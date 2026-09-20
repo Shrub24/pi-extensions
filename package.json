@@ -1,8 +1,8 @@
 {
   "name": "pi-extensions",
   "private": true,
-  "workspaces": ["pi-bash-processes", "pi-subagents", "pi-tool-renderer"],
+  "workspaces": ["pi-bash-processes", "pi-subagents", "pi-tool-renderer", "pi-jev"],
   "scripts": {
-    "test": "bun test pi-bash-processes/tests pi-bash-processes/extensions/__tests__ pi-tool-renderer/extensions/__tests__"
+    "test": "bun test pi-bash-processes/tests pi-bash-processes/extensions/__tests__ pi-tool-renderer/extensions/__tests__ pi-jev/tests"
   }
 }

@@ -1,0 +1,225 @@
+{
+	"name": "@vanillagreen/pi-jev",
+	"version": "0.1.0",
+	"description": "A modular substrate for Jev/TypeSafe decisions in Pi: consumers queue or send question sets against a shared per-session core. Ships a deferring permission authorizer for @gotgenes/pi-permission-system and an intent-nudge consumer.",
+	"license": "MIT",
+	"keywords": [
+		"pi-package",
+		"pi",
+		"coding-agent",
+		"jev",
+		"typesafe",
+		"permissions",
+		"semantic"
+	],
+	"pi": {
+		"extensions": [
+			"./extensions/permission-authorizer.ts",
+			"./extensions/tool-intent.ts"
+		]
+	},
+	"scripts": {
+		"test": "bun test ./tests"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*",
+		"pi-typesafe": ">=0.6 <1",
+		"typebox": "*"
+	},
+	"peerDependenciesMeta": {
+		"pi-typesafe": {
+			"optional": true
+		}
+	},
+	"files": [
+		"extensions/",
+		"README.md",
+		"DEVELOPMENT.md",
+		"package.json"
+	],
+	"kendex": {
+		"extensionManager": {
+			"displayName": "Jev decisions",
+			"settings": [
+				{
+					"key": "mode",
+					"label": "Mode",
+					"description": "shadow records what the judge would decide and always defers to the permission prompt. live lets it auto-allow or refuse; @gotgenes/pi-permission-system still caps an allow on its own path surfaces.",
+					"type": "enum",
+					"enumValues": [
+						"shadow",
+						"live"
+					],
+					"default": "shadow",
+					"category": "Authority",
+					"apply": "reload",
+					"requiresReload": true
+				},
+				{
+					"key": "authorizerName",
+					"label": "Authorizer link name",
+					"description": "The name to list in the permission system's authorizerChain. Registration alone grants no authority, so the link decides nothing until it is named there.",
+					"type": "string",
+					"default": "pi-jev",
+					"category": "Authority",
+					"apply": "reload",
+					"requiresReload": true
+				},
+				{
+					"key": "defaultThreshold",
+					"label": "Band edge",
+					"description": "Satisfied at p >= this value, violated at p <= 1 - it, unclear in between. Applies to every question until one has a measured threshold. Must be above 0.5.",
+					"type": "number",
+					"default": 0.9,
+					"category": "Thresholds",
+					"apply": "reload",
+					"requiresReload": true
+				},
+				{
+					"key": "advisoryThreshold",
+					"label": "Advisory band edge",
+					"description": "Band edge for nudging questions. Lower than the veto edge because a wrong nudge costs a sentence while a wrong veto refuses work. Must be above 0.5.",
+					"type": "number",
+					"default": 0.85,
+					"category": "Thresholds",
+					"apply": "reload",
+					"requiresReload": true
+				},
+				{
+					"key": "model",
+					"label": "Judge model",
+					"description": "TypeSafe model name for every question. Recorded with each decision, because a threshold does not transfer between models.",
+					"type": "string",
+					"default": "jev-latest",
+					"category": "Judge",
+					"apply": "reload",
+					"requiresReload": true
+				},
+				{
+					"key": "timeoutMs",
+					"label": "Judge timeout",
+					"description": "Milliseconds one Jev call may take before it is treated as a failure. This is time added ahead of the permission prompt, and a timeout defers to the human rather than deciding.",
+					"type": "number",
+					"default": 3000,
+					"category": "Judge",
+					"apply": "reload",
+					"requiresReload": true
+				},
+				{
+					"key": "maxRequestsPerSession",
+					"label": "Session request cap",
+					"description": "Attempts this judge may make in one session, including failed ones. Reaching it defers every later ask. Daily caps from PI_TYPESAFE_MAX_* still apply and can only lower this.",
+					"type": "number",
+					"default": 200,
+					"category": "Judge",
+					"apply": "reload",
+					"requiresReload": true
+				},
+				{
+					"key": "stateRetention",
+					"label": "State retention",
+					"description": "hash keeps only a state hash and the answers; full also keeps the state, which is what a replay calibration needs and what makes the log a record of conversation content.",
+					"type": "enum",
+					"enumValues": [
+						"hash",
+						"full"
+					],
+					"default": "hash",
+					"category": "Records",
+					"apply": "reload",
+					"requiresReload": true
+				},
+				{
+					"key": "recentUserMessages",
+					"label": "User messages in state",
+					"description": "How many of the user's own messages the judge is shown. 0 sends no intent at all, leaving the action to be judged on its own.",
+					"type": "number",
+					"default": 2,
+					"category": "State",
+					"apply": "reload",
+					"requiresReload": true
+				},
+				{
+					"key": "recentToolCalls",
+					"label": "Recent tool calls in state",
+					"description": "One line per tool call the agent already made, oldest first. Trimming drops these before it drops the user's instructions.",
+					"type": "number",
+					"default": 5,
+					"category": "State",
+					"apply": "reload",
+					"requiresReload": true
+				},
+				{
+					"key": "maxPlanChars",
+					"label": "Plan in state",
+					"description": "How much of the agent's own words before the call reach the judge. 0 removes the plan, which also removes the question that compares the call against it.",
+					"type": "number",
+					"default": 500,
+					"category": "State",
+					"apply": "reload",
+					"requiresReload": true
+				},
+				{
+					"key": "maxToolbox",
+					"label": "Toolbox in state",
+					"description": "How many available tools, with a one-line description each, the judge sees. This is what lets it judge whether the agent reached for the right tool. 0 omits the question.",
+					"type": "number",
+					"default": 12,
+					"category": "State",
+					"apply": "reload",
+					"requiresReload": true
+				},
+				{
+					"key": "maxStateChars",
+					"label": "State budget",
+					"description": "Character ceiling for one state. TypeSafe also caps a request at 64 KiB and 32 questions, which the pack stays well inside.",
+					"type": "number",
+					"default": 4000,
+					"category": "State",
+					"apply": "reload",
+					"requiresReload": true
+				},
+				{
+					"key": "logFile",
+					"label": "Decision log",
+					"description": "JSONL file holding one ask record per evaluation and one decision record per permission resolution, joined by requestId. Empty uses <agent dir>/pi-jev/decisions.jsonl.",
+					"type": "string",
+					"default": "",
+					"category": "Records",
+					"apply": "reload",
+					"requiresReload": true
+				},
+				{
+					"key": "deliverNudges",
+					"label": "Deliver nudges",
+					"description": "Send this package's veto findings to the agent as a steer. The intent consumer has its own switch.",
+					"type": "boolean",
+					"default": false,
+					"category": "Nudges",
+					"apply": "reload",
+					"requiresReload": true
+				},
+				{
+					"key": "deliverIntentNudges",
+					"label": "Deliver intent nudges",
+					"description": "Send the intent consumer's advisories to the agent as a steer: it names the question and the mismatch when a tool call contradicts the plan the agent just stated. Off until the report shows how often it would fire on your sessions.",
+					"type": "boolean",
+					"default": false,
+					"category": "Delivery",
+					"apply": "reload",
+					"requiresReload": true
+				},
+				{
+					"key": "queueFlushGapMs",
+					"label": "Queued-question wait",
+					"description": "How long a queued question may wait with no send before the core asks it anyway, in milliseconds. 0 disables the timer: queued questions are then answered by the next send, or at the turn boundary. A timed flush only runs mid-turn, and it is always late \u2014 it can nudge and log, never gate.",
+					"type": "number",
+					"default": 0,
+					"category": "Delivery",
+					"apply": "reload",
+					"requiresReload": true
+				}
+			]
+		}
+	}
+}

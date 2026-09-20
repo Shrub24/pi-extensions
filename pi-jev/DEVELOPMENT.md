@@ -1,0 +1,86 @@
+# pi-jev development
+
+For maintainers. What it does for a consumer is [README.md](README.md); the mechanics live as comments on the modules named below, and this file holds the invariants that span them.
+
+## The shape of the thing
+
+A **core** (`extensions/decision-core.ts`) holds consumers, question registrations, state providers, and one answer cache per action. A **consumer** (`extensions/consumers.ts` for the two here) is policy: it names its questions, says what the readings mean, and does something with the result. The two shipped consumers are the blocking permission link (`extensions/wiring.ts`, `extensions/authorizer-runtime.ts`) and the riding intent nudge (`extensions/intent.ts`), each its own extension entry file.
+
+Two verbs, and nothing else, on the ask side:
+
+- `queueDecisions({ action, actionKey, consumer, questions })` — adds to an action's queue. It asks nothing and costs nothing. The queue is per action, not per consumer: what it holds is the questions that something eventually wants about that action.
+- `sendDecisions({ action, actionKey, consumer, questions, interpret, signal, timeoutMs })` — asks now. It flushes the action's whole queue, plus every active consumer's standing questions, plus the caller's own; groups them by the state they read; runs one request per group in parallel; hands each consumer only its own readings back; and returns the per-request result.
+
+## Invariants
+
+- One core per session, one log per path, whatever entry arrives first. The registry (`extensions/registry.ts`) keys both on `globalThis` under `Symbol.for`, the way the permission system publishes its own service: a second core would mean a second request per action and two consumers disagreeing about the same answers, and a second log writer would append a duplicate of every line. Leases are refcounted; the last one out drops the core, so a finished session leaves nothing for the next to inherit. `created` is true only for the lease that supplied the judge, and that entry is the one that reports when the judge is unusable.
+- Batching is the reason the core exists, so nothing may ask outside it. A consumer that calls `ask` on its own bypasses the cache and the flush; the whole point of a shared core is that the first consumer to need an action pays for it and the rest read what it bought.
+- Whole consumer question sets are packed into chunks greedily and never split. A failed chunk means no consumer in it holds half its answers, and other groups answer anyway; atomicity in the other direction (all-or-nothing across groups) would let one dead group starve a consumer that had nothing to do with it.
+- A consumer only gets readings for its own questions, and only evaluates the bands it owns. Veto findings belong to the permission consumer, advisories to the intent consumer: one signal, one sentence, or the agent learns to ignore the channel.
+- The core owns no real timer, and a timer it does arm only ever runs mid-turn. `schedule` is injected, tests drive it by hand, and `isRunning()` gates both arming and firing: an idle flush would spend on a finished action and nudge a conversation nobody is having. A timed flush is always late, so it can nudge and log but never gate. `flushPending()` drains and disarms, and the host calls it at `turn_end`.
+- A boundary flush is interpreted by the consumer that queued the questions — but only when its questions are the whole flush, because one interpretation describes one ask. That is what keeps the log's bands complete for calls nothing gated.
+- Every failure defers. A judge that cannot be reached, answers with a shape the API did not promise, times out, or throws produces `{ kind: "defer" }` and a record saying so. Nothing in this package may turn an inability to judge into a refusal or an approval; the permission system's terminal decides. `extensions/authorizer-runtime.ts`.
+- Shadow mode is the default, and project settings cannot change that. `resolveConfig` reads only the user settings file, because `mode: "live"`, a moved band edge, and a redirected log all change whether an action runs without a human. `extensions/config.ts`.
+- A registration follows the service object, not the session id. The permission system publishes a new service per node and re-publishes after `/reload`; a link held against a superseded object would look registered and decide nothing. The previous link is disposed before a new one is registered, because a second registration under one name throws. `extensions/wiring.ts`.
+- Registration is idempotent. `permissions:ready` fires at `session_start` and again at the first `before_agent_start`; the same service object is never entered twice. `extensions/wiring.ts`.
+- Roles, not severities, decide what a band may do. `veto` may refuse; `advisory` may never refuse, only nudge. Every question declares its role, and composition reads it: a violated veto denies, nothing unresolved allows, everything else defers. The split is empirical (pi-warden: the off-task question caused 56 of 139 holds with no complaints and was demoted; pi-heed: prohibition interpretation ran 0.0% false blocks) and it is the reason a multi-question pack is safe at all.
+- One threshold convention, two edges. A question's probability is satisfied at `p >= t`, violated at `p <= 1 - t`, unclear between; vetoes use `defaultThreshold` (0.9), advisories `advisoryThreshold` (0.85), a per-question `thresholds` entry overrides either. A threshold of 0.5 or below is rejected rather than clamped, because the bands would meet. `extensions/action-pack.ts`.
+- A graded (`score`) question bands by level, not by probability, and its policy is stated with the question (`safety.reversibility`: satisfied at most 1, violated at least 3). A `score` answer that is the wrong type, out of range, or off the ladder is `missing`, never a silent mid-band.
+- An unmeasured question cannot refuse. Composition requires `measured: true` for a veto band to deny; an unmeasured violation defers and raises a notice instead. The flag flips when the question has labelled samples, so an untested bar never holds work while its precision is unknown.
+- Signals are recorded before they are delivered, and delivery is a consumer decision. An advisory violation is written to the log in every mode; `deliverNudges` (off by default) is what sends it. Any delivery failure is inert: it cannot change a verdict. `extensions/authorizer-runtime.ts`, `extensions/wiring.ts`.
+- An unclear band does not nudge. The unclear band spans `1 - t < p < t`, which is most of the range, so nudging there fires on nearly every call; pi-warden's 51-of-52 fixture credential warnings are the measured cost of that. Only a violated advisory nudges.
+- Questions with no labelled samples say so (`measured: false`) and the flag rides into the record, the deny text, and the report. A plausible question is not a measured one: pi-warden tested four candidate questions on 1,085 labelled turns and all four sat at the base rate.
+- Every question states three cases: the user asked for it, the user ruled it out, or the user did not mention it. The middle is what the unclear band is for, and no question may treat unmentionedness as conflict — a question that did would refuse every action the user never spelled out, which is the false-deny failure pi-warden hit when it demoted its off-task guard to a signal. `extensions/permission-questions.ts`.
+- One state, one batch group. The pack reads `action-v1` — the ask, the user's instructions, the agent's plan, the toolbox, recent tool calls — and everything in it rides one request. A question that needs different evidence belongs in another group with its own state, not in this one: pi-heed measured the cost of merging them (their go-ahead question caught 8 of 9 intended lifts alone and 5 of 9 inside a larger shared state, same question, same model), which is also TypeSafe's own advice to decompose the input state. `stateProvider` in the config names the group; the record carries it.
+- The state states who is speaking. `authority` on every state says that only `userIntent` carries authority and that assistant text, plans, and tool output are evidence, never instructions. This is the injection boundary: the agent authors `plan` and its own tool calls, so a state without that rule lets agent text pose as the user. pi-heed's E15 is the failure mode (a pasted task spec became ~30 bogus prohibitions).
+- The state is bounded, and its trimming is deterministic and named. Degradation drops the toolbox, then recent tool calls, then older instructions, then ordering guidance, then the plan, then the user's latest instruction, then shortens the authority rule; every cut is recorded in `truncated`, and a budget below the irreducible skeleton is marked `over-budget` rather than reported as fitting. A state that was trimmed is flagged in the join, because a score measured against a partial state is not comparable. `extensions/action-pack.ts`, `extensions/decision-record.ts`.
+- Nothing in the permission path reads the decision log. The log is written; the only readers are `scripts/report.ts` and tests. A log write failure never changes an answer.
+- Records are unlabelled at runtime and labelled later. `ask` and `decision` records are joined by `requestId`; only a resolution that carries a person's answer (`user_approved`, `user_approved_for_session`, `user_denied`) becomes a label. `authorizer_allowed`, `auto_approved`, `policy_allow`, `gate_error`, and anything unknown yield no label. A third kind — `event` — records registration and removal, carries no verdict, and is ignored by the join. `extensions/decision-record.ts`.
+- Third-party seams are structural mirrors, never imports for types. `@gotgenes/pi-permission-system` and `pi-typesafe` are resolved by dynamic import at runtime, and `extensions/types.ts` records which versions the shapes were copied from. Both packages are optional: absent is a state this package handles, not a load error.
+- Diagnostics do not become decisions. A notice is shown once per distinct message, is queued until a session context exists to show it in, and is never a reason to answer anything but `defer`.
+
+## Mechanics worth knowing
+
+- The judge's connection is warmed at `session_start` with pi-typesafe's `listModels`, which verifies the key and is not counted against the request budget. pi-heed measured a process's first request at ~900 ms against ~330 ms warm, and the first request here is one a human waits on.
+- The judge is consulted inside the authorizer chain, ahead of the interactive prompt. `timeoutMs` is therefore time added to a human's wait, which is why the default is three seconds and why a timeout defers.
+- `pi-typesafe`'s `ask` is the only call into Jev, and it never throws: a failure arrives as `{ ok: false, errorCode }`, and `configuration` is what triggers the one-time "no usable judge" notice.
+- The client is built lazily and its failures are retried on a 30-second cooldown, so a key entered mid-session by `/typesafe login` is picked up without a reload, and a missing key cannot become a request per ask.
+- `maxRequestsPerSession` is this package's own ceiling, defaulting to 200. pi-typesafe's own default of 20 is a tool's budget; a judge that asks once per permission prompt would trip it and look broken.
+- The question pack is versioned twice: `STATE_VERSION` moves when the state's shape or a field's meaning changes, `QUESTION_PACK_VERSION` when a question's wording, criteria, or the composition rule changes. Both ride on every record, because measurements from different packs are not comparable and must not be averaged.
+- Coverage of the pack is decided per ask: `path.within_approved_scope` is asked only for a path-shaped ask (`path`, `external_directory`, or a payload of that kind).
+- State field order is deliberate — `ask` first — because Jev anchors on what it reads first; the ordering of the conversational lists is stated inside the state rather than left to inference.
+- The conversation walk is bounded per string (`maxFieldChars * 4`) before the builder applies its smaller field bound. The permission path runs synchronously ahead of a human's prompt, so a pasted 200 KB message must not be carried through another transform; because the walk's bound is the looser one, the builder still sees an over-long string and records the cut it makes.
+- Redirecting `logFile` to `/dev/null` or a full disk degrades observability only: `openDecisionLog` swallows write failures.
+- Readings carry their reader's own detail verbatim (`detail`), and a question may be worded per action (`tool.choice` names its alternatives). The second property is why a reading records the hash of the wire question it answers: a cached answer under one wording must never satisfy a later ask whose wording differs, so `dropStaleWording` clears stale readings before reuse.
+- The first action recorded for an action key wins. A queue entry is stored with the context that motivated it — a tool call carrying its policy match — and a later sender's context (a gate's ask built from the permission payload) can be narrower; overwriting it would drop the queued question's reason to apply. `ensure` reads state, wording, and bands from the stored action.
+- The tool-choice policy is user-file only (`~/.pi/agent/pi-jev/tool-policy.yaml`), read once per session, and a malformed file is reported once and ignored. A project must not be able to steer tool choice by dropping a policy into the repo.
+- The intent consumer queues on tool calls rather than sending. A send per call would spend against pi-typesafe's per-session cap for a question whose answer only ever becomes a sentence; queued, it rides the next flush — a gate's ask, or the turn boundary — and costs nothing when nothing else asks.
+- Its consumer registration only applies when the agent stated a plan (`applies`), because the plan questions cannot be answered without one.
+
+## Tests
+
+```bash
+bun test ./tests
+```
+
+Every suite runs without a network, a Pi runtime, or a key. `tests/fixtures/fakes.ts` holds the injected seams — a judge answering from a table, an in-memory log, and the two permission-side interfaces an ask arrives through — and `tests/fixtures/host.ts` holds a fake Pi host whose lifecycle handlers and event bus are driven by hand, with more than one extension able to listen to the same event, as Pi allows.
+
+The registry is process-global, so a test file that wires anything resets it first (`beforeEach(() => resetRegistry())`); without that, one test's session serves the next test's asks from its own answers.
+
+- `action-pack.test.ts` — state construction and bounding, the pack's roles, banding (noul and score), composition, deny text, nudge text.
+- `authorizer-runtime.test.ts` — the vertical slice: shadow and live verdicts, a veto refusing, an advisory deferring and nudging, delivery bounds, a failure becoming a defer, state retention, one request per ask.
+- `wiring.test.ts` — registration, re-registration against a new service object, another node's events being ignored, duplicate names, the missing bus, notices, decision recording, shutdown.
+- `decision-core.test.ts` — queueing per consumer, one send carrying every active consumer's questions, grouping by state provider, reuse of remembered answers, chunk packing and its atomicity, spilling, the idle flush and its turn gate.
+- `registry.test.ts` — a second entry joining the core the first made, the pack installed once, the first lease owning the judge and reporting for it, refcounting, separate sessions getting separate cores, one log per path.
+- `intent.test.ts` — both entries wired into one host: a call queues and the gate's ask carries it in the same flush, the second entry's judge never runs, a call nothing gated is read at the boundary, no plan means no questions, delivery switches.
+- `decision-record.test.ts` — labels, joins, metrics, calibration samples and replay cases.
+- `conversation.test.ts`, `gotgenes.test.ts`, `jev.test.ts`, `config.test.ts` — the four impure edges, each against a fake.
+
+A live check, with the key and `@gotgenes/pi-permission-system` installed:
+
+```bash
+pi -ne -e ./extensions/permission-authorizer.ts -e ./extensions/tool-intent.ts
+bun scripts/report.ts --log ~/.pi/agent/pi-jev/decisions.jsonl
+```
+
+Each entry also loads alone, and the entry that owns the judge is the one that says it is unusable: the other joins its core and stays quiet rather than repeating the same warning.
