@@ -13,9 +13,21 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import type { Nudge } from "./consumers.js";
 
-export function deliverNudges(pi: ExtensionAPI, nudges: readonly Nudge[]): void {
+export interface DeliverOptions {
+	/**
+	 * `steer` lands after the current tool batch; `followUp` waits for the agent
+	 * to finish, and with `triggerTurn` wakes an idle agent — the orchestrator's
+	 * check-in wake. Default `steer`, for nudges sent while a human may be
+	 * waiting on a gate.
+	 */
+	mode?: "steer" | "followUp";
+	triggerTurn?: boolean;
+}
+
+export function deliverNudges(pi: ExtensionAPI, nudges: readonly Nudge[], options: DeliverOptions = {}): void {
 	const send = (pi as { sendMessage?: (message: unknown, options?: unknown) => unknown }).sendMessage;
 	if (typeof send !== "function") return;
+	const delivery = { deliverAs: options.mode ?? "steer", ...(options.triggerTurn ? { triggerTurn: true } : {}) } as const;
 	for (const nudge of nudges) {
 		try {
 			send.call(
@@ -26,7 +38,7 @@ export function deliverNudges(pi: ExtensionAPI, nudges: readonly Nudge[]): void 
 					display: true,
 					details: { source: nudge.source, role: nudge.role, measured: nudge.measured },
 				},
-				{ deliverAs: "steer" },
+				delivery,
 			);
 		} catch {
 			// A nudge that cannot be delivered must not affect any verdict.

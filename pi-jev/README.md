@@ -11,9 +11,15 @@ The two consumers shipped here:
 
 The two are separate extension entries: either loads without the other, and the registry is what keeps them on one core when both are present.
 
-### Subagent asks
+### Subagent work: two triggers, one question set
 
-The permission system forwards a subagent's ask to the session that spawned it, and a forwarded ask carries the child's name (`requestedBy`). Those asks get two more questions, in their own state group (`subagent-v1`): whether the call serves what the orchestrator dispatched the agent to do, and whether it stays inside the role the agent was given. Both are advisory and belong to the orchestrator's consumer, not the gate — a subagent question never denies, because revoking a child's tool on a guess strands work the parent cannot see. A violation becomes a steering sentence for the orchestrator, the one party that can redirect or retire the child, when `deliverSubagentNudges` is on.
+The subagent questions are: does this work serve what the orchestrator is trying to accomplish, and does it stay inside the agent's role? Both are advisory — a subagent question never denies, because revoking a child's tool on a guess strands work the parent cannot see. They ride two triggers:
+
+**A forwarded ask.** The permission system forwards a subagent's ask to the session that spawned it, and the forwarded facts carry the child's name. The action's own group is what the gate composes over; these two questions are the orchestrator's, and the permission consumer deliberately does not include them — an unresolved advisory in that composition would defer every forwarded ask. A violation becomes a steering sentence for the orchestrator, the party that can redirect or retire the child.
+
+**A check-in on the fleet.** pi-subagents already marks a step `active_long_running` or `needs_attention` on an elapsed-time threshold and appends a `subagent_control_notice` to the session. With `orchestratorCheckInMs` set, pi-jev scans those notices at each turn boundary and when the agent settles, asks the same two questions about each child the notice names, and — on a violation — wakes the orchestrator with `followUp` + `triggerTurn`, carrying the findings in one message. That wake *is* the keep-alive: a check-in costs nothing until a child looks off, so a quiet fleet is silent and a busy one is read at most once per notice. A notice already read is never read again.
+
+Set `orchestratorCheckInMs` (0 disables; env `PI_JEV_CHECK_IN_MS`) to the cadence you want the fleet read at — a few minutes is the useful range, since the notices themselves are already elapsed-time gated by pi-subagents.
 
 ## Install
 
@@ -74,8 +80,8 @@ No policy file, or an unreadable one, means no choice question and a one-time no
 | `scope.supports_active_task` | noul | advisory | the call serves nothing the user asked for |
 | `tool.fit` | noul | advisory, unmeasured | another available tool fits the intent plainly better |
 | `tool.choice` | choice | advisory, unmeasured | the judge picks the policy's preferred alternative with a clear margin |
-| `orchestrator.intent_alignment` | noul | advisory, unmeasured | the call serves what the orchestrator dispatched the agent to do |
-| `agent.role_adherence` | noul | advisory, unmeasured | the call stays inside the role the agent was given |
+| `orchestrator.intent_alignment` | noul | advisory, unmeasured | the work serves what the orchestrator is trying to accomplish |
+| `agent.role_adherence` | noul | advisory, unmeasured | the work stays inside the role the agent was given |
 
 - Answers are composed by one rule: a **measured** veto band that is violated refuses the ask, every question satisfied allows it, and anything else — including a missing answer — defers.
 - An **unmeasured** veto may not refuse: it defers and raises a notice instead. A bar with no labelled samples behind it has no evidence for holding your work, and pi-warden's four candidate questions all landed at the base rate.

@@ -50,6 +50,15 @@ export const PERMISSION_CONSUMER = "permission";
 export const INTENT_CONSUMER = "intent";
 export const SUBAGENT_CONSUMER = "subagent";
 
+/**
+ * The surface a check-in's synthetic action carries, so the consumer can tell a
+ * timer-driven read from a forwarded ask. The two want different delivery: an
+ * ask happens while a human is already waiting and its finding rides the gate as
+ * a steer, while a check-in is the only thing that will speak to an idle
+ * orchestrator — its finding must be the wake itself.
+ */
+export const CHECK_IN_SURFACE = "subagent_check_in";
+
 /** Questions the permission consumer needs for its verdict: every group's worth. */
 export const PERMISSION_QUESTIONS: readonly string[] = ACTION_QUESTION_IDS;
 
@@ -226,10 +235,10 @@ export function vetoNudges(signals: readonly Signal[]): Nudge[] {
 }
 
 /**
- * The orchestrator's nudges: a subagent call that departed from its dispatch or
- * its role. These are steering sentences for the orchestrator, not refusals —
- * the permission system keeps authority, and the orchestrator is the party that
- * can redirect or retire the child.
+ * The orchestrator's nudges: work that departed from its instructions or its
+ * role. These are steering sentences for the orchestrator, not refusals — the
+ * permission system keeps authority, and the orchestrator is the party that can
+ * redirect or retire a child.
  */
 export function subagentNudges(readings: readonly Reading[], config: JevConfig): Nudge[] {
 	const specs = SUBAGENT_SPECS;
@@ -272,6 +281,55 @@ export function intentNudges(readings: readonly Reading[], config: JevConfig): N
 			severity: "warn" as const,
 		}));
 	return nudgesFrom(signals);
+}
+
+/**
+ * Register the orchestrator's consumer on a core, once.
+ *
+ * Both entries want it, and they may share one core. `subscriptions` is keyed by
+ * id, so a second registration would overwrite the first — and the two are not
+ * interchangeable: the permission entry's is what joins a forwarded ask's flush,
+ * while the intent entry's is what a check-in send reports back to. One
+ * registration carries both behaviors, guarded per core so whichever entry gets
+ * there first is the only one to register.
+ *
+ * `onViolation` is called for each violated band the check-in should count; the
+ * nudge itself goes through `deliver` when the operator has steers on.
+ */
+const subagentRegistered = new WeakSet<object>();
+
+export function registerSubagentConsumer(
+	core: DecisionCore<ActionContext>,
+	input: {
+		config: JevConfig;
+		deliver?: (nudges: readonly Nudge[]) => void;
+		/** Every violated band, with the action that produced it. Never gated by the steer switch. */
+		onViolation?: (nudges: readonly Nudge[], action: ActionContext) => void;
+	},
+): void {
+	if (subagentRegistered.has(core as object)) return;
+	subagentRegistered.add(core as object);
+	core.registerConsumer({
+		id: SUBAGENT_CONSUMER,
+		questions: SUBAGENT_QUESTIONS,
+		// Standing interest only where a child genuinely exists: a forwarded ask.
+		// The check-in names its own questions on the send, so it does not need
+		// standing interest and must not add the group to some other gate's ask.
+		applies: (action: ActionContext) => action.facts.forwarded,
+		interpret: (readings) => interpretBands(readings, SUBAGENT_SPECS, input.config),
+		onAnswers: (delivery) => {
+			const nudges = subagentNudges(delivery.readings, input.config);
+			if (nudges.length === 0) return;
+			// Reported whoever is watching: a check-in's wake decision is about
+			// what the judge found, not about whether steers are switched on.
+			input.onViolation?.(nudges, delivery.action);
+			if (!input.config.deliverSubagentNudges) return;
+			// A check-in delivers its own finding, with the wake options an idle
+			// orchestrator needs; a steer here would queue unread instead.
+			if (delivery.action.facts.surface === CHECK_IN_SURFACE) return;
+			input.deliver?.(nudges);
+		},
+	});
 }
 
 /** The deny text for one band, exported so a consumer can phrase its own refusal. */

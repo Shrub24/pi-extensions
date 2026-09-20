@@ -76,6 +76,13 @@ export interface JevConfig {
 	 */
 	queueFlushGapMs: number;
 	/**
+	 * How often the orchestrator's check-in scans child notices and asks the
+	 * drift questions, in milliseconds. 0 disables the timer: the questions are
+	 * still asked on forwarded asks, but nothing wakes an idle orchestrator.
+	 * The wake itself is one steering sentence — a quiet child costs nothing.
+	 */
+	orchestratorCheckInMs: number;
+	/**
 	 * The TypeSafe key, when configured here. Unset means pi-typesafe resolves its
 	 * own: TYPESAFE_API_KEY in the environment, then the key /typesafe login
 	 * stored. A key in the settings file is read by every process that loads the
@@ -130,6 +137,7 @@ export const DEFAULTS: JevConfig = {
 	deliverIntentNudges: false,
 	deliverSubagentNudges: false,
 	queueFlushGapMs: 0,
+	orchestratorCheckInMs: 0,
 	logFile: "",
 };
 
@@ -261,6 +269,9 @@ export function resolveConfig(
 
 	const gap = pickNumber(settings.queueFlushGapMs, 0, 600_000);
 	if (gap !== undefined) config.queueFlushGapMs = gap;
+
+	const checkIn = pickNumber(env.PI_JEV_CHECK_IN_MS ?? settings.orchestratorCheckInMs, 0, 3_600_000);
+	if (checkIn !== undefined) config.orchestratorCheckInMs = checkIn;
 
 	const file = pickString(env.PI_JEV_LOG) ?? pickString(settings.logFile);
 	if (file) config.logFile = file.startsWith("~/") ? join(homedir(), file.slice(2)) : resolve(file);

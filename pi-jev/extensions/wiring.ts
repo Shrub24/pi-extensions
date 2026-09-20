@@ -28,7 +28,7 @@ import type { DecisionLog } from "./decision-log.js";
 import { RECORD_VERSION } from "./decision-record.js";
 import type { DecisionRecord, EventRecord } from "./decision-record.js";
 import { deliverNudges } from "./nudges.js";
-import { SUBAGENT_CONSUMER, SUBAGENT_QUESTIONS, SUBAGENT_SPECS, installPack, interpretBands, subagentNudges } from "./consumers.js";
+import { installPack, registerSubagentConsumer } from "./consumers.js";
 import type { Nudge } from "./consumers.js";
 import { acquireCore, acquireLog, logSink } from "./registry.js";
 import type { CoreLease } from "./registry.js";
@@ -141,26 +141,6 @@ export function wirePermissionAuthorizer(pi: ExtensionAPI, deps: WiringDeps = {}
 		...(deliver ? { deliver } : {}),
 	});
 
-	// The orchestrator's consumer: subagent questions read the forwarded-ask
-	// facts, so a local ask has nothing for them and the `applies` gate drops
-	// it from the flush entirely. A violation becomes a steering sentence for
-	// the orchestrator — the one party that can redirect or retire the child.
-	// It rides this entry because the chain link is what sees every ask,
-	// forwarded or not; the intent entry sees only tool calls.
-	const registerSubagentConsumer = (core: NonNullable<CoreLease["core"]>): void => {
-		core.registerConsumer({
-			id: SUBAGENT_CONSUMER,
-			questions: SUBAGENT_QUESTIONS,
-			applies: (action: ActionContext) => action.facts.forwarded,
-			interpret: (readings) => interpretBands(readings, SUBAGENT_SPECS, config),
-			onAnswers: (delivery) => {
-				if (!config.deliverSubagentNudges || !deliver) return;
-				const nudges = subagentNudges(delivery.readings, config);
-				if (nudges.length > 0) deliver(nudges);
-			},
-		});
-	};
-
 	const register = (service: unknown): void => {
 		const target = service as RegistrableService;
 		if (typeof target?.registerAuthorizer !== "function") return;
@@ -271,7 +251,11 @@ export function wirePermissionAuthorizer(pi: ExtensionAPI, deps: WiringDeps = {}
 				},
 				setup: (core) => {
 					installPack(core, config);
-					registerSubagentConsumer(core);
+					// The orchestrator's consumer rides this core too: subagent
+					// questions read the forwarded-ask facts, so a local ask drops
+					// them from the flush. A violation is a steering sentence for the
+					// orchestrator — the party that can redirect or retire a child.
+					registerSubagentConsumer(core, { config, ...(deliver ? { deliver } : {}) });
 				},
 			});
 		}

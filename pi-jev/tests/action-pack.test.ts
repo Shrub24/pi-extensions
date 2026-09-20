@@ -3,6 +3,7 @@ import { expect, test } from "bun:test";
 import {
 	ACTION_PACK,
 	SUBAGENT_PACK,
+	buildSubagentState,
 	subagentBundle,
 	askFactsFrom,
 	buildActionState,
@@ -399,12 +400,12 @@ test("conversation limits reach the state builder", () => {
 	expect(built.truncated.some((entry) => entry.startsWith("plan.text"))).toBe(true);
 });
 
-test("subagent questions apply only to forwarded asks, and read the subagent state", () => {
-	// A local ask has no orchestrator to steer: both questions drop out.
-	const local = questionsFor(facts(), SUBAGENT_PACK);
-	expect(local).toHaveLength(0);
+test("subagent questions read the subject, the role, and the task, whatever the trigger", () => {
+	// The questions themselves are trigger-agnostic: a forwarded ask, a
+	// long-running notice, or an orchestrator's own check-in all name a subject.
+	// WHO asks is the consumer's decision, not the pack's.
+	expect(SUBAGENT_PACK.map((spec) => spec.id)).toEqual(["orchestrator.intent_alignment", "agent.role_adherence"]);
 
-	// A forwarded ask names its requester and carries both questions.
 	const forwarded = facts({
 		agentName: "reviewer",
 		payload: {
@@ -423,21 +424,22 @@ test("subagent questions apply only to forwarded asks, and read the subagent sta
 			annotations: [],
 		},
 	});
-	const specs = questionsFor(forwarded, SUBAGENT_PACK);
-	expect(specs.map((spec) => spec.id)).toEqual(["orchestrator.intent_alignment", "agent.role_adherence"]);
+	expect(questionsFor(forwarded, SUBAGENT_PACK)).toHaveLength(2);
 
-	// The subagent state leads with who asked, the role, and the task — not the
-	// whole action state, which the action-v1 group already carries.
+	// The subagent state leads with the subject, the role, and the task — not
+	// the whole action state, which the action-v1 group already carries.
 	const built = subagentBundle(budget).buildState({ facts: forwarded, conversation: { userMessages: ["review the auth module"], recentToolCalls: [], declaredPlan: "reviewing the auth module for token handling", toolbox: [] } });
-	const state = built.state as { ask: { requestedBy: string }; role: { name: string } | null; task: { text: string } | null; userIntent: { latest: string | null } };
-	expect(state.ask.requestedBy).toBe("subagent reviewer");
+	const state = built.state as { subject: string; role: { name: string } | null; task: { text: string } | null; userIntent: { latest: string | null } };
+	expect(state.subject).toContain("git push --force");
 	expect(state.role?.name).toBe("reviewer");
 	expect(state.task?.text).toContain("auth module");
 	expect(state.userIntent.latest).toBe("review the auth module");
 
-	// An unknown agent has no role to read; the field says so rather than guessing.
-	const unnamed = subagentBundle(budget).buildState({ facts: { ...forwarded, agentName: null }, conversation: { userMessages: [], recentToolCalls: [], declaredPlan: null, toolbox: [] } });
-	expect((unnamed.state as { role: unknown }).role).toBeNull();
+	// A check-in with no agent name and no plan leaves those fields null rather
+	// than guessing: the judge answers with a middling probability instead.
+	const bare = buildSubagentState({ subject: "child still running", agentName: null, latestUserMessage: null, declaredPlan: null }, budget);
+	expect((bare.state as { role: unknown }).role).toBeNull();
+	expect((bare.state as { task: unknown }).task).toBeNull();
 });
 
 test("subagent bands are advisory: a violation nudges the orchestrator and never denies", () => {

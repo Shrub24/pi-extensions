@@ -298,3 +298,106 @@ test("no policy file means no choice question", async () => {
 	expect(intentJev.requests).toHaveLength(0);
 	expect(host.sent).toHaveLength(0);
 });
+
+test("a long-running notice is checked in on, and the finding wakes the orchestrator", async () => {
+	// The interval is long enough that only the settled event drives the scan —
+	// the timer path is the same code, and a real timer in a test is a race.
+	const service = fakeService();
+	const host = fakeHost({ branch: branchWith({ instruction: "fix the parser" }) });
+	const jev = fakeJevClient({
+		"orchestrator.intent_alignment": noul(0.05),
+		"agent.role_adherence": noul(0.05),
+	});
+	wireIntentConsumer(host.pi, {
+		config: testConfig({ mode: "shadow", deliverSubagentNudges: true, orchestratorCheckInMs: 3_600_000 }),
+		log: fakeLog(),
+		jev: jev as never,
+		now: () => new Date("2026-09-19T00:00:00.000Z"),
+		policy: { preferences: [], margin: 0.2 },
+	});
+	await host.sessionStart("s1");
+	// The child's own control notice from pi-subagents' watchdog.
+	host.setBranch([
+		...branchWith({ instruction: "fix the parser" }),
+		{
+			type: "custom_message",
+			customType: "subagent_control_notice",
+			id: "n1",
+			content: "Subagent active but long-running: reviewer\nRun: bg-1 step 1\nSignal: reviewer is still active but long-running",
+		},
+	]);
+	await host.fire("agent_settled");
+	await new Promise((resolve) => setTimeout(resolve, 0));
+
+	// The check-in asked the drift questions about the child the notice names.
+	expect(jev.requests).toHaveLength(1);
+	expect(Object.keys(jev.requests[0]?.questions ?? {}).sort()).toEqual(["agent.role_adherence", "orchestrator.intent_alignment"]);
+	const state = jev.requests[0]?.state as { subject?: string; role?: { name?: string } };
+	expect(state.subject).toContain("Subagent active but long-running");
+	expect(state.role?.name).toBe("reviewer");
+
+	// The finding is delivered as a wake, not a steer: an idle orchestrator has
+	// no tool batch for a steer to land after.
+	expect(host.sent).toHaveLength(1);
+	const sent = host.sent[0] as { message?: { content?: string }; options?: { deliverAs?: string; triggerTurn?: boolean } };
+	expect(sent.options?.deliverAs).toBe("followUp");
+	expect(sent.options?.triggerTurn).toBe(true);
+	expect(sent.message?.content).toContain("orchestrator.intent_alignment");
+});
+
+test("a notice is checked in on once, and a clean reading wakes nobody", async () => {
+	const service = fakeService();
+	const host = fakeHost({ branch: branchWith({ instruction: "fix the parser" }) });
+	const jev = fakeJevClient({
+		"orchestrator.intent_alignment": noul(0.97),
+		"agent.role_adherence": noul(0.96),
+	});
+	wireIntentConsumer(host.pi, {
+		config: testConfig({ mode: "shadow", deliverSubagentNudges: true, orchestratorCheckInMs: 3_600_000 }),
+		log: fakeLog(),
+		jev: jev as never,
+		now: () => new Date("2026-09-19T00:00:00.000Z"),
+		policy: { preferences: [], margin: 0.2 },
+	});
+	await host.sessionStart("s1");
+	host.setBranch([
+		...branchWith({ instruction: "fix the parser" }),
+		{ type: "custom_message", customType: "subagent_control_notice", id: "n1", content: "Subagent active but long-running: reviewer" },
+	]);
+	await host.fire("agent_settled");
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	expect(jev.requests).toHaveLength(1);
+	// Clean bands: the check-in spent one request and said nothing.
+	expect(host.sent).toHaveLength(0);
+
+	// A second settled event reads no new notice, so it spends nothing.
+	await host.fire("agent_settled");
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	expect(jev.requests).toHaveLength(1);
+});
+
+test("a check-in without steers switched on records without waking", async () => {
+	const service = fakeService();
+	const host = fakeHost({ branch: branchWith({ instruction: "fix the parser" }) });
+	const jev = fakeJevClient({ "orchestrator.intent_alignment": noul(0.05), "agent.role_adherence": noul(0.05) });
+	const log = fakeLog();
+	wireIntentConsumer(host.pi, {
+		config: testConfig({ mode: "shadow", orchestratorCheckInMs: 3_600_000 }),
+		log,
+		jev: jev as never,
+		now: () => new Date("2026-09-19T00:00:00.000Z"),
+		policy: { preferences: [], margin: 0.2 },
+	});
+	await host.sessionStart("s1");
+	host.setBranch([
+		...branchWith({ instruction: "fix the parser" }),
+		{ type: "custom_message", customType: "subagent_control_notice", id: "n1", content: "Subagent needs attention: fixer-2" },
+	]);
+	await host.fire("agent_settled");
+	await new Promise((resolve) => setTimeout(resolve, 0));
+
+	// The finding is in the log — that is how the threshold gets chosen — and
+	// the agent was not woken for it.
+	expect(log.records.some((record) => record.record !== "event")).toBe(true);
+	expect(host.sent).toHaveLength(0);
+});

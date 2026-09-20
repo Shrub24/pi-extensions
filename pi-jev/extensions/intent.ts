@@ -30,12 +30,13 @@ import type { ActionAskFacts, ActionContext } from "./action-pack.js";
 import { MAX_QUESTIONS_PER_REQUEST, readSettingsFile, resolveConfig } from "./config.js";
 import type { JevConfig } from "./config.js";
 import { configConversation, sessionSources, toolboxLines } from "./conversation.js";
-import { INTENT_CONSUMER, INTENT_QUESTIONS, INTENT_SPECS, installPack, intentNudges, interpretBands } from "./consumers.js";
 import type { Nudge } from "./consumers.js";
 import { createJevClient } from "./jev.js";
 import type { JevClient } from "./jev.js";
 import type { DecisionLog } from "./decision-log.js";
 import { deliverNudges } from "./nudges.js";
+import { checkInAction, checkInActionKey, checkInIntervalMs, combineFindings, newNotices, noticeNeedsAttention, CHECK_IN_QUESTIONS } from "./check-in.js";
+import { INTENT_CONSUMER, INTENT_QUESTIONS, INTENT_SPECS, SUBAGENT_CONSUMER, installPack, intentNudges, interpretBands, registerSubagentConsumer } from "./consumers.js";
 import { acquireCore, acquireLog, logSink } from "./registry.js";
 import type { CoreLease } from "./registry.js";
 import { preferredTool, TOOL_CHOICE_QUESTIONS, toolChoiceBand, toolChoiceNudgeText } from "./tool-choice.js";
@@ -141,6 +142,9 @@ export function wireIntentConsumer(pi: ExtensionAPI, deps: IntentDeps = {}): voi
 	let sessionId: string | null = null;
 	let lease: CoreLease | undefined;
 	let calls = 0;
+	let checkInTimer: ReturnType<typeof setTimeout> | undefined;
+	/** Notices already asked about, so a scan reads each one once. */
+	const seenNotices = new Set<string>();
 	const reported = new Set<string>();
 	const loaded = deps.policy ? { policy: deps.policy } : loadToolPolicy();
 	const toolPolicy: ToolPolicy = loaded.policy;
@@ -157,6 +161,9 @@ export function wireIntentConsumer(pi: ExtensionAPI, deps: IntentDeps = {}): voi
 
 	const deliver: ((nudges: readonly Nudge[]) => void) | undefined =
 		config.deliverNudges || config.deliverIntentNudges || config.deliverSubagentNudges ? (nudges) => deliverNudges(pi, nudges) : undefined;
+
+	/** Collected by the shared subagent consumer while a check-in runs. */
+	let checkInFindings: Nudge[] = [];
 
 	pi.on("session_start", (_event, context) => {
 		ctx = context;
@@ -207,6 +214,17 @@ export function wireIntentConsumer(pi: ExtensionAPI, deps: IntentDeps = {}): voi
 			},
 		});
 
+		// The orchestrator's steering consumer, shared with the permission entry:
+		// whichever lands first registers it, and this entry's `onViolation` is
+		// what the check-in's wake decision reads.
+		registerSubagentConsumer(lease.core, {
+			config,
+			...(deliver ? { deliver } : {}),
+			onViolation: (nudges) => {
+				checkInFindings.push(...nudges);
+			},
+		});
+
 		// The tool-choice consumer rides the same core: it queues on every tool
 		// call whose policy names an alternative, and its readings come back with
 		// whatever flush answers them. Its nudge text names the policy's reason,
@@ -242,6 +260,60 @@ export function wireIntentConsumer(pi: ExtensionAPI, deps: IntentDeps = {}): voi
 			},
 		});
 	});
+
+	// The orchestrator's check-in: on the configured interval, scan the branch
+	// for child notices nobody has asked about, queue the drift questions, and
+	// flush. A violation wakes the idle orchestrator with one sentence — the
+	// wake is the keep-alive, so a quiet child costs nothing and a busy one is
+	// read at most once per notice.
+	const runCheckIn = async (): Promise<void> => {
+		checkInTimer = undefined;
+		if (!lease || sessionId === null || !ctx) return;
+		if (checkInIntervalMs(config) <= 0) return;
+		let entries: readonly unknown[] = [];
+		try {
+			entries = (ctx.sessionManager as { getBranch?: () => readonly unknown[] }).getBranch?.() ?? [];
+		} catch {
+			entries = [];
+		}
+		const fresh = newNotices(entries, seenNotices).filter(noticeNeedsAttention);
+		if (fresh.length === 0) return;
+		for (const notice of fresh) seenNotices.add(notice.id);
+		const conversation = configConversation(sessionSources(ctx, pi as never), config);
+		const findings: Nudge[] = [];
+		for (const notice of fresh) {
+			try {
+				await lease.core.sendDecisions({
+					action: checkInAction(notice, conversation),
+					actionKey: checkInActionKey(notice),
+					consumer: SUBAGENT_CONSUMER,
+					questions: CHECK_IN_QUESTIONS,
+				});
+				// The shared consumer's onAnswers ran inside that flush and pushed
+				// whatever it found into `checkInFindings`; the check-in owns only
+				// the delivery, which is the part that wakes an idle orchestrator.
+				findings.push(...checkInFindings);
+				checkInFindings = [];
+			} catch {
+				// A failed check-in is a failed request, recorded by the core; it is
+				// not a reason to stop scanning the rest of the fleet.
+			}
+		}
+		const wake = combineFindings(findings);
+		if (wake && config.deliverSubagentNudges) {
+			// One wake for the whole scan: every message here is a turn the
+			// orchestrator spends, and its findings read as one paragraph anyway.
+			deliverNudges(pi, [wake], { mode: "followUp", triggerTurn: true });
+		}
+	};
+
+	const armCheckIn = (): void => {
+		const interval = checkInIntervalMs(config);
+		if (interval <= 0 || checkInTimer !== undefined) return;
+		checkInTimer = setTimeout(() => {
+			void runCheckIn();
+		}, interval);
+	};
 
 	// The trigger: a tool call is the moment a plan can be contradicted, and the
 	// moment a policy preference can be honoured instead of missed.
@@ -292,9 +364,21 @@ export function wireIntentConsumer(pi: ExtensionAPI, deps: IntentDeps = {}): voi
 		void lease?.core.flushPending().catch(() => {
 			// A failure is already recorded as a failed request.
 		});
+		// The check-in cadence resumes at every boundary: an idle orchestrator is
+		// scanned on the interval, a busy one is scanned by its own turns.
+		armCheckIn();
+	});
+
+	pi.on("agent_settled", () => {
+		// The agent has stopped for real — no retry, no follow-up left. One scan
+		// now, and the interval takes over from here.
+		void runCheckIn();
+		armCheckIn();
 	});
 
 	pi.on("session_shutdown", () => {
+		if (checkInTimer !== undefined) clearTimeout(checkInTimer);
+		checkInTimer = undefined;
 		lease?.release();
 		lease = undefined;
 		logLease?.release();
