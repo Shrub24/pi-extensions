@@ -21,7 +21,6 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 
 import type { ConversationFacts } from "./action-pack.js";
 import { createAuthorizerRuntime } from "./authorizer-runtime.js";
-import { installPack } from "./consumers.js";
 import { configConversation, sessionSources } from "./conversation.js";
 import { MAX_QUESTIONS_PER_REQUEST, readSettingsFile, resolveConfig } from "./config.js";
 import type { JevConfig } from "./config.js";
@@ -29,6 +28,8 @@ import type { DecisionLog } from "./decision-log.js";
 import { RECORD_VERSION } from "./decision-record.js";
 import type { DecisionRecord, EventRecord } from "./decision-record.js";
 import { deliverNudges } from "./nudges.js";
+import { SUBAGENT_CONSUMER, SUBAGENT_QUESTIONS, SUBAGENT_SPECS, installPack, interpretBands, subagentNudges } from "./consumers.js";
+import type { Nudge } from "./consumers.js";
 import { acquireCore, acquireLog, logSink } from "./registry.js";
 import type { CoreLease } from "./registry.js";
 import {
@@ -86,6 +87,7 @@ export function wirePermissionAuthorizer(pi: ExtensionAPI, deps: WiringDeps = {}
 			model: config.model,
 			timeoutMs: config.timeoutMs,
 			maxRequests: config.maxRequestsPerSession,
+			...(config.apiKey === undefined ? {} : { apiKey: config.apiKey }),
 		});
 	const locator = deps.locator ?? createSeamLocator();
 
@@ -128,13 +130,36 @@ export function wirePermissionAuthorizer(pi: ExtensionAPI, deps: WiringDeps = {}
 		}
 	};
 
+	const deliver: ((nudges: readonly Nudge[]) => void) | undefined =
+		config.deliverNudges || config.deliverSubagentNudges ? (nudges) => deliverNudges(pi, nudges) : undefined;
+
 	const runtime = createAuthorizerRuntime({
 		config,
 		core: () => lease?.core,
 		conversation: (): ConversationFacts => configConversation(sessionSources(ctx, pi as never), config),
 		report,
-		...(config.deliverNudges ? { deliver: (nudges) => deliverNudges(pi, nudges) } : {}),
+		...(deliver ? { deliver } : {}),
 	});
+
+	// The orchestrator's consumer: subagent questions read the forwarded-ask
+	// facts, so a local ask has nothing for them and the `applies` gate drops
+	// it from the flush entirely. A violation becomes a steering sentence for
+	// the orchestrator — the one party that can redirect or retire the child.
+	// It rides this entry because the chain link is what sees every ask,
+	// forwarded or not; the intent entry sees only tool calls.
+	const registerSubagentConsumer = (core: NonNullable<CoreLease["core"]>): void => {
+		core.registerConsumer({
+			id: SUBAGENT_CONSUMER,
+			questions: SUBAGENT_QUESTIONS,
+			applies: (action: ActionContext) => action.facts.forwarded,
+			interpret: (readings) => interpretBands(readings, SUBAGENT_SPECS, config),
+			onAnswers: (delivery) => {
+				if (!config.deliverSubagentNudges || !deliver) return;
+				const nudges = subagentNudges(delivery.readings, config);
+				if (nudges.length > 0) deliver(nudges);
+			},
+		});
+	};
 
 	const register = (service: unknown): void => {
 		const target = service as RegistrableService;
@@ -244,7 +269,10 @@ export function wirePermissionAuthorizer(pi: ExtensionAPI, deps: WiringDeps = {}
 						return () => clearTimeout(timer);
 					},
 				},
-				setup: (core) => installPack(core, config),
+				setup: (core) => {
+					installPack(core, config);
+					registerSubagentConsumer(core);
+				},
 			});
 		}
 		// A local resolution, no request: the user learns the judge is unusable

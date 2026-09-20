@@ -66,6 +66,8 @@ export interface JevConfig {
 	deliverNudges: boolean;
 	/** Deliver the intent consumer's nudges. Its own switch: different consumer, different noise. */
 	deliverIntentNudges: boolean;
+	/** Deliver the orchestrator's subagent-steering nudges. Off until the log shows the fire rate. */
+	deliverSubagentNudges: boolean;
 	/**
 	 * How long a queued question may wait with no send before the core asks it
 	 * anyway, in milliseconds. 0 disables the timer: by default a queued question
@@ -73,6 +75,13 @@ export interface JevConfig {
 	 * a clock.
 	 */
 	queueFlushGapMs: number;
+	/**
+	 * The TypeSafe key, when configured here. Unset means pi-typesafe resolves its
+	 * own: TYPESAFE_API_KEY in the environment, then the key /typesafe login
+	 * stored. A key in the settings file is read by every process that loads the
+	 * entry, so prefer the env var on a shared machine.
+	 */
+	apiKey?: string;
 	logFile: string;
 }
 
@@ -119,6 +128,7 @@ export const DEFAULTS: JevConfig = {
 	maxToolbox: 12,
 	deliverNudges: false,
 	deliverIntentNudges: false,
+	deliverSubagentNudges: false,
 	queueFlushGapMs: 0,
 	logFile: "",
 };
@@ -247,12 +257,16 @@ export function resolveConfig(
 
 	if (typeof settings.deliverNudges === "boolean") config.deliverNudges = settings.deliverNudges;
 	if (typeof settings.deliverIntentNudges === "boolean") config.deliverIntentNudges = settings.deliverIntentNudges;
+	if (typeof settings.deliverSubagentNudges === "boolean") config.deliverSubagentNudges = settings.deliverSubagentNudges;
 
 	const gap = pickNumber(settings.queueFlushGapMs, 0, 600_000);
 	if (gap !== undefined) config.queueFlushGapMs = gap;
 
 	const file = pickString(env.PI_JEV_LOG) ?? pickString(settings.logFile);
 	if (file) config.logFile = file.startsWith("~/") ? join(homedir(), file.slice(2)) : resolve(file);
+
+	const apiKey = pickString(env.PI_JEV_API_KEY) ?? pickString(settings.apiKey);
+	if (apiKey) config.apiKey = apiKey;
 
 	return config;
 }

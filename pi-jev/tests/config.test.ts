@@ -78,6 +78,17 @@ test("the environment overrides the file, and nonsense values fall back", () => 
 	expect(nonsense.timeoutMs).toBe(DEFAULTS.timeoutMs);
 });
 
+test("the api key comes from settings or the environment, or is left to pi-typesafe", () => {
+	// Settings key wins over the environment; absent both, the field is unset so
+	// pi-typesafe resolves TYPESAFE_API_KEY / the stored key itself.
+	const fromFile = resolveConfig({ apiKey: "  sk-file  " }, {} as NodeJS.ProcessEnv);
+	expect(fromFile.apiKey).toBe("sk-file");
+	const fromEnv = resolveConfig({ apiKey: "sk-file" }, { PI_JEV_API_KEY: "sk-env" } as unknown as NodeJS.ProcessEnv);
+	expect(fromEnv.apiKey).toBe("sk-env");
+	const unset = resolveConfig({}, {} as NodeJS.ProcessEnv);
+	expect("apiKey" in unset).toBe(false);
+});
+
 test("per-question thresholds are kept only when they are usable", () => {
 	expect(readThresholds({ a: 0.95, b: 0.4, c: "0.99", d: "nope", e: 1 }, {})).toEqual({ a: 0.95, c: 0.99, e: 1 });
 	expect(readThresholds({ a: 0.95 }, { a: 0.8, keep: 0.7 })).toEqual({ a: 0.95, keep: 0.7 });

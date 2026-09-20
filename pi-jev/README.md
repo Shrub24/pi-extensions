@@ -11,6 +11,10 @@ The two consumers shipped here:
 
 The two are separate extension entries: either loads without the other, and the registry is what keeps them on one core when both are present.
 
+### Subagent asks
+
+The permission system forwards a subagent's ask to the session that spawned it, and a forwarded ask carries the child's name (`requestedBy`). Those asks get two more questions, in their own state group (`subagent-v1`): whether the call serves what the orchestrator dispatched the agent to do, and whether it stays inside the role the agent was given. Both are advisory and belong to the orchestrator's consumer, not the gate — a subagent question never denies, because revoking a child's tool on a guess strands work the parent cannot see. A violation becomes a steering sentence for the orchestrator, the one party that can redirect or retire the child, when `deliverSubagentNudges` is on.
+
 ## Install
 
 - npm: `pi install npm:@vanillagreen/pi-jev` (both entries load).
@@ -70,6 +74,8 @@ No policy file, or an unreadable one, means no choice question and a one-time no
 | `scope.supports_active_task` | noul | advisory | the call serves nothing the user asked for |
 | `tool.fit` | noul | advisory, unmeasured | another available tool fits the intent plainly better |
 | `tool.choice` | choice | advisory, unmeasured | the judge picks the policy's preferred alternative with a clear margin |
+| `orchestrator.intent_alignment` | noul | advisory, unmeasured | the call serves what the orchestrator dispatched the agent to do |
+| `agent.role_adherence` | noul | advisory, unmeasured | the call stays inside the role the agent was given |
 
 - Answers are composed by one rule: a **measured** veto band that is violated refuses the ask, every question satisfied allows it, and anything else — including a missing answer — defers.
 - An **unmeasured** veto may not refuse: it defers and raises a notice instead. A bar with no labelled samples behind it has no evidence for holding your work, and pi-warden's four candidate questions all landed at the base rate.
@@ -92,11 +98,13 @@ Open `/extensions:settings`; values live under `kendex.extensionManager.config["
 - `model`, `timeoutMs` (default 3000), `maxRequestsPerSession` (default 200).
 - `stateRetention`: `hash` (default) or `full`.
 - `recentUserMessages` (2), `recentToolCalls` (5), `maxPlanChars` (500), `maxToolbox` (12), `maxStateChars` (4000).
-- `deliverNudges` (default false): send the permission consumer's veto findings to the agent as a steer. `deliverIntentNudges` (default false) is the same switch for the intent consumer's advisories. Both are off until the log shows how often a nudge would fire on your own sessions.
+- `deliverNudges` (default false): send the permission consumer's veto findings to the agent as a steer. `deliverIntentNudges` (default false) is the same switch for the intent consumer's advisories. `deliverSubagentNudges` (default false) sends the orchestrator's steering sentences when a forwarded ask departs from its dispatch or its role. All off until the log shows how often a nudge would fire on your own sessions.
 - `queueFlushGapMs` (default 0): how long a queued question may wait with no send before it is asked anyway, in milliseconds. 0 leaves it to the next send or the turn boundary.
 - `logFile`: default `<agent dir>/pi-jev/decisions.jsonl`.
 
-Environment overrides, for headless runs and tests: `PI_JEV_MODE`, `PI_JEV_MODEL`, `PI_JEV_TIMEOUT_MS`, `PI_JEV_THRESHOLD`, `PI_JEV_AUTHORIZER_NAME`, `PI_JEV_STATE_RETENTION`, `PI_JEV_LOG`. TypeSafe's own caps (`PI_TYPESAFE_MAX_*`) apply underneath and can only lower this judge's budget.
+Environment overrides, for headless runs and tests: `PI_JEV_MODE`, `PI_JEV_MODEL`, `PI_JEV_TIMEOUT_MS`, `PI_JEV_THRESHOLD`, `PI_JEV_AUTHORIZER_NAME`, `PI_JEV_STATE_RETENTION`, `PI_JEV_API_KEY`, `PI_JEV_LOG`. TypeSafe's own caps (`PI_TYPESAFE_MAX_*`) apply underneath and can only lower this judge's budget.
+
+The key: a settings `apiKey` wins, then `PI_JEV_API_KEY` in the environment, then pi-typesafe's own resolution (`TYPESAFE_API_KEY`, then the key `/typesafe login` stored). On a shared machine prefer the env var — a key in the settings file is read by every process that loads the entry.
 
 ## Nudges
 

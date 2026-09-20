@@ -36,15 +36,19 @@ import {
 	stateBudget,
 	PLAN_STATE_PROVIDER,
 	STATE_PROVIDER,
+	SUBAGENT_PACK,
+	SUBAGENT_STATE_PROVIDER,
+	subagentBundle,
 	thresholdFor,
 } from "./action-pack.js";
 import type { ActionContext, BandReading, QuestionSpec, Signal } from "./action-pack.js";
 import type { DecisionCore, Reading } from "./decision-core.js";
 import type { JevConfig } from "./config.js";
-import type { AuthorizerVerdict } from "./types.js";
+import type { AuthorizerVerdict, JevQuestion } from "./types.js";
 
 export const PERMISSION_CONSUMER = "permission";
 export const INTENT_CONSUMER = "intent";
+export const SUBAGENT_CONSUMER = "subagent";
 
 /** Questions the permission consumer needs for its verdict: every group's worth. */
 export const PERMISSION_QUESTIONS: readonly string[] = ACTION_QUESTION_IDS;
@@ -53,6 +57,11 @@ export const PERMISSION_QUESTIONS: readonly string[] = ACTION_QUESTION_IDS;
 export const INTENT_SPECS: readonly QuestionSpec[] = ACTION_PACK.filter((spec) => spec.stateProvider === PLAN_STATE_PROVIDER);
 
 export const INTENT_QUESTIONS: readonly string[] = INTENT_SPECS.map((spec) => spec.id);
+
+/** The subagent group's questions: the ones the orchestrator reads and steers on. */
+export const SUBAGENT_SPECS: readonly QuestionSpec[] = SUBAGENT_PACK;
+
+export const SUBAGENT_QUESTIONS: readonly string[] = SUBAGENT_SPECS.map((spec) => spec.id);
 
 export interface Nudge {
 	source: string;
@@ -92,7 +101,22 @@ export function bandFor(specs: readonly QuestionSpec[], readings: readonly Readi
 export function installPack(core: DecisionCore<ActionContext>, config: JevConfig): void {
 	core.registerBundle(actionBundle(stateBudget(config)));
 	core.registerBundle(planBundle(stateBudget(config)));
+	core.registerBundle(subagentBundle(stateBudget(config)));
 	core.registerQuestions(actionQuestionEntries<ActionContext>());
+	core.registerQuestions(
+		SUBAGENT_PACK.map((spec) => ({
+			id: spec.id,
+			stateProvider: spec.stateProvider,
+			owner: SUBAGENT_CONSUMER,
+			meta: { role: spec.role, purpose: spec.purpose, measured: spec.measured },
+			applies: (context: ActionContext) => spec.applies(context.facts),
+			question: (context: ActionContext) => spec.question(context.facts) ?? ({ type: "noul" } as JevQuestion),
+			read: (answer) => {
+				const read = spec.read(answer);
+				return read ? { probability: read.probability, level: read.level } : undefined;
+			},
+		})),
+	);
 }
 
 /** One band as a record line: everything a threshold review needs, and no more. */
@@ -199,6 +223,31 @@ export function nudgesFrom(signals: readonly Signal[]): Nudge[] {
 /** The permission consumer's nudges: veto bands, and nothing else. */
 export function vetoNudges(signals: readonly Signal[]): Nudge[] {
 	return nudgesFrom(signals.filter((signal) => signal.role === "veto"));
+}
+
+/**
+ * The orchestrator's nudges: a subagent call that departed from its dispatch or
+ * its role. These are steering sentences for the orchestrator, not refusals —
+ * the permission system keeps authority, and the orchestrator is the party that
+ * can redirect or retire the child.
+ */
+export function subagentNudges(readings: readonly Reading[], config: JevConfig): Nudge[] {
+	const specs = SUBAGENT_SPECS;
+	const bands = bandFor(specs, readings, config);
+	const signals: Signal[] = bands
+		.filter((band) => band.band === "violated")
+		.map((band) => ({
+			source: band.id,
+			role: band.role,
+			band: "violated" as const,
+			probability: band.probability,
+			level: band.level,
+			purpose: band.purpose,
+			confident: true,
+			measured: band.measured,
+			severity: "warn" as const,
+		}));
+	return nudgesFrom(signals);
 }
 
 /**

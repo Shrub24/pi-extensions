@@ -2,6 +2,8 @@ import { expect, test } from "bun:test";
 
 import {
 	ACTION_PACK,
+	SUBAGENT_PACK,
+	subagentBundle,
 	askFactsFrom,
 	buildActionState,
 	composeVerdict,
@@ -20,6 +22,8 @@ import {
 	thresholdFor,
 } from "../extensions/action-pack.js";
 import { conversation, fakeDetails, fakeQuery, noul, score } from "./fixtures/fakes.js";
+import { DEFAULTS } from "../extensions/config.js";
+import { subagentNudges } from "../extensions/consumers.js";
 import type { Reading } from "../extensions/decision-core.js";
 import type { JevAnswer } from "../extensions/types.js";
 
@@ -41,7 +45,7 @@ const facts = (overrides: Parameters<typeof fakeDetails>[0] = {}) => askFactsFro
  */
 function readings(answers: Record<string, JevAnswer>): Reading[] {
 	return Object.entries(answers).map(([question, answer]) => {
-		const spec = ACTION_PACK.find((entry) => entry.id === question);
+		const spec = [...ACTION_PACK, ...SUBAGENT_PACK].find((entry) => entry.id === question);
 		const read = spec?.read(answer);
 		return {
 			question,
@@ -393,4 +397,84 @@ test("conversation limits reach the state builder", () => {
 	expect((built.state.recentActivity as { toolCalls: string[] }).toolCalls).toEqual(["t2"]);
 	expect((built.state.plan as { text: string }).text.length).toBeLessThanOrEqual(100);
 	expect(built.truncated.some((entry) => entry.startsWith("plan.text"))).toBe(true);
+});
+
+test("subagent questions apply only to forwarded asks, and read the subagent state", () => {
+	// A local ask has no orchestrator to steer: both questions drop out.
+	const local = questionsFor(facts(), SUBAGENT_PACK);
+	expect(local).toHaveLength(0);
+
+	// A forwarded ask names its requester and carries both questions.
+	const forwarded = facts({
+		agentName: "reviewer",
+		payload: {
+			kind: "bash",
+			request: {
+				requester: { agentName: "reviewer", forwarded: true, sessionId: "child-1" },
+				surface: "bash",
+				toolName: "bash",
+				invokedToolName: null,
+				value: "git push --force origin main",
+				matchedPattern: null,
+				commandContext: null,
+				executedUnit: null,
+			},
+			evidence: [],
+			annotations: [],
+		},
+	});
+	const specs = questionsFor(forwarded, SUBAGENT_PACK);
+	expect(specs.map((spec) => spec.id)).toEqual(["orchestrator.intent_alignment", "agent.role_adherence"]);
+
+	// The subagent state leads with who asked, the role, and the task — not the
+	// whole action state, which the action-v1 group already carries.
+	const built = subagentBundle(budget).buildState({ facts: forwarded, conversation: { userMessages: ["review the auth module"], recentToolCalls: [], declaredPlan: "reviewing the auth module for token handling", toolbox: [] } });
+	const state = built.state as { ask: { requestedBy: string }; role: { name: string } | null; task: { text: string } | null; userIntent: { latest: string | null } };
+	expect(state.ask.requestedBy).toBe("subagent reviewer");
+	expect(state.role?.name).toBe("reviewer");
+	expect(state.task?.text).toContain("auth module");
+	expect(state.userIntent.latest).toBe("review the auth module");
+
+	// An unknown agent has no role to read; the field says so rather than guessing.
+	const unnamed = subagentBundle(budget).buildState({ facts: { ...forwarded, agentName: null }, conversation: { userMessages: [], recentToolCalls: [], declaredPlan: null, toolbox: [] } });
+	expect((unnamed.state as { role: unknown }).role).toBeNull();
+});
+
+test("subagent bands are advisory: a violation nudges the orchestrator and never denies", () => {
+	const forwarded = facts({
+		agentName: "reviewer",
+		payload: {
+			kind: "bash",
+			request: {
+				requester: { agentName: "reviewer", forwarded: true, sessionId: "child-1" },
+				surface: "bash",
+				toolName: "bash",
+				invokedToolName: null,
+				value: "git push --force origin main",
+				matchedPattern: null,
+				commandContext: null,
+				executedUnit: null,
+			},
+			evidence: [],
+			annotations: [],
+		},
+	});
+	const specs = questionsFor(forwarded, SUBAGENT_PACK);
+	const bands = readBands(specs, readings({ "orchestrator.intent_alignment": noul(0.04), "agent.role_adherence": noul(0.06) }), {});
+	expect(bands.map((band) => band.band)).toEqual(["violated", "violated"]);
+
+	// Composition over the permission pack is unaffected: the subagent bands are
+	// the subagent consumer's reading, not the gate's, so a violated alignment
+	// question defers nothing and denies nothing.
+	const combined = composeVerdict(readBands(questionsFor(facts()), readings(answers()), {}));
+	expect(combined.kind).toBe("allow");
+	expect(combined.signals).toHaveLength(0);
+
+	// The nudge text addresses the orchestrator about the child.
+	const nudges = subagentNudges(
+		bands.map((band) => ({ question: band.id, owner: "subagent", probability: band.probability, level: null, ok: true })),
+		{ ...DEFAULTS, thresholds: {} },
+	);
+	expect(nudges).toHaveLength(2);
+	expect(nudges[0]?.text).toContain("orchestrator.intent_alignment");
 });

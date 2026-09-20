@@ -35,6 +35,8 @@ export interface JevClientOptions {
 	 * would look like a judge that stopped working.
 	 */
 	maxRequests: number;
+	/** The key for createTypeSafe; omitted means pi-typesafe resolves its own. */
+	apiKey?: string;
 	/** Module loader, injected by tests. */
 	load?: () => Promise<unknown>;
 	/** Clock, injected by tests. */
@@ -124,7 +126,12 @@ export function createJevClient(options: JevClientOptions): JevClient {
 		try {
 			// A key that has not been entered yet throws here, by design: the
 			// client is constructed only from a resolvable key.
-			const client = loaded.createTypeSafe({ model: options.model, timeoutMs: options.timeoutMs, maxRequests: options.maxRequests });
+			const client = loaded.createTypeSafe({
+				model: options.model,
+				timeoutMs: options.timeoutMs,
+				maxRequests: options.maxRequests,
+				...(options.apiKey === undefined ? {} : { apiKey: options.apiKey }),
+			});
 			if (typeof (client as { evaluate?: unknown }).evaluate !== "function") {
 				judgeError = "pi-typesafe returned a client without evaluate().";
 				judgeBlockedUntil = now() + RESOLUTION_COOLDOWN_MS;

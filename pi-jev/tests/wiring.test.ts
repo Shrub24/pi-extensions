@@ -225,3 +225,81 @@ test("lifecycle records do not reach the join", async () => {
 	expect(joinRecords(records).joined).toEqual([]);
 	expect(joinRecords(records).unmatchedAsks).toBe(0);
 });
+
+test("a forwarded ask carries the subagent questions, and a violation nudges the orchestrator", async () => {
+	// A clean action-pack plus a subagent pair that violates: the judge says the
+	// call departed from the dispatch and from the reviewer role.
+	const service = fakeService();
+	const harnessed = harness({
+		answers: {
+			"safety.no_material_harm": noul(0.98),
+			"intent.conflicts_with_user": noul(0.97),
+			"intent.matches_plan": noul(0.97),
+			"scope.supports_active_task": noul(0.97),
+			"orchestrator.intent_alignment": noul(0.05),
+			"agent.role_adherence": noul(0.05),
+		},
+		config: { deliverSubagentNudges: true },
+		services: new Map([["s1", service.service]]),
+	});
+	await harnessed.sessionStart("s1");
+	harnessed.emit("permissions:ready", { sessionId: "s1", adjudicatesLocally: true });
+	await harnessed.settle();
+
+	const authorize = service.registered.get("pi-jev") as (details: unknown, query: unknown, log: unknown) => Promise<{ kind: string }>;
+	const forwarded = fakeDetails({
+		agentName: "reviewer",
+		payload: {
+			kind: "bash",
+			request: {
+				requester: { agentName: "reviewer", forwarded: true, sessionId: "child-1" },
+				surface: "bash",
+				toolName: "bash",
+				invokedToolName: null,
+				value: "git push --force origin main",
+				matchedPattern: null,
+				commandContext: null,
+				executedUnit: null,
+			},
+			evidence: [],
+			annotations: [],
+		},
+	} as never);
+	const verdict = await authorize(forwarded, fakeQuery(), { review: () => {}, debug: () => {} });
+
+	// The gate's verdict is untouched by the subagent bands: they are advisory
+	// and belong to the orchestrator's consumer.
+	expect(verdict).toEqual({ kind: "defer" });
+
+	// Three requests: the action group, the plan group, and the subagent group.
+	const asks = harnessed.log.records.filter((record) => record.record === "ask");
+	expect(new Set(asks.map((ask) => (ask as { judge?: { stateProvider?: string } }).judge?.stateProvider))).toEqual(new Set(["action-v1", "plan-v1", "subagent-v1"]));
+
+	// The nudges went to the agent, addressed to the orchestrator.
+	const texts = harnessed.sent.map((sent) => (sent.message as { content?: string }).content ?? "");
+	expect(texts.some((text) => text.includes("orchestrator.intent_alignment"))).toBe(true);
+	expect(texts.some((text) => text.includes("agent.role_adherence"))).toBe(true);
+});
+
+test("a local ask never carries the subagent questions", async () => {
+	const service = fakeService();
+	const harnessed = harness({
+		answers: {
+			"safety.no_material_harm": noul(0.98),
+			"intent.conflicts_with_user": noul(0.97),
+			"intent.matches_plan": noul(0.97),
+			"scope.supports_active_task": noul(0.97),
+		},
+		services: new Map([["s1", service.service]]),
+	});
+	await harnessed.sessionStart("s1");
+	harnessed.emit("permissions:ready", { sessionId: "s1", adjudicatesLocally: true });
+	await harnessed.settle();
+
+	const authorize = service.registered.get("pi-jev") as (details: unknown, query: unknown, log: unknown) => Promise<{ kind: string }>;
+	await authorize(fakeDetails(), fakeQuery(), { review: () => {}, debug: () => {} });
+
+	const asks = harnessed.log.records.filter((record) => record.record === "ask");
+	expect(new Set(asks.map((ask) => (ask as { judge?: { stateProvider?: string } }).judge?.stateProvider))).toEqual(new Set(["action-v1", "plan-v1"]));
+	expect(harnessed.sent).toHaveLength(0);
+});

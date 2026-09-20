@@ -156,7 +156,7 @@ export function wireIntentConsumer(pi: ExtensionAPI, deps: IntentDeps = {}): voi
 	};
 
 	const deliver: ((nudges: readonly Nudge[]) => void) | undefined =
-		config.deliverNudges || config.deliverIntentNudges ? (nudges) => deliverNudges(pi, nudges) : undefined;
+		config.deliverNudges || config.deliverIntentNudges || config.deliverSubagentNudges ? (nudges) => deliverNudges(pi, nudges) : undefined;
 
 	pi.on("session_start", (_event, context) => {
 		ctx = context;
@@ -167,7 +167,7 @@ export function wireIntentConsumer(pi: ExtensionAPI, deps: IntentDeps = {}): voi
 			sessionId = null;
 		}
 		if (sessionId === null || lease) return;
-		const client = (jev ??= deps.jev ?? createJevClient({ model: config.model, timeoutMs: config.timeoutMs, maxRequests: config.maxRequestsPerSession }));
+		const client = (jev ??= deps.jev ?? createJevClient({ model: config.model, timeoutMs: config.timeoutMs, maxRequests: config.maxRequestsPerSession, ...(config.apiKey === undefined ? {} : { apiKey: config.apiKey }) }));
 		lease = acquireCore({
 			sessionId,
 			options: {
