@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 
 import { createDecisionCore } from "../extensions/decision-core.js";
-import type { CoreRecordContext, DecisionCore, QuestionEntry, StateBundle } from "../extensions/decision-core.js";
+import type { CoreRecordContext, DecisionCore, QuestionEntry, StateBlock } from "../extensions/decision-core.js";
 import { noul, score } from "./fixtures/fakes.js";
 import type { JevAnswer, JevQuestion, JevQuestions } from "../extensions/types.js";
 
@@ -11,15 +11,18 @@ interface Action {
 	value?: string;
 }
 
-/** A bundle whose state is whatever the action says, plus its own marker. */
-function bundle(id: string, marker: string): StateBundle<Action> {
+/** A block whose section is the call, plus the marker naming where it came from. */
+function block(id: string, marker: string): StateBlock<Action> {
 	return {
 		id,
-		buildState: (action) => ({ state: { marker, call: action.call }, stateHash: `${marker}-${action.call}`, chars: 10, truncated: [] }),
+		buildState: (input) => ({ state: { marker, call: input.call }, stateHash: `${marker}-${input.call}`, chars: 10, truncated: [] }),
 	};
 }
 
-function entry(overrides: Partial<QuestionEntry<Action>> & { id: string; stateProvider: string; owner: string }): QuestionEntry<Action> {
+/** A subject key, so the tests read as "whose work is this". */
+const subject = (key: string) => ({ key, kind: "call" });
+
+function entry(overrides: Partial<QuestionEntry<Action>> & { id: string; blocks: readonly string[]; owner: string }): QuestionEntry<Action> {
 	return {
 		question: () => ({ type: "noul" } as JevQuestion),
 		read: (answer) => (answer && answer.type === "noul" ? { probability: answer.noul } : undefined),
@@ -48,13 +51,13 @@ function judge(answers: Record<string, JevAnswer> = {}) {
 function core(overrides: Parameters<typeof createDecisionCore<Action>>[0]) {
 	const records: CoreRecordContext[] = [];
 	const created: DecisionCore<Action> = createDecisionCore<Action>({ ...overrides, record: (context) => records.push(context) });
-	const offBundle = created.registerBundle(bundle("surface-v1", "surface"));
+	const offBlock = created.registerBlock(block("surface", "surface"));
 	const offQuestions = created.registerQuestions([
-		entry({ id: "surface.risk", stateProvider: "surface-v1", owner: "permission" }),
-		entry({ id: "surface.scope", stateProvider: "surface-v1", owner: "permission" }),
-		entry({ id: "plan.matches", stateProvider: "plan-v1", owner: "intent" }),
+		entry({ id: "surface.risk", blocks: ["surface"], owner: "permission" }),
+		entry({ id: "surface.scope", blocks: ["surface"], owner: "permission" }),
+		entry({ id: "plan.matches", blocks: ["plan"], owner: "intent" }),
 	]);
-	return { core: created, records, offBundle, offQuestions };
+	return { core: created, records, offBlock, offQuestions };
 }
 
 const ACTION: Action = { call: "bash gg", plan: "read the log" };
@@ -63,9 +66,9 @@ test("queueing is per consumer, deduplicated, and asks for nothing", () => {
 	const client = judge();
 	const { core: created } = core({ ask: client.ask });
 
-	expect(created.queueDecisions({ action: ACTION, actionKey: "call-1", consumer: "monitor", questions: ["surface.risk"] })).toEqual(["surface.risk"]);
-	expect(created.queueDecisions({ action: ACTION, actionKey: "call-1", consumer: "cache", questions: ["surface.risk"] })).toEqual(["surface.risk"]);
-	expect(created.queueDecisions({ action: ACTION, actionKey: "call-1", consumer: "monitor", questions: ["surface.risk"] })).toEqual([]);
+	expect(created.queueDecisions({ input: ACTION, subject: subject("call-1"), consumer: "monitor", questions: ["surface.risk"] })).toEqual(["surface.risk"]);
+	expect(created.queueDecisions({ input: ACTION, subject: subject("call-1"), consumer: "cache", questions: ["surface.risk"] })).toEqual(["surface.risk"]);
+	expect(created.queueDecisions({ input: ACTION, subject: subject("call-1"), consumer: "monitor", questions: ["surface.risk"] })).toEqual([]);
 	expect(client.calls).toHaveLength(0);
 	expect(created.queued("call-1")).toHaveLength(2);
 });
@@ -73,15 +76,14 @@ test("queueing is per consumer, deduplicated, and asks for nothing", () => {
 test("a send carries every active consumer's questions, and asks once", async () => {
 	const client = judge({ "surface.risk": noul(0.2), "surface.scope": noul(0.9), "plan.matches": noul(0.95) });
 	const { core: created } = core({ ask: client.ask });
-	created.registerBundle(bundle("plan-v1", "plan"));
+	created.registerBlock(block("plan", "plan"));
 	created.registerConsumer({ id: "monitor", questions: ["surface.scope"] });
 	created.registerConsumer({ id: "intent", questions: ["plan.matches"] });
 
 	// One send from one consumer, and the whole active set rides it.
-	const result = await created.sendDecisions({ action: ACTION, actionKey: "call-1", consumer: "permission", questions: ["surface.risk"] });
-	expect(client.calls).toHaveLength(2);
-	const asked = client.calls.flatMap((call) => Object.keys(call.questions)).sort();
-	expect(asked).toEqual(["plan.matches", "surface.risk", "surface.scope"]);
+	const result = await created.sendDecisions({ input: ACTION, subject: subject("call-1"), consumer: "permission", questions: ["surface.risk"] });
+	expect(client.calls).toHaveLength(1);
+	expect(Object.keys(client.calls[0]?.questions ?? {}).sort()).toEqual(["plan.matches", "surface.risk", "surface.scope"]);
 	expect(result.readings["plan.matches"]?.probability).toBe(0.95);
 });
 
@@ -91,46 +93,46 @@ test("a consumer's applies() narrows what gets queued", () => {
 	created.registerConsumer({ id: "intent", questions: ["plan.matches"], applies: (action) => action.plan !== undefined });
 
 	// A read call has a plan but is not a bash call: only intent queues.
-	expect(created.queueDecisions({ action: { call: "read x", plan: "check the log" }, actionKey: "call-2", consumer: "intent", questions: ["plan.matches"] })).toEqual(["plan.matches"]);
+	expect(created.queueDecisions({ input: { call: "read x", plan: "check the log" }, subject: subject("call-2"), consumer: "intent", questions: ["plan.matches"] })).toEqual(["plan.matches"]);
 	// A bash call with no plan: only permission queues.
-	expect(created.queueDecisions({ action: { call: "bash x" }, actionKey: "call-3", consumer: "permission", questions: ["surface.risk"] })).toEqual(["surface.risk"]);
+	expect(created.queueDecisions({ input: { call: "bash x" }, subject: subject("call-3"), consumer: "permission", questions: ["surface.risk"] })).toEqual(["surface.risk"]);
 });
 
-test("a flush groups queued questions by state provider: one request per group", async () => {
+test("a flush merges every question into one request, with each block's section", async () => {
 	const client = judge({ "surface.risk": noul(0.2), "surface.scope": noul(0.9), "plan.matches": noul(0.95) });
 	const { core: created, records } = core({ ask: client.ask });
-	created.registerBundle(bundle("plan-v1", "plan"));
+	created.registerBlock(block("plan", "plan"));
 	created.registerConsumer({ id: "permission", questions: ["surface.risk", "surface.scope"] });
 	created.registerConsumer({ id: "intent", questions: ["plan.matches"] });
 
-	const result = await created.sendDecisions({ action: ACTION, actionKey: "call-1", consumer: "permission", questions: ["surface.risk", "surface.scope"] });
+	const result = await created.sendDecisions({ input: ACTION, subject: subject("call-1"), consumer: "permission", questions: ["surface.risk", "surface.scope"] });
 
-	expect(client.calls).toHaveLength(2);
-	const byState = client.calls.map((call) => (call.state as { marker: string }).marker).sort();
-	expect(byState).toEqual(["plan", "surface"]);
-	expect(Object.keys(client.calls.find((call) => (call.state as { marker: string }).marker === "surface")?.questions ?? {})).toEqual([
-		"surface.risk",
-		"surface.scope",
-	]);
-	expect(Object.keys(client.calls.find((call) => (call.state as { marker: string }).marker === "plan")?.questions ?? {})).toEqual(["plan.matches"]);
+	// One subject, one request: both blocks' sections ride it under their names.
+	expect(client.calls).toHaveLength(1);
+	const state = client.calls[0]?.state as { surface: { marker: string }; plan: { marker: string } };
+	expect(state.surface.marker).toBe("surface");
+	expect(state.plan.marker).toBe("plan");
+	expect(Object.keys(client.calls[0]?.questions ?? {}).sort()).toEqual(["plan.matches", "surface.risk", "surface.scope"]);
 
 	expect(result.ok).toBe(true);
 	expect(result.readings["surface.risk"]).toMatchObject({ probability: 0.2, owner: "permission", ok: true });
 	expect(result.readings["plan.matches"]).toMatchObject({ probability: 0.95, owner: "intent", ok: true });
-	expect(records).toHaveLength(2);
-	expect(records.map((record) => record.stateProvider).sort()).toEqual(["plan-v1", "surface-v1"]);
-	expect(records.map((record) => record.stateHash).sort()).toEqual(["plan-bash gg", "surface-bash gg"]);
+	// One request, one record, and the record says which sections it carried.
+	expect(records).toHaveLength(1);
+	expect(records[0]?.request.blocks.map((entry) => entry.id).sort()).toEqual(["plan", "surface"]);
+	expect(records[0]?.request.blocks.map((entry) => entry.hash).sort()).toEqual(["plan-bash gg", "surface-bash gg"]);
+	expect(records[0]?.subjectKey).toBe("call-1");
 });
 
 test("each consumer is handed only its own questions", async () => {
 	const client = judge({ "surface.risk": noul(0.2), "surface.scope": noul(0.9), "plan.matches": noul(0.95) });
 	const { core: created } = core({ ask: client.ask });
-	created.registerBundle(bundle("plan-v1", "plan"));
+	created.registerBlock(block("plan", "plan"));
 	const deliveries: { consumer: string; ids: string[]; ok: boolean }[] = [];
 	created.registerConsumer({ id: "permission", questions: ["surface.risk", "surface.scope"], onAnswers: (delivery) => deliveries.push({ consumer: delivery.consumer, ids: delivery.readings.map((reading) => reading.question), ok: delivery.ok }) });
 	created.registerConsumer({ id: "intent", questions: ["plan.matches"], onAnswers: (delivery) => deliveries.push({ consumer: delivery.consumer, ids: delivery.readings.map((reading) => reading.question), ok: delivery.ok }) });
 
-	await created.sendDecisions({ action: ACTION, actionKey: "call-1", consumer: "permission", questions: ["surface.risk", "surface.scope"] });
+	await created.sendDecisions({ input: ACTION, subject: subject("call-1"), consumer: "permission", questions: ["surface.risk", "surface.scope"] });
 
 	expect(deliveries).toEqual([
 		{ consumer: "permission", ids: ["surface.risk", "surface.scope"], ok: true },
@@ -142,12 +144,12 @@ test("a consumer arriving after the flush is served from memory, asking nothing 
 	const client = judge({ "surface.risk": noul(0.2) });
 	const { core: created } = core({ ask: client.ask });
 
-	const first = await created.sendDecisions({ action: ACTION, actionKey: "call-1", consumer: "permission", questions: ["surface.risk"] });
+	const first = await created.sendDecisions({ input: ACTION, subject: subject("call-1"), consumer: "permission", questions: ["surface.risk"] });
 	expect(client.calls).toHaveLength(1);
 	expect(first?.requests).toHaveLength(1);
 
 	// The second consumer wants the same question: no request, no latency.
-	const second = await created.sendDecisions({ action: ACTION, actionKey: "call-1", consumer: "monitor", questions: ["surface.risk"] });
+	const second = await created.sendDecisions({ input: ACTION, subject: subject("call-1"), consumer: "monitor", questions: ["surface.risk"] });
 	expect(client.calls).toHaveLength(1);
 	expect(second?.requests).toHaveLength(0);
 	expect(second?.reused).toEqual(["surface.risk"]);
@@ -158,8 +160,8 @@ test("a consumer arriving later with a new question asks only for the difference
 	const client = judge({ "surface.risk": noul(0.2), "surface.scope": noul(0.9) });
 	const { core: created } = core({ ask: client.ask });
 
-	await created.sendDecisions({ action: ACTION, actionKey: "call-1", consumer: "permission", questions: ["surface.risk"] });
-	const second = await created.sendDecisions({ action: ACTION, actionKey: "call-1", consumer: "intent", questions: ["surface.risk", "surface.scope"] });
+	await created.sendDecisions({ input: ACTION, subject: subject("call-1"), consumer: "permission", questions: ["surface.risk"] });
+	const second = await created.sendDecisions({ input: ACTION, subject: subject("call-1"), consumer: "intent", questions: ["surface.risk", "surface.scope"] });
 
 	expect(client.calls).toHaveLength(2);
 	expect(Object.keys(client.calls[1]?.questions ?? {})).toEqual(["surface.scope"]);
@@ -171,11 +173,11 @@ test("a batched request queues and is answered by the next send", async () => {
 	const client = judge({ "surface.risk": noul(0.2) });
 	const { core: created } = core({ ask: client.ask });
 
-	created.queueDecisions({ action: ACTION, actionKey: "call-1", consumer: "monitor", questions: ["surface.risk"] });
+	created.queueDecisions({ input: ACTION, subject: subject("call-1"), consumer: "monitor", questions: ["surface.risk"] });
 	expect(client.calls).toHaveLength(0);
 	expect(created.queued("call-1")).toEqual([{ question: "surface.risk", consumer: "monitor" }]);
 
-	const result = await created.sendDecisions({ action: ACTION, actionKey: "call-1", consumer: "permission" });
+	const result = await created.sendDecisions({ input: ACTION, subject: subject("call-1"), consumer: "permission" });
 	expect(client.calls).toHaveLength(1);
 	expect(result.readings["surface.risk"]?.probability).toBe(0.2);
 	expect(created.queued("call-1")).toEqual([]);
@@ -195,9 +197,9 @@ test("a queued question is asked anyway once the gap passes with no send", async
 			};
 		},
 	});
-	created.registerQuestions([entry({ id: "surface.risk", stateProvider: "surface-v1", owner: "monitor" })]);
+	created.registerQuestions([entry({ id: "surface.risk", blocks: ["surface-v1"], owner: "monitor" })]);
 
-	created.queueDecisions({ action: ACTION, actionKey: "call-1", consumer: "monitor", questions: ["surface.risk"] });
+	created.queueDecisions({ input: ACTION, subject: subject("call-1"), consumer: "monitor", questions: ["surface.risk"] });
 	expect(timers).toHaveLength(1);
 	expect(timers[0]?.ms).toBe(250);
 	expect(client.calls).toHaveLength(0);
@@ -223,10 +225,10 @@ test("a send cancels the idle flush it would otherwise duplicate", async () => {
 			};
 		},
 	});
-	created.registerQuestions([entry({ id: "surface.risk", stateProvider: "surface-v1", owner: "monitor" })]);
+	created.registerQuestions([entry({ id: "surface.risk", blocks: ["surface-v1"], owner: "monitor" })]);
 
-	created.queueDecisions({ action: ACTION, actionKey: "call-1", consumer: "monitor", questions: ["surface.risk"] });
-	await created.sendDecisions({ action: ACTION, actionKey: "call-1", consumer: "permission" });
+	created.queueDecisions({ input: ACTION, subject: subject("call-1"), consumer: "monitor", questions: ["surface.risk"] });
+	await created.sendDecisions({ input: ACTION, subject: subject("call-1"), consumer: "permission" });
 	expect(timers).toHaveLength(0);
 	expect(client.calls).toHaveLength(1);
 });
@@ -235,8 +237,8 @@ test("flushPending asks everything left queued, for a host boundary", async () =
 	const client = judge({ "surface.risk": noul(0.3) });
 	const { core: created } = core({ ask: client.ask });
 
-	created.queueDecisions({ action: ACTION, actionKey: "call-1", consumer: "monitor", questions: ["surface.risk"] });
-	created.queueDecisions({ action: ACTION, actionKey: "call-2", consumer: "monitor", questions: ["surface.risk"] });
+	created.queueDecisions({ input: ACTION, subject: subject("call-1"), consumer: "monitor", questions: ["surface.risk"] });
+	created.queueDecisions({ input: ACTION, subject: subject("call-2"), consumer: "monitor", questions: ["surface.risk"] });
 	const results = await created.flushPending();
 	expect(results).toHaveLength(2);
 	expect(client.calls).toHaveLength(2);
@@ -261,9 +263,9 @@ test("a send's ceiling aborts what is still in flight", async () => {
 			};
 		},
 	});
-	created.registerQuestions([entry({ id: "surface.risk", stateProvider: "surface-v1", owner: "monitor" })]);
+	created.registerQuestions([entry({ id: "surface.risk", blocks: ["surface-v1"], owner: "monitor" })]);
 
-	const pending = created.sendDecisions({ action: ACTION, actionKey: "call-1", consumer: "monitor", questions: ["surface.risk"], timeoutMs: 50 });
+	const pending = created.sendDecisions({ input: ACTION, subject: subject("call-1"), consumer: "monitor", questions: ["surface.risk"], timeoutMs: 50 });
 	expect(timers[0]?.ms).toBe(50);
 	timers[0]?.run();
 	const result = await pending;
@@ -284,8 +286,8 @@ test("two concurrent asks for one action share a single request", async () => {
 	const { core: created } = core({ ask });
 
 	const both = Promise.all([
-		created.sendDecisions({ action: ACTION, actionKey: "call-1", consumer: "permission", questions: ["surface.risk"] }),
-		created.sendDecisions({ action: ACTION, actionKey: "call-1", consumer: "monitor", questions: ["surface.risk"] }),
+		created.sendDecisions({ input: ACTION, subject: subject("call-1"), consumer: "permission", questions: ["surface.risk"] }),
+		created.sendDecisions({ input: ACTION, subject: subject("call-1"), consumer: "monitor", questions: ["surface.risk"] }),
 	]);
 	release?.();
 	const [first, second] = await both;
@@ -299,29 +301,27 @@ test("two concurrent asks for one action share a single request", async () => {
 	expect(second?.readings["surface.risk"]?.probability).toBe(0.4);
 });
 
-test("a failed request is an atomic failure for its consumers, and other groups still answer", async () => {
-	const calls: JevQuestions[] = [];
+test("a failed flush is one failure for every consumer, and each keeps its own policy", async () => {
 	const { core: created, records } = core({
-		ask: async (state, questions) => {
-			calls.push(questions);
-			if ((state as { marker: string }).marker === "surface") return { ok: false, error: "TypeSafe request timed out.", errorCode: "timeout" };
-			return { ok: true, answers: { "plan.matches": noul(0.93) }, model: "test", usage: { input_tokens: 5, output_tokens: 1 }, elapsedMs: 3 };
-		},
+		ask: async () => ({ ok: false, error: "TypeSafe request timed out.", errorCode: "timeout" }) as const,
 	});
-	created.registerBundle(bundle("plan-v1", "plan"));
+	created.registerBlock(block("plan", "plan"));
 	const deliveries: { consumer: string; ok: boolean; ids: string[] }[] = [];
 	created.registerConsumer({ id: "permission", questions: ["surface.risk", "surface.scope"], onAnswers: (delivery) => deliveries.push({ consumer: delivery.consumer, ok: delivery.ok, ids: delivery.readings.map((reading) => reading.question) }) });
 	created.registerConsumer({ id: "intent", questions: ["plan.matches"], onAnswers: (delivery) => deliveries.push({ consumer: delivery.consumer, ok: delivery.ok, ids: delivery.readings.map((reading) => reading.question) }) });
 
-	const result = await created.sendDecisions({ action: ACTION, actionKey: "call-1", consumer: "permission", questions: ["surface.risk", "surface.scope"] });
+	const result = await created.sendDecisions({ input: ACTION, subject: subject("call-1"), consumer: "permission", questions: ["surface.risk", "surface.scope"] });
 
+	// One subject is one request, so a failure is total: no consumer is handed a
+	// partial set, and the ask is the consumer's to handle — the permission link
+	// defers, the monitor records and drops.
 	expect(result.ok).toBe(false);
-	// The permission consumer holds no partial set: both of its questions are missing.
 	expect(result.readings["surface.risk"]).toMatchObject({ ok: false, probability: null });
 	expect(result.readings["surface.scope"]).toMatchObject({ ok: false });
-	expect(deliveries.find((delivery) => delivery.consumer === "permission")).toEqual({ consumer: "permission", ok: false, ids: ["surface.risk", "surface.scope"] });
-	// The other group answered and was delivered normally.
-	expect(deliveries.find((delivery) => delivery.consumer === "intent")).toEqual({ consumer: "intent", ok: true, ids: ["plan.matches"] });
+	expect(deliveries).toEqual([
+		{ consumer: "permission", ok: false, ids: ["surface.risk", "surface.scope"] },
+		{ consumer: "intent", ok: false, ids: ["plan.matches"] },
+	]);
 	const failed = records.filter((record) => !record.request.ok);
 	expect(failed).toHaveLength(1);
 	expect(failed[0]?.request.error?.code).toBe("timeout");
@@ -337,11 +337,11 @@ test("a consumer set larger than one request is not silently split", async () =>
 		},
 	});
 	created.registerQuestions([
-		entry({ id: "big.a", stateProvider: "surface-v1", owner: "big" }),
-		entry({ id: "big.b", stateProvider: "surface-v1", owner: "big" }),
-		entry({ id: "big.c", stateProvider: "surface-v1", owner: "big" }),
+		entry({ id: "big.a", blocks: ["surface-v1"], owner: "big" }),
+		entry({ id: "big.b", blocks: ["surface-v1"], owner: "big" }),
+		entry({ id: "big.c", blocks: ["surface-v1"], owner: "big" }),
 	]);
-	const result = await created.sendDecisions({ action: ACTION, actionKey: "call-1", consumer: "big", questions: ["big.a", "big.b", "big.c"] });
+	const result = await created.sendDecisions({ input: ACTION, subject: subject("call-1"), consumer: "big", questions: ["big.a", "big.b", "big.c"] });
 	expect(calls).toHaveLength(1);
 	expect(Object.keys(calls[0] ?? {})).toEqual(["big.a", "big.b", "big.c"]);
 	expect(result?.requests).toHaveLength(1);
@@ -357,13 +357,13 @@ test("whole sets fill chunks greedily, so one request still carries several cons
 		},
 	});
 	created.registerQuestions([
-		entry({ id: "b.a", stateProvider: "surface-v1", owner: "b" }),
-		entry({ id: "b.b", stateProvider: "surface-v1", owner: "b" }),
-		entry({ id: "c.a", stateProvider: "surface-v1", owner: "c" }),
-		entry({ id: "c.b", stateProvider: "surface-v1", owner: "c" }),
-		entry({ id: "d.a", stateProvider: "surface-v1", owner: "d" }),
+		entry({ id: "b.a", blocks: ["surface-v1"], owner: "b" }),
+		entry({ id: "b.b", blocks: ["surface-v1"], owner: "b" }),
+		entry({ id: "c.a", blocks: ["surface-v1"], owner: "c" }),
+		entry({ id: "c.b", blocks: ["surface-v1"], owner: "c" }),
+		entry({ id: "d.a", blocks: ["surface-v1"], owner: "d" }),
 	]);
-	const result = await created.sendDecisions({ action: ACTION, actionKey: "call-1", consumer: "all", questions: ["b.a", "b.b", "c.a", "c.b", "d.a"] });
+	const result = await created.sendDecisions({ input: ACTION, subject: subject("call-1"), consumer: "all", questions: ["b.a", "b.b", "c.a", "c.b", "d.a"] });
 	expect(calls).toHaveLength(2);
 	expect(Object.keys(calls[0] ?? {})).toEqual(["b.a", "b.b", "c.a", "c.b"]);
 	expect(Object.keys(calls[1] ?? {})).toEqual(["d.a"]);
@@ -373,7 +373,7 @@ test("whole sets fill chunks greedily, so one request still carries several cons
 test("an unregistered question is a missing reading, never a throw", async () => {
 	const client = judge();
 	const { core: created } = core({ ask: client.ask });
-	const result = await created.sendDecisions({ action: ACTION, actionKey: "call-1", consumer: "monitor", questions: ["nobody.owns.this"] });
+	const result = await created.sendDecisions({ input: ACTION, subject: subject("call-1"), consumer: "monitor", questions: ["nobody.owns.this"] });
 	expect(client.calls).toHaveLength(0);
 	expect(result?.readings["nobody.owns.this"]).toEqual({ question: "nobody.owns.this", owner: "unregistered", probability: null, level: null, ok: false });
 });
@@ -381,8 +381,8 @@ test("an unregistered question is a missing reading, never a throw", async () =>
 test("a question whose applies() says no is a missing reading with its owner named", async () => {
 	const client = judge();
 	const { core: created } = core({ ask: client.ask });
-	created.registerQuestions([entry({ id: "surface.only-reads", stateProvider: "surface-v1", owner: "permission", applies: (action) => action.call.startsWith("read") })]);
-	const result = await created.sendDecisions({ action: ACTION, actionKey: "call-1", consumer: "permission", questions: ["surface.only-reads"] });
+	created.registerQuestions([entry({ id: "surface.only-reads", blocks: ["surface-v1"], owner: "permission", applies: (action) => action.call.startsWith("read") })]);
+	const result = await created.sendDecisions({ input: ACTION, subject: subject("call-1"), consumer: "permission", questions: ["surface.only-reads"] });
 	expect(client.calls).toHaveLength(0);
 	expect(result?.readings["surface.only-reads"]).toMatchObject({ owner: "permission", ok: false });
 });
@@ -393,12 +393,12 @@ test("a score answer is normalized as a level, not a probability", async () => {
 	created.registerQuestions([
 		entry({
 			id: "surface.rev",
-			stateProvider: "surface-v1",
+			blocks: ["surface-v1"],
 			owner: "permission",
 			read: (answer) => (answer && answer.type === "score" ? { level: Math.round(answer.score) } : undefined),
 		}),
 	]);
-	const result = await created.sendDecisions({ action: ACTION, actionKey: "call-1", consumer: "permission", questions: ["surface.rev"] });
+	const result = await created.sendDecisions({ input: ACTION, subject: subject("call-1"), consumer: "permission", questions: ["surface.rev"] });
 	expect(result?.readings["surface.rev"]).toMatchObject({ question: "surface.rev", owner: "permission", probability: null, level: 3, ok: true });
 });
 
@@ -406,8 +406,8 @@ test("the interpreter's output rides the request record, and its defects cannot 
 	const client = judge({ "surface.risk": noul(0.8) });
 	const { core: created, records } = core({ ask: client.ask });
 	const result = await created.sendDecisions({
-		action: ACTION,
-		actionKey: "call-1",
+		input: ACTION,
+		subject: subject("call-1"),
 		consumer: "permission",
 		questions: ["surface.risk"],
 		interpret: (readings) => ({ would: readings[0]?.probability === 0.8 ? "allow" : "deny" }),
@@ -417,8 +417,8 @@ test("the interpreter's output rides the request record, and its defects cannot 
 
 	const angry = core({ ask: client.ask });
 	await angry.core.sendDecisions({
-		action: ACTION,
-		actionKey: "call-2",
+		input: ACTION,
+		subject: subject("call-2"),
 		consumer: "permission",
 		questions: ["surface.risk"],
 		interpret: () => {
@@ -429,60 +429,62 @@ test("the interpreter's output rides the request record, and its defects cannot 
 	expect(angry.records).toHaveLength(1);
 });
 
-test("a question whose state provider is missing still asks, with an empty state", async () => {
+test("a question whose block is unregistered still asks, with the gap recorded", async () => {
 	const client = judge({ "ghost.q": noul(0.5) });
 	const records: CoreRecordContext[] = [];
 	const created = createDecisionCore<Action>({ ask: client.ask, record: (context) => records.push(context) });
-	created.registerQuestions([entry({ id: "ghost.q", stateProvider: "ghost-v1", owner: "monitor" })]);
+	created.registerQuestions([entry({ id: "ghost.q", blocks: ["ghost-v1"], owner: "monitor" })]);
 
-	const result = await created.sendDecisions({ action: ACTION, actionKey: "call-1", consumer: "monitor", questions: ["ghost.q"] });
+	const result = await created.sendDecisions({ input: ACTION, subject: subject("call-1"), consumer: "monitor", questions: ["ghost.q"] });
 	expect(client.calls[0]?.state).toEqual({});
 	expect(result?.readings["ghost.q"]?.probability).toBe(0.5);
-	expect(records[0]?.stateHash).toBe("");
+	// The gap is named in the record rather than thrown over: a question nobody
+	// supplies context for is a defect in the caller, not in the subject.
+	expect(records[0]?.request.blocks).toEqual([{ id: "ghost-v1", hash: "", chars: 0, truncated: [] }]);
 });
 
 test("answers are remembered per action, and forget() drops them", async () => {
 	const client = judge({ "surface.risk": noul(0.1) });
 	const { core: created } = core({ ask: client.ask });
-	await created.sendDecisions({ action: ACTION, actionKey: "call-1", consumer: "permission", questions: ["surface.risk"] });
-	await created.sendDecisions({ action: ACTION, actionKey: "call-1", consumer: "permission", questions: ["surface.risk"] });
+	await created.sendDecisions({ input: ACTION, subject: subject("call-1"), consumer: "permission", questions: ["surface.risk"] });
+	await created.sendDecisions({ input: ACTION, subject: subject("call-1"), consumer: "permission", questions: ["surface.risk"] });
 	expect(client.calls).toHaveLength(1);
 
 	created.forget("call-1");
-	await created.sendDecisions({ action: ACTION, actionKey: "call-1", consumer: "permission", questions: ["surface.risk"] });
+	await created.sendDecisions({ input: ACTION, subject: subject("call-1"), consumer: "permission", questions: ["surface.risk"] });
 	expect(client.calls).toHaveLength(2);
 });
 
 test("the cache is bounded: the least recently used action is dropped first", async () => {
 	const client = judge({ "surface.risk": noul(0.1) });
-	const { core: created } = core({ ask: client.ask, maxRememberedActions: 2 });
+	const { core: created } = core({ ask: client.ask, maxRememberedSubjects: 2 });
 	for (const key of ["a", "b", "c"]) {
-		await created.sendDecisions({ action: ACTION, actionKey: key, consumer: "permission", questions: ["surface.risk"] });
+		await created.sendDecisions({ input: ACTION, subject: subject(key), consumer: "permission", questions: ["surface.risk"] });
 	}
 	expect(client.calls).toHaveLength(3);
 	// `a` was evicted by `c`; asking again pays a request.
-	await created.sendDecisions({ action: ACTION, actionKey: "a", consumer: "permission", questions: ["surface.risk"] });
+	await created.sendDecisions({ input: ACTION, subject: subject("a"), consumer: "permission", questions: ["surface.risk"] });
 	expect(client.calls).toHaveLength(4);
 	// `c` is still remembered.
-	await created.sendDecisions({ action: ACTION, actionKey: "c", consumer: "permission", questions: ["surface.risk"] });
+	await created.sendDecisions({ input: ACTION, subject: subject("c"), consumer: "permission", questions: ["surface.risk"] });
 	expect(client.calls).toHaveLength(4);
 });
 
 test("disposers remove bundles, questions, and consumer interest", async () => {
 	const client = judge({ "surface.risk": noul(0.7) });
-	const { core: created, offBundle, offQuestions } = core({ ask: client.ask });
+	const { core: created, offBlock, offQuestions } = core({ ask: client.ask });
 	const offConsumer = created.registerConsumer({ id: "permission", questions: ["surface.risk"] });
 
 	expect(created.questionIds()).toEqual(["surface.risk", "surface.scope", "plan.matches"]);
-	expect(created.queueDecisions({ action: ACTION, actionKey: "call-1", consumer: "permission", questions: ["surface.risk"] })).toEqual(["surface.risk"]);
+	expect(created.queueDecisions({ input: ACTION, subject: subject("call-1"), consumer: "permission", questions: ["surface.risk"] })).toEqual(["surface.risk"]);
 
 	offConsumer();
-	expect(created.queueDecisions({ action: ACTION, actionKey: "call-2", consumer: "permission", questions: ["surface.risk"] })).toEqual(["surface.risk"]);
+	expect(created.queueDecisions({ input: ACTION, subject: subject("call-2"), consumer: "permission", questions: ["surface.risk"] })).toEqual(["surface.risk"]);
 
 	offQuestions();
-	offBundle();
+	offBlock();
 	expect(created.questionIds()).toEqual([]);
-	const result = await created.sendDecisions({ action: ACTION, actionKey: "call-3", consumer: "permission", questions: ["surface.risk"] });
+	const result = await created.sendDecisions({ input: ACTION, subject: subject("call-3"), consumer: "permission", questions: ["surface.risk"] });
 	expect(client.calls).toHaveLength(0);
 	expect(result?.readings["surface.risk"]?.ok).toBe(false);
 });
@@ -500,16 +502,16 @@ test("a consumer that throws on delivery does not stop the others", async () => 
 	});
 	created.registerConsumer({ id: "calm", questions: ["surface.scope"], onAnswers: () => seen.push("calm") });
 
-	created.queueDecisions({ action: ACTION, actionKey: "call-1", consumer: "permission", questions: ["surface.risk", "surface.scope"] });
-	await created.sendDecisions({ action: ACTION, actionKey: "call-1", consumer: "permission" });
+	created.queueDecisions({ input: ACTION, subject: subject("call-1"), consumer: "permission", questions: ["surface.risk", "surface.scope"] });
+	await created.sendDecisions({ input: ACTION, subject: subject("call-1"), consumer: "permission" });
 	expect(seen).toEqual(["calm"]);
 });
 
-test("a bundle selected by id asks for everything that reads it", async () => {
+test("a block selected by id asks for every question that reads it", async () => {
 	const client = judge({ "surface.risk": noul(0.4), "surface.scope": noul(0.4), "plan.matches": noul(0.4) });
 	const { core: created } = core({ ask: client.ask });
-	created.registerBundle(bundle("plan-v1", "plan"));
-	const result = await created.sendDecisions({ action: ACTION, actionKey: "call-1", consumer: "permission", bundle: "surface-v1" });
+	created.registerBlock(block("plan", "plan"));
+	const result = await created.sendDecisions({ input: ACTION, subject: subject("call-1"), consumer: "permission", block: "surface" });
 	expect(client.calls).toHaveLength(1);
 	expect(Object.keys(client.calls[0]?.questions ?? {})).toEqual(["surface.risk", "surface.scope"]);
 	expect(result?.requests).toHaveLength(1);
@@ -524,14 +526,14 @@ test("the idle flush never runs while the host is idle", async () => {
 
 	// Idle: nothing arms, nothing is spent.
 	const idle = armed(() => false);
-	idle.created.core.queueDecisions({ action: ACTION, actionKey: "a", consumer: "monitor", questions: ["surface.risk"] });
+	idle.created.core.queueDecisions({ input: ACTION, subject: subject("a"), consumer: "monitor", questions: ["surface.risk"] });
 	expect(timers).toHaveLength(0);
 	expect(idle.client.calls).toHaveLength(0);
 
 	// Mid-turn: it arms, and a turn that ended before it fires does not spend.
 	const running = { value: true };
 	const live = armed(() => running.value);
-	live.created.core.queueDecisions({ action: ACTION, actionKey: "a", consumer: "monitor", questions: ["surface.risk"] });
+	live.created.core.queueDecisions({ input: ACTION, subject: subject("a"), consumer: "monitor", questions: ["surface.risk"] });
 	expect(timers).toHaveLength(1);
 	running.value = false;
 	timers[0]!();
@@ -547,7 +549,7 @@ test("draining disarms the timer it would otherwise duplicate", async () => {
 	const client = judge({});
 	const timers: Array<() => void> = [];
 	const created = core({ ask: client.ask, flushGapMs: 50, schedule: (run) => { timers.push(run); return () => {}; } });
-	created.core.queueDecisions({ action: ACTION, actionKey: "a", consumer: "monitor", questions: ["surface.risk"] });
+	created.core.queueDecisions({ input: ACTION, subject: subject("a"), consumer: "monitor", questions: ["surface.risk"] });
 	expect(timers).toHaveLength(1);
 	await created.core.flushPending();
 	expect(timers).toHaveLength(1);
@@ -569,17 +571,17 @@ test("a reworded question is asked again instead of served from the old answer",
 	created.core.registerQuestions([
 		entry({
 			id: "surface.scope",
-			stateProvider: "surface-v1",
+			blocks: ["surface-v1"],
 			owner: "permission",
 			question: () => (call === 1 ? { type: "choice", criteria: { a: "first wording" } } : { type: "choice", criteria: { b: "second wording" } }),
 			read: (answer) => (answer?.type === "choice" ? { probability: 1, choice: answer.choice } : undefined) as never,
 		}),
 	]);
 
-	await created.core.sendDecisions({ action: ACTION, actionKey: "call-1", consumer: "permission", questions: ["surface.scope"] });
+	await created.core.sendDecisions({ input: ACTION, subject: subject("call-1"), consumer: "permission", questions: ["surface.scope"] });
 	// Same action, same question id, different wording: the cached reading does not
 	// apply, so this is a second request, not a reuse.
-	const second = await created.core.sendDecisions({ action: ACTION, actionKey: "call-1", consumer: "permission", questions: ["surface.scope"] });
+	const second = await created.core.sendDecisions({ input: ACTION, subject: subject("call-1"), consumer: "permission", questions: ["surface.scope"] });
 	expect(client.calls).toHaveLength(2);
 	expect(second.reused).toEqual([]);
 });
@@ -587,8 +589,82 @@ test("a reworded question is asked again instead of served from the old answer",
 test("an unchanged wording is still served from memory", async () => {
 	const client = judge({});
 	const created = core({ ask: client.ask });
-	await created.core.sendDecisions({ action: ACTION, actionKey: "call-1", consumer: "permission", questions: ["surface.risk"] });
-	const second = await created.core.sendDecisions({ action: ACTION, actionKey: "call-1", consumer: "permission", questions: ["surface.risk"] });
+	await created.core.sendDecisions({ input: ACTION, subject: subject("call-1"), consumer: "permission", questions: ["surface.risk"] });
+	const second = await created.core.sendDecisions({ input: ACTION, subject: subject("call-1"), consumer: "permission", questions: ["surface.risk"] });
 	expect(client.calls).toHaveLength(1);
 	expect(second.reused).toEqual(["surface.risk"]);
+});
+
+test("a block is built once per flush however many questions read it", async () => {
+	let builds = 0;
+	const client = judge({ "surface.risk": noul(0.2), "surface.scope": noul(0.9), "plan.matches": noul(0.95) });
+	const created = createDecisionCore<Action>({ ask: client.ask });
+	created.registerBlock({
+		id: "shared",
+		buildState: (input) => {
+			builds += 1;
+			return { state: { call: input.call }, stateHash: `h-${input.call}`, chars: 8, truncated: [] };
+		},
+	});
+	created.registerQuestions([
+		entry({ id: "surface.risk", blocks: ["shared"], owner: "permission" }),
+		entry({ id: "surface.scope", blocks: ["shared"], owner: "permission" }),
+		entry({ id: "plan.matches", blocks: ["shared"], owner: "intent" }),
+	]);
+
+	const result = await created.sendDecisions({ input: ACTION, subject: subject("call-1"), consumer: "permission", questions: ["surface.risk"] });
+
+	// Three questions, one block, one build, one request: building once is what
+	// keeps every question in a flush looking at the same instant of the session.
+	expect(builds).toBe(1);
+	expect(client.calls).toHaveLength(1);
+	expect(result.requests[0]?.blocks).toEqual([{ id: "shared", hash: "h-bash gg", chars: 8, truncated: [] }]);
+});
+
+test("two triggers naming the same call share one subject's flush", async () => {
+	const client = judge({ "surface.risk": noul(0.2), "plan.matches": noul(0.95) });
+	const { core: created } = core({ ask: client.ask });
+	created.registerBlock(block("plan", "plan"));
+	created.registerConsumer({ id: "intent", questions: ["plan.matches"] });
+
+	// The tool-call trigger queues first; the gate's ask arrives later for the
+	// same call and flushes what it queued.
+	created.queueDecisions({ input: { call: "bash gg", plan: "read the log" }, subject: subject("call:t9"), consumer: "intent", questions: ["plan.matches"] });
+	expect(created.queued("call:t9")).toHaveLength(1);
+
+	const result = await created.sendDecisions({ input: ACTION, subject: subject("call:t9"), consumer: "permission", questions: ["surface.risk"] });
+
+	expect(client.calls).toHaveLength(1);
+	expect(Object.keys(client.calls[0]?.questions ?? {}).sort()).toEqual(["plan.matches", "surface.risk"]);
+	expect(result.reused).toEqual([]);
+	// The queue was consumed by that flush rather than left for the boundary to
+	// ask a second time.
+	expect(created.queued("call:t9")).toEqual([]);
+});
+
+test("different subjects stay separate flushes, however close in time", async () => {
+	const client = judge({ "surface.risk": noul(0.2) });
+	const { core: created } = core({ ask: client.ask });
+
+	await created.sendDecisions({ input: ACTION, subject: subject("call:a"), consumer: "permission", questions: ["surface.risk"] });
+	await created.sendDecisions({ input: ACTION, subject: { key: "child:n1", kind: "child" }, consumer: "subagent", questions: ["surface.risk"] });
+
+	// A child's check-in and a call's ask are different work: separate flushes,
+	// so unrelated nudges never arrive stacked on one another.
+	expect(client.calls).toHaveLength(2);
+});
+
+test("a subject's record carries its kind and the host's correlation id", async () => {
+	const client = judge({ "surface.risk": noul(0.2) });
+	const { core: created, records } = core({ ask: client.ask });
+
+	await created.sendDecisions({
+		input: ACTION,
+		subject: { key: "call:t9", kind: "call", correlationId: "req-99" },
+		consumer: "permission",
+		questions: ["surface.risk"],
+	});
+
+	expect(records[0]?.subject).toEqual({ key: "call:t9", kind: "call", correlationId: "req-99" });
+	expect(records[0]?.request.subjectKey).toBe("call:t9");
 });

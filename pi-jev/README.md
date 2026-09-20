@@ -2,7 +2,11 @@
 
 A substrate for [Jev](https://typesafe.ai/) decisions in the Pi coding agent, plus two consumers that use it.
 
-The substrate is a small one: a *core*, one per session, to which consumers register the questions they want about an action. Each consumer either **queues** — it wants the answers eventually and nothing now — or **sends**, which asks immediately and flushes everything queued for that action with it. Questions are grouped by the state they read, one request per group, and answers are remembered per action, so a consumer that arrives after the flush is served from what the first one paid for. The point is that several consumers, arriving in whatever order Pi's hooks fire, produce one question set per action instead of one request each.
+The substrate is a small one: a *core*, one per session, to which consumers register the questions they want about a **subject**. A subject is the work under judgement — one call, one child, one session state — and it is the unit both of batching and of delivery. Each consumer either **queues** (it wants answers eventually and nothing now) or **sends**, which asks immediately and flushes everything already queued for that subject with it.
+
+A flush builds the **context blocks** its questions name — `ask`, `user_intent`, `plan`, `tool_history`, `toolbox`, `authority`, `child_work` — once each, at fire time, and sends them under those names in **one request**. So two consumers asking about the same call ride one request, and a question that arrives after the flush is served from what the first one paid for. Two triggers onto the *same* call share the subject: its `tool_call` hook and its permission ask both key on Pi's tool call id, which is why a queued plan-alignment question is answered by the gate's flush rather than a second one at the turn boundary.
+
+Subjects stay apart on purpose. An orchestrator's check-in about a child and a permission ask about that child's call are different work at different moments: they flush separately, so an unrelated nudge never arrives stacked on a gate's decision, and a check-in is never asked mid-call where its answer would be stale by the next tool result.
 
 The two consumers shipped here:
 
@@ -49,7 +53,6 @@ core.sendDecisions ({ action, actionKey, consumer, questions })   // asks now, a
 - Answers are cached per action and question, and concurrent sends for one action share one in-flight request. A consumer that arrives after the flush pays no request and no latency — which is how “ask everything about this action at once” works inside hooks that fire in an order nobody controls.
 - A queued question is answered by the next send for that action, or at the turn boundary (`turn_end`), or — if `queueFlushGapMs` is set — after that many milliseconds. A timer flush never runs outside a turn: an idle session has no action left to gate and nobody to nudge.
 - Whole consumer question sets are packed into chunks greedily and never split, so a failed request means no consumer in it holds half its answers; other groups still answer.
-- Questions are grouped by state provider, not by consumer: `action-v1` carries the ask, the instructions, the plan, the toolbox and recent calls; `plan-v1` carries only the call, the plan, and the authority rule, because a smaller state measurably answers the plan question better than a large shared one (pi-heed: 8 of 9 alone, 5 of 9 inside a bigger state).
 
 A third consumer needs to add a file that calls `acquireCore` and registers itself. Nothing in the core knows about permissions.
 
@@ -82,6 +85,8 @@ No policy file, or an unreadable one, means no choice question and a one-time no
 | `tool.choice` | choice | advisory, unmeasured | the judge picks the policy's preferred alternative with a clear margin |
 | `orchestrator.intent_alignment` | noul | advisory, unmeasured | the work serves what the orchestrator is trying to accomplish |
 | `agent.role_adherence` | noul | advisory, unmeasured | the work stays inside the role the agent was given |
+
+Every question names the blocks it reads, and only those are built and sent. The permission link's questions read the ask, the instruction, the plan, the tool history and the toolbox; harm and reversibility read the ask alone, because they are properties of the call rather than of the session.
 
 - Answers are composed by one rule: a **measured** veto band that is violated refuses the ask, every question satisfied allows it, and anything else — including a missing answer — defers.
 - An **unmeasured** veto may not refuse: it defers and raises a notice instead. A bar with no labelled samples behind it has no evidence for holding your work, and pi-warden's four candidate questions all landed at the base rate.

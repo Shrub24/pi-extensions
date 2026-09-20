@@ -15,7 +15,7 @@
  */
 
 import type { ActionAskFacts, QuestionSpec } from "./action-pack.js";
-import { STATE_PROVIDER } from "./action-pack.js";
+import { BLOCK_ASK, BLOCK_PLAN, BLOCK_TOOL_HISTORY, BLOCK_TOOLBOX } from "./action-pack.js";
 import type { JevAnswer } from "./types.js";
 
 import type { JevQuestion } from "./types.js";
@@ -66,7 +66,7 @@ export interface ChoiceReading {
 export const TOOL_CHOICE_QUESTIONS: readonly QuestionSpec[] = [
 	{
 		id: "tool.choice",
-		stateProvider: STATE_PROVIDER,
+		blocks: [BLOCK_ASK, BLOCK_PLAN, BLOCK_TOOL_HISTORY, BLOCK_TOOLBOX],
 		purpose: "another available tool fits this call's intent plainly better",
 		role: "advisory",
 		applies: (ask) => ask.toolName !== null && ask.preferredTool != null,

@@ -3,10 +3,11 @@ import { expect, test } from "bun:test";
 import {
 	ACTION_PACK,
 	SUBAGENT_PACK,
-	buildSubagentState,
-	subagentBundle,
+	actionBlocks,
+	askBlock,
+	childWorkBlock,
+	userIntentBlock,
 	askFactsFrom,
-	buildActionState,
 	composeVerdict,
 	DEFAULT_ADVISORY_EDGE,
 	DEFAULT_EDGE,
@@ -97,82 +98,112 @@ test("a throwing permission query is a fact, not a failure", () => {
 	expect(ask.value).toBe("rm -rf build");
 });
 
-test("state leads with the ask, states the authority rule, and carries plan and toolbox", () => {
-	const built = buildActionState({
-		ask: facts(),
+test("each block builds its own section, and the pack names one per section", () => {
+	const context = {
+		facts: facts(),
 		conversation: conversation({
 			userMessages: ["fix the failing test", "also clean the build dir"],
 			recentToolCalls: ["bash bun test"],
 			declaredPlan: "I will remove the stale build directory now.",
 			toolbox: ["grep: search file contents", "semble: semantic code search"],
 		}),
-		budget,
-	});
-	expect(Object.keys(built.state)[0]).toBe("ask");
-	const intent = built.state.userIntent as { latest: string; history: string[]; ordering: string };
+	};
+	// The block ids are the section names a question's instructions refer to.
+	expect(actionBlocks(budget).map((block) => block.id)).toEqual(["ask", "user_intent", "plan", "tool_history", "toolbox", "authority", "child_work"]);
+
+	const ask = askBlock(budget).buildState(context).state as { action: string; requestedBy: string };
+	expect(ask.action).toBe("bash: rm -rf build");
+	expect(ask.requestedBy).toBe("agent pi");
+
+	const intent = userIntentBlock(budget).buildState(context).state as { latest: string; history: string[]; ordering: string };
 	expect(intent.latest).toBe("also clean the build dir");
 	expect(intent.history).toEqual(["fix the failing test"]);
 	expect(intent.ordering).toContain("oldest first");
-	expect((built.state.plan as { text: string }).text).toContain("remove the stale build directory");
-	expect((built.state.toolbox as { tools: string[] }).tools).toHaveLength(2);
-	expect(String(built.state.authority)).toContain("never authorizes");
+
+	const plan = actionBlocks(budget)[2]?.buildState(context).state as { text: string } | null;
+	expect(plan?.text).toContain("remove the stale build directory");
+	const toolbox = actionBlocks(budget)[4]?.buildState(context).state as { tools: string[] } | null;
+	expect(toolbox?.tools).toHaveLength(2);
+	const authority = actionBlocks(budget)[5]?.buildState(context).state;
+	expect(String(authority)).toContain("never authorizes");
 });
 
-test("an absent plan and an empty toolbox leave no empty sections behind", () => {
-	const built = buildActionState({ ask: facts(), conversation: emptyConversation(), budget });
-	expect(built.state.plan).toBeNull();
-	expect(built.state.toolbox).toBeUndefined();
-	expect(built.state.recentActivity).toBeUndefined();
+test("an absent plan, history, or toolbox yields a null section rather than an empty one", () => {
+	const built = actionBlocks(budget).map((block) => block.buildState({ facts: facts(), conversation: emptyConversation() }));
+	const byId = new Map(actionBlocks(budget).map((block, index) => [block.id, built[index]?.state]));
+	expect(byId.get("plan")).toBeNull();
+	expect(byId.get("tool_history")).toBeNull();
+	expect(byId.get("toolbox")).toBeNull();
+	// The ask and the authority rule are always there: a question with nothing
+	// else to read still knows what is being asked and who wrote it.
+	expect(byId.get("ask")).toBeDefined();
+	expect(byId.get("authority")).toBeDefined();
 });
 
-test("state hashing is stable for identical input and moves with the facts", () => {
-	const input = { ask: facts(), conversation: conversation({ userMessages: ["go"] }), budget };
-	const first = buildActionState(input);
-	expect(first.stateHash).toBe(buildActionState(input).stateHash);
+test("a block hashes its own section, stably and sensitively", () => {
+	const input = { facts: facts(), conversation: conversation({ userMessages: ["go"] }) };
+	const block = userIntentBlock(budget);
+	const first = block.buildState(input);
+	expect(first.stateHash).toBe(block.buildState(input).stateHash);
 	expect(hashState({ a: 1 })).toBe(hashState({ a: 1 }));
-	expect(buildActionState({ ...input, conversation: conversation({ userMessages: ["stop"] }) }).stateHash).not.toBe(first.stateHash);
+	expect(block.buildState({ ...input, conversation: conversation({ userMessages: ["stop"] }) }).stateHash).not.toBe(first.stateHash);
 });
 
-test("the state budget is honoured, and what it dropped is named", () => {
+test("each block caps its own section and names what it cut", () => {
 	const long = "x".repeat(5_000);
-	const built = buildActionState({
-		ask: facts(),
+	const context = {
+		facts: facts({
+			payload: {
+				kind: "bash",
+				request: {
+					requester: { agentName: "pi", forwarded: false, sessionId: null },
+					surface: "bash",
+					toolName: "bash",
+					invokedToolName: null,
+					value: long,
+					matchedPattern: null,
+					commandContext: null,
+					executedUnit: null,
+				},
+				evidence: [],
+				annotations: [],
+			},
+		}),
 		conversation: conversation({
 			userMessages: [long, long, long],
 			recentToolCalls: [long, long, long, long, long, long],
 			declaredPlan: long,
 			toolbox: Array.from({ length: 30 }, (_, index) => `tool${index}: ${long}`),
 		}),
-		budget,
-	});
-	expect(built.chars).toBeLessThanOrEqual(budget.maxChars);
-	expect(built.truncated.length).toBeGreaterThan(0);
-	expect((built.state.ask as { value: string }).value.length).toBeGreaterThan(0);
+	};
+	// A block has no global staging to lean on any more: it caps its own fields
+	// and records every cut against the field it made.
+	const ask = askBlock(budget).buildState(context);
+	expect((ask.state as { value: string }).value.length).toBeLessThanOrEqual(budget.maxFieldChars);
+	expect(ask.truncated).toContain("ask.value");
+
+	const intent = userIntentBlock(budget).buildState(context);
+	expect(intent.truncated).toContain("user_intent.latest");
+	expect(intent.truncated.some((entry) => entry.startsWith("user_intent.history"))).toBe(true);
+
+	const history = actionBlocks(budget)[3]?.buildState(context);
+	expect((history?.state as { toolCalls: string[] }).toolCalls).toHaveLength(budget.maxToolCalls);
+	expect(history?.truncated.some((entry) => entry.includes("[-"))).toBe(true);
+
+	const toolbox = actionBlocks(budget)[4]?.buildState(context);
+	expect((toolbox?.state as { tools: string[] }).tools).toHaveLength(budget.maxToolbox);
+
+	// Every block reports a hashed section whatever it had to cut.
+	for (const block of actionBlocks(budget)) expect(block.buildState(context).stateHash).toMatch(/^[0-9a-f]{16}$/);
 });
 
-test("a budget at the config floor still fits, keeping the ask and the authority rule", () => {
-	const built = buildActionState({
-		ask: facts(),
-		conversation: conversation({ userMessages: ["y".repeat(900)] }),
-		budget: { ...budget, maxChars: 500 },
-	});
-	expect(built.chars).toBeLessThanOrEqual(500);
-	expect((built.state.ask as { value: string }).value.length).toBeGreaterThan(0);
-	expect(built.state.authority).toBeDefined();
-	expect(built.truncated).not.toContain("over-budget");
-});
-
-test("a budget below the irreducible skeleton says so instead of pretending it fits", () => {
-	const built = buildActionState({
-		ask: facts(),
-		conversation: conversation({ userMessages: ["y".repeat(900)] }),
-		budget: { ...budget, maxChars: 300 },
-	});
-	// The ask and the authority rule are what a state cannot do without, so the
-	// builder reports the overrun rather than dropping them.
-	expect(built.truncated).toContain("over-budget");
-	expect((built.state.ask as { value: string }).value.length).toBeGreaterThan(0);
-	expect(built.state.authority).toContain("data");
+test("an ask with an empty value still yields its section", () => {
+	const built = askBlock(budget).buildState({ facts: { ...facts(), value: "" }, conversation: emptyConversation() });
+	const state = built.state as { action: string; value: string };
+	// The action line is the tool and its argument; an empty argument leaves the
+	// tool name, which is still what the judge is being asked about.
+	expect(state.value).toBe("");
+	expect(state.action).toBe("bash: ");
 });
 
 test("the pack separates veto from advisory questions", () => {
@@ -387,17 +418,22 @@ test("the pending-call line is bounded", () => {
 	expect(pendingCallLine({ toolName: null, surface: "path", value: "z".repeat(400) } as never).length).toBeLessThanOrEqual(120);
 });
 
-test("conversation limits reach the state builder", () => {
-	const built = buildActionState({
-		ask: facts(),
+test("conversation limits reach the blocks that read them", () => {
+	const small = { ...budget, maxUserMessages: 1, maxToolCalls: 1, maxPlanChars: 100 };
+	const context = {
+		facts: facts(),
 		conversation: conversation({ userMessages: ["a", "b", "c"], recentToolCalls: ["t1", "t2"], declaredPlan: "p".repeat(900), toolbox: ["x: y"] }),
-		budget: { ...budget, maxUserMessages: 1, maxToolCalls: 1, maxPlanChars: 100 },
-	});
-	expect((built.state.userIntent as { latest: string }).latest).toBe("c");
-	expect((built.state.userIntent as { history: string[] }).history).toEqual([]);
-	expect((built.state.recentActivity as { toolCalls: string[] }).toolCalls).toEqual(["t2"]);
-	expect((built.state.plan as { text: string }).text.length).toBeLessThanOrEqual(100);
-	expect(built.truncated.some((entry) => entry.startsWith("plan.text"))).toBe(true);
+	};
+	const intent = userIntentBlock(small).buildState(context).state as { latest: string; history: string[] };
+	expect(intent.latest).toBe("c");
+	expect(intent.history).toEqual([]);
+
+	const history = actionBlocks(small)[3]?.buildState(context).state as { toolCalls: string[] } | null;
+	expect(history?.toolCalls).toEqual(["t2"]);
+
+	const plan = actionBlocks(small)[2]?.buildState(context);
+	expect((plan?.state as { text: string }).text.length).toBeLessThanOrEqual(100);
+	expect(plan?.truncated.some((entry) => entry.startsWith("plan.text"))).toBe(true);
 });
 
 test("subagent questions read the subject, the role, and the task, whatever the trigger", () => {
@@ -426,20 +462,20 @@ test("subagent questions read the subject, the role, and the task, whatever the 
 	});
 	expect(questionsFor(forwarded, SUBAGENT_PACK)).toHaveLength(2);
 
-	// The subagent state leads with the subject, the role, and the task — not
-	// the whole action state, which the action-v1 group already carries.
-	const built = subagentBundle(budget).buildState({ facts: forwarded, conversation: { userMessages: ["review the auth module"], recentToolCalls: [], declaredPlan: "reviewing the auth module for token handling", toolbox: [] } });
-	const state = built.state as { subject: string; role: { name: string } | null; task: { text: string } | null; userIntent: { latest: string | null } };
-	expect(state.subject).toContain("git push --force");
-	expect(state.role?.name).toBe("reviewer");
-	expect(state.task?.text).toContain("auth module");
-	expect(state.userIntent.latest).toBe("review the auth module");
+	// The child block names the agent and what it said it was doing; the
+	// instruction the orchestrator is serving comes from the intent block.
+	const context = { facts: forwarded, conversation: { userMessages: ["review the auth module"], recentToolCalls: [], declaredPlan: "reviewing the auth module for token handling", toolbox: [] } };
+	const child = childWorkBlock(budget).buildState(context).state as { agent: string; role: { name: string } | null; task: { text: string } | null };
+	expect(child.agent).toBe("reviewer");
+	expect(child.role?.name).toBe("reviewer");
+	expect(child.task?.text).toContain("auth module");
+	expect((userIntentBlock(budget).buildState(context).state as { latest: string | null }).latest).toBe("review the auth module");
 
-	// A check-in with no agent name and no plan leaves those fields null rather
-	// than guessing: the judge answers with a middling probability instead.
-	const bare = buildSubagentState({ subject: "child still running", agentName: null, latestUserMessage: null, declaredPlan: null }, budget);
-	expect((bare.state as { role: unknown }).role).toBeNull();
-	expect((bare.state as { task: unknown }).task).toBeNull();
+	// No agent name and no stated plan leave those fields null rather than
+	// guessing: the judge answers with a middling probability instead.
+	const bare = childWorkBlock(budget).buildState({ facts: { ...forwarded, agentName: null }, conversation: emptyConversation() }).state as { role: unknown; task: unknown };
+	expect(bare.role).toBeNull();
+	expect(bare.task).toBeNull();
 });
 
 test("subagent bands are advisory: a violation nudges the orchestrator and never denies", () => {

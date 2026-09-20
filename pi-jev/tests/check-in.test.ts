@@ -1,6 +1,6 @@
 import { beforeEach, expect, test } from "bun:test";
 
-import { checkInAction, checkInActionKey, combineFindings, newNotices, noticeAgent, noticeNeedsAttention, noticeSubject, latestUserMessage } from "../extensions/check-in.js";
+import { checkInAction, checkInSubjectKey, combineFindings, newNotices, noticeAgent, noticeNeedsAttention, noticeSubject, latestUserMessage } from "../extensions/check-in.js";
 import type { ChildNotice } from "../extensions/check-in.js";
 import { resetRegistry } from "../extensions/registry.js";
 
@@ -73,7 +73,7 @@ test("a check-in's action names its own surface and carries the notice as the su
 	expect(action.facts.agentName).toBe("reviewer");
 	// A check-in is not a forwarded ask: nothing is asking on a child's behalf.
 	expect(action.facts.forwarded).toBe(false);
-	expect(checkInActionKey(notice())).toBe("check-in:n1");
+	expect(checkInSubjectKey(notice())).toBe("child:notice:n1");
 	expect(latestUserMessage(action.conversation)).toBe("fix the parser");
 	expect(latestUserMessage({ userMessages: [], recentToolCalls: [], declaredPlan: null, toolbox: [] })).toBeNull();
 });

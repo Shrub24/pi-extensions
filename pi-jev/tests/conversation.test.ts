@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 
 import { conversationFacts, declaredPlan, sessionSources, toolCallLine, userMessageText } from "../extensions/conversation.js";
-import { askFactsFrom, buildActionState } from "../extensions/action-pack.js";
+import { askFactsFrom, userIntentBlock } from "../extensions/action-pack.js";
 import { fakeDetails, fakeQuery } from "./fixtures/fakes.js";
 
 type Entry = Record<string, unknown>;
@@ -133,14 +133,14 @@ test("a long message is capped at collection, and the builder still records the 
 	// A tool call is one line, and its own bound is tighter than the string cap.
 	expect(facts.recentToolCalls[0]?.length).toBe(200);
 
-	const built = buildActionState({
-		ask: askFactsFrom(fakeDetails(), fakeQuery()),
+	// The intent block is the reader now, and its own truncation names the field.
+	const built = userIntentBlock({ maxChars: 4_000, maxFieldChars: 200, maxUserMessages: 1, maxToolCalls: 1, maxPlanChars: 100, maxToolbox: 12 }).buildState({
+		facts: askFactsFrom(fakeDetails(), fakeQuery()),
 		conversation: facts,
-		budget: { maxChars: 4_000, maxFieldChars: 200, maxUserMessages: 1, maxToolCalls: 1, maxPlanChars: 100, maxToolbox: 12 },
 	});
-	const intent = built.state.userIntent as { latest: string };
+	const intent = built.state as { latest: string };
 	expect(intent.latest.length).toBeLessThanOrEqual(200);
-	expect(built.truncated.some((entry) => entry.startsWith("userIntent.latest"))).toBe(true);
+	expect(built.truncated.some((entry) => entry.startsWith("user_intent.latest"))).toBe(true);
 });
 
 test("the session sources read the branch and the tool list, and never throw", () => {

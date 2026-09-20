@@ -96,17 +96,22 @@ test("a call queues, and the gate's ask carries it in the same flush", async () 
 	expect(wired.host.sent).toHaveLength(0);
 
 	const authorize = wired.service.registered.get("pi-jev") as (d: unknown, q: unknown, l: unknown) => Promise<{ kind: string }>;
-	const verdict = await authorize(fakeDetails(), fakeQuery(), { review: () => {}, debug: () => {} });
+	// The ask names the same tool call the hook above saw: that id is the subject
+	// both triggers share, which is what puts them in one flush.
+	const verdict = await authorize(fakeDetails({ toolCallId: "t1" }), fakeQuery(), { review: () => {}, debug: () => {} });
 
 	// Shadow mode: the gate still defers to the human, whatever the judge said.
 	expect(verdict).toEqual({ kind: "defer" });
 
-	// One action, two state groups, two requests — and the second entry's judge
-	// never ran, because it joined the first one's core instead of asking again.
+	// One subject, one request: the queued intent questions and the gate's own
+	// questions were asked together, and the second entry's judge never ran.
 	const asked = wired.permissionJev.requests.map((request) => Object.keys(request.questions).sort());
-	expect(asked).toHaveLength(2);
-	expect(asked.flat()).toContain("intent.matches_plan");
+	expect(asked).toHaveLength(1);
+	expect(asked[0]).toContain("intent.matches_plan");
+	expect(asked[0]).toContain("safety.no_material_harm");
 	expect(wired.intentJev.requests).toHaveLength(0);
+	// The queue is consumed by that flush rather than left for the boundary.
+	expect(wired.core?.queued("call:t1") ?? []).toEqual([]);
 
 	// The nudge came from the same flush, with no second request behind it.
 	expect(wired.host.sent).toHaveLength(1);
@@ -332,9 +337,12 @@ test("a long-running notice is checked in on, and the finding wakes the orchestr
 	// The check-in asked the drift questions about the child the notice names.
 	expect(jev.requests).toHaveLength(1);
 	expect(Object.keys(jev.requests[0]?.questions ?? {}).sort()).toEqual(["agent.role_adherence", "orchestrator.intent_alignment"]);
-	const state = jev.requests[0]?.state as { subject?: string; role?: { name?: string } };
-	expect(state.subject).toContain("Subagent active but long-running");
-	expect(state.role?.name).toBe("reviewer");
+	// The state is the blocks the check-in's questions read, under their names:
+	// the notice as the ask, the child's name and work, the instruction served.
+	const state = jev.requests[0]?.state as { ask?: { value?: string }; child_work?: { agent?: string; role?: { name?: string } } };
+	expect(state.ask?.value).toContain("Subagent active but long-running");
+	expect(state.child_work?.agent).toBe("reviewer");
+	expect(state.child_work?.role?.name).toBe("reviewer");
 
 	// The finding is delivered as a wake, not a steer: an idle orchestrator has
 	// no tool batch for a steer to land after.

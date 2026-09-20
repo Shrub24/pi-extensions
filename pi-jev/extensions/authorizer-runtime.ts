@@ -17,7 +17,7 @@
  *   advisory band spends the agent's attention only after its precision is known.
  */
 
-import { askFactsFrom, pendingCallLine } from "./action-pack.js";
+import { askFactsFrom, callSubject, pendingCallLine } from "./action-pack.js";
 import type { ActionContext, ConversationFacts } from "./action-pack.js";
 import { askPermission, PERMISSION_CONSUMER } from "./consumers.js";
 import type { Nudge } from "./consumers.js";
@@ -69,17 +69,19 @@ export function createAuthorizerRuntime(deps: AuthorizerRuntimeDeps): Authorizer
 				return { kind: "defer" };
 			}
 			const context: ActionContext = { facts, conversation: deps.conversation() };
-			// The action key is the permission request id: it is what every
-			// consumer and the decision record join on, and it is unique per ask.
-			const actionKey = facts.requestId;
+			// The subject is the pending call. Its key is Pi's tool call id, which
+			// the tool_call hook also sees, so anything queued about this call lands
+			// on the flush that judges it; the permission request id rides along as
+			// the correlation id the decision channel joins on.
+			const subject = callSubject({ toolCallId: facts.toolCallId, requestId: facts.requestId, correlationId: facts.requestId });
 
-			const outcome = await askPermission({ config, core, context, actionKey });
+			const outcome = await askPermission({ config, core, context, subject });
 			const misconfigured = outcome.errors.find((error) => error.code === "configuration");
 			if (misconfigured) once(`pi-jev: no usable judge (${misconfigured.message}). Every ask is deferred to you.`);
 			const returned = config.mode === "live" ? outcome.verdict : ({ kind: "defer" } as AuthorizerVerdict);
 
 			authorizerLog.review("pi-jev.judged", {
-				requestId: actionKey,
+				requestId: facts.requestId,
 				consumer: PERMISSION_CONSUMER,
 				mode: config.mode,
 				would: outcome.verdict.kind,

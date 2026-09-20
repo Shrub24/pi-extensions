@@ -25,24 +25,20 @@
 import {
 	ACTION_PACK,
 	ACTION_QUESTION_IDS,
-	actionBundle,
+	actionBlocks,
 	actionQuestionEntries,
 	composeVerdict,
 	denyReason,
 	nudgeText,
 	pendingCallLine,
-	planBundle,
 	readBands,
 	stateBudget,
-	PLAN_STATE_PROVIDER,
-	STATE_PROVIDER,
+	BLOCK_PLAN,
 	SUBAGENT_PACK,
-	SUBAGENT_STATE_PROVIDER,
-	subagentBundle,
 	thresholdFor,
 } from "./action-pack.js";
 import type { ActionContext, BandReading, QuestionSpec, Signal } from "./action-pack.js";
-import type { DecisionCore, Reading } from "./decision-core.js";
+import type { DecisionCore, Reading, Subject } from "./decision-core.js";
 import type { JevConfig } from "./config.js";
 import type { AuthorizerVerdict, JevQuestion } from "./types.js";
 
@@ -63,7 +59,7 @@ export const CHECK_IN_SURFACE = "subagent_check_in";
 export const PERMISSION_QUESTIONS: readonly string[] = ACTION_QUESTION_IDS;
 
 /** The plan group's questions: the ones the intent consumer reads and nudges on. */
-export const INTENT_SPECS: readonly QuestionSpec[] = ACTION_PACK.filter((spec) => spec.stateProvider === PLAN_STATE_PROVIDER);
+export const INTENT_SPECS: readonly QuestionSpec[] = ACTION_PACK.filter((spec) => spec.blocks.includes(BLOCK_PLAN));
 
 export const INTENT_QUESTIONS: readonly string[] = INTENT_SPECS.map((spec) => spec.id);
 
@@ -108,14 +104,14 @@ export function bandFor(specs: readonly QuestionSpec[], readings: readonly Readi
  * because the core is per session and the catalog is per core.
  */
 export function installPack(core: DecisionCore<ActionContext>, config: JevConfig): void {
-	core.registerBundle(actionBundle(stateBudget(config)));
-	core.registerBundle(planBundle(stateBudget(config)));
-	core.registerBundle(subagentBundle(stateBudget(config)));
+	// Every block the pack defines is registered once per core; a question names
+	// the ones it reads, and a flush builds only those.
+	for (const block of actionBlocks(stateBudget(config))) core.registerBlock(block);
 	core.registerQuestions(actionQuestionEntries<ActionContext>());
 	core.registerQuestions(
 		SUBAGENT_PACK.map((spec) => ({
 			id: spec.id,
-			stateProvider: spec.stateProvider,
+			blocks: spec.blocks,
 			owner: SUBAGENT_CONSUMER,
 			meta: { role: spec.role, purpose: spec.purpose, measured: spec.measured },
 			applies: (context: ActionContext) => spec.applies(context.facts),
@@ -180,13 +176,13 @@ export function interpretBands(
 export async function askPermission(input: {
 	core: DecisionCore<ActionContext>;
 	context: ActionContext;
-	actionKey: string;
+	subject: Subject;
 	config: JevConfig;
 	signal?: AbortSignal;
 }): Promise<PermissionOutcome> {
 	const result = await input.core.sendDecisions({
-		action: input.context,
-		actionKey: input.actionKey,
+		subject: input.subject,
+		input: input.context,
 		consumer: PERMISSION_CONSUMER,
 		questions: PERMISSION_QUESTIONS,
 		...(input.signal ? { signal: input.signal } : {}),
@@ -303,8 +299,8 @@ export function registerSubagentConsumer(
 	input: {
 		config: JevConfig;
 		deliver?: (nudges: readonly Nudge[]) => void;
-		/** Every violated band, with the action that produced it. Never gated by the steer switch. */
-		onViolation?: (nudges: readonly Nudge[], action: ActionContext) => void;
+		/** Every violated band, with the input that produced it. Never gated by the steer switch. */
+		onViolation?: (nudges: readonly Nudge[], context: ActionContext) => void;
 	},
 ): void {
 	if (subagentRegistered.has(core as object)) return;
@@ -315,18 +311,18 @@ export function registerSubagentConsumer(
 		// Standing interest only where a child genuinely exists: a forwarded ask.
 		// The check-in names its own questions on the send, so it does not need
 		// standing interest and must not add the group to some other gate's ask.
-		applies: (action: ActionContext) => action.facts.forwarded,
+		applies: (context: ActionContext) => context.facts.forwarded,
 		interpret: (readings) => interpretBands(readings, SUBAGENT_SPECS, input.config),
 		onAnswers: (delivery) => {
 			const nudges = subagentNudges(delivery.readings, input.config);
 			if (nudges.length === 0) return;
 			// Reported whoever is watching: a check-in's wake decision is about
 			// what the judge found, not about whether steers are switched on.
-			input.onViolation?.(nudges, delivery.action);
+			input.onViolation?.(nudges, delivery.input);
 			if (!input.config.deliverSubagentNudges) return;
 			// A check-in delivers its own finding, with the wake options an idle
 			// orchestrator needs; a steer here would queue unread instead.
-			if (delivery.action.facts.surface === CHECK_IN_SURFACE) return;
+			if (delivery.input.facts.surface === CHECK_IN_SURFACE) return;
 			input.deliver?.(nudges);
 		},
 	});
@@ -343,4 +339,3 @@ export function edgeOf(spec: QuestionSpec, config: JevConfig): number | null {
 	return thresholdFor(spec.id, config.thresholds, spec.role === "veto" ? config.defaultThreshold : config.advisoryThreshold);
 }
 
-export { STATE_PROVIDER, PLAN_STATE_PROVIDER };

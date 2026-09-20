@@ -89,16 +89,17 @@ export function latestUserMessage(conversation: ConversationFacts): string | nul
 	return conversation.userMessages.length > 0 ? (conversation.userMessages[conversation.userMessages.length - 1] ?? null) : null;
 }
 
-/** One check-in's action key: derived from the notice id, unique per notice. */
-export function checkInActionKey(notice: ChildNotice): string {
-	return `check-in:${notice.id}`;
+/** One check-in's subject key: derived from the notice id, unique per notice. */
+export function checkInSubjectKey(notice: ChildNotice): string {
+	return `child:notice:${notice.id}`;
 }
 
 /** The action context one check-in asks about. */
-export function checkInAction(notice: ChildNotice, conversation: ConversationFacts): ActionContext {
+export function checkInAction(notice: ChildNotice, conversation: ConversationFacts | (() => ConversationFacts)): ActionContext {
 	return {
 		facts: {
-			requestId: checkInActionKey(notice),
+			requestId: checkInSubjectKey(notice),
+			toolCallId: null,
 			surface: CHECK_IN_SURFACE,
 			kind: "subagent",
 			value: noticeSubject(notice),

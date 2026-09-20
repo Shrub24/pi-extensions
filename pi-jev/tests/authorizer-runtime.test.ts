@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 
-import { actionBundle, actionQuestionEntries, PACK_VERSION, planBundle, stateBudget, STATE_VERSION } from "../extensions/action-pack.js";
+import { actionBlocks, actionQuestionEntries, PACK_VERSION, stateBudget, STATE_VERSION } from "../extensions/action-pack.js";
 import type { ActionContext } from "../extensions/action-pack.js";
 import { createAuthorizerRuntime } from "../extensions/authorizer-runtime.js";
 import { nudgesFrom } from "../extensions/consumers.js";
@@ -43,8 +43,7 @@ function harness(options: {
 		record: (context) =>
 			log.write(askRecordFromCore(context, { ts: "2026-09-19T00:00:00.000Z", mode: config.mode, model: jev.model, packVersion: PACK_VERSION, stateVersion: STATE_VERSION })),
 	});
-	core.registerBundle(actionBundle(stateBudget(config)));
-	core.registerBundle(planBundle(stateBudget(config)));
+	for (const block of actionBlocks(stateBudget(config))) core.registerBlock(block);
 	core.registerQuestions(actionQuestionEntries<ActionContext>());
 
 	const authorizerLogs: { event: string; details?: Record<string, unknown> }[] = [];
@@ -75,24 +74,24 @@ test("shadow mode records the would-be verdict and defers", async () => {
 	const harnessed = harness({ answers: CLEAN });
 	expect(await harnessed.authorize()).toEqual({ kind: "defer" });
 
-	// Two state groups, two requests, both remembered under the same action.
+	// One subject, one request: every block the pack's questions read rides it.
 	const asks = harnessed.asks();
-	expect(asks).toHaveLength(2);
-	const providers = asks.map((ask) => ask.judge.stateProvider).sort();
-	expect(providers).toEqual(["action-v1", "plan-v1"]);
-	for (const ask of asks) {
-		expect(ask.requestId).toBe("req-1");
-		expect(ask.mode).toBe("shadow");
-		expect(ask.stateHash).toHaveLength(16);
-		expect(ask.verdict).toBe("defer");
-		expect(ask.error).toBeNull();
-	}
-	const surface = asks.find((ask) => ask.judge.stateProvider === "action-v1");
-	expect(surface?.would).toBe("allow");
-	expect(surface?.questions).toEqual(["safety.no_material_harm", "safety.reversibility", "intent.conflicts_with_user", "tool.fit"]);
-	// Each record carries the whole ask's reading of the answers: a band list for
-	// one group alone would report the other group's questions as missing.
-	expect(surface?.bands.map((band) => `${band.id}[${band.role}]=${band.band}`)).toEqual([
+	expect(asks).toHaveLength(1);
+	// The blocks the permission consumer's questions read, and only those: the
+	// child block belongs to the subagent questions, which this ask did not carry.
+	expect([...new Set(asks.flatMap((ask) => ask.blocks.map((entry) => entry.id)))].sort()).toEqual(["ask", "authority", "plan", "tool_history", "toolbox", "user_intent"]);
+	const ask = asks[0];
+	// The record joins on the permission request id, which is what the decision
+	// channel reports back; the subject key adds its kind in front.
+	expect(ask?.requestId).toBe("req-1");
+	expect(ask?.subjectKind).toBe("call");
+	expect(ask?.mode).toBe("shadow");
+	expect(ask?.verdict).toBe("defer");
+	expect(ask?.error).toBeNull();
+	expect(ask?.would).toBe("allow");
+	// Every question the consumer reads went in the one request.
+	expect(ask?.questions).toEqual(["safety.no_material_harm", "safety.reversibility", "intent.conflicts_with_user", "intent.matches_plan", "scope.supports_active_task", "tool.fit"]);
+	expect(ask?.bands.map((band) => `${band.id}[${band.role}]=${band.band}`)).toEqual([
 		"safety.no_material_harm[veto]=satisfied",
 		"safety.reversibility[veto]=satisfied",
 		"intent.conflicts_with_user[veto]=satisfied",
@@ -100,17 +99,19 @@ test("shadow mode records the would-be verdict and defers", async () => {
 		"scope.supports_active_task[advisory]=satisfied",
 		"tool.fit[advisory]=satisfied",
 	]);
-	expect(surface?.bands.find((band) => band.id === "safety.reversibility")?.level).toBe(1);
-	const plan = asks.find((ask) => ask.judge.stateProvider === "plan-v1");
-	expect(plan?.questions).toEqual(["intent.matches_plan", "scope.supports_active_task"]);
-	// The plan group's state is the minimal one, and it says so.
-	expect(plan?.stateChars).toBeGreaterThan(0);
+	expect(ask?.bands.find((band) => band.id === "safety.reversibility")?.level).toBe(1);
+	// Every block records its own hash and size, so a report can tell what the
+	// judge could see and whether it had changed.
+	for (const block of ask?.blocks ?? []) {
+		expect(block.hash).toHaveLength(16);
+		expect(block.chars).toBeGreaterThan(0);
+	}
 });
 
 test("live mode allows a clean action", async () => {
 	const harnessed = harness({ answers: CLEAN, mode: "live" });
 	expect(await harnessed.authorize()).toEqual({ kind: "allow" });
-	expect(harnessed.jev.requests).toHaveLength(2);
+	expect(harnessed.jev.requests).toHaveLength(1);
 });
 
 test("live mode refuses a measured veto violation and teaches why", async () => {
@@ -144,7 +145,7 @@ test("an advisory violation defers and is recorded, without this consumer nudgin
 test("a nudge is recorded but not delivered when no seam is supplied", async () => {
 	const harnessed = harness({ answers: { ...CLEAN, "tool.fit": noul(0.05) } });
 	expect(await harnessed.authorize()).toEqual({ kind: "defer" });
-	const surface = harnessed.asks().find((ask) => ask.judge.stateProvider === "action-v1");
+	const surface = harnessed.asks()[0];
 	expect(surface?.signals.map((signal) => signal.source)).toEqual(["tool.fit"]);
 });
 
@@ -181,7 +182,7 @@ test("a missing answer defers rather than allowing", async () => {
 	delete partial["safety.reversibility"];
 	const harnessed = harness({ answers: partial, mode: "live" });
 	expect(await harnessed.authorize()).toEqual({ kind: "defer" });
-	const surface = harnessed.asks().find((ask) => ask.judge.stateProvider === "action-v1");
+	const surface = harnessed.asks()[0];
 	expect(surface?.bands.find((band) => band.id === "safety.reversibility")?.band).toBe("missing");
 });
 
@@ -190,7 +191,7 @@ test("a judge failure defers and is recorded per request", async () => {
 	expect(await harnessed.authorize()).toEqual({ kind: "defer" });
 
 	const asks = harnessed.asks();
-	expect(asks).toHaveLength(2);
+	expect(asks).toHaveLength(1);
 	for (const ask of asks) {
 		expect(ask.error).toEqual({ code: "timeout", message: "TypeSafe request timed out." });
 		expect(ask.would).toBe("defer");
@@ -214,7 +215,7 @@ test("full state retention stores the state each group was asked about", async (
 	await harnessed.authorize();
 	// State retention is the host's record policy; here it is exercised through the
 	// record builder, which stores the interpretation the consumer supplied.
-	const surface = harnessed.asks().find((ask) => ask.judge.stateProvider === "action-v1");
+	const surface = harnessed.asks()[0];
 	expect(surface?.bands).toHaveLength(6);
 	expect(surface?.stateChars).toBeGreaterThan(0);
 });
@@ -234,17 +235,17 @@ test("the review log gets one durable entry per judged ask, naming roles and lev
 test("a second consumer on the same action issues no new request", async () => {
 	const harnessed = harness({ answers: CLEAN });
 	await harnessed.authorize();
-	expect(harnessed.jev.requests).toHaveLength(2);
+	expect(harnessed.jev.requests).toHaveLength(1);
 
 	// A monitor asking for a question the permission ask already carried is served
 	// from memory: that is what makes riding along free.
 	const result = await harnessed.core.sendDecisions({
-		action: { facts: { requestId: "req-1" } as never, conversation: conversation() },
-		actionKey: "req-1",
+		input: { facts: { requestId: "req-1" } as never, conversation: conversation() },
+		subject: { key: "call:req-1", kind: "call" },
 		consumer: "monitor",
 		questions: ["safety.no_material_harm"],
 	});
-	expect(harnessed.jev.requests).toHaveLength(2);
+	expect(harnessed.jev.requests).toHaveLength(1);
 	expect(result?.requests).toHaveLength(0);
 	expect(result?.reused).toEqual(["safety.no_material_harm"]);
 	expect(result?.readings["safety.no_material_harm"]?.probability).toBe(0.99);

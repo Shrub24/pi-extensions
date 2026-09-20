@@ -74,9 +74,16 @@ export interface AskRecord {
 		packVersion: string;
 		stateVersion: string;
 	};
-	stateHash: string;
+	/** What the subject was: "call", "child", "session". Answers "about what?". */
+	subjectKind: string;
+	/**
+	 * The context blocks this request carried, in build order. The names say what
+	 * the judge could see; the hashes say whether that context had changed since a
+	 * previous ask; the truncations say what was cut to fit. A report can compare
+	 * two asks about the same subject by diffing these.
+	 */
+	blocks: { id: string; hash: string; chars: number; truncated: string[] }[];
 	stateChars: number;
-	truncated: string[];
 	/** Present only when state retention is `full`. */
 	state?: unknown;
 	bands: AskBandRecord[];
@@ -151,18 +158,17 @@ export function askRecordFromCore(context: CoreRecordContext, options: AskRecord
 		record: "ask",
 		version: RECORD_VERSION,
 		ts: options.ts,
-		requestId: context.actionKey,
+		requestId: context.subject.correlationId ?? context.subjectKey,
 		requestKey: context.request.id,
 		mode: options.mode,
 		judge: {
 			model: context.request.model ?? options.model,
 			packVersion: options.packVersion,
 			stateVersion: options.stateVersion,
-			stateProvider: context.stateProvider,
 		},
-		stateHash: context.stateHash,
-		stateChars: context.chars,
-		truncated: [...context.truncated],
+		subjectKind: context.subject.kind,
+		blocks: context.request.blocks.map((block) => ({ id: block.id, hash: block.hash, chars: block.chars, truncated: [...block.truncated] })),
+		stateChars: context.request.chars,
 		bands,
 		signals: (failed ? [] : (interpreted.signals ?? [])).map((source) => ({
 			source,
@@ -248,7 +254,7 @@ export function joinRecords(records: readonly JevRecord[]): JoinResult {
 		const decision = decisions.get(ask.requestId);
 		if (!decision) continue;
 		matched.add(ask.requestId);
-		if (ask.truncated.length > 0) truncatedStates++;
+		if (ask.blocks.some((block) => block.truncated.length > 0)) truncatedStates++;
 		const label = labelOf(decision.resolution);
 		if (label === undefined) {
 			unlabelled++;

@@ -16,7 +16,6 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
-import { STATE_PROVIDER } from "./action-pack.js";
 
 export const CONFIG_ID = "@vanillagreen/pi-jev";
 
@@ -48,8 +47,6 @@ export interface JevConfig {
 	advisoryThreshold: number;
 	/** Ban per question id; `satisfied` at p >= t, `violated` at p <= 1 - t. */
 	thresholds: Record<string, number>;
-	/** Which state the pack reads; the unit a batch group is keyed by. */
-	stateProvider: string;
 	/** Per-question pack version recorded with every decision. */
 	stateRetention: StateRetention;
 	/** Attempts this judge may make in one session, across failed ones. */
@@ -124,7 +121,6 @@ export const DEFAULTS: JevConfig = {
 	defaultThreshold: DEFAULT_THRESHOLD,
 	advisoryThreshold: DEFAULT_ADVISORY_THRESHOLD,
 	thresholds: {},
-	stateProvider: STATE_PROVIDER,
 	stateRetention: "hash",
 	maxRequestsPerSession: 200,
 	maxStateChars: 4_000,

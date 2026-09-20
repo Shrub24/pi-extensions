@@ -10,9 +10,9 @@ function ask(overrides: Partial<AskRecord> & { requestId: string }): AskRecord {
 		ts: "2026-09-19T00:00:00.000Z",
 		mode: "shadow",
 		judge: { model: "jev-latest", packVersion: "permission-pack-v1", stateVersion: "permission-state-v1" },
-		stateHash: "abc123",
+		subjectKind: "call",
+		blocks: [{ id: "ask", hash: "abc123", chars: 100, truncated: [] }],
 		stateChars: 100,
-		truncated: [],
 		bands: [{ id: "intent.authorized_by_user", band: "satisfied", probability: 0.96, threshold: 0.9 }],
 		would: "allow",
 		verdict: "defer",
@@ -137,7 +137,7 @@ test("replay cases need a retained state", () => {
 
 test("trimmed states are counted, because their scores are not comparable", () => {
 	const result = joinRecords([
-		ask({ requestId: "a", truncated: ["ask.value:halved"] }),
+		ask({ requestId: "a", blocks: [{ id: "ask", hash: "abc123", chars: 100, truncated: ["ask.value"] }] }),
 		decision({ requestId: "a" }),
 		ask({ requestId: "b" }),
 		decision({ requestId: "b" }),

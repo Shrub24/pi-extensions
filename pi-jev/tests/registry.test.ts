@@ -38,11 +38,11 @@ function judge(answer = 0.9) {
 }
 
 function setup(core: DecisionCore<ActionContext>): void {
-	core.registerBundle({ id: "one-v1", buildState: () => ({ state: { marker: 1 }, stateHash: "h", chars: 1, truncated: [] }) });
+	core.registerBlock({ id: "one", buildState: () => ({ state: { marker: 1 }, stateHash: "h", chars: 1, truncated: [] }) });
 	core.registerQuestions([
 		{
 			id: "one.risk",
-			stateProvider: "one-v1",
+			blocks: ["one"],
 			owner: "someone",
 			question: () => ({ type: "noul" }),
 			read: (answer) => (answer && answer.type === "noul" ? { probability: answer.noul } : undefined),
@@ -77,7 +77,7 @@ test("a second entry joins the core the first one made", async () => {
 	expect(setupCalls).toEqual(["a"]);
 	expect(a.core.questionIds()).toEqual(["one.risk"]);
 
-	await a.core.sendDecisions({ action: ACTION, actionKey: "a1", consumer: "first", questions: ["one.risk"] });
+	await a.core.sendDecisions({ input: ACTION, subject: { key: "a1", kind: "call" }, consumer: "first", questions: ["one.risk"] });
 	// The first lease's judge answered, and only one line was written for it: the
 	// second lease's sink would have duplicated the record.
 	expect(first.calls).toHaveLength(1);
@@ -119,7 +119,7 @@ test("either entry's turn boundary gates the idle flush", async () => {
 	const b = acquireCore({ sessionId: "s1", options: { ask: client.ask }, setup });
 
 	// Idle: nothing arms.
-	b.core.queueDecisions({ action: ACTION, actionKey: "a1", consumer: "later", questions: ["one.risk"] });
+	b.core.queueDecisions({ input: ACTION, subject: { key: "a1", kind: "call" }, consumer: "later", questions: ["one.risk"] });
 	expect(timers).toHaveLength(0);
 
 	// The second entry reports the turn, and the same core arms.
@@ -127,7 +127,7 @@ test("either entry's turn boundary gates the idle flush", async () => {
 	expect(timers).toHaveLength(0); // arming happens at the queue, not the boundary
 
 	const c = acquireCore({ sessionId: "s1", options: { ask: client.ask }, setup });
-	c.core.queueDecisions({ action: ACTION, actionKey: "a2", consumer: "later", questions: ["one.risk"] });
+	c.core.queueDecisions({ input: ACTION, subject: { key: "a2", kind: "call" }, consumer: "later", questions: ["one.risk"] });
 	expect(timers).toHaveLength(1);
 
 	// And the first entry's report of the turn ending stops it.

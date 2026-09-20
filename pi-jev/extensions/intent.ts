@@ -35,11 +35,12 @@ import { createJevClient } from "./jev.js";
 import type { JevClient } from "./jev.js";
 import type { DecisionLog } from "./decision-log.js";
 import { deliverNudges } from "./nudges.js";
-import { checkInAction, checkInActionKey, checkInIntervalMs, combineFindings, newNotices, noticeNeedsAttention, CHECK_IN_QUESTIONS } from "./check-in.js";
+import { checkInAction, checkInSubjectKey, checkInIntervalMs, combineFindings, newNotices, noticeNeedsAttention, CHECK_IN_QUESTIONS } from "./check-in.js";
 import { INTENT_CONSUMER, INTENT_QUESTIONS, INTENT_SPECS, SUBAGENT_CONSUMER, installPack, intentNudges, interpretBands, registerSubagentConsumer } from "./consumers.js";
 import { acquireCore, acquireLog, logSink } from "./registry.js";
 import type { CoreLease } from "./registry.js";
 import { preferredTool, TOOL_CHOICE_QUESTIONS, toolChoiceBand, toolChoiceNudgeText } from "./tool-choice.js";
+import { callSubject, conversationOf } from "./action-pack.js";
 import type { ToolPolicy } from "./tool-choice.js";
 import { loadToolPolicy } from "./tool-policy.js";
 
@@ -96,6 +97,7 @@ export function toolCallFacts(event: ToolCallLike, fallbackId: string, policy?: 
 	const value = callValue(event.input);
 	const facts: ActionAskFacts = {
 		requestId,
+		toolCallId: requestId,
 		surface: "tool_call",
 		kind: "tool",
 		value,
@@ -205,7 +207,7 @@ export function wireIntentConsumer(pi: ExtensionAPI, deps: IntentDeps = {}): voi
 			questions: INTENT_QUESTIONS,
 			// A plan question with no plan in the state is unanswerable, so a call
 			// with nothing stated ahead of it is dropped from the flush entirely.
-			applies: (action: ActionContext) => action.conversation.declaredPlan !== null,
+			applies: (context: ActionContext) => conversationOf(context).declaredPlan !== null,
 			interpret: (readings) => interpretIntent(readings, config),
 			onAnswers: (delivery) => {
 				if (!deliver) return;
@@ -232,11 +234,11 @@ export function wireIntentConsumer(pi: ExtensionAPI, deps: IntentDeps = {}): voi
 		lease.core.registerQuestions(
 			TOOL_CHOICE_QUESTIONS.map((spec) => ({
 				id: spec.id,
-				stateProvider: spec.stateProvider,
+				blocks: spec.blocks,
 				owner: TOOL_CHOICE_CONSUMER,
 				meta: { role: spec.role, purpose: spec.purpose, measured: spec.measured },
-				applies: (action: ActionContext) => spec.applies(action.facts),
-				question: (action: ActionContext) => spec.question(action.facts) ?? undefined,
+				applies: (context: ActionContext) => spec.applies(context.facts),
+				question: (context: ActionContext) => spec.question(context.facts) ?? undefined,
 				read: (answer) => {
 					const read = spec.read(answer);
 					return read ? { probability: read.margin, level: null, detail: { choice: read.choice, margin: read.margin } } : undefined;
@@ -246,17 +248,17 @@ export function wireIntentConsumer(pi: ExtensionAPI, deps: IntentDeps = {}): voi
 		lease.core.registerConsumer({
 			id: TOOL_CHOICE_CONSUMER,
 			questions: ["tool.choice"],
-			applies: (action: ActionContext) => action.facts.preferredTool != null,
+			applies: (context: ActionContext) => context.facts.preferredTool != null,
 			onAnswers: (delivery) => {
 				if (!deliver) return;
 				const reading = delivery.readings.find((reading) => reading.question === "tool.choice");
 				const detail = reading?.detail as { choice?: string; margin?: number } | undefined;
-				const band = toolChoiceBand(detail && detail.choice !== undefined ? { choice: detail.choice, margin: detail.margin ?? 0 } : undefined, delivery.action.facts.preferredTool, toolPolicy);
+				const band = toolChoiceBand(detail && detail.choice !== undefined ? { choice: detail.choice, margin: detail.margin ?? 0 } : undefined, delivery.input.facts.preferredTool, toolPolicy);
 				if (band.band !== "violated") return;
 				// The policy's own reason is the teaching part of the sentence, and the
 				// action the flush judged still carries it.
-				const preferredReason = (delivery.action as ActionContext | undefined)?.facts.preferredReason ?? null;
-				deliver([{ source: band.id, role: band.role, severity: "warn", measured: band.measured, text: toolChoiceNudgeText(band, delivery.action.facts.value, preferredReason) }]);
+				const preferredReason = delivery.input?.facts.preferredReason ?? null;
+				deliver([{ source: band.id, role: band.role, severity: "warn", measured: band.measured, text: toolChoiceNudgeText(band, delivery.input.facts.value, preferredReason) }]);
 			},
 		});
 	});
@@ -284,8 +286,8 @@ export function wireIntentConsumer(pi: ExtensionAPI, deps: IntentDeps = {}): voi
 		for (const notice of fresh) {
 			try {
 				await lease.core.sendDecisions({
-					action: checkInAction(notice, conversation),
-					actionKey: checkInActionKey(notice),
+					subject: { key: checkInSubjectKey(notice), kind: "child" },
+					input: checkInAction(notice, () => configConversation(sessionSources(ctx, pi as never), config)),
 					consumer: SUBAGENT_CONSUMER,
 					questions: CHECK_IN_QUESTIONS,
 				});
@@ -311,7 +313,10 @@ export function wireIntentConsumer(pi: ExtensionAPI, deps: IntentDeps = {}): voi
 		const interval = checkInIntervalMs(config);
 		if (interval <= 0 || checkInTimer !== undefined) return;
 		checkInTimer = setTimeout(() => {
-			void runCheckIn();
+			// The cadence repeats: a scan re-arms itself, so an orchestrator that
+			// stays idle across several intervals is read at each one. The notice
+			// is still judged once whatever the cadence does.
+			void runCheckIn().finally(armCheckIn);
 		}, interval);
 	};
 
@@ -334,19 +339,26 @@ export function wireIntentConsumer(pi: ExtensionAPI, deps: IntentDeps = {}): voi
 			report(`pi-jev: the conversation could not be read (${error instanceof Error ? error.message : String(error)}).`);
 			return;
 		}
-		const action: ActionContext = { facts, conversation };
+		// The call is the subject. Its input carries the frozen facts and a thunk
+		// for the conversation, so a flush that happens later — the turn boundary —
+		// reads the session as it is then rather than replaying this moment.
+		const input: ActionContext = { facts, conversation: () => configConversation(sessionSources(ctx, pi as never), config) };
+		// The same subject the gate will use for this call: the key is Pi's tool
+		// call id, so what the intent consumer queues here is flushed by the
+		// permission ask rather than waiting for the turn boundary.
+		const subject = callSubject({ toolCallId: facts.toolCallId, requestId: facts.requestId });
 		if (conversation.declaredPlan !== null) {
 			lease.core.queueDecisions({
-				action,
-				actionKey: facts.requestId,
+				subject,
+				input,
 				consumer: INTENT_CONSUMER,
 				questions: INTENT_QUESTIONS,
 			});
 		}
 		if (facts.preferredTool != null) {
 			lease.core.queueDecisions({
-				action,
-				actionKey: facts.requestId,
+				subject,
+				input,
 				consumer: TOOL_CHOICE_CONSUMER,
 				questions: ["tool.choice"],
 			});

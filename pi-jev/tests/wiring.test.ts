@@ -273,7 +273,9 @@ test("a forwarded ask carries the subagent questions, and a violation nudges the
 
 	// Three requests: the action group, the plan group, and the subagent group.
 	const asks = harnessed.log.records.filter((record) => record.record === "ask");
-	expect(new Set(asks.map((ask) => (ask as { judge?: { stateProvider?: string } }).judge?.stateProvider))).toEqual(new Set(["action-v1", "plan-v1", "subagent-v1"]));
+	expect(new Set(asks.flatMap((ask) => (ask as { blocks?: { id: string }[] }).blocks?.map((entry) => entry.id) ?? []))).toEqual(
+		new Set(["ask", "user_intent", "plan", "tool_history", "toolbox", "authority", "child_work"]),
+	);
 
 	// The nudges went to the agent, addressed to the orchestrator.
 	const texts = harnessed.sent.map((sent) => (sent.message as { content?: string }).content ?? "");
@@ -300,6 +302,6 @@ test("a local ask never carries the subagent questions", async () => {
 	await authorize(fakeDetails(), fakeQuery(), { review: () => {}, debug: () => {} });
 
 	const asks = harnessed.log.records.filter((record) => record.record === "ask");
-	expect(new Set(asks.map((ask) => (ask as { judge?: { stateProvider?: string } }).judge?.stateProvider))).toEqual(new Set(["action-v1", "plan-v1"]));
+	expect(new Set(asks.flatMap((ask) => (ask as { blocks?: { id: string }[] }).blocks?.map((entry) => entry.id) ?? []))).toEqual(new Set(["ask", "user_intent", "plan", "tool_history", "toolbox", "authority"]));
 	expect(harnessed.sent).toHaveLength(0);
 });
