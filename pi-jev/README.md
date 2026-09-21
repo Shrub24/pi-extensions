@@ -111,8 +111,8 @@ A file with none of the four constructs — or an unreadable one — means no to
 
 Every question names the blocks it reads, and only those are built and sent. The permission link's questions read the ask, the instruction, the plan, the tool history and the toolbox; harm and reversibility read the ask alone, because they are properties of the call rather than of the session.
 
-- Answers are composed by one rule: a **measured** veto band that is violated refuses the ask, every question satisfied allows it, and anything else — including a missing answer — defers.
-- An **unmeasured** veto may not refuse: it defers and raises a notice instead. A bar with no labelled samples behind it has no evidence for holding your work, and pi-warden's four candidate questions all landed at the base rate.
+- Answers are composed by one rule: a **measured** veto band that is violated refuses the ask; a veto violated on a bar with no samples, a veto the request never answered, or no reading at all defers; everything else allows. An `unclear` band is not an objection — a veto reads unclear when you never spoke to the question, an advisory reads unclear without any authority to refuse — so the judge having no opinion never stalls a call your own rules already allowed.
+- An **unmeasured** veto may not refuse: it defers and raises a notice instead. A bar with no labelled samples behind it has no evidence for holding your work, and pi-warden's four candidate questions all landed at the base rate. This is also the whole of `defer`'s budget: risk the judge actually saw, or a question it could not read — reserved for the risky-but-plausible call, never for every edge it landed near.
 - Each question names three cases, not two — the user asked for it, the user ruled it out, or the user did not mention it. Only an outright conflict refuses an action; silence lands in the middle band and reaches you as a prompt.
 - Every request record carries the whole ask's reading: each question's band, its probability or level, the edge it was read against, and whether that edge is measured.
 

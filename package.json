@@ -12,6 +12,7 @@
     "test": "bun test pi-bash-processes/tests pi-bash-processes/extensions/__tests__ pi-tool-renderer/extensions/__tests__ pi-jev/tests pi-cbmem/tests"
   },
   "devDependencies": {
+    "@gotgenes/pi-permission-system": "^33.0.5",
     "pi-typesafe": "^0.6.1"
   }
 }

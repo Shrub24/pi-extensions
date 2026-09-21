@@ -333,37 +333,51 @@ test("an unmeasured veto may not refuse work, and a measured one may", () => {
 	expect(measured.reason).toContain("level 3");
 });
 
-test("an advisory violation never denies; it defers and raises a nudge", () => {
+test("an advisory violation never denies and never blocks: it allows and raises a nudge", () => {
 	const specs = questionsFor(facts());
 	const composed = composeVerdict(readBands(specs, readings(answers({ "intent.matches_plan": noul(0.03) })), {}), "bash: rm -rf build");
-	expect(composed.kind).toBe("defer");
-	expect(composed.decidedBy).toBe("intent.matches_plan");
+	expect(composed.kind).toBe("allow");
 	expect(composed.signals).toHaveLength(1);
 	expect(composed.signals[0]).toMatchObject({ source: "intent.matches_plan", role: "advisory", severity: "warn" });
 
 	const toolFit = composeVerdict(readBands(specs, readings(answers({ "tool.fit": noul(0.05) })), {}));
-	expect(toolFit.kind).toBe("defer");
+	expect(toolFit.kind).toBe("allow");
 	expect(toolFit.signals.map((signal) => signal.source)).toEqual(["tool.fit"]);
 
 	const scope = composeVerdict(readBands(specs, readings(answers({ "scope.supports_active_task": noul(0.02) })), {}));
-	expect(scope.kind).toBe("defer");
+	expect(scope.kind).toBe("allow");
 	expect(scope.signals).toHaveLength(1);
 });
 
-test("an unclear band defers without nudging, because the middle of the edge is wide", () => {
+test("an unclear band is no objection: both roles allow without nudging", () => {
 	const specs = questionsFor(facts());
-	const composed = composeVerdict(readBands(specs, readings(answers({ "scope.supports_active_task": noul(0.5) })), {}));
-	expect(composed.kind).toBe("defer");
-	expect(composed.signals).toEqual([]);
+	const advisory = composeVerdict(readBands(specs, readings(answers({ "scope.supports_active_task": noul(0.5) })), {}));
+	expect(advisory.kind).toBe("allow");
+	expect(advisory.signals).toEqual([]);
+
+	// A veto in the wide middle means the user never spoke to the question, which
+	// is the normal state of most calls — it may not stall them.
+	const veto = composeVerdict(readBands(specs, readings(answers({ "intent.conflicts_with_user": noul(0.5) })), {}));
+	expect(veto.kind).toBe("allow");
 });
 
-test("a missing band defers and says which question never answered", () => {
+test("a missing veto defers and names the question that never answered", () => {
 	const specs = questionsFor(facts());
 	const partial = answers();
 	delete (partial as Record<string, unknown>)["safety.reversibility"];
 	const composed = composeVerdict(readBands(specs, readings(partial), {}), "bash: rm -rf build");
 	expect(composed.kind).toBe("defer");
 	expect(composed.decidedBy).toBe("safety.reversibility");
+
+	// A missing advisory is not a blind spot on a question that can refuse.
+	const advisoryMissing = answers();
+	delete (advisoryMissing as Record<string, unknown>)["tool.fit"];
+	expect(composeVerdict(readBands(specs, readings(advisoryMissing), {})).kind).toBe("allow");
+});
+
+test("no readable reading at all defers: silence is not consent", () => {
+	const specs = questionsFor(facts());
+	expect(composeVerdict(readBands(specs, readings({}), {}), "bash: rm -rf build").kind).toBe("defer");
 });
 
 test("the two edges are separate, and a question's own value wins for both", () => {

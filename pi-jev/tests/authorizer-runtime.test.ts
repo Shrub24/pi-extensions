@@ -129,13 +129,15 @@ test("live mode refuses a measured veto violation and teaches why", async () => 
 	expect(delivered[0]?.[0]).toMatchObject({ source: "safety.reversibility", role: "veto", severity: "notice", measured: false });
 });
 
-test("an advisory violation defers and is recorded, without this consumer nudging", async () => {
+test("an advisory violation allows and is recorded, without this consumer nudging", async () => {
 	// The advisory bands belong to the consumer that rides on them; a gate that
-	// also spoke for them would say the same thing twice about one action.
+	// also spoke for them would say the same thing twice about one action. And an
+	// advisory has no authority to block: a violation is worth a sentence, never a
+	// stalled call.
 	for (const mode of ["shadow", "live"] as const) {
 		const delivered: Nudge[][] = [];
 		const harnessed = harness({ answers: { ...CLEAN, "intent.matches_plan": noul(0.02) }, mode, deliver: (nudges) => delivered.push([...nudges]) });
-		expect(await harnessed.authorize()).toEqual({ kind: "defer" });
+		expect(await harnessed.authorize()).toEqual({ kind: mode === "live" ? "allow" : "defer" });
 		expect(delivered).toEqual([]);
 		const signals = new Set(harnessed.asks().flatMap((ask) => ask.signals.map((signal) => signal.source)));
 		expect([...signals]).toContain("intent.matches_plan");
@@ -155,8 +157,9 @@ test("a delivery seam that throws cannot change the verdict", async () => {
 		deliver: () => {
 			throw new Error("sendMessage exploded");
 		},
+		mode: "live",
 	});
-	expect(await harnessed.authorize()).toEqual({ kind: "defer" });
+	expect(await harnessed.authorize()).toEqual({ kind: "allow" });
 });
 
 test("every signal is recorded, whatever the delivery bound is", async () => {
@@ -171,9 +174,10 @@ test("every signal is recorded, whatever the delivery bound is", async () => {
 	expect(nudgesFrom([...signals].map((source) => ({ source, role: "advisory", band: "violated" as const, probability: 0.02, level: null, purpose: source, confident: true, measured: true, severity: "warn" as const })))).toHaveLength(2);
 });
 
-test("an unclear band defers in live mode without nudging", async () => {
+test("an unclear band allows in live mode without nudging", async () => {
+	// The judge has no opinion; the operator's own rules already allowed the call.
 	const harnessed = harness({ answers: { ...CLEAN, "safety.no_material_harm": noul(0.5) }, mode: "live" });
-	expect(await harnessed.authorize()).toEqual({ kind: "defer" });
+	expect(await harnessed.authorize()).toEqual({ kind: "allow" });
 	expect(harnessed.asks().flatMap((ask) => ask.signals)).toEqual([]);
 });
 
@@ -221,12 +225,12 @@ test("full state retention stores the state each group was asked about", async (
 });
 
 test("the review log gets one durable entry per judged ask, naming roles and levels", async () => {
-	const harnessed = harness({ answers: { ...CLEAN, "scope.supports_active_task": noul(0.02) } });
+	const harnessed = harness({ answers: { ...CLEAN, "scope.supports_active_task": noul(0.02) }, mode: "live" });
 	await harnessed.authorize();
 	const judged = harnessed.authorizerLogs.find((entry) => entry.event === "pi-jev.judged");
 	expect(judged).toBeDefined();
 	expect(judged?.details?.consumer).toBe("permission");
-	expect(judged?.details?.would).toBe("defer");
+	expect(judged?.details?.would).toBe("allow");
 	const bands = String(judged?.details?.bands);
 	expect(bands).toContain("safety.reversibility[veto]=satisfied#1");
 	expect(bands).toContain("scope.supports_active_task[advisory]=violated(0.02)");

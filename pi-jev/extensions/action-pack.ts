@@ -861,14 +861,19 @@ export interface ComposedVerdict {
  *           violation defers instead, and says so; pi-warden's four candidate
  *           questions all landed at the base rate, so an untested question is
  *           kept out of the refusing path until the log has scores for it.
- *   allow   no question unresolved — advisory bands included, because allowing
- *           is the one outcome that removes a human from the loop.
- *   defer   everything else, which is also the answer to a missing band.
+ *   allow   no veto violated and no veto unread. `unclear` does not block: a veto
+ *           reads unclear when the user never spoke to the question, and an
+ *           advisory reads unclear without any authority to refuse, so neither
+ *           is an objection to a call the operator's rules already allowed.
+ *   defer   a veto violated on an unmeasured bar, a veto the request never
+ *           answered, or no reading at all. This is the human's seat, and it is
+ *           kept narrow on purpose: a decision nobody is there to make is worse
+ *           than a permissive default the log can argue with.
  *
- * Signals are emitted for violated bands only. An unclear band is the wide
- * middle of the 0.9 edge, so nudging on it would fire on most calls — pi-warden
- * measured the cost of that: 51 of 52 credential warnings in two days were
- * fixture values read from a file, and the fix was to stop announcing them.
+ * Signals are emitted for violated advisory bands only. An unclear band is the
+ * wide middle of the 0.9 edge, so nudging on it would fire on most calls —
+ * pi-warden measured the cost of that: 51 of 52 credential warnings in two days
+ * were fixture values read from a file, and the fix was to stop announcing them.
  */
 export function composeVerdict(readings: readonly BandReading[], action?: string): ComposedVerdict {
 	const signals = readings
@@ -913,9 +918,18 @@ export function composeVerdict(readings: readonly BandReading[], action?: string
 		};
 	}
 	if (readings.length === 0) return { kind: "defer", signals };
-	const unresolved = readings.find((reading) => reading.band !== "satisfied");
-	if (!unresolved) return { kind: "allow", signals };
-	return { kind: "defer", decidedBy: unresolved.id, signals };
+	// A veto nobody could read is the same blind spot as one violated without a
+	// bar: the questions that exist to refuse did not answer, so the call gets one
+	// look rather than a silent yes.
+	const unread = readings.find((reading) => reading.role === "veto" && reading.band === "missing");
+	if (unread) return { kind: "defer", decidedBy: unread.id, signals };
+	// Everything else proceeds. `unclear` is not an objection: a veto reads unclear
+	// when the user never spoke to the question, and an advisory reads unclear
+	// without the authority to refuse anything. A call the operator's own rules
+	// already allowed is not blocked by the judge having no opinion — defer is
+	// reserved for risk the judge actually saw (a violated veto, above) or could
+	// not read at all, not for every edge it happened to land near.
+	return { kind: "allow", signals };
 }
 
 const MAX_REASON_CHARS = 300;
