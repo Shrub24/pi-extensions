@@ -39,10 +39,10 @@ import { checkInAction, checkInSubjectKey, checkInIntervalMs, combineFindings, n
 import { INTENT_CONSUMER, INTENT_QUESTIONS, INTENT_SPECS, SUBAGENT_CONSUMER, installPack, intentNudges, interpretBands, registerSubagentConsumer } from "./consumers.js";
 import { acquireCore, acquireLog, logSink } from "./registry.js";
 import type { CoreLease } from "./registry.js";
-import { preferredTool, TOOL_CHOICE_QUESTIONS, toolChoiceBand, toolChoiceNudgeText } from "./tool-choice.js";
+import { TOOL_CHOICE_QUESTIONS, toolAvoidNudgeText, toolChoiceBand, toolChoiceNudgeText } from "./tool-choice.js";
 import { callSubject, conversationOf } from "./action-pack.js";
 import type { ToolPolicy } from "./tool-choice.js";
-import { loadToolPolicy } from "./tool-policy.js";
+import { loadToolPolicy, applyGuidance } from "./tool-policy.js";
 
 export interface IntentDeps {
 	config?: JevConfig;
@@ -112,13 +112,12 @@ export function toolCallFacts(event: ToolCallLike, fallbackId: string, policy?: 
 		path: stringField(input, ["path", "file_path", "filePath"]),
 		preferredTool: null,
 		preferredReason: null,
+		rankedAlternatives: [],
+		policyIntent: null,
+		policyDirectives: [],
+		policyAvoid: null,
 	};
-	const alternative = policy ? preferredTool({ ...facts, value }, policy) : undefined;
-	if (alternative) {
-		facts.preferredTool = alternative.preferred;
-		facts.preferredReason = alternative.reason;
-	}
-	return facts;
+	return applyGuidance(facts, policy);
 }
 
 /** The plan group's interpretation, for a flush this consumer queued. */
@@ -247,18 +246,35 @@ export function wireIntentConsumer(pi: ExtensionAPI, deps: IntentDeps = {}): voi
 		);
 		lease.core.registerConsumer({
 			id: TOOL_CHOICE_CONSUMER,
-			questions: ["tool.choice"],
-			applies: (context: ActionContext) => context.facts.preferredTool != null,
+			questions: ["tool.choice", "tool.fit"],
+			applies: (context: ActionContext) => context.facts.preferredTool != null || context.facts.policyAvoid != null,
 			onAnswers: (delivery) => {
 				if (!deliver) return;
+				const nudges: Nudge[] = [];
+				// The avoid warning first: it is the stronger claim — the policy says
+				// this tool is wrong for such calls — and it is the one the agent can
+				// act on without knowing what the alternative would have been.
+				if (delivery.input.facts.policyAvoid) {
+					const fitReading = delivery.readings.find((reading) => reading.question === "tool.fit");
+					// The avoid nudge needs the judge to agree the fit is poor; a fit
+					// reading that is missing or confident-true stays quiet. The edge
+					// is the policy's avoidMargin: how clearly the judge must disagree
+					// with the call before the policy's warning becomes a sentence.
+					const probability = fitReading?.probability;
+					if (typeof probability === "number" && probability <= 1 - (toolPolicy.avoidMargin ?? toolPolicy.margin)) {
+						nudges.push({ source: "tool.fit", role: "advisory", severity: "warn", measured: false, text: toolAvoidNudgeText(delivery.input.facts.value, delivery.input.facts.policyAvoid.reason) });
+					}
+				}
 				const reading = delivery.readings.find((reading) => reading.question === "tool.choice");
 				const detail = reading?.detail as { choice?: string; margin?: number } | undefined;
 				const band = toolChoiceBand(detail && detail.choice !== undefined ? { choice: detail.choice, margin: detail.margin ?? 0 } : undefined, delivery.input.facts.preferredTool, toolPolicy);
-				if (band.band !== "violated") return;
-				// The policy's own reason is the teaching part of the sentence, and the
-				// action the flush judged still carries it.
-				const preferredReason = delivery.input?.facts.preferredReason ?? null;
-				deliver([{ source: band.id, role: band.role, severity: "warn", measured: band.measured, text: toolChoiceNudgeText(band, delivery.input.facts.value, preferredReason) }]);
+				if (band.band === "violated") {
+					// The policy's own reason is the teaching part of the sentence, and the
+					// action the flush judged still carries it.
+					const preferredReason = delivery.input?.facts.preferredReason ?? null;
+					nudges.push({ source: band.id, role: band.role, severity: "warn", measured: band.measured, text: toolChoiceNudgeText(band, delivery.input.facts.value, preferredReason) });
+				}
+				if (nudges.length > 0) deliver(nudges);
 			},
 		});
 	});

@@ -1,6 +1,6 @@
 {
 	"name": "@vanillagreen/pi-jev",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"description": "A modular substrate for Jev/TypeSafe decisions in Pi: consumers queue or send question sets against a shared per-session core. Ships a deferring permission authorizer for @gotgenes/pi-permission-system and an intent-nudge consumer.",
 	"license": "MIT",
 	"keywords": [

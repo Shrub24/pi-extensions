@@ -107,6 +107,14 @@ export interface ActionAskFacts {
 	 */
 	preferredTool?: string | null;
 	preferredReason?: string | null;
+	/** The policy's ranked alternatives, best first, when a precedence rule matched. */
+	rankedAlternatives?: { tool: string; reason: string; intent?: string }[];
+	/** The intent clause of a matched precedence rule, verbatim. */
+	policyIntent?: string | null;
+	/** The policy's directives that apply to this call, verbatim. */
+	policyDirectives?: string[];
+	/** The avoid-pair that matched this call, verbatim from the policy. */
+	policyAvoid?: { reason: string } | null;
 }
 
 /** Everything a block may read for one subject. */
@@ -126,6 +134,14 @@ export function conversationOf(context: ActionContext): ConversationFacts {
 	return typeof context.conversation === "function" ? context.conversation() : context.conversation;
 }
 
+/**
+ * Stamp a policy's ruling for this call onto already-built ask facts.
+ *
+ * Both fact builders call this — the gate rebuilds its facts from the ask's
+ * details and would otherwise never see what the policy said about the call,
+ * and the tool_call hook needs the same fields for the same questions. Guidance
+ * is resolved once per ask and every consumer reads the same fields.
+ */
 export interface ConversationFacts {
 	/** Oldest first; the last entry is the current instruction. */
 	userMessages: string[];
@@ -198,6 +214,10 @@ export function askFactsFrom(details: PromptPermissionDetails, query: Permission
 		kind: details.payload?.kind ?? "unknown",
 		preferredTool: null,
 		preferredReason: null,
+		rankedAlternatives: [],
+		policyIntent: null,
+		policyDirectives: [],
+		policyAvoid: null,
 		value,
 		toolName,
 		invokedToolName: request?.invokedToolName ?? null,
@@ -664,12 +684,16 @@ export const ACTION_PACK: readonly QuestionSpec[] = [
 		measured: false,
 		// When a policy names an alternative for this very call, `tool.choice` asks
 		// the better question — which tool fits, with the alternative in front of
-		// the judge. Two questions about one choice would land in one request.
-		applies: (ask) => ask.toolName !== null && ask.preferredTool == null,
-		question: () => ({
+		// the judge. Two questions about one choice would land in one request. But
+		// an avoid-pair stands the fit question up: the policy has something to say
+		// about this call that is not "use another tool", and the fit question is
+		// where it lands.
+		applies: (ask) => ask.toolName !== null && (ask.preferredTool == null || ask.policyAvoid != null),
+		question: (ask) => ({
 			type: "noul",
 			instructions:
-				"Given `toolbox.tools` (the tools the agent has available, with short descriptions) and `plan` (what the agent says it is doing), is the tool it reached for in `ask.action` a reasonable choice for that purpose? Judge the choice of tool, not the action's risk. Answer true when the choice is sensible or when no better-suited tool is listed; a tool the agent has to work around is a genuine mismatch.",
+				"Given `toolbox.tools` (the tools the agent has available, with short descriptions) and `plan` (what the agent says it is doing), is the tool it reached for in `ask.action` a reasonable choice for that purpose? Judge the choice of tool, not the action's risk. Answer true when the choice is sensible or when no better-suited tool is listed; a tool the agent has to work around is a genuine mismatch." +
+				(ask.policyAvoid ? ` The user's policy warns against this tool for such calls: ${ask.policyAvoid.reason}. Weigh that warning, then answer on the fit.` : ""),
 			criteria: {
 				true: "the chosen tool is a direct way to do what the agent says it is doing, or the toolbox lists nothing better suited",
 				false: "the toolbox lists a tool built for exactly this purpose (a code search or symbol tool where the agent is grepping, a dedicated test runner where it shells out to a wrapper, a file search where it is walking directories by hand) and the agent used neither it nor a reason of its own",

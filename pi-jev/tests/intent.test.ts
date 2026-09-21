@@ -409,3 +409,149 @@ test("a check-in without steers switched on records without waking", async () =>
 	expect(log.records.some((record) => record.record !== "event")).toBe(true);
 	expect(host.sent).toHaveLength(0);
 });
+
+test("a precedence rule words an N-option choice question and the nudge keeps the rank", async () => {
+	const service = fakeService();
+	const host = fakeHost({
+		branch: branchWith({ instruction: "fix the failing test", plan: "I will edit the failing test." }),
+		tools: [
+			{ name: "bash", description: "Run a shell command." },
+			{ name: "edit", description: "Edit file ranges." },
+			{ name: "grep", description: "Search file contents." },
+		],
+	});
+	const config = testConfig({ mode: "shadow", deliverIntentNudges: true });
+	const permissionJev = fakeJevClient({
+		"intent.authorized_by_user": noul(0.97),
+		"safety.no_material_harm": noul(0.98),
+		"tool.choice": { type: "choice", choice: "edit", probabilities: { edit: 0.9, bash: 0.3, grep: 0.2 }, confidence: 0.9 },
+	});
+	const intentJev = fakeJevClient({});
+	wirePermissionAuthorizer(host.pi, { config, log: fakeLog(), jev: permissionJev as never, locator: locatorFor(new Map([["s1", service.service]])), now: () => new Date("2026-09-19T00:00:00.000Z") });
+	wireIntentConsumer(host.pi, {
+		config,
+		log: fakeLog(),
+		jev: intentJev as never,
+		now: () => new Date("2026-09-19T00:00:00.000Z"),
+		policy: {
+			preferences: [],
+			precedence: [{ intent: "edit code", order: ["edit", "grep", "bash"], reason: "surgical edits beat rewrites and shell wrangling" }],
+			margin: 0.2,
+		},
+	});
+	await host.sessionStart("s1");
+	host.emit("permissions:ready", { sessionId: "s1", adjudicatesLocally: true });
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	await host.fire("turn_start");
+	await host.fire("tool_call", { toolName: "bash", toolCallId: "req-9", input: { command: "sed -i 's/old/new/' src/a.ts" } });
+
+	const authorize = service.registered.get("pi-jev") as (d: unknown, q: unknown, l: unknown) => Promise<{ kind: string }>;
+	// The choice question named all three ranked tools as options, current tool included.
+	// The gate's ask carries the same command the tool_call fired with — the
+	// permission system passes the call's value through to the link.
+	const gateAsk = fakeDetails({ requestId: "req-9", toolName: "bash", payload: { kind: "bash", request: { requester: { agentName: "pi", forwarded: false, sessionId: null }, surface: "bash", toolName: "bash", invokedToolName: null, value: "sed -i 's/old/new/' src/a.ts", matchedPattern: null, commandContext: null, executedUnit: null }, evidence: [], annotations: [] } as never });
+	await authorize(gateAsk, fakeQuery(), { review: () => {}, debug: () => {} });
+	const choiceRequest = permissionJev.requests.find((request) => Object.keys(request.questions).includes("tool.choice"));
+	const criteria = Object.keys(choiceRequest?.questions["tool.choice"].criteria ?? {});
+	expect(criteria).toContain("bash");
+	expect(criteria).toContain("edit");
+	expect(criteria).toContain("grep");
+	// The intent clause rode the instructions, verbatim from the policy.
+	expect(choiceRequest?.questions["tool.choice"].instructions).toContain("edit code");
+	// The judge picked the top-ranked alternative with a clear margin: nudge,
+	// quoting the policy's reason.
+	const texts = host.sent.map((sent) => (sent.message as { content?: string }).content ?? "");
+	expect(texts.some((text) => text.includes("edit") && text.includes("surgical edits beat rewrites"))).toBe(true);
+	expect(intentJev.requests).toHaveLength(0);
+});
+
+test("an avoid pair stands the fit question up and the nudge quotes the warning", async () => {
+	const service = fakeService();
+	const host = fakeHost({
+		branch: branchWith({ instruction: "read the config", plan: "I will read the config file." }),
+		tools: [{ name: "bash", description: "Run a shell command." }, { name: "read", description: "Read a file." }],
+	});
+	const config = testConfig({ mode: "shadow", deliverIntentNudges: true });
+	const permissionJev = fakeJevClient({
+		"intent.authorized_by_user": noul(0.97),
+		"safety.no_material_harm": noul(0.98),
+		"tool.fit": noul(0.1),
+	});
+	const intentJev = fakeJevClient({});
+	wirePermissionAuthorizer(host.pi, { config, log: fakeLog(), jev: permissionJev as never, locator: locatorFor(new Map([["s1", service.service]])), now: () => new Date("2026-09-19T00:00:00.000Z") });
+	wireIntentConsumer(host.pi, {
+		config,
+		log: fakeLog(),
+		jev: intentJev as never,
+		now: () => new Date("2026-09-19T00:00:00.000Z"),
+		policy: {
+			preferences: [],
+			avoid: [{ tool: "bash", when: "cat ", reason: "reading files through the shell skips the read tool's guards" }],
+			margin: 0.2,
+			avoidMargin: 0.3,
+		},
+	});
+	await host.sessionStart("s1");
+	host.emit("permissions:ready", { sessionId: "s1", adjudicatesLocally: true });
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	await host.fire("turn_start");
+	await host.fire("tool_call", { toolName: "bash", toolCallId: "req-10", input: { command: "cat /etc/hosts" } });
+
+	const authorize = service.registered.get("pi-jev") as (d: unknown, q: unknown, l: unknown) => Promise<{ kind: string }>;
+	const gateAsk = fakeDetails({ requestId: "req-10", toolName: "bash", payload: { kind: "bash", request: { requester: { agentName: "pi", forwarded: false, sessionId: null }, surface: "bash", toolName: "bash", invokedToolName: null, value: "cat /etc/hosts", matchedPattern: null, commandContext: null, executedUnit: null }, evidence: [], annotations: [] } as never });
+	await authorize(gateAsk, fakeQuery(), { review: () => {}, debug: () => {} });
+
+	// The fit question fired even though no alternative was named, and carried
+	// the policy's warning verbatim in its instructions.
+	const asked = permissionJev.requests.flatMap((request) => Object.keys(request.questions));
+	expect(asked).toContain("tool.fit");
+	const fitRequest = permissionJev.requests.find((request) => Object.keys(request.questions).includes("tool.fit"));
+	expect(fitRequest?.questions["tool.fit"].instructions).toContain("skips the read tool's guards");
+	// The nudge is the avoid warning, not a preference endorsement.
+	const texts = host.sent.map((sent) => (sent.message as { content?: string }).content ?? "");
+	expect(texts.some((text) => text.includes("warns against") && text.includes("skips the read tool's guards"))).toBe(true);
+	// No choice question: the policy named no alternative for this call.
+	expect(asked).not.toContain("tool.choice");
+	expect(intentJev.requests).toHaveLength(0);
+});
+
+test("an avoid match does not fire when the call does not match the context", async () => {
+	const service = fakeService();
+	const host = fakeHost({
+		branch: branchWith({ instruction: "run the build", plan: "I will run the build." }),
+		tools: [{ name: "bash", description: "Run a shell command." }],
+	});
+	const config = testConfig({ mode: "shadow", deliverIntentNudges: true });
+	const permissionJev = fakeJevClient({
+		"intent.authorized_by_user": noul(0.97),
+		"safety.no_material_harm": noul(0.98),
+	});
+	wirePermissionAuthorizer(host.pi, { config, log: fakeLog(), jev: permissionJev as never, locator: locatorFor(new Map([["s1", service.service]])), now: () => new Date("2026-09-19T00:00:00.000Z") });
+	wireIntentConsumer(host.pi, {
+		config,
+		log: fakeLog(),
+		jev: fakeJevClient({}) as never,
+		now: () => new Date("2026-09-19T00:00:00.000Z"),
+		policy: {
+			preferences: [],
+			avoid: [{ tool: "bash", when: "cat ", reason: "reading files through the shell skips guards" }],
+			margin: 0.2,
+		},
+	});
+	await host.sessionStart("s1");
+	host.emit("permissions:ready", { sessionId: "s1", adjudicatesLocally: true });
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	await host.fire("turn_start");
+	await host.fire("tool_call", { toolName: "bash", toolCallId: "req-11", input: { command: "cargo build --release" } });
+
+	const authorize = service.registered.get("pi-jev") as (d: unknown, q: unknown, l: unknown) => Promise<{ kind: string }>;
+	const gateAsk = fakeDetails({ requestId: "req-11", toolName: "bash", payload: { kind: "bash", request: { requester: { agentName: "pi", forwarded: false, sessionId: null }, surface: "bash", toolName: "bash", invokedToolName: null, value: "cargo build --release", matchedPattern: null, commandContext: null, executedUnit: null }, evidence: [], annotations: [] } as never });
+	await authorize(gateAsk, fakeQuery(), { review: () => {}, debug: () => {} });
+	// No avoid match: the generic fit question may still fire (it always has),
+	// but no nudge quotes the policy, because the policy said nothing here.
+	const texts = host.sent.map((sent) => (sent.message as { content?: string }).content ?? "");
+	expect(texts.some((text) => text.includes("warns against"))).toBe(false);
+	const choiceAsked = permissionJev.requests.flatMap((request) => Object.keys(request.questions));
+	expect(choiceAsked).not.toContain("tool.choice");
+	expect(host.sent).toHaveLength(0);
+});

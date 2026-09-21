@@ -43,6 +43,8 @@ import type { SeamLocator } from "./gotgenes.js";
 import { createJevClient } from "./jev.js";
 import type { JevClient } from "./jev.js";
 import type { PermissionsService } from "./types.js";
+import type { ToolPolicy } from "./tool-policy.js";
+import { loadToolPolicy } from "./tool-policy.js";
 
 export interface WiringDeps {
 	config?: JevConfig;
@@ -50,6 +52,13 @@ export interface WiringDeps {
 	jev?: JevClient;
 	locator?: SeamLocator;
 	now?: () => Date;
+	/**
+	 * The user's tool policy. Unset means it is loaded from the agent directory
+	 * like the intent entry loads it — the gate needs the same ruling the
+	 * tool_call hook had, or the choice and fit questions would only fire for
+	 * calls the hook saw first.
+	 */
+	policy?: ToolPolicy;
 }
 
 /** Register a bus listener; `undefined` when the host has no event bus. */
@@ -137,6 +146,7 @@ export function wirePermissionAuthorizer(pi: ExtensionAPI, deps: WiringDeps = {}
 		config,
 		core: () => lease?.core,
 		conversation: (): ConversationFacts => configConversation(sessionSources(ctx, pi as never), config),
+		policy: deps.policy ?? loadToolPolicy().policy,
 		report,
 		...(deliver ? { deliver } : {}),
 	});

@@ -25,8 +25,9 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import type { ToolPolicy } from "./tool-choice.js";
-import { DEFAULT_TOOL_POLICY } from "./tool-choice.js";
+import type { ToolAvoid, ToolDirective, ToolGuidance, ToolPolicy, ToolPrecedence } from "./tool-choice.js";
+import { DEFAULT_TOOL_POLICY, MAX_CHOICE_OPTIONS, toolGuidance } from "./tool-choice.js";
+import type { ActionAskFacts } from "./action-pack.js";
 
 export const POLICY_FILE = "tool-policy.yaml";
 
@@ -50,17 +51,35 @@ export function policyPath(env: NodeJS.ProcessEnv = process.env): string {
  */
 export function parseToolPolicy(text: string): ToolPolicy | undefined {
 	const preferences: ToolPolicy["preferences"] = [];
+	const precedence: ToolPrecedence[] = [];
+	const avoid: ToolAvoid[] = [];
+	const directives: ToolDirective[] = [];
 	let margin: number | undefined;
+	let avoidMargin: number | undefined;
 
 	const lines = text.split("\n");
 	let current: { tool?: string; match?: string; reason?: string } | undefined;
 	let inPreferences = false;
+	/** The multi-line block being read, when any: `precedence`, `avoid`, `directives`. */
+	let section: "precedence" | "avoid" | "directives" | undefined;
+	/** The current item of the active section. */
+	let item: { intent?: string; order?: string[]; reason?: string; tool?: string; when?: string; text?: string } | undefined;
 
 	const flush = (): void => {
 		if (current && typeof current.tool === "string" && current.tool !== "" && typeof current.reason === "string" && current.reason !== "") {
 			preferences.push({ tool: current.tool, ...(current.match === undefined ? {} : { match: current.match }), reason: current.reason });
 		}
 		current = undefined;
+		if (section === "precedence" && item && typeof item.intent === "string" && item.intent !== "" && Array.isArray(item.order) && item.order.length > 0 && typeof item.reason === "string" && item.reason !== "") {
+			precedence.push({ intent: item.intent, order: item.order.slice(0, MAX_CHOICE_OPTIONS), reason: item.reason });
+		}
+		if (section === "avoid" && item && typeof item.tool === "string" && item.tool !== "" && typeof item.when === "string" && item.when !== "" && typeof item.reason === "string" && item.reason !== "") {
+			avoid.push({ tool: item.tool, when: item.when, reason: item.reason });
+		}
+		if (section === "directives" && item && typeof item.text === "string" && item.text !== "") {
+			directives.push({ ...(item.when === undefined ? {} : { when: item.when }), text: item.text });
+		}
+		item = undefined;
 	};
 
 	for (const raw of lines) {
@@ -71,40 +90,131 @@ export function parseToolPolicy(text: string): ToolPolicy | undefined {
 			const [, key, rest] = top;
 			if (key === "preferences") {
 				flush();
+				section = undefined;
 				inPreferences = rest.trim() === "" || rest.trim() === "|";
+				continue;
+			}
+			if (key === "precedence" || key === "avoid" || key === "directives") {
+				flush();
+				inPreferences = false;
+				section = rest.trim() === "" || rest.trim() === "|" ? key : undefined;
 				continue;
 			}
 			if (key === "margin") {
 				const value = Number(rest.trim());
 				if (Number.isFinite(value) && value > 0 && value < 1) margin = value;
 				inPreferences = false;
+				section = undefined;
 				continue;
 			}
+			if (key === "avoidMargin") {
+				const value = Number(rest.trim());
+				if (Number.isFinite(value) && value > 0 && value < 1) avoidMargin = value;
+				inPreferences = false;
+				section = undefined;
+				continue;
+			}
+			// An unknown top-level key ends whatever was being read; the pending
+			// record flushes first, or a section followed by anything else would
+			// silently lose its items.
+			flush();
 			inPreferences = false;
+			section = undefined;
 			continue;
 		}
-		const item = line.match(/^\s*-\s+([A-Za-z_][A-Za-z0-9_]*):\s*(.*)$/);
-		if (item && inPreferences) {
-			const [, key, rest] = item;
-			if (key === "tool") {
-				flush();
-				current = { tool: rest.trim().replace(/^["']|["']$/g, "") };
+		const named = line.match(/^\s+-\s+([A-Za-z_][A-Za-z0-9_]*):\s*(.*)$/);
+		if (named) {
+			// A list item opens a new record in the active section — `preferences`,
+			// `precedence`, `avoid`, or `directives` — or is dropped when no section
+			// is being read.
+			const [, key, rest] = named;
+			const value = rest.trim().replace(/^["']|["']$/g, "");
+			if (section === undefined) {
+				if (inPreferences && key === "tool") {
+					flush();
+					current = { tool: value };
+				}
 				continue;
 			}
-			if (current && key === "match") {
-				current.match = rest.trim().replace(/^["']|["']$/g, "");
-				continue;
+			flush();
+			if (section === "precedence" && key === "intent") item = { intent: value };
+			else if (section === "avoid" && key === "tool") item = { tool: value };
+			else if (section === "directives" && key === "text") item = { text: value };
+			else if (section === "directives" && key === "when") item = { when: value };
+			continue;
+		}
+		// An indented key under the current record: `order: [a, b]`, `match:`,
+		// `reason:`, `when:`, `text:`. This branch is what makes preference
+			// match/reason lines readable at all — the original parser matched only
+			// top-level keys and `- ` items, so an indented field was silently
+			// dropped and every preference parsed as a bare tool name.
+		const field = line.match(/^\s+([A-Za-z_][A-Za-z0-9_]*):\s*(.*)$/);
+		if (field && section === undefined && current && inPreferences) {
+			const [, key, rawRest] = field;
+			const rest = rawRest.trim().replace(/^["']|["']$/g, "");
+			if (key === "match" && current.match === undefined) current.match = rest;
+			else if (key === "reason" && current.reason === undefined) current.reason = rest;
+			continue;
+		}
+		if (field && item && section !== undefined) {
+			const [, key, rawRest] = field;
+			const rest = rawRest.trim();
+			if (key === "order" && section === "precedence") {
+				const inner = rest.replace(/^\[|\]$/g, "");
+				item.order = inner
+					.split(",")
+					.map((tool) => tool.trim().replace(/^["']|["']$/g, ""))
+					.filter((tool) => tool !== "");
+			} else if (key === "reason") {
+				item.reason = rest.replace(/^["']|["']$/g, "");
+			} else if (key === "when" && section === "avoid") {
+				item.when = rest.replace(/^["']|["']$/g, "");
+			} else if (key === "text" && section === "directives") {
+				item.text = rest.replace(/^["']|["']$/g, "");
+			} else if (key === "tool" && section === "avoid" && item.tool === undefined) {
+				item.tool = rest.replace(/^["']|["']$/g, "");
+			} else if (key === "intent" && section === "precedence" && item.intent === undefined) {
+				item.intent = rest.replace(/^["']|["']$/g, "");
 			}
-			if (current && key === "reason") {
-				current.reason = rest.trim().replace(/^["']|["']$/g, "");
-				continue;
-			}
+			continue;
 		}
 	}
 	flush();
 
-	if (preferences.length === 0) return undefined;
-	return { preferences, margin: margin ?? DEFAULT_TOOL_POLICY.margin };
+	const usable = preferences.length + precedence.length + avoid.length + directives.length;
+	if (usable === 0) return undefined;
+	return {
+		preferences,
+		...(precedence.length > 0 ? { precedence } : {}),
+		...(avoid.length > 0 ? { avoid } : {}),
+		...(directives.length > 0 ? { directives } : {}),
+		margin: margin ?? DEFAULT_TOOL_POLICY.margin,
+		...(avoidMargin === undefined ? {} : { avoidMargin }),
+	};
+}
+
+/**
+ * Stamp a policy's ruling for this call onto already-built ask facts.
+ *
+ * Both fact builders call this — the gate rebuilds its facts from the ask's
+ * details and would otherwise never see what the policy said about the call,
+ * and the tool_call hook needs the same fields for the same questions. Lives in
+ * the policy module, not the pack: the pack cannot import from here without a
+ * cycle, since the choice question's spec reads pack constants.
+ */
+export function applyGuidance(facts: ActionAskFacts, policy?: ToolPolicy): ActionAskFacts {
+	if (!policy) return facts;
+	const guidance = toolGuidance(facts, policy);
+	const first = guidance.alternatives[0];
+	if (first) {
+		facts.preferredTool = first.tool;
+		facts.preferredReason = guidance.reason ?? first.reason;
+	}
+	facts.rankedAlternatives = guidance.alternatives.map((alternative) => ({ tool: alternative.tool, reason: alternative.reason, ...(guidance.intent ? { intent: guidance.intent } : {}) }));
+	facts.policyIntent = guidance.intent;
+	facts.policyDirectives = guidance.directives;
+	facts.policyAvoid = guidance.avoid ? { reason: guidance.avoid.reason } : null;
+	return facts;
 }
 
 /** The loaded policy, or the default when the file is absent or unreadable. */

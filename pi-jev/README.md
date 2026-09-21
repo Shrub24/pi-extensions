@@ -70,7 +70,30 @@ margin: 0.2                # how clearly the judge must prefer it before a nudge
 
 When a tool call matches a preference, the consumer queues `tool.choice` — a single choice question naming the tool in use and the policy's alternative. The judge answers with the tool it would pick and per-option probabilities; when its pick is the policy's alternative with a margin at or above `margin`, the nudge quotes the policy's reason: *"your policy prefers grep for `rg 'retry' src/`: ripgrep is faster for content search. Use it, or say why this call needs the tool it chose."* A pick without a clear margin stays quiet, and a judge that picks the tool in use stays quiet — the nudge fires only when the judge endorses the policy's alternative against the call that was made.
 
-No policy file, or an unreadable one, means no choice question and a one-time notice.
+The same file can rank a whole class of work instead of naming one alternative:
+
+```yaml
+precedence:
+  - intent: edit code        # matched by the judge, not by string search
+    order: [edit, write, bash]
+    reason: surgical edits beat rewrites and shell wrangling
+avoid:
+  - tool: bash
+    when: "cat "             # only when the call's value contains this
+    reason: reading files through the shell skips the read tool's guards
+directives:
+  - text: prefer edit for anything surgical
+  - when: edit               # directives with `when` apply to that tool only
+    text: write only for new files
+margin: 0.2                # the choice nudge's bar, and the fallback bar
+avoidMargin: 0.3            # how clearly the judge must agree before an avoid warning fires
+```
+
+- **`precedence`** turns `tool.choice` into an N-option question: every tool in `order` becomes an option, the intent clause rides the instructions verbatim, and the nudge fires when the judge picks a tool ranked above the one in use with a clear margin. More specific rules win: an intent precedence containing the tool in use beats a per-call `match`, which beats a bare mapping.
+- **`avoid`** stands up the `tool.fit` question with the policy's warning in its wording. The nudge fires only when the judge agrees the fit is poor — probability at or below `1 − avoidMargin` — and quotes the policy's reason: *"your policy warns against this call — reading files through the shell skips the read tool's guards. Do it another way, or say why this call needs the tool it chose."*
+- **`directives`** shape the judge's read without ever firing a nudge alone; they are folded into the choice question's instructions.
+
+A file with none of the four constructs — or an unreadable one — means no tool questions and a one-time notice.
 
 ## The question pack
 

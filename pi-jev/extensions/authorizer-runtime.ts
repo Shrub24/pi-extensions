@@ -19,10 +19,12 @@
 
 import { askFactsFrom, callSubject, pendingCallLine } from "./action-pack.js";
 import type { ActionContext, ConversationFacts } from "./action-pack.js";
+import { applyGuidance } from "./tool-policy.js";
 import { askPermission, PERMISSION_CONSUMER } from "./consumers.js";
 import type { Nudge } from "./consumers.js";
 import type { JevConfig } from "./config.js";
 import type { DecisionCore } from "./decision-core.js";
+import type { ToolPolicy } from "./tool-policy.js";
 import type { Authorizer, AuthorizerLog, AuthorizerVerdict, PermissionQuery, PromptPermissionDetails } from "./types.js";
 
 export type { Nudge };
@@ -36,6 +38,13 @@ export interface AuthorizerRuntimeDeps {
 	core: () => DecisionCore<ActionContext> | undefined;
 	/** The session's facts, read fresh for every ask. */
 	conversation: () => ConversationFacts;
+	/**
+	 * The user's tool policy, when one was loaded. The gate resolves its guidance
+	 * per ask so the choice and fit questions see the same facts a queued call
+	 * carried — the ask rebuilds its facts from the gate's details, and without
+	 * this the policy's ruling would only reach the tool_call hook's copy.
+	 */
+	policy?: ToolPolicy;
 	/** Reports a problem once per distinct message; used for the one-time notice. */
 	report?: (problem: string) => void;
 	/** Where a nudge goes. Unset means signals are recorded and dropped. */
@@ -62,7 +71,7 @@ export function createAuthorizerRuntime(deps: AuthorizerRuntimeDeps): Authorizer
 		authorizerLog: AuthorizerLog,
 	): Promise<AuthorizerVerdict> => {
 		try {
-			const facts = askFactsFrom(details, query);
+			const facts = applyGuidance(askFactsFrom(details, query), deps.policy);
 			const core = deps.core();
 			if (!core) {
 				once("pi-jev: no decision core for this session, so the ask was deferred to you.");
