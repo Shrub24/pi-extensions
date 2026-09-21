@@ -1,0 +1,137 @@
+{
+	"name": "@vanillagreen/pi-cbmem",
+	"version": "0.1.0",
+	"description": "codebase-memory-mcp as native Pi tools over MCP stdio: auto-index on connect, session project by default, no admin surface.",
+	"license": "MIT",
+	"keywords": [
+		"pi-package",
+		"pi",
+		"coding-agent",
+		"codebase-memory",
+		"code-graph",
+		"mcp"
+	],
+	"pi": {
+		"extensions": [
+			"./extensions/cbmem.ts"
+		]
+	},
+	"scripts": {
+		"test": "bun test ./tests"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"peerDependenciesMeta": {
+		"@earendil-works/pi-coding-agent": {
+			"optional": true
+		}
+	},
+	"kendex": {
+		"extensionManager": {
+			"displayName": "Codebase Memory",
+			"settings": [
+				{
+					"key": "enabled",
+					"label": "Enable codebase memory",
+					"description": "Register the graph tools and start the codebase-memory server for this session. Disable and reload to remove the tool surface.",
+					"type": "boolean",
+					"default": true,
+					"category": "General",
+					"apply": "reload",
+					"requiresReload": true
+				},
+				{
+					"key": "binary",
+					"label": "Server binary",
+					"description": "Executable that serves the graph over MCP stdio. Name resolves from PATH; an absolute path pins a specific build.",
+					"type": "string",
+					"default": "codebase-memory-mcp",
+					"category": "General",
+					"apply": "reload",
+					"requiresReload": true
+				},
+				{
+					"key": "project",
+					"label": "Project override",
+					"description": "Pin every query to this indexed project instead of deriving the name from the session working directory. Leave empty for per-workspace behaviour.",
+					"type": "string",
+					"default": "",
+					"category": "General",
+					"apply": "reload",
+					"requiresReload": true
+				},
+				{
+					"key": "connectOnSessionStart",
+					"label": "Connect at session start",
+					"description": "Start the server when the session opens. The connection is what triggers auto-indexing and watcher registration for this project, so leaving it on keeps the graph fresh before the first query.",
+					"type": "boolean",
+					"default": true,
+					"category": "Indexing",
+					"apply": "reload",
+					"requiresReload": true
+				},
+				{
+					"key": "adminTools",
+					"label": "Register admin tools",
+					"description": "Also register index_repository, delete_project, manage_adr, and ingest_traces. Off by default: the daemon indexes automatically and the rest are rare or destructive.",
+					"type": "boolean",
+					"default": false,
+					"category": "Tools",
+					"apply": "reload",
+					"requiresReload": true
+				},
+				{
+					"key": "enabledTools",
+					"label": "Enabled tools",
+					"description": "Comma-separated allowlist of tool names, or the group name \"admin\". Empty registers the default query surface.",
+					"type": "string",
+					"default": "",
+					"category": "Tools",
+					"apply": "reload",
+					"requiresReload": true
+				},
+				{
+					"key": "disabledTools",
+					"label": "Disabled tools",
+					"description": "Comma-separated tool names or group names to leave unregistered, applied after the allowlist.",
+					"type": "string",
+					"default": "",
+					"category": "Tools",
+					"apply": "reload",
+					"requiresReload": true
+				},
+				{
+					"key": "requestTimeoutMs",
+					"label": "Request timeout",
+					"description": "Per-call timeout in milliseconds; 0 disables it. A timeout is reported as a tool error and the connection stays up.",
+					"type": "number",
+					"default": 120000,
+					"category": "General",
+					"apply": "live"
+				},
+				{
+					"key": "notifyOnError",
+					"label": "Notify on server errors",
+					"description": "Show one warning when the server cannot start or dies. Tool errors are always returned to the agent.",
+					"type": "boolean",
+					"default": true,
+					"category": "General",
+					"apply": "live"
+				}
+			]
+		}
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/vanillagreencom/kendex.git",
+		"directory": "pi-extensions/pi-cbmem"
+	},
+	"author": "vanillagreen",
+	"publishConfig": {
+		"access": "public"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	}
+}
