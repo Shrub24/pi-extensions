@@ -781,7 +781,7 @@ export function stateBudget(config: {
 export interface BandReading {
 	id: string;
 	role: QuestionRole;
-	kind: "noul" | "score";
+	kind: "noul" | "score" | "choice";
 	/** `missing` is an answer the request never returned or that failed validation. */
 	band: "satisfied" | "violated" | "unclear" | "missing";
 	probability: number | null;

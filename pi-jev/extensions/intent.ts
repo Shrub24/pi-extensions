@@ -121,8 +121,13 @@ export function toolCallFacts(event: ToolCallLike, fallbackId: string, policy?: 
 }
 
 /** The plan group's interpretation, for a flush this consumer queued. */
-export function interpretIntent(readings: Parameters<typeof interpretBands>[0], config: JevConfig, callLine = "") {
-	return interpretBands(readings, INTENT_SPECS, config, callLine);
+export function interpretIntent(
+	readings: Parameters<typeof interpretBands>[0],
+	config: JevConfig,
+	callLine = "",
+	tool?: { policy: ToolPolicy; preferredTool: string | null },
+) {
+	return interpretBands(readings, INTENT_SPECS, config, callLine, tool);
 }
 
 /** The second consumer this entry runs: tool choice against the user's policy. */
@@ -201,13 +206,22 @@ export function wireIntentConsumer(pi: ExtensionAPI, deps: IntentDeps = {}): voi
 					return unavailable ? undefined : client.warm();
 				});
 		}
+		// One interpretation, registered by both consumers: the record then carries
+		// the plan bands and the tool band together, and a boundary flush — whose
+		// owners are both of them — still has a reading to write down.
+		const sharedInterpret = (readings: Parameters<typeof interpretBands>[0], input?: ActionContext) =>
+			interpretIntent(readings, config, "", { policy: toolPolicy, preferredTool: input?.facts.preferredTool ?? null });
+
 		lease.core.registerConsumer({
 			id: INTENT_CONSUMER,
 			questions: INTENT_QUESTIONS,
 			// A plan question with no plan in the state is unanswerable, so a call
 			// with nothing stated ahead of it is dropped from the flush entirely.
 			applies: (context: ActionContext) => conversationOf(context).declaredPlan !== null,
-			interpret: (readings) => interpretIntent(readings, config),
+			// The tool band rides this record too: an ungated call never passes the
+			// gate, so the turn boundary is the only place its tool reading is
+			// written down.
+			interpret: sharedInterpret,
 			onAnswers: (delivery) => {
 				if (!deliver) return;
 				const nudges = intentNudges(delivery.readings, config);
@@ -230,24 +244,14 @@ export function wireIntentConsumer(pi: ExtensionAPI, deps: IntentDeps = {}): voi
 		// call whose policy names an alternative, and its readings come back with
 		// whatever flush answers them. Its nudge text names the policy's reason,
 		// because "the policy prefers X" without why teaches nothing.
-		lease.core.registerQuestions(
-			TOOL_CHOICE_QUESTIONS.map((spec) => ({
-				id: spec.id,
-				blocks: spec.blocks,
-				owner: TOOL_CHOICE_CONSUMER,
-				meta: { role: spec.role, purpose: spec.purpose, measured: spec.measured },
-				applies: (context: ActionContext) => spec.applies(context.facts),
-				question: (context: ActionContext) => spec.question(context.facts) ?? undefined,
-				read: (answer) => {
-					const read = spec.read(answer);
-					return read ? { probability: read.margin, level: null, detail: { choice: read.choice, margin: read.margin } } : undefined;
-				},
-			})),
-		);
+		// The questions themselves are registered with the pack (`installPack`), so a
+		// gate's flush carries them even when this entry is not loaded; what this
+		// entry adds is the delivery — who reads the answers and what they say.
 		lease.core.registerConsumer({
 			id: TOOL_CHOICE_CONSUMER,
 			questions: ["tool.choice", "tool.fit"],
 			applies: (context: ActionContext) => context.facts.preferredTool != null || context.facts.policyAvoid != null,
+			interpret: sharedInterpret,
 			onAnswers: (delivery) => {
 				if (!deliver) return;
 				const nudges: Nudge[] = [];

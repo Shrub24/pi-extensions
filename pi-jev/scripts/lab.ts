@@ -31,7 +31,7 @@ import { createDecisionCore } from "../extensions/decision-core.js";
 import { askRecordFromCore } from "../extensions/decision-record.js";
 import { createJevClient } from "../extensions/jev.js";
 import { DEFAULTS } from "../extensions/config.js";
-import { bandFor, INTENT_QUESTIONS, PERMISSION_CONSUMER, PERMISSION_QUESTIONS } from "../extensions/consumers.js";
+import { bandFor, interpretBands, INTENT_QUESTIONS, INTENT_SPECS, PERMISSION_CONSUMER, PERMISSION_QUESTIONS } from "../extensions/consumers.js";
 import { TOOL_CHOICE_QUESTIONS } from "../extensions/tool-choice.js";
 import { applyGuidance, loadToolPolicy } from "../extensions/tool-policy.js";
 
@@ -311,9 +311,14 @@ for (const scenario of scenarios) {
 			questions,
 		});
 		const readings = result?.readings ? Object.values(result.readings) : [];
-		const specs = [...ACTION_PACK, ...TOOL_CHOICE_QUESTIONS].filter((spec) => questions.includes(spec.id));
-		const bands = bandFor(specs, readings, config);
-		const composed = composeVerdict(bands);
+		// The same interpretation the records use: the pack's own band for each
+		// question, and the policy's reading of the tool question.
+		const specs = (set === "veto" ? ACTION_PACK : INTENT_SPECS).filter((spec) => questions.includes(spec.id));
+		// The tool band belongs to the advisory set: it is the same reading either
+		// way, and printing it twice would double every tally.
+		const interpretation = interpretBands(readings, specs, config, "", set === "advisory" ? { policy, preferredTool: facts.preferredTool ?? null } : undefined);
+		const bands = interpretation.bands as unknown as ReturnType<typeof bandFor>;
+		const composed = composeVerdict(bands, undefined);
 		const latency = result?.elapsedMs ?? null;
 		const error = result?.requests.flatMap((request) => (request.error ? [request.error] : [])).join("; ") || null;
 		verdicts.push({ scenario: scenario.name, set, kind: composed.kind, decidedBy: composed.decidedBy ?? null, signals: composed.signals.map((signal) => signal.source.join?.("") ?? signal.source).flat() as string[], latencyMs: latency, error });

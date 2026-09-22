@@ -151,7 +151,12 @@ export interface QueueRequest<A = unknown> {
  */
 export interface SendRequest<A = unknown> extends QueueRequest<A> {
 	/** Opaque per-band detail for the log; the core never reads it. */
-	interpret?: (readings: readonly Reading[]) => unknown;
+	/**
+	 * How this consumer's own answers read, for a flush it did not start — a
+	 * boundary flush of its queued work. The input is the subject's stored one,
+	 * so a reader can see the facts the call carried.
+	 */
+	interpret?: (readings: readonly Reading[], input?: A) => unknown;
 	signal?: AbortSignal;
 	/**
 	 * Ceiling for this batch, in milliseconds. When it passes, the requests still
@@ -198,7 +203,12 @@ export interface ConsumerSubscription<A = unknown> {
 	applies?(input: A): boolean;
 	/** Called after a flush with the readings for this consumer's questions. */
 	onAnswers?(delivery: ConsumerDelivery): void;
-	interpret?: (readings: readonly Reading[]) => unknown;
+	/**
+	 * How this consumer's own answers read, for a flush it did not start — a
+	 * boundary flush of its queued work. The input is the subject's stored one,
+	 * so a reader can see the facts the call carried.
+	 */
+	interpret?: (readings: readonly Reading[], input?: A) => unknown;
 }
 
 export interface ConsumerDelivery<A = unknown> {
@@ -355,13 +365,15 @@ export function createDecisionCore<A = unknown>(options: DecisionCoreOptions<A>)
 		state: SubjectState,
 		subjectKey: string,
 		requests: readonly CoreRequest[],
-		interpret?: (readings: readonly Reading[]) => unknown,
+		interpret?: (readings: readonly Reading[], input?: A) => unknown,
 	): void {
 		if (!options.record || requests.length === 0) return;
 		let interpreted: unknown;
 		if (interpret) {
 			try {
-				interpreted = interpret([...state.readings.values()]);
+				// The subject's own input rides along: a reader that needs the facts a
+				// call carried (which tool the policy named, say) reads them here.
+				interpreted = interpret([...state.readings.values()], state.input);
 			} catch {
 				// A caller's interpreter is opaque to the core; a defect in it cannot
 				// fail a request that already produced answers.

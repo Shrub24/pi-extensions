@@ -84,7 +84,7 @@ export function createAuthorizerRuntime(deps: AuthorizerRuntimeDeps): Authorizer
 			// the correlation id the decision channel joins on.
 			const subject = callSubject({ toolCallId: facts.toolCallId, requestId: facts.requestId, correlationId: facts.requestId });
 
-			const outcome = await askPermission({ config, core, context, subject });
+			const outcome = await askPermission({ config, core, context, subject, ...(deps.policy ? { policy: deps.policy } : {}) });
 			const misconfigured = outcome.errors.find((error) => error.code === "configuration");
 			if (misconfigured) once(`pi-jev: no usable judge (${misconfigured.message}). Every ask is deferred to you.`);
 			const returned = config.mode === "live" ? outcome.verdict : ({ kind: "defer" } as AuthorizerVerdict);

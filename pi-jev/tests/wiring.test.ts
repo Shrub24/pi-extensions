@@ -4,7 +4,7 @@ import { joinRecords } from "../extensions/decision-record.js";
 import type { DecisionRecord } from "../extensions/decision-record.js";
 import type { JevConfig } from "../extensions/config.js";
 import { wirePermissionAuthorizer } from "../extensions/wiring.js";
-import { fakeDetails, fakeJevClient, fakeLog, fakeQuery, noul, testConfig } from "./fixtures/fakes.js";
+import { fakeDetails, fakeJevClient, fakeLog, fakeQuery, noul, score, testConfig } from "./fixtures/fakes.js";
 import { resetRegistry } from "../extensions/registry.js";
 import { fakeHost as fakePi, fakeService, locatorFor } from "./fixtures/host.js";
 
@@ -304,4 +304,58 @@ test("a local ask never carries the subagent questions", async () => {
 	const asks = harnessed.log.records.filter((record) => record.record === "ask");
 	expect(new Set(asks.flatMap((ask) => (ask as { blocks?: { id: string }[] }).blocks?.map((entry) => entry.id) ?? []))).toEqual(new Set(["ask", "user_intent", "plan", "tool_history", "toolbox", "authority"]));
 	expect(harnessed.sent).toHaveLength(0);
+});
+
+test("a gate ask carries the tool questions and their band, and they cannot refuse", async () => {
+	// The gate is where every call in a session passes, so it is where the tool
+	// policy's reading piles up for analysis. Both tool questions are advisory:
+	// a violated band is recorded and can nudge, but the verdict it composes into
+	// is still an allow.
+	const host = fakePi();
+	const service = fakeService();
+	const jev = fakeJevClient({
+		"safety.no_material_harm": noul(0.99),
+		"safety.reversibility": score(1),
+		"intent.conflicts_with_user": noul(0.98),
+		"tool.choice": { type: "choice", choice: "semble_search", probabilities: { semble_search: 0.9, grep: 0.1 }, confidence: 0.9 },
+	});
+	const log = fakeLog();
+	wirePermissionAuthorizer(host.pi, {
+		config: testConfig({ mode: "live" }),
+		log,
+		jev: jev as never,
+		locator: locatorFor(new Map([["s1", service.service]])),
+		now: () => new Date("2026-09-19T00:00:00.000Z"),
+		policy: {
+			preferences: [],
+			margin: 0.2,
+			precedence: [{ intent: "locate a concept", order: ["semble_search", "grep"], reason: "semble first" }],
+		},
+	});
+	await host.sessionStart("s1");
+	host.emit("permissions:ready", { sessionId: "s1", adjudicatesLocally: true });
+	await new Promise((resolve) => setTimeout(resolve, 0));
+
+	const authorizeLink = service.registered.get("pi-jev") as (details: unknown, query: unknown, log: unknown) => Promise<{ kind: string }>;
+	const base = fakeDetails();
+	const verdict = await authorizeLink(
+		fakeDetails({
+			toolName: "grep",
+			payload: { ...base.payload, kind: "tool", request: { ...base.payload.request, surface: "grep", toolName: "grep", value: "retryBackoff" } },
+		}),
+		fakeQuery(),
+		{ review: () => {}, debug: () => {} },
+	);
+
+	// Asked, and recorded: the ask carries the choice question, and the record's
+	// bands state the policy's own reading of the call.
+	const asked = jev.requests.flatMap((request) => Object.keys(request.questions));
+	expect(asked).toContain("tool.choice");
+	const record = log.records.find((entry) => entry.record === "ask" && (entry.questions ?? []).includes("tool.choice"));
+	expect(record).toBeDefined();
+	const choiceBand = (record as { bands?: { id: string; band: string }[] }).bands?.find((band) => band.id === "tool.choice");
+	expect(choiceBand?.band).toBe("violated");
+
+	// Advisory: the judge endorsing the policy's alternative does not refuse the call.
+	expect(verdict.kind).toBe("allow");
 });

@@ -58,6 +58,8 @@ A third consumer needs to add a file that calls `acquireCore` and registers itse
 
 ### Tool choice and the policy file
 
+Tool questions ride **both** entries' flushes. A gate is where every call in a session passes, so the permission consumer asks `tool.choice` and `tool.fit` too — for the record, not the verdict: both are advisory, so a violated tool band can nudge but never refuses. Ungated calls get the same treatment at the turn boundary, which means the tool reading is written down for every call either way, and `tool.choice`'s band in a record is the policy's own reading (violated when the judge endorses the policy's alternative over the tool the call used).
+
 The intent entry also runs a second consumer: **tool choice**. A policy file at `~/.pi/agent/pi-jev/tool-policy.yaml` (user-owned, like the settings file — a project cannot steer it) says which tool you would rather see for what:
 
 ```yaml
