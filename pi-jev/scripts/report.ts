@@ -134,6 +134,14 @@ if (objectionLimit > 0) {
 	}
 }
 
+// Bands whose refused boundary is not the mirror of the satisfied one: the
+// number that decides a deny, so a threshold review has to see it.
+const asymmetric = new Map<string, number>();
+for (const ask of asks) for (const band of ask.bands) if (typeof band.violatedAt === "number") asymmetric.set(band.id, band.violatedAt);
+if (asymmetric.size > 0) {
+	console.log(`\nrefused boundaries declared by the pack: ${[...asymmetric].map(([id, at]) => `${id} <= ${at}`).join(", ")}`);
+}
+
 const questions = [...new Set(asks.flatMap((ask) => ask.bands.filter((band) => band.probability !== null).map((band) => band.id)))].filter(
 	(id) => questionFilter === undefined || id === questionFilter,
 );

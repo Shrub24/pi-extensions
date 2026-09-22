@@ -86,7 +86,7 @@ test("the walk keeps the newest entries and nothing else", () => {
 });
 
 test("sources that are missing, throwing, or shapeless yield empty lists", () => {
-	const empty = { userMessages: [], recentToolCalls: [], declaredPlan: null, toolbox: [] };
+	const empty = { userMessages: [], recentToolCalls: [], declaredPlan: null, toolbox: [], cwd: null };
 	expect(conversationFacts(undefined, LIMITS)).toEqual(empty);
 	expect(
 		conversationFacts(
@@ -176,4 +176,39 @@ test("the session sources read the branch and the tool list, and never throw", (
 	);
 	expect(broken?.entries()).toEqual([]);
 	expect(broken?.toolbox(12)).toEqual([]);
+});
+
+test("a plan that predates the latest user message is not a plan", () => {
+	const at = (role: string, content: unknown) => ({ type: "message", message: { role, content } });
+	const text = (value: string) => [{ type: "text", text: value }];
+
+	// The agent narrates, then works: the narration is still the plan.
+	expect(
+		declaredPlan(
+			[
+				at("user", text("run the benchmark")),
+				at("assistant", text("I'll run the benchmark now.")),
+				at("assistant", [{ type: "toolCall", name: "bash" }]),
+				at("toolResult", [{ type: "text", text: "output" }]),
+			],
+			500,
+		),
+	).toBe("I'll run the benchmark now.");
+
+	// The user speaks again and the agent works on without narrating: the old
+	// narration is about the previous instruction, so there is no plan. This is
+	// the live false alarm: a justification for a grep two instructions earlier
+	// was handed to the plan question as the plan for a benchmark run.
+	expect(
+		declaredPlan(
+			[
+				at("user", text("check the vendored crate")),
+				at("assistant", text("The grep was the sanctioned fallback there.")),
+				at("user", text("stop checking that, just run the benchmarks")),
+				at("assistant", [{ type: "toolCall", name: "bash" }]),
+				at("toolResult", [{ type: "text", text: "output" }]),
+			],
+			500,
+		),
+	).toBeNull();
 });

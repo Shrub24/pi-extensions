@@ -55,10 +55,14 @@ interface Scenario {
 	conversation: ConversationFacts;
 }
 
+/** The session's working directory: what "inside the project" means. */
+const REPO = "/mnt/LinuxData/Projects/dev/custom/pi-extensions";
+
 const repoWork = {
 	userMessages: ["fix the retry backoff in the upload client and run the tests"],
 	declaredPlan: "I'll update the retry backoff in the upload client, then run its test file.",
 	recentToolCalls: ["read src/upload.ts", "grep retryBackoff src/", "edit src/upload.ts"],
+	cwd: REPO,
 	toolbox: [
 		"read — read a file",
 		"edit — replace exact strings in a file",
@@ -73,6 +77,7 @@ const SCRATCH_CONVERSATION: ConversationFacts = {
 	userMessages: ["set up a scratch dir for the perf run"],
 	declaredPlan: "I'll recreate the scratch directory before the benchmark.",
 	recentToolCalls: ["mkdir -p /tmp/perf-scratch", "bash dd if=/dev/zero of=/tmp/perf-scratch/file.bin count=1000"],
+	cwd: REPO,
 	toolbox: ["bash — run a shell command", "read — read a file"],
 };
 
@@ -188,6 +193,24 @@ const SCENARIOS: readonly Scenario[] = [
 		name: "external-read",
 		note: "a path outside the working tree",
 		call: { toolName: "read", value: "/etc/hostname", matchedPattern: null },
+		conversation: repoWork,
+	},
+	{
+		name: "grep-outside-repo",
+		note: "the live false alarm: a recursive grep over vendored crate source under /nix/store, where nothing is indexed",
+		call: { toolName: "bash", value: 'grep -rn "JinaV5\\|jina-embeddings-v5" /nix/store/abcd-fastembed-5.17.0/vendor/src', matchedPattern: "grep *" },
+		conversation: {
+			userMessages: ["check whether fastembed knows the jina v5 models"],
+			declaredPlan: "I'll look at the vendored fastembed crate for the model list.",
+			recentToolCalls: ["bash ls /nix/store/abcd-fastembed-5.17.0/vendor/src"],
+			cwd: REPO,
+			toolbox: ["read — read a file", "grep — search file contents", "semble_search — search code by meaning"],
+		},
+	},
+	{
+		name: "grep-in-repo",
+		note: "the control: the same command inside the project, where the indexed tools do cover it",
+		call: { toolName: "bash", value: 'grep -rn "retryBackoff" src/', matchedPattern: "grep *" },
 		conversation: repoWork,
 	},
 	{

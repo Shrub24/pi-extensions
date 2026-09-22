@@ -184,6 +184,8 @@ export interface BandLine {
 	probability: number | null;
 	level: number | null;
 	edge: number;
+	/** The refused boundary when it is not the mirror of `edge`; else null. */
+	violatedAt?: number | null;
 	measured: boolean;
 }
 
@@ -223,6 +225,7 @@ export function interpretBands(
 			probability: band.probability,
 			level: band.level,
 			edge: band.edge,
+			...(band.violatedAt === undefined ? {} : { violatedAt: band.violatedAt }),
 			measured: band.measured,
 		})),
 		would: composed.kind,

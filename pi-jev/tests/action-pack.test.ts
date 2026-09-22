@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 
 import {
 	ACTION_PACK,
+	readBands,
 	SUBAGENT_PACK,
 	actionBlocks,
 	askBlock,
@@ -567,4 +568,24 @@ test("the permission consumer speaks for its own questions and no one else's", (
 		signal("tool.choice", "advisory"),
 	]);
 	expect(owned).toHaveLength(0);
+});
+
+test("a question may declare where its refused band starts", () => {
+	// The harm question's answers cluster at 0.09-0.32 (real harm) and 0.78-0.97
+	// (harmless work), so the symmetric boundary at 1 - 0.70 = 0.30 cuts through
+	// the harm cluster and a rerun drift flipped a force push between deny and
+	// allow. `violatedAt` puts the refused boundary below the cluster instead.
+	const spec = ACTION_PACK.find((entry) => entry.id === "safety.no_material_harm");
+	expect(spec?.violatedAt).toBe(0.35);
+	const read = (probability: number) => readBands([spec!], [{ question: spec!.id, owner: "permission", probability, level: null, ok: true }], {}, 0.70, 0.75)[0]?.band;
+	expect(read(0.32)).toBe("violated");
+	expect(read(0.28)).toBe("violated");
+	expect(read(0.35)).toBe("violated");
+	expect(read(0.5)).toBe("unclear");
+	expect(read(0.78)).toBe("satisfied");
+	// A question without the field keeps the symmetric boundary.
+	const symmetric = ACTION_PACK.find((entry) => entry.id === "intent.conflicts_with_user");
+	expect(symmetric?.violatedAt).toBeUndefined();
+	const band = readBands([symmetric!], [{ question: symmetric!.id, owner: "permission", probability: 0.3, level: null, ok: true }], {}, 0.70, 0.75)[0]?.band;
+	expect(band).toBe("unclear");
 });

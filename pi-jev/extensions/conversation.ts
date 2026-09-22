@@ -83,6 +83,13 @@ export function userMessageText(content: unknown): string {
  * any, which is what "the plan" means for a call made in the message after it.
  * Thinking blocks are deliberately excluded — a plan the user cannot see is not
  * the agent's stated intent.
+ *
+ * A user message ends the search. The agent narrates, the user replies, the agent
+ * works on the new instruction without narrating again — and the old narration is
+ * then not a plan for anything, which is what produced two false plan objections
+ * in the live log (the text in front of the judge was a justification for a grep
+ * two instructions earlier). Null means "no plan", and the plan question answers
+ * true on null.
  */
 export function declaredPlan(entries: readonly unknown[], max: number): string | null {
 	if (!Array.isArray(entries)) return null;
@@ -90,7 +97,11 @@ export function declaredPlan(entries: readonly unknown[], max: number): string |
 		const entry = entries[index];
 		if (!isRecord(entry) || entry.type !== "message") continue;
 		const message = entry.message;
-		if (!isRecord(message) || message.role !== "assistant" || !Array.isArray(message.content)) continue;
+		if (!isRecord(message)) continue;
+		// The user has spoken since the agent last did: whatever the agent said
+		// before that was about an instruction that is no longer current.
+		if (message.role === "user") return null;
+		if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
 		const text = (message.content as ContentPart[])
 			.filter((part) => part && typeof part === "object" && part.type === "text" && typeof part.text === "string")
 			.map((part) => part.text as string)
@@ -162,6 +173,13 @@ export interface ConversationSources {
 	entries: () => readonly unknown[];
 	/** The live tool list, when the caller can reach it. */
 	toolbox: (limit: number) => string[];
+	/**
+	 * The session's working directory. It is what makes "inside the project" a
+	 * question the judge can answer: a search under it is repository exploration,
+	 * and one under `/nix/store`, a dependency cache, or a scratch directory is
+	 * not, whatever the command looks like.
+	 */
+	cwd: string | null;
 }
 
 /**
@@ -199,7 +217,7 @@ export function skillLoaded(entries: readonly unknown[], skill: string): boolean
 export function conversationFacts(sources: ConversationSources | undefined, limits: ConversationLimits): ConversationFacts {
 	const userMessages: string[] = [];
 	const recentToolCalls: string[] = [];
-	const empty: ConversationFacts = { userMessages, recentToolCalls, declaredPlan: null, toolbox: [] };
+	const empty: ConversationFacts = { userMessages, recentToolCalls, declaredPlan: null, toolbox: [], cwd: null };
 	if (!sources) return empty;
 
 	let entries: readonly unknown[] = [];
@@ -239,13 +257,15 @@ export function conversationFacts(sources: ConversationSources | undefined, limi
 		recentToolCalls: limits.maxToolCalls > 0 ? recentToolCalls.slice(-limits.maxToolCalls) : [],
 		declaredPlan: limits.maxPlanChars > 0 ? declaredPlan(entries, limits.maxPlanChars) : null,
 		toolbox,
+		cwd: typeof sources.cwd === "string" && sources.cwd !== "" ? sources.cwd : null,
 	};
 }
 
 /** The session's own sources, or a stub when the context exposes none. */
-export function sessionSources(ctx: Pick<ExtensionContext, "sessionManager"> | undefined, pi: ExtensionAPIForTools | undefined): ConversationSources | undefined {
+export function sessionSources(ctx: Pick<ExtensionContext, "sessionManager" | "cwd"> | undefined, pi: ExtensionAPIForTools | undefined): ConversationSources | undefined {
 	if (!ctx?.sessionManager && !pi) return undefined;
 	return {
+		cwd: typeof ctx?.cwd === "string" ? ctx.cwd : null,
 		entries: () => {
 			try {
 				return (ctx?.sessionManager?.getBranch() ?? []) as readonly unknown[];

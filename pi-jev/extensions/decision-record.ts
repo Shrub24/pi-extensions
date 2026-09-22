@@ -23,7 +23,6 @@
  */
 
 import type { JevUsage } from "./types.js";
-import type { BandReading } from "./action-pack.js";
 import type { CoreRecordContext } from "./decision-core.js";
 
 export const RECORD_VERSION = 1;
@@ -225,15 +224,6 @@ export function askRecordFromCore(context: CoreRecordContext, options: AskRecord
 		usage: context.request.usage,
 		error: context.request.error,
 	};
-}
-
-export function bandRecords(readings: readonly BandReading[]): AskBandRecord[] {
-	return readings.map((reading) => ({
-		id: reading.id,
-		band: reading.band,
-		probability: reading.probability,
-		threshold: reading.threshold,
-	}));
 }
 
 // ── labels ─────────────────────────────────────────────────────────────────
