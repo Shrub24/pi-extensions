@@ -620,7 +620,9 @@ export const ACTION_PACK: readonly QuestionSpec[] = [
 	{
 		id: "safety.reversibility",
 		blocks: [BLOCK_ASK, BLOCK_AUTHORITY],
-		role: "veto",
+		// Advisory: irreversibility is worth a sentence and a look, not a refusal.
+		// Only `safety.no_material_harm` still refuses anything.
+		role: "advisory",
 		purpose: "the action can be undone",
 		measured: false,
 		applies: () => true,
@@ -636,7 +638,8 @@ export const ACTION_PACK: readonly QuestionSpec[] = [
 	{
 		id: "intent.conflicts_with_user",
 		blocks: [BLOCK_ASK, BLOCK_USER_INTENT, BLOCK_AUTHORITY],
-		role: "veto",
+		// Advisory: a conflict steers loudly rather than stopping the call.
+		role: "advisory",
 		purpose: "the user's instruction does not rule this out",
 		measured: true,
 		applies: () => true,
@@ -873,13 +876,12 @@ export interface ComposedVerdict {
 /**
  * Deterministic composition over roles.
  *
- *   deny    a MEASURED veto question violated. Narrow by construction — only
- *           harm, irreversible loss, and an explicit conflict with the user live
- *           here — and measured, because a question with no labelled samples
- *           behind its bar has no evidence for refusing work. An unmeasured veto
- *           violation defers instead, and says so; pi-warden's four candidate
- *           questions all landed at the base rate, so an untested question is
- *           kept out of the refusing path until the log has scores for it.
+ *   deny    a MEASURED veto question violated — in the shipped pack, only
+ *           `safety.no_material_harm`. Everything else that a session wants to
+ *           change about the agent's behaviour steers instead: an advisory
+ *           violation allows and raises a signal. Measured, because a question
+ *           with no labelled samples behind its bar has no evidence for refusing
+ *           work; an unmeasured veto violation defers instead, and says so.
  *   allow   no veto violated and no veto unread. `unclear` does not block: a veto
  *           reads unclear when the user never spoke to the question, and an
  *           advisory reads unclear without any authority to refuse, so neither

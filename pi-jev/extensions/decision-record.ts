@@ -68,7 +68,7 @@ export interface AskRecord {
 	requestId: string;
 	/** The core request this record came from (action:group:chunk). */
 	requestKey: string;
-	mode: "shadow" | "live";
+	mode: "shadow" | "advisory" | "live";
 	judge: {
 		model: string | null;
 		packVersion: string;
@@ -132,7 +132,7 @@ export type JevRecord = AskRecord | DecisionRecord | EventRecord;
 
 export interface AskRecordOptions {
 	ts: string;
-	mode: "shadow" | "live";
+	mode: "shadow" | "advisory" | "live";
 	model: string;
 	packVersion: string;
 	stateVersion: string;

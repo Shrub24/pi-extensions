@@ -25,8 +25,8 @@ export const CONFIG_ID = "@vanillagreen/pi-jev";
  */
 export const MAX_QUESTIONS_PER_REQUEST = 32;
 
-/** `shadow` logs what it would decide and defers; `live` may allow or deny. */
-export type JevMode = "shadow" | "live";
+/** `shadow` defers, `advisory` allows and steers, `live` enforces. */
+export type JevMode = "shadow" | "advisory" | "live";
 
 /** Whether the decision log keeps the state, or only its hash. */
 export type StateRetention = "hash" | "full";
@@ -188,7 +188,7 @@ export function readSettingsFile(env: NodeJS.ProcessEnv = process.env): Record<s
 }
 
 function pickMode(value: unknown): JevMode | undefined {
-	return value === "shadow" || value === "live" ? value : undefined;
+	return value === "shadow" || value === "advisory" || value === "live" ? value : undefined;
 }
 
 function pickNumber(value: unknown, min: number, max: number): number | undefined {

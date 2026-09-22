@@ -191,6 +191,8 @@ export interface BandLine {
 export interface AskInterpretation {
 	bands: BandLine[];
 	would: string;
+	/** What this mode actually returned to the permission chain. */
+	verdict?: string;
 	decidedBy: string | null;
 	signals: string[];
 }
@@ -224,9 +226,27 @@ export function interpretBands(
 			measured: band.measured,
 		})),
 		would: composed.kind,
+		verdict: returnedKind(config.mode, composed.kind),
 		decidedBy: composed.decidedBy ?? null,
 		signals: composed.signals.map((signal) => signal.source),
 	};
+}
+
+/**
+ * What a mode actually returns for a would-be verdict. One mapping, used by the
+ * record and the runtime, so a log row's `would` and `verdict` can never say
+ * different things about the same mode.
+ */
+export function returnedKind(mode: JevConfig["mode"], would: string): string {
+	if (mode === "live") return would;
+	if (mode === "advisory") return "allow";
+	return "defer";
+}
+
+/** The same mapping as a verdict object, keeping a live mode's deny reason. */
+export function returnedVerdict(mode: JevConfig["mode"], would: AuthorizerVerdict): AuthorizerVerdict {
+	const kind = returnedKind(mode, would.kind);
+	return kind === would.kind ? would : ({ kind } as AuthorizerVerdict);
 }
 
 /** The permission consumer's verdict, and the pack's reading of the same answers. */
@@ -255,10 +275,7 @@ export async function askPermission(input: {
 	const raw = result?.readings ? Object.values(result.readings) : [];
 	const bands = [...bandAll(raw, input.config), ...(tool ? toolBands(raw, tool.preferredTool, tool.policy) : [])];
 	const composed = composeVerdict(bands, callLine);
-	// Vetoes are what this consumer gates on, so they are what it says something
-	// about; an advisory band belongs to the consumer that rides on it, and a second
-	// nudge for one signal teaches the agent to ignore the channel.
-	const nudges = vetoNudges(composed.signals);
+	const nudges = permissionNudges(composed.signals);
 
 	return {
 		verdict: composed.kind === "deny" ? { kind: "deny", reason: composed.reason } : { kind: composed.kind },
@@ -289,9 +306,17 @@ export function nudgesFrom(signals: readonly Signal[]): Nudge[] {
 	}));
 }
 
-/** The permission consumer's nudges: veto bands, and nothing else. */
-export function vetoNudges(signals: readonly Signal[]): Nudge[] {
-	return nudgesFrom(signals.filter((signal) => signal.role === "veto"));
+/**
+ * The permission consumer's nudges: its own bands, veto or advisory alike — a
+ * question nobody else rides still has to be able to speak, and a conflict with
+ * the user's instruction is exactly the kind of advisory this consumer owns.
+ * Signals the intent entry delivers (plan, scope, and the tool pair, which also
+ * loads a policy-named skill) are left to it: a second nudge for one signal
+ * teaches the agent to ignore the channel.
+ */
+export function permissionNudges(signals: readonly Signal[]): Nudge[] {
+	const owned = new Set<string>([...INTENT_QUESTIONS, ...TOOL_QUESTION_IDS]);
+	return nudgesFrom(signals.filter((signal) => !owned.has(signal.source)));
 }
 
 /**

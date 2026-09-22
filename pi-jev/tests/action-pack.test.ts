@@ -25,7 +25,7 @@ import {
 } from "../extensions/action-pack.js";
 import { conversation, fakeDetails, fakeQuery, noul, score } from "./fixtures/fakes.js";
 import { DEFAULTS } from "../extensions/config.js";
-import { subagentNudges } from "../extensions/consumers.js";
+import { permissionNudges, subagentNudges } from "../extensions/consumers.js";
 import type { Reading } from "../extensions/decision-core.js";
 import type { JevAnswer } from "../extensions/types.js";
 
@@ -210,13 +210,14 @@ test("the pack separates veto from advisory questions", () => {
 	const roles = ACTION_PACK.map((question) => `${question.id}=${question.role}`);
 	expect(roles).toEqual([
 		"safety.no_material_harm=veto",
-		"safety.reversibility=veto",
-		"intent.conflicts_with_user=veto",
+		"safety.reversibility=advisory",
+		"intent.conflicts_with_user=advisory",
 		"intent.matches_plan=advisory",
 		"scope.supports_active_task=advisory",
 		"tool.fit=advisory",
 	]);
-	expect(ACTION_PACK.filter((question) => question.role === "veto")).toHaveLength(3);
+	// Only material harm may refuse anything; everything else steers.
+	expect(ACTION_PACK.filter((question) => question.role === "veto").map((question) => question.id)).toEqual(["safety.no_material_harm"]);
 });
 
 test("the wire question set carries the pack's questions, with the reversibility ladder", () => {
@@ -296,7 +297,7 @@ test("a per-question threshold replaces the default only when it is usable", () 
 	expect(thresholdFor("scope.supports_active_task", {}, 0.85)).toBe(0.85);
 });
 
-test("composition: a veto violation denies, everything satisfied allows, anything else defers", () => {
+test("composition: only material harm refuses; reversibility and conflict steer", () => {
 	const specs = questionsFor(facts());
 
 	const denied = composeVerdict(readBands(specs, readings(answers({ "safety.no_material_harm": noul(0.02) })), {}), "bash: rm -rf build");
@@ -304,33 +305,37 @@ test("composition: a veto violation denies, everything satisfied allows, anythin
 	expect(denied.decidedBy).toBe("safety.no_material_harm");
 	expect(denied.reason).toContain("bash: rm -rf build");
 
-	// `safety.reversibility` has no samples behind its bar yet, so a level-3
-	// reading defers, names itself, and raises a notice rather than refusing.
+	// Irreversibility is advisory: a level-3 reading raises a signal and lets the
+	// call proceed — the steer, not the stop, is what the session wants here.
 	const irreversible = composeVerdict(readBands(specs, readings(answers({ "safety.reversibility": score(3) })), {}), "bash: git push --force");
-	expect(irreversible.kind).toBe("defer");
-	expect(irreversible.decidedBy).toBe("safety.reversibility");
-	expect(irreversible.signals.map((signal) => `${signal.source}:${signal.measured}`)).toEqual(["safety.reversibility:false"]);
+	expect(irreversible.kind).toBe("allow");
+	expect(irreversible.decidedBy).toBeUndefined();
+	expect(irreversible.signals.map((signal) => `${signal.source}:${signal.role}:${signal.measured}`)).toEqual(["safety.reversibility:advisory:false"]);
 
+	// So does an outright conflict with the user's instruction.
 	const conflict = composeVerdict(readBands(specs, readings(answers({ "intent.conflicts_with_user": noul(0.03) })), {}));
-	expect(conflict.kind).toBe("deny");
-	expect(conflict.decidedBy).toBe("intent.conflicts_with_user");
+	expect(conflict.kind).toBe("allow");
+	expect(conflict.decidedBy).toBeUndefined();
+	expect(conflict.signals.map((signal) => `${signal.source}:${signal.role}`)).toEqual(["intent.conflicts_with_user:advisory"]);
 
 	expect(composeVerdict(readBands(specs, readings(answers()), {})).kind).toBe("allow");
 	expect(composeVerdict([]).kind).toBe("defer");
 });
 
 test("an unmeasured veto may not refuse work, and a measured one may", () => {
-	const specs = questionsFor(facts());
-	const unmeasured = composeVerdict(readBands(specs, readings(answers({ "safety.reversibility": score(3) })), {}));
+	// The rule is about composition, not the pack: take the one shipped veto and
+	// strip its samples. The violation defers and names itself; it never refuses
+	// while its bar is a guess.
+	const guessPack = ACTION_PACK.map((question) => (question.id === "safety.no_material_harm" ? { ...question, measured: false } : question));
+	const unmeasured = composeVerdict(readBands(questionsFor(facts(), guessPack), readings(answers({ "safety.no_material_harm": noul(0.02) })), {}));
 	expect(unmeasured.kind).toBe("defer");
-	expect(unmeasured.signals[0]).toMatchObject({ source: "safety.reversibility", role: "veto", severity: "notice", measured: false });
+	expect(unmeasured.signals[0]).toMatchObject({ source: "safety.no_material_harm", role: "veto", severity: "notice", measured: false });
 
-	// Once a question carries samples, its band refuses again.
-	const measuredPack = ACTION_PACK.map((question) => (question.id === "safety.reversibility" ? { ...question, measured: true } : question));
-	const measured = composeVerdict(readBands(questionsFor(facts(), measuredPack), readings(answers({ "safety.reversibility": score(3) })), {}));
-	expect(measured.kind).toBe("deny");
-	expect(measured.decidedBy).toBe("safety.reversibility");
-	expect(measured.reason).toContain("level 3");
+	// With samples behind the bar — as shipped — it refuses.
+	const shipped = composeVerdict(readBands(questionsFor(facts(), ACTION_PACK), readings(answers({ "safety.no_material_harm": noul(0.02) })), {}));
+	expect(shipped.kind).toBe("deny");
+	expect(shipped.decidedBy).toBe("safety.no_material_harm");
+	expect(shipped.reason).toContain("safety.no_material_harm");
 });
 
 test("an advisory violation never denies and never blocks: it allows and raises a nudge", () => {
@@ -364,14 +369,15 @@ test("an unclear band is no objection: both roles allow without nudging", () => 
 test("a missing veto defers and names the question that never answered", () => {
 	const specs = questionsFor(facts());
 	const partial = answers();
-	delete (partial as Record<string, unknown>)["safety.reversibility"];
+	delete (partial as Record<string, unknown>)["safety.no_material_harm"];
 	const composed = composeVerdict(readBands(specs, readings(partial), {}), "bash: rm -rf build");
 	expect(composed.kind).toBe("defer");
-	expect(composed.decidedBy).toBe("safety.reversibility");
+	expect(composed.decidedBy).toBe("safety.no_material_harm");
 
 	// A missing advisory is not a blind spot on a question that can refuse.
 	const advisoryMissing = answers();
 	delete (advisoryMissing as Record<string, unknown>)["tool.fit"];
+	delete (advisoryMissing as Record<string, unknown>)["safety.reversibility"];
 	expect(composeVerdict(readBands(specs, readings(advisoryMissing), {})).kind).toBe("allow");
 });
 
@@ -529,4 +535,36 @@ test("subagent bands are advisory: a violation nudges the orchestrator and never
 	);
 	expect(nudges).toHaveLength(2);
 	expect(nudges[0]?.text).toContain("orchestrator.intent_alignment");
+});
+
+test("the permission consumer speaks for its own questions and no one else's", () => {
+	// A conflict with the user's instruction is now advisory, so it must still be
+	// able to say so from the gate — before this, only veto bands spoke, and the
+	// reclassified question would have gone silent.
+	const signal = (source: string, role: "veto" | "advisory") => ({
+		source,
+		role,
+		band: "violated" as const,
+		probability: 0.95,
+		level: null,
+		purpose: "test",
+		confident: true,
+		measured: true,
+		severity: "warn" as const,
+	});
+
+	const english = permissionNudges([signal("intent.conflicts_with_user", "advisory")]);
+	expect(english).toHaveLength(1);
+	expect(english[0]?.source).toBe("intent.conflicts_with_user");
+
+	// The intent entry owns the plan, scope and tool sentences — including the tool
+	// nudge that loads a policy-named skill — so a second voice for one signal
+	// would arrive as two sentences about the same call.
+	const owned = permissionNudges([
+		signal("intent.matches_plan", "advisory"),
+		signal("scope.supports_active_task", "advisory"),
+		signal("tool.fit", "advisory"),
+		signal("tool.choice", "advisory"),
+	]);
+	expect(owned).toHaveLength(0);
 });

@@ -69,6 +69,26 @@ if (asks.length > 0) {
 console.log(
 	`\nwould allow ${metrics.wouldAllow} (${metrics.falseAllow} the human refused), would deny ${metrics.wouldDeny} (${metrics.falseDeny} the human approved), would defer ${metrics.wouldDefer}`,
 );
+
+// What the mode did with those readings. The mode decides what is returned; the
+// judge's own reading is the `would`, and in a fail-open mode that reading is the
+// steering signal rather than a refusal. Printing both is what makes a fail-open
+// session measurable: how often did the judge object, and to what.
+const byMode = new Map<string, { asks: number; would: Map<string, number>; returned: Map<string, number> }>();
+for (const ask of asks) {
+	const entry = byMode.get(ask.mode) ?? { asks: 0, would: new Map(), returned: new Map() };
+	entry.asks++;
+	entry.would.set(ask.would, (entry.would.get(ask.would) ?? 0) + 1);
+	entry.returned.set(ask.verdict, (entry.returned.get(ask.verdict) ?? 0) + 1);
+	byMode.set(ask.mode, entry);
+}
+for (const [mode, entry] of byMode) {
+	const count = (map: Map<string, number>, kind: string): number => map.get(kind) ?? 0;
+	const would = `would allow ${count(entry.would, "allow")}, would deny ${count(entry.would, "deny")}, would defer ${count(entry.would, "defer")}`;
+	const returned = `returned ${count(entry.returned, "allow")} allow, ${count(entry.returned, "deny")} deny, ${count(entry.returned, "defer")} defer`;
+	console.log(`${mode}: ${entry.asks} asks — ${would}; ${returned}`);
+}
+
 console.log(`humans approved ${metrics.approved}, refused ${metrics.denied}`);
 console.log(`agreement ${metrics.agreement === null ? "n/a" : `${(metrics.agreement * 100).toFixed(1)}%`} over ${metrics.decided} decided asks`);
 console.log("a veto edge is a precision problem: what matters is how many denies the human would have approved, above and below.");

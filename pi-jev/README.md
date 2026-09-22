@@ -10,7 +10,9 @@ Subjects stay apart on purpose. An orchestrator's check-in about a child and a p
 
 The two consumers shipped here:
 
-- **`permission-authorizer`** — the blocking one. A link in [@gotgenes/pi-permission-system](https://github.com/gotgenes/pi-packages)'s authorizer chain: an ask reaches it, it answers `allow`, `deny`, or `defer` from the pack's deterministic composition, and the permission system stays authoritative. It starts in **shadow mode**, recording what it would have decided while deferring every ask to the prompt you would have seen anyway.
+- **`permission-authorizer`** — the blocking one. A link in [@gotgenes/pi-permission-system](https://github.com/gotgenes/pi-packages)'s authorizer chain: an ask reaches it, it answers `allow`, `deny`, or `defer` from the pack's deterministic composition, and the permission system stays authoritative. It starts in **shadow mode**, recording what it would have decided while deferring every ask to the prompt you would have seen anyway; **`advisory` is the mode to run day to day** — it allows every ask and steers instead, so no call waits on a prompt, and only material harm can refuse.
+
+This is a steering system first. Only `safety.no_material_harm` refuses anything; irreversibility, a conflict with your instruction, a departing plan, scope, and tool choice all travel as sentences to the agent while the work continues. The base rate is the reason: over 2,600 recorded asks, nothing arrived as a command worth stopping — the corrections you would have made were about work in progress, and a refusal that lands after the fact costs a turn a nudge would have saved.
 - **`tool-intent`** — the riding one. It never gates anything. It watches tool calls, and when a call contradicts the plan the agent stated a moment earlier, it says so as a nudge. It queues rather than sends, so it costs nothing until some other consumer asks about that action.
 
 The two are separate extension entries: either loads without the other, and the registry is what keeps them on one core when both are present.
@@ -129,7 +131,7 @@ Every question names the blocks it reads, and only those are built and sent. The
 
 Open `/extensions:settings`; values live under `kendex.extensionManager.config["@vanillagreen/pi-jev"]` in `~/.pi/agent/settings.json`. Only the user file is read: a project must not be able to put the judge into `live`, move a band edge, or redirect its decision log.
 
-- `mode`: `shadow` (default) or `live`.
+- `mode`: `shadow` (default), `advisory`, or `live`. `shadow` records and defers every ask to you; `advisory` allows every ask and steers instead — the judge's objection becomes a sentence to the agent, never a prompt or a refusal, and only material harm can refuse; `live` enforces the composition as written.
 - `authorizerName`: the link name for `authorizerChain`; default `pi-jev`.
 - `defaultThreshold`: the veto band edge, default `0.70`; `advisoryThreshold`: the advisory edge, default `0.75`. Both sit inside *measured gaps* rather than at round numbers: over three lab runs the harm question answered 0.10-0.28 on real harm and 0.78-0.97 on harmless work, with nothing between, and the advisory questions answered 0.09-0.22 on contradictions and 0.75-0.95 on matches. A per-question `thresholds` map in the settings file overrides either once a question has been measured.
 - `model`, `timeoutMs` (default 3000), `maxRequestsPerSession` (default 200).
@@ -149,21 +151,21 @@ A band that is violated but may not decide anything becomes a nudge — a senten
 
 The defaults are off for the same reason the mode defaults to shadow: a nudge spends the agent's attention, and pi-warden's own numbers show what a miscalibrated advisory costs — 52 of 67 steers over two days were credential warnings, 51 of them about fixture values read from a test file, and the fix was to stop announcing them. `bun scripts/report.ts` prints each advisory's fire rate so the threshold is chosen from your sessions rather than from this file.
 
-## Shadow mode, then calibration
+## Modes, then calibration
 
-Run normally for a while. Every ask the judge sees is recorded with its probabilities, and the permission system's own resolution of that ask — which is usually a person's answer — is recorded beside it. Then:
+Run normally for a while — `advisory` is the useful one, `shadow` is for watching the would-be verdicts before you let them steer anything. Every ask the judge sees is recorded with its probabilities, and the permission system's own resolution of that ask — which is usually a person's answer — is recorded beside it. Then:
 
 ```bash
 bun scripts/report.ts
 ```
 
-The report prints how often the would-be verdict matched the human, how many would-allows the human refused, each question's band counts, and per-question separation (AUC and a threshold sweep via `pi-typesafe/calibrate`, when it is installed). The numbers that matter differ by role: a veto edge is a precision question (how many denies you would have approved), an advisory edge is a recall question (how often the nudge fires on something worth mentioning, and how often it stays quiet when it should not).
+The report first prints what each mode did with the readings — in `advisory` that line is the fire rate that matters, since every ask is allowed and only the objections are news — then how often the would-be verdict matched the human, how many would-allows the human refused, each question's band counts, and per-question separation (AUC and a threshold sweep via `pi-typesafe/calibrate`, when it is installed). The numbers that matter differ by role: a veto edge is a precision question (how many denies you would have approved), an advisory edge is a recall question (how often the nudge fires on something worth mentioning, and how often it stays quiet when it should not).
 
 Move a question's threshold only after its samples say where the edge belongs, and keep `stateRetention: "hash"` while measuring — the probabilities and the labels are enough for the decision-level numbers, and a state kept is conversation content kept. Switch to `full` only when you want to replay states through a reworded question.
 
 ## Limits, stated plainly
 
-- `safety.reversibility` and `tool.fit` have no labelled samples behind their bars yet, and say so in the log, the deny text, and the report.
+- `safety.reversibility` and `tool.fit` have no labelled samples behind their bars yet, and say so in the log, the deny text, and the report. Reversibility is advisory regardless: irreversibility a session can live with is a sentence, not a stop.
 - The intent consumer's nudge can be late. A call nothing gated is read at the turn boundary, which is too late to steer that turn; a gated call is nudged while the human is already being asked. `queueFlushGapMs` is the middle ground, and the reading is recorded either way.
 - The judge sees the conversation at the node that adjudicates the ask. A forwarded ask from a subagent is judged against the serving session's instruction, which is the one that carried the authority to ask.
 - It never reads file contents, diffs, or tool output; the state is the ask, the user's messages, and a line per recent tool call.

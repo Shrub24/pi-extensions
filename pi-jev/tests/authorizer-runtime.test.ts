@@ -24,7 +24,7 @@ const CLEAN: Record<string, JevAnswer> = {
 
 function harness(options: {
 	answers: Record<string, JevAnswer> | { ok: false; error: string; errorCode?: string };
-	mode?: "shadow" | "live";
+	mode?: "shadow" | "advisory" | "live";
 	stateRetention?: "hash" | "full";
 	conversation?: ReturnType<typeof conversation>;
 	deliver?: (nudges: readonly Nudge[]) => void;
@@ -93,8 +93,8 @@ test("shadow mode records the would-be verdict and defers", async () => {
 	expect(ask?.questions).toEqual(["safety.no_material_harm", "safety.reversibility", "intent.conflicts_with_user", "intent.matches_plan", "scope.supports_active_task", "tool.fit"]);
 	expect(ask?.bands.map((band) => `${band.id}[${band.role}]=${band.band}`)).toEqual([
 		"safety.no_material_harm[veto]=satisfied",
-		"safety.reversibility[veto]=satisfied",
-		"intent.conflicts_with_user[veto]=satisfied",
+		"safety.reversibility[advisory]=satisfied",
+		"intent.conflicts_with_user[advisory]=satisfied",
 		"intent.matches_plan[advisory]=satisfied",
 		"scope.supports_active_task[advisory]=satisfied",
 		"tool.fit[advisory]=satisfied",
@@ -121,12 +121,12 @@ test("live mode refuses a measured veto violation and teaches why", async () => 
 	expect((verdict as { reason?: string }).reason ?? "").toContain("safety.no_material_harm");
 	expect((verdict as { reason?: string }).reason ?? "").toContain("bash: rm -rf build");
 
-	// `safety.reversibility` has no samples behind its bar, so level 3 defers
-	// with a notice: an untested bar does not get to refuse work.
+	// Irreversibility is advisory: live mode records the signal, delivers it,
+	// and lets the call proceed. Only material harm refuses.
 	const delivered: Nudge[][] = [];
 	const irreversible = harness({ answers: { ...CLEAN, "safety.reversibility": score(3) }, mode: "live", deliver: (nudges) => delivered.push([...nudges]) });
-	expect(await irreversible.authorize()).toEqual({ kind: "defer" });
-	expect(delivered[0]?.[0]).toMatchObject({ source: "safety.reversibility", role: "veto", severity: "notice", measured: false });
+	expect(await irreversible.authorize()).toEqual({ kind: "allow" });
+	expect(delivered[0]?.[0]).toMatchObject({ source: "safety.reversibility", role: "advisory", severity: "warn", measured: false });
 });
 
 test("an advisory violation allows and is recorded, without this consumer nudging", async () => {
@@ -181,13 +181,18 @@ test("an unclear band allows in live mode without nudging", async () => {
 	expect(harnessed.asks().flatMap((ask) => ask.signals)).toEqual([]);
 });
 
-test("a missing answer defers rather than allowing", async () => {
+test("a missing safety answer defers rather than allowing", async () => {
 	const partial = { ...CLEAN } as Record<string, JevAnswer>;
-	delete partial["safety.reversibility"];
+	delete partial["safety.no_material_harm"];
 	const harnessed = harness({ answers: partial, mode: "live" });
 	expect(await harnessed.authorize()).toEqual({ kind: "defer" });
 	const surface = harnessed.asks()[0];
-	expect(surface?.bands.find((band) => band.id === "safety.reversibility")?.band).toBe("missing");
+	expect(surface?.bands.find((band) => band.id === "safety.no_material_harm")?.band).toBe("missing");
+
+	// A missing advisory — reversibility included — does not stall the call.
+	const advisoryMissing = { ...CLEAN } as Record<string, JevAnswer>;
+	delete advisoryMissing["safety.reversibility"];
+	expect(await harness({ answers: advisoryMissing, mode: "live" }).authorize()).toEqual({ kind: "allow" });
 });
 
 test("a judge failure defers and is recorded per request", async () => {
@@ -214,6 +219,68 @@ test("an unusable judge configuration asks the human to fix it", async () => {
 	expect(harnessed.problems.join(" ")).toContain("no usable judge");
 });
 
+test("advisory mode allows a would-deny ask, records both, and still nudges", async () => {
+	const delivered: Nudge[][] = [];
+	const harnessed = harness({ answers: { ...CLEAN, "safety.no_material_harm": noul(0.03) }, mode: "advisory", deliver: (nudges) => delivered.push([...nudges]) });
+
+	// The judge says refuse; the mode says steer. The call is allowed.
+	expect(await harnessed.authorize()).toEqual({ kind: "allow" });
+
+	const ask = harnessed.asks()[0];
+	expect(ask?.mode).toBe("advisory");
+	expect(ask?.would).toBe("deny");
+	expect(ask?.verdict).toBe("allow");
+	expect(ask?.bands.find((band) => band.id === "safety.no_material_harm")?.band).toBe("violated");
+
+	// Delivery is a config seam, not a mode: the finding reaches the agent.
+	expect(delivered[0]?.[0]).toMatchObject({ source: "safety.no_material_harm", severity: "warn" });
+
+	// The review log keeps the pair too, so "what did it want?" stays answerable.
+	const judged = harnessed.authorizerLogs.find((entry) => entry.event === "pi-jev.judged");
+	expect(judged?.details).toMatchObject({ would: "deny", verdict: "allow", mode: "advisory" });
+});
+
+test("advisory mode allows a judge failure and keeps the record of why", async () => {
+	const harnessed = harness({ answers: { ok: false, error: "TypeSafe request timed out.", errorCode: "timeout" }, mode: "advisory" });
+	expect(await harnessed.authorize()).toEqual({ kind: "allow" });
+
+	const ask = harnessed.asks()[0];
+	expect(ask?.error).toEqual({ code: "timeout", message: "TypeSafe request timed out." });
+	expect(ask?.would).toBe("defer");
+	expect(ask?.verdict).toBe("allow");
+
+	const judged = harnessed.authorizerLogs.find((entry) => entry.event === "pi-jev.judged");
+	expect(judged?.details).toMatchObject({ would: "defer", verdict: "allow", mode: "advisory" });
+});
+
+test("advisory mode allows and reports when there is no core at all", async () => {
+	const problems: string[] = [];
+	const debugs: { event: string; details?: Record<string, unknown> }[] = [];
+	const runtime = createAuthorizerRuntime({
+		config: testConfig({ mode: "advisory" }),
+		core: () => undefined,
+		conversation: () => conversation(),
+		report: (problem) => problems.push(problem),
+	});
+
+	const verdict = await runtime.authorize(fakeDetails(), fakeQuery(), {
+		review: () => {},
+		debug: (event, details) => debugs.push({ event, details }),
+	});
+
+	expect(verdict).toEqual({ kind: "allow" });
+	expect(problems.join(" ")).toContain("allowed without judgment");
+	expect(debugs.some((entry) => entry.event === "pi-jev.error" && entry.details?.message === "no decision core")).toBe(true);
+});
+
+test("shadow still defers and live still refuses, so advisory is the only fail-open mode", async () => {
+	const harmful = { ...CLEAN, "safety.no_material_harm": noul(0.03) };
+	// A live deny carries its reason; compare the kind it decided on.
+	expect((await harness({ answers: harmful, mode: "shadow" }).authorize()).kind).toBe("defer");
+	expect((await harness({ answers: harmful, mode: "live" }).authorize()).kind).toBe("deny");
+	expect((await harness({ answers: harmful, mode: "advisory" }).authorize()).kind).toBe("allow");
+});
+
 test("full state retention stores the state each group was asked about", async () => {
 	const harnessed = harness({ answers: CLEAN, stateRetention: "full" });
 	await harnessed.authorize();
@@ -232,7 +299,7 @@ test("the review log gets one durable entry per judged ask, naming roles and lev
 	expect(judged?.details?.consumer).toBe("permission");
 	expect(judged?.details?.would).toBe("allow");
 	const bands = String(judged?.details?.bands);
-	expect(bands).toContain("safety.reversibility[veto]=satisfied#1");
+	expect(bands).toContain("safety.reversibility[advisory]=satisfied#1");
 	expect(bands).toContain("scope.supports_active_task[advisory]=violated(0.02)");
 });
 

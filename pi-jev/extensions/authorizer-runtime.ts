@@ -20,7 +20,7 @@
 import { askFactsFrom, callSubject, pendingCallLine } from "./action-pack.js";
 import type { ActionContext, ConversationFacts } from "./action-pack.js";
 import { applyGuidance } from "./tool-policy.js";
-import { askPermission, PERMISSION_CONSUMER } from "./consumers.js";
+import { askPermission, PERMISSION_CONSUMER, returnedVerdict } from "./consumers.js";
 import type { Nudge } from "./consumers.js";
 import type { JevConfig } from "./config.js";
 import type { DecisionCore } from "./decision-core.js";
@@ -74,8 +74,18 @@ export function createAuthorizerRuntime(deps: AuthorizerRuntimeDeps): Authorizer
 			const facts = applyGuidance(askFactsFrom(details, query), deps.policy);
 			const core = deps.core();
 			if (!core) {
-				once("pi-jev: no decision core for this session, so the ask was deferred to you.");
-				return { kind: "defer" };
+				const allowed = config.mode === "advisory";
+				once(
+					allowed
+						? "pi-jev: no decision core for this session, so asks are allowed without judgment."
+						: "pi-jev: no decision core for this session, so the ask was deferred to you.",
+				);
+				try {
+					authorizerLog.debug("pi-jev.error", { message: "no decision core", mode: config.mode });
+				} catch {
+					// The log seam is the caller's; a throwing log must not decide an ask.
+				}
+				return allowed ? { kind: "allow" } : { kind: "defer" };
 			}
 			const context: ActionContext = { facts, conversation: deps.conversation() };
 			// The subject is the pending call. Its key is Pi's tool call id, which
@@ -86,8 +96,15 @@ export function createAuthorizerRuntime(deps: AuthorizerRuntimeDeps): Authorizer
 
 			const outcome = await askPermission({ config, core, context, subject, ...(deps.policy ? { policy: deps.policy } : {}) });
 			const misconfigured = outcome.errors.find((error) => error.code === "configuration");
-			if (misconfigured) once(`pi-jev: no usable judge (${misconfigured.message}). Every ask is deferred to you.`);
-			const returned = config.mode === "live" ? outcome.verdict : ({ kind: "defer" } as AuthorizerVerdict);
+			if (misconfigured) {
+				once(
+					`pi-jev: no usable judge (${misconfigured.message}). ` +
+						(config.mode === "advisory" ? "Asks are allowed without judgment until it is fixed." : "Every ask is deferred to you."),
+				);
+			}
+			// Shadow defers, advisory allows whatever the judge said (steering
+			// carries the finding instead of stopping the call), live enforces.
+			const returned = returnedVerdict(config.mode, outcome.verdict);
 
 			authorizerLog.review("pi-jev.judged", {
 				requestId: facts.requestId,
@@ -102,9 +119,23 @@ export function createAuthorizerRuntime(deps: AuthorizerRuntimeDeps): Authorizer
 					.join(" "),
 			});
 
-			if (outcome.nudges.length > 0 && deps.deliver) {
+			// A would-deny that advisory mode allowed is the loudest finding there
+			// is: the sentence is what replaces the refusal, so it rides the same
+			// delivery seam as every other nudge.
+			const nudges = [...outcome.nudges];
+			if (returned.kind === "allow" && outcome.verdict.kind === "deny") {
+				const band = outcome.bands.find((entry) => entry.role === "veto" && entry.band === "violated");
+				nudges.push({
+					source: band?.id ?? "safety.no_material_harm",
+					role: "veto",
+					severity: "warn",
+					measured: band?.measured ?? false,
+					text: `${outcome.verdict.reason ?? "pi-jev: the judge would have refused this call."} Advisory mode allows it instead — act on this finding or say why it is needed.`,
+				});
+			}
+			if (nudges.length > 0 && deps.deliver) {
 				try {
-					deps.deliver(outcome.nudges);
+					deps.deliver(nudges);
 				} catch {
 					// A nudge that cannot be delivered is not a reason to change a verdict.
 				}
@@ -115,13 +146,14 @@ export function createAuthorizerRuntime(deps: AuthorizerRuntimeDeps): Authorizer
 			// Anything reaching here is a defect in this package or a malformed
 			// ask. Neither is knowledge about the action, so the ask goes on.
 			const message = error instanceof Error ? error.message : String(error);
-			once(`pi-jev: judge failed (${message}); the ask was deferred.`);
+			const allowed = config.mode === "advisory";
+			once(`pi-jev: judge failed (${message}); ${allowed ? "the ask was allowed without judgment." : "the ask was deferred."}`);
 			try {
-				authorizerLog.debug("pi-jev.error", { message });
+				authorizerLog.debug("pi-jev.error", { message, mode: config.mode });
 			} catch {
 				// The log seam is the caller's; a throwing log must not decide an ask.
 			}
-			return { kind: "defer" };
+			return allowed ? { kind: "allow" } : { kind: "defer" };
 		}
 	};
 
