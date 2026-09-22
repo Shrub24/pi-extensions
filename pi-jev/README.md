@@ -161,6 +161,12 @@ bun scripts/report.ts
 
 The report first prints what each mode did with the readings — in `advisory` that line is the fire rate that matters, since every ask is allowed and only the objections are news — then how often the would-be verdict matched the human, how many would-allows the human refused, each question's band counts, and per-question separation (AUC and a threshold sweep via `pi-typesafe/calibrate`, when it is installed). The numbers that matter differ by role: a veto edge is a precision question (how many denies you would have approved), an advisory edge is a recall question (how often the nudge fires on something worth mentioning, and how often it stays quiet when it should not).
 
+When a question objects, the record keeps a bounded excerpt of the state the judge read, so a false alarm can be diagnosed rather than guessed at:
+
+```bash
+bun scripts/report.ts --objections 3
+```
+
 Move a question's threshold only after its samples say where the edge belongs, and keep `stateRetention: "hash"` while measuring — the probabilities and the labels are enough for the decision-level numbers, and a state kept is conversation content kept. Switch to `full` only when you want to replay states through a reworded question.
 
 ## Limits, stated plainly

@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 
-import { decisionMetrics, joinRecords, labelOf, replayCasesFrom, samplesFrom } from "../extensions/decision-record.js";
+import { decisionMetrics, joinRecords, labelOf, objectionEvidence, replayCasesFrom, samplesFrom } from "../extensions/decision-record.js";
 import type { AskRecord, DecisionRecord } from "../extensions/decision-record.js";
 
 function ask(overrides: Partial<AskRecord> & { requestId: string }): AskRecord {
@@ -144,4 +144,17 @@ test("trimmed states are counted, because their scores are not comparable", () =
 	]);
 	expect(result.truncatedStates).toBe(1);
 	expect(result.joined).toHaveLength(2);
+});
+
+test("an objection keeps the state it objected to, bounded, and a clean ask keeps none", () => {
+	const blocks = [{ id: "ask" }, { id: "plan" }, { id: "missing" }];
+	const state = { ask: { action: "edit /tmp/x.py", change: "- a\n+ b" }, plan: "x".repeat(900) };
+	const evidence = objectionEvidence(state, blocks);
+	// Two blocks carry text; the third was never built, so it is not evidence.
+	expect(evidence.map((item) => item.block)).toEqual(["ask", "plan"]);
+	// Bounded twice: per block, and across the record.
+	expect((evidence[0]?.text ?? "").length).toBeLessThanOrEqual(300);
+	expect(evidence[1]?.text.endsWith("…")).toBe(true);
+	expect(evidence.reduce((total, item) => total + item.text.length, 0)).toBeLessThanOrEqual(1200);
+	expect(objectionEvidence(null, blocks)).toEqual([]);
 });

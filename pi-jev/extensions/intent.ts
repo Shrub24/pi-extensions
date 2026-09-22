@@ -70,6 +70,43 @@ function stringField(input: Record<string, unknown>, keys: readonly string[]): s
 	return null;
 }
 
+/**
+ * What the call changes, when the tool reports it, in one flat line.
+ *
+ * `value` names the target — which is what the policy matches on — and this is
+ * the content, because a question about whether a call does what the plan
+ * describes cannot be answered from a path. Phrased as replacements rather than
+ * a diff: state fields are single lines by construction (`truncate` flattens
+ * whitespace), and `- old + new` flattened is ambiguous where `replace "old"
+ * with "new"` is not. Null for tools that report no change, such as a shell
+ * command.
+ */
+export function changeSummary(input: unknown, max = 400): string | null {
+	if (input === null || typeof input !== "object") return null;
+	const record = input as Record<string, unknown>;
+	const parts: string[] = [];
+	const pair = (oldText: unknown, newText: unknown): void => {
+		const before = typeof oldText === "string" ? oldText.trim() : "";
+		const after = typeof newText === "string" ? newText.trim() : "";
+		if (before !== "" && after !== "") parts.push(`replace "${before}" with "${after}"`);
+		else if (after !== "") parts.push(`insert "${after}"`);
+		else if (before !== "") parts.push(`remove "${before}"`);
+	};
+	pair(record.oldText, record.newText);
+	if (Array.isArray(record.edits)) {
+		for (const edit of record.edits.slice(0, 3)) {
+			if (edit !== null && typeof edit === "object") {
+				const hunk = edit as Record<string, unknown>;
+				pair(hunk.oldText, hunk.newText);
+			}
+		}
+	}
+	if (typeof record.content === "string" && record.content.trim() !== "") parts.push(`write "${record.content.trim()}"`);
+	if (parts.length === 0) return null;
+	const joined = parts.join("; ");
+	return joined.length <= max ? joined : `${joined.slice(0, Math.max(1, max - 1))}…`;
+}
+
 /** The decision-relevant part of a tool call's arguments, in the pack's terms. */
 export function callValue(input: unknown): string {
 	if (typeof input === "string") return input;
@@ -101,6 +138,7 @@ export function toolCallFacts(event: ToolCallLike, fallbackId: string, policy?: 
 		surface: "tool_call",
 		kind: "tool",
 		value,
+		change: changeSummary(event.input),
 		toolName,
 		invokedToolName: null,
 		matchedPattern: null,

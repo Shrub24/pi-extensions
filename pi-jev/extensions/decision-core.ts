@@ -79,6 +79,12 @@ export interface CoreRequest {
 	blocks: readonly BlockProvenance[];
 	/** Total characters of state sent; the sum of the block sizes. */
 	chars: number;
+	/**
+	 * The state this request sent, kept for the record sink so an objection can be
+	 * read back against what the judge actually saw. Nothing else reads it: the
+	 * questions were worded and answered against it already.
+	 */
+	state?: unknown;
 	owner: string;
 	questions: readonly string[];
 	ok: boolean;
@@ -575,6 +581,7 @@ export function createDecisionCore<A = unknown>(options: DecisionCoreOptions<A>)
 			subjectKey: input.subjectKey,
 			blocks: input.built.provenance,
 			chars: input.built.chars,
+			state: input.built.state,
 			owner: input.chunk[0]?.owner ?? "unknown",
 			questions: ids,
 			ok: outcome.ok,

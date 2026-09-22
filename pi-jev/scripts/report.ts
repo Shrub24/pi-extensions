@@ -117,6 +117,23 @@ if (signalCounts.size > 0) {
 	}
 }
 
+// The objections, with what the judge read when it made them. This is the loop
+// for rewording a question: the band says which one fired, the evidence says why.
+const objections = asks.filter((ask) => ask.evidence !== undefined);
+const objectionLimit = Number(argument("objections") ?? 0);
+if (objectionLimit > 0) {
+	if (objections.length === 0) {
+		console.log("\nno objections with evidence in this log");
+	} else {
+		console.log(`\nlast ${Math.min(objectionLimit, objections.length)} of ${objections.length} objections, with the state the judge read`);
+		for (const ask of objections.slice(-objectionLimit)) {
+			const violated = ask.bands.filter((band) => band.band === "violated").map((band) => `${band.id}(${band.probability === null ? "level" : band.probability.toFixed(2)})`);
+			console.log(`\n  ${ask.ts}  ${ask.mode}  ${violated.join(", ")}  [${ask.questions.join(", ")}]`);
+			for (const item of ask.evidence ?? []) console.log(`    ${item.block}: ${item.text.replace(/\n/g, " ⏎ ")}`);
+		}
+	}
+}
+
 const questions = [...new Set(asks.flatMap((ask) => ask.bands.filter((band) => band.probability !== null).map((band) => band.id)))].filter(
 	(id) => questionFilter === undefined || id === questionFilter,
 );

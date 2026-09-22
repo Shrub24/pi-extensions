@@ -87,6 +87,12 @@ export interface AskRecord {
 	/** Present only when state retention is `full`. */
 	state?: unknown;
 	bands: AskBandRecord[];
+	/**
+	 * What the judge read, kept only for records where a question was violated.
+	 * Present to make a false alarm diagnosable: without it a hash-only log says
+	 * an objection happened and nothing about what produced it.
+	 */
+	evidence?: { block: string; text: string }[];
 	signals: AskSignalRecord[];
 	/** The question ids this request carried, in the order they were sent. */
 	questions: string[];
@@ -144,6 +150,38 @@ export interface AskRecordOptions {
  * owns the reading of them, which is why the interpretation arrives already
  * computed and is stored verbatim.
  */
+/**
+ * The state behind an objection, bounded.
+ *
+ * A hash-only log answers "did the judge object" but not "to what", which is the
+ * question that has to be answered to reword a question or fix a block. So when a
+ * band is violated — and only then — each block the request sent is kept as a
+ * short excerpt. Bounded twice: per block, and across the record.
+ */
+export function objectionEvidence(state: unknown, blocks: readonly { id: string }[], perBlock = 300, total = 1200): { block: string; text: string }[] {
+	if (state === null || typeof state !== "object") return [];
+	const record = state as Record<string, unknown>;
+	const evidence: { block: string; text: string }[] = [];
+	let spent = 0;
+	for (const block of blocks) {
+		if (spent >= total) break;
+		const value = record[block.id];
+		if (value === undefined) continue;
+		let text: string;
+		try {
+			text = typeof value === "string" ? value : (JSON.stringify(value) ?? "");
+		} catch {
+			continue;
+		}
+		if (text === "") continue;
+		const room = Math.min(perBlock, total - spent);
+		const excerpt = text.length <= room ? text : `${text.slice(0, Math.max(1, room - 1))}…`;
+		evidence.push({ block: block.id, text: excerpt });
+		spent += excerpt.length;
+	}
+	return evidence;
+}
+
 export function askRecordFromCore(context: CoreRecordContext, options: AskRecordOptions): AskRecord {
 	const interpreted = (context.interpreted ?? {}) as {
 		bands?: unknown;
@@ -178,6 +216,9 @@ export function askRecordFromCore(context: CoreRecordContext, options: AskRecord
 			text: "",
 		})),
 		questions: [...context.request.questions],
+		// Only an objection keeps the state: a log of every state is a transcript,
+		// and a log of the ones that went wrong is a diagnosis.
+		...(bands.some((band) => band.band === "violated") ? { evidence: objectionEvidence(context.request.state, context.request.blocks) } : {}),
 		would: interpreted.would ?? "defer",
 		verdict: interpreted.verdict ?? "defer",
 		latencyMs: context.request.latencyMs,
