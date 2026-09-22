@@ -38,6 +38,14 @@ export interface ToolPrecedence {
 	order: string[];
 	/** Why the policy ranks it this way, in one clause. Nudge text quotes this. */
 	reason: string;
+	/**
+	 * The skill that covers this intent, loaded when the judge agrees another
+	 * tool fits and the session has not loaded it yet. A skill is context the
+	 * agent should be working from, not a sentence it reads once.
+	 */
+	skill?: string;
+	/** Why loading that skill helps; falls back to the rule's reason. */
+	skillReason?: string;
 }
 
 /** A tool the policy warns against in a stated context. */
@@ -95,13 +103,15 @@ export interface ToolGuidance {
 	directives: string[];
 	/** The avoid-pair that matched, when one did. */
 	avoid: ToolAvoid | null;
+	/** The skill covering the matched intent, when the rule names one. */
+	skill: { name: string; reason: string } | null;
 	/** The margin the choice nudge needs; per-rule, then the policy's. */
 	margin: number;
 	/** The avoid nudge's margin; per-rule `avoidMargin`, then `margin`. */
 	avoidMargin: number;
 }
 
-export const EMPTY_GUIDANCE: ToolGuidance = { alternatives: [], reason: null, intent: null, directives: [], avoid: null, margin: 0.2, avoidMargin: 0.2 };
+export const EMPTY_GUIDANCE: ToolGuidance = { alternatives: [], reason: null, intent: null, directives: [], avoid: null, skill: null, margin: 0.2, avoidMargin: 0.2 };
 
 /** The tool name a call used, and the alternative the policy would rather see. */
 export function preferredTool(ask: ActionAskFacts, policy: ToolPolicy): { preferred: string; reason: string } | undefined {
@@ -132,7 +142,7 @@ function matchingDirectives(ask: ActionAskFacts, policy: ToolPolicy): string[] {
 export function toolGuidance(ask: ActionAskFacts, policy: ToolPolicy): ToolGuidance {
 	const directives = matchingDirectives(ask, policy);
 	const avoid = matchingAvoid(ask, policy);
-	const base = { directives, avoid: avoid ?? null, margin: policy.margin, avoidMargin: policy.avoidMargin ?? policy.margin };
+	const base = { directives, avoid: avoid ?? null, skill: null, margin: policy.margin, avoidMargin: policy.avoidMargin ?? policy.margin };
 	if (ask.toolName === null) return { ...EMPTY_GUIDANCE, ...base };
 
 	// An intent precedence that names the tool in use: the most specific rule.
@@ -144,6 +154,7 @@ export function toolGuidance(ask: ActionAskFacts, policy: ToolPolicy): ToolGuida
 			alternatives: better.map((tool) => ({ tool, reason: precedence.reason })),
 			reason: precedence.reason,
 			intent: precedence.intent,
+			skill: precedence.skill ? { name: precedence.skill, reason: precedence.skillReason ?? precedence.reason } : null,
 		};
 	}
 
@@ -254,6 +265,11 @@ export function toolChoiceNudgeText(band: ToolChoiceBand, callLine: string, reas
 	const alternative = band.choice ?? "another tool";
 	const why = reason ? `: ${reason}` : ".";
 	return `pi-jev: your policy prefers ${alternative} for ${callLine}${why} Use it, or say why this call needs the tool it chose.`;
+}
+
+/** The skill line a nudge carries when the policy names a skill for the intent. */
+export function skillLoadText(skill: { name: string; reason: string }): string {
+	return `pi-jev: the ${skill.name} skill covers this work — ${skill.reason} Load it with /skill:${skill.name} rather than working without it.`;
 }
 
 /** The nudge text for a matched avoid-pair: warn, quote the policy's reason. */

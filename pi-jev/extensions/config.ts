@@ -63,6 +63,12 @@ export interface JevConfig {
 	deliverNudges: boolean;
 	/** Deliver the intent consumer's nudges. Its own switch: different consumer, different noise. */
 	deliverIntentNudges: boolean;
+	/**
+	 * Whether a policy-named skill is loaded when the judge agrees the call in
+	 * front of it picked the lesser tool. Off by default like every other
+	 * delivery: loading a skill forces a turn, which is a real cost.
+	 */
+	loadSkills: boolean;
 	/** Deliver the orchestrator's subagent-steering nudges. Off until the log shows the fire rate. */
 	deliverSubagentNudges: boolean;
 	/**
@@ -139,6 +145,7 @@ export const DEFAULTS: JevConfig = {
 	maxToolbox: 12,
 	deliverNudges: false,
 	deliverIntentNudges: false,
+	loadSkills: false,
 	deliverSubagentNudges: false,
 	queueFlushGapMs: 0,
 	orchestratorCheckInMs: 0,
@@ -269,6 +276,7 @@ export function resolveConfig(
 
 	if (typeof settings.deliverNudges === "boolean") config.deliverNudges = settings.deliverNudges;
 	if (typeof settings.deliverIntentNudges === "boolean") config.deliverIntentNudges = settings.deliverIntentNudges;
+	if (typeof settings.loadSkills === "boolean") config.loadSkills = settings.loadSkills;
 	if (typeof settings.deliverSubagentNudges === "boolean") config.deliverSubagentNudges = settings.deliverSubagentNudges;
 
 	const gap = pickNumber(settings.queueFlushGapMs, 0, 600_000);

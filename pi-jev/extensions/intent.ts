@@ -29,7 +29,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import type { ActionAskFacts, ActionContext } from "./action-pack.js";
 import { MAX_QUESTIONS_PER_REQUEST, readSettingsFile, resolveConfig } from "./config.js";
 import type { JevConfig } from "./config.js";
-import { configConversation, sessionSources, toolboxLines } from "./conversation.js";
+import { configConversation, sessionSources, skillLoaded, toolboxLines } from "./conversation.js";
 import type { Nudge } from "./consumers.js";
 import { createJevClient } from "./jev.js";
 import type { JevClient } from "./jev.js";
@@ -39,7 +39,7 @@ import { checkInAction, checkInSubjectKey, checkInIntervalMs, combineFindings, n
 import { INTENT_CONSUMER, INTENT_QUESTIONS, INTENT_SPECS, SUBAGENT_CONSUMER, installPack, intentNudges, interpretBands, registerSubagentConsumer } from "./consumers.js";
 import { acquireCore, acquireLog, logSink } from "./registry.js";
 import type { CoreLease } from "./registry.js";
-import { TOOL_CHOICE_QUESTIONS, toolAvoidNudgeText, toolChoiceBand, toolChoiceNudgeText } from "./tool-choice.js";
+import { skillLoadText, TOOL_CHOICE_QUESTIONS, toolAvoidNudgeText, toolChoiceBand, toolChoiceNudgeText } from "./tool-choice.js";
 import { callSubject, conversationOf } from "./action-pack.js";
 import type { ToolPolicy } from "./tool-choice.js";
 import { loadToolPolicy, applyGuidance } from "./tool-policy.js";
@@ -272,12 +272,31 @@ export function wireIntentConsumer(pi: ExtensionAPI, deps: IntentDeps = {}): voi
 					// The policy's own reason is the teaching part of the sentence, and the
 					// action the flush judged still carries it.
 					const preferredReason = delivery.input?.facts.preferredReason ?? null;
+					const skill = delivery.input.facts.policySkill ?? null;
 					nudges.push({ source: band.id, role: band.role, severity: "warn", measured: band.measured, text: toolChoiceNudgeText(band, delivery.input.facts.value, preferredReason) });
+					// A rule that names a skill wants the agent working from it, not merely
+					// told about it: the nudge says why, and — when the switch is on and the
+					// session has not loaded it — the skill is loaded for real. Loading
+					// forces a turn, which is the cost that keeps this off by default.
+					if (skill) {
+						nudges.push({ source: band.id, role: "advisory", severity: "notice", measured: band.measured, text: skillLoadText(skill) });
+						if (config.loadSkills && !skillAlreadyLoaded(skill.name)) void pi.sendUserMessage(`/skill:${skill.name}`, { deliverAs: "steer", expandPromptTemplates: true });
+					}
 				}
 				if (nudges.length > 0) deliver(nudges);
 			},
 		});
 	});
+
+	/** Whether the branch already carries evidence this skill was pulled in. */
+	const skillAlreadyLoaded = (name: string): boolean => {
+		try {
+			const entries = (ctx?.sessionManager as { getBranch?: () => readonly unknown[] } | undefined)?.getBranch?.() ?? [];
+			return skillLoaded(entries, name);
+		} catch {
+			return false;
+		}
+	};
 
 	// The orchestrator's check-in: on the configured interval, scan the branch
 	// for child notices nobody has asked about, queue the drift questions, and

@@ -115,6 +115,8 @@ export interface ActionAskFacts {
 	policyDirectives?: string[];
 	/** The avoid-pair that matched this call, verbatim from the policy. */
 	policyAvoid?: { reason: string } | null;
+	/** The skill the policy names for this call's intent, when a rule names one. */
+	policySkill?: { name: string; reason: string } | null;
 }
 
 /** Everything a block may read for one subject. */
@@ -218,6 +220,7 @@ export function askFactsFrom(details: PromptPermissionDetails, query: Permission
 		policyIntent: null,
 		policyDirectives: [],
 		policyAvoid: null,
+		policySkill: null,
 		value,
 		toolName,
 		invokedToolName: request?.invokedToolName ?? null,

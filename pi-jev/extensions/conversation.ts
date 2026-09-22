@@ -172,6 +172,30 @@ export interface ConversationSources {
  * what the user asked for. A missing or throwing source yields empty lists
  * rather than failing the ask: the judge then decides on the action alone.
  */
+/**
+ * Whether the session has already pulled a skill in, read from the branch.
+ *
+ * The evidence is one of two things in the transcript: the skill command the
+ * loader expanded (`/skill:name`), or a tool call that touched the skill's own
+ * file. Both are what "already loaded" looks like from the outside, and both are
+ * cheap to check on a branch the caller already walks.
+ */
+export function skillLoaded(entries: readonly unknown[], skill: string): boolean {
+	const command = `/skill:${skill}`.toLowerCase();
+	const path = `${skill.toLowerCase()}/skill.md`;
+	for (const entry of entries) {
+		if (!isRecord(entry) || entry.type !== "message") continue;
+		const message = entry.message;
+		if (!isRecord(message)) continue;
+		if (message.role === "user" && userMessageText(message.content).toLowerCase().includes(command)) return true;
+		if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
+		for (const part of message.content as ContentPart[]) {
+			if (part && typeof part === "object" && part.type === "toolCall" && JSON.stringify(part).toLowerCase().includes(path)) return true;
+		}
+	}
+	return false;
+}
+
 export function conversationFacts(sources: ConversationSources | undefined, limits: ConversationLimits): ConversationFacts {
 	const userMessages: string[] = [];
 	const recentToolCalls: string[] = [];

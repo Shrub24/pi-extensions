@@ -63,7 +63,7 @@ export function parseToolPolicy(text: string): ToolPolicy | undefined {
 	/** The multi-line block being read, when any: `precedence`, `avoid`, `directives`. */
 	let section: "precedence" | "avoid" | "directives" | undefined;
 	/** The current item of the active section. */
-	let item: { intent?: string; order?: string[]; reason?: string; tool?: string; when?: string; text?: string } | undefined;
+	let item: { intent?: string; order?: string[]; reason?: string; tool?: string; when?: string; text?: string; skill?: string; skillReason?: string } | undefined;
 
 	const flush = (): void => {
 		if (current && typeof current.tool === "string" && current.tool !== "" && typeof current.reason === "string" && current.reason !== "") {
@@ -71,7 +71,13 @@ export function parseToolPolicy(text: string): ToolPolicy | undefined {
 		}
 		current = undefined;
 		if (section === "precedence" && item && typeof item.intent === "string" && item.intent !== "" && Array.isArray(item.order) && item.order.length > 0 && typeof item.reason === "string" && item.reason !== "") {
-			precedence.push({ intent: item.intent, order: item.order.slice(0, MAX_CHOICE_OPTIONS), reason: item.reason });
+			precedence.push({
+				intent: item.intent,
+				order: item.order.slice(0, MAX_CHOICE_OPTIONS),
+				reason: item.reason,
+				...(item.skill === undefined ? {} : { skill: item.skill }),
+				...(item.skillReason === undefined ? {} : { skillReason: item.skillReason }),
+			});
 		}
 		if (section === "avoid" && item && typeof item.tool === "string" && item.tool !== "" && typeof item.when === "string" && item.when !== "" && typeof item.reason === "string" && item.reason !== "") {
 			avoid.push({ tool: item.tool, when: item.when, reason: item.reason });
@@ -175,6 +181,10 @@ export function parseToolPolicy(text: string): ToolPolicy | undefined {
 				item.tool = rest.replace(/^["']|["']$/g, "");
 			} else if (key === "intent" && section === "precedence" && item.intent === undefined) {
 				item.intent = rest.replace(/^["']|["']$/g, "");
+			} else if (key === "skill" && section === "precedence" && item.skill === undefined) {
+				item.skill = rest.replace(/^["']|["']$/g, "");
+			} else if (key === "skillReason" && section === "precedence") {
+				item.skillReason = rest.replace(/^["']|["']$/g, "");
 			}
 			continue;
 		}
@@ -214,6 +224,7 @@ export function applyGuidance(facts: ActionAskFacts, policy?: ToolPolicy): Actio
 	facts.policyIntent = guidance.intent;
 	facts.policyDirectives = guidance.directives;
 	facts.policyAvoid = guidance.avoid ? { reason: guidance.avoid.reason } : null;
+	facts.policySkill = guidance.skill;
 	return facts;
 }
 

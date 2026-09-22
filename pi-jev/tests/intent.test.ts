@@ -515,6 +515,45 @@ test("an avoid pair stands the fit question up and the nudge quotes the warning"
 	expect(intentJev.requests).toHaveLength(0);
 });
 
+test("a rule that names a skill loads it once, and only when the load switch is on", async () => {
+	const policy = {
+		preferences: [],
+		margin: 0.2,
+		precedence: [
+			{
+				intent: "locate where a concept lives in a codebase",
+				order: ["semble_search", "grep"],
+				reason: "semble finds the concept; grep finds the string",
+				skill: "codebase-explore",
+				skillReason: "it teaches the discovery order",
+			},
+		],
+	};
+	const answers = {
+		"tool.choice": { type: "choice", choice: "semble_search", margin: 0.6, probabilities: { semble_search: 0.8, grep: 0.2 }, confidence: 1 },
+	} as unknown as Record<string, JevAnswer>;
+
+	for (const [loadSkills, expected] of [[true, 1], [false, 0]] as const) {
+		const host = fakeHost();
+		wireIntentConsumer(host.pi, { config: testConfig({ deliverIntentNudges: true, loadSkills }), policy, jev: fakeJevClient(answers), log: fakeLog() });
+		await host.sessionStart("s1");
+		await host.fire("turn_start");
+		await host.fire("tool_call", { toolName: "grep", toolCallId: "call-1", input: { pattern: "retryBackoff" } });
+		await host.fire("turn_end");
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(host.userSent).toHaveLength(expected);
+		if (expected === 1) {
+			expect(host.userSent[0]?.message).toBe("/skill:codebase-explore");
+			expect((host.userSent[0]?.options as { expandPromptTemplates?: boolean } | undefined)?.expandPromptTemplates).toBe(true);
+		}
+		// The sentence about the skill rides the nudge either way: knowing why the
+		// skill matters is free, loading it is the switch.
+		const texts = host.sent.map((entry) => JSON.stringify(entry.message));
+		expect(texts.some((text) => text.includes("codebase-explore"))).toBe(true);
+	}
+});
+
 test("an avoid match does not fire when the call does not match the context", async () => {
 	const service = fakeService();
 	const host = fakeHost({

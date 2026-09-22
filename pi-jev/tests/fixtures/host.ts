@@ -26,6 +26,7 @@ export function fakeHost(options: HostOptions = {}) {
 	let branch: readonly unknown[] = options.branch ?? [];
 	/** The session Pi is currently in, as `session_start` reported it. */
 	let current: string | null = null;
+	const userSent: { message: unknown; options: unknown }[] = [];
 
 	const pi = {
 		on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
@@ -35,6 +36,10 @@ export function fakeHost(options: HostOptions = {}) {
 		},
 		sendMessage(message: unknown, sendOptions?: unknown) {
 			sent.push({ message, options: sendOptions });
+		},
+		sendUserMessage(message: unknown, sendOptions?: unknown) {
+			userSent.push({ message, options: sendOptions });
+			return Promise.resolve();
 		},
 		getAllTools: () => (options.tools ?? []).map((tool) => ({ ...tool })),
 		events:
@@ -69,6 +74,7 @@ export function fakeHost(options: HostOptions = {}) {
 		pi: pi as never,
 		notices,
 		sent,
+		userSent,
 		listenerCount: (channel: string) => listeners.get(channel)?.size ?? 0,
 		emit: (channel: string, payload: unknown) => {
 			for (const handler of [...(listeners.get(channel) ?? [])]) handler(payload);
