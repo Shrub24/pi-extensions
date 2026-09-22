@@ -75,7 +75,7 @@ The same file can rank a whole class of work instead of naming one alternative:
 ```yaml
 precedence:
   - intent: edit code        # matched by the judge, not by string search
-    order: [edit, write, bash]
+    order: [edit, write]
     reason: surgical edits beat rewrites and shell wrangling
 avoid:
   - tool: bash
@@ -89,7 +89,7 @@ margin: 0.2                # the choice nudge's bar, and the fallback bar
 avoidMargin: 0.3            # how clearly the judge must agree before an avoid warning fires
 ```
 
-- **`precedence`** turns `tool.choice` into an N-option question: every tool in `order` becomes an option, the intent clause rides the instructions verbatim, and the nudge fires when the judge picks a tool ranked above the one in use with a clear margin. More specific rules win: an intent precedence containing the tool in use beats a per-call `match`, which beats a bare mapping.
+- **`precedence`** turns `tool.choice` into an N-option question: every tool in `order` becomes an option, the intent clause rides the instructions verbatim, and the nudge fires when the judge picks a tool ranked above the one in use with a clear margin. A rule is matched when `order` **contains the tool in use** — so `order` names the tools you would accept for that intent, best first — and only the first such rule can match. Keep `bash` out of `order`: it is a catch-all, so a rule listing it swallows every shell call and names the wrong intent; shell forms belong to a per-call `preferences` entry or an `avoid` pair instead. More specific rules win across constructs: an intent precedence beats a per-call `match`, which beats a bare mapping whose reason names the tool in use.
 - **`avoid`** stands up the `tool.fit` question with the policy's warning in its wording. The nudge fires only when the judge agrees the fit is poor — probability at or below `1 − avoidMargin` — and quotes the policy's reason: *"your policy warns against this call — reading files through the shell skips the read tool's guards. Do it another way, or say why this call needs the tool it chose."*
 - **`directives`** shape the judge's read without ever firing a nudge alone; they are folded into the choice question's instructions.
 

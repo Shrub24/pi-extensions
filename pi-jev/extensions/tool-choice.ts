@@ -150,6 +150,9 @@ export function toolGuidance(ask: ActionAskFacts, policy: ToolPolicy): ToolGuida
 	// A per-call match: one named alternative for calls whose args contain it.
 	for (const preference of policy.preferences) {
 		if (preference.tool === ask.toolName || preference.match === undefined) continue;
+		// A per-call match has no tool of its own to anchor on — it matches the
+		// call's text — so it pays the same guard the other branches do: a rule
+		// naming the tool already in use is not an alternative to it.
 		if (!ask.value.toLowerCase().includes(preference.match.toLowerCase())) continue;
 		return { ...base, alternatives: [{ tool: preference.tool, reason: preference.reason }], reason: preference.reason, intent: null };
 	}
