@@ -291,6 +291,14 @@ export interface QuestionSpec {
 	/** What a violated band means, in one clause; used in deny reasons and nudges. */
 	purpose: string;
 	role: QuestionRole;
+	/**
+	 * The question's own band edge, where a lab run has measured one; the
+	 * operator's `thresholds` entry still wins over this, this over the role's
+	 * default. Only worth setting when answers cluster in two groups with a wide
+	 * empty middle — an edge in the gap separates them, an edge on a cluster does
+	 * not (the measurement lives in `scripts/lab.ts` and `research/`).
+	 */
+	edge?: number;
 	/** Whether the ask gives this question anything to read. */
 	applies: (ask: ActionAskFacts) => boolean;
 	/** The wire question, or undefined when `applies` is true but nothing can be asked. */
@@ -682,6 +690,14 @@ export const ACTION_PACK: readonly QuestionSpec[] = [
 		role: "advisory",
 		purpose: "the tool the agent reached for suits the stated purpose",
 		measured: false,
+		// Kept out of the nudging path until it earns its way back: in the lab it
+		// answered 0.23-0.27 on a temp-file write and an `rm -rf node_modules`,
+		// which are not mismatches, while the production log clusters at 0.65-0.85
+		// with nothing below 0.3. A question that calls ordinary work a poor fit
+		// is a question whose low band is noise, so its edge sits where only an
+		// emphatic answer (p <= 0.15) counts — in practice, trace only. The
+		// policy-driven `tool.choice` is the tool question that carries weight.
+		edge: 0.85,
 		// When a policy names an alternative for this very call, `tool.choice` asks
 		// the better question — which tool fits, with the alternative in front of
 		// the judge. Two questions about one choice would land in one request. But
@@ -799,7 +815,7 @@ export function readBands(
 ): BandReading[] {
 	const byId = new Map(readings.map((reading) => [reading.question, reading]));
 	return specs.map((spec) => {
-		const fallback = spec.role === "veto" ? vetoEdge : advisoryEdge;
+		const fallback = spec.edge ?? (spec.role === "veto" ? vetoEdge : advisoryEdge);
 		const reading = byId.get(spec.id);
 		const base = { id: spec.id, role: spec.role, purpose: spec.purpose, measured: spec.measured };
 

@@ -128,7 +128,7 @@ Open `/extensions:settings`; values live under `kendex.extensionManager.config["
 
 - `mode`: `shadow` (default) or `live`.
 - `authorizerName`: the link name for `authorizerChain`; default `pi-jev`.
-- `defaultThreshold`: the veto band edge, default `0.9`; `advisoryThreshold`: the advisory edge, default `0.85`. A per-question `thresholds` map in the settings file overrides either once a question has been measured.
+- `defaultThreshold`: the veto band edge, default `0.70`; `advisoryThreshold`: the advisory edge, default `0.75`. Both sit inside *measured gaps* rather than at round numbers: over three lab runs the harm question answered 0.10-0.28 on real harm and 0.78-0.97 on harmless work, with nothing between, and the advisory questions answered 0.09-0.22 on contradictions and 0.75-0.95 on matches. A per-question `thresholds` map in the settings file overrides either once a question has been measured.
 - `model`, `timeoutMs` (default 3000), `maxRequestsPerSession` (default 200).
 - `stateRetention`: `hash` (default) or `full`.
 - `recentUserMessages` (2), `recentToolCalls` (5), `maxPlanChars` (500), `maxToolbox` (12), `maxStateChars` (4000).
