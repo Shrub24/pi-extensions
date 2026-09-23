@@ -29,18 +29,82 @@ export interface JevClientOptions {
 	model: string;
 	timeoutMs: number;
 	/**
-	 * Attempts this client instance may make, including failed ones. Our own
-	 * ceiling, because pi-typesafe's default of 20 is a tool's budget and this
-	 * judge asks once per permission prompt; a session cap that trips silently
-	 * would look like a judge that stopped working.
+	 * Attempts this client instance may make, including failed ones. A backstop
+	 * against a runaway loop, not a budget: the day cap and the rate limits below
+	 * are what shape ordinary use, and this number is only reached by a defect.
 	 */
 	maxRequests: number;
+	/**
+	 * Requests per local day, counted by pi-typesafe's ledger, which persists
+	 * across restarts and rolls over at the local midnight. A spend guard — at
+	 * our state sizes a few thousand requests is cents.
+	 */
+	maxRequestsPerDay?: number;
+	/** Requests inside one minute before the rest are skipped. 0 disables it. */
+	ratePerMinute?: number;
+	/** Requests inside one hour before the rest are skipped. 0 disables it. */
+	ratePerHour?: number;
 	/** The key for createTypeSafe; omitted means pi-typesafe resolves its own. */
 	apiKey?: string;
 	/** Module loader, injected by tests. */
 	load?: () => Promise<unknown>;
 	/** Clock, injected by tests. */
 	now?: () => number;
+}
+
+const ONE_MINUTE_MS = 60_000;
+const ONE_HOUR_MS = 3_600_000;
+
+/**
+ * The spike guard, in front of the request.
+ *
+ * A session cap alone cannot tell a busy afternoon from a runaway loop: both
+ * arrive at the same total, one of them an hour early. This counts the recent
+ * window instead, so a loop that queues a thousand asks in a minute spends its
+ * first N and skips the rest — visible in the log as `rate`, never silently.
+ */
+function createLimiter(now: () => number, perMinute: number, perHour: number) {
+	/** Timestamps of admitted requests inside the hour window, oldest first. */
+	const admitted: number[] = [];
+	return {
+		/** Why the next request must be skipped, when it must be. */
+		refusal(): string | undefined {
+			const t = now();
+			while (admitted.length > 0 && t - (admitted[0] as number) >= ONE_HOUR_MS) admitted.shift();
+			if (perMinute > 0) {
+				let inMinute = 0;
+				for (let i = admitted.length - 1; i >= 0 && t - (admitted[i] as number) < ONE_MINUTE_MS; i -= 1) inMinute += 1;
+				if (inMinute >= perMinute) {
+					return `pi-jev rate limit: ${perMinute} requests per minute reached; this one was skipped rather than spent.`;
+				}
+			}
+			if (perHour > 0 && admitted.length >= perHour) {
+				return `pi-jev rate limit: ${perHour} requests per hour reached; this one was skipped rather than spent.`;
+			}
+			return undefined;
+		},
+		admit(): void {
+			admitted.push(now());
+		},
+	};
+}
+
+/**
+ * The budget knobs one config hands a client. Structural on purpose: the caller
+ * passes its config, this file stays free of a config import.
+ */
+export function budgetFrom(config: {
+	maxRequestsPerSession: number;
+	maxRequestsPerDay: number;
+	rateLimitPerMinute: number;
+	rateLimitPerHour: number;
+}): Pick<JevClientOptions, "maxRequests" | "maxRequestsPerDay" | "ratePerMinute" | "ratePerHour"> {
+	return {
+		maxRequests: config.maxRequestsPerSession,
+		...config.maxRequestsPerDay > 0 ? { maxRequestsPerDay: config.maxRequestsPerDay } : {},
+		ratePerMinute: config.rateLimitPerMinute,
+		ratePerHour: config.rateLimitPerHour,
+	};
 }
 
 export interface JevClient {
@@ -89,6 +153,7 @@ async function defaultLoad(): Promise<unknown> {
 
 export function createJevClient(options: JevClientOptions): JevClient {
 	const now = options.now ?? (() => Date.now());
+	const limiter = createLimiter(now, options.ratePerMinute ?? 0, options.ratePerHour ?? 0);
 
 	let module: PiTypesafeModule | undefined;
 	let judge: JevJudge | undefined;
@@ -130,6 +195,7 @@ export function createJevClient(options: JevClientOptions): JevClient {
 				model: options.model,
 				timeoutMs: options.timeoutMs,
 				maxRequests: options.maxRequests,
+				...(options.maxRequestsPerDay === undefined ? {} : { maxRequestsPerDay: options.maxRequestsPerDay }),
 				...(options.apiKey === undefined ? {} : { apiKey: options.apiKey }),
 			});
 			if (typeof (client as { evaluate?: unknown }).evaluate !== "function") {
@@ -165,6 +231,9 @@ export function createJevClient(options: JevClientOptions): JevClient {
 		async ask(state, questions, askOptions = {}) {
 			const active = await resolveJudge();
 			if (!active) return { ok: false, error: judgeError ?? MISSING_MODULE, errorCode: "configuration" };
+			const refusal = limiter.refusal();
+			if (refusal !== undefined) return { ok: false, error: refusal, errorCode: "rate" };
+			limiter.admit();
 			const loaded = module as PiTypesafeModule;
 			try {
 				return await loaded.ask(

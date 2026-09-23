@@ -129,6 +129,11 @@ test("each block builds its own section, and the pack names one per section", ()
 	expect(String(authority)).toContain("never authorizes");
 });
 
+test("the ask section carries the agent's own intent line when the tool reported one", () => {
+	const built = askBlock(budget).buildState({ facts: { ...facts(), intent: "Find real consumers of each API key" }, conversation: emptyConversation() }).state as { intent: string };
+	expect(built.intent).toBe("Find real consumers of each API key");
+});
+
 test("an absent plan, history, or toolbox yields a null section rather than an empty one", () => {
 	const built = actionBlocks(budget).map((block) => block.buildState({ facts: facts(), conversation: emptyConversation() }));
 	const byId = new Map(actionBlocks(budget).map((block, index) => [block.id, built[index]?.state]));

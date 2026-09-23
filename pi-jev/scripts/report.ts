@@ -63,7 +63,16 @@ if (asks.length > 0) {
 	const latencies = asks.map((ask) => ask.latencyMs).sort((a, b) => a - b);
 	const percentile = (fraction: number) => latencies[Math.min(latencies.length - 1, Math.floor(latencies.length * fraction))] ?? 0;
 	const errors = asks.filter((ask) => ask.error !== null);
-	console.log(`judge ${[...models].join(", ")} | pack ${[...packs].join(", ")} | latency p50 ${percentile(0.5)}ms p95 ${percentile(0.95)}ms | ${errors.length} failed calls`);
+	// Broken down by code, because the codes mean different things: `budget` and
+	// `rate` are this package's own ceilings refusing to spend, the rest are the
+	// judge or the network failing.
+	const errorCodes = new Map<string, number>();
+	for (const ask of errors) {
+		const code = ask.error?.code ?? "unknown";
+		errorCodes.set(code, (errorCodes.get(code) ?? 0) + 1);
+	}
+	const codes = errorCodes.size === 0 ? "" : ` (${[...errorCodes].map(([code, count]) => `${code} ${count}`).join(", ")})`;
+	console.log(`judge ${[...models].join(", ")} | pack ${[...packs].join(", ")} | latency p50 ${percentile(0.5)}ms p95 ${percentile(0.95)}ms | ${errors.length} failed calls${codes}`);
 }
 
 console.log(

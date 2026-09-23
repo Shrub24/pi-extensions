@@ -31,7 +31,7 @@ import { MAX_QUESTIONS_PER_REQUEST, readSettingsFile, resolveConfig } from "./co
 import type { JevConfig } from "./config.js";
 import { configConversation, sessionSources, skillLoaded, toolboxLines } from "./conversation.js";
 import type { Nudge } from "./consumers.js";
-import { createJevClient } from "./jev.js";
+import { budgetFrom, createJevClient } from "./jev.js";
 import type { JevClient } from "./jev.js";
 import type { DecisionLog } from "./decision-log.js";
 import { deliverNudges } from "./nudges.js";
@@ -139,6 +139,7 @@ export function toolCallFacts(event: ToolCallLike, fallbackId: string, policy?: 
 		kind: "tool",
 		value,
 		change: changeSummary(event.input),
+		intent: stringField(input, ["intent"]),
 		toolName,
 		invokedToolName: null,
 		matchedPattern: null,
@@ -218,7 +219,7 @@ export function wireIntentConsumer(pi: ExtensionAPI, deps: IntentDeps = {}): voi
 			sessionId = null;
 		}
 		if (sessionId === null || lease) return;
-		const client = (jev ??= deps.jev ?? createJevClient({ model: config.model, timeoutMs: config.timeoutMs, maxRequests: config.maxRequestsPerSession, ...(config.apiKey === undefined ? {} : { apiKey: config.apiKey }) }));
+		const client = (jev ??= deps.jev ?? createJevClient({ model: config.model, timeoutMs: config.timeoutMs, ...budgetFrom(config), ...(config.apiKey === undefined ? {} : { apiKey: config.apiKey }) }));
 		lease = acquireCore({
 			sessionId,
 			options: {

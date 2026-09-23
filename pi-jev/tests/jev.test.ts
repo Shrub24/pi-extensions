@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 
-import { createJevClient } from "../extensions/jev.js";
+import { budgetFrom, createJevClient } from "../extensions/jev.js";
 import { fakeJudge, noul } from "./fixtures/fakes.js";
 
 function moduleWith(options: { create?: () => unknown; ask?: (judge: unknown, request: unknown, askOptions: unknown) => Promise<unknown> } = {}) {
@@ -113,4 +113,101 @@ test("the caller's signal reaches the judge", async () => {
 	const controller = new AbortController();
 	await client.ask({}, { q: { type: "noul" } }, { signal: controller.signal });
 	expect(built.askCalls[0]?.askOptions.signal).toBe(controller.signal);
+});
+
+test("a burst past the minute window is skipped with a rate code, and recovers when the window slides", async () => {
+	const built = moduleWith();
+	let clock = 1_000_000;
+	const client = createJevClient({
+		model: "m",
+		timeoutMs: 1_000,
+		maxRequests: 100,
+		ratePerMinute: 2,
+		ratePerHour: 0,
+		load: async () => built.module,
+		now: () => clock,
+	});
+	expect((await client.ask({}, { q: { type: "noul" } })).ok).toBe(true);
+	expect((await client.ask({}, { q: { type: "noul" } })).ok).toBe(true);
+	const third = await client.ask({}, { q: { type: "noul" } });
+	expect(third.ok).toBe(false);
+	expect((third as { errorCode?: string }).errorCode).toBe("rate");
+	// The judged requests reached the client; the skipped one did not.
+	expect(built.askCalls.length).toBe(2);
+
+	clock += 60_001;
+	const fourth = await client.ask({}, { q: { type: "noul" } });
+	expect(fourth.ok).toBe(true);
+	expect(built.askCalls.length).toBe(3);
+});
+
+test("the hour window holds when the minute window does not", async () => {
+	const built = moduleWith();
+	let clock = 0;
+	const client = createJevClient({
+		model: "m",
+		timeoutMs: 1_000,
+		maxRequests: 100,
+		ratePerMinute: 0,
+		ratePerHour: 2,
+		load: async () => built.module,
+		now: () => clock,
+	});
+	await client.ask({}, { q: { type: "noul" } });
+	clock += 60_000;
+	await client.ask({}, { q: { type: "noul" } });
+	clock += 60_000;
+	const third = await client.ask({}, { q: { type: "noul" } });
+	expect(third.ok).toBe(false);
+	expect((third as { errorCode?: string }).errorCode).toBe("rate");
+
+	clock += 3_600_001;
+	expect((await client.ask({}, { q: { type: "noul" } })).ok).toBe(true);
+});
+
+test("the day cap reaches pi-typesafe's client, and 0 leaves it out", async () => {
+	const seen: Record<string, unknown>[] = [];
+	const built = moduleWith({
+		create: () => {
+			return built.judge;
+		},
+	});
+	// createTypeSafe must receive the day cap; the fake records what it was given.
+	const recording = {
+		createTypeSafe: (options: Record<string, unknown>) => {
+			seen.push(options);
+			return built.judge;
+		},
+		ask: built.module.ask,
+	};
+	const withCap = createJevClient({ model: "m", timeoutMs: 1_000, maxRequests: 10, maxRequestsPerDay: 400, load: async () => recording, now: () => 0 });
+	await withCap.ask({}, { q: { type: "noul" } });
+	expect(seen[0]?.maxRequestsPerDay).toBe(400);
+	expect(seen[0]?.maxRequests).toBe(10);
+
+	const withoutCap = createJevClient({ model: "m", timeoutMs: 1_000, maxRequests: 10, load: async () => recording, now: () => 0 });
+	await withoutCap.ask({}, { q: { type: "noul" } });
+	expect("maxRequestsPerDay" in (seen[1] as Record<string, unknown>)).toBe(false);
+});
+
+test("budgetFrom carries the config's numbers and omits a disabled day cap", async () => {
+	const built = moduleWith();
+	const seen: Record<string, unknown>[] = [];
+	const recording = {
+		createTypeSafe: (options: Record<string, unknown>) => {
+			seen.push(options);
+			return built.judge;
+		},
+		ask: built.module.ask,
+	};
+	const client = createJevClient({
+		model: "m",
+		timeoutMs: 1_000,
+		...budgetFrom({ maxRequestsPerSession: 5_000, maxRequestsPerDay: 0, rateLimitPerMinute: 60, rateLimitPerHour: 1_000 }),
+		load: async () => recording,
+		now: () => 0,
+	});
+	await client.ask({}, { q: { type: "noul" } });
+	expect(seen[0]).toMatchObject({ maxRequests: 5_000 });
+	expect("maxRequestsPerDay" in (seen[0] as Record<string, unknown>)).toBe(false);
 });

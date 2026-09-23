@@ -40,7 +40,7 @@ import {
 	readReadyEvent,
 } from "./gotgenes.js";
 import type { SeamLocator } from "./gotgenes.js";
-import { createJevClient } from "./jev.js";
+import { budgetFrom, createJevClient } from "./jev.js";
 import type { JevClient } from "./jev.js";
 import type { PermissionsService } from "./types.js";
 import type { ToolPolicy } from "./tool-policy.js";
@@ -95,7 +95,7 @@ export function wirePermissionAuthorizer(pi: ExtensionAPI, deps: WiringDeps = {}
 		createJevClient({
 			model: config.model,
 			timeoutMs: config.timeoutMs,
-			maxRequests: config.maxRequestsPerSession,
+			...budgetFrom(config),
 			...(config.apiKey === undefined ? {} : { apiKey: config.apiKey }),
 		});
 	const locator = deps.locator ?? createSeamLocator();

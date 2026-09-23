@@ -210,6 +210,15 @@ test("a call's decision-relevant argument is what the questions read", () => {
 	expect(toolCallFacts({ toolName: "bash", input: {} }, "call-3").requestId).toBe("call-3");
 });
 
+test("the call's own intent line reaches the facts, and an absent one stays null", () => {
+	const facts = toolCallFacts(
+		{ toolName: "bash", toolCallId: "t10", input: { command: 'rg -n "apiKey" src/', intent: "Find real consumers of each API key" } },
+		"call-1",
+	);
+	expect(facts.intent).toBe("Find real consumers of each API key");
+	expect(toolCallFacts({ toolName: "bash", input: {} }, "call-2").intent).toBeNull();
+});
+
 test("a policy preference queues a choice question, and the nudge names the reason", async () => {
 	const service = fakeService();
 	const host = fakeHost({

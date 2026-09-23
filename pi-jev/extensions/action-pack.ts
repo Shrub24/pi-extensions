@@ -97,6 +97,15 @@ export interface ActionAskFacts {
 	 * path. Absent for tools that report no change.
 	 */
 	change?: string | null;
+	/**
+	 * The agent's own one-line statement of why it is making this call, when the
+	 * tool carries one (`intent` on bash, edit, write, bg_task, read …). Every Pi
+	 * tool takes it, it is written at call time rather than turn time, and it names
+	 * the *purpose* where `value` names the mechanics — "Find real consumers of each
+	 * API key" against `rg -n "apiKey" src/`. It is a claim, not authority, but a
+	 * claim is what a question about intent or fit needs to read.
+	 */
+	intent?: string | null;
 	toolName: string | null;
 	invokedToolName: string | null;
 	matchedPattern: string | null;
@@ -241,6 +250,7 @@ export function askFactsFrom(details: PromptPermissionDetails, query: Permission
 		forwarded,
 		policy: { surfaceState, toolState },
 		path: details.path ?? null,
+		intent: null,
 	};
 }
 
@@ -431,6 +441,7 @@ export function askBlock(budget: StateBudget): StateBlock<ActionContext> {
 					kind: ask.kind,
 					value,
 					change: cut("ask.change", ask.change ?? null, budget.maxFieldChars),
+					intent: cut("ask.intent", ask.intent ?? null, budget.maxFieldChars),
 					workingDirectory: conversationOf(context).cwd,
 					matchedRule: cut("ask.matchedRule", ask.matchedPattern, 120),
 					nested: ask.commandContext === null ? null : cut("ask.nested", ask.commandContext, 60),

@@ -22,7 +22,10 @@ test("defaults hold when there is no settings file, and a malformed file is not 
 	expect(empty.authorizerName).toBe("pi-jev");
 	expect(empty.defaultThreshold).toBe(DEFAULTS.defaultThreshold);
 	expect(empty.stateRetention).toBe("hash");
-	expect(empty.maxRequestsPerSession).toBe(200);
+	expect(empty.maxRequestsPerSession).toBe(DEFAULTS.maxRequestsPerSession);
+	expect(empty.maxRequestsPerDay).toBe(5_000);
+	expect(empty.rateLimitPerMinute).toBe(60);
+	expect(empty.rateLimitPerHour).toBe(1_000);
 
 	const dir = mkdtempSync(join(tmpdir(), "pi-jev-bad-"));
 	writeFileSync(join(dir, "settings.json"), "{ not json", "utf8");
@@ -44,6 +47,9 @@ test("settings resolve under the extension manager's config key", () => {
 		maxStateChars: 2_000,
 		maxFieldChars: 300,
 		maxRequestsPerSession: 25,
+		maxRequestsPerDay: 400,
+		rateLimitPerMinute: 5,
+		rateLimitPerHour: 40,
 	});
 	const config = resolveConfig(readSettingsFile(env), env);
 	expect(config).toMatchObject({
@@ -58,16 +64,21 @@ test("settings resolve under the extension manager's config key", () => {
 		maxStateChars: 2_000,
 		maxFieldChars: 300,
 		maxRequestsPerSession: 25,
+		maxRequestsPerDay: 400,
+		rateLimitPerMinute: 5,
+		rateLimitPerHour: 40,
 	});
 	expect(config.logFile).toBe(join(env.PI_CODING_AGENT_DIR as string, "pi-jev", "decisions.jsonl"));
 });
 
 test("the environment overrides the file, and nonsense values fall back", () => {
-	const env = { ...writeSettings({ mode: "shadow", model: "from-file", timeoutMs: 9_000 }), PI_JEV_MODE: "live", PI_JEV_MODEL: "from-env", PI_JEV_TIMEOUT_MS: "1500" } as NodeJS.ProcessEnv;
+	const env = { ...writeSettings({ mode: "shadow", model: "from-file", timeoutMs: 9_000 }), PI_JEV_MODE: "live", PI_JEV_MODEL: "from-env", PI_JEV_TIMEOUT_MS: "1500", PI_JEV_RATE_PER_MINUTE: "7", PI_JEV_MAX_REQUESTS_PER_DAY: "250" } as NodeJS.ProcessEnv;
 	const config = resolveConfig(readSettingsFile(env), env);
 	expect(config.mode).toBe("live");
 	expect(config.model).toBe("from-env");
 	expect(config.timeoutMs).toBe(1_500);
+	expect(config.rateLimitPerMinute).toBe(7);
+	expect(config.maxRequestsPerDay).toBe(250);
 
 	const nonsense = resolveConfig({ mode: "yolo", stateRetention: "everything", defaultThreshold: 0.5, maxStateChars: 10, timeoutMs: 5 }, {} as NodeJS.ProcessEnv);
 	expect(nonsense.mode).toBe("shadow");
