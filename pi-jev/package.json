@@ -209,6 +209,16 @@
 					"apply": "reload",
 					"requiresReload": true
 				},
+{
+			    "key": "nudgeCooldownMs",
+			    "label": "Nudge cooldown",
+			    "description": "How long the same finding stays quiet after it has been said, in milliseconds. The first occurrence goes as written; a repeat inside the window is counted and not sent; a repeat after it returns as an accumulated reminder naming the calls behind it. The window doubles per delivery to 15 minutes. 0 delivers every occurrence as written.",
+			    "type": "number",
+			    "default": 60000,
+			    "category": "Delivery",
+			    "apply": "reload",
+			    "requiresReload": true
+			},
 				{
 					"key": "queueFlushGapMs",
 					"label": "Queued-question wait",

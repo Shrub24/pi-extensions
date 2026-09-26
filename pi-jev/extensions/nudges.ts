@@ -12,6 +12,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import type { Nudge } from "./consumers.js";
+import { type LedgerOptions, ledgerFor } from "./nudge-ledger.js";
 
 export interface DeliverOptions {
 	/**
@@ -44,4 +45,25 @@ export function deliverNudges(pi: ExtensionAPI, nudges: readonly Nudge[], option
 			// A nudge that cannot be delivered must not affect any verdict.
 		}
 	}
+}
+
+/**
+ * A delivery that goes through the session's ledger: what the consumers call.
+ *
+ * `ref` is the subject the finding is about — the tool call id behind the ask —
+ * and it is what an accumulated reminder names, so "3rd time this session" is
+ * followed by the calls being counted. Without a scope (no live session) the
+ * ledger is a pass-through.
+ */
+export type NudgeDelivery = (nudges: readonly Nudge[], ref?: string | null) => void;
+
+export function createNudgeDelivery(
+	pi: ExtensionAPI,
+	scope: () => object | undefined,
+	options: DeliverOptions & LedgerOptions = {},
+): NudgeDelivery {
+	return (nudges, ref = null) => {
+		const admitted = ledgerFor(scope(), options).admit(nudges, ref);
+		if (admitted.length > 0) deliverNudges(pi, admitted, options);
+	};
 }

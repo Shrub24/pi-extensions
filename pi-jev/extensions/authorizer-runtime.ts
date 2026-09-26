@@ -22,6 +22,7 @@ import type { ActionContext, ConversationFacts } from "./action-pack.js";
 import { applyGuidance } from "./tool-policy.js";
 import { askPermission, PERMISSION_CONSUMER, returnedVerdict } from "./consumers.js";
 import type { Nudge } from "./consumers.js";
+import type { NudgeDelivery } from "./nudges.js";
 import type { JevConfig } from "./config.js";
 import type { DecisionCore } from "./decision-core.js";
 import type { ToolPolicy } from "./tool-policy.js";
@@ -48,7 +49,7 @@ export interface AuthorizerRuntimeDeps {
 	/** Reports a problem once per distinct message; used for the one-time notice. */
 	report?: (problem: string) => void;
 	/** Where a nudge goes. Unset means signals are recorded and dropped. */
-	deliver?: (nudges: readonly Nudge[]) => void;
+	deliver?: NudgeDelivery;
 }
 
 export interface AuthorizerRuntime {
@@ -135,7 +136,9 @@ export function createAuthorizerRuntime(deps: AuthorizerRuntimeDeps): Authorizer
 			}
 			if (nudges.length > 0 && deps.deliver) {
 				try {
-					deps.deliver(nudges);
+					// The ref is the call this finding is about, so a reminder that
+					// comes back later can name the calls it is counting.
+					deps.deliver(nudges, facts.toolCallId ?? facts.requestId);
 				} catch {
 					// A nudge that cannot be delivered is not a reason to change a verdict.
 				}

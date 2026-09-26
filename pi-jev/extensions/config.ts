@@ -78,6 +78,11 @@ export interface JevConfig {
 	/** Deliver the orchestrator's subagent-steering nudges. Off until the log shows the fire rate. */
 	deliverSubagentNudges: boolean;
 	/**
+	 * How long the same finding stays quiet after it has been said, in
+	 * milliseconds. 0 delivers every occurrence as written.
+	 */
+	nudgeCooldownMs: number;
+	/**
 	 * How long a queued question may wait with no send before the core asks it
 	 * anyway, in milliseconds. 0 disables the timer: by default a queued question
 	 * is answered by the next send, or at the turn boundary, and nothing spends on
@@ -156,6 +161,7 @@ export const DEFAULTS: JevConfig = {
 	deliverIntentNudges: false,
 	loadSkills: false,
 	deliverSubagentNudges: false,
+	nudgeCooldownMs: 60_000,
 	queueFlushGapMs: 0,
 	orchestratorCheckInMs: 0,
 	logFile: "",
@@ -301,6 +307,9 @@ export function resolveConfig(
 	if (typeof settings.deliverIntentNudges === "boolean") config.deliverIntentNudges = settings.deliverIntentNudges;
 	if (typeof settings.loadSkills === "boolean") config.loadSkills = settings.loadSkills;
 	if (typeof settings.deliverSubagentNudges === "boolean") config.deliverSubagentNudges = settings.deliverSubagentNudges;
+
+	const cooldown = pickNumber(env.PI_JEV_NUDGE_COOLDOWN_MS ?? settings.nudgeCooldownMs, 0, 3_600_000);
+	if (cooldown !== undefined) config.nudgeCooldownMs = cooldown;
 
 	const gap = pickNumber(settings.queueFlushGapMs, 0, 600_000);
 	if (gap !== undefined) config.queueFlushGapMs = gap;

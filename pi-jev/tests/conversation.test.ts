@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 
-import { conversationFacts, declaredPlan, sessionSources, toolCallLine, userMessageText } from "../extensions/conversation.js";
+import { TREND_WINDOW, conversationFacts, declaredPlan, sessionSources, toolCallLine, toolTrend, userMessageText } from "../extensions/conversation.js";
 import { askFactsFrom, userIntentBlock } from "../extensions/action-pack.js";
 import { fakeDetails, fakeQuery } from "./fixtures/fakes.js";
 
@@ -85,8 +85,53 @@ test("the walk keeps the newest entries and nothing else", () => {
 	expect(trimmed.recentToolCalls).toEqual([]);
 });
 
+test("the trend counts what the recent calls add up to", () => {
+	const call = (name: string, args: Record<string, unknown>) => message("assistant", [{ type: "toolCall", name, arguments: args }]);
+	const entries = [
+		message("user", "find the retry logic"),
+		call("bash", { command: "rg retryBackoff src/" }),
+		call("bash", { command: "grep -rn 'apiKey' src/extensions/" }),
+		call("bash", { command: "rg TIMEOUT /nix/store/abc/lib" }),
+		call("bash", { command: "git grep -n registry" }),
+		call("bash", { command: "ls -la ~/.cache" }),
+		call("grep", { pattern: "retry" }),
+		call("edit", { path: "src/a.ts" }),
+		call("read", { path: "src/b.ts" }),
+	];
+	const facts = conversationFacts(sourcesWith(entries), LIMITS);
+	expect(facts.toolTrend).toEqual({
+		window: 8,
+		byTool: [
+			{ name: "bash", count: 5 },
+			{ name: "edit", count: 1 },
+			{ name: "grep", count: 1 },
+			{ name: "read", count: 1 },
+		],
+		shellSearches: 4,
+		// The `/nix/store` search is the one that left the project.
+		shellSearchesHere: 3,
+		indexed: 1,
+	});
+	// `ls` is neither a search nor an indexed read.
+	expect(facts.toolTrend?.window).toBe(8);
+});
+
+test("a trend needs more than a couple of calls, and reads only the newest window", () => {
+	expect(toolTrend([])).toBeNull();
+	expect(toolTrend([{ name: "bash", text: "rg x" }, { name: "bash", text: "rg y" }, { name: "bash", text: "rg z" }])).toBeNull();
+
+	const call = (name: string, args: Record<string, unknown>) => message("assistant", [{ type: "toolCall", name, arguments: args }]);
+	const many = [message("user", "go"), ...Array.from({ length: TREND_WINDOW + 5 }, (_, index) => call("bash", { command: `rg call${index}` }))];
+	const facts = conversationFacts(sourcesWith(many), LIMITS);
+	// The window is its own bound: the five rendered lines and the twenty counted
+	// calls are different questions about the same session.
+	expect(facts.recentToolCalls).toHaveLength(5);
+	expect(facts.toolTrend?.window).toBe(TREND_WINDOW);
+	expect(facts.toolTrend?.byTool).toEqual([{ name: "bash", count: TREND_WINDOW }]);
+});
+
 test("sources that are missing, throwing, or shapeless yield empty lists", () => {
-	const empty = { userMessages: [], recentToolCalls: [], declaredPlan: null, toolbox: [], cwd: null };
+	const empty = { userMessages: [], recentToolCalls: [], toolTrend: null, declaredPlan: null, toolbox: [], cwd: null };
 	expect(conversationFacts(undefined, LIMITS)).toEqual(empty);
 	expect(
 		conversationFacts(

@@ -114,7 +114,7 @@ export function testConfig(overrides: Partial<JevConfig> = {}): JevConfig {
 }
 
 export function conversation(overrides: Partial<ConversationFacts> = {}): ConversationFacts {
-	return { userMessages: [], recentToolCalls: [], declaredPlan: null, toolbox: [], ...overrides };
+	return { userMessages: [], recentToolCalls: [], toolTrend: null, declaredPlan: null, toolbox: [], ...overrides };
 }
 
 /** A conversation source backed by an array of branch entries. */

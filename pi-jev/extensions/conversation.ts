@@ -55,6 +55,70 @@ const PRIMARY_ARGUMENT: Record<string, string> = {
 	spawn: "command",
 };
 
+/**
+ * Tools that answer a question about the codebase without reading it by hand:
+ * the indexed and graph tools, the semantic search, the docs and code gates. A
+ * trend that counted only shell searches would miss the point — it is the ratio
+ * between these and the shell that says whether the agent is exploring the
+ * project or reading it a file at a time.
+ */
+const RETRIEVAL_TOOLS = new Set([
+	"grep",
+	"find",
+	"glob",
+	"search_code",
+	"search_graph",
+	"query_graph",
+	"get_code_snippet",
+	"get_file_outline",
+	"get_architecture",
+	"trace_path",
+	"list_projects",
+	"semble_search",
+	"semble_find_related",
+	"mcp",
+	"mcp__docs_mcp_server",
+]);
+
+/**
+ * A shell command that searches: the shapes the audit counted. `git grep` is
+ * checked before the bare verbs so a repository-wide search is not read as a
+ * plain `grep` argument.
+ */
+const SHELL_SEARCH = /(^|[\s|&;(])(git\s+grep|rg|grep|ag|ack|fd|find)\s/;
+
+/**
+ * A path argument that leaves the project: absolute, or home-relative. The
+ * trend says "in this project" from this alone, so it is deliberately blunt —
+ * a command naming `/nix/store`, `/tmp`, or `~/.cache` is about something other
+ * than the code under the working directory, and a relative one is not.
+ */
+const OUTSIDE_PATH = /(^|\s)[~/]/;
+
+/** How many recent calls the trend reads. Enough for a habit, small enough to bound the walk. */
+export const TREND_WINDOW = 20;
+
+export function toolTrend(sample: readonly { name: string; text: string }[]): ToolTrend | null {
+	if (sample.length < 4) return null;
+	const counts = new Map<string, number>();
+	let shellSearches = 0;
+	let shellSearchesHere = 0;
+	let indexed = 0;
+	for (const call of sample) {
+		counts.set(call.name, (counts.get(call.name) ?? 0) + 1);
+		if (call.name === "bash" && SHELL_SEARCH.test(call.text)) {
+			shellSearches += 1;
+			if (!OUTSIDE_PATH.test(call.text)) shellSearchesHere += 1;
+		}
+		if (RETRIEVAL_TOOLS.has(call.name)) indexed += 1;
+	}
+	const byTool = [...counts]
+		.map(([name, count]) => ({ name, count }))
+		.sort((a, b) => b.count - a.count || a.name.localeCompare(b.name))
+		.slice(0, 6);
+	return { window: sample.length, byTool, shellSearches, shellSearchesHere, indexed };
+}
+
 interface ContentPart {
 	type?: string;
 	text?: string;
@@ -119,15 +183,31 @@ export function declaredPlan(entries: readonly unknown[], max: number): string |
  * registered tool a reader has never heard of still reaches the judge.
  */
 export function toolCallLine(part: ContentPart, max = 200): string {
-	const name = typeof part.name === "string" && part.name !== "" ? part.name : "tool";
-	const args = isRecord(part.arguments) ? part.arguments : {};
-	const key = PRIMARY_ARGUMENT[name];
-	const value = key && typeof args[key] === "string" ? (args[key] as string) : JSON.stringify(args);
-	const flat = String(value ?? "").replace(/\s+/g, " ").trim();
+	const name = callName(part);
+	const flat = callArgument(part);
 	// An empty argument view says nothing the tool name has not already said.
 	if (flat === "" || flat === "{}" || flat === "[]") return name;
 	const line = `${name} ${flat}`;
 	return line.length <= max ? line : `${line.slice(0, max - 1)}…`;
+}
+
+/** The tool's name as the call reported it, or "tool" when it reported none. */
+function callName(part: ContentPart): string {
+	return typeof part.name === "string" && part.name !== "" ? part.name : "tool";
+}
+
+/**
+ * The argument that says what the call acts on, flattened to one line. The trend
+ * reads the same string the judge's tool lines show, so a count and the lines it
+ * counts can never disagree about what a call was.
+ */
+function callArgument(part: ContentPart): string {
+	const args = isRecord(part.arguments) ? part.arguments : {};
+	const key = PRIMARY_ARGUMENT[callName(part)];
+	const value = key && typeof args[key] === "string" ? (args[key] as string) : JSON.stringify(args);
+	return String(value ?? "")
+		.replace(/\s+/g, " ")
+		.trim();
 }
 
 function cap(text: string, max: number): string {
@@ -217,7 +297,11 @@ export function skillLoaded(entries: readonly unknown[], skill: string): boolean
 export function conversationFacts(sources: ConversationSources | undefined, limits: ConversationLimits): ConversationFacts {
 	const userMessages: string[] = [];
 	const recentToolCalls: string[] = [];
-	const empty: ConversationFacts = { userMessages, recentToolCalls, declaredPlan: null, toolbox: [], cwd: null };
+	// The trend's own window, independent of how many calls are rendered: the
+	// lines are capped at five for the judge's attention, and a habit needs more
+	// calls than that to be a habit at all.
+	const sample: { name: string; text: string }[] = [];
+	const empty: ConversationFacts = { userMessages, recentToolCalls, toolTrend: null, declaredPlan: null, toolbox: [], cwd: null };
 	if (!sources) return empty;
 
 	let entries: readonly unknown[] = [];
@@ -239,7 +323,11 @@ export function conversationFacts(sources: ConversationSources | undefined, limi
 		}
 		if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
 		for (const part of message.content as ContentPart[]) {
-			if (part && typeof part === "object" && part.type === "toolCall") recentToolCalls.push(cap(toolCallLine(part), limits.maxCharsPerString));
+			if (part && typeof part === "object" && part.type === "toolCall") {
+				recentToolCalls.push(cap(toolCallLine(part), limits.maxCharsPerString));
+				sample.push({ name: callName(part), text: callArgument(part) });
+				if (sample.length > TREND_WINDOW) sample.shift();
+			}
 		}
 	}
 
@@ -255,6 +343,7 @@ export function conversationFacts(sources: ConversationSources | undefined, limi
 	return {
 		userMessages: limits.maxUserMessages > 0 ? userMessages.slice(-limits.maxUserMessages) : [],
 		recentToolCalls: limits.maxToolCalls > 0 ? recentToolCalls.slice(-limits.maxToolCalls) : [],
+		toolTrend: toolTrend(sample),
 		declaredPlan: limits.maxPlanChars > 0 ? declaredPlan(entries, limits.maxPlanChars) : null,
 		toolbox,
 		cwd: typeof sources.cwd === "string" && sources.cwd !== "" ? sources.cwd : null,

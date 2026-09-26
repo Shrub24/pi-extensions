@@ -16,7 +16,7 @@ import type { CoreRecordContext, DecisionCore } from "../extensions/decision-cor
 
 beforeEach(() => resetRegistry());
 
-const ACTION: ActionContext = { facts: {} as never, conversation: { userMessages: [], recentToolCalls: [], declaredPlan: null, toolbox: [] } };
+const ACTION: ActionContext = { facts: {} as never, conversation: { userMessages: [], recentToolCalls: [], toolTrend: null, declaredPlan: null, toolbox: [] } };
 
 /** A judge that answers one question and counts what it was asked. */
 function judge(answer = 0.9) {

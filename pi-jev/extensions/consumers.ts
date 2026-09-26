@@ -86,6 +86,13 @@ export interface Nudge {
 	severity: "notice" | "warn";
 	measured: boolean;
 	text: string;
+	/**
+	 * Which finding this is, when one question can raise more than one kind.
+	 * `tool.fit` carries both the pack's verdict on the tool and the loaded
+	 * policy's own warning; they are different complaints about the same call, so
+	 * the ledger counts them apart rather than letting the first hide the second.
+	 */
+	finding?: string;
 }
 
 export interface PermissionOutcome {
@@ -390,7 +397,7 @@ export function registerSubagentConsumer(
 	core: DecisionCore<ActionContext>,
 	input: {
 		config: JevConfig;
-		deliver?: (nudges: readonly Nudge[]) => void;
+		deliver?: NudgeDelivery;
 		/** Every violated band, with the input that produced it. Never gated by the steer switch. */
 		onViolation?: (nudges: readonly Nudge[], context: ActionContext) => void;
 	},
@@ -415,7 +422,7 @@ export function registerSubagentConsumer(
 			// A check-in delivers its own finding, with the wake options an idle
 			// orchestrator needs; a steer here would queue unread instead.
 			if (delivery.input.facts.surface === CHECK_IN_SURFACE) return;
-			input.deliver?.(nudges);
+			input.deliver?.(nudges, delivery.input.facts.requestId);
 		},
 	});
 }

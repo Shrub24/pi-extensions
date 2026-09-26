@@ -34,7 +34,8 @@ import type { Nudge } from "./consumers.js";
 import { budgetFrom, createJevClient } from "./jev.js";
 import type { JevClient } from "./jev.js";
 import type { DecisionLog } from "./decision-log.js";
-import { deliverNudges } from "./nudges.js";
+import { createNudgeDelivery, deliverNudges } from "./nudges.js";
+import type { NudgeDelivery } from "./nudges.js";
 import { checkInAction, checkInSubjectKey, checkInIntervalMs, combineFindings, newNotices, noticeNeedsAttention, CHECK_IN_QUESTIONS } from "./check-in.js";
 import { INTENT_CONSUMER, INTENT_QUESTIONS, INTENT_SPECS, SUBAGENT_CONSUMER, installPack, intentNudges, interpretBands, registerSubagentConsumer } from "./consumers.js";
 import { acquireCore, acquireLog, logSink } from "./registry.js";
@@ -204,8 +205,10 @@ export function wireIntentConsumer(pi: ExtensionAPI, deps: IntentDeps = {}): voi
 		}
 	};
 
-	const deliver: ((nudges: readonly Nudge[]) => void) | undefined =
-		config.deliverNudges || config.deliverIntentNudges || config.deliverSubagentNudges ? (nudges) => deliverNudges(pi, nudges) : undefined;
+	const deliver: NudgeDelivery | undefined =
+		config.deliverNudges || config.deliverIntentNudges || config.deliverSubagentNudges
+			? createNudgeDelivery(pi, () => lease?.core, { cooldownMs: config.nudgeCooldownMs })
+			: undefined;
 
 	/** Collected by the shared subagent consumer while a check-in runs. */
 	let checkInFindings: Nudge[] = [];
@@ -264,7 +267,7 @@ export function wireIntentConsumer(pi: ExtensionAPI, deps: IntentDeps = {}): voi
 			onAnswers: (delivery) => {
 				if (!deliver) return;
 				const nudges = intentNudges(delivery.readings, config);
-				if (nudges.length > 0) deliver(nudges);
+				if (nudges.length > 0) deliver(nudges, delivery.input.facts.toolCallId ?? delivery.input.facts.requestId);
 			},
 		});
 
@@ -305,7 +308,7 @@ export function wireIntentConsumer(pi: ExtensionAPI, deps: IntentDeps = {}): voi
 					// with the call before the policy's warning becomes a sentence.
 					const probability = fitReading?.probability;
 					if (typeof probability === "number" && probability <= 1 - (toolPolicy.avoidMargin ?? toolPolicy.margin)) {
-						nudges.push({ source: "tool.fit", role: "advisory", severity: "warn", measured: false, text: toolAvoidNudgeText(delivery.input.facts.value, delivery.input.facts.policyAvoid.reason) });
+						nudges.push({ source: "tool.fit", finding: "policy.avoid", role: "advisory", severity: "warn", measured: false, text: toolAvoidNudgeText(delivery.input.facts.value, delivery.input.facts.policyAvoid.reason) });
 					}
 				}
 				const reading = delivery.readings.find((reading) => reading.question === "tool.choice");
@@ -316,17 +319,17 @@ export function wireIntentConsumer(pi: ExtensionAPI, deps: IntentDeps = {}): voi
 					// action the flush judged still carries it.
 					const preferredReason = delivery.input?.facts.preferredReason ?? null;
 					const skill = delivery.input.facts.policySkill ?? null;
-					nudges.push({ source: band.id, role: band.role, severity: "warn", measured: band.measured, text: toolChoiceNudgeText(band, delivery.input.facts.value, preferredReason) });
+					nudges.push({ source: band.id, finding: "policy.choice", role: band.role, severity: "warn", measured: band.measured, text: toolChoiceNudgeText(band, delivery.input.facts.value, preferredReason) });
 					// A rule that names a skill wants the agent working from it, not merely
 					// told about it: the nudge says why, and — when the switch is on and the
 					// session has not loaded it — the skill is loaded for real. Loading
 					// forces a turn, which is the cost that keeps this off by default.
 					if (skill) {
-						nudges.push({ source: band.id, role: "advisory", severity: "notice", measured: band.measured, text: skillLoadText(skill) });
+						nudges.push({ source: band.id, finding: "policy.skill", role: "advisory", severity: "notice", measured: band.measured, text: skillLoadText(skill) });
 						if (config.loadSkills && !skillAlreadyLoaded(skill.name)) void pi.sendUserMessage(`/skill:${skill.name}`, { deliverAs: "steer", expandPromptTemplates: true });
 					}
 				}
-				if (nudges.length > 0) deliver(nudges);
+				if (nudges.length > 0) deliver(nudges, delivery.input.facts.toolCallId ?? delivery.input.facts.requestId);
 			},
 		});
 	});

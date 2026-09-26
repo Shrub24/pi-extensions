@@ -22,6 +22,7 @@ import {
 	questionsFor,
 	readBands,
 	REVERSIBILITY_LEVELS,
+	renderTrend,
 	thresholdFor,
 } from "../extensions/action-pack.js";
 import { conversation, fakeDetails, fakeQuery, noul, score } from "./fixtures/fakes.js";
@@ -104,7 +105,7 @@ test("each block builds its own section, and the pack names one per section", ()
 		facts: facts(),
 		conversation: conversation({
 			userMessages: ["fix the failing test", "also clean the build dir"],
-			recentToolCalls: ["bash bun test"],
+			recentToolCalls: ["bash bun test"], toolTrend: null,
 			declaredPlan: "I will remove the stale build directory now.",
 			toolbox: ["grep: search file contents", "semble: semantic code search"],
 		}),
@@ -177,7 +178,7 @@ test("each block caps its own section and names what it cut", () => {
 		}),
 		conversation: conversation({
 			userMessages: [long, long, long],
-			recentToolCalls: [long, long, long, long, long, long],
+			recentToolCalls: [long, long, long, long, long, long], toolTrend: null,
 			declaredPlan: long,
 			toolbox: Array.from({ length: 30 }, (_, index) => `tool${index}: ${long}`),
 		}),
@@ -201,6 +202,29 @@ test("each block caps its own section and names what it cut", () => {
 
 	// Every block reports a hashed section whatever it had to cut.
 	for (const block of actionBlocks(budget)) expect(block.buildState(context).stateHash).toMatch(/^[0-9a-f]{16}$/);
+});
+
+test("the tool history section carries what the recent calls add up to", () => {
+	const context = {
+		facts: facts(),
+		conversation: conversation({
+			userMessages: ["find the retry logic"],
+			recentToolCalls: ["bash rg retry src/", "bash rg backoff src/", "grep retry"],
+			toolTrend: { window: 9, byTool: [{ name: "bash", count: 6 }, { name: "edit", count: 2 }, { name: "grep", count: 1 }], shellSearches: 5, shellSearchesHere: 4, indexed: 3 },
+			declaredPlan: "I will find the retry logic.",
+			toolbox: [],
+		}),
+	};
+	const history = actionBlocks(budget)[3]?.buildState(context);
+	const state = history?.state as { toolCalls: string[]; trend: string };
+	expect(state.toolCalls).toHaveLength(3);
+	expect(state.trend).toBe("last 9 calls — bash 6, edit 2, grep 1; 5 shell searches (4 in this project, 1 elsewhere); 3 used a retrieval tool");
+});
+
+test("a trend with no shell searches says so rather than naming a zero", () => {
+	expect(renderTrend({ window: 4, byTool: [{ name: "edit", count: 3 }, { name: "read", count: 1 }], shellSearches: 0, shellSearchesHere: 0, indexed: 1 })).toBe(
+		"last 4 calls — edit 3, read 1; no shell searches; 1 used a retrieval tool",
+	);
 });
 
 test("an ask with an empty value still yields its section", () => {
@@ -448,7 +472,7 @@ test("conversation limits reach the blocks that read them", () => {
 	const small = { ...budget, maxUserMessages: 1, maxToolCalls: 1, maxPlanChars: 100 };
 	const context = {
 		facts: facts(),
-		conversation: conversation({ userMessages: ["a", "b", "c"], recentToolCalls: ["t1", "t2"], declaredPlan: "p".repeat(900), toolbox: ["x: y"] }),
+		conversation: conversation({ userMessages: ["a", "b", "c"], recentToolCalls: ["t1", "t2"], toolTrend: null, declaredPlan: "p".repeat(900), toolbox: ["x: y"] }),
 	};
 	const intent = userIntentBlock(small).buildState(context).state as { latest: string; history: string[] };
 	expect(intent.latest).toBe("c");
@@ -490,7 +514,7 @@ test("subagent questions read the subject, the role, and the task, whatever the 
 
 	// The child block names the agent and what it said it was doing; the
 	// instruction the orchestrator is serving comes from the intent block.
-	const context = { facts: forwarded, conversation: { userMessages: ["review the auth module"], recentToolCalls: [], declaredPlan: "reviewing the auth module for token handling", toolbox: [] } };
+	const context = { facts: forwarded, conversation: { userMessages: ["review the auth module"], recentToolCalls: [], toolTrend: null, declaredPlan: "reviewing the auth module for token handling", toolbox: [] } };
 	const child = childWorkBlock(budget).buildState(context).state as { agent: string; role: { name: string } | null; task: { text: string } | null };
 	expect(child.agent).toBe("reviewer");
 	expect(child.role?.name).toBe("reviewer");

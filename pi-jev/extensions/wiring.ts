@@ -27,7 +27,8 @@ import type { JevConfig } from "./config.js";
 import type { DecisionLog } from "./decision-log.js";
 import { RECORD_VERSION } from "./decision-record.js";
 import type { DecisionRecord, EventRecord } from "./decision-record.js";
-import { deliverNudges } from "./nudges.js";
+import { createNudgeDelivery } from "./nudges.js";
+import type { NudgeDelivery } from "./nudges.js";
 import { installPack, registerSubagentConsumer } from "./consumers.js";
 import type { Nudge } from "./consumers.js";
 import { acquireCore, acquireLog, logSink } from "./registry.js";
@@ -139,8 +140,8 @@ export function wirePermissionAuthorizer(pi: ExtensionAPI, deps: WiringDeps = {}
 		}
 	};
 
-	const deliver: ((nudges: readonly Nudge[]) => void) | undefined =
-		config.deliverNudges || config.deliverSubagentNudges ? (nudges) => deliverNudges(pi, nudges) : undefined;
+	const deliver: NudgeDelivery | undefined =
+		config.deliverNudges || config.deliverSubagentNudges ? createNudgeDelivery(pi, () => lease?.core, { cooldownMs: config.nudgeCooldownMs }) : undefined;
 
 	const runtime = createAuthorizerRuntime({
 		config,

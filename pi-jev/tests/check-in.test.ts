@@ -66,7 +66,7 @@ test("only notices that say something is wrong need a check-in", () => {
 });
 
 test("a check-in's action names its own surface and carries the notice as the subject", () => {
-	const action = checkInAction(notice(), { userMessages: ["fix the parser"], recentToolCalls: [], declaredPlan: "running the suite", toolbox: [] });
+	const action = checkInAction(notice(), { userMessages: ["fix the parser"], recentToolCalls: [], toolTrend: null, declaredPlan: "running the suite", toolbox: [] });
 	expect(action.facts.surface).toBe("subagent_check_in");
 	expect(action.facts.kind).toBe("subagent");
 	expect(action.facts.value).toContain("Subagent active but long-running");
@@ -75,7 +75,7 @@ test("a check-in's action names its own surface and carries the notice as the su
 	expect(action.facts.forwarded).toBe(false);
 	expect(checkInSubjectKey(notice())).toBe("child:notice:n1");
 	expect(latestUserMessage(action.conversation)).toBe("fix the parser");
-	expect(latestUserMessage({ userMessages: [], recentToolCalls: [], declaredPlan: null, toolbox: [] })).toBeNull();
+	expect(latestUserMessage({ userMessages: [], recentToolCalls: [], toolTrend: null, declaredPlan: null, toolbox: [] })).toBeNull();
 });
 
 test("a scan's findings become one wake, keeping the weakest evidence claim", () => {

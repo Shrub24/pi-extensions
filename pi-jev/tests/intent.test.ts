@@ -136,9 +136,11 @@ test("a call nothing gated is read at the turn boundary, once", async () => {
 	// the reading is recorded for both because the consumer that queued them
 	// supplies the interpretation.
 	expect(wired.permissionJev.requests).toHaveLength(2);
-	expect(wired.host.sent).toHaveLength(2);
+	// Both calls are judged and both readings are recorded; one sentence is
+	// delivered. The same finding about two calls in one boundary is one thing to
+	// say, and the ledger keeps the second as a count rather than a repeat.
+	expect(wired.host.sent).toHaveLength(1);
 	expect(wired.host.sent.map((sent) => (sent.message as { details?: { source?: string } }).details?.source)).toEqual([
-		"intent.matches_plan",
 		"intent.matches_plan",
 	]);
 });
@@ -545,7 +547,10 @@ test("a rule that names a skill loads it once, and only when the load switch is 
 	for (const [loadSkills, expected] of [[true, 1], [false, 0]] as const) {
 		const host = fakeHost();
 		wireIntentConsumer(host.pi, { config: testConfig({ deliverIntentNudges: true, loadSkills }), policy, jev: fakeJevClient(answers), log: fakeLog() });
-		await host.sessionStart("s1");
+		// One session id per pass: the registry (and with it the nudge ledger) is
+		// per session, so reusing one id across two hosts would carry the first
+		// pass's delivered finding into the second.
+		await host.sessionStart(loadSkills ? "s-skill-on" : "s-skill-off");
 		await host.fire("turn_start");
 		await host.fire("tool_call", { toolName: "grep", toolCallId: "call-1", input: { pattern: "retryBackoff" } });
 		await host.fire("turn_end");

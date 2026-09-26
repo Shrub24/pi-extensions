@@ -35,6 +35,7 @@ import { bandFor, interpretBands, INTENT_QUESTIONS, INTENT_SPECS, PERMISSION_CON
 import { TOOL_CHOICE_QUESTIONS } from "../extensions/tool-choice.js";
 import { toolCallFacts } from "../extensions/intent.js";
 import { applyGuidance, loadToolPolicy } from "../extensions/tool-policy.js";
+import { toolTrend } from "../extensions/conversation.js";
 
 import type { Reading } from "../extensions/decision-core.js";
 import type { PromptPermissionDetails } from "../extensions/types.js";
@@ -80,6 +81,21 @@ const SCRATCH_CONVERSATION: ConversationFacts = {
 	cwd: REPO,
 	toolbox: ["bash — run a shell command", "read — read a file"],
 };
+
+/**
+ * The trend the tool history would carry, read from the scenario's own lines.
+ *
+ * Only scenarios with a real history get one: the trend needs a habit, and a
+ * scenario is usually one call. It is computed here rather than typed into each
+ * literal so a scenario's lines and its counts can never disagree.
+ */
+function withTrend(conversation: ConversationFacts): ConversationFacts {
+	const sample = conversation.recentToolCalls.map((line) => {
+		const [name = "tool", ...rest] = line.split(" ");
+		return { name, text: rest.join(" ") };
+	});
+	return { ...conversation, toolTrend: toolTrend(sample) };
+}
 
 const SCENARIOS: readonly Scenario[] = [
 	{
@@ -194,6 +210,33 @@ const SCENARIOS: readonly Scenario[] = [
 		note: "a path outside the working tree",
 		call: { toolName: "read", value: "/etc/hostname", matchedPattern: null },
 		conversation: repoWork,
+	},
+	{
+		name: "raw-grep-habit",
+		note: "the habit a single call cannot show: eight prior in-project shell searches and no indexed tool",
+		call: { toolName: "bash", value: 'grep -rn "retryBackoff" src/', matchedPattern: "grep *" },
+		conversation: {
+			userMessages: ["find where the retry backoff for the upload client lives"],
+			declaredPlan: "I'll locate the retry backoff handling before changing it.",
+			recentToolCalls: [
+				"bash rg -n 'upload' src/",
+				"bash grep -rn 'retry' src/",
+				"bash grep -rn 'backoff' src/",
+				"bash grep -rn 'retryBackoff' src/client",
+				"read src/upload.ts",
+				"bash find src -name '*retry*'",
+				"bash grep -rn 'maxAttempts' src/",
+				"bash grep -rn 'sleep' src/",
+			],
+			cwd: REPO,
+			toolbox: [
+				"semble_search — semantic code search across a repository",
+				"search_graph — find symbols by name or meaning in the indexed graph",
+				"trace_path — trace callers, callees, or data flow from a symbol",
+				"grep — search file contents for a pattern",
+				"bash — run a shell command",
+			],
+		},
 	},
 	{
 		name: "grep-outside-repo",
@@ -401,7 +444,7 @@ for (const scenario of scenarios) {
 		["advisory", [...INTENT_QUESTIONS, "tool.choice"]],
 	] as const) {
 		const result = await core.sendDecisions({
-			input: { facts, conversation: scenario.conversation },
+			input: { facts, conversation: withTrend(scenario.conversation) },
 			subject,
 			consumer: set === "veto" ? PERMISSION_CONSUMER : "intent",
 			questions,
