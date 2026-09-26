@@ -3,13 +3,15 @@
   "private": true,
   "workspaces": [
     "pi-bash-processes",
-    "pi-subagents",
-    "pi-tool-renderer",
+    "pi-cbmem",
     "pi-jev",
-    "pi-cbmem"
+    "pi-otel",
+    "pi-output-policy",
+    "pi-subagents",
+    "pi-tool-renderer"
   ],
   "scripts": {
-    "test": "bun test pi-bash-processes/tests pi-bash-processes/extensions/__tests__ pi-tool-renderer/extensions/__tests__ pi-jev/tests pi-cbmem/tests"
+    "test": "bun test pi-bash-processes/tests pi-bash-processes/extensions/__tests__ pi-tool-renderer/extensions/__tests__ pi-jev/tests pi-cbmem/tests pi-output-policy/tests"
   },
   "devDependencies": {
     "@gotgenes/pi-permission-system": "^33.0.5",
