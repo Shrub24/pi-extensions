@@ -33,9 +33,15 @@ which is what makes the daemon, the auto-index, and the shared watcher work.
   `codebase-memory-mcp cli <tool>`.
 - **A tool list that stays short.** Every tool carries a `promptSnippet`, so Pi's
   Available-tools section is one line per tool instead of the full description.
+- **Self-healing calls.** A tool call rebuilds a failed or dead server before and
+  during its attempt, so a deploy that kills the daemon mid-session costs one
+  slow call (~5s), not a stuck session.
 - **`/cbm status`** — the project the cwd resolved to, the server state and pid, and
   the tools this configuration registered. `/cbm config` adds the resolved settings,
-  `/cbm server` the server's own `config list` and `daemon status`.
+  `/cbm server` the server's own `config list` and `daemon status`. `/cbm clean`
+  deletes indexed projects whose root directory is gone — `/tmp` roots are deleted
+  (pytest and opencode leftovers pile up), moved real repos are only reported;
+  `--dry` previews.
 
 ## Install
 

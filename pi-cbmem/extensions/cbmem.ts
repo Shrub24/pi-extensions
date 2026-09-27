@@ -23,6 +23,8 @@ import { execFile } from "node:child_process";
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
+import { existsSync } from "node:fs";
+
 import { readSettingsFile, resolveConfig, type CbmemConfig, sessionProjectFor } from "./config.js";
 import { CbmServer } from "./server.js";
 import { selectTools, wireParameters, type ToolSpec } from "./tools.js";
@@ -52,9 +54,9 @@ export default function piCbmem(pi: ExtensionAPI): void {
 		}
 	};
 
-	/** One server per session cwd; a new cwd replaces the old child. */
+	/** One live server per session cwd; a new cwd or a dead child replaces it. */
 	const ensureServer = (cwd: string): CbmServer => {
-		if (server && serverCwd === cwd) return server;
+		if (server && serverCwd === cwd && server.state !== "failed" && server.state !== "stopped") return server;
 		server?.stop();
 		server = new CbmServer({ binary: config.binary, cwd, requestTimeoutMs: config.requestTimeoutMs });
 		serverCwd = cwd;
@@ -96,8 +98,13 @@ export default function piCbmem(pi: ExtensionAPI): void {
 			execute: async (_toolCallId, params: Record<string, unknown>, signal: AbortSignal, _onUpdate, ctx) => {
 				const cwd = ctx?.cwd ?? sessionCwd ?? process.cwd();
 				sessionProject ??= config.project ?? sessionProjectFor(cwd);
-				const current = ensureServer(cwd);
 				const args = withProject(spec, params, sessionProject);
+
+				// The initial connect at session_start may have failed (a daemon
+				// cohort flip, a deploy mid-session). The call itself is the retry:
+				// a failed or dead server is rebuilt here, and transport errors
+				// already reconnect inside CbmServer.call.
+				const current = ensureServer(cwd);
 				const result = await current.call(spec.name, args, signal);
 				return {
 					content: Array.isArray(result.content)
@@ -138,7 +145,7 @@ function registerStatusCommand(
 	specs: ToolSpec[] = [],
 ): void {
 	pi.registerCommand?.("cbm", {
-		description: "codebase-memory: server, project, and tool status",
+		description: "codebase-memory: status | config | server | clean [--dry] (delete dead tmp-root projects)",
 		handler: async (args: string, ctx: ExtensionContext) => {
 			const config = getConfig();
 			const lines: string[] = [];
@@ -173,9 +180,101 @@ function registerStatusCommand(
 				const info = await readServerConfig(config.binary, cwd);
 				lines.push("", "server config:", ...info);
 			}
+			if (args.trim().startsWith("clean")) {
+				// Reuse the session connection when there is one; otherwise make a
+				// throwaway one, so the command works on a not-yet-connected session.
+				const conn = server ?? new CbmServer({ binary: config.binary, cwd });
+				try {
+					lines.push("", ...(await cleanStaleProjects(conn, args.trim().endsWith("--dry"))));
+				} finally {
+					if (!server) conn.stop();
+				}
+			}
 			notifyLines(ctx, lines);
 		},
 	});
+}
+
+/**
+ * Delete indexed projects whose root directory no longer exists.
+ *
+ * Only roots under /tmp are deleted outright — pytest and opencode leftovers,
+ * never anything valuable. Real repos whose root has moved or been renamed are
+ * reported and left alone: re-deleting and re-indexing them by hand is a
+ * deliberate choice, not a side effect of a status command.
+ */
+export async function cleanStaleProjects(
+	server: CbmServer,
+	dryRun: boolean,
+): Promise<string[]> {
+	const lines: string[] = [];
+	const names: string[] = [];
+	// list_projects pages at 50 rows; walk the pages until has_more is false.
+	for (let offset = 0; ; offset += 50) {
+		const page = await server.call("list_projects", { offset });
+		const text = toolText(page);
+		names.push(...[...text.matchAll(/^\s{2}(\S+)/gm)].map((m) => m[1]));
+		if (!/has_more: true/.test(text)) break;
+		if (offset > 10_000) break; // absurd-list guard
+	}
+
+	// One MCP connection, fanned out in bounded batches: a CLI call per project
+	// costs seconds each and this audit is fifty projects on a normal machine.
+	const roots = new Map<string, string>();
+	const BATCH = 8;
+	for (let i = 0; i < names.length; i += BATCH) {
+		await Promise.all(
+			names.slice(i, i + BATCH).map(async (name) => {
+				try {
+					const status = await server.call("index_status", { project: name });
+					roots.set(name, /root_path: (.*)/.exec(toolText(status))?.[1]?.trim() ?? "");
+				} catch {
+					/* unreachable project is a delete candidate too */
+				}
+			}),
+		);
+	}
+
+	const dead: string[] = [];
+	const moved: string[] = [];
+	if (names.length === 0) return ["clean: no indexed projects"];
+	for (const name of names) {
+		const root = roots.get(name) ?? "";
+		if (root && existsSync(root)) continue;
+		if (root.startsWith("/tmp/")) dead.push(name);
+		else moved.push(root ? `${name} → ${root}` : `${name} (root unknown)`);
+	}
+
+	lines.push(`indexed: ${names.length}, dead tmp roots: ${dead.length}, moved/missing real roots: ${moved.length}`);
+	for (const entry of moved) lines.push(`  kept (moved or unknown): ${entry}`);
+
+	if (dryRun) {
+		for (const name of dead) lines.push(`  would delete: ${name}`);
+		return lines;
+	}
+
+	let deleted = 0;
+	for (const name of dead) {
+		try {
+			await server.call("delete_project", { project: name });
+			deleted++;
+		} catch (error) {
+			lines.push(`  failed: ${name} — ${(error as Error).message.split("\n")[0]}`);
+		}
+	}
+	lines.push(`deleted: ${deleted}/${dead.length}`);
+	return lines;
+}
+
+/**
+ * The plain text of an MCP tool result: the regexes below match against the
+ * server's human-readable output, not the content envelope.
+ */
+function toolText(result: { content?: Array<{ type: string; text?: string }> }): string {
+	const parts = Array.isArray(result.content) ? result.content : [];
+	return parts
+		.map((part) => (typeof part?.text === "string" ? part.text : ""))
+		.join("\n");
 }
 
 function notifyLines(ctx: ExtensionContext, lines: string[]): void {
@@ -205,11 +304,14 @@ async function readServerConfig(binary: string, cwd: string): Promise<string[]> 
 	return out;
 }
 
-function run(binary: string, args: string[], cwd: string): Promise<string> {
+function run(binary: string, args: string[], cwd: string, timeoutMs = 30_000): Promise<string> {
 	return new Promise((resolve, reject) => {
-		execFile(binary, args, { cwd, timeout: 5_000 }, (error, stdout) => {
+		const child = execFile(binary, args, { cwd, timeout: timeoutMs }, (error, stdout) => {
 			if (error) reject(error);
 			else resolve(stdout);
 		});
+		// A pipe stdin that never closes makes the cli wait forever for JSON
+		// args; closing it up front is the `</dev/null` the shell would give.
+		child.stdin?.end();
 	});
 }
