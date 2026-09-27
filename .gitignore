@@ -1,6 +1,5 @@
 node_modules/
 .jj/
 *.log
-dist/
+/dist/
 *.tgz
-.mirrors/
