@@ -52,10 +52,13 @@ to make that a one-liner, not to keep a lineage that would be rewritten anyway.
 
 ```bash
 bun install
-bun test          # the suites kept in the root run: see package.json
+bun test          # every package's suite, one process each
 ```
 
-`pi-subagents` ships its own suite (large, and red on its own terms) and stays out
-of the root run; so does `pi-otel`'s, which runs from its own directory.
+`bun test` runs six suites: `pi-bash-processes`, `pi-tool-renderer`, `pi-otel`,
+`pi-jev`, `pi-cbmem`, `pi-output-policy`. `pi-subagents` is left out deliberately —
+it ships a large suite of its own that is red on its own terms, and a root `bun
+test` without package paths would drag it in — so run it from its directory when
+that is what you want to see.
 
 Packages install into Pi by npm name (`pi install npm:<name>`), not from this repo.
