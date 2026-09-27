@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 
-import { budgetFrom, createJevClient } from "../extensions/jev.js";
+import { budgetFrom, createJevClient, installedPiTypesafe } from "../extensions/jev.js";
 import { fakeJudge, noul } from "./fixtures/fakes.js";
 
 function moduleWith(options: { create?: () => unknown; ask?: (judge: unknown, request: unknown, askOptions: unknown) => Promise<unknown> } = {}) {
@@ -21,6 +21,20 @@ function moduleWith(options: { create?: () => unknown; ask?: (judge: unknown, re
 		},
 	};
 }
+
+test("a checkout falls back to the copy Pi installed", () => {
+	const asked: string[] = [];
+	const href = installedPiTypesafe({ PI_CODING_AGENT_DIR: "/agent" } as NodeJS.ProcessEnv, (path) => {
+		asked.push(path);
+		return true;
+	});
+	expect(asked).toEqual(["/agent/npm/node_modules/pi-typesafe/dist/index.js"]);
+	expect(href).toBe("file:///agent/npm/node_modules/pi-typesafe/dist/index.js");
+
+	// Nothing installed: the bare specifier stands as the only answer, so the
+	// loader reports what it always reported.
+	expect(installedPiTypesafe({ PI_CODING_AGENT_DIR: "/agent" } as NodeJS.ProcessEnv, () => false)).toBeUndefined();
+});
 
 test("a fetch failure in the loader is reported and not repeated inside the cooldown", async () => {
 	let loads = 0;

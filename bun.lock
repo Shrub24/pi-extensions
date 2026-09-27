@@ -6,7 +6,7 @@
       "name": "pi-extensions",
       "devDependencies": {
         "@gotgenes/pi-permission-system": "^33.0.5",
-        "pi-typesafe": "^0.6.1",
+        "pi-typesafe": "^0.7.4",
       },
     },
     "pi-bash-processes": {
@@ -558,7 +558,7 @@
 
     "pi-subagents": ["pi-subagents@workspace:pi-subagents"],
 
-    "pi-typesafe": ["pi-typesafe@0.6.1", "", { "dependencies": { "@typesafe-ai/sdk": "^0.6.0", "typebox": "^1.3.31" }, "peerDependencies": { "@earendil-works/pi-coding-agent": ">=0.85.1 <1", "@earendil-works/pi-tui": ">=0.85.1 <1" }, "optionalPeers": ["@earendil-works/pi-coding-agent", "@earendil-works/pi-tui"] }, "sha512-ZQPBOdFc7XJql96IAm9rtMkBnjupRxyjBliZYBtQGxHMBciLlPhmnhitoPY7Cmcq16hjEkGtFgX23pHLOi2+LQ=="],
+    "pi-typesafe": ["pi-typesafe@0.7.4", "", { "dependencies": { "@typesafe-ai/sdk": "^0.6.0", "typebox": "^1.3.31" }, "peerDependencies": { "@earendil-works/pi-coding-agent": ">=0.85.1 <1", "@earendil-works/pi-tui": ">=0.85.1 <1" }, "optionalPeers": ["@earendil-works/pi-coding-agent", "@earendil-works/pi-tui"] }, "sha512-yNtRXtkP7dJuZwIcvZM69mEWqQvAAkdzFAk7VvuEidctJojjS8nas+8MKBEIq6YXh8JuQAP5ZACK13fwJ3+voA=="],
 
     "proper-lockfile": ["proper-lockfile@4.1.2", "", { "dependencies": { "graceful-fs": "^4.2.4", "retry": "^0.12.0", "signal-exit": "^3.0.2" } }, "sha512-TjNPblN4BwAWMXU8s9AEz4JmQxnD1NNL7bNOY/AKUzyamc379FWASUhc/K1pL2noVb+XmZKLL68cjzLsiOAMaA=="],
 

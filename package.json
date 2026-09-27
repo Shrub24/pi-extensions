@@ -15,6 +15,6 @@
   },
   "devDependencies": {
     "@gotgenes/pi-permission-system": "^33.0.5",
-    "pi-typesafe": "^0.6.1"
+    "pi-typesafe": "^0.7.4"
   }
 }

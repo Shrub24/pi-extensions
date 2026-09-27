@@ -13,8 +13,18 @@
  * mid-session — `/typesafe login` in another extension writes the same store —
  * is picked up without a reload. Failed resolutions are retried on a cooldown
  * so a missing key cannot become a request per ask.
+ *
+ * Two places can answer for the package, because this extension is loaded two
+ * ways. Installed by `pi install`, pi-typesafe sits beside it and the bare
+ * specifier resolves. Loaded from a checkout — the dev setup — nothing sits
+ * beside it, and the copy Pi's extension manager installed is the same package
+ * the session is already running, so that copy answers instead.
  */
 
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { agentDir } from "./config.js";
 import type { JevAskAnswer, JevJudge, JevQuestions } from "./types.js";
 
 /** The package pi-typesafe publishes; resolved through Pi's own node_modules. */
@@ -144,11 +154,28 @@ function isModule(value: unknown): value is PiTypesafeModule {
 	return typeof candidate.createTypeSafe === "function" && typeof candidate.ask === "function";
 }
 
+/**
+ * The entry point of the pi-typesafe Pi installed, if there is one. A blank or
+ * absent result means the bare specifier is the only way to find the package.
+ */
+export function installedPiTypesafe(
+	env: NodeJS.ProcessEnv = process.env,
+	exists: (path: string) => boolean = existsSync,
+): string | undefined {
+	const entry = join(agentDir(env), "npm", "node_modules", "pi-typesafe", "dist", "index.js");
+	return exists(entry) ? pathToFileURL(entry).href : undefined;
+}
+
 async function defaultLoad(): Promise<unknown> {
 	// The specifier is held in a variable so the host's module resolution — not
 	// a bundler's — decides whether the package is present.
-	const specifier: string = PI_TYPESAFE_SPECIFIER;
-	return import(specifier);
+	try {
+		return await import(PI_TYPESAFE_SPECIFIER);
+	} catch (error) {
+		const installed = installedPiTypesafe();
+		if (!installed) throw error;
+		return await import(installed);
+	}
 }
 
 export function createJevClient(options: JevClientOptions): JevClient {

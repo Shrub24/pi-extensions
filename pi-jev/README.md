@@ -46,6 +46,8 @@ Registration alone grants no authority. Until the name appears in `authorizerCha
 
 The judge needs a TypeSafe key: install [pi-typesafe](https://github.com/DevMortimer/pi-typesafe) and run `/typesafe login`, or set `TYPESAFE_API_KEY`.
 
+The package is found two ways, because this extension is loaded two ways. Installed with `pi install`, pi-typesafe sits beside it and the import resolves as usual. Loaded from a checkout, nothing sits beside it, and pi-jev falls back to the copy Pi's extension manager installed (`<agent dir>/npm/node_modules/pi-typesafe`) — the same package the session is already running. Both routes report the same message when neither exists: `pi-typesafe is not installed; install it and run /typesafe login`.
+
 ## The substrate
 
 ```ts
