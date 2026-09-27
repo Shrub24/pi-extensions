@@ -1,0 +1,31 @@
+# Local collector gateway in front of pi-otel, with Jaeger as the OTLP backend.
+# From this directory:
+#   docker compose -f docker-compose.yaml up
+# Pi:
+#   export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+#   pi
+# Traces UI: http://localhost:16686
+
+services:
+  collector:
+    image: otel/opentelemetry-collector-contrib:0.160.0
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC from pi (optional)
+      - "4318:4318"   # OTLP HTTP from pi (default)
+    depends_on:
+      - jaeger
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.76.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686" # Jaeger UI
+    # otel-collector-config.yaml exports to host "backend:4317"; alias Jaeger for local runs.
+    networks:
+      default:
+        aliases:
+          - backend

@@ -1,0 +1,111 @@
+# OpenTelemetry Collector (contrib) gateway for pi-otel.
+# Image: otel/opentelemetry-collector-contrib (includes tail_sampling processor).
+# Mount this file and run with: --config=/etc/otelcol-contrib/config.yaml
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Cap memory before batching and tail sampling buffers traces.
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 512
+    spike_limit_mib: 128
+
+  # Tail sampling needs the contrib distribution (tailsamplingprocessor).
+  # decision_wait holds spans until the trace can be decided; allow headroom for long pi sessions.
+  tail_sampling:
+    decision_wait: 15s
+    num_traces: 100000
+    expected_new_traces_per_sec: 20
+    policies:
+      # Keep traces where any span recorded a provider or tool error category.
+      - name: error-type-attribute
+        type: string_attribute
+        string_attribute:
+          key: error.type
+          enabled_regex_matching: true
+          values:
+            - rate_limit
+            - server_error
+            - auth_error
+            - timeout
+            - request_too_large
+            - client_error
+            - content_filter
+            - tool_error
+      # Keep sessions that ended with at least one error (attribute on the pi.session span).
+      - name: session-errors
+        type: numeric_attribute
+        numeric_attribute:
+          key: pi.error_count
+          min_value: 1
+      # Keep long agent sessions (pi.turn_count is set on the session span at shutdown).
+      - name: long-sessions
+        type: numeric_attribute
+        numeric_attribute:
+          key: pi.turn_count
+          min_value: 25
+      # Keep traces whose root or child spans use the pi.session span name family.
+      - name: session-span-name
+        type: span
+        span:
+          match_span:
+            - name: "pi.session*"
+      # Representative sample of routine traces (pi defaults to head ratio 1.0).
+      - name: probabilistic-rest
+        type: probabilistic
+        probabilistic:
+          sampling_percentage: 10
+
+  # Drop prompt and tool payload attributes before export (see commented block below to enable).
+  # attributes/redact-prompts:
+  #   actions:
+  #     - key: gen_ai.input.messages
+  #       action: delete
+  #     - key: gen_ai.output.messages
+  #       action: delete
+  #     - key: gen_ai.tool.call.arguments
+  #       action: delete
+  #     - key: gen_ai.tool.call.result
+  #       action: delete
+
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+
+exporters:
+  # Replace host with your platform ingest.
+  # docker-compose.yaml adds a network alias "backend" -> Jaeger for local testing.
+  otlp/backend:
+    endpoint: backend:4317
+    tls:
+      insecure: true
+
+  logging:
+    verbosity: basic
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, tail_sampling, batch]
+      exporters: [otlp/backend, logging]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/backend, logging]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/backend, logging]

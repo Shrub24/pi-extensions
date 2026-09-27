@@ -1,0 +1,43 @@
+# Tail-sampling policies for pi-otel agent traces (reference excerpt).
+# This block is already wired into otel-collector-config.yaml under processors.tail_sampling.
+# Copy it into your own collector config if you split processors across files.
+
+processors:
+  tail_sampling:
+    decision_wait: 15s
+    num_traces: 100000
+    expected_new_traces_per_sec: 20
+    policies:
+      - name: error-type-attribute
+        type: string_attribute
+        string_attribute:
+          key: error.type
+          enabled_regex_matching: true
+          values:
+            - rate_limit
+            - server_error
+            - auth_error
+            - timeout
+            - request_too_large
+            - client_error
+            - content_filter
+            - tool_error
+      - name: session-errors
+        type: numeric_attribute
+        numeric_attribute:
+          key: pi.error_count
+          min_value: 1
+      - name: long-sessions
+        type: numeric_attribute
+        numeric_attribute:
+          key: pi.turn_count
+          min_value: 25
+      - name: session-span-name
+        type: span
+        span:
+          match_span:
+            - name: "pi.session*"
+      - name: probabilistic-rest
+        type: probabilistic
+        probabilistic:
+          sampling_percentage: 10
