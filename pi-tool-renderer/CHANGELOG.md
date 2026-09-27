@@ -1,0 +1,31 @@
+# Changelog
+
+## Consumer-impacting changes
+
+### Unreleased
+
+- The managed `bash` tool from `@vanillagreen/pi-background-tasks` remains active instead of being replaced with Pi's native Bash executor.
+- Batch refusal, timeout, and result notices start with stable keys and values.
+- Parsed settings, unchanged tool chrome, and complete compact user-message cards are reused across renders instead of being rebuilt every frame.
+- Compact user-message borders use the active theme before falling back to ANSI green.
+- `fileHyperlinks` can be `auto`, `on`, or `off`; `off` avoids OSC 8 parsing overhead in slow terminals.
+
+### 2.0.1
+
+- Pi 0.85.1 parity: the re-registered `edit` tool forwards Pi's `prepareArguments` hook from the wrapped definition. Argument shapes Pi's own tool normalizes before validation are accepted with the renderer active instead of failing validation.
+- `PI_CODING_AGENT_DIR` is used only when it names a root-anchored path — a drive or UNC share on Windows, a leading `/` on POSIX. Anything else uses `~/.pi/agent`.
+
+### 2.0.0
+
+- **Breaking**: the settings namespace is renamed from `vstack` to `kendex`, with no compatibility fallback. Configuration previously read from `vstack.extensionManager.config["@vanillagreen/pi-tool-renderer"]` in `.pi/settings.json` is now read from `kendex.extensionManager.config["@vanillagreen/pi-tool-renderer"]`; settings still stored under the old key are ignored and this package silently falls back to its defaults until the key is renamed. The `package.json` block that declares these settings is renamed from `"vstack"` to `"kendex"` to match.
+- **Breaking**: cross-extension interop symbols move from the `vstack.*` to the `kendex.*` `Symbol.for` registry (`kendex.pi-tool-renderer.assistant-message-patch`, `kendex.pi-tool-renderer.compaction-summary-renderer-patch`, `kendex.pi-tool-renderer.custom-message-spacing-patch`, `kendex.pi-tool-renderer.installed`, `kendex.pi-tool-renderer.markdown-code-block-patch`, `kendex.pi-tool-renderer.overlay-check`, `kendex.pi-tool-renderer.skill-invocation-renderer-patch`, `kendex.pi-tool-renderer.tool-chrome-patch`, `kendex.pi-tool-renderer.tool-chrome-theme`, `kendex.pi-tool-renderer.tool-execution-renderer-patch.v2`, `kendex.pi-tool-renderer.user-message-box-state`, `kendex.pi-tool-renderer.user-message-patch`, `kendex.pi-tool-renderer.working-loader-alignment-patch`, `kendex.pi.modal-lock`, `kendex.pi.project-trust`). Symbol identity is the interop contract, so a package on the old namespace cannot see one on the new namespace — upgrade every installed `@vanillagreen` Pi extension together rather than one at a time.
+- Project-root detection recognizes `.kendex-lock.json` instead of `.vstack-lock.json`.
+- Repository, homepage, issue-tracker, and README asset URLs now point at `vanillagreencom/kendex`.
+
+### 1.7.2
+
+- Documentation only, no runtime change. This version ships what landed on main after 1.7.1 was published: the packaged README trimmed to the consumer contract — what the extension does, its settings, and setup — with contributor-facing internals moved to the unpublished `DEVELOPMENT.md` (#1473), and a `test` script in the manifest, `bun test ./extensions/__tests__`, which the repo's CI and `tools/validate-changed` now run (#1474). Published so the npm and pi.dev gallery pages carry the current copy; `extensions/` is byte-identical to 1.7.1.
+
+### 1.7.1
+
+- Baseline: changelog introduced at this version. Consumer-impacting changes — behavior deltas, new/renamed/removed exports, settings and config changes, protocol/audit-shape changes — are recorded here from this version forward.
