@@ -1,0 +1,176 @@
+import { expect, test } from "bun:test";
+import { DEFAULT_SOFT_TIMEOUT_MS } from "../extensions/constants.js";
+import { runSpawnFixture, SPAWN_FIXTURE_TIMEOUT_MS } from "./fixtures/spawn-child-runner.js";
+
+interface SoftState {
+	status: string;
+	exitNotified: boolean;
+	expiresAt: number | null;
+	softExpiresAt: number | null;
+	softTimeoutMs: number | null;
+	softTimeoutNotified: boolean | null;
+}
+
+interface SoftFixtureResult {
+	spawn: { resultId: string };
+	soft?: Record<string, unknown>;
+	final: SoftState;
+	remainingTimers: unknown[];
+	unexpected: unknown[];
+	messages: unknown[];
+}
+
+const softState = (result: SoftFixtureResult): SoftState => result.final;
+const soft = (result: SoftFixtureResult): Record<string, unknown> => {
+	if (!result.soft) throw new Error(`spawn_fixture.soft_scenario_missing=${result.soft}`);
+	return result.soft;
+};
+
+/**
+ * Soft expiry: exactly one reminder steer, the process is never signalled, the
+ * task stays running, and the later real exit still delivers its wake.
+ */
+test("soft expiry wakes once, never stops the process, and keeps the later exit wake", () => {
+	const result = runSpawnFixture("spawn-extension.ts", { mode: "soft-expiry", softTimeoutMs: 60_000 }) as SoftFixtureResult;
+	const { atSpawn, afterWake, afterExit } = soft(result) as {
+		atSpawn: { timers: number; state: SoftState };
+		afterWake: { state: SoftState; wakes: number; text: string; signals: unknown[]; softTimers: number; exitWakes: number };
+		afterExit: { state: SoftState; exitWakes: number; softWakes: number };
+	};
+	expect(atSpawn, "one soft timer armed at spawn, task running").toStrictEqual({
+		timers: 1,
+		state: { status: "running", exitNotified: false, expiresAt: null, softExpiresAt: 1_700_000_060_000, softTimeoutMs: 60_000, softTimeoutNotified: false },
+	});
+	expect(afterWake.state.status, "the task is still running; a soft reminder never stops it").toBe("running");
+	expect(afterWake.signals, "no SIGTERM/SIGKILL was sent").toEqual([]);
+	expect(afterWake.wakes, "exactly one soft reminder").toBe(1);
+	expect(afterWake.softTimers, "the one-shot timer consumed itself").toBe(0);
+	expect(afterWake.exitWakes, "a reminder is not an exit wake").toBe(0);
+	expect(afterWake.text).toContain("still running after");
+	expect(afterWake.text).toContain('bg_task action:"extend"');
+	expect(afterWake.text).toContain('bg_task action:"stop"');
+	expect(afterExit.state.status, "the real exit still finalized the task").toBe("completed");
+	expect(afterExit.exitWakes, "the later exit wake still fired").toBe(1);
+	expect(afterExit.softWakes, "and no second reminder").toBe(1);
+}, SPAWN_FIXTURE_TIMEOUT_MS);
+
+/**
+ * extend clears the fired one-shot latch, re-arms a fresh window from now, and
+ * never touches the hard timeoutSeconds budget.
+ */
+test("extend re-arms a fresh soft window and leaves the hard timeout unchanged", () => {
+	const result = runSpawnFixture("spawn-extension.ts", { mode: "soft-extend", softTimeoutMs: 60_000, extendSoftTimeoutMs: 120_000, timeoutSeconds: 3600 }) as SoftFixtureResult;
+	const { firstWake, afterExtend, secondWake, afterExit } = soft(result) as {
+		firstWake: { state: SoftState; wakes: number; softTimers: number; wakeText: string; signals: unknown[] };
+		afterExtend: { action: string; state: SoftState; softTimers: number; hardTimers: number; text: string };
+		secondWake: { state: SoftState; wakes: number; text: string; signals: unknown[]; hardTimers: number };
+		afterExit: { state: SoftState; exitWakes: number; softWakes: number };
+	};
+	expect(firstWake.wakes, "the original deadline fired once").toBe(1);
+	expect(firstWake.softTimers, "and consumed itself").toBe(0);
+	expect(firstWake.wakeText, "the first wake surfaces the hard backstop time").toContain("Hard timeout backstop");
+	expect(firstWake.signals, "and sent no signal").toEqual([]);
+	expect(afterExtend.action, "the extend action is reported").toBe("extend");
+	expect(afterExtend.state.softTimeoutNotified, "the one-shot latch was cleared").toBe(false);
+	expect(afterExtend.state.softTimeoutMs, "the new window is stored").toBe(120_000);
+	expect(afterExtend.state.softExpiresAt, "the deadline is now, not the old one").toBe(1_700_000_120_000);
+	expect(afterExtend.softTimers, "exactly one re-armed timer").toBe(1);
+	expect(afterExtend.hardTimers, "the hard timeout timer stays armed").toBe(1);
+	expect(afterExtend.text).toContain("Hard timeout is unchanged");
+	expect(secondWake.wakes, "the extended window fired a second reminder").toBe(2);
+	expect(secondWake.signals, "extend never signals the process").toEqual([]);
+	expect(secondWake.hardTimers, "hard timer still armed after the second reminder").toBe(1);
+	expect(afterExit.state.expiresAt, "hard deadline survived untouched").toBe(1_700_003_600_000);
+	expect(afterExit.exitWakes, "the exit still wakes").toBe(1);
+	expect(afterExit.softWakes, "still exactly two reminders").toBe(2);
+}, SPAWN_FIXTURE_TIMEOUT_MS * 2);
+
+/** extend with softTimeoutMs: 0 disables the reminder entirely. */
+test("extend with softTimeoutMs 0 disables further reminders", () => {
+	const result = runSpawnFixture("spawn-extension.ts", { mode: "soft-extend", softTimeoutMs: 60_000, extendSoftTimeoutMs: 0 }) as SoftFixtureResult;
+	const { afterExtend, secondWake, afterExit } = soft(result) as {
+		afterExtend: { state: SoftState; softTimers: number; text: string };
+		secondWake: { fired: boolean; state: SoftState; wakes: number };
+		afterExit: { softWakes: number };
+	};
+	expect(afterExtend.state.softTimeoutNotified).toBe(false);
+	expect(afterExtend.state.softExpiresAt, "no deadline while disabled").toBeNull();
+	expect(afterExtend.softTimers, "no timer armed").toBe(0);
+	expect(afterExtend.text).toContain("disabled");
+	expect(secondWake.fired, "the disabled window never fires").toBe(false);
+	expect(secondWake.wakes, "still only the first reminder").toBe(1);
+	expect(afterExit.softWakes, "and no reminder after the exit").toBe(1);
+}, SPAWN_FIXTURE_TIMEOUT_MS * 2);
+
+/** A task that exits before its soft deadline never gets a reminder. */
+test("a terminal task emits no soft wake and leaves no timer behind", () => {
+	const result = runSpawnFixture("spawn-extension.ts", { mode: "soft-terminal", softTimeoutMs: 60_000 }) as SoftFixtureResult;
+	const scenario = soft(result) as {
+		softTimers: number;
+		softWakes: number;
+		exitWakes: number;
+		timers: { kind: string; ms: number }[];
+	};
+	expect(scenario.softTimers, "the finalize cleared the soft timer").toBe(0);
+	expect(scenario.softWakes, "no reminder for a finished task").toBe(0);
+	expect(scenario.exitWakes, "the exit still woke normally").toBe(1);
+	expect(scenario.timers, "only the orphan-watcher interval remains").toEqual([{ kind: "interval", ms: 30_000 }]);
+}, SPAWN_FIXTURE_TIMEOUT_MS);
+
+/**
+ * A restored live task (pid still alive across restart) re-arms exactly one
+ * soft reminder from its persisted deadline.
+ */
+test("a restored live task re-arms its soft reminder without double-arming", () => {
+	const result = runSpawnFixture("spawn-extension.ts", { mode: "soft-restore", softTimeoutMs: 60_000 }) as SoftFixtureResult;
+	const { beforeRestore, afterRestore, afterWake } = soft(result) as {
+		beforeRestore: { state: SoftState; softTimers: number };
+		afterRestore: { state: SoftState; softTimers: number; timers: { kind: string; ms: number }[] };
+		afterWake: { state: SoftState; wakes: number; text: string; signals: unknown[]; shiftedTimers: number; exitWakes: number };
+	};
+	expect(beforeRestore.softTimers, "one timer before restart").toBe(1);
+	expect(afterRestore.state.status, "the task survives the restart as running").toBe("running");
+	expect(afterRestore.state.softTimeoutNotified, "the one-shot latch is still false").toBe(false);
+	expect(afterRestore.softTimers, "re-armed exactly once after restore").toBe(1);
+	expect(afterRestore.timers.filter((timer) => timer.kind === "timeout" && timer.ms === 60_000).length, "no duplicated soft timer after restore").toBe(1);
+	expect(afterWake.wakes, "the restored deadline still fires its one reminder").toBe(1);
+	expect(afterWake.signals, "and never stops the process").toEqual([]);
+	expect(afterWake.shiftedTimers, "one-shot consumed").toBe(0);
+}, SPAWN_FIXTURE_TIMEOUT_MS);
+
+/**
+ * The one-shot latch is persisted: a restart after the reminder fired must not
+ * produce a second reminder for the same deadline.
+ */
+test("a restored task whose reminder already fired does not re-wake", () => {
+	const result = runSpawnFixture("spawn-extension.ts", { mode: "soft-restore-notified", softTimeoutMs: 60_000 }) as SoftFixtureResult;
+	const { afterWake, afterRestore } = soft(result) as {
+		afterWake: { state: SoftState; wakes: number; softTimers: number };
+		afterRestore: { state: SoftState; softTimers: number; wakes: number; exitWakes: number };
+	};
+	expect(afterWake.wakes, "reminder fired before restart").toBe(1);
+	expect(afterWake.state.softTimeoutNotified, "latch persisted").toBe(true);
+	expect(afterWake.softTimers, "no timer while fired").toBe(0);
+	expect(afterRestore.wakes, "restore produced no new reminder").toBe(1);
+	expect(afterRestore.softTimers, "and armed no timer").toBe(0);
+	expect(afterRestore.state.softTimeoutNotified, "the latch survived the restore").toBe(true);
+}, SPAWN_FIXTURE_TIMEOUT_MS);
+
+/**
+ * The extension default is the approved 10 minutes, and per-spawn
+ * `softTimeoutMs` overrides it (0 disables).
+ */
+test("spawn schema default is 600000ms and per-spawn override wins", () => {
+	const defaulted = runSpawnFixture("spawn-extension.ts", { mode: "spawn", softTimeoutMs: null, defaultSoftTimeoutMs: 600_000 }) as SoftFixtureResult & { spawnSoftState?: SoftState };
+	expect(defaulted.spawnSoftState?.softTimeoutMs, "the 10-minute default applies").toBe(DEFAULT_SOFT_TIMEOUT_MS);
+	expect(defaulted.spawnSoftState?.softExpiresAt, "deadline = start + default").toBe(1_700_000_000_000 + DEFAULT_SOFT_TIMEOUT_MS);
+	expect(defaulted.spawnSoftState?.softTimeoutNotified, "the reminder starts unfired").toBe(false);
+
+	const overridden = runSpawnFixture("spawn-extension.ts", { mode: "spawn", softTimeoutMs: 0 }) as SoftFixtureResult & { spawnSoftState?: SoftState };
+	expect(overridden.spawnSoftState?.softTimeoutMs, "0 disables").toBe(0);
+	expect(overridden.spawnSoftState?.softExpiresAt, "and arms no deadline").toBeNull();
+
+	const custom = runSpawnFixture("spawn-extension.ts", { mode: "spawn", softTimeoutMs: 45_000 }) as SoftFixtureResult & { spawnSoftState?: SoftState };
+	expect(custom.spawnSoftState?.softTimeoutMs, "a per-spawn value passes through").toBe(45_000);
+	expect(custom.spawnSoftState?.softExpiresAt, "deadline = start + value").toBe(1_700_000_045_000);
+}, SPAWN_FIXTURE_TIMEOUT_MS * 3);
