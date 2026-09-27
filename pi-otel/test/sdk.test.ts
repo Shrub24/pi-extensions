@@ -385,22 +385,24 @@ describe("diag routing", () => {
 
 describe("per-signal exporters", () => {
   test("multi-exporter traces: otlp+console yields two span processors", async () => {
-    const origWrite = process.stdout.write.bind(process.stdout);
-    const out: string[] = [];
-    process.stdout.write = ((chunk: unknown) => {
-      out.push(String(chunk));
-      return true;
-    }) as typeof process.stdout.write;
+    // The console exporter prints with console.dir(spanInfo, { depth: 3 }); a
+    // patched process.stdout.write does not see it, because Bun's console does
+    // not write through that function.
+    const origDir = console.dir;
+    const printed: { name?: string }[] = [];
+    console.dir = ((item: { name?: string }) => {
+      printed.push(item);
+    }) as typeof console.dir;
     const rt = await startRuntime(cfg({ tracesExporters: ["otlp", "console"] }));
     try {
       assert.ok(rt.traceProvider, "trace provider present");
       const span = rt.tracer.startSpan("console-export-test");
       span.end();
       await rt.flush();
-      const joined = out.join("");
-      assert.match(joined, /console-export-test/);
+      const names = printed.map((item) => item.name ?? "").join("\n");
+      assert.match(names, /console-export-test/);
     } finally {
-      process.stdout.write = origWrite;
+      console.dir = origDir;
       await rt.shutdown();
     }
   });
