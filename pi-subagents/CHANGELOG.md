@@ -5,6 +5,7 @@
 ### Changed
 
 - Require substantial delegated mutation work to be classified by implementation topology before writer launch, preventing issue-wide writer commissions across independent seams without forcing artificial fanout.
+- MCP `mcp:` direct-tool selectors no longer fail closed against pi-mcp-adapter 3.1.0+, whose config hash adds a stdio server's `inheritEnv` and `literalEnv` to the identity. Child resolution now computes the same hash, so cached tool metadata stays valid and configured direct tools resolve again.
 
 ## [0.70.0] - 2026-09-19
 
