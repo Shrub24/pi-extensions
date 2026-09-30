@@ -1051,6 +1051,12 @@ export default function outputPolicy(pi: ExtensionAPI): void {
 				reason: "details payload exceeded inline budget; capped per policyMode (set policyMode=compat or sanitizeDetails=false to disable)",
 			};
 		}
-		return { content: processed.content, details };
+		// Pi's `ExtensionRunner.emitToolResult` drops `structuredContent` when a
+		// handler returns `content` without it. That field arrived in Pi 0.99 and is
+		// how a codemode script receives a tool's structured result instead of its
+		// text, so rewriting the text must not silently strip it. Forwarded only
+		// when the event carries one, so this keeps working against 0.87.
+		const forwarded = event.structuredContent === undefined ? {} : { structuredContent: event.structuredContent };
+		return { content: processed.content, details, ...forwarded };
 	});
 }
