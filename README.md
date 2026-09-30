@@ -33,20 +33,39 @@ with this repo. Both live in `~/Projects/dev/custom/.pi-ext-mirrors`
 remotes, which makes the two operations one command each:
 
 ```bash
-git diff upstream-pi-subagents/main HEAD -- pi-subagents   # what upstream has that we do not
-git cherry-pick -n <sha>                                   # take one fix; the commit lands here
+git diff upstream-pi-subagents/main HEAD -- pi-subagents   # our delta against the current upstream tip
+./scripts/upstream.sh                                      # refresh mirrors; print what upstream has after our last take
+git cherry-pick -n <sha>                                   # take one commit; it lands here as an ordinary commit
 ```
 
-`scripts/upstream.sh` refreshes the mirrors and the rewrite and prints how far
-behind each fork is. Both forks sit on upstream heads and carry a local delta on
-top. The other four are independent: kendex's copies of
+`scripts/upstream.sh` refreshes the mirrors and the rewrite, and reports the
+commits upstream has taken since we last took one. Both forks sit on upstream
+heads and carry a local delta on top — 47 files for `pi-subagents`, 11 for
+`pi-otel`. The other four are independent: kendex's copies of
 `pi-bash-processes`, `pi-tool-renderer` and `pi-output-policy` are frozen (a single
 version-bump commit since the extraction), and `pi-jev` and `pi-cbmem` were never
 forks of anything.
 
-Our commits are not linear descendants of upstream's, so an update is a
-cherry-pick of the commits worth having rather than a rebase — the mirrors exist
-to make that a one-liner, not to keep a lineage that would be rewritten anyway.
+The branch that carries a fork's lineage is `refs/heads/import-<package>`, not the
+current tree: the `pi-subagents` directory arrived here as one commit even though
+the import branch holds 1759. Rebasing that branch onto the mirror replays the
+fork's own delta and nothing else:
+
+```bash
+git clone --shared . /tmp/rebase && cd /tmp/rebase
+git checkout import-pi-subagents
+git rebase --onto upstream-pi-subagents/main <pivot>       # pivot = that branch's last upstream commit
+```
+
+The pivot has to come from the branch being rebased. The two rewrites give the
+same upstream commit different ids — `#2350` is `868e45be2` in the import branch
+and `528029351` in the mirror — so an id from one is meaningless in the other;
+`scripts/upstream.sh` resolves each in its own id space by subject. That rebase
+stops on the MCP and schema files for a hand resolution (a scratch run on
+2026-10-01 conflicted in five), which is why the 2026-09-30 syncs took upstream's
+tree whole and re-applied the delta instead: cheaper per take, but it leaves the
+import branch behind, so its rebase now replays the 09-27 delta rather than
+today's.
 
 ## Develop
 
