@@ -1,8 +1,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-import { CONFIG_ID, invalidateSettingsCache } from "./settings.js";
-
-const SETTINGS_EVENT = "kendex:extension-settings-changed";
+import { clearPackageConfigCache, SETTINGS_CHANGED_EVENT } from "./package-config.js";
+import { CONFIG_ID } from "./settings.js";
+import { invalidateRenderCaches } from "./settings-revision.js";
 
 interface ToolExecutionUi {
 	requestRender?: () => void;
@@ -13,7 +13,16 @@ interface TrackedToolExecutionComponent {
 	ui?: ToolExecutionUi;
 }
 
-const activeToolExecutionComponents = new Set<TrackedToolExecutionComponent>();
+/** Pi's chat view owns each tool-execution component; this module only needs
+ *  to reach the ones Pi still holds. A weak reference per component keeps a
+ *  component Pi dropped collectable, and `trackedComponents` stops the same
+ *  component taking a second reference on every render. */
+let trackedComponents = new WeakSet<TrackedToolExecutionComponent>();
+let componentRefs = new Set<WeakRef<TrackedToolExecutionComponent>>();
+/** Reference count at which the next track call drops collected references.
+ *  It doubles past the live count after each prune, so pruning stays amortized. */
+const MIN_PRUNE_AT = 64;
+let pruneAt = MIN_PRUNE_AT;
 
 interface ExtensionSettingChange {
 	extensionId?: unknown;
@@ -21,12 +30,30 @@ interface ExtensionSettingChange {
 }
 
 export function trackToolExecutionComponent(component: unknown): void {
-	if (component && typeof component === "object") activeToolExecutionComponents.add(component as TrackedToolExecutionComponent);
+	if (!component || typeof component !== "object") return;
+	const tracked = component as TrackedToolExecutionComponent;
+	if (trackedComponents.has(tracked)) return;
+	trackedComponents.add(tracked);
+	componentRefs.add(new WeakRef(tracked));
+	if (componentRefs.size < pruneAt) return;
+	pruneCollectedComponents();
+	pruneAt = Math.max(MIN_PRUNE_AT, componentRefs.size * 2);
+}
+
+function pruneCollectedComponents(): void {
+	for (const ref of componentRefs) {
+		if (!ref.deref()) componentRefs.delete(ref);
+	}
 }
 
 export function refreshToolExecutionComponents(): void {
 	const userInterfaces = new Set<ToolExecutionUi>();
-	for (const component of activeToolExecutionComponents) {
+	for (const ref of componentRefs) {
+		const component = ref.deref();
+		if (!component) {
+			componentRefs.delete(ref);
+			continue;
+		}
 		if (component.ui) userInterfaces.add(component.ui);
 		try {
 			component.invalidate?.();
@@ -44,23 +71,21 @@ export function refreshToolExecutionComponents(): void {
 }
 
 export function clearTrackedToolExecutionComponents(): void {
-	activeToolExecutionComponents.clear();
+	trackedComponents = new WeakSet();
+	componentRefs = new Set();
+	pruneAt = MIN_PRUNE_AT;
 }
 
 export function installLiveSettingsRefresh(pi: ExtensionAPI): void {
-	const unsubscribe = pi.events.on(SETTINGS_EVENT, (data: unknown) => {
+	const unsubscribe = pi.events.on(SETTINGS_CHANGED_EVENT, (data: unknown) => {
+		clearPackageConfigCache();
 		const change = data as ExtensionSettingChange | undefined;
-		if (change?.extensionId !== CONFIG_ID) return;
-		invalidateSettingsCache();
+		if (change?.extensionId !== CONFIG_ID || change.key !== "showReadImages") return;
 		refreshToolExecutionComponents();
 	});
-	pi.on("session_start", () => {
-		invalidateSettingsCache();
-		clearTrackedToolExecutionComponents();
-	});
+	pi.on("session_start", clearTrackedToolExecutionComponents);
 	pi.on("session_shutdown", () => {
 		unsubscribe();
-		invalidateSettingsCache();
 		clearTrackedToolExecutionComponents();
 	});
 }

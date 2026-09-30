@@ -9,7 +9,7 @@ import { stripAnsi } from "../tool-renderer/ansi.js";
 import { __test, withResultTheme } from "../tool-renderer/chrome.js";
 import { clearTrackedToolExecutionComponents, refreshToolExecutionComponents } from "../tool-renderer/live-settings.js";
 import { RESERVED_IMAGE_ROW_MARKER, TOOL_RENDER_OVERLAY_CHECK_SYMBOL } from "../tool-renderer/overlay.js";
-import { recordProjectTrust } from "../tool-renderer/settings.js";
+import { clearPackageConfigCache, recordProjectTrust } from "../tool-renderer/package-config.js";
 
 const createdDirs: string[] = [];
 
@@ -17,6 +17,7 @@ afterEach(() => {
 	resetCapabilitiesCache();
 	clearTrackedToolExecutionComponents();
 	for (const dir of createdDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+	clearPackageConfigCache();
 });
 
 const theme = {
@@ -30,13 +31,17 @@ function tempCwd(config?: Record<string, unknown>): string {
 	const dir = mkdtempSync(join(tmpdir(), "pi-tool-renderer-chrome-"));
 	createdDirs.push(dir);
 	if (config) {
-		mkdirSync(join(dir, ".pi"), { recursive: true });
-		writeFileSync(join(dir, ".pi", "settings.json"), JSON.stringify({
-			kendex: { extensionManager: { config: { "@vanillagreen/pi-tool-renderer": config } } },
-		}));
+		writeConfig(dir, config);
 		recordProjectTrust({ cwd: dir, isProjectTrusted: () => true });
 	}
 	return dir;
+}
+
+function writeConfig(dir: string, config: Record<string, unknown>): void {
+	mkdirSync(join(dir, ".pi"), { recursive: true });
+	writeFileSync(join(dir, ".pi", "settings.json"), JSON.stringify({
+		kendex: { extensionManager: { config: { "@vanillagreen/pi-tool-renderer": config } } },
+	}));
 }
 
 function toolComponent(cwd: string): any {
@@ -61,21 +66,26 @@ describe("tool chrome", () => {
 		expect(lines.every((line) => visibleWidth(line) <= 39)).toBe(true);
 	});
 
-	test("reuses cached chrome output until source or settings change", () => {
-		const cwd = tempCwd();
+	test("unchanged input reuses the chrome lines; new content, width, rule or mode redraws", () => {
+		const cwd = tempCwd({});
 		const component = toolComponent(cwd);
-		const rendered = ["", "● Read src/main.ts · 20 lines", ""];
-		const first = __test.renderToolChromeLines(component, rendered, 80);
-		const cached = __test.renderToolChromeLines(component, rendered.slice(), 80);
+		const first = __test.renderToolChromeLines(component, ["● Bash $ echo hi"], 40);
+		expect(__test.renderToolChromeLines(component, ["● Bash $ echo hi"], 40)).toBe(first);
 
-		expect(cached).toBe(first);
+		const changed = __test.renderToolChromeLines(component, ["● Bash $ echo bye"], 40);
+		expect(stripAnsi(changed[1]!)).toBe("● Bash $ echo bye");
+		const narrow = __test.renderToolChromeLines(component, ["● Bash $ echo bye"], 20);
+		expect(stripAnsi(narrow[0]!)).toBe("─".repeat(19));
+		__test.renderToolChromeLines(component, ["● Bash $ echo bye", "bye"], 20);
+		expect(__test.renderToolChromeLines(component, ["● Bash $ echo bye"], 20).map(stripAnsi)).not.toContain("bye");
 
-		const changed = __test.renderToolChromeLines(component, ["", "● Read src/other.ts · 10 lines", ""], 80);
-		expect(changed).not.toBe(first);
-
-		recordProjectTrust({ cwd, isProjectTrusted: () => true });
-		const invalidated = __test.renderToolChromeLines(component, rendered, 80);
-		expect(invalidated).not.toBe(first);
+		component.ui = { theme: { fg: (token: string, text: string) => (token === "borderMuted" ? `\x1b[94m${text}\x1b[39m` : text) } };
+		expect(__test.renderToolChromeLines(component, ["● Bash $ echo bye"], 20)[0]).toBe(`\x1b[94m${"─".repeat(19)}\x1b[39m`);
+		// A live settings change clears the config cache; the chrome follows on the next render.
+		// The rule key also changes here (transparent has none), so only dropping both mode and rule reddens this.
+		writeConfig(cwd, { toolChrome: "transparent" });
+		clearPackageConfigCache();
+		expect(__test.renderToolChromeLines(component, ["● Bash $ echo bye"], 20)).toEqual(["● Bash $ echo bye"]);
 	});
 
 	test("transparent chrome still trims blank self-render shell rows without rules", () => {

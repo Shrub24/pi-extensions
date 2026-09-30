@@ -5,7 +5,7 @@ import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { stripAnsi } from "../tool-renderer/ansi.js";
-import { recordProjectTrust } from "../tool-renderer/settings.js";
+import { recordProjectTrust } from "../tool-renderer/package-config.js";
 import { readCallText, readOnlyCallText, renderToolPathText } from "../tool-renderer/text.js";
 
 const theme = {

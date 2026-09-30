@@ -94,7 +94,7 @@ export function preview(text: string, count: number, direction: "head" | "tail",
 }
 
 export function commandExit(text: string): number | null {
-	const match = text.match(/exit code:\s*(\d+)/i) ?? text.match(/exit\s+(\d+)/i);
+	const match = text.match(/(?:^|\n)Command exited with code (\d+)\s*$/);
 	return match ? Number.parseInt(match[1]!, 10) : null;
 }
 

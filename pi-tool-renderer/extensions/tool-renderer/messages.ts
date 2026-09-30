@@ -17,7 +17,8 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "./ansi.js";
-import { settingBoolean, settingEnum, settingNumber, settingString, settingsCacheRevision } from "./settings.js";
+import { renderSettingsRevision } from "./settings-revision.js";
+import { readkendexConfig, settingBoolean, settingEnum, settingNumber, settingString } from "./settings.js";
 import { frameGlyphs, glyphs } from "./glyphs.js";
 import { mutedHorizontalRule } from "./chrome.js";
 import { recordGutterHit, recordGutterMiss } from "./render-debug.js";
@@ -166,18 +167,8 @@ interface UserMessagePatchState {
 	invalidatePatched?: boolean;
 	originalInvalidate?: () => void;
 	originalRender: (width: number) => string[];
+	originalInvalidate?: (this: object) => void;
 }
-
-interface UserMessageRenderCacheEntry {
-	lines: string[];
-	markdownTheme: any;
-	revision: number;
-	text: string;
-	theme: any;
-	width: number;
-}
-
-const userMessageRenderCache = new WeakMap<object, UserMessageRenderCacheEntry>();
 
 /**
  * Timestamp per user message component. Live messages are queued on
@@ -188,28 +179,61 @@ const userStampTimes = new WeakMap<object, number>();
 const pendingUserStamps: number[] = [];
 export const __stampTest = { userStampTimes, pendingUserStamps };
 
-function renderRawUserMessageLines(component: any, width: number, theme: any): string[] | undefined {
+/** A message longer than this is never cached: the layout exists to keep a
+ *  frame cheap, and a one-off 100 KB message would cost more held than redrawn. */
+const USER_LAYOUT_MAX_CHARS = 40_000;
+
+interface UserMessageLayout {
+	text: string;
+	theme: unknown;
+	markdownTheme: unknown;
+	settings: unknown;
+	revision: number;
+	markdown: Markdown;
+	width?: number;
+	lines?: string[];
+}
+let userMessageLayouts = new WeakMap<object, UserMessageLayout>();
+let userMessageLayoutCount = 0;
+
+function renderRawUserMessageLines(component: any, width: number, theme: any, cwd?: string): string[] | undefined {
 	const text = typeof component?.text === "string" ? component.text : undefined;
 	if (text === undefined) return undefined;
-	const markdownTheme = component?.markdownTheme ?? getMarkdownTheme();
-	const revision = settingsCacheRevision();
-	const cached = userMessageRenderCache.get(component);
-	if (cached
-		&& cached.markdownTheme === markdownTheme
-		&& cached.revision === revision
-		&& cached.text === text
-		&& cached.theme === theme
-		&& cached.width === width) return cached.lines;
-
-	const lines = new Markdown(
-		text,
-		0,
-		0,
-		markdownTheme,
-		{ color: (content: string) => theme.fg("userMessageText", content) },
-		{ preserveOrderedListMarkers: true, preserveBackslashEscapes: true },
-	).render(width);
-	userMessageRenderCache.set(component, { lines, markdownTheme, revision, text, theme, width });
+	const markdownTheme = component?.markdownTheme;
+	const settings = readkendexConfig(cwd);
+	// The revision is in the key alongside the parsed settings for the replayed
+	// case: a record and its settings can both be referentially unchanged across
+	// a settings edit, and the entry would otherwise serve stale lines.
+	const revision = renderSettingsRevision();
+	let layout = userMessageLayouts.get(component);
+	if (!layout || layout.theme !== theme || layout.markdownTheme !== markdownTheme || layout.settings !== settings || layout.revision !== revision) {
+		layout = {
+			text, theme, markdownTheme, settings, revision,
+			markdown: new Markdown(text, 0, 0, markdownTheme ?? getMarkdownTheme(),
+				{ color: (content: string) => theme.fg("userMessageText", content) },
+				{ preserveOrderedListMarkers: true, preserveBackslashEscapes: true }),
+		};
+	} else if (layout.text !== text) {
+		layout.markdown.setText(text);
+		layout.text = text;
+		layout.lines = undefined;
+	}
+	if (layout.lines && layout.width === width) return layout.lines;
+	const lines = layout.markdown.render(width);
+	if (text.length <= USER_LAYOUT_MAX_CHARS && lines.reduce((size, line) => size + line.length, 0) <= USER_LAYOUT_MAX_CHARS) {
+		layout.width = width;
+		layout.lines = lines;
+		if (!userMessageLayouts.has(component)) {
+			if (userMessageLayoutCount >= 256) {
+				userMessageLayouts = new WeakMap();
+				userMessageLayoutCount = 0;
+			}
+			userMessageLayoutCount++;
+		}
+		userMessageLayouts.set(component, layout);
+	} else if (userMessageLayouts.delete(component)) {
+		userMessageLayoutCount--;
+	}
 	return lines;
 }
 
@@ -234,7 +258,7 @@ function renderCompactUserMessageLines(component: any, width: number, frameWidth
 	claimUserStamp(component);
 	const rawLines = renderRawUserMessageLines(component, Math.max(1, frameWidth - 2), theme);
 	if (!rawLines) return undefined;
-	const revision = settingsCacheRevision();
+	const revision = renderSettingsRevision();
 	const cached = compactUserMessageRenderCache.get(component);
 	if (cached
 		&& cached.cwd === cwd
@@ -265,6 +289,22 @@ export function installUserMessageRenderer(pi: ExtensionAPI, UserMessageComponen
 			originalRender: prototype.render as (width: number) => string[],
 		};
 		prototype[USER_MESSAGE_PATCH_SYMBOL] = state;
+		// `invalidate` may already carry a wrapper from an earlier install in the
+		// same process (a second Pi session in one runtime). Guard on the flag so
+		// the chain stays one deep: without this, each install wraps the previous
+		// wrapper and `state.originalInvalidate` ends up pointing at the wrapper.
+		if (!state.invalidatePatched) {
+			state.invalidatePatched = true;
+			state.originalInvalidate = prototype.invalidate as UserMessagePatchState["originalInvalidate"];
+			prototype.invalidate = function invalidateUserMessageLayout(this: object): void {
+				const layout = userMessageLayouts.get(this);
+				if (layout) {
+					layout.lines = undefined;
+					layout.markdown.invalidate();
+				}
+				state!.originalInvalidate?.call(this);
+			};
+		}
 		prototype.render = function compactUserMessageRender(this: any, width: number): string[] {
 			const ctx = state?.activeCtx;
 			const cwd = safeCtxCwd(ctx);
@@ -318,7 +358,7 @@ export function installUserMessageRenderer(pi: ExtensionAPI, UserMessageComponen
 		state.hadOwnInvalidate = Object.prototype.hasOwnProperty.call(prototype, "invalidate");
 		state.originalInvalidate = typeof prototype.invalidate === "function" ? prototype.invalidate as () => void : undefined;
 		prototype.invalidate = function invalidateCompactUserMessage(this: any): void {
-			userMessageRenderCache.delete(this);
+			userMessageLayouts.delete(this);
 			compactUserMessageRenderCache.delete(this);
 			state?.originalInvalidate?.call(this);
 		};
@@ -337,6 +377,8 @@ export function installUserMessageRenderer(pi: ExtensionAPI, UserMessageComponen
 			}
 			delete prototype[USER_MESSAGE_PATCH_SYMBOL];
 		}
+		userMessageLayouts = new WeakMap();
+		userMessageLayoutCount = 0;
 		state!.activeCtx = undefined;
 	});
 }
@@ -362,7 +404,7 @@ function assistantInputFingerprint(component: any, width: number, turnEnded: boo
 	}
 	hash = (hash * 31 + (component?.hasToolCalls ? 7 : 3)) | 0;
 	hash = (hash * 31 + (turnEnded ? 11 : 5)) | 0;
-	hash = (hash * 31 + settingsCacheRevision()) | 0;
+	hash = (hash * 31 + renderSettingsRevision()) | 0;
 	hash = (hash * 31 + (startTimes.get(component) ?? 0) % 100000) | 0;
 	hash = (hash * 31 + (endTimes.get(component) ?? 0) % 100000) | 0;
 	return hash;
@@ -427,7 +469,7 @@ function assistantTextGutterLinesCached(component: any, lines: string[], width: 
 	let fingerprint = lines.length;
 	for (const line of lines) fingerprint = (fingerprint * 31 + line.length) | 0;
 	if (lines.length > 0) fingerprint = (fingerprint * 31 + lines[lines.length - 1]!.length) | 0;
-	const revision = settingsCacheRevision();
+	const revision = renderSettingsRevision();
 	const cached = gutterCache.get(component);
 	if (cached && cached.style === style && cached.width === width && cached.revision === revision
 		&& cached.skipPrefix === skipPrefix
@@ -580,7 +622,7 @@ export function installAssistantMessageRenderer(pi: ExtensionAPI, AssistantMessa
 					})
 				: undefined;
 			const fingerprint = assistantFingerprint(rendered, stamp, style, paneled, turnRule);
-			const revision = settingsCacheRevision();
+			const revision = renderSettingsRevision();
 			const cached = assistantRenderCache.get(this);
 			if (cached && cached.width === width && cached.revision === revision && cached.fingerprint === fingerprint) {
 				return cached.lines;

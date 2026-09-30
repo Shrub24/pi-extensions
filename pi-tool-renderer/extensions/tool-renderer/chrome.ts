@@ -1,5 +1,6 @@
 import { ToolExecutionComponent, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { recordChromeHit, recordChromeMiss } from "./render-debug.js";
+import { renderSettingsRevision } from "./settings-revision.js";
 import { Box, Container, Loader, Text } from "@earendil-works/pi-tui";
 
 import {
@@ -24,7 +25,7 @@ import {
 	shouldUseUnknownToolRenderer,
 	componentDefinesRenderer,
 } from "./generic.js";
-import { settingBoolean, settingEnum, settingsCacheRevision, toolChromeMode, type ToolChromeMode } from "./settings.js";
+import { settingBoolean, settingEnum, toolChromeMode, type ToolChromeMode } from "./settings.js";
 import { RESERVED_IMAGE_ROW_MARKER, TOOL_RENDER_OVERLAY_CHECK_SYMBOL } from "./overlay.js";
 import { trackToolExecutionComponent } from "./live-settings.js";
 import { glyphs } from "./glyphs.js";
@@ -182,12 +183,28 @@ function toolChromeThemeFor(component: any): any {
 	return component?.[TOOL_CHROME_THEME_SYMBOL] ?? component?.ui?.theme ?? (activeToolChromeCtx?.hasUI ? activeToolChromeCtx.ui.theme : undefined);
 }
 
+/** Last chrome output per component. Pi re-renders the whole tree on every
+ * frame, and re-wrapping every tool block each time made long sessions spin.
+ * The hit check compares line by line, never a joined copy: joining would
+ * scan and retain every block's full text on every frame. */
+type ToolChromeCacheEntry = { width: number; mode: ToolChromeMode; rule: string; rendered: string[]; lines: string[] };
+const toolChromeCache = new WeakMap<object, ToolChromeCacheEntry>();
+
+function toolChromeCacheHit(entry: ToolChromeCacheEntry | undefined, width: number, mode: ToolChromeMode, rule: string, rendered: string[]): entry is ToolChromeCacheEntry {
+	return entry !== undefined
+		&& entry.width === width
+		&& entry.mode === mode
+		&& entry.rule === rule
+		&& entry.rendered.length === rendered.length
+		&& rendered.every((line, i) => line === entry.rendered[i]);
+}
+
 function renderToolChromeLines(component: any, rendered: string[], width: number): string[] {
 	const effectiveCwd = component?.cwd ?? process.cwd();
 	const mode = toolChromeMode(effectiveCwd);
 	if (mode === "off") return rendered;
 
-	const revision = settingsCacheRevision();
+	const revision = renderSettingsRevision();
 	const cacheKey = component && typeof component === "object" ? component as object : undefined;
 	const chromeTheme = mode === "outlines" || mode === "panel" ? toolChromeThemeFor(component) : undefined;
 	const cached = cacheKey ? toolChromeRenderCache.get(cacheKey) : undefined;

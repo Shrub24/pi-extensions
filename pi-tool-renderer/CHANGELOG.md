@@ -2,7 +2,31 @@
 
 ## Consumer-impacting changes
 
-### Unreleased
+### 2.0.8
+
+- User messages reuse Markdown layout during typing and streaming. Width, content and theme changes rebuild the layout.
+
+### 2.0.7
+
+- Long sessions no longer grow in memory with every read, bash, grep, find and ls call. Grouped tool calls are tracked only while `stackToolCalls` is on, at most 256 are kept (in groups of at most 64), each keeps at most 16,384 characters of its result, and all of them are cleared when a session starts or ends. Once a group has been dropped, a dropped call that Pi draws again (ctrl+o, a resize) is shown on its own, and the groups still kept and the group receiving live calls are left as they were. A tool display Pi no longer shows is not kept alive for the settings refresh.
+
+### 2.0.6
+
+- A project trust answer that another kendex Pi extension records now applies on the next settings read. Before, it applied only after the one-second window in which settings are answered from memory.
+
+### 2.0.5
+
+- Pi 0.86.0 parity: the replacement `read`, `bash`, `edit` and `write` tools carry Pi's `constrainedSampling` setting from the wrapped tool, so their requests keep Pi's strict-prefer JSON-schema sampling with the renderer active. Every replacement tool now forwards the wrapped tool's description, parameters, `constrainedSampling` and `prepareArguments`.
+
+### 2.0.4
+
+- Long sessions no longer hold Pi's main thread at full CPU under the renderer. Extension settings are read from disk at most once per second for each package and working directory, and, while tool chrome is on, each tool block keeps its drawn lines until its content, width, chrome mode or rule changes. A hand edit to `settings.json` now applies within one second; changes made through the extension manager and project trust changes still apply on the next render (#2837).
+
+### 2.0.3
+
+- Bash commands and `tool_batch` children run through the renderer keep Pi's session and model metadata: `PI_SESSION_ID`, `PI_SESSION_FILE`, `PI_PROVIDER`, `PI_MODEL` and `PI_REASONING_LEVEL` reach the command instead of arriving empty. The replacement tools and batch child calls forward Pi's execution context to the built-in tool unchanged (#3101).
+
+### 2.0.2
 
 - The managed `bash` tool from `@vanillagreen/pi-background-tasks` remains active instead of being replaced with Pi's native Bash executor.
 - Batch refusal, timeout, and result notices start with stable keys and values.

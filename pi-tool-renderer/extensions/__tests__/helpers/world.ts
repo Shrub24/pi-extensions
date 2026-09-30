@@ -2,7 +2,7 @@ import { afterEach, beforeEach } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { recordProjectTrust } from "../../tool-renderer/settings.js";
+import { clearPackageConfigCache, recordProjectTrust } from "../../tool-renderer/package-config.js";
 
 /** Give each case owned project and user settings directories. */
 export function useWorld() {
@@ -17,11 +17,13 @@ export function useWorld() {
 		current = { root, cwd, agent };
 		previousAgent = process.env.PI_CODING_AGENT_DIR;
 		process.env.PI_CODING_AGENT_DIR = agent;
+		clearPackageConfigCache();
 		recordProjectTrust({ cwd, isProjectTrusted: () => true });
 	});
 	afterEach(() => {
 		if (previousAgent === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = previousAgent;
+		clearPackageConfigCache();
 		if (current) rmSync(current.root, { recursive: true, force: true });
 		current = undefined;
 	});

@@ -4,12 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { glyphs, glyphStyle } from "../tool-renderer/glyphs.js";
+import { clearPackageConfigCache } from "../tool-renderer/package-config.js";
 
 const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 
 afterEach(() => {
 	if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 	else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+	clearPackageConfigCache();
 });
 
 function fixture(config: Record<string, unknown>): string {
@@ -20,6 +22,7 @@ function fixture(config: Record<string, unknown>): string {
 	mkdirSync(join(project, ".pi"), { recursive: true });
 	writeFileSync(join(user, "settings.json"), JSON.stringify({ kendex: { extensionManager: { config } } }));
 	process.env.PI_CODING_AGENT_DIR = user;
+	clearPackageConfigCache();
 	return project;
 }
 

@@ -79,6 +79,23 @@ export function getBuiltInTool(agent: any, cwd: string, toolName: BuiltInToolNam
 	return tools[toolName];
 }
 
+/**
+ * Four fields of the wrapped AgentTool that Pi's agent loop reads, which a
+ * replacement definition carries unchanged. `description`, `parameters` and
+ * `constrainedSampling` are the tool as declared to the model, the last being
+ * Pi's schema-sampling choice, strict-prefer on read, bash, edit and write.
+ * `prepareArguments` runs before arguments validate against `parameters`, so
+ * without it the shapes Pi's own tool accepts fail before `execute` delegates.
+ */
+function piToolContract(original: any) {
+	return {
+		description: original.description,
+		parameters: original.parameters,
+		constrainedSampling: original.constrainedSampling,
+		prepareArguments: original.prepareArguments,
+	};
+}
+
 export function contextCwd(context: any, fallback: string): string {
 	return context?.cwd ?? fallback;
 }
@@ -90,11 +107,11 @@ export function registerRead(pi: ExtensionAPI, agent: any, cwd: string): void {
 		renderShell: "self",
 		name: "read",
 		label: "read",
-		description: original.description,
+		...piToolContract(original),
 		parameters: intentParameters("read", original.parameters, cwd),
 		prepareArguments: intentPrepare("read", "Reading the file", cwd),
 		async execute(id: string, params: any, signal: AbortSignal | undefined, onUpdate: unknown, context: any) {
-			return getBuiltInTool(agent, contextCwd(context, cwd), "read").execute(id, stripIntent(params), signal, onUpdate);
+			return getBuiltInTool(agent, contextCwd(context, cwd), "read").execute(id, stripIntent(params), signal, onUpdate, context);
 		},
 		renderCall(args: any, theme: any, context: any) {
 			const intentLead = typeof args?.intent === "string" && args.intent.trim()
@@ -134,10 +151,9 @@ export function registerBash(pi: ExtensionAPI, agent: any, cwd: string): void {
 		renderShell: "self",
 		name: "bash",
 		label: "bash",
-		description: original.description,
-		parameters: original.parameters,
+		...piToolContract(original),
 		async execute(id: string, params: any, signal: AbortSignal | undefined, onUpdate: unknown, context: any) {
-			return getBuiltInTool(agent, contextCwd(context, cwd), "bash").execute(id, params, signal, onUpdate);
+			return getBuiltInTool(agent, contextCwd(context, cwd), "bash").execute(id, params, signal, onUpdate, context);
 		},
 		renderCall(args: any, theme: any, context: any) {
 			return renderManagedBashCall({ args, context, theme, cwd });
@@ -164,7 +180,7 @@ export function registerEdit(pi: ExtensionAPI, agent: any, cwd: string): void {
 		renderShell: "self",
 		name: "edit",
 		label: "edit",
-		description: original.description,
+		...piToolContract(original),
 		parameters: intentParameters("edit", original.parameters, cwd),
 		// Pi's agent loop prepares arguments before schema validation; the
 		// replacement definition has to carry the hook or the shapes Pi's own
@@ -178,7 +194,7 @@ export function registerEdit(pi: ExtensionAPI, agent: any, cwd: string): void {
 			const effectiveCwd = contextCwd(context, cwd);
 			const targetPath = params?.path ?? params?.file_path;
 			const before = readTextForDiff(targetPath, effectiveCwd);
-			const result = await getBuiltInTool(agent, effectiveCwd, "edit").execute(id, stripIntent(params), signal, onUpdate);
+			const result = await getBuiltInTool(agent, effectiveCwd, "edit").execute(id, stripIntent(params), signal, onUpdate, context);
 			const after = result?.isError ? before : readTextForDiff(targetPath, effectiveCwd);
 			return attachDiffDetails(result, before, after, typeof targetPath === "string" ? targetPath : undefined);
 		},
@@ -221,14 +237,14 @@ export function registerWrite(pi: ExtensionAPI, agent: any, cwd: string): void {
 		renderShell: "self",
 		name: "write",
 		label: "write",
-		description: original.description,
+		...piToolContract(original),
 		parameters: intentParameters("write", original.parameters, cwd),
 		prepareArguments: intentPrepare("write", "Writing the file", cwd),
 		async execute(id: string, params: any, signal: AbortSignal | undefined, onUpdate: unknown, context: any) {
 			const effectiveCwd = contextCwd(context, cwd);
 			const targetPath = params?.path ?? params?.file_path;
 			const before = readTextForDiff(targetPath, effectiveCwd);
-			const result = await getBuiltInTool(agent, effectiveCwd, "write").execute(id, stripIntent(params), signal, onUpdate);
+			const result = await getBuiltInTool(agent, effectiveCwd, "write").execute(id, stripIntent(params), signal, onUpdate, context);
 			const after = result?.isError ? before : typeof params?.content === "string" ? params.content : readTextForDiff(targetPath, effectiveCwd);
 			return attachDiffDetails(result, before, after, typeof targetPath === "string" ? targetPath : undefined);
 		},
@@ -277,13 +293,14 @@ export function registerReadOnly(pi: ExtensionAPI, agent: any, cwd: string, tool
 		renderShell: "self",
 		name: toolName,
 		label: toolName,
+		...piToolContract(original),
 		description: toolName === "find"
 			? "Fuzzy path and glob search. Use when the target is fundamentally a path or filename, or as a scoped fallback after indexed/semantic code discovery. Do not use as the first tool for conceptual, behavioral, symbol, caller, or architecture discovery."
 			: original.description,
 		parameters: intentParameters(toolName, original.parameters, cwd),
 		prepareArguments: intentPrepare(toolName, `Running ${toolName}`, cwd),
 		async execute(id: string, params: any, signal: AbortSignal | undefined, onUpdate: unknown, context: any) {
-			return getBuiltInTool(agent, contextCwd(context, cwd), toolName).execute(id, stripIntent(params), signal, onUpdate);
+			return getBuiltInTool(agent, contextCwd(context, cwd), toolName).execute(id, stripIntent(params), signal, onUpdate, context);
 		},
 		renderCall(args: any, theme: any, context: any) {
 			return renderPendingCall(readOnlyCallText(toolName, args ?? {}, theme, context?.cwd ?? cwd), theme, context, cwd);

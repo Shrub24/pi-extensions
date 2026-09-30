@@ -4,11 +4,11 @@ import { renderBashDiffOutput, shouldRenderBashDiffsForCommand, suppressReadOnly
 import {
 	settingNumber,
 	stackChildDisplay,
+	stackToolCalls,
 	type StackChildDisplay,
 } from "./settings.js";
 import { stackPrefix, toolLabel, treeConnector, treeStem, type TreeBranch } from "./theme.js";
 import {
-	commandExit,
 	joinPhrases,
 	lineCount,
 	makeEmpty,
@@ -33,6 +33,10 @@ export interface StackItem {
 	batchId: string;
 	id: string;
 	isError: boolean;
+	/** Line count of the whole result, taken before `resultText` is capped. */
+	resultLines: number;
+	/** The result text, capped at STACK_RESULT_MAX_CHARS: the head for read and
+	 *  search tools, the tail for bash, the ends their previews show. */
 	resultText: string;
 	status: StackItemStatus;
 	toolName: StackableToolName;
@@ -47,10 +51,27 @@ export interface StackBatch {
 }
 
 const STACKABLE_TOOLS = new Set<string>(["read", "bash", "grep", "find", "ls"]);
+/** At most this many stack items are kept. Past it the oldest finished batches
+ *  are dropped whole; a dropped call that renders again is drawn on its own,
+ *  outside every batch, and kept only while there is room. */
+export const STACK_MAX_ITEMS = 256;
+/** A run of stackable calls longer than this starts a new batch, so the batch
+ *  still receiving calls stays small enough for eviction to reach the rest. */
+export const STACK_MAX_BATCH_ITEMS = 64;
+/** At most this many characters of one result are kept for its preview. */
+export const STACK_RESULT_MAX_CHARS = 16_384;
 export const stackItems = new Map<string, StackItem>();
 export const stackBatches = new Map<string, StackBatch>();
 const stackInvalidators = new Map<string, () => void>();
+/** The batch live calls join: only tool_execution_start adds to it. */
 let currentStackBatch: StackBatch | null = null;
+/** The batch calls first seen at render time join, such as a resumed
+ *  session's history. It is never the live batch. */
+let renderedStackBatch: StackBatch | null = null;
+/** Whether this session has dropped a batch. From then on a call first seen at
+ *  render time may be a dropped one, and keeping it would take the room of a
+ *  batch still on screen. */
+let stackEvicted = false;
 let stackBatchCounter = 0;
 
 export function isStackableToolName(toolName: unknown): toolName is StackableToolName {
@@ -66,23 +87,102 @@ function notifyStackBatch(batchId: string): void {
 function createStackBatch(firstId: string): StackBatch {
 	const batch: StackBatch = { anchorId: firstId, id: `stack-${++stackBatchCounter}`, items: [], updatedAt: Date.now() };
 	stackBatches.set(batch.id, batch);
-	currentStackBatch = batch;
 	return batch;
 }
 
-export function ensureStackItem(toolName: StackableToolName, id: string, args: any): StackItem {
+/** The one constructor of a StackItem: a running call with no result yet. */
+export function newStackItem(toolName: StackableToolName, id: string, args: any, batchId: string): StackItem {
+	return { args, batchId, id, isError: false, resultLines: 0, resultText: "", status: "running", toolName, truncated: false };
+}
+
+function addStackItem(batch: StackBatch, item: StackItem): void {
+	batch.items.push(item.id);
+	stackItems.set(item.id, item);
+	batch.updatedAt = Date.now();
+}
+
+/** Record a live call: it joins the live batch, or starts one, and the oldest
+ *  finished batches are dropped once the item count passes STACK_MAX_ITEMS. */
+function startStackItem(toolName: StackableToolName, id: string, args: any): StackItem {
 	const existing = stackItems.get(id);
 	if (existing) {
 		existing.args = args ?? existing.args;
 		return existing;
 	}
-	const batch = currentStackBatch ?? createStackBatch(id);
-	if (!batch.items.includes(id)) batch.items.push(id);
-	const item: StackItem = { args, batchId: batch.id, id, isError: false, resultText: "", status: "running", toolName, truncated: false };
-	stackItems.set(id, item);
-	batch.updatedAt = Date.now();
-	notifyStackBatch(batch.id);
+	if (!currentStackBatch || currentStackBatch.items.length >= STACK_MAX_BATCH_ITEMS) currentStackBatch = createStackBatch(id);
+	const item = newStackItem(toolName, id, args, currentStackBatch.id);
+	addStackItem(currentStackBatch, item);
+	evictOldStackBatches();
+	notifyStackBatch(item.batchId);
 	return item;
+}
+
+/** The item for a call Pi renders. A call first seen here, such as a resumed
+ *  session's history, joins the rendered batch and never evicts: a render pass
+ *  that dropped the batches it draws next would regroup the whole history.
+ *  Once the item count reaches STACK_MAX_ITEMS, or the session has dropped a
+ *  batch, such a call gets an item outside every batch that is not kept. */
+function renderedStackItem(toolName: StackableToolName, id: string, args: any): StackItem {
+	const existing = stackItems.get(id);
+	if (existing) {
+		existing.args = args ?? existing.args;
+		return existing;
+	}
+	if (stackEvicted || stackItems.size >= STACK_MAX_ITEMS) return newStackItem(toolName, id, args, "");
+	if (!renderedStackBatch || renderedStackBatch.items.length >= STACK_MAX_BATCH_ITEMS || !stackBatches.has(renderedStackBatch.id)) {
+		renderedStackBatch = createStackBatch(id);
+	}
+	const item = newStackItem(toolName, id, args, renderedStackBatch.id);
+	addStackItem(renderedStackBatch, item);
+	return item;
+}
+
+/** Drop the oldest batches until the item count is within STACK_MAX_ITEMS. The
+ *  current batch is never dropped: its calls are still arriving. */
+function evictOldStackBatches(): void {
+	for (const [batchId, batch] of stackBatches) {
+		if (stackItems.size <= STACK_MAX_ITEMS) return;
+		if (batch === currentStackBatch) continue;
+		for (const id of batch.items) {
+			stackItems.delete(id);
+			stackInvalidators.delete(id);
+		}
+		stackBatches.delete(batchId);
+		stackEvicted = true;
+	}
+}
+
+/** A live event ends both open batches: a later call starts a new one. */
+function closeOpenStackBatches(): void {
+	currentStackBatch = null;
+	renderedStackBatch = null;
+}
+
+/** Record a finished result's text on its item, capping the text it keeps.
+ *  `truncated` is true when the producer already cut the text. */
+export function setStackItemResultText(item: StackItem, text: string, isError: boolean, truncated: boolean): void {
+	item.status = isError ? "error" : "done";
+	item.isError = isError;
+	item.resultLines = lineCount(text);
+	item.truncated = truncated || text.length > STACK_RESULT_MAX_CHARS;
+	if (text.length <= STACK_RESULT_MAX_CHARS) item.resultText = text;
+	else if (item.toolName === "bash") item.resultText = text.slice(-STACK_RESULT_MAX_CHARS);
+	else item.resultText = text.slice(0, STACK_RESULT_MAX_CHARS);
+}
+
+/** Record a finished tool result on its item. */
+function setStackItemResult(item: StackItem, result: any, isError: unknown): void {
+	setStackItemResultText(item, textContent(result), Boolean(isError), resultTruncated(result));
+}
+
+/** Release every stack collection: the items, their batches and invalidators
+ *  belong to one session's tool calls. */
+export function clearStackState(): void {
+	stackItems.clear();
+	stackBatches.clear();
+	stackInvalidators.clear();
+	closeOpenStackBatches();
+	stackEvicted = false;
 }
 
 export function contextToolCallId(context: any, toolName: string, args: any): string {
@@ -99,21 +199,19 @@ function stackItemSummary(item: StackItem, theme: any): string {
 	if (item.status === "running") return theme.fg("warning", "running");
 	if (item.isError) return theme.fg("error", "failed");
 	if (item.toolName === "read") {
-		const count = lineCount(item.resultText);
+		const count = item.resultLines;
 		let text = theme.fg("success", `${count} line${count === 1 ? "" : "s"}`);
 		if (item.truncated) text += theme.fg("warning", " · truncated");
 		return text;
 	}
 	if (item.toolName === "bash") {
-		const exit = commandExit(item.resultText);
-		const count = lineCount(item.resultText);
-		const exitLabel = exit === null ? "exit 0" : `exit ${exit}`;
-		let text = exit !== null && exit !== 0 ? theme.fg("error", exitLabel) : theme.fg("success", exitLabel);
+		const count = item.resultLines;
+		let text = theme.fg("success", "exit 0");
 		text += theme.fg("dim", ` · ${count} line${count === 1 ? "" : "s"}`);
 		if (item.truncated) text += theme.fg("warning", " · truncated");
 		return text;
 	}
-	const count = item.resultText.trim() ? lineCount(item.resultText) : 0;
+	const count = item.resultText.trim() ? item.resultLines : 0;
 	let text = theme.fg("success", `${count} result${count === 1 ? "" : "s"}`);
 	if (item.truncated) text += theme.fg("warning", " · truncated");
 	return text;
@@ -145,8 +243,7 @@ export function renderStackItemText(item: StackItem, theme: any, expanded: boole
 	return text;
 }
 
-function stackBatchHeadline(batch: StackBatch, theme: any, expanded: boolean, childDisplay: StackChildDisplay): string {
-	const items = batch.items.map((id) => stackItems.get(id)).filter(Boolean) as StackItem[];
+function stackBatchHeadline(items: StackItem[], theme: any, expanded: boolean, childDisplay: StackChildDisplay): string {
 	const running = items.some((item) => item.status === "running");
 	const done = items.filter((item) => item.status !== "running").length;
 	const reads = items.filter((item) => item.toolName === "read").length;
@@ -163,10 +260,9 @@ function stackBatchHeadline(batch: StackBatch, theme: any, expanded: boolean, ch
 	return `${stackPrefix(theme)}${sentence}${running ? "…" : ""}${progress}${expandHint}`;
 }
 
-function renderStackBatch(batch: StackBatch, theme: any, expanded: boolean, cwd?: string, childDisplay: StackChildDisplay = "rows"): TruncatedLines {
-	let text = stackBatchHeadline(batch, theme, expanded, childDisplay);
+function renderStackBatch(items: StackItem[], theme: any, expanded: boolean, cwd?: string, childDisplay: StackChildDisplay = "rows"): TruncatedLines {
+	let text = stackBatchHeadline(items, theme, expanded, childDisplay);
 	if (childDisplay === "anchor-list" || (childDisplay === "headline" && expanded)) {
-		const items = batch.items.map((id) => stackItems.get(id)).filter(Boolean) as StackItem[];
 		items.forEach((item, index) => {
 			text += `\n${renderStackItemText(item, theme, expanded, cwd, index === items.length - 1 ? "└" : "├")}`;
 		});
@@ -176,33 +272,32 @@ function renderStackBatch(batch: StackBatch, theme: any, expanded: boolean, cwd?
 
 export function renderStackedToolResult(toolName: StackableToolName, result: any, isPartial: boolean, expanded: boolean, theme: any, context: any, cwd: string) {
 	const id = contextToolCallId(context, toolName, context?.args);
-	const item = ensureStackItem(toolName, id, context?.args ?? {});
-	if (context?.invalidate) stackInvalidators.set(id, context.invalidate);
-	if (!isPartial) {
-		item.status = context?.isError ? "error" : "done";
-		item.isError = Boolean(context?.isError);
-		item.resultText = textContent(result);
-		item.truncated = resultTruncated(result);
-		stackBatches.get(item.batchId)!.updatedAt = Date.now();
-	}
+	const item = renderedStackItem(toolName, id, context?.args ?? {});
 	const batch = stackBatches.get(item.batchId);
-	if (!batch) return makeEmpty();
+	if (batch && context?.invalidate) stackInvalidators.set(id, context.invalidate);
+	if (!isPartial) {
+		setStackItemResult(item, result, context?.isError);
+		if (batch) batch.updatedAt = Date.now();
+	}
 	const effectiveCwd = context?.cwd ?? cwd;
 	const childDisplay = stackChildDisplay(effectiveCwd);
-	if (batch.anchorId === id) return renderStackBatch(batch, theme, expanded, effectiveCwd, childDisplay);
-	if (childDisplay !== "rows") return makeEmpty();
+	// An item outside every batch is drawn as a batch of one.
+	if (!batch) return renderStackBatch([item], theme, expanded, effectiveCwd, childDisplay);
 	const items = batch.items.map((itemId) => stackItems.get(itemId)).filter(Boolean) as StackItem[];
+	if (batch.anchorId === id) return renderStackBatch(items, theme, expanded, effectiveCwd, childDisplay);
+	if (childDisplay !== "rows") return makeEmpty();
 	const index = Math.max(0, items.findIndex((candidate) => candidate.id === id));
 	return makeTruncatedLines(renderStackItemText(item, theme, false, effectiveCwd, index === items.length - 1 ? "└" : "├"));
 }
 
 export function registerStackEvents(pi: ExtensionAPI): void {
-	pi.on("agent_start", () => {
-		currentStackBatch = null;
-	});
-	pi.on("tool_execution_start", (event: any) => {
-		if (isStackableToolName(event.toolName)) {
-			ensureStackItem(event.toolName, String(event.toolCallId), event.args ?? event.input ?? {});
+	pi.on("session_start", clearStackState);
+	pi.on("session_shutdown", clearStackState);
+	pi.on("agent_start", closeOpenStackBatches);
+	pi.on("tool_execution_start", (event: any, ctx: any) => {
+		renderedStackBatch = null;
+		if (isStackableToolName(event.toolName) && stackToolCalls(ctx?.cwd)) {
+			startStackItem(event.toolName, String(event.toolCallId), event.args ?? event.input ?? {});
 			return;
 		}
 		currentStackBatch = null;
@@ -210,14 +305,9 @@ export function registerStackEvents(pi: ExtensionAPI): void {
 	pi.on("tool_execution_end", (event: any) => {
 		const item = stackItems.get(String(event.toolCallId));
 		if (!item) return;
-		item.status = event.isError ? "error" : "done";
-		item.isError = Boolean(event.isError);
-		item.resultText = textContent(event.result);
-		item.truncated = resultTruncated(event.result);
+		setStackItemResult(item, event.result, event.isError);
 		notifyStackBatch(item.batchId);
 	});
-	pi.on("agent_end", () => {
-		currentStackBatch = null;
-	});
+	pi.on("agent_end", closeOpenStackBatches);
 }
 

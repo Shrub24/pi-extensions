@@ -210,10 +210,15 @@ export function renderManagedBashResult({ result, expanded, isPartial, context, 
 	}
 	clearBlink(context);
 	clearBashLiveTailTimer(liveTailState);
-	const exit = commandExit(output);
+	// Pi's own verdict wins over the output text. A command whose *output* happens
+	// to mention an exit code — a manual page, a test asserting on the string —
+	// must not read as a failure, and a timeout or cancellation carries no exit
+	// code at all, so it can only be reported from `isError`.
+	const failed = Boolean(context?.isError || result?.isError);
+	const exit = failed ? commandExit(output) : null;
 	const count = lineCount(output);
-	const exitLabel = exit === null ? "exit 0" : `exit ${exit}`;
-	let summary = exit !== null && exit !== 0 ? theme.fg("error", exitLabel) : theme.fg("success", exitLabel);
+	const exitLabel = exit === null ? (failed ? "failed" : "exit 0") : `exit ${exit}`;
+	let summary = theme.fg(failed ? "error" : "success", exitLabel);
 	summary += theme.fg("dim", ` · ${count} line${count === 1 ? "" : "s"}`);
 	// Foreground rows show wall time once the task snapshot carries timing.
 	const foreground = result?.details?.task as { startedAt?: number; updatedAt?: number } | undefined;

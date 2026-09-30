@@ -29,6 +29,14 @@ Restart Pi after installation. Use `kendex update-pi --check` to preview the ins
 
 Pi runs a tool and gives its call and result to the display extension. The extension formats those values using your settings. It shows a compact preview that you can expand. Optional diff views show changed files, and grouped read calls share one result display.
 
+## Memory use
+
+- User messages keep at most 256 weakly held Markdown layouts. Each keeps one width and at most 65,536 characters each of source text and rendered lines. Larger messages render without retention. The layouts do not keep message components alive and are cleared at session shutdown.
+- Grouped tool calls are tracked only while `stackToolCalls` is on.
+- At most 256 grouped calls are kept, in groups of at most 64; older groups are dropped. Each keeps at most 16,384 characters of its result for the preview: the start for read and search calls, the end for bash.
+- A dropped call that Pi draws again (ctrl+o, a resize) is shown on its own and is not kept.
+- Grouped calls and the list of tool displays to refresh are cleared when a session starts or ends. A tool display Pi no longer shows is not kept alive.
+
 ## Settings
 
 The settings editor writes project values to `.pi/settings.json`. The default user file is `~/.pi/agent/settings.json`. `PI_CODING_AGENT_DIR` changes the user directory. Package values are stored under `kendex.extensionManager.config["@vanillagreen/pi-tool-renderer"]`.
