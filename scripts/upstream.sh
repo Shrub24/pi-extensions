@@ -54,9 +54,9 @@ MIRRORS="${PI_EXT_MIRRORS:-$HOME/Projects/dev/custom/.pi-ext-mirrors}"
 FORKS=(
   "pi-subagents|pi-subagents|https://github.com/nicobailon/pi-subagents.git|.|964481f4ea5fac2cb8dceaa7ce60547d6c6ffd60 0958598823920997f9a9241c4b2ac367297c95e3"
   "pi-otel|pi-otel|https://github.com/stnly/pi-otel.git|.|398d40a72a1ba3a599e8596f26c3f148df1e7296"
-  "pi-bash-processes|kendex|https://github.com/vanillagreencom/kendex.git|pi-extensions/pi-background-tasks|c9ee5844c65c66c91a3cbd48f6b3c0598bf5dfe6"
-  "pi-tool-renderer|kendex|https://github.com/vanillagreencom/kendex.git|pi-extensions/pi-tool-renderer|77632e7bab9461e8fb01f9e3531dbffda8357a97"
-  "pi-output-policy|kendex|https://github.com/vanillagreencom/kendex.git|pi-extensions/pi-output-policy|522c52cfdf1288df4332b36dad81d78d771dcbdf"
+  "pi-bash-processes|kendex|https://github.com/vanillagreencom/kendex.git|pi-extensions/pi-background-tasks|fb55afe5cd4593b69939c7a53de56ea298a9b994"
+  "pi-tool-renderer|kendex|https://github.com/vanillagreencom/kendex.git|pi-extensions/pi-tool-renderer|f5a2cd0a51c20f9de0c73b66eda944e7d30e5b1e"
+  "pi-output-policy|kendex|https://github.com/vanillagreencom/kendex.git|pi-extensions/pi-output-policy|6948c0f3c69cd170d2685fef5b6a6cf8a605e881"
 )
 UNTAKEN_SHOWN=8
 
