@@ -18,10 +18,13 @@
 # FORKS below is the table. "path" is where the package sits in upstream — "."
 # for a repository that is the package (nicobailon, stnly), pi-extensions/<name>
 # for kendex, whose rewrite therefore also filters: only commits touching that
-# path survive. "takes" are the upstream commits this repo has adopted, in
-# upstream's own id space; a take does not have to touch the path, since for
-# kendex it is the repo state we extracted from, and the rewrite's pivot is that
-# path's last commit at or before it.
+# path survive, and that prefix is stripped so the result lands at
+# <package>/<file>, the layout this repo uses. Without the strip a kendex take
+# arrives as <package>/pi-extensions/<name>/<file> and no cherry-pick applies.
+# "takes" are the upstream commits this repo has adopted, in upstream's own id
+# space; a take does not have to touch the path, since for kendex it is the repo
+# state we extracted from, and the rewrite's pivot is that path's last commit at
+# or before it.
 #
 # Ids are not portable between the mirrors: the same upstream commit is a
 # different object in each rewrite (different graph roots), so #2350 is
@@ -77,7 +80,8 @@ rewrite() {
   if [ "$path" = "." ]; then
     git -C "$out" filter-repo --force --to-subdirectory-filter "$pkg" >/dev/null
   else
-    git -C "$out" filter-repo --force --path "$path" --to-subdirectory-filter "$pkg" >/dev/null
+    git -C "$out" filter-repo --force --path "$path" \
+      --path-rename "$path/:" --to-subdirectory-filter "$pkg" >/dev/null
   fi
   git fetch --quiet "$out" "+refs/heads/*:refs/remotes/upstream-$pkg/*"
 }
