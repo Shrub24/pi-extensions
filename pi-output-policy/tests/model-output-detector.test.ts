@@ -10,7 +10,7 @@ const paragraph = "Let me launch it in background and check config dirs after a 
 test("stream detector input and threshold table", () => {
 	const repeated = `${"repeat ".repeat(10)}\n`.repeat(100);
 	const cases: Array<{
-		name: string; text: string; chunk?: number; reason?: string; count?: number; early?: boolean; thinking?: boolean;
+		name: string; text: string; chunk?: number; reason?: string; count?: number; early?: boolean;
 		options?: Parameters<typeof inspectModelOutputDelta>[2]; totalChars?: number;
 		state?: { lastBlock: string | undefined; consecutiveRepeats: number; repeatedChars: number };
 	}> = [
@@ -31,6 +31,8 @@ test("stream detector input and threshold table", () => {
 		{ name: "exact character cap", text: "x".repeat(900), chunk: 899, options: { ...options, maxChars: 900 }, reason: "max-chars", totalChars: 900 },
 		{ name: "character cap disabled", text: "x".repeat(100_000), options: { ...options, maxChars: 0 } },
 		{ name: "repetition disabled", text: repeated, options: { ...options, maxChars: 0, repetitionEnabled: false } },
+		// Thinking deltas are counted separately: the visible-output cap must not
+		// fire on reasoning, which legitimately streams far more text.
 		{ name: "thinking below backstop", text: "x".repeat(899), thinking: true, options: { ...options, maxChars: 900, maxThinkingChars: 900 } },
 		{ name: "thinking hits backstop not visible cap", text: "x".repeat(900), chunk: 899, thinking: true, options: { ...options, maxChars: 900, maxThinkingChars: 900 }, reason: "max-thinking-chars", totalChars: 900 },
 		{ name: "thinking backstop disabled", text: "x".repeat(100_000), thinking: true, options: { ...options, maxChars: 900, maxThinkingChars: 0 } },
@@ -40,9 +42,8 @@ test("stream detector input and threshold table", () => {
 		const state = createModelOutputGuardState();
 		let detection;
 		const chunk = row.chunk ?? row.text.length;
-		const streamDelta = { delta: "", thinking: row.thinking === true };
 		for (let offset = 0; offset < row.text.length && !detection; offset += chunk) {
-			detection = inspectModelOutputDelta(state, { ...streamDelta, delta: row.text.slice(offset, offset + chunk) }, row.options ?? options);
+			detection = inspectModelOutputDelta(state, { delta: row.text.slice(offset, offset + chunk), thinking: row.thinking === true }, row.options ?? options);
 		}
 		expect(detection?.reason, row.name).toBe(row.reason);
 		if (row.count !== undefined) expect(detection?.consecutiveRepeats).toBe(row.count);

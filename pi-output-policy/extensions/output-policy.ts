@@ -1,8 +1,10 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ToolResultEventResult } from "@earendil-works/pi-coding-agent";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { type FileHandle, mkdir, open, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { basename, join } from "node:path";
+
+import { installSettingsCacheRefresh, piUserDir, readPackageConfig, recordProjectTrust } from "./package-config.js";
 
 const INSTALL_SYMBOL = Symbol.for("kendex.pi-output-policy.installed");
 const CONFIG_ID = "@vanillagreen/pi-output-policy";
@@ -82,7 +84,7 @@ const DEFAULT_POLICY_MODE: PolicyMode = "balanced";
 type kendexConfig = Record<string, unknown>;
 type Direction = "head" | "tail";
 
-interface TruncationMeta {
+export interface TruncationMeta {
 	direction: Direction;
 	truncated: boolean;
 	reason: string;
@@ -148,23 +150,6 @@ function counters(sessionId: string): SessionCounters {
 	return entry;
 }
 
-function expandHome(input: string): string {
-	if (input === "~") return homedir();
-	if (input.startsWith("~/")) return join(homedir(), input.slice(2));
-	return input;
-}
-
-/** Root-anchored as `crates/core/src/harness/pi.rs::pi_root_is_absolute_for`
- * means it, which `isAbsolute` is not: it calls a driveless `\root` absolute
- * where the renderer does not, putting the two on different roots. Hoisted, so
- * a circular import cannot reach it inside a temporal dead zone. */
-function rootAnchored(path: string, windows: boolean): boolean { return windows ? /^(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/]+[\\/][^\\/]+)/.test(path) : path.startsWith("/"); }
-
-function piUserDir(): string {
-	const override = expandHome(process.env.PI_CODING_AGENT_DIR?.trim() || "");
-	return resolve(rootAnchored(override, process.platform === "win32") ? override : expandHome("~/.pi/agent"));
-}
-
 function safeFileName(value: string): string {
 	return value.replace(/[^\w.-]+/g, "_");
 }
@@ -183,89 +168,8 @@ function artifactDir(ctx: ExtensionContext): string {
 	return join(piUserDir(), "kendex", "sessions", safeFileName(sessionIdForContext(ctx)), SESSION_FOLDER, "artifacts");
 }
 
-function projectSettingsPath(cwd: string): string {
-	let current = resolve(cwd);
-	while (true) {
-		const candidate = join(current, ".pi", "settings.json");
-		if (existsSync(candidate)) return candidate;
-		if (existsSync(join(current, ".pi")) || existsSync(join(current, ".git")) || existsSync(join(current, ".kendex-lock.json"))) return candidate;
-		const parent = dirname(current);
-		if (parent === current) return join(resolve(cwd), ".pi", "settings.json");
-		current = parent;
-	}
-}
-
-const PROJECT_TRUST_SYMBOL = Symbol.for("kendex.pi.project-trust");
-
-interface ProjectTrustRegistry {
-	projectSettings?: Map<string, boolean>;
-}
-
-function projectTrustRegistry(): ProjectTrustRegistry {
-	const host = globalThis as unknown as Record<PropertyKey, ProjectTrustRegistry | undefined>;
-	const existing = host[PROJECT_TRUST_SYMBOL];
-	if (existing) return existing;
-	const created: ProjectTrustRegistry = {};
-	host[PROJECT_TRUST_SYMBOL] = created;
-	return created;
-}
-
-export function recordProjectTrust(ctx: { cwd?: string; isProjectTrusted?: () => boolean }): void {
-	if (!ctx.cwd) return;
-	let trusted = true;
-	try {
-		trusted = ctx.isProjectTrusted?.() === true;
-	} catch {
-		trusted = false;
-	}
-	const registry = projectTrustRegistry();
-	if (!registry.projectSettings) registry.projectSettings = new Map();
-	registry.projectSettings.set(projectSettingsPath(ctx.cwd), trusted);
-}
-
-function projectSettingsTrusted(settingsPath: string): boolean {
-	return projectTrustRegistry().projectSettings?.get(settingsPath) === true;
-}
-
-function projectSettingsTrustedForCwd(cwd = process.cwd()): boolean {
-	return projectSettingsTrusted(projectSettingsPath(cwd));
-}
-
-function piSettingsPaths(cwd = process.cwd()): string[] {
-	const user = join(piUserDir(), "settings.json");
-	const project = projectSettingsPath(cwd);
-	return projectSettingsTrustedForCwd(cwd) ? [user, project] : [user];
-}
-
 function readkendexConfig(cwd?: string): kendexConfig {
-	const merged: kendexConfig = {};
-	for (const path of piSettingsPaths(cwd)) {
-		if (!existsSync(path)) continue;
-		try {
-			const parsed = JSON.parse(readFileSync(path, "utf8"));
-			const config = parsed?.kendex?.extensionManager?.config?.[CONFIG_ID];
-			if (config && typeof config === "object" && !Array.isArray(config)) Object.assign(merged, config);
-		} catch {
-			// Ignore malformed optional manager config.
-		}
-	}
-	return merged;
-}
-
-function settingNumber(key: string, fallback: number, cwd?: string): number {
-	const value = readkendexConfig(cwd)[key];
-	const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
-	return Number.isFinite(parsed) ? parsed : fallback;
-}
-
-function settingBoolean(key: string, fallback: boolean, cwd?: string): boolean {
-	const value = readkendexConfig(cwd)[key];
-	return typeof value === "boolean" ? value : fallback;
-}
-
-function settingString(key: string, fallback: string, cwd?: string): string {
-	const value = readkendexConfig(cwd)[key];
-	return typeof value === "string" ? value : fallback;
+	return readPackageConfig(CONFIG_ID, cwd) as kendexConfig;
 }
 
 function configNumber(config: kendexConfig, key: string, fallback: number): number {
@@ -279,24 +183,34 @@ function configBoolean(config: kendexConfig, key: string, fallback: boolean): bo
 	return typeof value === "boolean" ? value : fallback;
 }
 
-export function resolvePolicyMode(cwd?: string): PolicyMode {
-	const raw = settingString("policyMode", DEFAULT_POLICY_MODE, cwd).toLowerCase().trim();
+function configString(config: kendexConfig, key: string, fallback: string): string {
+	const value = config[key];
+	return typeof value === "string" ? value : fallback;
+}
+
+function configList(config: kendexConfig, key: string): string[] {
+	return configString(config, key, "")
+		.split(",")
+		.map((part) => part.trim().toLowerCase())
+		.filter(Boolean);
+}
+
+function policyModeFrom(config: kendexConfig): PolicyMode {
+	const raw = configString(config, "policyMode", DEFAULT_POLICY_MODE).toLowerCase().trim();
 	if (raw === "compat" || raw === "balanced" || raw === "compact") return raw;
 	return DEFAULT_POLICY_MODE;
 }
 
-function modeDefault<K extends keyof ModeDefaults>(key: K, cwd?: string): ModeDefaults[K] {
-	return MODE_DEFAULTS[resolvePolicyMode(cwd)][key];
+export function resolvePolicyMode(cwd?: string): PolicyMode {
+	return policyModeFrom(readkendexConfig(cwd));
 }
 
-function sanitizeExceptTools(cwd?: string): string[] {
-	const configured = listSetting("sanitizeDetails.exceptTools", cwd);
-	return configured.length > 0 ? configured : DEFAULT_SANITIZE_EXCEPT_TOOLS;
-}
-
-export function isSanitizeExceptTool(toolName: string, cwd?: string): boolean {
+/** `config` is the settings snapshot a tool-result handler already read, so
+ * one result reads the settings files once. */
+export function isSanitizeExceptTool(toolName: string, cwd?: string, config: kendexConfig = readkendexConfig(cwd)): boolean {
 	const name = toolName.toLowerCase();
-	const allowlist = sanitizeExceptTools(cwd);
+	const configured = configList(config, "sanitizeDetails.exceptTools");
+	const allowlist = configured.length > 0 ? configured : DEFAULT_SANITIZE_EXCEPT_TOOLS;
 	return allowlist.includes(name) || allowlist.some((entry) => entry && name.endsWith(`.${entry}`));
 }
 
@@ -442,49 +356,6 @@ function formatSize(bytes: number): string {
 	return `${(bytes / (1024 * 1024)).toFixed(bytes >= 10 * 1024 * 1024 ? 0 : 1)}MB`;
 }
 
-function truncateLine(line: string, maxWidth: number): string {
-	if (line.length <= maxWidth) return line;
-	return `${line.slice(0, Math.max(0, maxWidth - 1))}…`;
-}
-
-function boundedByBytes(lines: string[], maxBytes: number, direction: Direction): string[] {
-	const out: string[] = [];
-	let bytes = 0;
-	const source = direction === "head" ? lines : [...lines].reverse();
-	for (const line of source) {
-		const lineBytes = byteLength(line) + 1;
-		if (out.length > 0 && bytes + lineBytes > maxBytes) break;
-		if (bytes + lineBytes > maxBytes && out.length === 0) {
-			out.push(line.slice(0, Math.max(1, maxBytes - 1)));
-			break;
-		}
-		out.push(line);
-		bytes += lineBytes;
-	}
-	return direction === "head" ? out : out.reverse();
-}
-
-function truncateText(text: string, direction: Direction, maxBytes: number, maxLines: number, maxLineWidth: number): { content: string; meta: Omit<TruncationMeta, "artifactPath" | "artifactError" | "reason" | "truncated"> } {
-	const rawLines = text.split(/\r?\n/);
-	const widthSafe = rawLines.map((line) => truncateLine(line, maxLineWidth));
-	const lineLimited = direction === "head" ? widthSafe.slice(0, maxLines) : widthSafe.slice(-maxLines);
-	const byteLimited = boundedByBytes(lineLimited, maxBytes, direction);
-	const shownStart = direction === "head" ? 1 : Math.max(1, rawLines.length - byteLimited.length + 1);
-	const shownEnd = direction === "head" ? byteLimited.length : rawLines.length;
-	const content = byteLimited.join("\n");
-	return {
-		content,
-		meta: {
-			direction,
-			totalBytes: byteLength(text),
-			totalLines: rawLines.length,
-			shownBytes: byteLength(content),
-			shownLines: byteLimited.length,
-			shownRange: `lines ${shownStart}-${shownEnd}`,
-		},
-	};
-}
-
 function isReadTool(toolName: string): boolean {
 	const name = toolName.toLowerCase();
 	return name === "read" || name.endsWith(".read");
@@ -495,9 +366,9 @@ function isMutationTool(toolName: string): boolean {
 	return name === "edit" || name === "write" || name.endsWith(".edit") || name.endsWith(".write");
 }
 
-function shouldBypassTool(toolName: string, cwd?: string): boolean {
-	if (isReadTool(toolName) && !settingBoolean("truncateReadOutputs", false, cwd)) return true;
-	if (isMutationTool(toolName) && !settingBoolean("truncateMutationOutputs", false, cwd)) return true;
+function shouldBypassTool(toolName: string, config: kendexConfig): boolean {
+	if (isReadTool(toolName) && !configBoolean(config, "truncateReadOutputs", false)) return true;
+	if (isMutationTool(toolName) && !configBoolean(config, "truncateMutationOutputs", false)) return true;
 	return false;
 }
 
@@ -513,69 +384,265 @@ function commandFamily(command: string): string {
 	return basename(first).toLowerCase();
 }
 
-function listSetting(key: string, cwd?: string): string[] {
-	return settingString(key, "", cwd)
-		.split(",")
-		.map((part) => part.trim().toLowerCase())
-		.filter(Boolean);
-}
-
-function shouldMinimize(command: string, cwd?: string): boolean {
-	if (!settingBoolean("shellMinimizer.enabled", DEFAULT_SHELL_MINIMIZER_ENABLED, cwd)) return false;
+function shouldMinimize(command: string, config: kendexConfig): boolean {
+	if (!configBoolean(config, "shellMinimizer.enabled", DEFAULT_SHELL_MINIMIZER_ENABLED)) return false;
 	const family = commandFamily(command);
 	const defaults = ["git", "npm", "pnpm", "yarn", "bun", "cargo", "pytest", "go", "mvn", "gradle"];
-	const only = listSetting("shellMinimizer.only", cwd);
-	const except = listSetting("shellMinimizer.except", cwd);
+	const only = configList(config, "shellMinimizer.only");
+	const except = configList(config, "shellMinimizer.except");
 	if (except.includes(family)) return false;
 	return only.length > 0 ? only.includes(family) : defaults.includes(family);
 }
 
-export function minimizeShellOutput(text: string, command: string, cwd?: string): { text: string; dropped: number } {
-	if (!shouldMinimize(command, cwd)) return { dropped: 0, text };
-	if (byteLength(text) > settingNumber("shellMinimizer.maxCaptureBytes", DEFAULT_MINIMIZER_MAX_CAPTURE_BYTES, cwd)) {
+const IMPORTANT_SHELL_LINE = /(error|failed|failure|panic|warning|warn|exception|traceback|summary|finished|test result|\bpass(ed)?\b|\bfail(ed)?\b|\bok\b|exit code|aborted|denied)/i;
+
+/** `config` is the settings snapshot a tool-result handler already read. */
+export function minimizeShellOutput(text: string, command: string, cwd?: string, config: kendexConfig = readkendexConfig(cwd)): { text: string; dropped: number } {
+	if (!shouldMinimize(command, config)) return { dropped: 0, text };
+	if (byteLength(text) > configNumber(config, "shellMinimizer.maxCaptureBytes", DEFAULT_MINIMIZER_MAX_CAPTURE_BYTES)) {
 		return { dropped: 0, text };
 	}
-	const lines = text.split(/\r?\n/);
-	const keep = new Set<number>();
-	const important = /(error|failed|failure|panic|warning|warn|exception|traceback|summary|finished|test result|\bpass(ed)?\b|\bfail(ed)?\b|\bok\b|exit code|aborted|denied)/i;
-	for (let i = 0; i < lines.length; i += 1) {
-		const line = lines[i] ?? "";
-		if (i < 20 || i >= lines.length - 80 || important.test(line)) keep.add(i);
-	}
+	const total = countLines(text);
 	const compact: string[] = [];
 	let dropped = 0;
 	let gap = 0;
-	for (let i = 0; i < lines.length; i += 1) {
-		if (keep.has(i)) {
+	let i = 0;
+	eachLine(text, (start, end) => {
+		const line = text.slice(start, end);
+		if (i < 20 || i >= total - 80 || IMPORTANT_SHELL_LINE.test(line)) {
 			if (gap > 0) compact.push(minimizedNotice(gap));
 			gap = 0;
-			compact.push(lines[i] ?? "");
+			compact.push(line);
 		} else {
 			dropped += 1;
 			gap += 1;
 		}
-	}
+		i += 1;
+	});
 	if (gap > 0) compact.push(minimizedNotice(gap));
 	return dropped > 0 ? { dropped, text: compact.join("\n") } : { dropped: 0, text };
 }
 
-function writeArtifact(ctx: ExtensionContext, toolName: string, toolCallId: string | undefined, text: string): { path?: string; error?: string } {
-	if (!settingBoolean("preserveFullOutput", true, ctx.cwd)) return {};
+// Lines are what `/\r?\n/` splits: a `\r` before a `\n` belongs to the
+// terminator, and a trailing `\r` with no `\n` after it belongs to the line.
+// `eachLine` walks those boundaries forward and the tail selection walks them
+// backward, both by newline position, so a large result is never split into a
+// whole-output array. The truncation preview slices only the lines it keeps;
+// the shell minimizer slices each line of its input, which
+// `shellMinimizer.maxCaptureBytes` bounds.
+
+function contentEnd(text: string, start: number, newline: number): number {
+	return newline > start && text.charCodeAt(newline - 1) === 13 ? newline - 1 : newline;
+}
+
+/** Visits each line's content span, first to last, and stops early when
+ * `visit` returns false. */
+function eachLine(text: string, visit: (start: number, end: number) => boolean | void): void {
+	for (let start = 0; ;) {
+		const nl = text.indexOf("\n", start);
+		if (visit(start, nl < 0 ? text.length : contentEnd(text, start, nl)) === false || nl < 0) return;
+		start = nl + 1;
+	}
+}
+
+function countLines(text: string): number {
+	let lines = 1;
+	for (let nl = text.indexOf("\n"); nl >= 0; nl = text.indexOf("\n", nl + 1)) lines += 1;
+	return lines;
+}
+
+interface TextStats {
+	bytes: number;
+	lines: number;
+	overWidth: boolean;
+}
+
+/** `widthLimit` is undefined when the text is already over a byte limit: the
+ * result is cut either way, so only its line count is still needed. */
+function textStats(text: string, bytes: number, widthLimit: number | undefined): TextStats {
+	if (widthLimit === undefined) return { bytes, lines: countLines(text), overWidth: false };
+	let lines = 0;
+	let overWidth = false;
+	eachLine(text, (start, end) => {
+		lines += 1;
+		overWidth ||= end - start > widthLimit;
+	});
+	return { bytes, lines, overWidth };
+}
+
+function widthSafeLine(text: string, start: number, end: number, maxWidth: number): string {
+	return end - start <= maxWidth ? text.slice(start, end) : `${text.slice(start, start + Math.max(0, maxWidth - 1))}…`;
+}
+
+const UTF8 = new TextEncoder();
+
+/** The longest prefix of `text` whose UTF-8 encoding fits `maxBytes`, never
+ * splitting a character. */
+function prefixWithinBytes(text: string, maxBytes: number): string {
+	return text.slice(0, UTF8.encodeInto(text, new Uint8Array(Math.max(0, maxBytes))).read);
+}
+
+/** What is left of one result's inline allowance. `started` is whether any line
+ * of the result has been kept, so only the result's first line is ever cut to
+ * fit rather than dropped. */
+interface InlineBudget {
+	bytes: number;
+	lines: number;
+	started: boolean;
+}
+
+/** Keeps `line` if the budget holds it plus its newline. The first line that
+ * does not fit ends the selection for the whole result, so what is shown stays
+ * one contiguous run of lines. */
+function takeLine(picked: string[], line: string, budget: InlineBudget): boolean {
+	const cost = byteLength(line) + 1;
+	if (cost <= budget.bytes) {
+		picked.push(line);
+		budget.bytes -= cost;
+		budget.lines -= 1;
+		budget.started = true;
+		return true;
+	}
+	if (!budget.started && budget.bytes > 1) picked.push(prefixWithinBytes(line, budget.bytes - 1));
+	budget.started = true;
+	budget.lines = 0;
+	return false;
+}
+
+/** The head or tail lines of `text` the budget holds, in text order. Only the
+ * kept lines are sliced; the rest of the text is never copied. */
+function selectLines(text: string, direction: Direction, budget: InlineBudget, maxLineWidth: number): string[] {
+	const picked: string[] = [];
+	if (direction === "head") {
+		eachLine(text, (start, end) => budget.lines > 0 && takeLine(picked, widthSafeLine(text, start, end, maxLineWidth), budget));
+		return picked;
+	}
+	// `stop` is the index of the newline that ends the current line, or the text's end.
+	let stop = text.length;
+	while (budget.lines > 0) {
+		const nl = stop === 0 ? -1 : text.lastIndexOf("\n", stop - 1);
+		const start = nl + 1;
+		const end = stop === text.length ? stop : contentEnd(text, start, stop);
+		if (!takeLine(picked, widthSafeLine(text, start, end, maxLineWidth), budget) || nl < 0) break;
+		stop = nl;
+	}
+	return picked.reverse();
+}
+
+interface TextPolicy {
+	mode: PolicyMode;
+	maxLineWidth: number;
+	maxLineCount: number;
+	spillThresholdBytes: number;
+	maxTextBytes: number;
+	inlineTailBytes: number;
+	inlineTailLines: number;
+	preserveFullOutput: boolean;
+}
+
+type NumericModeKey = Exclude<keyof ModeDefaults, "sanitizeDetails">;
+
+function textPolicy(config: kendexConfig): TextPolicy {
+	const mode = policyModeFrom(config);
+	const defaults = MODE_DEFAULTS[mode];
+	const count = (key: NumericModeKey, floor: number) => Math.max(floor, Math.floor(configNumber(config, key, defaults[key])));
+	const kilobytes = (key: NumericModeKey) => Math.max(1, Math.floor(configNumber(config, key, defaults[key]) * 1024));
+	return {
+		inlineTailBytes: kilobytes("inlineTailKb"),
+		inlineTailLines: count("inlineTailLines", MIN_LINE_LIMIT),
+		maxLineCount: count("maxLineCount", MIN_LINE_LIMIT),
+		maxLineWidth: count("maxLineWidth", 80),
+		maxTextBytes: kilobytes("maxTextBlockKb"),
+		mode,
+		preserveFullOutput: configBoolean(config, "preserveFullOutput", true),
+		spillThresholdBytes: kilobytes("spillThresholdKb"),
+	};
+}
+
+// Artifact writes run off Pi's thread. The slot count bounds how many full
+// outputs are being written at once when tool results overlap. Each write
+// encodes into one fixed buffer and writes it out before encoding more, so a
+// write holds one buffer beside the text Pi already holds, never an encoded
+// copy of the whole output.
+const ARTIFACT_WRITE_SLOTS = 2;
+const ARTIFACT_BUFFER_BYTES = 64 * 1024;
+let artifactWritesActive = 0;
+const artifactWriteQueue: Array<() => void> = [];
+
+async function acquireArtifactWriteSlot(): Promise<void> {
+	if (artifactWritesActive < ARTIFACT_WRITE_SLOTS) {
+		artifactWritesActive += 1;
+		return;
+	}
+	// A released slot passes straight to the next waiter, so the count holds.
+	await new Promise<void>((grant) => artifactWriteQueue.push(grant));
+}
+
+function releaseArtifactWriteSlot(): void {
+	const next = artifactWriteQueue.shift();
+	if (next) next();
+	else artifactWritesActive -= 1;
+}
+
+async function writeBytes(file: FileHandle, bytes: Uint8Array): Promise<void> {
+	for (let offset = 0; offset < bytes.length;) {
+		const { bytesWritten } = await file.write(bytes, offset, bytes.length - offset);
+		if (bytesWritten <= 0) throw new Error(`artifact-write=no-progress offset=${offset}`);
+		offset += bytesWritten;
+	}
+}
+
+/** Writes the texts joined by newlines, as the preview's line numbers count them. */
+async function writeTexts(path: string, texts: readonly string[]): Promise<void> {
+	const file = await open(path, "wx", 0o600);
+	const buffer = new Uint8Array(ARTIFACT_BUFFER_BYTES);
+	try {
+		for (const [index, text] of texts.entries()) {
+			if (index > 0) await writeBytes(file, UTF8.encode("\n"));
+			// encodeInto stops before a character that does not fit, so no
+			// character is ever split across two writes.
+			for (let read = 0; read < text.length;) {
+				const step = UTF8.encodeInto(read === 0 ? text : text.slice(read), buffer);
+				if (step.read <= 0) throw new Error(`artifact-encode=no-progress offset=${read}`);
+				await writeBytes(file, buffer.subarray(0, step.written));
+				read += step.read;
+			}
+		}
+	} catch (error) {
+		// A partial artifact would pass for the full output, so it goes too.
+		try {
+			await file.close();
+			await rm(path, { force: true });
+		} catch (cleanup) {
+			throw new Error(`${stringifyError(error)}; cleanup ${stringifyError(cleanup)}`);
+		}
+		throw error;
+	}
+	await file.close();
+}
+
+async function writeArtifact(ctx: ExtensionContext, toolName: string, toolCallId: string | undefined, texts: readonly string[]): Promise<{ path?: string; error?: string }> {
 	const safeTool = toolName.replaceAll(/[^a-z0-9_.-]+/gi, "-").slice(0, 40) || "tool";
 	const safeId = (toolCallId ?? Date.now().toString(36)).replaceAll(/[^a-z0-9_.-]+/gi, "-").slice(0, 80);
 	const candidates = [artifactDir(ctx), join(tmpdir(), "pi-output-policy", safeFileName(sessionIdForContext(ctx)))];
-	for (const dir of candidates) {
-		try {
-			mkdirSync(dir, { recursive: true, mode: 0o700 });
+	const errors: string[] = [];
+	await acquireArtifactWriteSlot();
+	try {
+		for (const dir of candidates) {
 			const unique = randomUUID().replaceAll("-", "").slice(0, 12);
 			const artifactPath = join(dir, `${Date.now()}-${unique}-${safeTool}-${safeId}.txt`);
-			writeFileSync(artifactPath, text, { encoding: "utf8", mode: 0o600 });
-			return { path: artifactPath };
-		} catch (error) {
-			if (dir === candidates[candidates.length - 1]) return { error: stringifyError(error) };
+			try {
+				await mkdir(dir, { recursive: true, mode: 0o700 });
+				await writeTexts(artifactPath, texts);
+				return { path: artifactPath };
+			} catch (error) {
+				errors.push(stringifyError(error));
+			}
 		}
+	} finally {
+		releaseArtifactWriteSlot();
 	}
-	return { error: "artifact persistence unavailable" };
+	return { error: errors.join("; ") };
 }
 
 function minimizedNotice(lines: number): string {
@@ -586,126 +653,304 @@ function policyNotice(key: string, value: string | number, explanation: string):
 	return `[output-policy:${key}=${JSON.stringify(value)}]\n${explanation}`;
 }
 
+// A notice appended to text follows a blank line. `appendNotice` is the one
+// place that joins them and `noticeLines` the one place that counts what the
+// join adds: the notice's own lines plus the blank line.
+const NOTICE_SEPARATOR = "\n\n";
+
+function appendNotice(text: string, noticeText: string): string {
+	return `${text}${NOTICE_SEPARATOR}${noticeText}`;
+}
+
+function noticeLines(noticeText: string): number {
+	return countLines(noticeText) + 1;
+}
+
+/** The truncation notice, followed by the write-error notice when the full
+ * output could not be saved. */
 function notice(meta: TruncationMeta): string {
 	const target = meta.direction === "tail" ? `Showing last ${meta.shownLines} lines / ${formatSize(meta.shownBytes)}` : `Showing ${meta.shownRange} of ${meta.totalLines} / ${formatSize(meta.shownBytes)}`;
-	const artifact = meta.artifactPath ? ` Full output: ${meta.artifactPath}` : meta.artifactError ? ` Full output preservation unavailable: ${meta.artifactError}` : "";
+	const artifact = meta.artifactPath ? ` Full output: ${meta.artifactPath}` : "";
 	const minimized = meta.minimized ? ` Minimized ${meta.minimizedDroppedLines} noisy line(s) before truncation.` : "";
 	const saved = typeof meta.savedBytes === "number" && meta.savedBytes > 0 ? ` Saved ${formatSize(meta.savedBytes)} from transcript (turn total: ${formatSize(meta.turnSavedBytes ?? 0)}, session: ${formatSize(meta.sessionSavedBytes ?? 0)}).` : "";
 	const continuation = meta.direction === "head" && meta.totalLines > meta.shownLines ? ` Continue with the same tool using an offset past line ${meta.shownLines} to read more.` : "";
-	return policyNotice("truncated-bytes", meta.totalBytes, `Output truncated (${meta.direction}). ${target}. Total: ${meta.totalLines} lines / ${formatSize(meta.totalBytes)}.${minimized}${saved}${artifact}${continuation}`);
+	const truncation = policyNotice("truncated-bytes", meta.totalBytes, `Output truncated (${meta.direction}). ${target}. Total: ${meta.totalLines} lines / ${formatSize(meta.totalBytes)}.${minimized}${saved}${artifact}${continuation}`);
+	return meta.artifactError === undefined ? truncation : appendNotice(truncation, policyNotice("artifact-error", meta.artifactError, "Full output was not saved. Only the preview above remains."));
 }
 
-export function processText(event: any, ctx: ExtensionContext, text: string): { text: string; meta?: TruncationMeta } {
-	const cwd = ctx.cwd;
+// The floor of both line caps: the tallest notice, the truncation notice with
+// the write-error notice after it, plus one preview line. Every notice value
+// is JSON-escaped, so the notice's line count does not vary with its figures.
+const MIN_LINE_LIMIT = noticeLines(notice({ artifactError: "", direction: "head", reason: "", shownBytes: 0, shownLines: 0, shownRange: "", totalBytes: 0, totalLines: 0, truncated: true })) + 1;
+
+// The notice is sized before the preview is cut from worst-case figures; this
+// covers the few characters by which the final figures can print wider.
+const NOTICE_SLACK_BYTES = 64;
+
+type ContentPart = NonNullable<ToolResultEventResult["content"]>[number];
+
+function isTextPart(part: ContentPart): part is Extract<ContentPart, { type: "text" }> {
+	return part?.type === "text" && typeof part.text === "string";
+}
+
+interface PolicedText {
+	index: number;
+	original: string;
+	working: string;
+	stats: TextStats;
+}
+
+export interface ProcessedContent {
+	changed: boolean;
+	content: ContentPart[];
+	meta?: TruncationMeta;
+}
+
+/**
+ * Applies the policy to one tool result's content. The text parts share one
+ * inline budget, notices included: read as one text joined by newlines, the
+ * result keeps its head or tail lines, a part left with no line is dropped, and
+ * the whole original text goes to one artifact. Non-text parts pass through.
+ * `config` is the settings snapshot a tool-result handler already read.
+ */
+export async function processContent(event: any, ctx: ExtensionContext, content: ContentPart[], config: kendexConfig = readkendexConfig(ctx.cwd)): Promise<ProcessedContent> {
+	const unchanged: ProcessedContent = { changed: false, content };
 	const toolName = String(event.toolName ?? "tool");
-	if (shouldBypassTool(toolName, cwd)) return { text };
-	const mode = resolvePolicyMode(cwd);
+	const policy = textPolicy(config);
 	const direction = directionForTool(toolName);
-	const maxLineWidth = Math.max(80, Math.floor(settingNumber("maxLineWidth", modeDefault("maxLineWidth", cwd), cwd)));
-	const maxLineCount = Math.max(1, Math.floor(settingNumber("maxLineCount", modeDefault("maxLineCount", cwd), cwd)));
-	const spillThresholdBytes = Math.max(1, Math.floor(settingNumber("spillThresholdKb", modeDefault("spillThresholdKb", cwd), cwd) * 1024));
-	const maxTextBytes = Math.max(1, Math.floor(settingNumber("maxTextBlockKb", modeDefault("maxTextBlockKb", cwd), cwd) * 1024));
-	const inlineTailBytes = Math.max(1, Math.floor(settingNumber("inlineTailKb", modeDefault("inlineTailKb", cwd), cwd) * 1024));
-	const inlineTailLines = Math.max(1, Math.floor(settingNumber("inlineTailLines", modeDefault("inlineTailLines", cwd), cwd)));
-
-	const original = text;
-	let working = text;
-	let minimized = false;
+	const command = toolName.toLowerCase() === "bash" && typeof event.input?.command === "string" ? event.input.command as string : undefined;
+	const texts: PolicedText[] = [];
 	let minimizedDroppedLines = 0;
-	if ((event.toolName ?? "").toLowerCase() === "bash" && typeof event.input?.command === "string") {
-		const result = minimizeShellOutput(working, event.input.command, cwd);
-		working = result.text;
-		minimized = result.dropped > 0;
-		minimizedDroppedLines = result.dropped;
+	for (const [index, part] of content.entries()) {
+		if (!isTextPart(part)) continue;
+		let working = part.text;
+		if (command !== undefined) {
+			const result = minimizeShellOutput(working, command, ctx.cwd, config);
+			working = result.text;
+			minimizedDroppedLines += result.dropped;
+		}
+		const bytes = byteLength(working);
+		const overBytes = bytes > Math.min(policy.maxTextBytes, policy.spillThresholdBytes);
+		texts.push({ index, original: part.text, stats: textStats(working, bytes, overBytes ? undefined : policy.maxLineWidth), working });
 	}
-
-	const lines = working.split(/\r?\n/);
-	const workingBytes = byteLength(working);
-	const overSpill = workingBytes > spillThresholdBytes;
-	const overTextBlock = workingBytes > maxTextBytes;
-	const overLineCount = lines.length > maxLineCount;
-	const overLineWidth = lines.some((line) => line.length > maxLineWidth);
-	const tooLarge = overSpill || overTextBlock || overLineCount || overLineWidth;
+	if (texts.length === 0) return unchanged;
+	const minimized = minimizedDroppedLines > 0;
+	const minimizedText = minimized ? minimizedNotice(minimizedDroppedLines) : undefined;
+	const joinedBytes = (sizes: number[]) => sizes.reduce((sum, size) => sum + size, sizes.length - 1);
+	const totalBytes = joinedBytes(texts.map((text) => text.stats.bytes));
+	const totalLines = texts.reduce((sum, text) => sum + text.stats.lines, 0);
+	const inlineBytes = totalBytes + (minimizedText === undefined ? 0 : byteLength(appendNotice("", minimizedText)));
+	const inlineLines = totalLines + (minimizedText === undefined ? 0 : noticeLines(minimizedText));
+	const overSpill = inlineBytes > policy.spillThresholdBytes;
+	const overTextBlock = inlineBytes > policy.maxTextBytes;
+	const tooLarge = overSpill || overTextBlock || inlineLines > policy.maxLineCount || texts.some((text) => text.stats.overWidth);
 	if (!tooLarge) {
-		const widthSafe = lines.map((line) => truncateLine(line, maxLineWidth)).join("\n");
-		return minimized ? { text: `${widthSafe}\n\n${minimizedNotice(minimizedDroppedLines)}` } : { text: widthSafe };
+		if (minimizedText === undefined) return unchanged;
+		const last = texts[texts.length - 1];
+		const next = [...content];
+		for (const text of texts) next[text.index] = { ...(content[text.index] as Extract<ContentPart, { type: "text" }>), text: text === last ? appendNotice(text.working, minimizedText) : text.working };
+		return { changed: true, content: next };
 	}
 
-	const artifact = writeArtifact(ctx, event.toolName ?? "tool", event.toolCallId, original);
-	const bytes = direction === "tail" ? inlineTailBytes : maxTextBytes;
-	const lineLimit = direction === "tail" ? inlineTailLines : maxLineCount;
-	const truncated = truncateText(working, direction, bytes, lineLimit, maxLineWidth);
-	const originalBytes = byteLength(original);
-	const savedBytes = Math.max(0, originalBytes - truncated.meta.shownBytes);
+	const artifact = policy.preserveFullOutput ? await writeArtifact(ctx, toolName, event.toolCallId, texts.map((text) => text.original)) : {};
+	const tail = direction === "tail";
+	const byteLimit = Math.min(policy.maxTextBytes, tail ? policy.inlineTailBytes : policy.maxTextBytes);
+	const lineLimit = Math.min(policy.maxLineCount, tail ? policy.inlineTailLines : policy.maxLineCount);
+	const originalBytes = joinedBytes(texts.map((text) => text.original === text.working ? text.stats.bytes : byteLength(text.original)));
 	const session = counters(sessionIdForContext(ctx));
-	session.turnSavedBytes += savedBytes;
-	session.sessionSavedBytes += savedBytes;
-	const reason = overSpill ? "spill-threshold" : overTextBlock ? "max-text-block" : "ui-safety";
-	const meta: TruncationMeta = {
-		...truncated.meta,
+	const base = {
 		artifactError: artifact.error,
 		artifactPath: artifact.path,
 		direction,
 		minimized,
 		minimizedDroppedLines,
-		policyMode: mode,
-		reason,
+		policyMode: policy.mode,
+		reason: overSpill ? "spill-threshold" : overTextBlock ? "max-text-block" : "ui-safety",
+		totalBytes,
+		totalLines,
+		truncated: true,
+	};
+	// Every figure at its widest, and one line short of the total so the
+	// head notice's continuation clause is counted.
+	const worstNotice = notice({
+		...base,
+		savedBytes: originalBytes,
+		sessionSavedBytes: session.sessionSavedBytes + originalBytes,
+		shownBytes: totalBytes,
+		shownLines: totalLines - 1,
+		shownRange: `lines ${totalLines}-${totalLines}`,
+		turnSavedBytes: session.turnSavedBytes + originalBytes,
+	});
+	const budget: InlineBudget = {
+		bytes: Math.max(0, byteLimit - byteLength(appendNotice("", worstNotice)) - NOTICE_SLACK_BYTES),
+		lines: Math.max(0, lineLimit - noticeLines(worstNotice)),
+		started: false,
+	};
+	const shown = new Map<number, { lines: number; text: string }>();
+	for (const text of tail ? [...texts].reverse() : texts) {
+		if (budget.lines <= 0) break;
+		const lines = selectLines(text.working, direction, budget, policy.maxLineWidth);
+		if (lines.length > 0) shown.set(text.index, { lines: lines.length, text: lines.join("\n") });
+	}
+	let shownBytes = 0;
+	let shownLines = 0;
+	for (const part of shown.values()) {
+		shownBytes += byteLength(part.text);
+		shownLines += part.lines;
+	}
+	const savedBytes = Math.max(0, originalBytes - shownBytes);
+	session.turnSavedBytes += savedBytes;
+	session.sessionSavedBytes += savedBytes;
+	const meta: TruncationMeta = {
+		...base,
 		savedBytes,
 		sessionSavedBytes: session.sessionSavedBytes,
-		truncated: true,
+		shownBytes,
+		shownLines,
+		shownRange: shownLines === 0 ? "none" : tail ? `lines ${totalLines - shownLines + 1}-${totalLines}` : `lines 1-${shownLines}`,
 		turnSavedBytes: session.turnSavedBytes,
 	};
-	return { meta, text: `${truncated.content}\n\n${notice(meta)}` };
+	const next: ContentPart[] = [];
+	let lastText = -1;
+	for (const [index, part] of content.entries()) {
+		if (!isTextPart(part)) {
+			next.push(part);
+			continue;
+		}
+		const kept = shown.get(index);
+		if (!kept) continue;
+		lastText = next.length;
+		next.push({ ...part, text: kept.text });
+	}
+	const policyText = notice(meta);
+	if (lastText < 0) next.push({ text: policyText, type: "text" });
+	else {
+		const part = next[lastText] as Extract<ContentPart, { type: "text" }>;
+		next[lastText] = { ...part, text: appendNotice(part.text, policyText) };
+	}
+	return { changed: true, content: next, meta };
 }
 
 const SANITIZE_ARRAY_CAP = 50;
 const SANITIZE_OBJECT_CAP = 80;
+const SANITIZE_MAX_DEPTH = 4;
+const SANITIZE_STRING_CHARS = 8 * 1024;
+// One traversal shares these across the whole details tree: every visited
+// value spends a node, every kept string its UTF-8 bytes.
+const SANITIZE_NODE_BUDGET = 2_000;
+const SANITIZE_BYTE_BUDGET = 64 * 1024;
 
-export function sanitizeDetails(value: unknown, depth = 0): { value: unknown; changed: boolean } {
-	if (depth > 4) return { changed: true, value: policyNotice("detail-depth", depth, "Maximum detail depth reached.") };
-	if (value == null || typeof value === "number" || typeof value === "boolean") return { changed: false, value };
-	if (typeof value === "string") {
-		const max = 8 * 1024;
-		return value.length > max ? { changed: true, value: `${value.slice(0, max)}…\n${policyNotice("detail-chars", value.length, "Detail string truncated.")}` } : { changed: false, value };
+interface DetailBudget {
+	bytes: number;
+	nodes: number;
+}
+
+/** Caps a details tree. A branch the caps leave alone is returned by
+ * reference, so an in-budget tree is traversed but never copied. */
+export function sanitizeDetails(value: unknown): { value: unknown; changed: boolean } {
+	const sanitized = sanitizeNode(value, 0, { bytes: SANITIZE_BYTE_BUDGET, nodes: SANITIZE_NODE_BUDGET });
+	return { changed: !Object.is(sanitized, value), value: sanitized };
+}
+
+function byteBudgetNotice(): string {
+	return policyNotice("detail-byte-budget", SANITIZE_BYTE_BUDGET, "Detail byte budget reached.");
+}
+
+function budgetNotice(budget: DetailBudget): string | undefined {
+	if (budget.nodes <= 0) return policyNotice("detail-node-budget", SANITIZE_NODE_BUDGET, "Detail traversal budget reached.");
+	if (budget.bytes <= 0) return byteBudgetNotice();
+	return undefined;
+}
+
+function sanitizeNode(value: unknown, depth: number, budget: DetailBudget): unknown {
+	budget.nodes -= 1;
+	if (depth > SANITIZE_MAX_DEPTH) return policyNotice("detail-depth", depth, "Maximum detail depth reached.");
+	if (value == null || typeof value === "number" || typeof value === "boolean") return value;
+	if (typeof value === "string") return sanitizeString(value, budget);
+	if (Array.isArray(value)) return sanitizeArray(value, depth, budget);
+	if (typeof value === "object") return sanitizeObject(value as Record<string, unknown>, depth, budget);
+	return String(value);
+}
+
+/** A string over the character cap ends with a `detail-chars` notice. One the
+ * byte budget cuts ends with the `detail-byte-budget` notice and spends the
+ * rest of the budget, since a multi-byte cut can leave a few bytes no whole
+ * character fits. */
+function sanitizeString(value: string, budget: DetailBudget): string {
+	const overChars = value.length > SANITIZE_STRING_CHARS;
+	const head = overChars ? value.slice(0, SANITIZE_STRING_CHARS) : value;
+	const bytes = byteLength(head);
+	if (bytes <= budget.bytes) {
+		budget.bytes -= bytes;
+		return overChars ? `${head}…\n${policyNotice("detail-chars", value.length, "Detail string truncated.")}` : value;
 	}
-	if (Array.isArray(value)) {
-		const overflow = value.length > SANITIZE_ARRAY_CAP;
-		const limit = overflow ? SANITIZE_ARRAY_CAP - 1 : value.length;
-		const sanitized: unknown[] = [];
-		let changed = overflow;
-		for (let i = 0; i < limit; i += 1) {
-			const nested = sanitizeDetails(value[i], depth + 1);
-			changed ||= nested.changed;
-			sanitized.push(nested.value);
+	const kept = prefixWithinBytes(head, budget.bytes);
+	budget.bytes = 0;
+	return `${kept}…\n${byteBudgetNotice()}`;
+}
+
+function sanitizeArray(value: unknown[], depth: number, budget: DetailBudget): unknown[] {
+	const overflow = value.length > SANITIZE_ARRAY_CAP;
+	const limit = overflow ? SANITIZE_ARRAY_CAP - 1 : value.length;
+	let out: unknown[] | undefined;
+	for (let i = 0; i < limit; i += 1) {
+		const stop = budgetNotice(budget);
+		if (stop !== undefined) {
+			out ??= value.slice(0, i);
+			out.push(stop);
+			return out;
 		}
-		if (overflow) {
-			sanitized.push(policyNotice("detail-array-dropped", value.length - limit, "Detail array truncated."));
+		const item = sanitizeNode(value[i], depth + 1, budget);
+		if (out) out.push(item);
+		else if (!Object.is(item, value[i])) {
+			out = value.slice(0, i);
+			out.push(item);
 		}
-		return { changed, value: sanitized };
 	}
-	if (typeof value === "object") {
-		// Iterate own keys with an early break instead of materializing the full
-		// Object.entries(...) array, so a wide untrusted `details` object cannot
-		// exhaust memory or CPU before the cap engages.
-		let changed = false;
-		const out: Record<string, unknown> = {};
-		const source = value as Record<string, unknown>;
-		let kept = 0;
-		for (const key in source) {
-			if (!Object.hasOwn(source, key)) continue;
-			if (kept >= SANITIZE_OBJECT_CAP) {
-				out["[output-policy:truncated]"] = policyNotice("detail-object-cap", SANITIZE_OBJECT_CAP, "Detail object truncated.");
-				changed = true;
-				break;
-			}
-			const sanitized = sanitizeDetails(source[key], depth + 1);
-			changed ||= sanitized.changed;
-			out[key] = sanitized.value;
-			kept += 1;
-		}
-		return { changed, value: out };
+	if (!overflow) return out ?? value;
+	out ??= value.slice(0, limit);
+	out.push(policyNotice("detail-array-dropped", value.length - limit, "Detail array truncated."));
+	return out;
+}
+
+/** The first `count` own keys of `source`, values by reference. */
+function copyOwnKeys(source: Record<string, unknown>, count: number): Record<string, unknown> {
+	const out: Record<string, unknown> = {};
+	let copied = 0;
+	for (const key in source) {
+		if (copied >= count) break;
+		if (!Object.hasOwn(source, key)) continue;
+		out[key] = source[key];
+		copied += 1;
 	}
-	return { changed: true, value: String(value) };
+	return out;
+}
+
+function sanitizeObject(source: Record<string, unknown>, depth: number, budget: DetailBudget): Record<string, unknown> {
+	// Iterate own keys with an early break instead of materializing the full
+	// Object.entries(...) array, so a wide untrusted `details` object cannot
+	// exhaust memory or CPU before the cap engages.
+	let out: Record<string, unknown> | undefined;
+	let kept = 0;
+	for (const key in source) {
+		if (!Object.hasOwn(source, key)) continue;
+		const stop = kept >= SANITIZE_OBJECT_CAP
+			? policyNotice("detail-object-cap", SANITIZE_OBJECT_CAP, "Detail object truncated.")
+			: budgetNotice(budget);
+		if (stop !== undefined) {
+			out ??= copyOwnKeys(source, kept);
+			out["[output-policy:truncated]"] = stop;
+			break;
+		}
+		const item = sanitizeNode(source[key], depth + 1, budget);
+		if (out) out[key] = item;
+		else if (!Object.is(item, source[key])) {
+			out = copyOwnKeys(source, kept);
+			out[key] = item;
+		}
+		kept += 1;
+	}
+	return out ?? source;
 }
 
 function stringifyError(error: unknown): string {
@@ -734,6 +979,7 @@ export default function outputPolicy(pi: ExtensionAPI): void {
 		return modelOutputConfig;
 	};
 
+	installSettingsCacheRefresh(pi);
 	pi.on("session_start", async (_event, ctx: ExtensionContext) => {
 		resetModelOutputState();
 		recordProjectTrust(ctx);
@@ -783,35 +1029,28 @@ export default function outputPolicy(pi: ExtensionAPI): void {
 
 	pi.on("tool_result", async (event: any, ctx: ExtensionContext) => {
 		recordProjectTrust(ctx);
-		if (!settingBoolean("enabled", true, ctx.cwd)) return undefined;
+		const config = readkendexConfig(ctx.cwd);
+		if (!configBoolean(config, "enabled", true)) return undefined;
 		const toolName = String(event.toolName ?? "tool");
-		if (shouldBypassTool(toolName, ctx.cwd)) return undefined;
-		let changed = false;
-		const metas: TruncationMeta[] = [];
-		const content = (event.content ?? []).map((part: any) => {
-			if (!part || part.type !== "text" || typeof part.text !== "string") return part;
-			const processed = processText(event, ctx, part.text);
-			if (processed.text !== part.text) changed = true;
-			if (processed.meta) metas.push(processed.meta);
-			return { ...part, text: processed.text };
-		});
-		const sanitizeOn = settingBoolean("sanitizeDetails", modeDefault("sanitizeDetails", ctx.cwd), ctx.cwd);
-		const exemptByTool = isSanitizeExceptTool(toolName, ctx.cwd);
-		const sanitizedDetails = sanitizeOn && !exemptByTool ? sanitizeDetails(event.details) : { changed: false, value: event.details };
+		if (shouldBypassTool(toolName, config)) return undefined;
+		const processed = await processContent(event, ctx, event.content ?? [], config);
+		const mode = policyModeFrom(config);
+		const sanitizeOn = configBoolean(config, "sanitizeDetails", MODE_DEFAULTS[mode].sanitizeDetails);
+		const sanitizedDetails = sanitizeOn && !isSanitizeExceptTool(toolName, ctx.cwd, config) ? sanitizeDetails(event.details) : { changed: false, value: event.details };
+		if (!processed.changed && !sanitizedDetails.changed) return undefined;
 		let details = sanitizedDetails.value;
-		if (metas.length > 0 || sanitizedDetails.changed) {
+		if (processed.meta || sanitizedDetails.changed) {
 			details = details && typeof details === "object" && !Array.isArray(details) ? { ...(details as Record<string, unknown>) } : {};
-			changed = true;
 		}
-		if (metas.length > 0) {
-			(details as Record<string, unknown>).kendexOutputPolicy = metas;
+		if (processed.meta) {
+			(details as Record<string, unknown>).kendexOutputPolicy = [processed.meta];
 		}
 		if (sanitizedDetails.changed) {
 			(details as Record<string, unknown>).kendexOutputPolicySanitized = {
-				policyMode: resolvePolicyMode(ctx.cwd),
+				policyMode: mode,
 				reason: "details payload exceeded inline budget; capped per policyMode (set policyMode=compat or sanitizeDetails=false to disable)",
 			};
 		}
-		return changed ? { content, details } : undefined;
+		return { content: processed.content, details };
 	});
 }

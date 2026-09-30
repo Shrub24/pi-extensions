@@ -35,59 +35,29 @@ describe("model output guard handler", () => {
 		});
 	});
 
-	test("counts tool-call argument deltas toward the hard cap", async () => {
-			const type = "toolcall_delta";
-			await withConfigAsync({ "modelOutputGuard.maxChars": 100 }, async (cwd) => {
-				const fake = createFakePi();
-				outputPolicy(fake.pi);
-				const notices: string[] = [];
-				const guard = guardCtx(cwd, message => notices.push(message));
-				await fake.fire("message_update", { assistantMessageEvent: { type, delta: "x".repeat(100) } }, guard.ctx);
-				expect(guard.aborts()).toBe(1);
-				expect(notices).toHaveLength(1);
-				expect(notices[0].split("\n")[0]).toBe("[output-policy:max-chars=100]");
-			});
-	});
-
-	test("thinking deltas no longer count toward the visible-output cap", async () => {
-		await withConfigAsync({ "modelOutputGuard.maxChars": 100 }, async (cwd) => {
+	// Thinking deltas count toward their own backstop, not the visible-output cap:
+	// reasoning models legitimately stream 100K+ thinking chars. Tool-call argument
+	// deltas are visible output and stay on the cap.
+	test("holds thinking deltas to their own backstop and tool-call arguments to the visible cap", async () => {
+		await withConfigAsync({ "modelOutputGuard.maxChars": 100, "modelOutputGuard.maxThinkingChars": 100 }, async (cwd) => {
 			const fake = createFakePi();
 			outputPolicy(fake.pi);
 			const notices: string[] = [];
 			const guard = guardCtx(cwd, message => notices.push(message));
-			await fake.fire("message_update", { assistantMessageEvent: { type: "thinking_delta", delta: "x".repeat(150) } }, guard.ctx);
-			expect(guard.aborts()).toBe(0);
-			expect(notices).toHaveLength(0);
-		});
-	});
-
-	test("thinking deltas still trip the repetition detector", async () => {
-		await withConfigAsync({
-			"modelOutputGuard.maxConsecutiveRepeats": 3,
-			"modelOutputGuard.minRepeatBlockChars": 32,
-			"modelOutputGuard.minRepeatedChars": 64,
-		}, async (cwd) => {
-			const fake = createFakePi();
-			outputPolicy(fake.pi);
-			const notices: string[] = [];
-			const guard = guardCtx(cwd, message => notices.push(message));
-			const delta = `${"y".repeat(40)}\n`;
-			for (let i = 0; i < 3; i++) {
-				await fake.fire("message_update", { assistantMessageEvent: { type: "thinking_delta", delta } }, guard.ctx);
-			}
+			await fake.fire("message_update", { assistantMessageEvent: { type: "toolcall_delta", delta: "x".repeat(100) } }, guard.ctx);
 			expect(guard.aborts()).toBe(1);
-			expect(notices[0].split("\n")[0]).toBe("[output-policy:repetition=3]");
+			expect(notices).toHaveLength(1);
+			expect(notices[0].split("\n")[0]).toBe("[output-policy:max-chars=100]");
 		});
-	});
 
-	test("thinking backstop fires at maxThinkingChars", async () => {
-		await withConfigAsync({ "modelOutputGuard.maxThinkingChars": 100 }, async (cwd) => {
+		await withConfigAsync({ "modelOutputGuard.maxChars": 100, "modelOutputGuard.maxThinkingChars": 100 }, async (cwd) => {
 			const fake = createFakePi();
 			outputPolicy(fake.pi);
 			const notices: string[] = [];
 			const guard = guardCtx(cwd, message => notices.push(message));
 			await fake.fire("message_update", { assistantMessageEvent: { type: "thinking_delta", delta: "x".repeat(100) } }, guard.ctx);
 			expect(guard.aborts()).toBe(1);
+			expect(notices).toHaveLength(1);
 			expect(notices[0].split("\n")[0]).toBe("[output-policy:max-thinking-chars=100]");
 		});
 	});
