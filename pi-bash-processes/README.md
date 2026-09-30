@@ -35,6 +35,13 @@ Every model-facing Bash command starts under the task manager. If it finishes wi
 
 Every background task has a soft timeout (10 minutes by default; per-spawn `softTimeoutMs`, 0 disables). When it expires the process is **not** stopped: the agent receives exactly one progress wake with elapsed time, the current output tail, and the log path, and must choose — continue (optionally extend with `bg_task action: "extend" id:... softTimeoutMs:...`, which starts a fresh window from now), inspect the log, or stop the task. The reminder is one-shot and survives restarts; a restored live task re-arms it, a fired one stays fired. The hard `timeoutSeconds` is only a backstop that should rarely fire (default disabled); when both are set, the soft wake also names the remaining hard time so the decision happens long before any kill. Extending never changes the hard timeout.
 
+## Memory and disk use
+
+- A finished task's output is read from its log file; the process handle and the in-memory output are released once the task has exited and its last log write has finished. A task whose last log write failed or stalled keeps its in-memory output instead.
+- At most 50 finished tasks are kept; past that, the oldest finished task is removed with its log. `clear` also deletes the logs of the tasks it removes. A forked session removes the tasks it copied from the original session but keeps their logs, which the original session still reads.
+- Logs live in one directory per session in the `lanes/` folder of the task directory (`taskDir`, default the system temporary directory's `kendex-pi-bg`). A session's directory is deleted once its working directory is gone (a merged worktree), and any log older than 5 days is deleted. Pi applies both rules when a session starts, to `lanes/` only, and only to directories the package made there.
+- A log written before 2.1.0 stays directly in the task directory. The prune, `clear` and the 50-task bound do not delete it; a task restored with such a log is removed from the list without its log.
+
 ## Settings
 
 The settings editor writes project values to `.pi/settings.json`. The default user file is `~/.pi/agent/settings.json`. `PI_CODING_AGENT_DIR` changes the user directory. Package values are stored under `kendex.extensionManager.config["@vanillagreen/pi-background-tasks"]`.

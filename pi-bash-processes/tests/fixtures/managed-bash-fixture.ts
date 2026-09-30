@@ -147,6 +147,10 @@ try {
 		if (native.spawns.length !== 1) throw new Error(`managed_bash_fixture.respawned=${native.spawns.length}`);
 		if (runningState?.status !== "running") throw new Error(`managed_bash_fixture.status=${String(runningState?.status)}`);
 		child.emit("close", 0);
+		// The exit wake waits for the task's log to hold its output, so let the
+		// captured writes settle before the next turn boundary is dispatched.
+		const { taskLogs } = await import("../../extensions/log-writer.js");
+		await taskLogs.drain();
 		await Promise.resolve();
 	} else {
 		if (native.signals.length !== 0) throw new Error("managed_bash_fixture.early_kill");

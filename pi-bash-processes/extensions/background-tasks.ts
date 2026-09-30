@@ -14,8 +14,10 @@ import {
 	type Theme,
 } from "@earendil-works/pi-coding-agent";
 import { spawn } from "node:child_process";
-import { appendFileSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, rmSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { Type } from "typebox";
+import { openLaneDir, pruneLanes } from "../scripts/lane-retention.js";
 
 import { shouldAdoptActiveContext } from "./active-context.js";
 import {
@@ -24,6 +26,7 @@ import {
 	forcedBackgroundDecision,
 } from "./auto-background.js";
 import { publishBackgroundTaskActivity, publishBackgroundTaskStarted } from "./activity.js";
+import { createCoalescedCall } from "./coalesce.js";
 import {
 	BG_COMMAND,
 	BG_INSTALL_SYMBOL,
@@ -37,6 +40,7 @@ import {
 	DEFAULT_FOREGROUND_YIELD_MS,
 	DEFAULT_LOG_TAIL_MAX_CHARS,
 	DEFAULT_OUTPUT_ALERT_MAX_CHARS,
+	DEFAULT_OUTPUT_BUFFER_MAX_CHARS,
 	DEFAULT_OUTPUT_SETTLE_MS,
 	DEFAULT_OUTPUT_WAKE_BUDGET_MAX_BYTES,
 	DEFAULT_OUTPUT_WAKE_BUDGET_MAX_WAKES,
@@ -46,6 +50,7 @@ import {
 	DEFAULT_WIDGET_TOGGLE_SHORTCUT,
 	MANAGED_BASH_PARTIAL_UPDATE_MS,
 	MANAGED_BASH_SYMBOL,
+	MAX_FINISHED_TASKS,
 	WIDGET_COMPACT_TASKS,
 } from "./constants.js";
 
@@ -75,10 +80,11 @@ import {
 } from "./render.js";
 import { logBackgroundDiagnostic } from "./diagnostics.js";
 import { registerAll } from "./registrations.js";
-import { finalizeTaskLifecycle, replayMissedExitsLifecycle, type LifecycleHooks } from "./lifecycle.js";
+import { closeTaskLifecycle, replayMissedExitsLifecycle, sendExitWakeLifecycle, type LifecycleHooks } from "./lifecycle.js";
+import { taskLogs } from "./log-writer.js";
 import { buildManagedBashEnv, createForegroundWaiter, formatManagedBashCompletionText, formatManagedBashRunningText, normalizeManagedBashTimeoutSeconds, settleForegroundWaiter } from "./managed-bash.js";
-import { matchSleepIntercept } from "./sleep-intercept.js";
 import { emulateTruncation, stripTerminalTruncation } from "./pipe-strip.js";
+import { matchSleepIntercept } from "./sleep-intercept.js";
 import type * as ManagedBashPresentation from "@vanillagreen/pi-tool-renderer/managed-bash";
 import { getIntent, intentModeFor, intentParameters, intentPrepare, intentSuffix, stripIntent, withIntentParameter } from "@vanillagreen/pi-tool-renderer/intent";
 let managedBashPresentation: typeof ManagedBashPresentation | undefined;
@@ -93,8 +99,10 @@ async function loadManagedBashPresentation(): Promise<void> {
 void loadManagedBashPresentation();
 import { createOrphanWatcher, type OrphanWatcher } from "./orphan-watcher.js";
 import { applyCustomEntryWithBarrier, createPersistence, sessionIdForContext, sidecarStatePath } from "./persistence.js";
+import { mapWithConcurrency, PROBE_CONCURRENCY } from "./probes.js";
 import { defaultSystemdUnitActive, planResourceControlledSpawn, stopResourceControlledTask } from "./resource-control.js";
-import { consumeLogPath, logFilePath, recordProjectTrust, settingBoolean, settingEnum, settingNumber, settingString, taskEnv } from "./settings.js";
+import { installSettingsCacheRefresh, recordProjectTrust } from "./package-config.js";
+import { consumeLogPath, logFilePath, settingBoolean, settingEnum, settingNumber, settingString, taskEnv, taskLaneDir, taskLanesRoot } from "./settings.js";
 import { drainConsumedLogPaths } from "./read-shim.js";
 import { clampTaskWaitSeconds, createTaskWaitWaiter, DEFAULT_TASK_WAIT_SECONDS, formatTaskWaitRunningText, MAX_TASK_WAIT_SECONDS, settleTaskWaitWaiter, TASK_WAIT_PENDING_POLL_MS } from "./task-wait.js";
 import { applyBgToolResultTasksWithBarrier } from "./tool-result-details.js";
@@ -160,6 +168,11 @@ function clampAboveEditorWidget(lines: string[], terminalRows: number, theme: Th
 	return [...lines.slice(0, maxLines - 1), theme.fg("muted", `… ${hidden} more (open dashboard for full view)`)];
 }
 
+// Task output arrives one chunk at a time. A chunk only marks the widget and
+// the persisted state stale; these windows bound how often each is redone.
+const OUTPUT_UI_REFRESH_MS = 200;
+const OUTPUT_PERSIST_MS = 1_000;
+
 export default function backgroundTasks(pi: ExtensionAPI): void {
 	const guard = pi as unknown as Record<PropertyKey, unknown>;
 	if (guard[BG_INSTALL_SYMBOL]) return;
@@ -206,23 +219,17 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		),
 	});
 
-	const rememberRestoredSnapshot = (snapshot: BackgroundTaskSnapshot) => {
-		if (!snapshot?.id || !snapshot.command) return;
-		const existing = tasks.get(snapshot.id);
-		if (existing && existing.updatedAt >= snapshot.updatedAt) return;
-		const restored = restoredTaskFromSnapshot(snapshot, {
-			sessionId: activeSessionId ?? undefined,
-			unitActiveProbe: defaultSystemdUnitActive,
-		});
-		tasks.set(restored.id, restored);
-		taskCounter = Math.max(taskCounter, numericTaskId(restored.id));
-		rememberSnapshot(restored);
+	// Deferred persistence for per-chunk state; any immediate persist covers it.
+	const persistSoon = createCoalescedCall(() => persistenceLayer.persistSnapshots(), OUTPUT_PERSIST_MS);
+	const persistSnapshots = (): { appendEntry: boolean; sidecar: boolean } => {
+		persistSoon.cancel();
+		return persistenceLayer.persistSnapshots();
 	};
 
-	const persistSnapshots = (): { appendEntry: boolean; sidecar: boolean } =>
-		persistenceLayer.persistSnapshots();
-
-	const restoreSnapshots = (ctx: ExtensionContext) => {
+	// Restore replays the session's plain snapshot data first, newest per task
+	// id, and only then rehydrates and probes the final task set, so startup
+	// probes each surviving task once however long the history is.
+	const restoreSnapshots = async (ctx: ExtensionContext) => {
 		// Drop the previous in-memory tasks without leaking their armed timers:
 		// the rehydrated task objects re-arm their own (including the soft
 		// reminder), and a stale timer would fire a second wake for a task that no
@@ -231,6 +238,14 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		tasks.clear();
 		taskCounter = 0;
 		activeSessionId = sessionIdForContext(ctx);
+		const replayed = new Map<string, BackgroundTaskSnapshot>();
+		const rememberRestoredSnapshot = (snapshot: BackgroundTaskSnapshot) => {
+			if (!snapshot?.id || !snapshot.command) return;
+			const existing = replayed.get(snapshot.id);
+			if (existing && existing.updatedAt >= snapshot.updatedAt) return;
+			replayed.set(snapshot.id, snapshot);
+		};
+		const clearRestoredTasks = () => { replayed.clear(); };
 		let sidecarLoaded = false;
 		let sidecarTasks: BackgroundTaskSnapshot[] | undefined;
 		try {
@@ -248,14 +263,13 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			logBackgroundDiagnostic("persistence failed (sidecar-read)", { error: msg });
 			// Fall back to session entries below.
 		}
-		const clearRestoredTasks = () => { tasks.clear(); taskCounter = 0; };
 		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type === "custom" && entry.customType === BG_STATE_TYPE) {
 				applyCustomEntryWithBarrier({
 					data: entry.data,
 					sidecarLoaded,
 					sidecarTasks,
-					clear: () => { tasks.clear(); taskCounter = 0; },
+					clear: clearRestoredTasks,
 					apply: (snapshot) => rememberRestoredSnapshot(snapshot),
 				});
 			}
@@ -271,6 +285,14 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 				});
 			}
 		}
+		const sessionId = activeSessionId ?? undefined;
+		const restored = await mapWithConcurrency([...replayed.values()], PROBE_CONCURRENCY, (snapshot) =>
+			restoredTaskFromSnapshot(snapshot, { sessionId, unitActiveProbe: defaultSystemdUnitActive }));
+		for (const task of restored) {
+			tasks.set(task.id, task);
+			taskCounter = Math.max(taskCounter, numericTaskId(task.id));
+			rememberSnapshot(task);
+		}
 		// Reconcile markers with what we just restored: a session that died
 		// mid-task leaves markers behind, and a restored running task needs one.
 		for (const task of tasks.values()) {
@@ -284,14 +306,86 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 
 	const sortedTasks = (): ManagedTask[] => [...tasks.values()].sort((a, b) => b.startedAt - a.startedAt);
 
+	// A finished task's output lives in its log only; read back as much of the
+	// end as the in-memory buffer would have held. The dashboard asks on every
+	// redraw, so the last tail read is reused while its log is unchanged.
+	let lastLogTail: { logFile: string; size: number; mtimeMs: number; text: string } | undefined;
+	const readLogTail = (logFile: string): string => {
+		const maxChars = settingNumber("outputBufferMaxChars", DEFAULT_OUTPUT_BUFFER_MAX_CHARS);
+		let fd: number | undefined;
+		try {
+			fd = openSync(logFile, "r");
+			const { size, mtimeMs } = fstatSync(fd);
+			if (lastLogTail?.logFile === logFile && lastLogTail.size === size && lastLogTail.mtimeMs === mtimeMs) return lastLogTail.text;
+			const length = Math.min(size, maxChars);
+			const buffer = Buffer.alloc(length);
+			readSync(fd, buffer, 0, length, size - length);
+			// A cut through a multi-byte character decodes to U+FFFD at the start.
+			const text = buffer.toString("utf8").replace(/^\uFFFD+/, "");
+			lastLogTail = { logFile, size, mtimeMs, text };
+			return text;
+		} catch (error) {
+			const reason = error instanceof Error ? error.message : String(error);
+			logBackgroundDiagnostic("task log read failed", { logFile, error: reason });
+			return `[log unreadable: ${reason}]`;
+		} finally {
+			if (fd !== undefined) closeSync(fd);
+		}
+	};
+
 	const getTaskOutput = (task: ManagedTask): string => {
 		if (task.output.length > 0) return task.output;
 		if (!existsSync(task.logFile)) return "";
-		try {
-			return readFileSync(task.logFile, "utf8");
-		} catch {
-			return "";
+		return readLogTail(task.logFile);
+	};
+
+	// A write the log writer still holds for the file would create it again,
+	// so the removal waits for the file's writes to settle.
+	const removeTaskLog = (task: ManagedTask) => {
+		const remove = () => {
+			try {
+				rmSync(task.logFile, { force: true });
+			} catch (error) {
+				logBackgroundDiagnostic("task log removal failed", { id: task.id, logFile: task.logFile, error: error instanceof Error ? error.message : String(error) });
+			}
+		};
+		const written = taskLogs.flush(task.logFile);
+		if (written) void written.then(remove);
+		else remove();
+	};
+
+	/** The lane directory this session's task logs are written to. */
+	const ownLaneDir = (): string => taskLaneDir(activeSessionId ?? `ephemeral-${process.pid}`);
+
+	// A task restored from another session's branch, as a forked session holds,
+	// keeps its log: the session that wrote it still reads it, and the lane
+	// prune removes it in time.
+	const forgetFinishedTask = (task: ManagedTask) => {
+		voidPendingTaskWakes(task, "clear", logWakeDiagnostic);
+		clearTaskTimers(task);
+		tasks.delete(task.id);
+		forgetSnapshot(task.id);
+		if (dirname(task.logFile) === ownLaneDir()) removeTaskLog(task);
+	};
+
+	// Tasks that exited and whose exit wake waits for their log's flush.
+	const exitWakeDue = new WeakSet<ManagedTask>();
+
+	// Keep at most MAX_FINISHED_TASKS finished tasks, dropping the oldest. Each
+	// finished task the bound counts has had its exit reported or never asked
+	// for it: an exit wake goes unsent only during session_shutdown, which
+	// empties the map first, and session_start replays missed exits before it
+	// bounds. A task whose exit wake waits for its log's flush is not counted.
+	const boundFinishedTasks = (): number => {
+		const finished = [...tasks.values()].filter((task) => task.status !== "running" && !exitWakeDue.has(task));
+		const excess = finished.length - MAX_FINISHED_TASKS;
+		let removed = 0;
+		for (const task of finished.sort((a, b) => a.updatedAt - b.updatedAt)) {
+			if (removed >= excess) break;
+			forgetFinishedTask(task);
+			removed += 1;
 		}
+		return removed;
 	};
 
 	const releaseTaskTimers = (task: ManagedTask) => {
@@ -405,10 +499,12 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 	}
 
 	const refreshUi = () => {
+		outputUiRefresh.cancel();
 		for (const task of tasks.values()) rememberSnapshot(task);
 		if (activeCtx) syncWidget(activeCtx);
 		requestWidgetRender?.();
 	};
+	const outputUiRefresh = createCoalescedCall(refreshUi, OUTPUT_UI_REFRESH_MS);
 
 	const logWakeDiagnostic = (diagnostic: WakeDiagnostic) => {
 		logBackgroundDiagnostic("wake diagnostic", diagnostic);
@@ -427,8 +523,9 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			reason,
 			task,
 		});
-		rememberSnapshot(task);
-		persistSnapshots();
+		// A dropped output wake is a diagnostic record, and a chatty task drops
+		// one per chunk; it rides the next persist instead of forcing one.
+		persistSoon.request();
 	};
 
 	const wakeBudgetLimits = (cwd?: string): OutputWakeBudgetLimits => ({
@@ -712,12 +809,41 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		}
 	};
 
-	const finalizeTask = (task: ManagedTask, exitCode: number | null, statusOverride?: BackgroundTaskStatus): ManagedTask => {
-		const finalized = finalizeTaskLifecycle(task, exitCode, lifecycleHooks, statusOverride);
-		clearRunningMarker(finalized);
-		settleForeground(finalized, { exitCode: finalized.exitCode, kind: "exited", status: finalized.status });
-		settleTaskWait(finalized, { kind: "settled" });
-		return finalized;
+	// The task's final status and its timers settle at once, so a stop,
+	// timeout or shutdown after the child exits signals nothing. The exit wake
+	// names the log file as the task's full output, so it waits for the log's
+	// flush to release. A task cleared or replaced meanwhile gets no wake.
+	// Once the log holds the output, the process handle and the in-memory
+	// output are released: an exited process has nothing left to report. A log
+	// whose last write failed or is still stalled keeps the in-memory output as
+	// the record.
+	const finalizeTask = (task: ManagedTask, exitCode: number | null, statusOverride?: BackgroundTaskStatus): void => {
+		if (!closeTaskLifecycle(task, exitCode, lifecycleHooks, statusOverride)) return;
+		clearRunningMarker(task);
+		task.child = null;
+		refreshUi();
+		exitWakeDue.add(task);
+		const settle = () => {
+			exitWakeDue.delete(task);
+			if (tasks.get(task.id) === task) {
+				// The exit-wake decision runs while an attached waiter is still
+				// unsettled: that is how a foreground bash wait or a bounded task
+				// wait is recognised as the delivery channel for this exit.
+				sendExitWakeLifecycle(task, lifecycleHooks);
+				if (taskLogs.settled(task.logFile) && existsSync(task.logFile)) {
+					task.output = "";
+					task.lastAnnouncedLength = 0;
+				}
+				if (boundFinishedTasks() > 0) persistSnapshots();
+			}
+			// Release the waiters after that decision, and even for a task a newer
+			// run replaced: an attached wait must always end.
+			settleForeground(task, { exitCode: task.exitCode, kind: "exited", status: task.status });
+			settleTaskWait(task, { kind: "settled" });
+		};
+		const written = taskLogs.flush(task.logFile);
+		if (written) void written.then(settle);
+		else settle();
 	};
 
 	// Orphan-running tasks (status=
@@ -762,13 +888,10 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		}
 	};
 
-	const appendLogLine = (task: ManagedTask, text: string) => {
-		try {
-			appendFileSync(task.logFile, text);
-		} catch {
-			// Keep in-memory output even if the log file is temporarily unavailable.
-		}
-	};
+	// A non-null result is the log writer's hold: the task's output should
+	// pause until it resolves.
+	const appendLogLine = (task: ManagedTask, text: string): Promise<void> | null =>
+		taskLogs.append(task.logFile, text);
 
 	const resourceControlFallbackWarned = new Set<string>();
 	const warnResourceControlFallback = (message: string, cwd?: string) => {
@@ -821,7 +944,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 
 		task.stopReason = reason;
 		// stamp terminationReason eagerly so when the child's
-		// close handler later calls finalizeTaskLifecycle the annotation
+		// close handler later calls closeTaskLifecycle the annotation
 		// is already in place. session_shutdown calls requestStop with
 		// reason="shutdown" so the two paths land on distinct values.
 		// The author decides the wake, not the reason: an agent-authored stop is
@@ -887,7 +1010,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			// Session metadata is best-effort; the command still runs.
 		}
 		const model = ctx.model as { id?: string; provider?: string } | undefined;
-		return buildManagedBashEnv(taskEnv(), {
+		return buildManagedBashEnv(taskEnv(ownLaneDir()), {
 			sessionId,
 			sessionFile,
 			provider: model?.provider,
@@ -1395,7 +1518,8 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			: Math.max(0, Math.floor(settingNumber("defaultSoftTimeoutMs", DEFAULT_SOFT_TIMEOUT_MS, cwd)));
 		const expiresAt = timeoutSeconds > 0 ? now + timeoutSeconds * 1_000 : null;
 		const softExpiresAt = softTimeoutMs > 0 ? now + softTimeoutMs : null;
-		const logFile = logFilePath(id, now);
+		const laneDir = openLaneDir(ownLaneDir(), activeCtx?.cwd ?? cwd);
+		const logFile = logFilePath(laneDir, id, now);
 		writeFileSync(logFile, "");
 
 		const { shell, args } = getShellConfig();
@@ -1434,12 +1558,11 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		const child = spawn(spawnPlan.file, spawnPlan.args, {
 			cwd,
 			detached: process.platform !== "win32",
-			env: options.env ?? taskEnv(),
+		env: options.env ?? taskEnv(laneDir),
 			stdio: ["ignore", "pipe", "pipe"],
 		});
 
 		const spawnedPid = child.pid ?? 0;
-		const procIdent = spawnedPid > 0 ? (defaultReadProcessIdentity(spawnedPid) ?? undefined) : undefined;
 		const task: ManagedTask = {
 			child,
 			closed: false,
@@ -1447,7 +1570,6 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			cwd,
 			exitCode: null,
 			exitNotified: false,
-			procIdent,
 			resourceControl: spawnPlan.metadata,
 			sessionId: activeSessionId ?? undefined,
 			expiresAt,
@@ -1511,6 +1633,33 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		rememberSnapshot(task);
 		persistSnapshots();
 		publishBackgroundTaskStarted(task);
+		// The identity lets a later restore tell this process from a reused
+		// pid; it rides the next windowed persist, and every lifecycle persist
+		// and session_shutdown flush it. A task cleared or replaced before the
+		// read resolves stays forgotten. An identity the read could not answer
+		// stays unset, so restore falls back to pid-only liveness.
+		if (spawnedPid > 0) {
+			void defaultReadProcessIdentity(spawnedPid).then((reading) => {
+				if (tasks.get(task.id) !== task) return;
+				switch (reading.kind) {
+					case "identity":
+						task.procIdent = reading.identity;
+						rememberSnapshot(task);
+						persistSoon.request();
+						return;
+					case "alive":
+					case "gone":
+						return;
+					case "unknown":
+						logBackgroundDiagnostic("spawn identity unknown", { id: task.id, pid: spawnedPid, reason: reading.reason });
+						return;
+					default: {
+						const unreachable: never = reading;
+						throw new Error(`unknown identity reading: ${JSON.stringify(unreachable)}`);
+					}
+				}
+			});
+		}
 
 		const handleChunk = (chunk: Buffer) => {
 			const text = chunk.toString();
@@ -1521,10 +1670,19 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			const trimmed = trimOutputBuffer(task.output, task.lastAnnouncedLength);
 			task.output = trimmed.output;
 			task.lastAnnouncedLength = trimmed.lastAnnouncedLength;
-			appendLogLine(task, text);
-			rememberSnapshot(task);
+			const hold = appendLogLine(task, text);
+			if (hold) {
+				// The log's writes fell behind: stop reading until they settle
+				// or one stalls, so the child blocks on its pipe meanwhile.
+				child.stdout?.pause();
+				child.stderr?.pause();
+				void hold.then(() => {
+					child.stdout?.resume();
+					child.stderr?.resume();
+				});
+			}
 			scheduleOutputReaction(task);
-			refreshUi();
+			outputUiRefresh.request();
 		};
 
 		child.stdout?.on("data", handleChunk);
@@ -1551,12 +1709,9 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 
 	const clearFinishedTasks = (): number => {
 		let removed = 0;
-		for (const [id, task] of tasks) {
+		for (const task of [...tasks.values()]) {
 			if (task.status === "running") continue;
-			voidPendingTaskWakes(task, "clear", logWakeDiagnostic);
-			clearTaskTimers(task);
-			tasks.delete(id);
-			forgetSnapshot(id);
+			forgetFinishedTask(task);
 			removed += 1;
 		}
 		persistSnapshots();
@@ -1614,6 +1769,8 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 
 	pi.registerMessageRenderer(BG_MESSAGE_TYPE, (message, { expanded }, theme) => renderTaskEventMessage(message, expanded, theme));
 
+	installSettingsCacheRefresh(pi);
+
 	// A wake is a follow-up message: it cannot steer the run that is already in
 	// flight, so holding it until the agent truly stops costs nothing and is the
 	// only way several completions can arrive as ONE grouped wake.
@@ -1630,17 +1787,18 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		flushDeferredExitWakes();
 		announceRunningTasks();
 	});
-	pi.on("session_start", (_event, ctx) => {
+	pi.on("session_start", async (_event, ctx) => {
 		shuttingDown = false;
 		recordProjectTrust(ctx);
 		activeCtx = ctx;
-		restoreSnapshots(ctx);
+		const pruned = pruneLanes(taskLanesRoot());
+		for (const failure of pruned.failed) logBackgroundDiagnostic("task log prune failed", { path: failure.path, error: failure.error });
+		await restoreSnapshots(ctx);
 		replayMissedExits();
-		// Run one synchronous orphan-check before arming the interval so a
-		// task whose pid already died between Pi shutdown and Pi restart
-		// gets its exit wake without waiting one poll cycle.
+		if (boundFinishedTasks() > 0) persistSnapshots();
+		// Restore just probed every task the watcher would check, so the first
+		// pass waits one poll interval.
 		ensureOrphanWatcher();
-		orphanWatcher?.checkOnce();
 		syncWidget(ctx);
 	});
 	pi.on("before_agent_start", (_event, ctx) => {
@@ -1657,7 +1815,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		activeCtx = ctx;
 		syncWidget(ctx);
 	});
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", async () => {
 		deferredExitWakes.clear();
 		idleExitBatch.clear();
 		delete interop[MANAGED_BASH_SYMBOL];
@@ -1665,6 +1823,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		shuttingDown = true;
 		orphanWatcher?.stop();
 		orphanWatcher = null;
+		outputUiRefresh.cancel();
 		// Abort in-flight bounded waits before the stop path runs. The wait
 		// detaches and rejects through its normal `Operation aborted`
 		// channel, and because the shutdown exit-wake gate owns delivery,
@@ -1693,8 +1852,12 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			clearTaskTimers(task);
 		}
 		persistSnapshots();
+		// The persisted snapshots carry the tasks to the next session_start.
+		tasks.clear();
 		clearWidget();
+		lastLogTail = undefined;
 		activeCtx = null;
+		await taskLogs.drain();
 	});
 
 	// Model-facing bash is spawned exactly once by the managed bash tool

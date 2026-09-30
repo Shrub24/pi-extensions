@@ -43,7 +43,23 @@ export function finalizeTaskLifecycle(
 	statusOverride?: BackgroundTaskStatus,
 	terminationReason?: BackgroundTaskTerminationReason,
 ): ManagedTask {
-	if (task.closed) return task;
+	if (!closeTaskLifecycle(task, exitCode, hooks, statusOverride, terminationReason)) return task;
+	sendExitWakeLifecycle(task, hooks);
+	hooks.refreshUi();
+	return task;
+}
+
+// The terminal transition without the exit wake, for finalizeTaskLifecycle
+// and background-tasks.ts finalizeTask, which call sendExitWakeLifecycle
+// after it. Returns false when the task was already closed.
+export function closeTaskLifecycle(
+	task: ManagedTask,
+	exitCode: number | null,
+	hooks: LifecycleHooks,
+	statusOverride?: BackgroundTaskStatus,
+	terminationReason?: BackgroundTaskTerminationReason,
+): boolean {
+	if (task.closed) return false;
 	task.closed = true;
 	task.updatedAt = Date.now();
 	task.exitCode = exitCode;
@@ -61,39 +77,32 @@ export function finalizeTaskLifecycle(
 	task.terminationReason = resolveTerminationReason(task, exitCode, terminationReason);
 	hooks.rememberSnapshot(task);
 	hooks.persistSnapshots();
+	return true;
+}
 
-	// An agent-initiated stop needs no exit wake: the bg_task/bg_status stop
-	// tool result already reported the stop, and waking the agent for its own
-	// action is pure noise. Session shutdown and external kills still notify
-	// (the agent did not author those).
-	// Agent-authored stop: a user/agent-initiated stop whose finalize carries
-	// the extension-stop reason. An override (orphan reuse, shutdown) means an
-	// external force performed the terminal transition, which the agent did
-	// not author and must hear about.
-	const agentAuthoredStop = task.stopReason === "user"
-		&& (terminationReason ?? task.terminationReason) === "extension-stop";
-	if (agentAuthoredStop || task.supersededBy) {
-		// Two suppressions by design:
-		//   • Agent-authored stop: the stop tool result already delivered the news.
-		//   • Superseded: a newer run of the same command in the same cwd replaced
-		//     this one, so its exit carries no decision the agent can still act on.
-		//     Without this, a chain of reruns (rebuild after rebuild) emits one wake
-		//     per dead task — the bg-108/158/160/167 wake storm.
-		// Record it as notified anyway, otherwise the missed-exit replay treats the
-		// suppressed wake as undelivered and resurrects it after a restart.
-		task.exitNotified = true;
-		hooks.rememberSnapshot(task);
-		hooks.persistSnapshots();
-	} else {
-		const notified = hooks.sendTaskEvent("exit", task);
-		if (notified) {
-			task.exitNotified = true;
-			hooks.rememberSnapshot(task);
-			hooks.persistSnapshots();
-		}
+// The exit wake, with two by-design suppressions:
+//   • Agent-authored stop: a user/agent-initiated stop whose finalize carries the
+//     extension-stop reason. The bg_task/bg_status stop tool result already
+//     reported the stop, so waking the agent for its own action is pure noise.
+//     An override (orphan reuse, shutdown) means an external force performed the
+//     terminal transition, which the agent did not author and must hear about.
+//   • Superseded: a newer run of the same command in the same cwd replaced this
+//     one, so its exit carries no decision the agent can still act on. Without
+//     this, a chain of reruns (rebuild after rebuild) emits one wake per dead
+//     task — the bg-108/158/160/167 wake storm.
+// A suppressed wake is still recorded as notified, otherwise the missed-exit
+// replay treats it as undelivered and resurrects it after a restart.
+//
+// Callers run closeTaskLifecycle first, which resolves task.terminationReason,
+// so the explicit reason reaches this check without being passed again.
+export function sendExitWakeLifecycle(task: ManagedTask, hooks: LifecycleHooks): void {
+	const agentAuthoredStop = task.stopReason === "user" && task.terminationReason === "extension-stop";
+	if (!agentAuthoredStop && !task.supersededBy) {
+		if (!hooks.sendTaskEvent("exit", task)) return;
 	}
-	hooks.refreshUi();
-	return task;
+	task.exitNotified = true;
+	hooks.rememberSnapshot(task);
+	hooks.persistSnapshots();
 }
 
 // Resolve the terminationReason for a finalize call. Precedence:

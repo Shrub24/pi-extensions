@@ -23,10 +23,11 @@ function runScenario(scenario: string, extra: Record<string, unknown> = {}): Fix
 	return runSpawnFixture("task-wait-fixture.ts", { mode: "spawn", scenario, ...extra }) as FixtureResult;
 }
 
-// The orphan watcher registers a perpetual interval(30s) for every session;
-// everything else in the table belongs to the wait under test.
+// The orphan watcher registers a perpetual interval(30s) for every session, and
+// the state writer arms its 1s persist window per spawn; everything else in the
+// table belongs to the wait under test.
 const waitTimers = (timers: { kind: string; ms: number }[]) =>
-	timers.filter((timer) => !(timer.kind === "interval" && timer.ms === 30_000));
+	timers.filter((timer) => !(timer.kind === "interval" && timer.ms === 30_000) && !(timer.kind === "timeout" && timer.ms === 1_000));
 
 test("bounded wait: already-terminal task returns its terminal result immediately", () => {
 	const result = runScenario("terminal");
@@ -109,7 +110,7 @@ test("bounded wait: queued steer releases the wait quickly and keeps the later w
 	expect(result.resultText).toContain("Still Running bg-1");
 	expect(result.resultTask?.status).toBe("running");
 	expect(result.timersAfterWait.filter((timer) => timer.kind === "interval" && timer.ms === 100), "poll stops with the wait").toEqual([]);
-	expect(result.timersAfterWait.filter((timer) => timer.kind === "timeout"), "the full window is not left pending").toEqual([]);
+	expect(waitTimers(result.timersAfterWait).filter((timer) => timer.kind === "timeout"), "the full window is not left pending").toEqual([]);
 	expect(result.exitWakeCount, "later completion wake remains enabled").toBe(1);
 	expect(result.finalTasks[0]?.status).toBe("completed");
 	expect(result.unexpected).toEqual([]);

@@ -7,6 +7,27 @@
 - Publishes the managed-Bash interop marker so `@vanillagreen/pi-tool-renderer` leaves its execution override intact.
 - Every background task now gets a soft timeout (10 minutes by default; `defaultSoftTimeoutMs`, per-spawn `softTimeoutMs`, 0 disables). At soft expiry the process keeps running and the agent receives exactly one progress wake asking it to continue (optionally extend via `bg_task action: "extend"`, which starts a fresh window from now and never changes the hard timeout), inspect the log, or stop. The reminder is one-shot, persisted across restarts, re-armed for restored live tasks, and excluded from exit/output wake accounting — a later real exit still wakes normally.
 
+### 2.1.0
+
+- New task logs go into one directory per session in the task directory's `lanes/` folder. A session's log directory is deleted once its working directory is gone (a merged worktree), and any log older than 5 days is deleted, when the next session starts. The prune reads only `lanes/`, and in it only real directories this user owns that the package marked as its own, so other folders in the task directory are never touched. Logs written before 2.1.0 stay where they are and are not deleted by the prune, `clear` or the task bound.
+- A task's process handle and in-memory output are released once it has exited and its last log write has finished; `log` and exit wakes read the end of the log file instead. A task whose last log write failed or stalled keeps its in-memory output as the record, and a log that cannot be read shows `[log unreadable: <error>]` instead of empty output. At most 50 finished tasks are kept: past that, the oldest finished task is removed with its log. `clear` now deletes the logs of the tasks it removes. A forked session keeps the logs of tasks it copied from the original session. The task list is released when a session ends; the next session restores it from the saved snapshots.
+
+### 2.0.4
+
+- A task that prints a lot no longer makes Pi write the task log synchronously, save the full task state and redraw the widget for every output chunk. Slow task log writes no longer block Pi; the task waits on its output instead.
+- A log write that fails loses its bytes, and a log write that stalls loses the output that arrives past a bounded buffer; the log marks each loss with its byte count. In 2.0.3 and earlier a failed write lost its bytes with no mark, and a stalled write blocked Pi.
+- Checks of this session's tasks that outlived a Pi restart or reload no longer block Pi at startup or on their 30-second recheck.
+- Startup and reload with a long task history no longer slow down.
+
+### 2.0.3
+
+- Settings reads come from memory. A read is answered for one second without touching disk, then the settings files are read again. A change made in the extension manager, or a new session, applies at once; a hand edit to `settings.json` applies within one second. Before, every read went to disk.
+
+### 2.0.2
+
+- The npm install and uninstall helper reports each refusal as an `append-system: <key>=<value>` line followed by the explanation.
+- An appendSystem source file that cannot be read is reported and skipped instead of throwing, so the npm install still completes.
+
 ### 2.0.1
 
 - Finished tasks disappear from the inline widget after `widgetFinishedRetentionSeconds` without waiting for another task event. Long retention periods use bounded timer waits, and hiding the widget or ending the session clears the timer.

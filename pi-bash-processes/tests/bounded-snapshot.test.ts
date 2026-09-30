@@ -13,6 +13,7 @@ import {
 } from "../extensions/persistence.js";
 import type { BackgroundTaskSnapshot } from "../extensions/types.js";
 import { boundedSnapshot } from "./fixtures/bounded-snapshot.js";
+import { clearPackageConfigCache } from "../extensions/package-config.js";
 
 function withPersistenceContext(run: (ctx: NonNullable<ReturnType<PersistenceDeps["getActiveCtx"]>>, sidecarFile: string) => void): void {
 	const root = mkdtempSync(join(tmpdir(), "pi-bg-bounded-"));
@@ -21,6 +22,7 @@ function withPersistenceContext(run: (ctx: NonNullable<ReturnType<PersistenceDep
 	try {
 		const piDir = join(root, "agent");
 		process.env.PI_CODING_AGENT_DIR = piDir;
+		clearPackageConfigCache();
 		process.env.PI_BG_TASK_DIAGNOSTIC_LOG = join(root, "diagnostics.log");
 		const ctx = {
 			cwd: root,
@@ -35,6 +37,7 @@ function withPersistenceContext(run: (ctx: NonNullable<ReturnType<PersistenceDep
 		else process.env.PI_CODING_AGENT_DIR = previousPiDir;
 		if (previousDiagnosticLog === undefined) delete process.env.PI_BG_TASK_DIAGNOSTIC_LOG;
 		else process.env.PI_BG_TASK_DIAGNOSTIC_LOG = previousDiagnosticLog;
+		clearPackageConfigCache();
 		rmSync(root, { recursive: true, force: true });
 	}
 }
@@ -57,11 +60,14 @@ test("snapshot append decisions follow content changes", () => {
 		] as const) {
 			snapshots = [boundedSnapshot({ status, updatedAt })];
 			const result = persistence.persistSnapshots();
-			const sidecar = JSON.parse(readFileSync(sidecarFile, "utf8")) as PersistencePayload;
-			expect({ result, appendCount: appended.length, sidecarTasks: sidecar.tasks }, name).toEqual({
+			const sidecarText = readFileSync(sidecarFile, "utf8");
+			const sidecar = JSON.parse(sidecarText) as PersistencePayload;
+			// The sidecar body is the compact serialization plus one newline.
+			expect({ result, appendCount: appended.length, sidecarTasks: sidecar.tasks, sidecarText }, name).toEqual({
 				result: { appendEntry: true, sidecar: true, appendReason },
 				appendCount: count,
 				sidecarTasks: snapshots,
+				sidecarText: `${JSON.stringify(sidecar)}\n`,
 			});
 		}
 	});

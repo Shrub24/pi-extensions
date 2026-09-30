@@ -23,6 +23,7 @@ interface Tool { name: string; execute(id: string, params: Record<string, unknow
 const tools = new Map<string, Tool>();
 const events = new Map<string, (event: unknown, ctx: ExtensionContext) => unknown>();
 const messages: unknown[][] = [];
+const entries: unknown[] = [];
 let pendingMessages = false;
 const ctx = {
 	cwd: process.cwd(), hasUI: false, isProjectTrusted: () => true,
@@ -34,7 +35,7 @@ const pi = {
 	registerTool(tool: Tool) { tools.set(tool.name, tool); },
 	registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {},
 	on(event: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) { events.set(event, handler); },
-	appendEntry() {},
+	appendEntry: (...args: unknown[]) => entries.push(args),
 	sendMessage: (...args: unknown[]) => messages.push(args),
 } as unknown as ExtensionAPI;
 
@@ -58,9 +59,19 @@ try {
 		undefined,
 		ctx,
 	);
+	// session_shutdown releases the in-memory list and leaves the tasks to the
+	// snapshot the next session_start restores, so the newest persisted snapshot
+	// is the post-shutdown view of the tasks.
+	const persistedTasks = (): Record<string, unknown>[] => {
+		for (const entry of [...entries].reverse() as [string, { tasks?: Record<string, unknown>[] }][]) {
+			if (entry[1]?.tasks) return entry[1].tasks;
+		}
+		return [];
+	};
 	const taskList = async () => {
 		const listed = await bgTask.execute("list-1", { action: "list" });
-		return (listed.details as { tasks: Record<string, unknown>[] }).tasks;
+		const tasks = (listed.details as { tasks: Record<string, unknown>[] }).tasks;
+		return tasks.length > 0 ? tasks : persistedTasks();
 	};
 	const exitWakeCount = () => messages.filter((args) => {
 		const message = args[0] as { details?: { eventType?: string; task?: { id?: string } } };

@@ -1,5 +1,5 @@
 import type { LifecycleHooks } from "../../extensions/lifecycle.js";
-import { fakeTask } from "./lifecycle.js";
+import { fakeTask, reading } from "./lifecycle.js";
 import { interceptNativeEffects } from "./spawn-native.js";
 
 const input: { identity: "gone" | "reused" | "matching" } = JSON.parse(await Bun.stdin.text());
@@ -19,9 +19,9 @@ try {
 	};
 	const watcher = createOrphanWatcher({
 		getTasks: () => [task], hooks,
-		identityProbe: (pid) => input.identity === "gone" ? null : { comm: "bash", pid, startToken: input.identity === "matching" ? "start-4242" : "reused-start" },
+		identityProbe: async (pid) => reading(input.identity === "gone" ? null : { comm: "bash", pid, startToken: input.identity === "matching" ? "start-4242" : "reused-start" }),
 	});
-	const result = watcher.checkOnce();
+	const result = await watcher.checkOnce();
 	process.stdout.write(JSON.stringify({
 		result, calls, events,
 		task: { id: task.id, status: task.status, reason: task.terminationReason ?? null, reasonIsUndefined: task.terminationReason === undefined, exitCode: task.exitCode, closed: task.closed, exitNotified: task.exitNotified, stopReason: task.stopReason },

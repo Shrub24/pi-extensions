@@ -1,89 +1,11 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
-import { delimiter, dirname, join, resolve } from "node:path";
+import { existsSync, readdirSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { delimiter, join, resolve } from "node:path";
 
 import { CONFIG_ID } from "./constants.js";
+import { expandHome, piUserDir, readPackageConfig } from "./package-config.js";
 import { installReadShims } from "./read-shim.js";
 import type { kendexConfig } from "./types.js";
-
-export function expandHome(input: string): string {
-	if (input === "~") return homedir();
-	if (input.startsWith("~/")) return join(homedir(), input.slice(2));
-	return input;
-}
-
-function projectSettingsPath(cwd: string): string {
-	let current = resolve(cwd);
-	while (true) {
-		const candidate = join(current, ".pi", "settings.json");
-		if (existsSync(candidate)) return candidate;
-		if (existsSync(join(current, ".pi")) || existsSync(join(current, ".git")) || existsSync(join(current, ".kendex-lock.json"))) return candidate;
-		const parent = dirname(current);
-		if (parent === current) return join(resolve(cwd), ".pi", "settings.json");
-		current = parent;
-	}
-}
-
-const PROJECT_TRUST_SYMBOL = Symbol.for("kendex.pi.project-trust");
-
-interface ProjectTrustRegistry {
-	projectSettings?: Map<string, boolean>;
-}
-
-function projectTrustRegistry(): ProjectTrustRegistry {
-	const host = globalThis as unknown as Record<PropertyKey, ProjectTrustRegistry | undefined>;
-	const existing = host[PROJECT_TRUST_SYMBOL];
-	if (existing) return existing;
-	const created: ProjectTrustRegistry = {};
-	host[PROJECT_TRUST_SYMBOL] = created;
-	return created;
-}
-
-export function recordProjectTrust(ctx: { cwd?: string; isProjectTrusted?: () => boolean }): void {
-	if (!ctx.cwd) return;
-	let trusted = true;
-	try {
-		trusted = ctx.isProjectTrusted?.() === true;
-	} catch {
-		trusted = false;
-	}
-	const registry = projectTrustRegistry();
-	if (!registry.projectSettings) registry.projectSettings = new Map();
-	registry.projectSettings.set(projectSettingsPath(ctx.cwd), trusted);
-}
-
-function projectSettingsTrusted(settingsPath: string): boolean {
-	return projectTrustRegistry().projectSettings?.get(settingsPath) === true;
-}
-
-/** Root-anchored as `crates/core/src/harness/pi.rs::pi_root_is_absolute_for`
- * means it, which `isAbsolute` is not: it calls a driveless `\root` absolute
- * where the renderer does not, putting the two on different roots. Hoisted, so
- * a circular import cannot reach it inside a temporal dead zone. */
-function rootAnchored(path: string, windows: boolean): boolean { return windows ? /^(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/]+[\\/][^\\/]+)/.test(path) : path.startsWith("/"); }
-
-function piSettingsPaths(cwd = process.cwd()): string[] {
-	const override = expandHome(process.env.PI_CODING_AGENT_DIR?.trim() || "");
-	const userDir = resolve(rootAnchored(override, process.platform === "win32") ? override : expandHome("~/.pi/agent"));
-	const user = join(userDir, "settings.json");
-	const project = projectSettingsPath(cwd);
-	return projectSettingsTrusted(project) ? [user, project] : [user];
-}
-
-export function readPackageConfig(packageId: string, cwd?: string): Record<string, unknown> {
-	const merged: Record<string, unknown> = {};
-	for (const settingsPath of piSettingsPaths(cwd)) {
-		if (!existsSync(settingsPath)) continue;
-		try {
-			const parsed = JSON.parse(readFileSync(settingsPath, "utf8"));
-			const config = parsed?.kendex?.extensionManager?.config?.[packageId];
-			if (config && typeof config === "object" && !Array.isArray(config)) Object.assign(merged, config);
-		} catch {
-			// Ignore malformed optional manager config.
-		}
-	}
-	return merged;
-}
 
 export function readkendexConfig(cwd?: string): kendexConfig {
 	return readPackageConfig(CONFIG_ID, cwd) as kendexConfig;
@@ -110,7 +32,7 @@ export function settingEnum<T extends string>(key: string, allowed: readonly T[]
 	return typeof value === "string" && (allowed as readonly string[]).includes(value) ? (value as T) : fallback;
 }
 
-function taskDir(): string {
+export function taskDir(): string {
 	const configured = settingString("taskDir", "");
 	return process.env.PI_BG_TASK_DIR?.trim() || (configured ? resolve(expandHome(configured)) : join(tmpdir(), "kendex-pi-bg"));
 }
@@ -119,17 +41,16 @@ function safeLabel(input: string): string {
 	return input.replaceAll(/[^a-z0-9-]+/gi, "-").replaceAll(/^-+|-+$/g, "").slice(0, 48) || "task";
 }
 
-export function logFilePath(id: string, now: number = Date.now()): string {
-	const dir = taskDir();
-	mkdirSync(dir, { recursive: true, mode: 0o700 });
-	return join(dir, `${safeLabel(id)}-${now}.log`);
+/** The log file for task `id`, in the lane directory `laneDir`. */
+export function logFilePath(laneDir: string, id: string, now: number = Date.now()): string {
+	return join(laneDir, `${safeLabel(id)}-${now}.log`);
 }
 
-/** Directory holding every managed task's log file. */
-export function logDir(): string {
-	const dir = taskDir();
-	mkdirSync(dir, { recursive: true, mode: 0o700 });
-	return dir;
+/** The folder, inside the task directory, that holds this package's lane
+ *  directories. The task directory is a user setting that may hold other
+ *  tools' folders; the retention prune reads only this one. */
+export function taskLanesRoot(): string {
+	return join(taskDir(), "lanes");
 }
 
 /** Directory holding the managed-bash read shims (cat/tail/head/…, pi-bg). */
@@ -174,14 +95,19 @@ function pruneStaleConsumeLogs(): void {
 	}
 }
 
-function piAgentDir(): string {
-	const configured = expandHome(process.env.PI_CODING_AGENT_DIR?.trim() || "");
-	return rootAnchored(configured, process.platform === "win32") ? resolve(configured) : join(homedir(), ".pi", "agent");
+/** The directory one session's task logs live in, under taskLanesRoot. */
+export function taskLaneDir(sessionId: string): string {
+	return join(taskLanesRoot(), sessionId.replace(/[^\w.-]+/g, "_"));
 }
 
-export function taskEnv(): NodeJS.ProcessEnv {
+/**
+ * The environment for a managed shell. `laneDir` is the task lane whose logs
+ * the read shims must recognise, so a read of a task log is recorded against
+ * the session that owns it.
+ */
+export function taskEnv(laneDir: string): NodeJS.ProcessEnv {
 	const env = { ...process.env };
-	const binDir = join(piAgentDir(), "bin");
+	const binDir = join(piUserDir(), "bin");
 	if (existsSync(binDir)) {
 		const current = env.PATH || "";
 		const parts = current.split(delimiter).filter(Boolean);
@@ -189,7 +115,7 @@ export function taskEnv(): NodeJS.ProcessEnv {
 	}
 	// Managed bash gets the read shims on PATH so a plain `tail`/`cat`/`grep`
 	// read of a task log is observable without guessing at command strings.
-	return { ...env, ...readShimEnv() };
+	return { ...env, ...readShimEnv(laneDir) };
 }
 
 /**
@@ -197,15 +123,15 @@ export function taskEnv(): NodeJS.ProcessEnv {
  * paths count as task logs and where to report a read. The shims exec the real
  * binary, so behavior is unchanged except for the side-channel append.
  */
-export function readShimEnv(): Record<string, string> {
+export function readShimEnv(laneDir: string): Record<string, string> {
 	pruneStaleConsumeLogs();
 	const dir = installReadShims(shimDir());
 	if (!dir) return {};
 	return {
 		PATH: [dir, process.env.PATH ?? ""].filter(Boolean).join(delimiter),
 		PI_BG_CONSUME_LOG: consumeLogPath(),
-		PI_BG_LOG_DIR: logDir(),
-		PI_BG_LOG_GLOB: `${logDir()}/*`,
+		PI_BG_LOG_DIR: laneDir,
+		PI_BG_LOG_GLOB: `${laneDir}/*`,
 		PI_BG_REAL_PATH: process.env.PATH ?? "",
 	};
 }

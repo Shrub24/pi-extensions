@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 
+import { runProbe, runProbeSync, type ProbeResult, type ProbeRunner } from "./probes.js";
 import { settingBoolean, settingEnum, settingNumber } from "./settings.js";
 
 export const RESOURCE_CONTROL_MODES = ["auto", "systemd-run", "nice-ionice", "off"] as const;
@@ -53,6 +54,7 @@ export interface ResourceControlProbes {
 	platform?: NodeJS.Platform;
 	commandExists?: (command: string) => boolean;
 	userSystemdAvailable?: () => boolean;
+	userManager?: UserManagerReachability;
 }
 
 export interface ResourceControlStopResult {
@@ -71,7 +73,58 @@ const DEFAULT_NICE = 10;
 const DEFAULT_IONICE_CLASS: ResourceControlIoniceClass = "best-effort";
 const DEFAULT_IONICE_LEVEL = 7;
 const SYSTEMCTL_TIMEOUT_MS = 2_000;
+/** Succeeds only when the user's systemd manager answers on its bus. */
+const SYSTEMD_USER_MANAGER_PROBE_ARGS = ["--user", "show-environment"];
 const cachedUserSystemdRunnable = new Map<string, boolean>();
+
+/**
+ * Whether the user's systemd manager answers. Spawn planning asks
+ * synchronously and liveness probes asynchronously; both read one memo, so
+ * once either settles the answer the other never probes.
+ */
+export interface UserManagerReachability {
+	/** null: this call's probe settled nothing. */
+	sync(): boolean | null;
+	/** Concurrent callers share one probe. */
+	check(): Promise<boolean>;
+}
+
+export interface UserManagerReachabilityDeps {
+	run?: ProbeRunner;
+	runSync?: (file: string, args: string[]) => ProbeResult;
+}
+
+function reachability(result: ProbeResult): boolean | null {
+	return result.kind === "unsettled" ? null : result.kind === "exited" && result.status === 0;
+}
+
+export function createUserManagerReachability(deps: UserManagerReachabilityDeps = {}): UserManagerReachability {
+	const run = deps.run ?? runProbe;
+	const runSync = deps.runSync ?? runProbeSync;
+	let answer: boolean | null = null;
+	let inFlight: Promise<boolean> | null = null;
+	return {
+		sync() {
+			answer ??= reachability(runSync("systemctl", SYSTEMD_USER_MANAGER_PROBE_ARGS));
+			return answer;
+		},
+		check() {
+			if (answer !== null) return Promise.resolve(answer);
+			inFlight ??= run("systemctl", SYSTEMD_USER_MANAGER_PROBE_ARGS).then((result) => {
+				answer ??= reachability(result);
+				inFlight = null;
+				return answer === true;
+			});
+			return inFlight;
+		},
+	};
+}
+
+/**
+ * The user manager answer this extension load reads. Pi re-imports the
+ * extension on /reload, which starts a fresh memo.
+ */
+const userManager = createUserManagerReachability();
 
 function finiteInt(value: number, fallback: number): number {
 	return Number.isFinite(value) ? Math.round(value) : fallback;
@@ -123,18 +176,20 @@ function systemdResourcePropertyArgs(settings: ResourceControlSettings): string[
 	];
 }
 
-function userSystemdAvailable(commandProbe: (command: string) => boolean, platform: NodeJS.Platform, settings: ResourceControlSettings): boolean {
+function userSystemdAvailable(commandProbe: (command: string) => boolean, platform: NodeJS.Platform, settings: ResourceControlSettings, manager: UserManagerReachability): boolean {
 	if (platform !== "linux") return false;
 	if (!commandProbe("systemd-run") || !commandProbe("systemctl")) return false;
 	const cacheKey = systemdProbeCacheKey(settings);
 	const cached = cachedUserSystemdRunnable.get(cacheKey);
 	if (cached !== undefined) return cached;
+	// A manager that did not answer is cached as unavailable for this settings
+	// key, so spawn planning blocks Pi's thread on it once; the asynchronous
+	// liveness check keeps asking.
+	if (manager.sync() !== true) {
+		cachedUserSystemdRunnable.set(cacheKey, false);
+		return false;
+	}
 	try {
-		const result = spawnSync("systemctl", ["--user", "show-environment"], { stdio: "ignore", timeout: 1_500 });
-		if (result.status !== 0) {
-			cachedUserSystemdRunnable.set(cacheKey, false);
-			return false;
-		}
 		// Probe the exact transient-service shape used below. Older scope-based
 		// plans accepted availability checks but failed at spawn time on hosts
 		// where `--scope --wait` or scope-level Nice/IOScheduling properties are
@@ -170,7 +225,7 @@ function commandProbeFor(probes: ResourceControlProbes | undefined, platform: No
 }
 
 function systemdProbeFor(probes: ResourceControlProbes | undefined, commandProbe: (command: string) => boolean, platform: NodeJS.Platform, settings: ResourceControlSettings): () => boolean {
-	return probes?.userSystemdAvailable ?? (() => userSystemdAvailable(commandProbe, platform, settings));
+	return probes?.userSystemdAvailable ?? (() => userSystemdAvailable(commandProbe, platform, settings, probes?.userManager ?? userManager));
 }
 
 function originApplies(settings: ResourceControlSettings, origin: ResourceControlOrigin): boolean {
@@ -331,14 +386,30 @@ export function stopResourceControlledTask(
 	};
 }
 
-export function defaultSystemdUnitActive(unitName: string): boolean | null {
-	if (!unitName || process.platform !== "linux") return null;
-	try {
-		const result = spawnSync("systemctl", ["--user", "is-active", "--quiet", unitName], { stdio: "ignore", timeout: 1_000 });
+export interface SystemdUnitActiveProbeDeps {
+	platform?: () => NodeJS.Platform;
+	run?: ProbeRunner;
+	userManager?: UserManagerReachability;
+}
+
+/**
+ * Build an asynchronous unit liveness probe: true while the unit is active,
+ * false when `systemctl is-active` reports it inactive, null when it cannot
+ * be queried. An unreachable user manager answers null without a unit query.
+ */
+export function createSystemdUnitActiveProbe(deps: SystemdUnitActiveProbeDeps = {}): (unitName: string) => Promise<boolean | null> {
+	const platform = deps.platform ?? (() => process.platform);
+	const run = deps.run ?? runProbe;
+	const manager = deps.userManager ?? userManager;
+	return async (unitName: string): Promise<boolean | null> => {
+		if (!unitName || platform() !== "linux") return null;
+		if (!(await manager.check())) return null;
+		const result = await run("systemctl", ["--user", "is-active", "--quiet", unitName]);
+		if (result.kind !== "exited") return null;
 		if (result.status === 0) return true;
 		if (result.status === 3) return false;
 		return null;
-	} catch {
-		return null;
-	}
+	};
 }
+
+export const defaultSystemdUnitActive = createSystemdUnitActiveProbe();

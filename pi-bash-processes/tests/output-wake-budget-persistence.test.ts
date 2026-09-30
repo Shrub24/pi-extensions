@@ -6,10 +6,10 @@ import {
 import { restoredTaskFromSnapshot, taskSnapshot } from "../extensions/snapshot.js";
 import type { WakeDiagnostic } from "../extensions/types.js";
 import { shouldEmitOutputWake } from "../extensions/wake-events.js";
-import { fakeIdent, fakeTask } from "./fixtures/lifecycle.js";
+import { fakeIdent, fakeTask, reading } from "./fixtures/lifecycle.js";
 
 describe("output wake budget persistence", () => {
-	test("retains each budget and restore state before the wake decision", () => {
+	test("retains each budget and restore state before the wake decision", async () => {
 		const now = 1_700_000_001_000;
 		const limits = {
 			maxBytes: DEFAULT_OUTPUT_WAKE_BUDGET_MAX_BYTES,
@@ -76,8 +76,8 @@ describe("output wake budget persistence", () => {
 		for (const row of rows) {
 			const snapshot = taskSnapshot(row.task);
 			const probedPids: number[] = [];
-			const restored = restoredTaskFromSnapshot(snapshot, {
-				now, identityProbe: (pid) => { probedPids.push(pid); return row.identity; },
+			const restored = await restoredTaskFromSnapshot(snapshot, {
+				now, identityProbe: async (pid) => { probedPids.push(pid); return reading(row.identity); },
 			});
 			// Capture fields before the wake helper can normalize or change live state.
 			const restoredBeforeDecision = {

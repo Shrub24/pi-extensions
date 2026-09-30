@@ -54,9 +54,23 @@ async function execute(params: Record<string, unknown>) {
 	if (!tool) throw new Error("spawn_fixture.tool_missing=bg_task");
 	return await tool.execute("private-tool-call", params, undefined, undefined, ctx);
 }
+// session_shutdown releases the task list, so after it the task is read from
+// the snapshot it persisted for the next session to restore. `appendEntry`
+// records { type, customType, data }, and the snapshot set is `data.tasks`.
+function persistedTask(): Record<string, unknown> | undefined {
+	for (const entry of [...entries].reverse() as Array<{ data?: { tasks?: Record<string, unknown>[] } }>) {
+		const task = entry?.data?.tasks?.find((candidate) => candidate.id === "bg-1");
+		if (task) return task;
+	}
+	return undefined;
+}
 async function state() {
-	const inspected = await execute({ action: "log", id: "bg-1" });
-	const task = inspected.details.task;
+	// After `session_shutdown` the live map is empty (upstream's handler clears it,
+	// where HEAD's deliberately did not), and a finalized task may be pruned from
+	// it by the finished-task bound (#3224). The persisted snapshot is then the
+	// record — and reading it is what a later turn does too, so a pruned task and
+	// a retained one report the same state.
+	const task = (shutDown ? undefined : (await execute({ action: "log", id: "bg-1" })).details.task) ?? persistedTask();
 	if (!task) throw new Error("spawn_fixture.task_missing=bg-1");
 	return { id: task.id, pid: task.pid, status: task.status, reason: task.terminationReason ?? null, exitCode: task.exitCode, exitNotified: task.exitNotified };
 }
@@ -81,6 +95,20 @@ async function softState() {
 		softTimeoutMs: task.softTimeoutMs ?? null,
 		softTimeoutNotified: task.softTimeoutNotified ?? null,
 	};
+}
+
+// A task with pending log text finalizes after its log flush, which the real
+// file system finishes in real time.
+async function finalized() {
+	for (let waited = 0; waited < 5_000 && (await state()).status === "running"; waited += 1) await Bun.sleep(1);
+	// The status turns terminal synchronously in `closeTaskLifecycle`, but upstream
+	// defers `finalizeTask`'s exit-wake decision to the task log's flush: that
+	// callback is what records delivery as `exitNotified`. Landing pending writes
+	// and letting one macrotask run means the read below sees the snapshot a later
+	// turn would, instead of one caught mid-decision.
+	const { taskLogs } = await import("../../extensions/log-writer.js");
+	await taskLogs.drain();
+	await Bun.sleep(1);
 }
 try {
 	const { default: backgroundTasks } = await import("../../extensions/background-tasks.js");
@@ -345,9 +373,11 @@ try {
 		operatorStop = { messages: wakeText, activeStopKey: true };
 	} else if (input.mode === "wait-any") {
 		// No id: the wait should attach to the oldest running task. Native timers
-		// are intercepted, so fire the 1s expiry, then close the child.
-		const waitedPromise = execute({ action: "wait", waitSeconds: 1 });
-		native.fireTimeout(1_000);
+		// are intercepted, so fire the wait's expiry, then close the child. The
+		// window is 3s so it cannot be confused with the state writer's 1s
+		// persist window or the 2s log stall deadline; fireTimeout is exact.
+		const waitedPromise = execute({ action: "wait", waitSeconds: 3 });
+		native.fireTimeout(3_000);
 		const waited = await waitedPromise;
 		native.children[0]?.emit("close", 0);
 		waitAny = { first: spawned.content[0]?.text ?? "", waited: waited.content[0]?.text ?? "", details: waited.details as { task?: { id?: string } } };
@@ -385,10 +415,14 @@ try {
 			native.fireTimeout(5000);
 			escalated = { state: await state(), signals: [...native.signals], unitCalls: native.syncCalls.slice(stopStart) };
 			child.emit("close", null);
+			await finalized();
 		}
 	}
 	if (input.mode === "spawn") child.emit("close", 0);
 	const final = await state();
+	// Log lines are written asynchronously; the drain lands them before the read.
+	const { taskLogs } = await import("../../extensions/log-writer.js");
+	await taskLogs.drain();
 	const log = readFileSync(spawned.details.task!.logFile as string, "utf8");
 	const stoppedTimers = native.activeTimers();
 	const stopCalls = native.syncCalls.slice(stopStart);
