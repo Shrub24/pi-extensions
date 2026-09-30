@@ -6,10 +6,10 @@ repo's history.
 | Package | npm name | Provenance |
 |---|---|---|
 | `pi-bash-processes` | `@vanillagreen/pi-background-tasks` | fork of [vanillagreencom/kendex](https://github.com/vanillagreencom/kendex) `pi-extensions/pi-background-tasks`, extracted at `c9ee5844`; fork reason: a bounded foreground wait, configurable task policy, and log reads that consume the exit wake |
-| `pi-tool-renderer` | `@vanillagreen/pi-tool-renderer` | fork of kendex `pi-extensions/pi-tool-renderer`, extracted after upstream `#2467`; fork reason: render-path caching, and the bash decision moved to `session_start` |
+| `pi-tool-renderer` | `@vanillagreen/pi-tool-renderer` | fork of kendex `pi-extensions/pi-tool-renderer`, extracted after upstream `#2467` and kept current through `#3255` (`f5a2cd0a`); fork reason: the intent argument on the read/edit/write/search tools, the managed-bash row, panel chrome, and the bash registration deferred to `session_start` |
 | `pi-subagents` | `pi-subagents` | fork of [nicobailon/pi-subagents](https://github.com/nicobailon/pi-subagents), vendored at upstream `#2586`; fork reason: an advisory per-run soft deadline and a mid-run child context budget; upstream is active |
 | `pi-otel` | `pi-otel` | fork of [stnly/pi-otel](https://github.com/stnly/pi-otel) at `398d40a`; fork reason: trace-per-session became trace-per-run with Pi attempt and compaction semantics (`pi-otel/docs/plan.md`) |
-| `pi-output-policy` | `@vanillagreen/pi-output-policy` | fork of `kendex` `pi-extensions/pi-output-policy` at `522c52c`; fork reason: thinking deltas counted toward the 96K visible-output cap |
+| `pi-output-policy` | `@vanillagreen/pi-output-policy` | fork of `kendex` `pi-extensions/pi-output-policy` at `522c52c`, kept current through `#3213` (`6948c0f3`); fork reason: thinking deltas counted toward the 96K visible-output cap |
 | `pi-jev` | `@vanillagreen/pi-jev` | new; semantic decisions from Jev, as a link in `@gotgenes/pi-permission-system`'s authorizer chain |
 | `pi-cbmem` | `@vanillagreen/pi-cbmem` | new; codebase-memory MCP tools behind a short tool list, with a self-healing server |
 
@@ -47,12 +47,16 @@ kendex keeps its extensions under `pi-extensions/<name>`, so a take is the repo
 state we extracted from and the pivot is that path's last commit at or before it,
 which is content we actually have.
 
-Right now `pi-subagents` and `pi-otel` are level with their upstreams (47 and 11
-files differ), while kendex has moved under all three of its packages: 4 commits
-to take for `pi-bash-processes`, 9 for `pi-tool-renderer`, 2 for
-`pi-output-policy` — mostly a shared settings reader and retention rules that
-landed across kendex's packages at once. `pi-jev` and `pi-cbmem` were never forks
-of anything.
+Right now `pi-subagents` and `pi-otel` are level with their upstreams (92 and 11
+files differ — the 92 is our own delta, not lag). Two of the three kendex
+packages were taken on 2026-10-01: `pi-tool-renderer` at `f5a2cd0a` (#3255) and
+`pi-output-policy` at `6948c0f3` (#3213), both merging cleanly with this fork's
+own work. `pi-bash-processes` is the last one — it needs a real merge rather than
+a take, because the fork carries four commits upstream never adopted (a bounded
+foreground wait, configurable task policy, soft timeouts, and the read shims
+that stop a log read from consuming the exit wake) while upstream refactored
+several of its concerns out into new modules. `pi-jev` and `pi-cbmem` were never
+forks of anything.
 
 The branch that carries a fork's lineage is `refs/heads/import-<package>`, not the
 current tree: the `pi-subagents` directory arrived here as one commit even though
