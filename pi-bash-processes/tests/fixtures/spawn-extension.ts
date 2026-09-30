@@ -89,7 +89,7 @@ try {
 	started = true;
 	// Only the platform-sensitive spawn call runs under this row's platform.
 	if (input.platform) Object.defineProperty(process, "platform", { ...originalPlatform, value: input.platform });
-	const wantsExitWake = input.mode === "deferred" || input.mode === "deferred-unobserved" || input.mode === "deferred-wait" || input.mode === "deferred-raw-read" || input.mode === "deferred-settle-hold" || input.mode === "operator-stop" || input.mode === "soft-expiry" || input.mode === "soft-extend" || input.mode === "soft-restore" || input.mode === "soft-terminal";
+	const wantsExitWake = input.mode === "deferred" || input.mode === "deferred-unobserved" || input.mode === "deferred-wait" || input.mode === "deferred-raw-read" || input.mode === "deferred-raw-read-foreign" || input.mode === "deferred-settle-hold" || input.mode === "operator-stop" || input.mode === "soft-expiry" || input.mode === "soft-extend" || input.mode === "soft-restore" || input.mode === "soft-terminal";
 	// Legacy scenarios pin the soft reminder off (`softTimeoutMs: 0`) so their
 	// exact timer sets stay about the behavior under test; `softTimeoutMs: null`
 	// exercises the extension default, and a number is passed through.
@@ -108,7 +108,7 @@ try {
 	let supersede: { wakes: unknown[]; listText: string } | undefined;
 	let operatorStop: { messages: unknown[]; activeStopKey: boolean } | undefined;
 	let deferred: { afterExit: unknown[]; afterLog: unknown[]; afterTurnEnd: unknown[] } | undefined;
-	if (input.mode === "deferred" || input.mode === "deferred-unobserved" || input.mode === "deferred-wait" || input.mode === "deferred-raw-read" || input.mode === "deferred-settle-hold" ) {
+	if (input.mode === "deferred" || input.mode === "deferred-unobserved" || input.mode === "deferred-wait" || input.mode === "deferred-raw-read" || input.mode === "deferred-raw-read-foreign" || input.mode === "deferred-settle-hold" ) {
 		// Run in flight: the exit arrives mid-run. The run boundary is
 		// before_agent_start → agent_end → agent_settled (Pi emits turn_end per tool round, so
 		// flushing there would split one run's completions across wakes).
@@ -124,7 +124,21 @@ try {
 		if (input.mode === "deferred-raw-read") {
 			// The agent read the log through a shimmed tool (cat/tail/head/grep/less
 			// or `pi-bg read`): the wrapper appended the exact path it opened to the
-			// consume log. That read is the delivery and must drop the pending wake.
+			// consuming session's own consume log (consumed-<pid>.log — one file per
+			// Pi session, since the task dir is shared by every session on the
+			// machine and a drain truncates what it reads). That read is the delivery
+			// and must drop the pending wake.
+			const logFile = spawned.details.task!.logFile as string;
+			const dir = process.env.PI_BG_TASK_DIR!;
+			appendFileSync(join(dir, `consumed-${process.pid}.log`), `${logFile}\n`);
+			afterLog = messages.slice(afterExit.length);
+		}
+		if (input.mode === "deferred-raw-read-foreign") {
+			// Regression (cross-session consume theft): a record in some other
+			// session's consume file — here the legacy shared `consumed.log` — must
+			// be invisible to this session both ways: it cannot consume our wake, and
+			// (per-process files) no other session can truncate ours before we match
+			// it. The wake therefore still flushes at run end.
 			const logFile = spawned.details.task!.logFile as string;
 			const dir = process.env.PI_BG_TASK_DIR!;
 			appendFileSync(join(dir, "consumed.log"), `${logFile}\n`);

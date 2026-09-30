@@ -1,5 +1,8 @@
 import { expect, test } from "bun:test";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
+import { consumeLogPath } from "../extensions/settings.js";
 import { runSpawnFixture, SPAWN_FIXTURE_TIMEOUT_MS } from "./fixtures/spawn-child-runner.js";
 
 /**
@@ -74,6 +77,37 @@ test("a read reported by the log shims consumes the pending wake", () => {
 	}) as { deferred: { afterExit: unknown[]; afterLog: unknown[]; afterTurnEnd: unknown[] } };
 	expect(result.deferred.afterExit).toHaveLength(0);
 	expect(result.deferred.afterTurnEnd, "the bash read already delivered this exit").toHaveLength(0);
+}, SPAWN_FIXTURE_TIMEOUT_MS);
+
+/**
+ * Regression (bg-2191/bg-2204, 2026-09-29): the read shims and the drain used
+ * ONE task-dir-wide `consumed.log`, while every Pi session on the machine
+ * drains the file it reads and truncates it. Any other session's flush could
+ * therefore swallow a record before the owning session's run ended — the read
+ * was lost, and the agent was woken for a result it had already read. The live
+ * proof: this session recorded a shimmed read mid-run and the file was empty
+ * before this session had settled once.
+ *
+ * The consume log is now per process, so a record can only be matched (and
+ * truncated) by the session that wrote it.
+ */
+test("the consume log is per process, so no other session can swallow a read", () => {
+	expect(consumeLogPath().endsWith(`consumed-${process.pid}.log`), "one consume log per Pi session").toBe(true);
+	expect(consumeLogPath()).not.toBe(join(tmpdir(), "kendex-pi-bg", "consumed.log"));
+});
+
+/**
+ * The other half of the same invariant: a record that lands in some other
+ * session's file (here the legacy shared name) is neither acted on nor able to
+ * mask ours — the wake this session owes still flushes at run end.
+ */
+test("a record in a foreign consume file does not touch this session's wake", () => {
+	const result = runSpawnFixture("spawn-extension.ts", {
+		mode: "deferred-raw-read-foreign",
+		command: "sleep 30 && echo done",
+	}) as { deferred: { afterExit: unknown[]; afterLog: unknown[]; afterTurnEnd: unknown[] } };
+	expect(result.deferred.afterExit).toHaveLength(0);
+	expect(result.deferred.afterTurnEnd, "a foreign file neither consumes nor hides our wake").toHaveLength(1);
 }, SPAWN_FIXTURE_TIMEOUT_MS);
 
 /**

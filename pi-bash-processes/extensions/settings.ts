@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 
@@ -141,9 +141,37 @@ export function shimDir(): string {
  * Append-only file the read shims write to when a managed log is read.
  * Drained (and truncated) before any wake is handed over, so a read that
  * happened while the run was still going cancels that task's wake.
+ *
+ * Per process, not one shared file: the task dir is shared by every Pi session
+ * on the machine, while a drain matches records against its own task map and
+ * truncates whatever it read. With one shared file, any other session's flush
+ * could swallow a record before the session that owns the task saw it — the
+ * read was silently lost and the exit wake fired anyway.
  */
 export function consumeLogPath(): string {
-	return join(taskDir(), "consumed.log");
+	return join(taskDir(), `consumed-${process.pid}.log`);
+}
+
+let prunedConsumeLogs = false;
+/** Drops per-process consume logs whose session is long gone. Best effort, once per process. */
+function pruneStaleConsumeLogs(): void {
+	if (prunedConsumeLogs) return;
+	prunedConsumeLogs = true;
+	try {
+		const dir = taskDir();
+		const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+		for (const entry of readdirSync(dir)) {
+			if (!/^consumed-\d+\.log$/.test(entry) || entry === `consumed-${process.pid}.log`) continue;
+			const file = join(dir, entry);
+			try {
+				if (statSync(file).mtimeMs < cutoff) rmSync(file, { force: true });
+			} catch {
+				// Best effort.
+			}
+		}
+	} catch {
+		// Best effort.
+	}
 }
 
 function piAgentDir(): string {
@@ -170,6 +198,7 @@ export function taskEnv(): NodeJS.ProcessEnv {
  * binary, so behavior is unchanged except for the side-channel append.
  */
 export function readShimEnv(): Record<string, string> {
+	pruneStaleConsumeLogs();
 	const dir = installReadShims(shimDir());
 	if (!dir) return {};
 	return {
