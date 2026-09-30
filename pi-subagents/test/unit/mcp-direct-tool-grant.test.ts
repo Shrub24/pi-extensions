@@ -188,6 +188,28 @@ test("sanitizes server prefixes the way adapter registration does", () => {
 	}
 });
 
+// The adapter renders a resource as `read_<name>`, so a server granted by name
+// resolves its tools and its resources together. `get_` here would leave every
+// resource selector unresolved against cached metadata the adapter wrote.
+test("names generated resource tools the way the adapter registers them", () => {
+	const grant = planMcpDirectToolGrant({
+		selectors: ["grep.app"],
+		servers: { "grep.app": {} },
+		metadata: {
+			"grep.app": {
+				tools: [{ name: "searchGitHub" }],
+				resources: [{ name: "Index Status", uri: "resource://index-status" }],
+			},
+		},
+		toolPrefix: "server",
+	});
+
+	assert.deepEqual(grant.selections, [
+		{ name: "grep_2e_app_searchGitHub", selector: "grep.app/searchGitHub" },
+		{ name: "grep_2e_app_read_index_status", selector: "grep.app/read_index_status" },
+	]);
+});
+
 test("supports the adapter mcp prefix mode", () => {
 	const grant = planMcpDirectToolGrant({
 		selectors: ["codegraph"],
