@@ -33,8 +33,8 @@ declare -A FORK=(
   [pi-otel]="https://github.com/stnly/pi-otel.git"
 )
 declare -A BASE=(
-  # docs: require implementation topology preflight (#2350)
-  [pi-subagents]="5280293512e9c23f3397c3cba354db6095b89b5f"
+  # fix: keep delegation and supervisor tools out of codemode scripts (#2586)
+  [pi-subagents]="27c2bf6d1a6499c30bc38e452e68c6fd9a0ca7b6"
   # chore: release 0.3.1
   [pi-otel]="0e3a1f102e13fd67e308562ee82a565703c78529"
 )

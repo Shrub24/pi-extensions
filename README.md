@@ -7,7 +7,7 @@ repo's history.
 |---|---|---|
 | `pi-bash-processes` | `@vanillagreen/pi-background-tasks` | extracted from [vanillagreencom/kendex](https://github.com/vanillagreencom/kendex) at `b146363` (`pi-extensions/pi-background-tasks`); independent since |
 | `pi-tool-renderer` | `@vanillagreen/pi-tool-renderer` | extracted from [vanillagreencom/kendex](https://github.com/vanillagreencom/kendex) (`pi-extensions/pi-tool-renderer`), last upstream commit `#2467`; independent since |
-| `pi-subagents` | `pi-subagents` | fork of [nicobailon/pi-subagents](https://github.com/nicobailon/pi-subagents), vendored at upstream `#2350`; upstream is active |
+| `pi-subagents` | `pi-subagents` | fork of [nicobailon/pi-subagents](https://github.com/nicobailon/pi-subagents), vendored at upstream `#2586`; fork reason: an advisory per-run soft deadline and a mid-run child context budget; upstream is active |
 | `pi-otel` | `pi-otel` | fork of [stnly/pi-otel](https://github.com/stnly/pi-otel) at `398d40a`; fork reason: trace-per-session became trace-per-run with Pi attempt and compaction semantics (`pi-otel/docs/plan.md`) |
 | `pi-output-policy` | `@vanillagreen/pi-output-policy` | fork of `kendex` `pi-extensions/pi-output-policy` at `522c52c`; fork reason: thinking deltas counted toward the 96K visible-output cap |
 | `pi-jev` | `@vanillagreen/pi-jev` | new; semantic decisions from Jev, as a link in `@gotgenes/pi-permission-system`'s authorizer chain |
@@ -38,8 +38,8 @@ git cherry-pick -n <sha>                                   # take one fix; the c
 ```
 
 `scripts/upstream.sh` refreshes the mirrors and the rewrite and prints how far
-behind each fork is. `pi-subagents` is the one with a real backlog; `pi-otel` is
-level with its upstream. The other four are independent: kendex's copies of
+behind each fork is. Both forks sit on upstream heads and carry a local delta on
+top. The other four are independent: kendex's copies of
 `pi-bash-processes`, `pi-tool-renderer` and `pi-output-policy` are frozen (a single
 version-bump commit since the extraction), and `pi-jev` and `pi-cbmem` were never
 forks of anything.
