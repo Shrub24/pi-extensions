@@ -112,7 +112,7 @@ report() {
     printf '%-18s upstream %s · last take %s %s · %s to take · %s files differ\n' \
       "$pkg" "$tip" "${newest_take:0:7}" "$newest_subject" "$newest_behind" "$delta"
     if [ "$newest_behind" != "0" ]; then
-      git log --oneline --no-decorate "$newest_pivot..$ref" -- "$pkg" | head -"$UNTAKEN_SHOWN" | sed 's/^/    /'
+      git log --oneline --no-decorate -n "$UNTAKEN_SHOWN" "$newest_pivot..$ref" -- "$pkg" | sed 's/^/    /'
       [ "$newest_behind" -le "$UNTAKEN_SHOWN" ] || printf '    … %s more\n' "$((newest_behind - UNTAKEN_SHOWN))"
     fi
   fi
