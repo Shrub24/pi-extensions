@@ -99,7 +99,9 @@ export function planMcpDirectToolGrant(input: McpDirectToolGrantInput): McpDirec
 		if (server.exposeResources === false) continue;
 		for (const resource of Array.isArray(metadata.resources) ? metadata.resources : []) {
 			if (typeof resource?.name !== "string" || !resource.name || typeof resource.uri !== "string" || !resource.uri) continue;
-			const baseName = `get_${resourceNameToToolName(resource.name)}`;
+			// pi-mcp-adapter renders a resource as `read_<name>`; matching that is
+			// what lets the same metadata resolve to the same tool on both sides.
+			const baseName = `read_${resourceNameToToolName(resource.name)}`;
 			if (toolFilter !== true && !toolFilter.has(baseName)) continue;
 			if (!isToolAllowed(baseName, serverName, prefix, server.includeTools, server.excludeTools)) continue;
 			const name = formatToolName(baseName, serverName, prefix);

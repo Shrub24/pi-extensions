@@ -20,7 +20,7 @@ test("plans server grants from explicit metadata facts and preserves resource fi
 	assert.deepEqual(grant, {
 		selections: [
 			{ name: "browser-mcp_navigate", selector: "browser-mcp/navigate" },
-			{ name: "browser-mcp_get_console_logs", selector: "browser-mcp/get_console_logs" },
+			{ name: "browser-mcp_read_console_logs", selector: "browser-mcp/read_console_logs" },
 		],
 		unresolvedSelectors: [],
 	});
@@ -64,8 +64,8 @@ test("enforces server includeTools before exclusions for tools and generated res
 		selectors: ["demo"],
 		servers: {
 			demo: {
-				includeTools: ["get_*", "demo_list_records"],
-				excludeTools: ["get_secret", "demo_get_private*"],
+				includeTools: ["get_*", "demo_list_records", "read_*"],
+				excludeTools: ["get_secret", "demo_get_private*", "demo_read_private_notes"],
 			},
 		},
 		metadata: {
@@ -88,7 +88,7 @@ test("enforces server includeTools before exclusions for tools and generated res
 	assert.deepEqual(grant.selections, [
 		{ name: "demo_get_public", selector: "demo/get_public" },
 		{ name: "demo_list_records", selector: "demo/list_records" },
-		{ name: "demo_get_run_book", selector: "demo/get_run_book" },
+		{ name: "demo_read_run_book", selector: "demo/read_run_book" },
 	]);
 	assert.deepEqual(grant.unresolvedSelectors, []);
 });
