@@ -34,6 +34,7 @@ remotes, which makes the two operations one command each:
 
 ```bash
 git diff upstream-pi-subagents/main HEAD -- pi-subagents   # our delta against the current upstream tip
+jj  diff --from main@upstream-pi-subagents --to @ -- pi-subagents   # the same, in jj's naming
 ./scripts/upstream.sh                                      # refresh mirrors; print what upstream has after our last take
 git cherry-pick -n <sha>                                   # take one commit; it lands here as an ordinary commit
 ```
@@ -67,12 +68,16 @@ git rebase --onto upstream-pi-subagents/main <pivot>       # pivot = that branch
 The pivot has to come from the branch being rebased. The two rewrites give the
 same upstream commit different ids — `#2350` is `868e45be2` in the import branch
 and `528029351` in the mirror — so an id from one is meaningless in the other;
-`scripts/upstream.sh` resolves each in its own id space by subject. That rebase
-stops on the MCP and schema files for a hand resolution (a scratch run on
-2026-10-01 conflicted in five), which is why the 2026-09-30 syncs took upstream's
-tree whole and re-applied the delta instead: cheaper per take, but it leaves the
-import branch behind, so its rebase now replays the 09-27 delta rather than
-today's.
+`scripts/upstream.sh` resolves each in its own id space by subject.
+
+A rebase replays only what the branch carries, and for `pi-subagents` that is no
+longer what this tree differs by: the branch stops at `#2350`, one soft-deadline
+commit past it, while the tree has since taken upstream twice and grown the
+context-budget feature — 305 files apart. `pi-otel` is one file apart. The script
+prints that gap for each fork, because the tree, not the branch, is where a
+fork's work now lives: hence the 2026-09-30 syncs took upstream's tree whole and
+re-applied the delta, which cost a hand resolution in the files both sides
+changed and left the import branch behind.
 
 ## Develop
 

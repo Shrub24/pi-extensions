@@ -34,9 +34,15 @@
 #   git checkout import-pi-subagents
 #   git rebase --onto upstream-pi-subagents/main <pivot>   # pivot = that branch's last upstream commit
 #
-# The report prints each branch's pivot, and says so when the branch stops
-# before the newest take (a take that came in as a whole tree, leaving the
-# import branch behind).
+# That replays only what the import branch carries. Whether that is also what
+# this tree differs by is a separate question, and usually not: a take that came
+# in as a whole tree leaves the branch behind, so the report prints how far the
+# tree has moved past each branch before anyone rebases it.
+#
+# jj names the same commits its own way — a remote branch is <branch>@<remote>,
+# a local one is its bookmark — so the delta reads
+#
+#   jj diff --from 'main@upstream-pi-subagents' --to @ -- pi-subagents
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
@@ -52,7 +58,8 @@ FORKS=(
 UNTAKEN_SHOWN=8
 
 refresh_pristine() {
-  local mirror=$1 url=$2 dir="$MIRRORS/upstream/$mirror.git"
+  local mirror=$1 url=$2
+  local dir="$MIRRORS/upstream/$mirror.git"
   if [ -d "$dir" ]; then
     git -C "$dir" fetch --quiet --prune origin '+refs/heads/*:refs/heads/*'
   else
@@ -62,7 +69,8 @@ refresh_pristine() {
 }
 
 rewrite() {
-  local pkg=$1 mirror=$2 path=$3 out="$MIRRORS/ns/$pkg.git"
+  local pkg=$1 mirror=$2 path=$3
+  local out="$MIRRORS/ns/$pkg.git"
   rm -rf "$out"
   mkdir -p "$MIRRORS/ns"
   git clone --quiet --mirror "$MIRRORS/upstream/$mirror.git" "$out"
@@ -79,7 +87,7 @@ report() {
   shift 3
   local pristine="$MIRRORS/upstream/$mirror.git"
   local ref="upstream-$pkg/main"
-  local tip delta take last subject pivot="" pivot_subject="" behind newest_behind=""
+  local tip delta take last subject pivot="" behind newest_behind=""
 
   for take in "$@"; do
     last=$(git -C "$pristine" rev-list -1 "$take" -- "$path")
@@ -109,15 +117,23 @@ report() {
     fi
   fi
 
-  local branch="import-$pkg" import_pivot branch_head
+  local branch="import-$pkg" import_pivot branch_head drift
   if git rev-parse --verify --quiet "$branch" >/dev/null; then
     branch_head=$(git log -1 --format='%h %s (%ad)' --date=short "$branch")
     import_pivot=$(git log --format='%h' -1 "$branch" --fixed-strings --grep="${newest_subject:-}" 2>/dev/null || true)
-    if [ -n "$import_pivot" ]; then
-      printf '    %s holds through %s — rebase its delta with: git rebase --onto %s %s %s\n' \
+    drift=$(git diff --numstat "$branch" HEAD -- "$pkg" | wc -l)
+    if [ "$drift" -ne 0 ]; then
+      local unit="files"
+      if [ "$drift" -eq 1 ]; then unit="file"; fi
+      printf '    %s holds through %s — this tree is %s %s past it, so a rebase there\n' \
+        "$branch" "$branch_head" "$drift" "$unit"
+      printf '      replays only what that branch carries. The delta is: git diff %s HEAD -- %s\n' \
+        "$ref" "$pkg"
+    elif [ -n "$import_pivot" ]; then
+      printf '    %s holds through %s and matches the tree — rebase its delta with: git rebase --onto %s %s %s\n' \
         "$branch" "$branch_head" "$ref" "$import_pivot" "$branch"
     else
-      printf '    %s head %s — predates the newest take, so a rebase there replays the older delta\n' \
+      printf '    %s holds through %s — predates the newest take, so a rebase there replays the older delta\n' \
         "$branch" "$branch_head"
     fi
   fi
