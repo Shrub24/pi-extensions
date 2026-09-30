@@ -684,16 +684,14 @@ Do work
 		assert.equal(worker?.defaultContext, "fork");
 	});
 
-	it("loads packaged worker and oracle with fork defaultContext and advisor alias", () => {
+	it("loads packaged worker fresh and oracle forked with advisor alias", () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-builtin-default-context-"));
 		tempDirs.push(dir);
 		const agents = discoverAgentsAll(dir).builtin;
 
-		for (const name of ["worker", "oracle"]) {
-			const agent = agents.find((candidate) => candidate.name === name);
-			assert.equal(agent?.defaultContext, "fork", `${name} should default to fork context`);
-		}
+		assert.equal(agents.find((candidate) => candidate.name === "worker")?.defaultContext, "fresh");
 		const oracle = agents.find((candidate) => candidate.name === "oracle");
+		assert.equal(oracle?.defaultContext, "fork");
 		assert.deepEqual(oracle?.aliases, ["advisor"]);
 		assert.doesNotMatch(oracle?.tools?.join(",") ?? "", /contact_supervisor/);
 		for (const name of ["scout", "researcher", "oracle", "reviewer"]) {
@@ -1271,6 +1269,8 @@ Agent prompt
 				},
 			},
 		});
+		// Mark this fixture as the project root, even when /tmp is a project.
+		fs.mkdirSync(path.join(dir, ".pi"));
 		writeAgent(path.join(dir, "root-agent.md"), `---
 name: root-agent
 description: Root package agent
@@ -1432,62 +1432,6 @@ Review only.
 		assert.equal(result.isError, true);
 		assert.match(result.content[0]?.text ?? "", /read-only/);
 	}));
-});
-
-describe("agent frontmatter completionGuard", () => {
-	it("serializes disabled completion guard into agent frontmatter", () => {
-		const agent: AgentConfig = {
-			name: "test-runner",
-			description: "Test runner",
-			systemPrompt: "Validate changes",
-			systemPromptMode: "replace",
-			inheritProjectContext: false,
-			inheritSkills: false,
-			source: "project",
-			filePath: "/tmp/test-runner.md",
-			completionGuard: false,
-		};
-
-		const serialized = serializeAgent(agent);
-		assert.match(serialized, /completionGuard: false/);
-	});
-
-	it("omits enabled completion guard from serialized frontmatter", () => {
-		const agent: AgentConfig = {
-			name: "test-runner",
-			description: "Test runner",
-			systemPrompt: "Validate changes",
-			systemPromptMode: "replace",
-			inheritProjectContext: false,
-			inheritSkills: false,
-			source: "project",
-			filePath: "/tmp/test-runner.md",
-			completionGuard: true,
-		};
-
-		const serialized = serializeAgent(agent);
-		assert.doesNotMatch(serialized, /completionGuard:/);
-	});
-
-	it("parses completionGuard from discovered agent frontmatter", () => {
-		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-agent-completion-guard-"));
-		tempDirs.push(dir);
-		const agentsDir = path.join(dir, ".pi", "agents");
-		fs.mkdirSync(agentsDir, { recursive: true });
-		fs.writeFileSync(path.join(agentsDir, "test-runner.md"), `---
-name: test-runner
-description: Test runner
-completionGuard: false
----
-
-Validate changes
-`, "utf-8");
-
-		const result = discoverAgents(dir, "project");
-		const runner = result.agents.find((agent) => agent.name === "test-runner");
-		assert.equal(runner?.completionGuard, false);
-		assert.equal(runner?.extraFields?.completionGuard, undefined);
-	});
 });
 
 describe("agent frontmatter maxSubagentDepth", () => {
@@ -1822,7 +1766,7 @@ Do work
 		assert.equal(worker?.extraFields?.fast, undefined);
 	});
 
-	it("adds the fast extension only for allowlisted native models", () => {
+	it("adds the fast extension only for native OpenAI-Codex models", () => {
 		const launch = {
 			host: "parent" as const,
 			cwd: process.cwd(),
@@ -1834,12 +1778,13 @@ Do work
 			childIndex: 0,
 			fast: true,
 		};
-		const allowed = buildInProcessChildLaunch({ ...launch, model: "openai-codex/gpt-5.6-luna:low" });
+		const allowed = buildInProcessChildLaunch({ ...launch, model: "openai-codex/gpt-6-sol:low" });
 
 		assert.ok(allowed.toolPlan.runtimeExtensions.some((extensionPath) => extensionPath.endsWith("fast-mode-extension.ts")));
 		// Ordered as loaded: prompt runtime, then the per-feature hooks the launch adds.
 		assert.deepEqual(allowed.session.hooks.map((hook) => hook.name), ["pi-subagents:prompt-runtime", "pi-subagents:fast-mode", "pi-subagents:child-compaction"]);
 		assert.throws(() => buildInProcessChildLaunch({ ...launch, model: "anthropic/claude-sonnet-4" }), /fast mode supports only/);
+		assert.throws(() => buildInProcessChildLaunch({ ...launch, model: "openai/gpt-6-sol" }), /fast mode supports only/);
 	});
 });
 

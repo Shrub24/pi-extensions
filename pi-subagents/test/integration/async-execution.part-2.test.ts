@@ -11,6 +11,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { pathToFileURL } from "node:url";
 import { createTempDir, events, makeAgent, makeMinimalCtx, removeTempDir, resolveMockPiCallArgs } from "../support/helpers.ts";
 import { deliverInterruptRequest, deliverStopRequest, deliverTimeoutRequest, requestAsyncSteer } from "../../src/runs/background/control-channel.ts";
 import { writeAtomicJson } from "../../src/shared/atomic-json.ts";
@@ -203,29 +204,55 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		mockPi.onCall({ output: "first done" });
 		mockPi.onCall({ delay: 10_000, output: "second done" });
 		const id = `async-paused-stop-race-${Date.now().toString(36)}`;
-		executeAsyncChain(id, {
-			chain: [{ parallel: [{ agent: "first", task: "Finish", acceptance: false }, { agent: "second", task: "Wait", acceptance: false }], concurrency: 2 }],
-			resultMode: "parallel",
-			agents: [makeAgent("first"), makeAgent("second")],
-			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
-			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
-			shareEnabled: false,
-			maxSubagentDepth: 2,
-		});
-
 		const asyncDir = path.join(ASYNC_DIR, id);
+		const gateDir = path.join(tempDir, `${id}-gate`);
+		fs.mkdirSync(gateDir);
+		const preload = path.join(tempDir, `${id}-close-stop-inbox.mjs`);
+		fs.writeFileSync(preload, `
+import fs from "node:fs";
+import path from "node:path";
+import { syncBuiltinESMExports } from "node:module";
+const gateDir = process.env.PAUSED_STOP_GATE_DIR;
+const originalRename = fs.renameSync;
+fs.renameSync = function(source, target) {
+  if (path.basename(String(target)) === "stop-inbox-closed.json") {
+    fs.writeFileSync(path.join(gateDir, "reached"), "");
+    // Longer than the test's own waits, so a slow test process still delivers stop before closure.
+    const deadline = Date.now() + 60000;
+    while (!fs.existsSync(path.join(gateDir, "release")) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+  }
+  return originalRename.call(this, source, target);
+};
+syncBuiltinESMExports();
+`);
+		const previousNodeOptions = process.env.NODE_OPTIONS;
+		process.env.NODE_OPTIONS = [previousNodeOptions, `--import=${pathToFileURL(preload).href}`].filter(Boolean).join(" ");
+		process.env.PAUSED_STOP_GATE_DIR = gateDir;
+		try {
+			executeAsyncChain(id, {
+				chain: [{ parallel: [{ agent: "first", task: "Finish", acceptance: false }, { agent: "second", task: "Wait", acceptance: false }], concurrency: 2 }],
+				resultMode: "parallel",
+				agents: [makeAgent("first"), makeAgent("second")],
+				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false,
+				maxSubagentDepth: 2,
+			});
+		} finally {
+			if (previousNodeOptions === undefined) delete process.env.NODE_OPTIONS; else process.env.NODE_OPTIONS = previousNodeOptions;
+			delete process.env.PAUSED_STOP_GATE_DIR;
+		}
+
 		const running = await waitForAsyncState(id, (status) => status.steps?.[1]?.status === "running" && typeof status.pid === "number");
-		const pausedStop = new Promise<void>((resolve) => {
-			const timer = setInterval(() => {
-				const status = readStatus(asyncDir);
-				if (status?.state !== "paused") return;
-				deliverStopRequest({ asyncDir, pid: status.pid, source: "test" });
-				clearInterval(timer);
-				resolve();
-			}, 1);
-		});
 		deliverInterruptRequest({ asyncDir, pid: running.pid, source: "test" });
-		await pausedStop;
+		const gateDeadline = Date.now() + 30_000;
+		while (!fs.existsSync(path.join(gateDir, "reached")) && Date.now() < gateDeadline) await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.equal(fs.existsSync(path.join(gateDir, "reached")), true, "runner must reach stop-inbox closure before the test delivers stop");
+		try {
+			deliverStopRequest({ asyncDir, pid: running.pid, source: "test" });
+		} finally {
+			fs.writeFileSync(path.join(gateDir, "release"), "");
+		}
 
 		const resultPath = await waitForAsyncResultFile(id, 30_000);
 		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
@@ -236,7 +263,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.deepEqual(status.steps?.map((step) => step.status), ["complete", "stopped"]);
 	});
 
-	for (const diagnostic of ["hidden", "empty", "structured", "file", "mutation"] as const) {
+	for (const diagnostic of ["hidden", "empty", "structured", "file"] as const) {
 		for (const interrupted of [true, false]) {
 			it(`${interrupted ? "defers" : "enforces"} ${diagnostic} completion diagnostics ${interrupted ? "while paused" : "on completion"}`, { skip: !isAsyncAvailable() ? "jiti not available" : process.platform === "win32" ? "cross-process interrupt delivery unreliable on Windows CI" : undefined }, async () => {
 				const id = `async-completion-${diagnostic}-${interrupted}-${Date.now().toString(36)}`;
@@ -256,12 +283,12 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 				const launch = executeAsyncChain(id, {
 					chain: [{
 						agent: "worker",
-						task: diagnostic === "mutation" ? "Implement the fix in src/example.ts." : "Inspect the task and return a report. Do not edit files.",
+						task: "Inspect the task and return a report. Do not edit files.",
 						acceptance: false,
 						...(diagnostic === "structured" ? { outputSchema: { type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } } } : {}),
 						...(diagnostic === "file" ? { output: outputPath, outputMode: "file-only" as const } : {}),
 					}],
-					agents: [makeAgent("worker", { tools: ["read", "write"], completionGuard: diagnostic === "mutation" })],
+					agents: [makeAgent("worker", { tools: ["read", "write"] })],
 					ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-completion-diagnostics" },
 					artifactConfig: { enabled: true, includeInput: false, includeOutput: true, includeJsonl: true, includeMetadata: true, cleanupDays: 7 },
 					artifactsDir: path.join(tempDir, "artifacts", id),
@@ -296,7 +323,6 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 						empty: /empty|no.*output/i,
 						structured: /structured_output/,
 						file: /Required file-only output was not produced/,
-						mutation: /without making edits/,
 					};
 					assert.match(payload.results[0]?.error ?? "", expected[diagnostic]);
 					assert.equal(status.steps?.[0]?.status, "failed");
@@ -318,7 +344,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		executeAsyncSingle(id, {
 			agent: "worker",
 			task: "Wait for guidance",
-			agentConfig: makeAgent("worker", { completionGuard: false }),
+			agentConfig: makeAgent("worker"),
 			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-inbox-steer" },
 			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
 			shareEnabled: false,
@@ -368,7 +394,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		executeAsyncSingle(id, {
 			agent: "worker",
 			task: "Wait for guidance",
-			agentConfig: makeAgent("worker", { completionGuard: false }),
+			agentConfig: makeAgent("worker"),
 			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-steer-unconsumed-queued" },
 			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
 			shareEnabled: false,
@@ -427,7 +453,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		executeAsyncSingle(id, {
 			agent: "worker",
 			task: "Wait for guidance",
-			agentConfig: makeAgent("worker", { completionGuard: false }),
+			agentConfig: makeAgent("worker"),
 			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-steer-consumed" },
 			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
 			shareEnabled: false,
@@ -1190,7 +1216,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.match(payload.results[0]?.error ?? "", /subagentOnlyExtensions/);
 	});
 
-	it("records blocked mutation effects when background implementation tools are missing", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+	it("preserves missing background child-tool failures without mutation inference", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({ output: "I cannot edit because fixture_search is missing", missingTools: ["fixture_search"] });
 		const id = `async-missing-implementation-tool-${Date.now().toString(36)}`;
 
@@ -1213,12 +1239,8 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(payload.success, false);
 		assert.equal(payload.state, "failed");
 		assert.match(payload.results[0]?.error ?? "", /requested unavailable child tools: fixture_search/);
-		assert.doesNotMatch(payload.results[0]?.error ?? "", /completed without making edits/);
-		assert.equal(payload.results[0]?.effects?.fileMutation?.status, "blocked");
-		assert.equal(payload.results[0]?.effects?.fileMutation?.expected, true);
-		assert.equal(payload.results[0]?.effects?.fileMutation?.attempted, false);
-		assert.match(payload.results[0]?.effects?.fileMutation?.message ?? "", /requested unavailable child tools: fixture_search/);
-		assert.equal(statusPayload.steps?.[0]?.effects?.fileMutation?.status, "blocked");
+		assert.equal(payload.results[0]?.effects?.fileMutation, undefined);
+		assert.equal(statusPayload.steps?.[0]?.effects?.fileMutation, undefined);
 	});
 
 	it("applies agent acceptance roles to inferred async acceptance", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
@@ -1241,7 +1263,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 
 
 
-	it("infers async chain acceptance after expanding top-level task templates", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+	it("uses structured roles instead of expanded task text for async chain acceptance", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({ output: "patched" });
 		mockPi.onCall({ output: "reviewed" });
 
@@ -1256,7 +1278,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			maxSubagentDepth: 2,
 		});
 		const patchPayload = await readAsyncPayload(patchId);
-		assert.equal(patchPayload.results[0]?.acceptance?.effectiveAcceptance?.level, "checked");
+		assert.equal(patchPayload.results[0]?.acceptance?.effectiveAcceptance?.level, "none");
 
 		const reviewId = `async-role-task-template-review-${Date.now().toString(36)}`;
 		executeAsyncChain(reviewId, {
@@ -1269,7 +1291,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			maxSubagentDepth: 2,
 		});
 		const reviewPayload = await readAsyncPayload(reviewId);
-		assert.equal(reviewPayload.results[0]?.acceptance?.effectiveAcceptance?.level, "none");
+		assert.equal(reviewPayload.results[0]?.acceptance?.effectiveAcceptance?.level, "checked");
 	});
 
 
@@ -1348,7 +1370,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		executeAsyncSingle(id, {
 			agent: "worker",
 			task: "Implement acceptance-covered fix",
-			agentConfig: makeAgent("worker", { completionGuard: false }),
+			agentConfig: makeAgent("worker"),
 			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-acceptance" },
 			artifactConfig,
 			shareEnabled: false,
@@ -1779,7 +1801,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.deepEqual(dynamicNode?.children?.map((child) => child.acceptanceStatus), ["not-required", "not-required"]);
 	});
 
-	it("infers async dynamic acceptance after materializing item templates", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+	it("does not infer async dynamic acceptance from materialized item templates", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({ output: "targets", structuredOutput: { items: [{ path: "src/a.ts" }, { path: "src/b.ts" }] } });
 		const writerReport = [
 			"done",
@@ -1817,11 +1839,11 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 
 		const payload = await readAsyncPayload(id);
 		const explorerResults = payload.results.filter((child) => child.agent === "explorer");
-		assert.deepEqual(explorerResults.map((child) => child.acceptance?.effectiveAcceptance?.level), ["checked", "checked"]);
+		assert.deepEqual(explorerResults.map((child) => child.acceptance?.effectiveAcceptance?.level), ["none", "none"]);
 		const dynamicNode = payload.workflowGraph?.nodes?.[1];
 		assert.equal(payload.success, true);
-		assert.equal(dynamicNode?.acceptanceStatus, "rejected");
-		assert.deepEqual(dynamicNode?.children?.map((child) => child.acceptanceStatus), ["rejected", "rejected"]);
+		assert.equal(dynamicNode?.acceptanceStatus, "not-required");
+		assert.deepEqual(dynamicNode?.children?.map((child) => child.acceptanceStatus), ["not-required", "not-required"]);
 	});
 
 	it("cancels dynamic fanout aggregate acceptance when the run times out", { skip: !isAsyncAvailable() ? "jiti not available" : process.platform === "win32" ? "timeout signal delivery intermittent on Windows CI" : undefined }, async () => {
@@ -1838,7 +1860,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 					collect: { as: "reviews" },
 					acceptance: {
 						level: "verified",
-						verify: [{ id: "slow", command: `${process.execPath} -e "setTimeout(()=>process.exit(0), 5000)"`, timeoutMs: 10_000 }],
+						verify: [{ id: "slow", command: `${process.execPath} -e "setTimeout(()=>process.exit(0), 30000)"`, timeoutMs: 60_000 }],
 					},
 				},
 			],
@@ -1863,7 +1885,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.match(dynamicNode?.error ?? "", /Subagent timed out after 1000ms\./);
 		assert.notEqual(dynamicNode?.acceptanceStatus, "verified");
 		assert.equal(status.timedOut, true);
-		assert.ok(elapsedMs < 3_000, `timeout should cancel dynamic aggregate acceptance promptly, elapsed ${elapsedMs}ms`);
+		assert.ok(elapsedMs < 5_000, `timeout should cancel dynamic aggregate acceptance well before the verify command completes, elapsed ${elapsedMs}ms`);
 	});
 
 	it("async dynamic fanout recomputes later child intercom targets by final flat index", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
@@ -2153,10 +2175,11 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 				events.toolStart("write", { path: "side-effect.txt", content: "done" }),
 				events.toolEnd("write"),
 				events.toolResult("write", "Wrote side-effect.txt"),
-				{ type: "compaction_start" },
-				{ type: "message_end", message: { role: "assistant", content: [], model: "openai/gpt-5-mini", stopReason: "aborted", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } } },
+				{ type: "message_end", message: { role: "assistant", content: [], model: "openai/gpt-5-mini", stopReason: "error", errorMessage: "This operation was aborted", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } } },
 				{ type: "agent_settled" },
+				{ type: "compaction_start" },
 			],
+			omitImplicitFinalEvents: true,
 			writeFiles: [{ path: "side-effect.txt", content: "done" }, { path: sessionFile, content: "{}\n" }],
 			keepAliveAfterFinalMessageMs: 5_000,
 			exitCode: 0,

@@ -5,7 +5,7 @@ import { validateAcceptanceInput } from "../runs/shared/acceptance.ts";
 import { validatePermissionRules, type PermissionRules } from "../runs/shared/permissions.ts";
 import { validateToolBudgetConfig } from "../runs/shared/tool-budget.ts";
 import { BUILTIN_AGENT_NAMES } from "./builtin-names.ts";
-import type { AgentConfig, AgentDefaultContext, AgentDiscoveryDiagnostic } from "./agents.ts";
+import { applyRuntimeAgentSettings, type AgentConfig, type AgentDefaultContext, type AgentDiscoveryDiagnostic, type RuntimeAgentSettingsContext } from "./agents.ts";
 
 export const RUNTIME_AGENT_REGISTRY_KEY = "pi-subagents.runtime-agents.v1";
 
@@ -48,7 +48,6 @@ export interface RuntimeAgentDefinition {
 	defaultProgress?: boolean;
 	interactive?: boolean;
 	maxSubagentDepth?: number;
-	completionGuard?: boolean;
 	toolBudget?: ToolBudgetConfig;
 	permissions?: PermissionRules;
 }
@@ -203,7 +202,7 @@ function validateDefinition(value: unknown): RuntimeAgentDefinition {
 		"systemPromptMode", "inheritProjectContext", "inheritGlobalContext", "inheritSkills", "defaultContext", "defaultAsync", "defaultTimeoutMs",
 		"defaultToolTimeoutMs", "defaultAcceptance", "acceptanceRole", "runner", "machine", "skills", "skillPath",
 		"extensions", "subagentOnlyExtensions", "mutationTools", "output", "outputMode", "defaultReads", "defaultProgress", "interactive",
-		"maxSubagentDepth", "completionGuard", "toolBudget", "permissions",
+		"maxSubagentDepth", "toolBudget", "permissions",
 	]);
 	const unknown = Object.keys(definition).filter((key) => !supported.has(key));
 	if (unknown.length > 0) throw new Error(`Runtime agent definition has unknown fields: ${unknown.join(", ")}.`);
@@ -243,7 +242,6 @@ function validateDefinition(value: unknown): RuntimeAgentDefinition {
 	const defaultProgress = validateBoolean(definition.defaultProgress, "Runtime agent definition defaultProgress");
 	const interactive = validateBoolean(definition.interactive, "Runtime agent definition interactive");
 	const maxSubagentDepth = validatePositiveInteger(definition.maxSubagentDepth, "Runtime agent definition maxSubagentDepth");
-	const completionGuard = validateBoolean(definition.completionGuard, "Runtime agent definition completionGuard");
 	const toolBudget = validateToolBudget(definition.toolBudget);
 	const permissions = validatePermissionRules(definition.permissions, "Runtime agent definition permissions");
 	return {
@@ -279,7 +277,6 @@ function validateDefinition(value: unknown): RuntimeAgentDefinition {
 		...(defaultProgress !== undefined ? { defaultProgress } : {}),
 		...(interactive !== undefined ? { interactive } : {}),
 		...(maxSubagentDepth !== undefined ? { maxSubagentDepth } : {}),
-		...(completionGuard !== undefined ? { completionGuard } : {}),
 		...(toolBudget !== undefined ? { toolBudget } : {}),
 		...(permissions !== undefined ? { permissions } : {}),
 	};
@@ -361,7 +358,6 @@ function toAgentConfig(name: string, definition: RuntimeAgentDefinition): AgentC
 		...(definition.defaultProgress !== undefined ? { defaultProgress: definition.defaultProgress } : {}),
 		...(definition.interactive !== undefined ? { interactive: definition.interactive } : {}),
 		...(definition.maxSubagentDepth !== undefined ? { maxSubagentDepth: definition.maxSubagentDepth } : {}),
-		...(definition.completionGuard !== undefined ? { completionGuard: definition.completionGuard } : {}),
 		...(definition.toolBudget !== undefined ? { toolBudget: definition.toolBudget } : {}),
 		...(definition.permissions !== undefined ? { permissions: definition.permissions } : {}),
 	};
@@ -421,10 +417,17 @@ function assertNoConfiguredCollision(configuredAgents: readonly AgentConfig[], r
 	}
 }
 
-export function mergeRuntimeAgents<T extends { agents: AgentConfig[]; agentDiagnostics?: AgentDiscoveryDiagnostic[] }>(pi: RuntimeAgentOwner, discovered: T, configuredAgents: readonly AgentConfig[] = discovered.agents): T {
-	const runtimeAgents = listRuntimeAgentConfigs(pi).filter((agent) => agent.disabled !== true);
-	if (runtimeAgents.length === 0) return discovered;
-	assertNoIdentityCollisions(runtimeAgents, "Runtime agent registration");
-	assertNoConfiguredCollision(configuredAgents, runtimeAgents);
+/**
+ * Append registered runtime agents to a discovery result. With `settings`, the
+ * runtime agents also receive the subagent model-tier settings that apply in
+ * that discovery context (see `applyRuntimeAgentSettings`); without it they
+ * carry only their registered definition.
+ */
+export function mergeRuntimeAgents<T extends { agents: AgentConfig[]; agentDiagnostics?: AgentDiscoveryDiagnostic[] }>(pi: RuntimeAgentOwner, discovered: T, configuredAgents: readonly AgentConfig[] = discovered.agents, settings?: RuntimeAgentSettingsContext): T {
+	const registered = listRuntimeAgentConfigs(pi).filter((agent) => agent.disabled !== true);
+	if (registered.length === 0) return discovered;
+	assertNoIdentityCollisions(registered, "Runtime agent registration");
+	assertNoConfiguredCollision(configuredAgents, registered);
+	const runtimeAgents = settings ? applyRuntimeAgentSettings(registered, settings) : registered;
 	return { ...discovered, agents: [...discovered.agents, ...runtimeAgents] };
 }

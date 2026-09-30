@@ -739,7 +739,8 @@ describe("subagent extension child mode", () => {
 			for (const handler of handlers.get("tool_result")) await handler({ toolName: "subagent" }, ctx);
 			const fleetWidgets = widgets.filter((entry) => entry.key === "subagent-fleet-status");
 			if (!fleetWidgets.some((entry) => typeof entry.value === "function")) throw new Error("management result did not restore active fleet status: " + JSON.stringify(fleetWidgets));
-			if (!herdrCommands.some(({ args }) => args.includes("summary=⏳ 1 subagent"))) throw new Error("management result did not restore Herdr status: " + JSON.stringify(herdrCommands));
+			// The coordinator stays visible while contributing no subagent leaf.
+			if (!herdrCommands.some(({ args }) => args.includes("summary=⏳ 0 subagents"))) throw new Error("management result did not restore Herdr status: " + JSON.stringify(herdrCommands));
 			const herdrCommandCount = herdrCommands.length;
 			for (const handler of handlers.get("tool_result")) await handler({ toolName: "subagent" }, ctx);
 			if (herdrCommands.length !== herdrCommandCount) throw new Error("unchanged active jobs redundantly refreshed Herdr status: " + JSON.stringify(herdrCommands));
@@ -978,6 +979,7 @@ describe("subagent extension child mode", () => {
 		const script = String.raw`
 			import registerSubagentExtension from "./index.ts";
 			import { currentCompletionOwnerId } from "./src/shared/completion-owner.ts";
+			process.env.PI_OFFLINE = "1";
 			const completionOwnerId = currentCompletionOwnerId();
 			const pendingTimers = new Map();
 			const realSetTimeout = globalThis.setTimeout;
@@ -1053,6 +1055,7 @@ describe("subagent extension child mode", () => {
 		const script = String.raw`
 			import registerSubagentExtension from "./index.ts";
 			import { currentCompletionOwnerId } from "./src/shared/completion-owner.ts";
+			process.env.PI_OFFLINE = "1";
 			const completionOwnerId = currentCompletionOwnerId();
 			const pendingTimers = new Map();
 			const realSetTimeout = globalThis.setTimeout;

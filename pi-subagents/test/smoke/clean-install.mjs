@@ -1,4 +1,4 @@
-// Run with Node >=22.19.0: node --experimental-strip-types test/smoke/clean-install.mjs [artifact-dir] [0.84.3|0.84.4|0.85.1]
+// Run with Node >=22.19.0: node --experimental-strip-types test/smoke/clean-install.mjs [artifact-dir] [0.86.1]
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -7,9 +7,8 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const source = fileURLToPath(new URL("../../", import.meta.url));
-const version = process.argv[3] ?? "0.85.1";
-assert.ok(["0.84.3", "0.84.4", "0.85.1"].includes(version), "requires an explicitly supported smoke version");
-const isPreChord = version.startsWith("0.84.");
+const version = process.argv[3] ?? "0.86.1";
+assert.equal(version, "0.86.1", "requires the supported smoke version");
 const root = process.argv[2] ? path.resolve(process.argv[2]) : fs.mkdtempSync(path.join(os.tmpdir(), "clean-install-smoke-"));
 fs.mkdirSync(root, { recursive: true });
 const host = path.join(root, "host");
@@ -43,23 +42,34 @@ assert.ok(packed.files.some(file => file.path === "runner-peer-preload.mjs"), "p
 assert.ok(packed.files.some(file => file.path === "runner-peer-loader.mjs"), "older-Node peer loader must ship");
 assert.equal(packed.files.some(file => file.path.endsWith(".ts") && !file.path.endsWith(".d.ts")), false, "package must not ship TypeScript sources");
 assert.ok(packed.files.some(file => file.path === "index.js"), "compiled extension entry must ship");
-assert.ok(packed.files.some(file => file.path === "src/runs/background/subagent-runner.js"), "compiled background runner must ship");
+assert.ok(packed.files.some(file => file.path === "src/inspectors/inspector-runner.js"), "compiled inspector runner must ship");
+assert.ok(packed.files.some(file => file.path === "src/runs/background/subagent-runner-bootstrap.js"), "compiled background bootstrap must ship");
+assert.ok(packed.files.some(file => file.path === "src/runs/background/subagent-runner.js"), "compiled background execution module must ship");
 fs.writeFileSync(path.join(extension, "package.json"), JSON.stringify({ private: true, dependencies: { "pi-subagents": `file:${path.join(root, packed.filename)}` } }));
 run("extension-install", "npm", ["install", "--no-audit", "--no-fund"], extension);
 const installed = path.join(extension, "node_modules/pi-subagents");
+const inspectorRun = path.join(root, "inspector-run");
+fs.mkdirSync(inspectorRun);
+fs.writeFileSync(path.join(inspectorRun, "status.json"), JSON.stringify({
+	runId: "smoke-inspector", mode: "single", state: "completed", startedAt: Date.now(), cwd,
+	steps: [{ agent: "worker", status: "completed", recentOutput: ["done"] }],
+}));
+const inspector = run("inspector", process.execPath, [
+	path.join(installed, "inspector-runner.mjs"), "--async-dir", inspectorRun, "--run-id", "smoke-inspector",
+], cwd);
+assert.match(inspector.stdout, /pi-subagents inspector for smoke-inspector/);
 const pi = path.join(host, "node_modules/@earendil-works/pi-coding-agent");
 const { createJiti } = await import(pathToFileURL(path.join(extension, "node_modules/jiti/lib/jiti.mjs")).href);
 const { resolveHostPeerAliases, findHostPeerPackageDir, resolvePackageSubpath } = await import(pathToFileURL(path.join(installed, "src/runs/background/runner-aliases.js")).href);
-if (version === "0.85.1") assert.equal(findHostPeerPackageDir(pi, "@earendil-works/pi-client"), undefined, "stable host must remain missing client");
+assert.equal(findHostPeerPackageDir(pi, "@earendil-works/pi-client"), undefined, "stable host must remain missing client");
 run("pristine-public-sdk", process.execPath, ["--input-type=module", "-e", `await import(${JSON.stringify(pathToFileURL(resolvePackageSubpath(pi, ".")).href)})`], cwd);
 const resolved = resolveHostPeerAliases(pi);
 assert.deepEqual(resolved.missing, []);
 const tui = findHostPeerPackageDir(pi, "@earendil-works/pi-tui");
 assert.ok(tui.startsWith(host + path.sep), "TUI must come from the host install");
 assert.equal(resolved.aliases["@earendil-works/pi-tui"], resolvePackageSubpath(tui, "."));
-if (isPreChord) assert.equal(findHostPeerPackageDir(pi, "@earendil-works/chord"), undefined);
 for (const specifier of ["@earendil-works/chord", "@earendil-works/chord/context"]) {
-	assert.equal(Boolean(resolved.aliases[specifier]), !isPreChord);
+	assert.ok(resolved.aliases[specifier]);
 }
 assert.equal(resolved.aliases["@earendil-works/pi-client/unix"], undefined);
 fs.writeFileSync(path.join(root, "aliases.json"), JSON.stringify(resolved, null, 2));
@@ -74,14 +84,14 @@ const entryStarted = performance.now();
 const entry = await entryLoader.import(path.join(installed, "index.js"));
 assert.equal(typeof entry.default, "function", "compiled extension entry must export its factory");
 console.log(`PASS compiled package entry loaded through Jiti in ${Math.round(performance.now() - entryStarted)} ms`);
-for (const file of ["pi085-child.ts", "pi085-extension.ts"]) fs.copyFileSync(new URL(file, import.meta.url), path.join(cwd, file));
+for (const file of ["sdk-child.ts", "sdk-extension.ts"]) fs.copyFileSync(new URL(file, import.meta.url), path.join(cwd, file));
 const childEnv = {
 	SMOKE_EXTENSION: installed,
 	JITI_ALIAS: JSON.stringify(resolved.aliases),
 	PI_ASYNC_NATIVE_RUNNER: "1",
 };
 const jiti = path.join(extension, "node_modules/jiti/lib/jiti-cli.mjs");
-const args = [jiti, path.join(cwd, "pi085-child.ts")];
+const args = [jiti, path.join(cwd, "sdk-child.ts")];
 const preload = Object.keys(resolved.aliases).length ? ["--import", pathToFileURL(path.join(installed, "runner-peer-preload.mjs")).href] : [];
 const positive = run("child", process.execPath, [...preload, ...args], cwd, childEnv);
 assert.match(positive.stdout, /PASS public SDK\/default child factory/);
@@ -91,5 +101,5 @@ const packedSelection = run("packed-selection", process.execPath, [
 	resolvePackageSubpath(pi, "."),
 ], cwd, childEnv);
 assert.match(packedSelection.stdout, /PASS packed node_modules selects compiled JavaScript/);
-if (version === "0.85.1") assert.equal(findHostPeerPackageDir(pi, "@earendil-works/pi-client"), undefined);
+assert.equal(findHostPeerPackageDir(pi, "@earendil-works/pi-client"), undefined);
 console.log(`${positive.stdout.trim()}\nArtifacts: ${root}`);

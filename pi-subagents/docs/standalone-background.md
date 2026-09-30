@@ -1,6 +1,6 @@
 # Standalone background execution
 
-Supported standalone target: **official Pi 0.85.1, Linux x64**. Keep its adjacent release assets with the executable. Other versions, operating systems, architectures and packagers are outside the fully validated support target; limited experimental Windows coverage is described below.
+Supported standalone target: **official Pi 0.86.1, Linux x64**. Keep its adjacent release assets with the executable. Other versions, operating systems, architectures and packagers are outside the fully validated support target; limited experimental Windows coverage is described below.
 
 Pi's extension loader supplies its embedded SDK to `binary-bootstrap.ts`, which awaits the existing configured runner before exiting. Startup authorization, revival leases, controls, disposal and process-close observation remain shared with npm. Each independent run has its own host; native sessions inside that run share it. No per-session CLI protocol, runtime download/install, alternate SDK or foreground fallback is introduced. Npm Pi keeps its Node runner, peer aliases and detected npm `PI_PACKAGE_DIR` override (including refusal when no npm root exists).
 
@@ -10,7 +10,7 @@ Implementation and lifecycle fixtures derive from [@xz-dev](https://github.com/x
 
 The resolver recognizes Bun's Windows virtual entrypoint prefixes, `B:/~BUN/` and `B:\~BUN\`, alongside `/$bunfs/`. It launches the real `process.execPath` (or the existing executable override). The `B:` prefix is virtual, not the installation drive; `pi-native.exe` is not a required executable name.
 
-A local Windows x64 smoke passed with **xz-dev/pi `0.85.1-xz.169.1.gb5f4d0ff`, Bun 1.4.2**: a fresh async worker executed a read-only Git command, returned its result, delivered the native completion notification, and exited with code 0 and no remaining runner process. This is not validation of the official Windows distribution or every Bun-compiled Pi host. Windows remains **experimental**: the full standalone lifecycle matrix has not been validated there.
+Windows remains **experimental**: the full standalone lifecycle matrix has not been validated there or for every Bun-compiled Pi host.
 
 Node-hosted npm Pi keeps its existing runner path and is not affected by this virtual-entrypoint detection defect. Installing only the pi-subagents extension through npm does not change a Bun-compiled Pi host into an npm Pi host.
 
@@ -33,17 +33,17 @@ The `official-standalone` CI job runs this gate. Both archive and executable has
 
 The matrix covers public launch/notification, workflows, same-run concurrent sessions, parallel stop, targeted steer/interrupt, child/tool/run deadlines, missing bootstrap, post-spawn persistence/authorization failures, SDK initialization failure, malformed bootstrap input/EOF with an authorized positive control, and competing revival. The provider is deterministic, but SDK sessions, runner and public extension are real. Only startup-failure writes are faulted.
 
-`matrix.json` records complete/partial results; `inputs.json` freezes source identities and every mode must use the same package hash. Inspect per-mode logs, `identity.json`, lifecycle/notification evidence, `status.json` and `process-terminal.json`. A persisted result is not exit proof: the gate separately awaits observed close, verifies dead PIDs before sandbox teardown and checks session shutdown/lease release. CI retains receipts and at most 32 MiB compressed lifecycle evidence. Contributor-head passes do not establish acceptance for a different integration snapshot.
+`matrix.json` records complete/partial results with per-mode durations; `inputs.json` freezes source identities. The candidate is built and packed once and every mode must use that package hash. Modes run one at a time; they are CPU-bound and miss their deadlines when run concurrently. Inspect per-mode logs, `identity.json`, lifecycle/notification evidence, `status.json` and `process-terminal.json`. A persisted result is not exit proof: the gate separately awaits observed close, verifies dead PIDs before sandbox teardown and checks session shutdown/lease release. CI retains receipts and at most 32 MiB compressed lifecycle evidence. Contributor-head passes do not establish acceptance for a different integration snapshot.
 
 For a focused diagnostic, use `node test/smoke/standalone-background.mjs "$release_dir/pi/pi" "$(mktemp -d)/check" bootstrap-errors` (or another matrix mode). A focused pass is not the complete gate.
 
 ## Npm regressions and local trial
 
-Existing npm clean-install CI covers real SDK 0.85.1. The standalone CI job also checks the public npm launch path without execution-time network:
+Existing npm clean-install CI covers real SDK 0.86.1. The standalone CI job also checks the public npm launch path without execution-time network:
 
 ```bash
 npm_checks="$(mktemp -d)"
-node test/smoke/clean-install.mjs "$npm_checks/sdk" 0.85.1
+node test/smoke/clean-install.mjs "$npm_checks/sdk" 0.86.1
 node test/smoke/npm-background.mjs "$npm_checks/sdk" "$npm_checks/launch"
 ```
 

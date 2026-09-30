@@ -80,12 +80,12 @@ export interface BuiltinAgentOverrideBase {
 	extensions?: string[];
 	subagentOnlyExtensions?: string[];
 	mutationTools?: string[];
-	completionGuard?: boolean;
 	toolBudget?: ToolBudgetConfig;
 }
 
 interface BuiltinAgentOverrideConfig {
 	description?: string;
+	advertise?: boolean;
 	machine?: string | false;
 	output?: string | false;
 	outputMode?: OutputMode;
@@ -110,7 +110,6 @@ interface BuiltinAgentOverrideConfig {
 	extensions?: string[] | false;
 	subagentOnlyExtensions?: string[] | false;
 	mutationTools?: string[] | false;
-	completionGuard?: boolean;
 	toolBudget?: ToolBudgetConfig | false;
 }
 
@@ -177,7 +176,6 @@ export interface AgentConfig {
 	defaultProgress?: boolean;
 	interactive?: boolean;
 	maxSubagentDepth?: number;
-	completionGuard?: boolean;
 	toolBudget?: ToolBudgetConfig;
 	permissions?: PermissionRules;
 	memory?: AgentMemoryConfig;
@@ -610,7 +608,7 @@ function collectSettingsPackageRoots(settingsFile: string, baseDir: string): str
 	return roots;
 }
 
-function collectPackageSubagentPaths(cwd: string, options: { includeUser: boolean; includeProject: boolean } = { includeUser: true, includeProject: true }): PackageSubagentPaths {
+function collectPackageSubagentPaths(cwd: string, options: { includeUser: boolean; includeProject: boolean; globalNpmRoot?: string | null } = { includeUser: true, includeProject: true }): PackageSubagentPaths {
 	const agentDir = getAgentDir();
 	const projectRoot = findConfiguredProjectRoot(cwd) ?? cwd;
 	const packageRoots: Array<{ root: string; scope: PackageScope }> = [
@@ -645,7 +643,7 @@ function collectPackageSubagentPaths(cwd: string, options: { includeUser: boolea
 	}
 
 	if (options.includeUser) {
-		const globalRoot = getGlobalNpmRoot();
+		const globalRoot = options.globalNpmRoot === undefined ? getGlobalNpmRoot() : options.globalNpmRoot;
 		if (globalRoot) {
 			packageRoots.push(...collectPackageRootsFromNodeModules(globalRoot, watchPaths).map((root) => ({ root, scope: "user" as const })));
 		}
@@ -798,7 +796,6 @@ function cloneOverrideBase(agent: AgentConfig): BuiltinAgentOverrideBase {
 		...(!agent.extensionsFromDefault && agent.extensions ? { extensions: [...agent.extensions] } : {}),
 		...(agent.subagentOnlyExtensions ? { subagentOnlyExtensions: [...agent.subagentOnlyExtensions] } : {}),
 		...(agent.mutationTools ? { mutationTools: [...agent.mutationTools] } : {}),
-		...(agent.completionGuard !== undefined ? { completionGuard: agent.completionGuard } : {}),
 		...(agent.toolBudget !== undefined ? { toolBudget: agent.toolBudget } : {}),
 	};
 }
@@ -830,7 +827,6 @@ function cloneOverrideValue(override: BuiltinAgentOverrideConfig): BuiltinAgentO
 		...(override.extensions !== undefined ? { extensions: override.extensions === false ? false : [...override.extensions] } : {}),
 		...(override.subagentOnlyExtensions !== undefined ? { subagentOnlyExtensions: override.subagentOnlyExtensions === false ? false : [...override.subagentOnlyExtensions] } : {}),
 		...(override.mutationTools !== undefined ? { mutationTools: override.mutationTools === false ? false : [...override.mutationTools] } : {}),
-		...(override.completionGuard !== undefined ? { completionGuard: override.completionGuard } : {}),
 		...(override.toolBudget !== undefined ? { toolBudget: override.toolBudget === false ? false : { ...override.toolBudget, ...(Array.isArray(override.toolBudget.block) ? { block: [...override.toolBudget.block] } : {}) } } : {}),
 	};
 }
@@ -1015,6 +1011,11 @@ function parseBuiltinOverrideEntry(
 		}
 	}
 
+	if ("advertise" in input) {
+		if (typeof input.advertise === "boolean") override.advertise = input.advertise;
+		else throw new Error(`Builtin override '${name}' in '${filePath}' has invalid 'advertise'; expected a boolean.`);
+	}
+
 	if ("output" in input) {
 		if ((typeof input.output === "string" && input.output.trim()) || input.output === false) override.output = input.output;
 		else throw new Error(`Builtin override '${name}' in '${filePath}' has invalid 'output'; expected a non-empty string or false.`);
@@ -1099,13 +1100,6 @@ function parseBuiltinOverrideEntry(
 		}
 	}
 
-	if ("completionGuard" in input) {
-		if (typeof input.completionGuard === "boolean") {
-			override.completionGuard = input.completionGuard;
-		} else {
-			throw new Error(`Builtin override '${name}' in '${filePath}' has invalid 'completionGuard'; expected a boolean.`);
-		}
-	}
 
 	if ("toolBudget" in input) {
 		if (input.toolBudget === false) {
@@ -1470,6 +1464,7 @@ function applyBuiltinOverride(
 	};
 
 	if (override.description !== undefined) next.description = override.description;
+	if (override.advertise !== undefined) next.advertise = override.advertise;
 	if (override.machine !== undefined) { if (override.machine === false) delete next.machine; else next.machine = override.machine; }
 	if (override.output !== undefined) { if (override.output === false) delete next.output; else next.output = override.output; }
 	if (override.outputMode !== undefined) next.outputMode = override.outputMode;
@@ -1500,7 +1495,6 @@ function applyBuiltinOverride(
 	if (override.extensions !== undefined) { if (override.extensions === false) delete next.extensions; else next.extensions = [...override.extensions]; }
 	if (override.subagentOnlyExtensions !== undefined) { if (override.subagentOnlyExtensions === false) delete next.subagentOnlyExtensions; else next.subagentOnlyExtensions = [...override.subagentOnlyExtensions]; }
 	if (override.mutationTools !== undefined) { if (override.mutationTools === false) delete next.mutationTools; else next.mutationTools = [...override.mutationTools]; }
-	if (override.completionGuard !== undefined) next.completionGuard = override.completionGuard;
 	if (override.toolBudget !== undefined) { if (override.toolBudget === false) delete next.toolBudget; else next.toolBudget = override.toolBudget; }
 
 	return next;
@@ -1601,9 +1595,48 @@ function applyCustomAgentOverrides(
 	});
 }
 
+export interface RuntimeAgentSettingsContext {
+	cwd: string;
+	scope: AgentScope;
+	preferredModelProvider?: string;
+}
+
+function runtimeAgentOverrides(settings: SubagentSettings): SubagentSettings {
+	const overrides: Record<string, BuiltinAgentOverrideConfig> = {};
+	for (const [name, override] of Object.entries(settings.overrides)) {
+		const narrowed: BuiltinAgentOverrideConfig = {};
+		if (override.model !== undefined) narrowed.model = override.model;
+		if (override.defaultProvider !== undefined) narrowed.defaultProvider = override.defaultProvider;
+		if (override.fast !== undefined) narrowed.fast = override.fast;
+		if (override.thinking !== undefined) narrowed.thinking = override.thinking;
+		if (Object.keys(narrowed).length > 0) overrides[name] = narrowed;
+	}
+	return { ...settings, overrides };
+}
+
+/**
+ * Runtime-registered agents keep their extension-owned definition (prompt,
+ * tools, context, budgets, and every other launch field) but follow the same
+ * model-tier settings as every other agent: `subagents.defaultModel`,
+ * `defaultProvider`, `defaultThinking`, and the `model`, `defaultProvider`,
+ * `fast`, and `thinking` fields of `agentOverrides.<name>`, user then project,
+ * provider-scoped overrides included. Other override fields are ignored for
+ * runtime agents. A definition `model` still wins over `defaultModel`.
+ */
+export function applyRuntimeAgentSettings(agents: AgentConfig[], context: RuntimeAgentSettingsContext): AgentConfig[] {
+	if (agents.length === 0) return agents;
+	const sources = getAgentDiscoverySources(context.cwd, context.preferredModelProvider);
+	const { user, project } = settingsForScope(sources, context.scope);
+	const defaultProvider = resolveSubagentDefaultProvider(user, project, sources.projectSettingsPath);
+	const defaultModel = resolveSubagentDefaultModel(user, project, sources.userSettingsPath, sources.projectSettingsPath, defaultProvider);
+	const defaultThinking = resolveSubagentDefaultThinking(user, project, sources.projectSettingsPath);
+	const withDefaults = applySubagentDefaultThinking(applySubagentDefaultModel(agents, defaultModel, defaultProvider), defaultThinking);
+	return applyCustomAgentOverrides(withDefaults, runtimeAgentOverrides(user), runtimeAgentOverrides(project), sources.userSettingsPath, sources.projectSettingsPath);
+}
+
 export function buildBuiltinOverrideConfig(
 	base: BuiltinAgentOverrideBase,
-	draft: Pick<AgentConfig, "model" | "modelProvider" | "fast" | "thinking" | "systemPromptMode" | "inheritProjectContext" | "inheritGlobalContext" | "inheritSkills" | "defaultContext" | "acceptanceRole" | "disabled" | "systemPrompt" | "skills" | "tools" | "allowNestedSubagents" | "mcpDirectTools" | "extensions" | "subagentOnlyExtensions" | "mutationTools" | "completionGuard" | "toolBudget"> & Partial<Pick<AgentConfig, "description" | "machine" | "output" | "outputMode" | "defaultReads" | "excludeTools">>,
+	draft: Pick<AgentConfig, "model" | "modelProvider" | "fast" | "thinking" | "systemPromptMode" | "inheritProjectContext" | "inheritGlobalContext" | "inheritSkills" | "defaultContext" | "acceptanceRole" | "disabled" | "systemPrompt" | "skills" | "tools" | "allowNestedSubagents" | "mcpDirectTools" | "extensions" | "subagentOnlyExtensions" | "mutationTools" | "toolBudget"> & Partial<Pick<AgentConfig, "description" | "machine" | "output" | "outputMode" | "defaultReads" | "excludeTools">>,
 ): BuiltinAgentOverrideConfig | undefined {
 	const override: BuiltinAgentOverrideConfig = {};
 	if (draft.machine !== base.machine) override.machine = draft.machine ?? false;
@@ -1639,9 +1672,6 @@ export function buildBuiltinOverrideConfig(
 		override.subagentOnlyExtensions = draft.subagentOnlyExtensions ? [...draft.subagentOnlyExtensions] : false;
 	}
 	if (!arraysEqual(draft.mutationTools, base.mutationTools)) override.mutationTools = draft.mutationTools ? [...draft.mutationTools] : false;
-	if ((draft.completionGuard !== false) !== (base.completionGuard !== false)) {
-		override.completionGuard = draft.completionGuard !== false;
-	}
 	if (JSON.stringify(draft.toolBudget) !== JSON.stringify(base.toolBudget)) override.toolBudget = draft.toolBudget ?? false;
 
 	return Object.keys(override).length > 0 ? override : undefined;
@@ -2003,7 +2033,7 @@ function parseAgentRunnerFrontmatter(raw: string | undefined, agentName: string)
 
 function validateExternalRunnerProfile(frontmatter: Record<string, string>, agentName: string, runner: AgentRunnerConfig | undefined): void {
 	if (runner?.type !== "external-cli" && runner?.type !== "external-job") return;
-	const unsupported = ["tools", "excludeTools", "allowNestedSubagents", "allowedAgents", "model", "thinking", "extensions", "subagentOnlyExtensions", "mutationTools", "maxSubagentDepth", "completionGuard", "skills", "skill", "skillPath", "toolBudget", "permission", "permissions"]
+	const unsupported = ["tools", "excludeTools", "allowNestedSubagents", "allowedAgents", "model", "thinking", "extensions", "subagentOnlyExtensions", "mutationTools", "maxSubagentDepth", "skills", "skill", "skillPath", "toolBudget", "permission", "permissions"]
 		.filter((field) => frontmatter[field] !== undefined);
 	if (unsupported.length > 0) {
 		throw new Error(`Agent '${agentName}' uses runner.type='${runner.type}' and declares unsupported Pi-only fields: ${unsupported.join(", ")}.`);
@@ -2200,11 +2230,6 @@ function loadAgentsFromDefinitionFiles(files: AgentDefinitionFile[], source: Age
 			assertJsonSchemaObject(parsed, `Agent '${localName}' outputSchema`);
 			outputSchema = parsed;
 		}
-		const completionGuard = frontmatter.completionGuard === "false"
-			? false
-			: frontmatter.completionGuard === "true"
-				? true
-				: undefined;
 
 		const maxSubagentDepth = Number.isInteger(parsedMaxSubagentDepth) && parsedMaxSubagentDepth >= 0
 			? parsedMaxSubagentDepth
@@ -2257,7 +2282,6 @@ function loadAgentsFromDefinitionFiles(files: AgentDefinitionFile[], source: Age
 			defaultProgress: frontmatter.defaultProgress === "true",
 			interactive: frontmatter.interactive === "true",
 			...(maxSubagentDepth !== undefined ? { maxSubagentDepth } : {}),
-			...(completionGuard !== undefined ? { completionGuard } : {}),
 			...(toolBudget !== undefined ? { toolBudget } : {}),
 			...(permissions !== undefined ? { permissions } : {}),
 			...(memory !== undefined ? { memory } : {}),
@@ -2456,6 +2480,7 @@ export interface AgentDiscoveryAllResult {
 	package: AgentConfig[];
 	user: AgentConfig[];
 	project: AgentConfig[];
+	cwd: string;
 	agentDiagnostics?: AgentDiscoveryDiagnostic[];
 	chains: ChainConfig[];
 	chainDiagnostics: ChainDiscoveryDiagnostic[];
@@ -2477,6 +2502,11 @@ export interface AgentDiscoveryAllResult {
 export interface AgentDiscoverySnapshot {
 	effective: AgentDiscoveryResult;
 	all: AgentDiscoveryAllResult;
+}
+
+/** Undefined uses synchronous npm lookup; null skips global npm discovery. */
+export interface AgentDiscoveryOptions {
+	globalNpmRoot?: string | null;
 }
 
 interface LoadedAgentDirectory {
@@ -2581,10 +2611,11 @@ function discoveryFingerprint(sources: AgentDiscoverySources): string {
 		.join("\n");
 }
 
-function discoveryCacheKey(cwd: string, preferredModelProvider: string | undefined): string {
+function discoveryCacheKey(cwd: string, preferredModelProvider: string | undefined, globalNpmRoot?: string | null): string {
 	return JSON.stringify([
 		path.resolve(cwd),
 		preferredModelProvider ?? null,
+		globalNpmRoot === undefined ? ["default"] : ["override", globalNpmRoot],
 		getProjectConfigDir(path.resolve(cwd)),
 		getAgentDir(),
 		os.homedir(),
@@ -2613,7 +2644,7 @@ function packageEntryIncluded(scope: AgentScope, packageScopes: PackageSubagentP
 	return packageScopes.has(scope);
 }
 
-function buildAgentDiscoverySources(cwd: string, preferredModelProvider?: string): AgentDiscoverySources {
+function buildAgentDiscoverySources(cwd: string, preferredModelProvider?: string, globalNpmRoot?: string | null): AgentDiscoverySources {
 	const effectiveCwd = path.resolve(cwd);
 	const userDirOld = path.join(getAgentDir(), "agents");
 	const userDirNew = path.join(os.homedir(), ".agents");
@@ -2622,7 +2653,7 @@ function buildAgentDiscoverySources(cwd: string, preferredModelProvider?: string
 	const { readDirs: projectChainDirs, preferredDir: projectChainDir } = resolveNearestProjectChainDirs(effectiveCwd);
 	const userSettingsPath = getUserAgentSettingsPath();
 	const projectSettingsPath = getProjectAgentSettingsPath(effectiveCwd);
-	const packageSubagentPaths = collectPackageSubagentPaths(effectiveCwd);
+	const packageSubagentPaths = collectPackageSubagentPaths(effectiveCwd, { includeUser: true, includeProject: true, globalNpmRoot });
 	const exclusionRoots = agentExclusionRoots(userSettingsPath, projectSettingsPath);
 	const isExcluded = agentExclusions(exclusionRoots);
 	const userScanDirs = settingsAgentScanDirs(readConfiguredAgentScanDirs(userSettingsPath), isExcluded);
@@ -2708,8 +2739,8 @@ function ensureDiscoveryChains(sources: AgentDiscoverySources): void {
 	sources.watchPaths = [...new Set([...sources.watchPaths, ...watchPaths])];
 }
 
-function getAgentDiscoverySources(cwd: string, preferredModelProvider?: string, includeChains = false): AgentDiscoverySources {
-	const key = discoveryCacheKey(cwd, preferredModelProvider);
+function getAgentDiscoverySources(cwd: string, preferredModelProvider?: string, includeChains = false, globalNpmRoot?: string | null): AgentDiscoverySources {
+	const key = discoveryCacheKey(cwd, preferredModelProvider, globalNpmRoot);
 	const cached = agentDiscoveryCache.get(key);
 	if (cached && cached.fingerprint === discoveryFingerprint(cached.sources)) {
 		if (includeChains) {
@@ -2718,7 +2749,7 @@ function getAgentDiscoverySources(cwd: string, preferredModelProvider?: string, 
 		}
 		return cached.sources;
 	}
-	const sources = buildAgentDiscoverySources(cwd, preferredModelProvider);
+	const sources = buildAgentDiscoverySources(cwd, preferredModelProvider, globalNpmRoot);
 	const entry = { sources, fingerprint: discoveryFingerprint(sources) };
 	agentDiscoveryCache.set(key, entry);
 	if (includeChains) {
@@ -2883,6 +2914,7 @@ function buildAllDiscovery(sources: AgentDiscoverySources, includeChains: boolea
 		],
 		chains,
 		chainDiagnostics: [...packageChainDiagnostics, ...(sources.userChains?.diagnostics ?? []), ...projectChainDiagnostics],
+		cwd: sources.cwd,
 		userDir: sources.userDir,
 		projectDir: sources.projectAgentsDir,
 		userChainDir: sources.userChainDir,
@@ -2897,14 +2929,14 @@ export function discoverAgentSnapshot(
 	cwd: string,
 	scope: AgentScope,
 	preferredModelProvider?: string,
-	options: { includeChains?: boolean } = {},
+	options: AgentDiscoveryOptions & { includeChains?: boolean } = {},
 ): AgentDiscoverySnapshot {
 	const includeChains = options.includeChains !== false;
-	const sources = getAgentDiscoverySources(cwd, preferredModelProvider, includeChains);
+	const sources = getAgentDiscoverySources(cwd, preferredModelProvider, includeChains, options.globalNpmRoot);
 	return { effective: buildEffectiveDiscovery(sources, scope), all: buildAllDiscovery(sources, includeChains, scope) };
 }
 
-function discoverAgentsUncached(cwd: string, scope: AgentScope, preferredModelProvider?: string): AgentDiscoveryResult {
+function discoverAgentsUncached(cwd: string, scope: AgentScope, preferredModelProvider?: string, options: AgentDiscoveryOptions = {}): AgentDiscoveryResult {
 	const effectiveCwd = path.resolve(cwd);
 	const userDirOld = path.join(getAgentDir(), "agents");
 	const userDirNew = path.join(os.homedir(), ".agents");
@@ -2920,7 +2952,7 @@ function discoverAgentsUncached(cwd: string, scope: AgentScope, preferredModelPr
 	const defaultExtensions = resolveSubagentDefaultExtensions(userSettings, projectSettings, projectSettingsPath);
 	const defaultSubagentOnlyExtensions = resolveSubagentDefaultSubagentOnlyExtensions(userSettings, projectSettings, projectSettingsPath);
 	const modelScope = projectSettings.modelScope ?? userSettings.modelScope;
-	const packageSubagentPaths = collectPackageSubagentPaths(effectiveCwd, { includeUser: scope !== "project", includeProject: scope !== "user" });
+	const packageSubagentPaths = collectPackageSubagentPaths(effectiveCwd, { includeUser: scope !== "project", includeProject: scope !== "user", globalNpmRoot: options.globalNpmRoot });
 	const isExcluded = agentExclusions(agentExclusionRoots(userSettingsPath, projectSettingsPath));
 	const directories: AgentDefinitionDirectoryReport[] = [reportAgentDefinitionDirectory("builtin", BUILTIN_AGENTS_DIR, BUILTIN_AGENT_DEFINITION_INSPECTION)];
 	const builtinLoaded = loadAgentsFromDefinitionFiles(BUILTIN_AGENT_DEFINITION_FILES, "builtin");
@@ -2955,12 +2987,12 @@ function discoverAgentsUncached(cwd: string, scope: AgentScope, preferredModelPr
 	return { agents, agentDiagnostics, projectAgentsDir, cwd: effectiveCwd, scope, directories, ...(modelScope !== undefined ? { modelScope } : {}), ...(maxThinking !== undefined ? { maxThinking } : {}) };
 }
 
-export function discoverAgents(cwd: string, scope: AgentScope, preferredModelProvider?: string): AgentDiscoveryResult {
-	if (scope !== "both") return discoverAgentsUncached(cwd, scope, preferredModelProvider);
-	const sources = getAgentDiscoverySources(cwd, preferredModelProvider);
+export function discoverAgents(cwd: string, scope: AgentScope, preferredModelProvider?: string, options: AgentDiscoveryOptions = {}): AgentDiscoveryResult {
+	if (scope !== "both") return discoverAgentsUncached(cwd, scope, preferredModelProvider, options);
+	const sources = getAgentDiscoverySources(cwd, preferredModelProvider, false, options.globalNpmRoot);
 	return buildEffectiveDiscovery(sources, scope);
 }
 
-export function discoverAgentsAll(cwd: string, preferredModelProvider?: string): AgentDiscoveryAllResult {
-	return discoverAgentSnapshot(cwd, "both", preferredModelProvider).all;
+export function discoverAgentsAll(cwd: string, preferredModelProvider?: string, options: AgentDiscoveryOptions = {}): AgentDiscoveryAllResult {
+	return discoverAgentSnapshot(cwd, "both", preferredModelProvider, options).all;
 }

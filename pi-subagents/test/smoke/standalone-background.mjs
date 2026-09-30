@@ -1,5 +1,5 @@
 // Linux real-binary smoke from xz-dev's PR #2049. No filesystem core SDK or execution network.
-// node test/smoke/standalone-background.mjs /absolute/pi-binary [fresh-artifacts] [mode]
+// node test/smoke/standalone-background.mjs /absolute/pi-binary [fresh-artifacts] [mode] [/absolute/prebuilt.tgz]
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -25,18 +25,27 @@ assert.equal(createHash("sha256").update(fs.readFileSync(binary)).digest("hex"),
 const root = process.argv[3] ? path.resolve(process.argv[3]) : fs.mkdtempSync(path.join(os.tmpdir(), "pi-standalone-smoke-"));
 fs.mkdirSync(root, { recursive: true });
 assert.deepEqual(fs.readdirSync(root), [], "requires an empty artifact directory");
-const coreSdk = /(?:^|\/)@earendil-works\/(?:pi-coding-agent|pi-agent-core|pi-ai|pi-tui)(?:\/|$)/;
+const coreSdk = /(?:^|\/)(?:@earendil-works\/(?:pi-coding-agent|pi-agent-core|pi-ai|pi-tui)|typebox)(?:\/|$)/;
 function run(name, command, args) {
 	const result = spawnSync(command, args, { cwd: source, encoding: "utf8", timeout: 90_000, maxBuffer: 10 * 1024 * 1024 });
 	fs.writeFileSync(path.join(root, `${name}.log`), `${result.stdout ?? ""}${result.stderr ?? ""}`);
 	assert.ifError(result.error);
 	return result;
 }
-const built = run("build-package", process.execPath, ["scripts/build-package.mjs"]);
-assert.equal(built.status, 0, built.stderr);
-const packed = run("pack", "npm", ["pack", "--ignore-scripts", "--json", "--pack-destination", root, path.join(source, "dist-pkg")]);
-assert.equal(packed.status, 0, packed.stderr);
-const tarball = JSON.parse(packed.stdout)[0];
+// The matrix packs once and passes the tarball so every mode stages the same candidate.
+const prebuilt = process.argv[5];
+let tarball;
+if (prebuilt) {
+	assert.ok(path.isAbsolute(prebuilt) && fs.existsSync(prebuilt), "the prebuilt package must be an existing absolute path");
+	tarball = { filename: path.basename(prebuilt) };
+	fs.copyFileSync(prebuilt, path.join(root, tarball.filename));
+} else {
+	const built = run("build-package", process.execPath, ["scripts/build-package.mjs"]);
+	assert.equal(built.status, 0, built.stderr);
+	const packed = run("pack", "npm", ["pack", "--ignore-scripts", "--json", "--pack-destination", root, path.join(source, "dist-pkg")]);
+	assert.equal(packed.status, 0, packed.stderr);
+	tarball = JSON.parse(packed.stdout)[0];
+}
 assert.equal(run("extract", "tar", ["-xf", path.join(root, tarball.filename), "-C", root]).status, 0);
 // Copy rather than symlink: ancestor resolution must not escape into the checkout's dev SDK/shim.
 fs.cpSync(path.join(source, "node_modules"), path.join(root, "package/node_modules"), {
@@ -53,7 +62,7 @@ for (const name of ["standalone-parent.ts", "standalone-provider.ts", "standalon
 fs.writeFileSync(path.join(root, "work/bunfig.toml"), '[install]\nauto = "disable"\n');
 fs.writeFileSync(path.join(root, "work/negative.ts"), 'import "@earendil-works/pi-coding-agent";\n');
 fs.mkdirSync(path.join(root, "work/.pi/agents"), { recursive: true });
-fs.writeFileSync(path.join(root, "work/.pi/agents/binary-smoke.md"), `---\nname: binary-smoke\ndescription: Isolated native async regression\nmodel: standalone-smoke/local\ntools: ${mode === "tool-timeout" ? "bash" : ""}\nextensions:\n  - /stage/package/test/smoke/standalone-observer.ts\n  - /stage/package/test/smoke/standalone-provider.ts\ncompletionGuard: false\n---\nReturn the scripted response.\n`);
+fs.writeFileSync(path.join(root, "work/.pi/agents/binary-smoke.md"), `---\nname: binary-smoke\ndescription: Isolated native async regression\nmodel: standalone-smoke/local\ntools: ${mode === "tool-timeout" ? "bash" : ""}\nextensions:\n  - /stage/package/test/smoke/standalone-observer.ts\n  - /stage/package/test/smoke/standalone-provider.ts\n---\nReturn the scripted response.\n`);
 fs.writeFileSync(path.join(root, "agent/settings.json"), JSON.stringify({ defaultProvider: "standalone-smoke", defaultModel: "local", packages: [] }));
 fs.mkdirSync(path.join(root, "agent/extensions"), { recursive: true });
 fs.writeFileSync(path.join(root, "agent/extensions/ambient-sentinel.ts"), 'import fs from "node:fs"; export default function () { fs.writeFileSync("/stage/ambient-loaded", String(process.pid)); }\n');
@@ -76,7 +85,7 @@ console.log(`Artifacts: ${root}`);
 if (mode === "bootstrap-errors") {
 	const nativeStep = {
 		agent: "binary-smoke", task: "Return the scripted response.", context: "fresh", model: "standalone-smoke/local",
-		tools: [], extensions: ["/stage/package/test/smoke/standalone-provider.ts"], completionGuard: false,
+		tools: [], extensions: ["/stage/package/test/smoke/standalone-provider.ts"],
 		inheritProjectContext: false, inheritGlobalContext: false, inheritSkills: false,
 	};
 	const cases = [
@@ -85,7 +94,7 @@ if (mode === "bootstrap-errors") {
 		{ name: "relative-input", configPath: "relative.json", expected: /Missing absolute PI_SUBAGENT_RUNNER_CONFIG/ },
 		{ name: "missing-file", configPath: "/stage/not-present.json", expected: /ENOENT/ },
 		{ name: "malformed-json", payload: "{", expected: /Subagent binary runner error/ },
-		{ name: "invalid-shape", payload: "{}", expected: /Invalid binary runner configuration/ },
+		{ name: "invalid-shape", payload: "{}", expected: /Invalid runner configuration: 'id' must be a non-empty string/ },
 		{ name: "wrong-authorization", barrier: true, expected: /startup control token does not match/ },
 		{ name: "missing-authorization", barrier: true, expected: /waiting for runner startup control 'proceed'/ },
 	];

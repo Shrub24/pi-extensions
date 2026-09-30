@@ -5,6 +5,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	type AgentConfig,
 	type AgentDiscoveryDiagnostic,
+	type AgentDiscoveryAllResult,
 	type AgentScope,
 	type AgentSource,
 	defaultInheritProjectContext,
@@ -42,7 +43,11 @@ import { listExternalJobProviders } from "../api/external-job-provider.ts";
 
 type ManagementAction = "list" | "get" | "models" | "create" | "update" | "delete" | "eject" | "disable" | "enable" | "reset";
 type ManagementScope = "user" | "project";
-type ManagementContext = Pick<ExtensionContext, "cwd" | "modelRegistry"> & { model?: ExtensionContext["model"]; config?: ExtensionConfig; currentSessionId?: string; runtimeAgentOwner?: RuntimeAgentOwner; onAgentsChanged?: () => void };
+type ManagementContext = Pick<ExtensionContext, "cwd" | "modelRegistry"> & { model?: ExtensionContext["model"]; config?: ExtensionConfig; currentSessionId?: string; runtimeAgentOwner?: RuntimeAgentOwner; onAgentsChanged?: () => void; discoverAgentsAll?: typeof discoverAgentsAll };
+
+function discoverCatalog(ctx: ManagementContext, cwd: string = ctx.cwd, provider?: string): AgentDiscoveryAllResult {
+	return (ctx.discoverAgentsAll ?? discoverAgentsAll)(cwd, provider);
+}
 
 interface ManagementParams {
 	action?: string;
@@ -125,43 +130,48 @@ function parsePackageConfig(value: unknown): { packageName?: string; error?: str
 	return parsePackageName(value, "config.package");
 }
 
-function allAgents(d: { builtin: AgentConfig[]; package: AgentConfig[]; user: AgentConfig[]; project: AgentConfig[] }): AgentConfig[] {
+type DiscoveredAgentSets = Pick<AgentDiscoveryAllResult, "builtin" | "package" | "user" | "project" | "cwd">;
+
+function allAgents(d: DiscoveredAgentSets): AgentConfig[] {
 	return [...d.builtin, ...d.package, ...d.user, ...d.project];
 }
 
 function effectiveAgentsForScope(
 	scope: AgentScope,
-	d: { builtin: AgentConfig[]; package: AgentConfig[]; user: AgentConfig[]; project: AgentConfig[] },
+	d: DiscoveredAgentSets,
 	runtimeAgentOwner?: RuntimeAgentOwner,
+	preferredModelProvider?: string,
 ): AgentConfig[] {
 	let agents = mergeAgentsForScope(scope, d.user, d.project, d.builtin, d.package);
 	if (runtimeAgentOwner) {
-		agents = mergeRuntimeAgents(runtimeAgentOwner, { agents }, allAgents(d)).agents;
+		agents = mergeRuntimeAgents(runtimeAgentOwner, { agents }, allAgents(d), { cwd: d.cwd, scope, preferredModelProvider }).agents;
 	}
 	return agents;
 }
 
 function availableAgentNamesFromDiscovery(
-	d: { builtin: AgentConfig[]; package: AgentConfig[]; user: AgentConfig[]; project: AgentConfig[] },
+	d: DiscoveredAgentSets,
 	runtimeAgentOwner?: RuntimeAgentOwner,
+	preferredModelProvider?: string,
 ): string[] {
-	const agents = runtimeAgentOwner ? effectiveAgentsForScope("both", d, runtimeAgentOwner) : allAgents(d);
+	const agents = runtimeAgentOwner ? effectiveAgentsForScope("both", d, runtimeAgentOwner, preferredModelProvider) : allAgents(d);
 	return [...new Set(agents.map((agent) => agent.name))].sort((a, b) => a.localeCompare(b));
 }
 
-function availableAgentNames(cwd: string): string[] {
-	return availableAgentNamesFromDiscovery(discoverAgentsAll(cwd));
+function availableAgentNames(ctx: ManagementContext, cwd: string = ctx.cwd): string[] {
+	return availableAgentNamesFromDiscovery(discoverCatalog(ctx, cwd));
 }
 
 function findAgentsInDiscovery(
 	name: string,
-	d: { builtin: AgentConfig[]; package: AgentConfig[]; user: AgentConfig[]; project: AgentConfig[] },
+	d: DiscoveredAgentSets,
 	scope: AgentScope = "both",
 	runtimeAgentOwner?: RuntimeAgentOwner,
+	preferredModelProvider?: string,
 ): AgentConfig[] {
 	const raw = name.trim();
 	const sanitized = sanitizeName(raw);
-	const scoped = effectiveAgentsForScope(scope, d, runtimeAgentOwner);
+	const scoped = effectiveAgentsForScope(scope, d, runtimeAgentOwner, preferredModelProvider);
 	let resolved = resolveAgentName(raw, scoped);
 	if (!resolved.agent && !resolved.error && sanitized !== raw) resolved = resolveAgentName(sanitized, scoped);
 	if (resolved.agent) return scoped.filter((agent) => agent.name === resolved.agent!.name).sort((a, b) => a.source.localeCompare(b.source));
@@ -171,8 +181,8 @@ function findAgentsInDiscovery(
 		.sort((a, b) => a.source.localeCompare(b.source));
 }
 
-function findAgents(name: string, cwd: string, scope: AgentScope = "both"): AgentConfig[] {
-	return findAgentsInDiscovery(name, discoverAgentsAll(cwd), scope);
+function findAgents(name: string, ctx: ManagementContext, scope: AgentScope = "both"): AgentConfig[] {
+	return findAgentsInDiscovery(name, discoverCatalog(ctx), scope);
 }
 
 function diagnosticsForScope(diagnostics: AgentDiscoveryDiagnostic[] | undefined, scope: AgentScope): AgentDiscoveryDiagnostic[] | undefined {
@@ -199,8 +209,8 @@ function resolveEffectiveAgent(d: ReturnType<typeof discoverAgentsAll>, name: st
 	return { agent: matches.reduce((best, agent) => (AGENT_SOURCE_PRECEDENCE[agent.source] > AGENT_SOURCE_PRECEDENCE[best.source] ? agent : best)) };
 }
 
-function nameExistsInScope(cwd: string, scope: ManagementScope, name: string, excludePath?: string): boolean {
-	const d = discoverAgentsAll(cwd);
+function nameExistsInScope(ctx: ManagementContext, scope: ManagementScope, name: string, excludePath?: string): boolean {
+	const d = discoverCatalog(ctx);
 	for (const a of scope === "user" ? d.user : d.project) {
 		if (a.name === name && a.filePath !== excludePath) return true;
 	}
@@ -280,7 +290,6 @@ export function editableAgentConfig(agent: AgentConfig): AgentConfig {
 		allowedAgents: _allowedAgents,
 		subagentOnlyExtensions: _subagentOnlyExtensions,
 		mutationTools: _mutationTools,
-		completionGuard: _completionGuard,
 		toolBudget: _toolBudget,
 		...editable
 	} = withoutExtensions;
@@ -318,7 +327,6 @@ export function editableAgentConfig(agent: AgentConfig): AgentConfig {
 		...(base.extensions !== undefined ? { extensions: [...base.extensions] } : {}),
 		...(base.subagentOnlyExtensions !== undefined ? { subagentOnlyExtensions: [...base.subagentOnlyExtensions] } : {}),
 		...(base.mutationTools !== undefined ? { mutationTools: [...base.mutationTools] } : {}),
-		...(base.completionGuard !== undefined ? { completionGuard: base.completionGuard } : {}),
 		...(base.toolBudget !== undefined ? { toolBudget: base.toolBudget } : {}),
 	}, agent.filePath);
 }
@@ -383,10 +391,6 @@ export function preservedAgentFrontmatterFields(agent: AgentConfig, cfg: Record<
 	if (hasKey(cfg, "reads")) changed("defaultReads");
 	if (hasKey(cfg, "progress")) changed("defaultProgress");
 	if (hasKey(cfg, "maxSubagentDepth")) changed("maxSubagentDepth");
-	if (hasKey(cfg, "completionGuard")) {
-		changed("completionGuard");
-		if (cfg.completionGuard === true) fields.add("completionGuard");
-	}
 	if (hasKey(cfg, "toolBudget")) changed("toolBudget");
 
 	return fields;
@@ -598,10 +602,6 @@ function applyAgentConfig(target: AgentConfig, cfg: Record<string, unknown>): st
 			target.maxSubagentDepth = cfg.maxSubagentDepth;
 		} else return "config.maxSubagentDepth must be an integer >= 0 or false when provided.";
 	}
-	if (hasKey(cfg, "completionGuard")) {
-		if (typeof cfg.completionGuard !== "boolean") return "config.completionGuard must be a boolean when provided.";
-		target.completionGuard = cfg.completionGuard;
-	}
 	if (hasKey(cfg, "toolBudget")) {
 		if (cfg.toolBudget === false || cfg.toolBudget === "") delete target.toolBudget;
 		else {
@@ -621,7 +621,6 @@ function applyAgentConfig(target: AgentConfig, cfg: Record<string, unknown>): st
 			target.mutationTools?.length ? "mutationTools" : undefined,
 			target.skills?.length || target.skillPath?.length ? "skills" : undefined,
 			target.maxSubagentDepth !== undefined ? "maxSubagentDepth" : undefined,
-			target.completionGuard !== undefined ? "completionGuard" : undefined,
 			target.toolBudget ? "toolBudget" : undefined,
 		].filter((field): field is string => Boolean(field));
 		if (unsupported.length > 0) return `config.runner type '${target.runner.type}' does not support Pi-only fields: ${unsupported.join(", ")}.`;
@@ -633,6 +632,7 @@ function resolveTarget<T extends { name: string; source: AgentSource; filePath: 
 	name: string,
 	matches: T[],
 	cwd: string,
+	ctx: ManagementContext,
 	scopeHint?: string,
 ): T | AgentToolResult<Details> {
 	const distinctNames = [...new Set(matches.map((match) => match.name))];
@@ -640,7 +640,7 @@ function resolveTarget<T extends { name: string; source: AgentSource; filePath: 
 	const mutable = matches.filter((match): match is T & { source: ManagementScope } => isMutableSource(match.source));
 	if (mutable.length === 0) {
 		if (matches.length > 0) return result(`Agent '${name}' is read-only and cannot be modified. Create a same-named agent in user or project scope to override it.`, true);
-		return result(`Agent '${name}' not found. Available: ${availableAgentNames(cwd).join(", ") || "none"}.`, true);
+		return result(`Agent '${name}' not found. Available: ${availableAgentNames(ctx, cwd).join(", ") || "none"}.`, true);
 	}
 	if (mutable.length === 1) return mutable[0]!;
 	const scope = asDisambiguationScope(scopeHint);
@@ -654,8 +654,8 @@ function resolveTarget<T extends { name: string; source: AgentSource; filePath: 
 	return scoped[0]!;
 }
 
-function renamePath(currentPath: string, newName: string, scope: ManagementScope, cwd: string): { filePath?: string; error?: string } {
-	if (nameExistsInScope(cwd, scope, newName, currentPath)) return { error: `Name '${newName}' already exists in ${scope} scope.` };
+function renamePath(currentPath: string, newName: string, scope: ManagementScope, ctx: ManagementContext): { filePath?: string; error?: string } {
+	if (nameExistsInScope(ctx, scope, newName, currentPath)) return { error: `Name '${newName}' already exists in ${scope} scope.` };
 	const filePath = path.join(path.dirname(currentPath), `${newName}.md`);
 	if (fs.existsSync(filePath) && filePath !== currentPath) return { error: `File already exists at ${filePath} but is not a valid agent definition. Remove or rename it first.` };
 	fs.renameSync(currentPath, filePath);
@@ -963,7 +963,6 @@ function formatAgentDetail(agent: AgentConfig): string {
 	if (agent.defaultReads?.length) lines.push(`Reads: ${agent.defaultReads.join(", ")}`);
 	if (agent.defaultProgress) lines.push("Progress: true");
 	if (agent.maxSubagentDepth !== undefined) lines.push(`Max subagent depth: ${agent.maxSubagentDepth}`);
-	if (agent.completionGuard === false) lines.push("Completion guard: false");
 	if (agent.toolBudget) lines.push(`Tool budget: ${JSON.stringify(agent.toolBudget)}`);
 	if (agent.memory) lines.push(`Memory: ${agent.memory.scope} scope, path: ${agent.memory.path}`);
 	if (agent.systemPrompt.trim()) lines.push("", "System Prompt:", agent.systemPrompt);
@@ -972,8 +971,8 @@ function formatAgentDetail(agent: AgentConfig): string {
 
 export function handleList(params: ManagementParams, ctx: ManagementContext): AgentToolResult<Details> {
 	const scope = normalizeListScope(params.agentScope) ?? "both";
-	const d = discoverAgentsAll(ctx.cwd, ctx.model?.provider);
-	let scopedAgents = effectiveAgentsForScope(scope, d, ctx.runtimeAgentOwner);
+	const d = discoverCatalog(ctx, ctx.cwd, ctx.model?.provider);
+	let scopedAgents = effectiveAgentsForScope(scope, d, ctx.runtimeAgentOwner, ctx.model?.provider);
 	scopedAgents = scopedAgents
 		.sort((a, b) => a.name.localeCompare(b.name));
 	const capabilityCeiling = resolveCurrentSubagentCapabilityCeiling(ctx.currentSessionId);
@@ -1028,8 +1027,8 @@ function handleModels(params: ManagementParams, ctx: ManagementContext): AgentTo
 	const scope = normalizeListScope(params.agentScope);
 	if (!scope) return result("agentScope must be 'user', 'project', or 'both' for models.", true);
 
-	const discovered = discoverAgentsAll(ctx.cwd, ctx.model?.provider);
-	const effectiveAgents = effectiveAgentsForScope(scope, discovered, ctx.runtimeAgentOwner)
+	const discovered = discoverCatalog(ctx, ctx.cwd, ctx.model?.provider);
+	const effectiveAgents = effectiveAgentsForScope(scope, discovered, ctx.runtimeAgentOwner, ctx.model?.provider)
 		.sort((a, b) => a.name.localeCompare(b.name));
 	const availableModels = ctx.modelRegistry.getAvailable().map(toModelInfo);
 	const currentModel = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined;
@@ -1038,7 +1037,7 @@ function handleModels(params: ManagementParams, ctx: ManagementContext): AgentTo
 
 	let selectedAgents = effectiveAgents;
 	if (requestedAgent) {
-		const matches = findAgentsInDiscovery(requestedAgent, discovered, scope, ctx.runtimeAgentOwner);
+		const matches = findAgentsInDiscovery(requestedAgent, discovered, scope, ctx.runtimeAgentOwner, ctx.model?.provider);
 		const diagnostics = diagnosticsForScope(discovered.agentDiagnostics, scope);
 		const normalizedName = sanitizeName(requestedAgent);
 		const diagnostic = findBlockingAgentDiagnostic(requestedAgent, matches, diagnostics)
@@ -1047,7 +1046,7 @@ function handleModels(params: ManagementParams, ctx: ManagementContext): AgentTo
 		const distinctNames = [...new Set(matches.map((agent) => agent.name))];
 		if (distinctNames.length > 1) return result(`Ambiguous agent alias or name '${params.agent}': ${distinctNames.sort((a, b) => a.localeCompare(b)).join(", ")}`, true);
 		if (!matches.length) {
-			return result(`Agent '${params.agent}' not found. Available: ${availableAgentNamesFromDiscovery(discovered, ctx.runtimeAgentOwner).join(", ") || "none"}.`, true);
+			return result(`Agent '${params.agent}' not found. Available: ${availableAgentNamesFromDiscovery(discovered, ctx.runtimeAgentOwner, ctx.model?.provider).join(", ") || "none"}.`, true);
 		}
 		selectedAgents = [matches[0]!];
 	}
@@ -1124,7 +1123,7 @@ function handleGet(params: ManagementParams, ctx: ManagementContext): AgentToolR
 	if (!params.agent) return result("Specify 'agent' for get.", true);
 	const scope = normalizeListScope(params.agentScope);
 	if (!scope) return result("agentScope must be 'user', 'project', or 'both' for get.", true);
-	const discovered = discoverAgentsAll(ctx.cwd, ctx.model?.provider);
+	const discovered = discoverCatalog(ctx, ctx.cwd, ctx.model?.provider);
 	const matches = findAgentsInDiscovery(params.agent, discovered, scope);
 	const diagnostics = diagnosticsForScope(discovered.agentDiagnostics, scope);
 	const rawName = params.agent.trim();
@@ -1156,11 +1155,11 @@ export function handleCreate(params: ManagementParams, ctx: ManagementContext): 
 	if (scopeRaw !== "user" && scopeRaw !== "project") return result("config.scope must be 'user' or 'project'.", true);
 	const scope = scopeRaw;
 	if (hasKey(cfg, "steps")) return result("Durable chain definitions were removed; use workflowScript or /prompt-workflow for repeatable workflows.", true);
-	const d = discoverAgentsAll(ctx.cwd);
+	const d = discoverCatalog(ctx);
 	const projectConfigDir = getProjectConfigDir(ctx.cwd);
 	const targetDir = scope === "user" ? d.userDir : d.projectDir ?? path.join(projectConfigDir, "agents");
 	fs.mkdirSync(targetDir, { recursive: true });
-	if (nameExistsInScope(ctx.cwd, scope, runtimeName)) return result(`Name '${runtimeName}' already exists in ${scope} scope. Use update instead.`, true);
+	if (nameExistsInScope(ctx, scope, runtimeName)) return result(`Name '${runtimeName}' already exists in ${scope} scope. Use update instead.`, true);
 	const targetPath = path.join(targetDir, `${runtimeName}.md`);
 	if (fs.existsSync(targetPath)) return result(`File already exists at ${targetPath} but is not a valid agent definition. Remove or rename it first.`, true);
 	const warnings: string[] = [];
@@ -1200,7 +1199,7 @@ export function handleUpdate(params: ManagementParams, ctx: ManagementContext): 
 	if (hasKey(cfg, "steps")) return result("Durable chain definitions were removed; use workflowScript or /prompt-workflow for repeatable workflows.", true);
 	const warnings: string[] = [];
 	const scopeHint = asDisambiguationScope(params.agentScope);
-	const targetOrError = resolveTarget(params.agent, findAgents(params.agent, ctx.cwd, scopeHint ?? "both"), ctx.cwd, scopeHint);
+	const targetOrError = resolveTarget(params.agent, findAgents(params.agent, ctx, scopeHint ?? "both"), ctx.cwd, ctx, scopeHint);
 	if ("content" in targetOrError) return targetOrError;
 	const target = targetOrError;
 	if (target.source !== "user" && target.source !== "project") return result(`Cannot update ${target.source} agent '${target.name}'. Eject it to user or project scope first.`, true);
@@ -1244,7 +1243,7 @@ export function handleUpdate(params: ManagementParams, ctx: ManagementContext): 
 		if (sw) warnings.push(sw);
 	}
 	if (updated.name !== oldName) {
-		const renamed = renamePath(target.filePath, updated.name, target.source, ctx.cwd);
+		const renamed = renamePath(target.filePath, updated.name, target.source, ctx);
 		if (renamed.error) return result(renamed.error, true);
 		updated.filePath = renamed.filePath!;
 	}
@@ -1259,7 +1258,7 @@ export function handleUpdate(params: ManagementParams, ctx: ManagementContext): 
 function handleDelete(params: ManagementParams, ctx: ManagementContext): AgentToolResult<Details> {
 	if (!params.agent) return result("Specify 'agent' for delete.", true);
 	const scopeHint = asDisambiguationScope(params.agentScope);
-	const targetOrError = resolveTarget(params.agent, findAgents(params.agent, ctx.cwd, scopeHint ?? "both"), ctx.cwd, scopeHint);
+	const targetOrError = resolveTarget(params.agent, findAgents(params.agent, ctx, scopeHint ?? "both"), ctx.cwd, ctx, scopeHint);
 	if ("content" in targetOrError) return targetOrError;
 	const target = targetOrError;
 	fs.unlinkSync(target.filePath);
@@ -1274,17 +1273,17 @@ function handleEject(params: ManagementParams, ctx: ManagementContext): AgentToo
 	const parsedScope = actionScope(params.agentScope, "eject");
 	if (parsedScope.error) return parsedScope.error;
 	const scope = parsedScope.scope!;
-	const d = discoverAgentsAll(ctx.cwd);
+	const d = discoverCatalog(ctx);
 	const source = [...d.package, ...d.builtin].find((a) => a.name === raw || a.name === sanitized);
 	if (!source) {
-		return result(`Agent '${raw}' not found or is not a bundled/package agent. eject copies a builtin or package agent to ${scope} scope so it can be customized. Available: ${availableAgentNames(ctx.cwd).join(", ") || "none"}.`, true);
+		return result(`Agent '${raw}' not found or is not a bundled/package agent. eject copies a builtin or package agent to ${scope} scope so it can be customized. Available: ${availableAgentNames(ctx).join(", ") || "none"}.`, true);
 	}
 	const runtimeName = source.name;
 	const existingCustom = (scope === "user" ? d.user : d.project).find((a) => a.name === runtimeName);
 	if (existingCustom) {
 		return result(`Agent '${runtimeName}' is already a custom ${scope} agent at ${existingCustom.filePath}. Edit it with { action: "update", agent: "${runtimeName}" } or delete it first.`, true);
 	}
-	if (nameExistsInScope(ctx.cwd, scope, runtimeName)) {
+	if (nameExistsInScope(ctx, scope, runtimeName)) {
 		return result(`An agent named '${runtimeName}' already exists in ${scope} scope. Remove or rename it first.`, true);
 	}
 	const projectConfigDir = getProjectConfigDir(ctx.cwd);
@@ -1312,18 +1311,18 @@ function handleDisable(params: ManagementParams, ctx: ManagementContext): AgentT
 	const parsedScope = actionScope(params.agentScope, "disable");
 	if (parsedScope.error) return parsedScope.error;
 	const scope = parsedScope.scope!;
-	const d = discoverAgentsAll(ctx.cwd);
+	const d = discoverCatalog(ctx);
 	if (scope === "project" && d.projectSettingsPath === null) {
 		return result("Project override is not available here: no project config root (.pi or .agents) was found above the cwd. Use agentScope: 'user' or run from inside a project.", true);
 	}
 	const effective = resolveEffectiveAgent(d, raw);
 	if (effective.error) return result(effective.error, true);
 	if (!effective.agent) {
-		return result(`Agent '${raw}' not found. Available: ${availableAgentNames(ctx.cwd).join(", ") || "none"}.`, true);
+		return result(`Agent '${raw}' not found. Available: ${availableAgentNames(ctx).join(", ") || "none"}.`, true);
 	}
 	const runtimeName = effective.agent.name;
 	const settingsPath = mergeBuiltinAgentOverride(ctx.cwd, runtimeName, scope, { disabled: true });
-	const after = resolveEffectiveAgent(discoverAgentsAll(ctx.cwd), raw).agent;
+	const after = resolveEffectiveAgent(discoverCatalog(ctx), raw).agent;
 	if (after?.disabled === true) {
 		ctx.onAgentsChanged?.();
 		return result(`Disabled agent '${runtimeName}' via ${scope} settings override at ${settingsPath}. It is now hidden from runtime discovery and { action: "list" }.`);
@@ -1337,18 +1336,18 @@ function handleEnable(params: ManagementParams, ctx: ManagementContext): AgentTo
 	const parsedScope = actionScope(params.agentScope, "enable");
 	if (parsedScope.error) return parsedScope.error;
 	const scope = parsedScope.scope!;
-	const d = discoverAgentsAll(ctx.cwd);
+	const d = discoverCatalog(ctx);
 	if (scope === "project" && d.projectSettingsPath === null) {
 		return result("Project override is not available here: no project config root (.pi or .agents) was found above the cwd. Use agentScope: 'user' or run from inside a project.", true);
 	}
 	const effective = resolveEffectiveAgent(d, raw);
 	if (effective.error) return result(effective.error, true);
 	if (!effective.agent) {
-		return result(`Agent '${raw}' not found. Available: ${availableAgentNames(ctx.cwd).join(", ") || "none"}.`, true);
+		return result(`Agent '${raw}' not found. Available: ${availableAgentNames(ctx).join(", ") || "none"}.`, true);
 	}
 	const runtimeName = effective.agent.name;
 	const { path: settingsPath, removed } = removeBuiltinAgentOverrideFields(ctx.cwd, runtimeName, scope, ["disabled"]);
-	const after = resolveEffectiveAgent(discoverAgentsAll(ctx.cwd), raw).agent;
+	const after = resolveEffectiveAgent(discoverCatalog(ctx), raw).agent;
 	if (after && after.disabled !== true) {
 		if (removed) ctx.onAgentsChanged?.();
 		if (removed) return result(`Enabled agent '${runtimeName}' (removed disabled override at ${settingsPath}).`);
@@ -1367,7 +1366,7 @@ function handleReset(params: ManagementParams, ctx: ManagementContext): AgentToo
 	const parsedScope = actionScope(params.agentScope, "reset");
 	if (parsedScope.error) return parsedScope.error;
 	const scope = parsedScope.scope!;
-	const d = discoverAgentsAll(ctx.cwd);
+	const d = discoverCatalog(ctx);
 	if (scope === "project" && d.projectSettingsPath === null) {
 		return result("Project override is not available here: no project config root (.pi or .agents) was found above the cwd. Use agentScope: 'user' or run from inside a project.", true);
 	}
@@ -1377,7 +1376,7 @@ function handleReset(params: ManagementParams, ctx: ManagementContext): AgentToo
 		if (custom) {
 			return result(`Agent '${raw}' has no bundled default to reset to. Use { action: "delete", agent: "${custom.name}" } to remove the custom ${custom.source} agent.`, true);
 		}
-		return result(`Agent '${raw}' not found. Available: ${availableAgentNames(ctx.cwd).join(", ") || "none"}.`, true);
+		return result(`Agent '${raw}' not found. Available: ${availableAgentNames(ctx).join(", ") || "none"}.`, true);
 	}
 	const runtimeName = bundled.name;
 	const custom = (scope === "user" ? d.user : d.project).find((a) => a.name === raw || a.name === sanitized);

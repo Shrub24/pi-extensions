@@ -27,7 +27,7 @@ describe("foreign workflow tool steering (separate processes)", () => {
 		ctx.sessionManager.getSessionFile = () => sessionFile;
 		ctx.sessionManager.getSessionId = () => "different-runtime-id-in-owner";
 		const state: any = { baseCwd: tempDir, currentSessionId: null, asyncJobs: new Map(), foregroundControls: new Map(), lastForegroundControlId: null };
-		const executor = createSubagentExecutor({ pi: { events: createEventBus(), getSessionName: () => undefined }, state, config: {}, asyncByDefault: false, tempArtifactsDir: tempDir, getSubagentSessionRoot: () => tempDir, expandTilde: p => p, discoverAgents: () => ({ agents: [makeAgent("worker", { completionGuard: false })] }) });
+		const executor = createSubagentExecutor({ pi: { events: createEventBus(), getSessionName: () => undefined }, state, config: {}, asyncByDefault: false, tempArtifactsDir: tempDir, getSubagentSessionRoot: () => tempDir, expandTilde: p => p, discoverAgents: () => ({ agents: [makeAgent("worker")] }) });
 		const launch = await executor.execute("owner", { workflowScript: 'return await runs.run("A", { agent: "worker", task: "Wait" });', async: true, mission: false }, new AbortController().signal, undefined, ctx);
 		assert.notEqual(launch.isError, true, JSON.stringify(launch));
 		const runId = launch.details.asyncId!;
@@ -70,16 +70,20 @@ describe("foreign workflow tool steering (separate processes)", () => {
 		const sessionFile = path.join(tempDir, "parent.jsonl");
 		const status = JSON.stringify({ runId, mode: "workflow", state: "running", sessionId: sessionFile, completionOwnerId: "unavailable-owner", pid: 99999999, updatedAt: 1, steps: [{ status: "running", workflowKey: "A" }, { status: "running", workflowKey: "B" }] });
 		fs.writeFileSync(path.join(dir, "status.json"), status);
-		for (const policy of ["forbid", "confirm"]) {
-			const refused = await hostB(sessionFile, { dir }, policy, policy);
+		const [forbidden, confirmation, mismatch, b] = await hostB(sessionFile, [
+			{ params: { dir }, policy: "forbid" },
+			{ params: { dir }, policy: "confirm" },
+			{ params: { dir, id: "another-workflow" } },
+			{ params: { id: runId } },
+		], "unavailable-owner");
+		for (const refused of [forbidden, confirmation]) {
 			assert.equal(refused.result.isError, true);
 			assert.match(refused.result.content[0].text, /Authority policy/);
-			assert.equal(fs.existsSync(steerRequestsDir(dir)), false);
+			assert.equal(refused.requestCount, 0);
 		}
-		const mismatch = await hostB(sessionFile, { dir, id: "another-workflow" }, "mismatch");
 		assert.equal(mismatch.result.isError, true);
 		assert.match(mismatch.result.content[0].text, /does not match directory/);
-		const b = await hostB(sessionFile, { id: runId }, "noack");
+		assert.equal(mismatch.requestCount, 0);
 		assert.notEqual(b.result.isError, true, JSON.stringify(b));
 		assert.equal(b.result.details.steering.state, "pending");
 		assert.equal(b.result.details.steering.deliveryStatus, "queued");

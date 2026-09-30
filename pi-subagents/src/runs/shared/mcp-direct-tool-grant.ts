@@ -1,11 +1,13 @@
 const BUILTIN_TOOL_NAMES = new Set(["read", "bash", "edit", "write", "grep", "find", "ls", "mcp"]);
 
-export type McpToolPrefix = "server" | "none" | "short";
+export type McpToolPrefix = "server" | "none" | "short" | "mcp";
 
 export interface McpGrantServerFacts {
 	readonly exposeResources?: boolean;
 	readonly includeTools?: readonly unknown[];
 	readonly excludeTools?: readonly unknown[];
+	/** Per-server prefix override, matching the adapter's `ServerEntry.toolPrefix`. */
+	readonly toolPrefix?: unknown;
 }
 
 export interface McpGrantToolMetadata {
@@ -73,7 +75,6 @@ export function planMcpDirectToolGrant(input: McpDirectToolGrantInput): McpDirec
 	const { servers: selectedServers, tools: selectedTools } = parseMcpDirectToolSelectors(selectors);
 	const selections: ResolvedMcpDirectToolSelection[] = [];
 	const seenNames = new Set<string>();
-	const prefix = normalizeMcpToolPrefix(input.toolPrefix);
 
 	for (const [serverName, server] of Object.entries(input.servers)) {
 		const metadata = input.metadata[serverName];
@@ -83,6 +84,7 @@ export function planMcpDirectToolGrant(input: McpDirectToolGrantInput): McpDirec
 			? true
 			: selectedTools.get(serverName);
 		if (!toolFilter) continue;
+		const prefix = normalizeMcpToolPrefix(server.toolPrefix ?? input.toolPrefix);
 
 		for (const tool of Array.isArray(metadata.tools) ? metadata.tools : []) {
 			if (typeof tool?.name !== "string" || !tool.name) continue;
@@ -97,7 +99,7 @@ export function planMcpDirectToolGrant(input: McpDirectToolGrantInput): McpDirec
 		if (server.exposeResources === false) continue;
 		for (const resource of Array.isArray(metadata.resources) ? metadata.resources : []) {
 			if (typeof resource?.name !== "string" || !resource.name || typeof resource.uri !== "string" || !resource.uri) continue;
-			const baseName = `read_${resourceNameToToolName(resource.name)}`;
+			const baseName = `get_${resourceNameToToolName(resource.name)}`;
 			if (toolFilter !== true && !toolFilter.has(baseName)) continue;
 			if (!isToolAllowed(baseName, serverName, prefix, server.includeTools, server.excludeTools)) continue;
 			const name = formatToolName(baseName, serverName, prefix);
@@ -116,7 +118,7 @@ export function planMcpDirectToolGrant(input: McpDirectToolGrantInput): McpDirec
 }
 
 export function normalizeMcpToolPrefix(value: unknown): McpToolPrefix {
-	return value === "none" || value === "short" || value === "server" ? value : "server";
+	return value === "none" || value === "short" || value === "mcp" || value === "server" ? value : "server";
 }
 
 export function formatUnresolvedMcpDirectToolSelectors(selectors: readonly string[]): string {
@@ -126,21 +128,25 @@ export function formatUnresolvedMcpDirectToolSelectors(selectors: readonly strin
 function getServerPrefix(serverName: string, mode: McpToolPrefix): string {
 	if (mode === "none") return "";
 	if (mode === "short") return sanitizeServerPrefix(serverName.replace(/-?mcp$/i, "")) || "mcp";
+	if (mode === "mcp") return `mcp__${sanitizeServerPrefix(serverName)}`;
 	return sanitizeServerPrefix(serverName);
 }
 
-// Mirrors pi-mcp-adapter's sanitizeServerPrefix: characters outside
-// [A-Za-z0-9_-] become _<hex codepoint>_ so dotted server names
-// (e.g. "grep.app") resolve to the same tool names the adapter registers.
+/** Adapter parity: characters outside [A-Za-z0-9_-] become `_<code point in hex>_`. */
 function sanitizeServerPrefix(serverName: string): string {
-	return Array.from(serverName, (char) =>
-		/^[A-Za-z0-9_-]$/.test(char) ? char : `_${char.codePointAt(0)?.toString(16)}_`,
-	).join("");
+	return Array.from(serverName, (char) => /^[A-Za-z0-9_-]$/.test(char) ? char : `_${char.codePointAt(0)!.toString(16)}_`).join("");
 }
 
 function formatToolName(toolName: string, serverName: string, prefix: McpToolPrefix): string {
 	const serverPrefix = getServerPrefix(serverName, prefix);
-	return serverPrefix ? `${serverPrefix}_${toolName}` : toolName;
+	const sanitized = toolName.replace(/\./g, "_");
+	// Some servers prefix their tool names with the server name (codegraph ->
+	// codegraph_explore). pi-mcp-adapter registers such a name unchanged, so
+	// keep the two sides in agreement instead of demanding codegraph_codegraph_explore.
+	if (serverPrefix && sanitized.startsWith(`${serverPrefix}_`) && sanitized.length > serverPrefix.length + 1) {
+		return sanitized;
+	}
+	return serverPrefix ? `${serverPrefix}_${sanitized}` : sanitized;
 }
 
 function isToolAllowed(
@@ -162,6 +168,7 @@ function toolNameCandidates(toolName: string, serverName: string, prefix: McpToo
 		formatToolName(toolName, serverName, prefix),
 		formatToolName(toolName, serverName, "server"),
 		formatToolName(toolName, serverName, "short"),
+		formatToolName(toolName, serverName, "mcp"),
 		formatToolName(toolName, serverName, "none"),
 	]);
 }

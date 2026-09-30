@@ -53,9 +53,6 @@ import {
 } from "../../shared/utils.ts";
 import { resolveSkillsWithFallback } from "../../agents/skills.ts";
 import { effectiveToolTimeoutMs, formatToolTimeoutMessage, resolveToolTimeoutMs, toolTimeoutCallKey, toolTimeoutFromEnv } from "../shared/tool-timeout.ts";
-import { evaluateCompletionMutationGuard, expectsImplementationMutation, hasMutationToolCapability, validateImplementationToolContract } from "../shared/completion-guard.ts";
-import { planCompletionEvidence } from "../shared/completion-evidence.ts";
-import { arbitrateCompletionGuardRescue } from "../shared/llm-intent-arbiter.ts";
 import { preflightLaunchCwd } from "../shared/launch-cwd.ts";
 import { createJsonlWriter } from "../../shared/jsonl-writer.ts";
 import { createOrcaProgressTab, type OrcaProgressTab } from "../shared/orca-progress-tabs.ts";
@@ -65,7 +62,7 @@ import { deriveChildSessionName } from "../../shared/child-session-name.ts";
 import { assertAgentAllowedByCapabilityCeiling, intersectSubagentCapabilityCeilings, resolveCurrentSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
 import { resolveEffectiveThinking } from "../../shared/model-info.ts";
 import { assertThinkingWithinCeiling, intersectThinkingCeilings } from "../../shared/thinking-ceiling.ts";
-import { MISSING_STRUCTURED_ACCEPTANCE_REPORT_ERROR, MISSING_STRUCTURED_OUTPUT_CALL_ERROR } from "../shared/structured-output.ts";
+import { formatStructuredOutputRejectionError, MISSING_STRUCTURED_ACCEPTANCE_REPORT_ERROR, MISSING_STRUCTURED_OUTPUT_CALL_ERROR } from "../shared/structured-output.ts";
 import { formatMidToolExitError, isOrdinaryToolForMidToolExit } from "../shared/process-signal.ts";
 import { formatChildToolDiagnostic } from "../shared/tool-availability.ts";
 import { formatChildModelResolutionDiagnostic, isChildModelResolutionFailure } from "../shared/model-resolution-diagnostic.ts";
@@ -287,6 +284,7 @@ interface StructuredDelegationProgressState {
 	model?: string;
 	toolCount: number;
 	tokens: number;
+	turnCount?: number;
 }
 
 function captureStructuredDelegationProgressState(progress: AgentProgress, result: SingleResult): StructuredDelegationProgressState {
@@ -299,6 +297,7 @@ function captureStructuredDelegationProgressState(progress: AgentProgress, resul
 		model: progress.model ?? result.model,
 		toolCount: progress.toolCount,
 		tokens: progress.tokens,
+		turnCount: progress.turnCount,
 	};
 }
 
@@ -313,6 +312,7 @@ function structuredDelegationProgressChanged(
 		|| previous.model !== (progress.model ?? result.model)
 		|| previous.toolCount !== progress.toolCount
 		|| previous.tokens !== progress.tokens
+		|| previous.turnCount !== progress.turnCount
 		|| previous.recentOutput.length !== progress.recentOutput.length) return true;
 	for (let index = 0; index < progress.recentOutput.length; index++) {
 		if (previous.recentOutput[index] !== progress.recentOutput[index]) return true;
@@ -327,6 +327,9 @@ function structuredDelegationProgressChanged(
 	return false;
 }
 
+function isCompleteUsageCounter(value: unknown): value is number {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
 
 const STOPPED_BEFORE_COMPLETION_ERROR = "Subagent stopped before completion.";
 const AFTER_COMPACTION_SETTLEMENT = Symbol("afterCompactionSettlement");
@@ -405,6 +408,7 @@ async function runSingleAttempt(
 		mcpDirectTools: agent.mcpDirectTools,
 		cwd: options.cwd ?? runtimeCwd,
 		intercomSessionName: options.intercomSessionName,
+		projectTrusted: options.projectTrusted,
 		sessionName: childSessionName,
 		orchestratorIntercomTarget: options.orchestratorIntercomTarget,
 		runId: options.runId,
@@ -439,34 +443,6 @@ async function runSingleAttempt(
 	}
 
 	const effectiveSystemPrompt = shared.systemPrompt;
-	const contractTools = toolPlan.explicitToolAllowlist ? toolPlan.effectiveToolAllowlist : undefined;
-	const contractError = validateImplementationToolContract({
-		agent: agent.name,
-		task: shared.originalTask ?? task,
-		tools: contractTools,
-		mcpDirectTools: toolPlan.effectiveMcpTools,
-		configuredExtensions: toolPlan.configuredExtensions,
-		requestedTools: toolPlan.requestedBuiltinTools,
-		acceptanceRole: agent.acceptanceRole,
-		completionGuard: agent.completionGuard,
-	});
-	if (contractError) {
-		return {
-			index: options.index ?? 0,
-			agent: agent.name,
-			task,
-			...(childSessionName ? { sessionName: childSessionName } : {}),
-			messages: [],
-			finalOutput: "",
-			exitCode: 1,
-			error: contractError,
-			usage: emptyUsage(),
-			model: modelArg,
-			progressSummary: { status: "failed", toolCount: 0, tokens: 0, durationMs: 0 },
-			...(toolPlan.capabilityCeiling ? { capabilityCeiling: toolPlan.capabilityCeiling } : {}),
-			...(toolPlan.capabilityAudit ? { capabilityAudit: toolPlan.capabilityAudit } : {}),
-		};
-	}
 	const fast = options.fast ?? agent.fast;
 	const { launchContractDigest } = resolveLaunchBinding({
 		agent,
@@ -517,6 +493,10 @@ async function runSingleAttempt(
 		pendingControlEvents.push(event);
 		options.onControlEvent?.(event);
 	};
+	let inputUsageComplete = true;
+	let outputUsageComplete = true;
+	let cacheReadUsageComplete = true;
+	let cacheWriteUsageComplete = true;
 
 	const progress: AgentProgress = {
 		index: options.index ?? 0,
@@ -531,12 +511,20 @@ async function runSingleAttempt(
 		tokens: 0,
 		...(modelArg ? { model: modelArg } : {}),
 		...(resolvedThinking ? { thinking: resolvedThinking } : {}),
-		inputTokens: 0,
-		outputTokens: 0,
 		durationMs: 0,
 		lastActivityAt: startTime,
 	};
 	result.progress = progress;
+	const projectCompleteUsage = () => {
+		if (inputUsageComplete) progress.inputTokens = result.usage.input;
+		else delete progress.inputTokens;
+		if (outputUsageComplete) progress.outputTokens = result.usage.output;
+		else delete progress.outputTokens;
+		if (cacheReadUsageComplete) progress.cacheRead = result.usage.cacheRead;
+		else delete progress.cacheRead;
+		if (cacheWriteUsageComplete) progress.cacheWrite = result.usage.cacheWrite;
+		else delete progress.cacheWrite;
+	};
 	const attemptTimeout = resolveAttemptTimeout(options);
 	if (attemptTimeout?.remainingMs === 0) {
 		result.exitCode = 1;
@@ -553,7 +541,6 @@ async function runSingleAttempt(
 		return result;
 	}
 	const mutationSnapshot = options.machine ? { source: "tracked-files" as const, trackedOnly: true as const, cwd: options.cwd ?? runtimeCwd, dirtyFiles: [], fingerprints: {}, unavailable: "Local Git evidence is not authoritative for a pane-native remote run." } : snapshotTrackedMutations(options.cwd ?? runtimeCwd);
-	let observedMutationAttempt = false;
 	let structuredOutputToolInvoked = false;
 	let structuredOutputMessageStartIndex: number | undefined;
 	let toolAvailabilityError: string | undefined;
@@ -981,7 +968,10 @@ async function runSingleAttempt(
 			jsonlWriter.writeLine(JSON.stringify(projectChildSessionEventForJson(evt)));
 			shared.transcriptWriter?.writeChildEvent(evt);
 			shared.orcaProgressTab?.event(evt);
-			if (evt.type === "compaction_start") compactionStartedReceived = true;
+			if (evt.type === "compaction_start") {
+				compactionStartedReceived = true;
+				if (agentSettledReceived) afterCompactionSettlement = true;
+			}
 			if (evt.type === "compaction_end" && evt.willRetry === true) {
 				compactionStartedReceived = false;
 				afterCompactionSettlement = false;
@@ -1059,7 +1049,6 @@ async function runSingleAttempt(
 					result.toolBudget = toolBudgetState(options.toolBudget, progress.toolCount);
 				}
 				const mutates = isMutatingTool(evt.toolName, toolArgs, agent.mutationTools);
-				observedMutationAttempt = observedMutationAttempt || mutates;
 				pendingToolResult = { tool: evt.toolName ?? "tool", path: activeTool?.path, mutates, startedAt: now };
 				fireUpdate();
 			}
@@ -1093,6 +1082,10 @@ async function runSingleAttempt(
 					const hasToolCall = toolCalls.length > 0;
 					const terminalAssistantStop = (evt.message as { stopReason?: string }).stopReason === "stop" && !hasToolCall;
 					const u = evt.message.usage;
+					inputUsageComplete &&= isCompleteUsageCounter(u?.input);
+					outputUsageComplete &&= isCompleteUsageCounter(u?.output);
+					cacheReadUsageComplete &&= isCompleteUsageCounter(u?.cacheRead);
+					cacheWriteUsageComplete &&= isCompleteUsageCounter(u?.cacheWrite);
 					if (u) {
 						const window = (u.input || 0) + (u.cacheRead || 0);
 						result.usage.input += u.input || 0;
@@ -1101,11 +1094,10 @@ async function runSingleAttempt(
 						result.usage.cacheWrite += u.cacheWrite || 0;
 						result.usage.cost += u.cost?.total || 0;
 						progress.tokens = result.usage.input + result.usage.output;
-						progress.inputTokens = result.usage.input;
-						progress.outputTokens = result.usage.output;
 						progress.window = window;
 						progress.windowPeak = Math.max(progress.windowPeak ?? 0, window);
 					}
+					projectCompleteUsage();
 					if (evt.message.model) {
 						progress.model = evt.message.model;
 						if (!result.model) result.model = evt.message.model;
@@ -1324,6 +1316,8 @@ async function runSingleAttempt(
 			if (!closeError && (abortedBySignal || session?.shutDown) && !result.interrupted && !result.timedOut) {
 				closeError = session?.shutDown ? "Subagent stopped because the parent session shut down." : STOPPED_BEFORE_COMPLETION_ERROR;
 			}
+			// A workflow child ended by the workflow's abort signal was stopped, not failed.
+			if (options.abortedAsStopped && abortedBySignal && !session?.shutDown && !result.interrupted && !result.timedOut) result.stopped = true;
 			if (!closeError && forced && !forcedDrainAfterFinalSuccess) {
 				closeError = "Subagent session did not settle after it was aborted.";
 			}
@@ -1332,8 +1326,7 @@ async function runSingleAttempt(
 			if (session && messageBaseline !== undefined) {
 				result.usage = reconcileAttemptUsage(result.usage, session.messages, messageBaseline);
 				progress.tokens = result.usage.input + result.usage.output;
-				progress.inputTokens = result.usage.input;
-				progress.outputTokens = result.usage.output;
+				projectCompleteUsage();
 				progress.turnCount = result.usage.turns;
 			}
 			finish(finalCode);
@@ -1459,15 +1452,11 @@ async function runSingleAttempt(
 		result.exitCode = 1;
 	}
 	let validatedStructuredOutput = false;
-	if (options.structuredOutput && result.exitCode === 0 && !result.error) {
+	if (options.structuredOutput) {
 		result.structuredOutputSchemaPath = options.structuredOutput.schemaPath;
 		result.structuredOutputPath = options.structuredOutput.outputPath;
 		const structured = capture.structuredOutput();
-		if (!structuredOutputToolInvoked || !structured.called) {
-			result.exitCode = 1;
-			result.error = MISSING_STRUCTURED_OUTPUT_CALL_ERROR;
-			result.structuredOutputFailed = true;
-		} else {
+		if (structuredOutputToolInvoked && structured.called) {
 			result.structuredOutput = structured.value;
 			const acceptanceMode = options.structuredOutput.acceptanceReportPath
 				? options.structuredOutput.acceptanceReportRequired ? "required" : "optional"
@@ -1479,6 +1468,12 @@ async function runSingleAttempt(
 			(result as SingleResult & { structuredAcceptanceReport?: unknown; structuredAcceptanceReportError?: string }).structuredAcceptanceReportError = acceptanceReportError;
 			writeStructuredOutputArtifacts(options.structuredOutput, structured.value, acceptanceMode ? structured.acceptanceReport : undefined);
 			validatedStructuredOutput = true;
+		} else if (result.exitCode === 0 && !result.error) {
+			result.exitCode = 1;
+			result.error = structuredOutputToolInvoked
+				? formatStructuredOutputRejectionError(result.messages ?? [])
+				: MISSING_STRUCTURED_OUTPUT_CALL_ERROR;
+			result.structuredOutputFailed = true;
 		}
 	}
 	if (result.exitCode === 0 && !result.error) {
@@ -1548,70 +1543,6 @@ async function runSingleAttempt(
 		fullOutput = fullOutput.trim()
 			? `${timeoutMessage}\n\n${result.timeoutRecovery.message}\n\nPartial output before timeout:\n${fullOutput}`
 			: `${timeoutMessage}\n\n${result.timeoutRecovery.message}`;
-	}
-	const completionGuardEnabled = isAgentContract(options.agentContract) ? agent.completionGuard === true : agent.completionGuard !== false;
-	const completionGuard = ((result.exitCode === 0 && !result.error) || toolAvailabilityError) && completionGuardEnabled
-		? evaluateCompletionMutationGuard({
-			agent: agent.name,
-			task: shared.originalTask ?? task,
-			messages: result.messages ?? [],
-			tools: contractTools,
-			mcpDirectTools: toolPlan.effectiveMcpTools,
-			mutationTools: agent.mutationTools,
-			toolAvailabilityError,
-			mutationEvidence,
-		})
-		: undefined;
-	const mutationAttemptObserved = observedMutationAttempt || mutationEvidence.attemptedMutation;
-	let completionGuardTriggered = completionGuard?.triggered === true && !mutationAttemptObserved;
-	// The classifier is deliberately narrow, so a read-only review task can
-	// still be misread as implementation. Arbitrate BEFORE any failure side
-	// effect is published (effects, exit code, progress, notifications,
-	// acceptance, output persistence): only a confident read-only verdict
-	// rescues, and the task text alone is evidence — never the child's own
-	// final message.
-	let arbiterRescued = false;
-	if (completionGuardTriggered) {
-		const arbitration = await arbitrateCompletionGuardRescue({
-			guardTriggered: true,
-			task: shared.originalTask ?? task,
-			arbiter: options.llmIntentArbiter,
-		});
-		completionGuardTriggered = arbitration.triggered;
-		arbiterRescued = arbitration.rescued;
-	}
-	const completionEvidence = planCompletionEvidence({
-		guard: completionGuard,
-		guardTriggered: completionGuardTriggered,
-		completionGuardEnabled,
-		mutationCapable: hasMutationToolCapability(contractTools, toolPlan.effectiveMcpTools),
-		implementationMutationExpected: expectsImplementationMutation(agent.name, shared.originalTask ?? task),
-		mutationAttemptObserved,
-		mutationEvidence,
-		arbiterRescued,
-		agentContractEnabled: isAgentContract(options.agentContract),
-	});
-	if (completionEvidence.fileMutation) {
-		result.effects = {
-			...(result.effects ?? {}),
-			fileMutation: completionEvidence.fileMutation,
-		};
-	}
-	if (completionEvidence.legacyFailureError) {
-		result.exitCode = 1;
-		result.error = completionEvidence.legacyFailureError;
-		progress.status = "failed";
-		progress.error = result.error;
-		emitControlEvent(buildControlEvent({
-			from: progress.activityState,
-			to: "needs_attention",
-			runId: options.runId ?? agent.name,
-			agent: agent.name,
-			index: options.index,
-			ts: Date.now(),
-			message: `${agent.name} completed without making edits for an implementation task`,
-			reason: "completion_guard",
-		}));
 	}
 		if (options.outputPath && result.exitCode === 0) {
 			const resolvedOutput = resolveSingleOutput(options.outputPath, fullOutput, shared.outputSnapshot, options.outputClaimPath);

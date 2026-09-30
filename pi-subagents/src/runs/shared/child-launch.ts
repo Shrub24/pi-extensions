@@ -17,7 +17,7 @@ import {
 	type HerdrMachineReference,
 } from "../../shared/types.ts";
 import type { NestedPathEntry } from "./nested-path.ts";
-import type { McpRuntimeSnapshotHost } from "./mcp-direct-tool-allowlist.ts";
+import { extensionOnlyMcpServers, type McpRuntimeSnapshotHost, type ResolvedMcpDirectToolSelection } from "./mcp-direct-tool-allowlist.ts";
 import type { PermissionRules } from "./permissions.ts";
 import type { StructuredOutputRuntime } from "./structured-output.ts";
 import type { ChildToolDiagnostic } from "./tool-availability.ts";
@@ -40,7 +40,6 @@ import {
 } from "./child-compaction.ts";
 import type { ChildTranscriptWriter } from "../../shared/child-transcript.ts";
 import type { ChildSessionLaunch, ChildSessionStorage } from "./child-session.ts";
-import type { ArbiterModelContext } from "./llm-intent-arbiter.ts";
 import { resolveRequiredChildExtensions, type RequiredChildExtensionSnapshot } from "../../shared/required-child-extensions.ts";
 
 /** Environment variable pi-mcp-adapter reads for the tools a child may expose. */
@@ -91,9 +90,13 @@ export interface BuildInProcessChildLaunchInput {
 	requiredExtensions?: RequiredChildExtensionSnapshot;
 	systemPrompt?: string | null;
 	mcpDirectTools?: string[];
+	/** Selections the parent resolved against Pi's built-in MCP, carried to the runner. */
+	builtinMcpTools?: ResolvedMcpDirectToolSelection[];
 	extensionBindings?: ExtensionBindings;
 	cwd: string;
 	intercomSessionName?: string;
+	/** The launching session's project trust; undefined when the host has no trust concept. */
+	projectTrusted?: boolean;
 	sessionName?: string;
 	orchestratorIntercomTarget?: string;
 	runId?: string;
@@ -128,7 +131,6 @@ export interface BuildInProcessChildLaunchInput {
 }
 
 export interface InProcessChildCapture {
-	completionIntentContext?(): ArbiterModelContext | undefined;
 	structuredOutput(): { called: boolean; value?: unknown; acceptanceReport?: unknown; acceptanceReportProvided: boolean };
 	toolDiagnostic(): ChildToolDiagnostic | undefined;
 	runtimeAcknowledgedExtensions(): RuntimeAcknowledgedChildExtensions | undefined;
@@ -169,7 +171,9 @@ function inheritedCapabilityCeiling(inherited: InheritedChildRuntime | undefined
 function childProcessEnv(input: BuildInProcessChildLaunchInput, toolPlan: PiLaunchToolPlan): Record<string, string | undefined> {
 	const env: Record<string, string | undefined> = {};
 	env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV] = encodeExtensionBindings(input.extensionBindings);
-	if (!toolPlan.capabilityCeiling && input.mcpDirectTools?.length) env[MCP_DIRECT_TOOLS_ENV] = input.mcpDirectTools.join(",");
+	// Selectors resolved against Pi's built-in MCP never reach an adapter.
+	if (toolPlan.builtinMcpTools) env[MCP_DIRECT_TOOLS_ENV] = "__none__";
+	else if (!toolPlan.capabilityCeiling && input.mcpDirectTools?.length) env[MCP_DIRECT_TOOLS_ENV] = input.mcpDirectTools.join(",");
 	else if (toolPlan.capabilityCeiling && toolPlan.effectiveMcpSelections.length && !toolPlan.capabilityCeiling.denyExtensions) {
 		env[MCP_DIRECT_TOOLS_ENV] = toolPlan.effectiveMcpSelections.map((selection) => selection.selector).join(",");
 	} else env[MCP_DIRECT_TOOLS_ENV] = "__none__";
@@ -206,6 +210,7 @@ export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput)
 		subagentOnlyExtensions: input.subagentOnlyExtensions,
 		requiredExtensions,
 		mcpDirectTools: input.mcpDirectTools,
+		builtinMcpTools: input.builtinMcpTools,
 		cwd: input.cwd,
 		requireReadTool: input.requireReadTool,
 		structuredOutput: Boolean(input.structuredOutput),
@@ -217,6 +222,12 @@ export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput)
 		permissionRules: input.permissionRules,
 		runtimeSnapshotHost: input.runtimeSnapshotHost,
 	});
+	// Foreground children load no ambient extensions, so an extension's registerMcpServer() never runs in them.
+	if (input.host === "parent" && input.runtimeSnapshotHost && toolPlan.builtinMcpTools?.length) {
+		// Pi treats a session without a trust decision as trusted.
+		const servers = extensionOnlyMcpServers(toolPlan.effectiveMcpSelections, input.runtimeSnapshotHost, input.cwd, input.projectTrusted !== false);
+		if (servers.length) throw new Error(`Agent '${input.childAgentName}' selects MCP tools from servers that extensions registered (${servers.join(", ")}). Only background children (async: true) load those extensions; run the agent in the background or add the server to the global mcp.json or a trusted project's .pi/mcp.json.`);
+	}
 	toolPlan.capabilityCeiling = intersectSubagentCapabilityCeilings(toolPlan.capabilityCeiling, agentCapabilityCeiling);
 	if (toolPlan.capabilityAudit && toolPlan.capabilityCeiling) {
 		toolPlan.capabilityAudit = { ...toolPlan.capabilityAudit, ceiling: toolPlan.capabilityCeiling };
@@ -249,6 +260,7 @@ export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput)
 	let structuredAcceptanceReport: unknown;
 	let structuredCalled = false;
 	let structuredAcceptanceProvided = false;
+	const structuredTerminalState = { captured: false };
 
 	const config: ChildRuntimeConfig = {
 		cwd: input.cwd,
@@ -285,6 +297,7 @@ export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput)
 			? {
 				structuredOutput: {
 					schema: input.structuredOutput.schema,
+					terminalState: structuredTerminalState,
 					...(input.structuredOutput.acceptanceReportPath
 						? { acceptanceReport: input.structuredOutput.acceptanceReportRequired ? "required" as const : "optional" as const }
 						: {}),
@@ -293,6 +306,7 @@ export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput)
 						structuredValue = value;
 						structuredAcceptanceProvided = acceptanceReport !== undefined;
 						structuredAcceptanceReport = acceptanceReport;
+						structuredTerminalState.captured = true;
 					},
 				},
 			}
@@ -301,7 +315,7 @@ export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput)
 		...(toolPlan.effectiveMcpTools.length > 0 ? { mcpDirectTools: toolPlan.effectiveMcpTools } : {}),
 		fast: input.fast === true,
 	};
-	const capturedHooks = createCapturedChildHooks(config, input.host === "runner");
+	const capturedHooks = createCapturedChildHooks(config);
 	// Child context budget: pi's own between-turn compaction check becomes the
 	// trigger (the factory arms the threshold on the child's settings manager),
 	// and this hook supplies the deterministic summary so pi never spends a
@@ -325,10 +339,12 @@ export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput)
 	const session: Omit<ChildSessionLaunch, "onExtensionError"> = {
 		cwd: input.cwd,
 		...(input.machine ? { machine: input.machine } : {}),
+		...(input.projectTrusted !== undefined ? { projectTrusted: input.projectTrusted } : {}),
 		...(input.machine ? { remoteResources: { agent: input.childAgentName, ...(input.remoteSkillNames ? { skills: input.remoteSkillNames } : {}), ...(input.remoteReads !== undefined ? { reads: input.remoteReads } : {}), ...(toolPlan.explicitToolAllowlist ? { toolCeiling: [...toolPlan.effectiveToolAllowlist] } : toolPlan.capabilityCeiling?.allowedTools ? { toolCeiling: [...toolPlan.capabilityCeiling.allowedTools] } : {}) } } : {}),
 		storage: childStorage(input),
 		...(input.model ? { model: input.model } : {}),
 		...(toolPlan.explicitToolAllowlist ? { tools: toolPlan.effectiveToolAllowlist } : {}),
+		...(toolPlan.builtinMcpTools?.length ? { builtinMcpTools: toolPlan.builtinMcpTools } : {}),
 		...(!toolPlan.explicitToolAllowlist && toolPlan.excludeTools.length > 0 ? { excludeTools: toolPlan.excludeTools } : {}),
 		extensionPaths,
 		requiredExtensions: toolPlan.requiredExtensions,
@@ -349,7 +365,6 @@ export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput)
 		config,
 		session,
 		capture: {
-			completionIntentContext: capturedHooks.completionIntentContext,
 			structuredOutput: () => ({ called: structuredCalled, value: structuredValue, acceptanceReport: structuredAcceptanceReport, acceptanceReportProvided: structuredAcceptanceProvided }),
 			toolDiagnostic: capturedHooks.toolDiagnostic,
 			runtimeAcknowledgedExtensions: capturedHooks.runtimeAcknowledgedExtensions,

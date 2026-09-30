@@ -981,33 +981,6 @@ Advise only.
 		assert.match(readText(invalid), /config\.acceptanceRole must be 'read-only', 'writer', or false/);
 	});
 
-	it("creates agents with completion guard disabled", () => {
-		const ctx = { cwd: tempDir, modelRegistry: { getAvailable: () => [] } };
-		const result = handleCreate(
-			{ config: { name: "test-runner", description: "Run tests", scope: "project", tools: "read, grep, bash, ls", completionGuard: false } },
-			ctx,
-		);
-
-		assert.equal(result.isError, false);
-		const filePath = path.join(tempDir, ".pi", "agents", "test-runner.md");
-		const content = fs.readFileSync(filePath, "utf-8");
-		assert.match(content, /^completionGuard: false$/m);
-
-		const got = handleManagementAction("get", { agent: "test-runner" }, ctx);
-		assert.equal(got.isError, false);
-		assert.match(readText(got), /Completion guard: false/);
-	});
-
-	it("rejects non-boolean completion guard config", () => {
-		const result = handleCreate(
-			{ config: { name: "test-runner", description: "Run tests", scope: "project", completionGuard: "false" } },
-			{ cwd: tempDir, modelRegistry: { getAvailable: () => [] } },
-		);
-
-		assert.equal(result.isError, true);
-		assert.match(readText(result), /config\.completionGuard must be a boolean/);
-	});
-
 	it("creates agents with subagent-only extensions", () => {
 		const ctx = { cwd: tempDir, modelRegistry: { getAvailable: () => [] } };
 		const result = handleCreate(
@@ -1239,7 +1212,7 @@ Drive the failing test first.
 		});
 	}
 
-	it("shows runtime agents but refuses edits without writing configuration", async () => {
+	it("shows provider-scoped runtime agent metadata but refuses edits without writing configuration", async () => {
 		const sent: Array<{ content?: string }> = [];
 		const notified: string[] = [];
 		const pi = {
@@ -1252,15 +1225,28 @@ Drive the failing test first.
 			definition: { description: "Runtime admin helper", systemPrompt: "Help at runtime." },
 		});
 		try {
+			fs.mkdirSync(path.join(tempDir, "agent-home"), { recursive: true });
+			fs.writeFileSync(path.join(tempDir, "agent-home", "settings.json"), JSON.stringify({
+				subagents: {
+					agentOverridesByProvider: {
+						custom: { "runtime-admin-helper": { model: "custom/provider-model", thinking: "high" } },
+					},
+				},
+			}));
 			await openSubagentsAdmin(pi, {
 				cwd: tempDir, hasUI: false,
 				modelRegistry: { getAvailable: () => [] },
+				model: { provider: "custom", id: "session-model" },
 			} as never, "runtime-admin-helper");
 			assert.match(sent.at(-1)?.content ?? "", /Agent: runtime-admin-helper \(runtime\)/);
+			assert.match(sent.at(-1)?.content ?? "", /Model: custom\/provider-model/);
+			assert.match(sent.at(-1)?.content ?? "", /Thinking: high/);
+			fs.rmSync(path.join(tempDir, "agent-home", "settings.json"));
 
 			await openSubagentsAdmin(pi, {
 				cwd: tempDir, hasUI: true,
 				modelRegistry: { getAvailable: () => [{ provider: "custom", id: "new-model" }] },
+				model: { provider: "custom", id: "session-model" },
 				ui: {
 					select: async () => "custom/new-model",
 					notify: (message: string) => notified.push(message),
@@ -1547,7 +1533,6 @@ Drive the failing test first.
 						tools: ["bash"],
 						skills: ["override-skill"],
 						defaultContext: "fork",
-						completionGuard: false,
 						toolBudget: { hard: 3 },
 					},
 				},
@@ -1560,7 +1545,6 @@ thinking: off
 tools:
 skills:
 defaultContext:
-completionGuard: true
 toolBudget:
 ---
 
@@ -1585,7 +1569,6 @@ Drive the failing test first.
 		assert.match(content, /^tools: ?$/m);
 		assert.match(content, /^skills: ?$/m);
 		assert.match(content, /^defaultContext: ?$/m);
-		assert.match(content, /^completionGuard: true$/m);
 		assert.match(content, /^toolBudget: ?$/m);
 
 		const gotAfter = handleManagementAction("get", { agent: "implementer" }, ctx);
