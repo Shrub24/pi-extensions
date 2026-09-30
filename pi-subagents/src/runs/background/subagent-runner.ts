@@ -82,6 +82,7 @@ import {
 	Semaphore,
 } from "../shared/parallel-utils.ts";
 import { applyThinkingSuffix, projectLaunchResolvedChildExtensions, resolvePiLaunchToolPlan } from "../shared/child-tool-plan.ts";
+import { CHILD_COMPACTION_COMPACTOR, formatChildCompactionNotice, resolveChildContextBudget } from "../shared/child-compaction.ts";
 import type { InheritedChildRuntime } from "../shared/child-launch.ts";
 import { buildRunnerChildLaunch } from "./runner-child-launch.ts";
 import { normalizeExtensionBindings } from "../shared/extension-bindings.ts";
@@ -1637,6 +1638,8 @@ async function runSingleStep(
 type RunnerStatusStep = NonNullable<AsyncStatus["steps"]>[number] & {
 	exitCode?: number | null;
 	description?: string;
+	/** Mid-run context compactions this child performed under its budget. */
+	contextCompactions?: number;
 };
 
 function externalRunnerStatus(runner: SubagentStep["runner"]): ExternalCliRunnerStatus | ExternalJobRunnerStatus | undefined {
@@ -3218,6 +3221,42 @@ export async function runSubagent(
 				refreshUsageBudget();
 			}
 			statusPayload.turnCount = Math.max(statusPayload.turnCount ?? 0, step.turnCount);
+		} else if (event.type === "compaction_end" && (event as { aborted?: boolean }).aborted !== true && (event as { result?: { details?: { compactor?: string } } }).result?.details?.compactor === CHILD_COMPACTION_COMPACTOR) {
+			// The child rewrote its own context mid-run. Unlike the soft deadline this
+			// is not a decision request — the run continues on a smaller context — but
+			// the orchestrator must know its view of the child's working memory is
+			// stale, and that steering is now the cheaper lever than more work.
+			const end = event as { reason?: string; result?: { tokensBefore?: number } };
+			step.contextCompactions = (step.contextCompactions ?? 0) + 1;
+			// The child compacted itself mid-run: the orchestrator's picture of its
+			// working memory is stale, so it is told rather than asked. `to` stays the
+			// current state — a compaction is not an attention request that needs a
+			// reply, and claiming "needs_attention" would corner the supervisor into
+			// answering a run that is progressing normally.
+			appendControlEvent(buildControlEvent(omitUndefinedProperties({
+				type: "needs_attention",
+				from: step.activityState,
+				to: step.activityState ?? "active_long_running",
+				runId: id,
+				agent: step.agent,
+				index: flatIndex,
+				ts: now,
+				reason: "context_budget",
+				message: formatChildCompactionNotice({
+					at: now,
+					tokensBefore: end.result?.tokensBefore ?? 0,
+					budgetTokens: resolveChildContextBudget(step.contextLimit).budgetTokens,
+					reason: end.reason ?? "threshold",
+				}, step.agent),
+				turns: step.turnCount,
+				tokens: step.tokens?.total,
+				toolCount: step.toolCount,
+				currentTool: step.currentTool,
+				currentPath: step.currentPath,
+				elapsedMs: now - overallStartTime,
+			})), { bypassClaim: true });
+			statusPayload.lastUpdate = now;
+			writeStatusPayload();
 		}
 		syncTopLevelCurrentTool();
 		step.lastActivityAt = now;

@@ -33,6 +33,11 @@ import {
 } from "./child-tool-plan.ts";
 import type { ChildRuntimeConfig } from "./child-runtime-config.ts";
 import { createCapturedChildHooks, withChildSessionErrorReporting } from "./child-hooks.ts";
+import {
+	createChildCompactionHooks,
+	createChildContextBudgetState,
+	type ChildContextBudgetState,
+} from "./child-compaction.ts";
 import type { ChildTranscriptWriter } from "../../shared/child-transcript.ts";
 import type { ChildSessionLaunch, ChildSessionStorage } from "./child-session.ts";
 import type { ArbiterModelContext } from "./llm-intent-arbiter.ts";
@@ -138,6 +143,8 @@ export interface InProcessChildLaunch {
 	launchResolvedExtensions: LaunchResolvedChildExtensions;
 	warnings: string[];
 	capabilityAudit?: SubagentCapabilityAudit;
+	/** Present when this child runs with a context budget; absent otherwise. */
+	contextBudget?: ChildContextBudgetState;
 }
 
 /** Actual host create-input boundary. Evidence remains explicitly opt-in and dormant in production. */
@@ -295,6 +302,13 @@ export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput)
 		fast: input.fast === true,
 	};
 	const capturedHooks = createCapturedChildHooks(config, input.host === "runner");
+	// Child context budget: pi's own between-turn compaction check becomes the
+	// trigger (the factory arms the threshold on the child's settings manager),
+	// and this hook supplies the deterministic summary so pi never spends a
+	// model call on it. Only for hosted children — a pane-native remote launch
+	// runs its own process and cannot take an inline hook.
+	const contextBudget = input.machine ? undefined : createChildContextBudgetState();
+	if (contextBudget) capturedHooks.hooks.push(...createChildCompactionHooks(contextBudget));
 
 	const extensionPaths = toolPlan.extensionArgs.filter((extensionPath) => !isSubagentRuntimeExtensionPath(extensionPath));
 	const ambientExtensions = input.host === "runner" && !toolPlan.disableAmbientExtensions;
@@ -322,6 +336,7 @@ export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput)
 		hooks: capturedHooks.hooks,
 		...(input.host === "runner" ? { processEnv: childProcessEnv(input, toolPlan) } : {}),
 		runtime: config,
+		...(contextBudget ? { contextBudget } : {}),
 		noSkills: !input.inheritSkills,
 		noContextFiles: !input.inheritProjectContext,
 		...(taggedPrompt !== undefined
@@ -340,6 +355,7 @@ export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput)
 			runtimeAcknowledgedExtensions: capturedHooks.runtimeAcknowledgedExtensions,
 			finalDrainHeld: capturedHooks.finalDrainHeld,
 		},
+		...(contextBudget ? { contextBudget } : {}),
 		launchResolvedExtensions,
 		warnings: toolPlan.warnings,
 		...(toolPlan.capabilityAudit ? { capabilityAudit: toolPlan.capabilityAudit } : {}),

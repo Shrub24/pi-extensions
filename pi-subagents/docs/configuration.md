@@ -295,6 +295,30 @@ Global default for the async single-agent `checkpointBeforeDeadlineMs` launch op
 
 An explicit `subagent` call value wins over this default. Choose a value at least as long as the child's longest expected tool call; a steer cannot land inside one. When the deadline leaves less than one second of run time before the checkpoint, the checkpoint is disarmed and the run behaves as if the option were absent. The global config value must be a positive integer no greater than `2147483647`; invalid values fail config loading rather than silently disabling the checkpoint.
 
+## `childContextBudget`
+
+```json
+{ "childContextBudget": { "ratio": 0.3, "capTokens": 250000 } }
+```
+
+Keeps a child's context bounded mid-run. The budget is `min(ratio × model context window, capTokens)`, floored so a window always retains room to answer. With the defaults a 1M-window combo (`omniroute/coder-high`) budgets 250,000 tokens, a 400k-window model budgets 120,000, and a 200k-window model budgets 60,000.
+
+Two halves, both inside pi-subagents' own lifecycle — no extension is loaded into the child and no host module is patched:
+
+**Trigger.** The child's session is created with an in-memory settings override (`compaction.enabled = true`, `reserveTokens = window − budget`) applied through the SDK's settings manager. That makes pi's *own* between-turn check — `contextTokens > contextWindow − reserveTokens`, evaluated after tool results and before the next assistant response — fire at the budget. Your global `compaction.enabled: false` is untouched: the parent session stays under magic-context's control while children throttle themselves.
+
+**Summary.** A `session_before_compact` hook supplies the compaction content, so pi never spends a model call on it. The hook summarizes both lists pi prepares — history (`messagesToSummarize`) and, for the split-turn case that a mid-tool-loop threshold compaction usually produces, the current turn's prefix (`turnPrefixMessages`) — and declines rather than answering with a partial summary. The summary is produced by the deterministic pipeline vendored from [pi-vcc](https://github.com/sting8k/pi-vcc) (`src/runs/shared/pi-vcc/`, MIT) — extracted goals, files and changes, commits, outstanding context, preferences, plus a brief transcript. If the pipeline yields nothing, the hook declines and pi's ordinary summarizer runs instead, so compaction never fails for lack of a summary.
+
+The run continues after the compaction, and the orchestrator is told: the runner emits a `needs_attention` control event with `reason: "context_budget"` carrying the tokens compacted and the budget, alongside the soft-deadline wake. Steering is usually the right response — the child's working memory was just rewritten, so the orchestrator's picture of it is stale.
+
+Disable with `PI_SUBAGENTS_CHILD_CONTEXT_BUDGET=0` (or `false`/`off`). Pane-native remote launches run their own process and do not take this hook; their context is bounded by whatever the remote session configures.
+
+```json
+{ "childContextBudget": { "ratio": 0.5, "capTokens": 150000 } }
+```
+
+A tighter budget for a spend-sensitive fleet. The ratio governs models below `capTokens / ratio` (150k / 0.5 = 300k windows); larger windows hit the cap.
+
 ## `globalConcurrencyLimit`
 
 ```json

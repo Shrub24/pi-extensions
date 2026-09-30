@@ -127,6 +127,23 @@ function validateMainWindowRendererConfig(value: unknown): void {
 	}
 }
 
+function validateChildContextBudgetConfig(value: unknown): void {
+	if (value === undefined) return;
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("config.childContextBudget must be a JSON object");
+	const budget = value as Record<string, unknown>;
+	for (const key of Object.keys(budget)) {
+		if (key !== "ratio" && key !== "capTokens") throw new Error(`config.childContextBudget.${key} is not supported`);
+	}
+	if (budget.ratio !== undefined
+		&& (typeof budget.ratio !== "number" || !Number.isFinite(budget.ratio) || budget.ratio <= 0 || budget.ratio > 1)) {
+		throw new Error("config.childContextBudget.ratio must be a number greater than 0 and at most 1");
+	}
+	if (budget.capTokens !== undefined
+		&& (typeof budget.capTokens !== "number" || !Number.isInteger(budget.capTokens) || budget.capTokens <= 0)) {
+		throw new Error("config.childContextBudget.capTokens must be a positive integer");
+	}
+}
+
 function validateConfig(config: Record<string, unknown>): void {
 	if (config.worktree !== undefined && typeof config.worktree !== "boolean") {
 		throw new Error("config.worktree must be a boolean");
@@ -142,6 +159,7 @@ function validateConfig(config: Record<string, unknown>): void {
 		throw new Error('config.defaultSubagentContext must be "fresh" or "fork"');
 	}
 	validateForkContextConfig(config.forkContext);
+	validateChildContextBudgetConfig(config.childContextBudget);
 	if (config.checkpointBeforeDeadlineMs !== undefined
 		&& (typeof config.checkpointBeforeDeadlineMs !== "number"
 			|| !Number.isInteger(config.checkpointBeforeDeadlineMs)
@@ -227,7 +245,7 @@ export function loadConfig(): ExtensionConfig {
 		try {
 			const raw = JSON.parse(fs.readFileSync(configPath, "utf-8")) as unknown;
 			if (raw && typeof raw === "object" && !Array.isArray(raw)
-				&& (Object.hasOwn(raw, "worktreeProvider") || Object.hasOwn(raw, "worktreeBranchPrefix") || Object.hasOwn(raw, "modelResponseAliases") || Object.hasOwn(raw, "modelExclusions") || Object.hasOwn(raw, "checkpointBeforeDeadlineMs"))) throw error;
+				&& (Object.hasOwn(raw, "worktreeProvider") || Object.hasOwn(raw, "worktreeBranchPrefix") || Object.hasOwn(raw, "modelResponseAliases") || Object.hasOwn(raw, "modelExclusions") || Object.hasOwn(raw, "checkpointBeforeDeadlineMs") || Object.hasOwn(raw, "childContextBudget"))) throw error;
 		} catch (readError) {
 			if (readError === error) throw error;
 		}

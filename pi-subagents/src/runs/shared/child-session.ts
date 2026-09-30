@@ -13,6 +13,8 @@ import { pinChildCacheRetention } from "../../shared/child-cache-retention.ts";
 import { getAgentDir } from "../../shared/utils.ts";
 import type { ChildRuntimeConfig } from "./child-runtime-config.ts";
 import type { RequiredChildExtensionSnapshot } from "../../shared/required-child-extensions.ts";
+import type { ChildContextBudgetState } from "./child-compaction.ts";
+import { applyChildContextBudget } from "./child-compaction.ts";
 import type { HerdrMachineReference, HerdrRemoteGitStatus } from "../../shared/types.ts";
 
 export interface ChildSessionEvent {
@@ -83,6 +85,12 @@ export interface ChildSessionLaunch {
 	processEnv?: Record<string, string | undefined>;
 	/** The typed runtime config the hooks were built from; informational for factories. */
 	runtime: ChildRuntimeConfig;
+	/**
+	 * Child context budget: the trigger threshold pi's own between-turn check
+	 * uses, plus the record of compactions this child performed. Absent when the
+	 * budget is disabled, so a factory can treat presence as "budget active".
+	 */
+	contextBudget?: ChildContextBudgetState;
 	onExtensionError?: (error: ChildSessionExtensionError) => void;
 }
 
@@ -314,6 +322,13 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 					? pi.resolveCliModel({ cliModel: launch.model, modelRuntime })
 					: undefined;
 				if (resolvedModel?.error) throw new Error(resolvedModel.error);
+				// Child context budget: arm pi's own between-turn compaction check at the
+				// budget by shrinking its reserve. Applied in memory only — the user's
+				// settings.json keeps `compaction.enabled: false`, so the parent session
+				// stays under magic-context's control while children throttle themselves.
+				if (launch.contextBudget) {
+					applyChildContextBudget(settingsManager, resolvedModel?.model, launch.contextBudget);
+				}
 				const { session } = await pi.createAgentSession({
 					cwd: launch.cwd,
 					agentDir,

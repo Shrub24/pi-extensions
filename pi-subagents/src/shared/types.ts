@@ -270,6 +270,14 @@ export interface ToolBudgetConfig {
 	block?: string[] | "*";
 }
 
+/** Global child context budget; a child compacts at `min(ratio x window, capTokens)`. */
+export interface ChildContextBudgetConfig {
+	/** Fraction of the model's context window, in (0, 1]. Default 0.3. */
+	ratio?: number;
+	/** Absolute ceiling in tokens regardless of window. Default 250000. */
+	capTokens?: number;
+}
+
 export interface ResolvedToolBudget {
 	soft?: number;
 	hard: number;
@@ -381,7 +389,7 @@ export interface ControlEvent {
 	nestedRunId?: string;
 	nestingPath?: NestedRunAddress["path"];
 	message: string;
-	reason?: "idle" | "completion_guard" | "active_long_running" | "tool_failures" | "supervisor_request" | "time_threshold" | "soft_deadline" | "turn_threshold" | "token_threshold" | "tool_open_threshold";
+	reason?: "idle" | "completion_guard" | "active_long_running" | "tool_failures" | "supervisor_request" | "time_threshold" | "soft_deadline" | "turn_threshold" | "token_threshold" | "tool_open_threshold" | "context_budget";
 	turns?: number;
 	tokens?: number;
 	toolCount?: number;
@@ -1978,6 +1986,8 @@ export interface AsyncStatus {
 		model?: string;
 		thinking?: string;
 		contextLimit?: number;
+		/** Mid-run context compactions this child performed under its budget. */
+		contextCompactions?: number;
 		thinkingCeiling?: ThinkingLevel;
 		requestedModel?: string;
 		/** True when the child input exceeded the model context window. */
@@ -2677,6 +2687,13 @@ export interface ExtensionConfig {
 	 * leave no run time before the checkpoint disarm it.
 	 */
 	checkpointBeforeDeadlineMs?: number;
+	/**
+	 * Keeps a child's context bounded mid-run: the budget is
+	 * `min(ratio x model context window, capTokens)`, armed on the child's own
+	 * settings manager so Pi's between-turn compaction check fires there. The
+	 * summary is deterministic (no model call) and the run continues.
+	 */
+	childContextBudget?: ChildContextBudgetConfig;
 	control?: ControlConfig;
 	completionBatch?: CompletionBatchConfig;
 	toolBudget?: ToolBudgetConfig;
