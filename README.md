@@ -5,8 +5,8 @@ repo's history.
 
 | Package | npm name | Provenance |
 |---|---|---|
-| `pi-bash-processes` | `@vanillagreen/pi-background-tasks` | extracted from [vanillagreencom/kendex](https://github.com/vanillagreencom/kendex) at `b146363` (`pi-extensions/pi-background-tasks`); independent since |
-| `pi-tool-renderer` | `@vanillagreen/pi-tool-renderer` | extracted from [vanillagreencom/kendex](https://github.com/vanillagreencom/kendex) (`pi-extensions/pi-tool-renderer`), last upstream commit `#2467`; independent since |
+| `pi-bash-processes` | `@vanillagreen/pi-background-tasks` | fork of [vanillagreencom/kendex](https://github.com/vanillagreencom/kendex) `pi-extensions/pi-background-tasks`, extracted at `c9ee5844`; fork reason: a bounded foreground wait, configurable task policy, and log reads that consume the exit wake |
+| `pi-tool-renderer` | `@vanillagreen/pi-tool-renderer` | fork of kendex `pi-extensions/pi-tool-renderer`, extracted after upstream `#2467`; fork reason: render-path caching, and the bash decision moved to `session_start` |
 | `pi-subagents` | `pi-subagents` | fork of [nicobailon/pi-subagents](https://github.com/nicobailon/pi-subagents), vendored at upstream `#2586`; fork reason: an advisory per-run soft deadline and a mid-run child context budget; upstream is active |
 | `pi-otel` | `pi-otel` | fork of [stnly/pi-otel](https://github.com/stnly/pi-otel) at `398d40a`; fork reason: trace-per-session became trace-per-run with Pi attempt and compaction semantics (`pi-otel/docs/plan.md`) |
 | `pi-output-policy` | `@vanillagreen/pi-output-policy` | fork of `kendex` `pi-extensions/pi-output-policy` at `522c52c`; fork reason: thinking deltas counted toward the 96K visible-output cap |
@@ -38,13 +38,20 @@ git diff upstream-pi-subagents/main HEAD -- pi-subagents   # our delta against t
 git cherry-pick -n <sha>                                   # take one commit; it lands here as an ordinary commit
 ```
 
-`scripts/upstream.sh` refreshes the mirrors and the rewrite, and reports the
-commits upstream has taken since we last took one. Both forks sit on upstream
-heads and carry a local delta on top — 47 files for `pi-subagents`, 11 for
-`pi-otel`. The other four are independent: kendex's copies of
-`pi-bash-processes`, `pi-tool-renderer` and `pi-output-policy` are frozen (a single
-version-bump commit since the extraction), and `pi-jev` and `pi-cbmem` were never
-forks of anything.
+`scripts/upstream.sh` refreshes the mirrors and the rewrites, and reports per
+package what upstream has after our last take and how many files differ. Five
+upstreams are tracked: `nicobailon/pi-subagents` and `stnly/pi-otel` whole-repo,
+and `vanillagreencom/kendex` for three packages, where the rewrite also filters —
+kendex keeps its extensions under `pi-extensions/<name>`, so a take is the repo
+state we extracted from and the pivot is that path's last commit at or before it,
+which is content we actually have.
+
+Right now `pi-subagents` and `pi-otel` are level with their upstreams (47 and 11
+files differ), while kendex has moved under all three of its packages: 4 commits
+to take for `pi-bash-processes`, 9 for `pi-tool-renderer`, 2 for
+`pi-output-policy` — mostly a shared settings reader and retention rules that
+landed across kendex's packages at once. `pi-jev` and `pi-cbmem` were never forks
+of anything.
 
 The branch that carries a fork's lineage is `refs/heads/import-<package>`, not the
 current tree: the `pi-subagents` directory arrived here as one commit even though

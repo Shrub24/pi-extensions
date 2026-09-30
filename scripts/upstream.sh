@@ -1,116 +1,138 @@
 #!/usr/bin/env bash
 #
-# Upstream status and mirrors for the two packages that fork somebody else's
-# active work.
+# Upstream status and mirrors for the packages that fork somebody else's work.
 #
 #   scripts/upstream.sh                # refresh every fork, then report
-#   scripts/upstream.sh pi-subagents   # one
+#   scripts/upstream.sh pi-subagents   # one (or several)
 #
 # A fork needs two repositories, and neither belongs inside this working tree: a
 # pristine mirror of upstream, and that mirror with every path rewritten to
 # <package>/ so its commits line up with this repo and can be diffed or
-# cherry-picked directly. Mirrors live in ~/Projects/dev/custom/.pi-ext-mirrors
+# cherry-picked directly. Both live in ~/Projects/dev/custom/.pi-ext-mirrors
 # (PI_EXT_MIRRORS overrides it) and reach this repo through the
 # upstream-<package> remotes:
 #
-#   git diff upstream-pi-subagents/main HEAD -- pi-subagents   # our delta
+#   git diff upstream-pi-subagents/main HEAD -- pi-subagents   # files differing
 #   git cherry-pick -n <sha>                                   # take one commit
 #
-# TAKEN below is what this repo has already adopted from upstream, by SUBJECT:
-# the mirrors are regenerated, and filter-repo rewrites whole histories, so ids
-# from a mirror are not a thing to record — a subject is. The report counts what
-# upstream has after the newest take; that is the honest "how far behind".
+# FORKS below is the table. "path" is where the package sits in upstream — "."
+# for a repository that is the package (nicobailon, stnly), pi-extensions/<name>
+# for kendex, whose rewrite therefore also filters: only commits touching that
+# path survive. "takes" are the upstream commits this repo has adopted, in
+# upstream's own id space; a take does not have to touch the path, since for
+# kendex it is the repo state we extracted from, and the rewrite's pivot is that
+# path's last commit at or before it.
 #
-# Rebasing a fork's own delta onto upstream is a scratch-clone job, and the
-# pivot has to come from the branch being rebased: the two rewrites give the
-# same upstream commit different ids (import-pi-subagents and
-# upstream-pi-subagents do not share an id space), which is also why the report
-# names the last upstream commit the import branch holds instead of assuming it
-# is current.
+# Ids are not portable between the mirrors: the same upstream commit is a
+# different object in each rewrite (different graph roots), so #2350 is
+# 868e45be2 in import-pi-subagents and 528029351 in the mirror. Pivots are
+# therefore resolved per space here — never copied between them.
+#
+# Rebasing a fork's delta onto upstream is a scratch-clone job:
+#
+#   git clone --shared . /tmp/rebase && cd /tmp/rebase
+#   git checkout import-pi-subagents
+#   git rebase --onto upstream-pi-subagents/main <pivot>   # pivot = that branch's last upstream commit
+#
+# The report prints each branch's pivot, and says so when the branch stops
+# before the newest take (a take that came in as a whole tree, leaving the
+# import branch behind).
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
 
 MIRRORS="${PI_EXT_MIRRORS:-$HOME/Projects/dev/custom/.pi-ext-mirrors}"
-declare -A FORK=(
-  [pi-subagents]="https://github.com/nicobailon/pi-subagents.git"
-  [pi-otel]="https://github.com/stnly/pi-otel.git"
+FORKS=(
+  "pi-subagents|pi-subagents|https://github.com/nicobailon/pi-subagents.git|.|964481f4ea5fac2cb8dceaa7ce60547d6c6ffd60 0958598823920997f9a9241c4b2ac367297c95e3"
+  "pi-otel|pi-otel|https://github.com/stnly/pi-otel.git|.|398d40a72a1ba3a599e8596f26c3f148df1e7296"
+  "pi-bash-processes|kendex|https://github.com/vanillagreencom/kendex.git|pi-extensions/pi-background-tasks|c9ee5844c65c66c91a3cbd48f6b3c0598bf5dfe6"
+  "pi-tool-renderer|kendex|https://github.com/vanillagreencom/kendex.git|pi-extensions/pi-tool-renderer|77632e7bab9461e8fb01f9e3531dbffda8357a97"
+  "pi-output-policy|kendex|https://github.com/vanillagreencom/kendex.git|pi-extensions/pi-output-policy|522c52cfdf1288df4332b36dad81d78d771dcbdf"
 )
-declare -A TAKEN=(
-  [pi-subagents]="show a revived workflow child as its key's latest run (#2585)|keep delegation and supervisor tools out of codemode scripts (#2586)"
-  [pi-otel]="chore: release 0.3.1"
-)
+UNTAKEN_SHOWN=8
 
-resolve() { # resolve <ref> <subject> -> commit id, or empty
-  git log --format=%H -1 "$1" --fixed-strings --grep="$2" 2>/dev/null || true
-}
-
-refresh() {
-  local pkg=$1 url=${FORK[$1]}
-  local pristine="$MIRRORS/upstream/$pkg.git" rewritten="$MIRRORS/ns/$pkg.git"
-
-  if [ -d "$pristine" ]; then
-    git -C "$pristine" fetch --quiet --prune origin '+refs/heads/*:refs/heads/*'
+refresh_pristine() {
+  local mirror=$1 url=$2 dir="$MIRRORS/upstream/$mirror.git"
+  if [ -d "$dir" ]; then
+    git -C "$dir" fetch --quiet --prune origin '+refs/heads/*:refs/heads/*'
   else
     mkdir -p "$MIRRORS/upstream"
-    git clone --quiet --mirror "$url" "$pristine"
+    git clone --quiet --mirror "$url" "$dir"
   fi
+}
 
-  rm -rf "$rewritten"
+rewrite() {
+  local pkg=$1 mirror=$2 path=$3 out="$MIRRORS/ns/$pkg.git"
+  rm -rf "$out"
   mkdir -p "$MIRRORS/ns"
-  git clone --quiet --mirror "$pristine" "$rewritten"
-  git -C "$rewritten" filter-repo --force --to-subdirectory-filter "$pkg" >/dev/null
-  git fetch --quiet "$rewritten" "+refs/heads/*:refs/remotes/upstream-$pkg/*"
+  git clone --quiet --mirror "$MIRRORS/upstream/$mirror.git" "$out"
+  if [ "$path" = "." ]; then
+    git -C "$out" filter-repo --force --to-subdirectory-filter "$pkg" >/dev/null
+  else
+    git -C "$out" filter-repo --force --path "$path" --to-subdirectory-filter "$pkg" >/dev/null
+  fi
+  git fetch --quiet "$out" "+refs/heads/*:refs/remotes/upstream-$pkg/*"
+}
 
-  # The newest recorded take that is still reachable from upstream main.
-  local newest="" newest_subject="" newest_behind="" subject hit behind
-  local IFS='|'
-  for subject in ${TAKEN[$pkg]}; do
-    hit=$(resolve "upstream-$pkg/main" "$subject")
-    if [ -z "$hit" ]; then
-      printf '%s: recorded take not in upstream main: %s\n' "$pkg" "$subject" >&2
+report() {
+  local pkg=$1 mirror=$2 path=$3
+  shift 3
+  local pristine="$MIRRORS/upstream/$mirror.git"
+  local ref="upstream-$pkg/main"
+  local tip delta take last subject pivot="" pivot_subject="" behind newest_behind=""
+
+  for take in "$@"; do
+    last=$(git -C "$pristine" rev-list -1 "$take" -- "$path")
+    subject=$(git -C "$pristine" log -1 --format=%s "$last")
+    pivot=$(git log --format=%h -1 "$ref" --fixed-strings --grep="$subject")
+    if [ -z "$pivot" ]; then
+      printf '%s: recorded take %s (%s) is not in the rewrite — dropped by the path filter?\n' \
+        "$pkg" "${take:0:7}" "$subject" >&2
       continue
     fi
-    behind=$(git rev-list --count "$hit..upstream-$pkg/main")
+    behind=$(git rev-list --count "$pivot..$ref")
     if [ -z "$newest_behind" ] || [ "$behind" -lt "$newest_behind" ]; then
-      newest=$hit newest_subject=$subject newest_behind=$behind
+      newest_behind=$behind newest_pivot=$pivot newest_subject=$subject newest_take=$take
     fi
   done
-  unset IFS
 
-  local tip after touching delta
-  tip=$(git log -1 --format='%h (%ad)' --date=short "upstream-$pkg/main")
-  delta=$(git diff --numstat "upstream-$pkg/main" HEAD -- "$pkg" | wc -l)
-  if [ -n "$newest" ]; then
-    after=$(git rev-list --count "$newest..upstream-$pkg/main")
-    touching=$(git rev-list --count "$newest..upstream-$pkg/main" -- "$pkg")
-    printf '%s: upstream %s — %s commits after our newest take, %s of them touching %s/; our delta %s files\n' \
-      "$pkg" "$tip" "$after" "$touching" "$pkg" "$delta"
-    if [ "$after" != "0" ]; then
-      printf '%s: not taken yet:\n' "$pkg"
-      git log --oneline --no-decorate "$newest..upstream-$pkg/main" -- "$pkg" | sed 's/^/    /'
-    fi
+  tip=$(git log -1 --format='%h (%ad)' --date=short "$ref")
+  delta=$(git diff --numstat "$ref" HEAD -- "$pkg" | wc -l)
+  if [ -z "$newest_behind" ]; then
+    printf '%-18s upstream %s — no recorded take resolved; %s files differ\n' "$pkg" "$tip" "$delta"
   else
-    printf '%s: upstream %s — no recorded take found; our delta %s files\n' "$pkg" "$tip" "$delta"
+    printf '%-18s upstream %s · last take %s %s · %s to take · %s files differ\n' \
+      "$pkg" "$tip" "${newest_take:0:7}" "$newest_subject" "$newest_behind" "$delta"
+    if [ "$newest_behind" != "0" ]; then
+      git log --oneline --no-decorate "$newest_pivot..$ref" -- "$pkg" | head -"$UNTAKEN_SHOWN" | sed 's/^/    /'
+      [ "$newest_behind" -le "$UNTAKEN_SHOWN" ] || printf '    … %s more\n' "$((newest_behind - UNTAKEN_SHOWN))"
+    fi
   fi
 
-  # What the in-repo import branch holds, and the rebase its pivot implies.
-  local branch="import-$pkg" pivot pivot_subject
+  local branch="import-$pkg" import_pivot branch_head
   if git rev-parse --verify --quiet "$branch" >/dev/null; then
-    pivot=$(git log --format='%H %h %s' -1 "$branch" --fixed-strings --grep="${newest_subject}" 2>/dev/null | cut -d' ' -f2 || true)
-    pivot_subject=$(git log -1 --format='%h %s (%ad)' --date=short "$branch")
-    if [ -n "$pivot" ]; then
-      printf '%s: %s holds through %s — rebase the delta it carries with:\n    git rebase --onto upstream-%s/main %s %s\n' \
-        "$pkg" "$branch" "$pivot_subject" "$pkg" "$pivot" "$branch"
+    branch_head=$(git log -1 --format='%h %s (%ad)' --date=short "$branch")
+    import_pivot=$(git log --format='%h' -1 "$branch" --fixed-strings --grep="${newest_subject:-}" 2>/dev/null || true)
+    if [ -n "$import_pivot" ]; then
+      printf '    %s holds through %s — rebase its delta with: git rebase --onto %s %s %s\n' \
+        "$branch" "$branch_head" "$ref" "$import_pivot" "$branch"
     else
-      printf '%s: %s stops before the newest take (%s) — a rebase there replays the older delta only\n' \
-        "$pkg" "$branch" "$pivot_subject"
+      printf '    %s head %s — predates the newest take, so a rebase there replays the older delta\n' \
+        "$branch" "$branch_head"
     fi
   fi
 }
 
-if [ $# -gt 0 ]; then
-  for pkg in "$@"; do refresh "$pkg"; done
-else
-  for pkg in pi-subagents pi-otel; do refresh "$pkg"; done
-fi
+wanted=("$@")
+[ ${#wanted[@]} -gt 0 ] || wanted=(pi-subagents pi-otel pi-bash-processes pi-tool-renderer pi-output-policy)
+
+for entry in "${FORKS[@]}"; do
+  IFS='|' read -r pkg mirror url path takes <<<"$entry"
+  for want in "${wanted[@]}"; do
+    [ "$want" = "$pkg" ] || continue
+    refresh_pristine "$mirror" "$url"
+    rewrite "$pkg" "$mirror" "$path"
+    # shellcheck disable=SC2086
+    report "$pkg" "$mirror" "$path" $takes
+  done
+done
