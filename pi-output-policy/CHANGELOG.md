@@ -2,6 +2,18 @@
 
 ## Consumer-impacting changes
 
+### 2.1.3
+
+- Settings reads come from memory. A read is answered for one second without touching disk, then the settings files are read again. A change made in the extension manager, or a new session, applies at once; a hand edit to `settings.json` applies within one second. Before, every read went to disk.
+
+### 2.1.2
+
+- Session startup keeps fresh saved full outputs when their working directory exists and its name ends in whitespace. Cleanup previously trimmed the name and could delete these files.
+
+### 2.1.1
+
+- At session start, saved full outputs are deleted when their recorded working directory is gone, or when a file is older than 5 days. This applies to per-session artifacts and the temporary-directory fallback. Files from earlier versions without a working-directory record stay untouched.
+
 ### 2.1.0
 
 - One tool result now has one inline budget. All its text blocks share `maxTextBlockKb` and the line cap, or `inlineTailKb` and `inlineTailLines` for tail-truncated tools, and the truncation notice counts inside both the byte and the line allowance. A result of many small blocks no longer passes several times the budget to the model. Blocks past the budget are dropped from the preview, and one artifact holds the full text of every block. `details.kendexOutputPolicy` carries one entry per result.
@@ -11,7 +23,6 @@
 - Large tool output is no longer split into whole-output line arrays. The truncation preview copies only the lines it keeps; the shell minimizer still copies the lines it keeps, for output up to `shellMinimizer.maxCaptureBytes`, and settings are read once per tool result instead of once per setting.
 - Detail sanitizing shares one budget of 2,000 values and 64 KiB of string text across a result's whole `details` tree, beside the per-array, per-object and per-string caps. A string the byte budget cuts ends with an `[output-policy:detail-byte-budget=65536]` notice, and a container the budget stops ends with that notice or `[output-policy:detail-node-budget=2000]`. Details within every limit pass through unchanged, not copied.
 - A tool result within every limit now passes through unchanged. Before, its CRLF line ends were rewritten to LF.
-- Settings reads come from memory. A read is answered for one second without touching disk, then the settings files are read again. A change made in the extension manager, or a new session, applies at once; a hand edit to `settings.json` applies within one second. Before, every read went to disk.
 
 ### 2.0.2
 
