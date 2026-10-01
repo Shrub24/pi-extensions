@@ -1,0 +1,122 @@
+# Project orchestration
+
+[Documentation index](../README.md) · [Coordination](../concepts/coordination.md)
+
+Use Manager when independent project work deserves separate Leads and Git
+branches instead of more Agents inside one Lead's worktree.
+
+Manager coordinates. Leads implement.
+
+## Enter Manager mode
+
+Start Pi in the primary workspace of the Herdr worktree group and run:
+
+```text
+/manager
+```
+
+The current Lead must be eligible for Manager mode and must not still own
+unresolved Agent work. Only one live Manager can hold authority for a project
+scope at a time. No prior chat turn or existing linked worktree is required in
+an ordinary Git primary workspace.
+
+Manager's work projection reports `active`, `paused`, or `conflict`. A live
+Lead's runtime state is separate from project status.
+
+## Start and resume project work
+
+Ask Manager for a bounded objective:
+
+```text
+Implement the API change on branch feat/api-change.
+```
+
+Manager delegates the work to a Lead. The Git branch is the durable semantic
+work handle; the Lead is the current executor. Internal assignment IDs are not
+project-work handles. A branch is optional when starting new work. If omitted,
+Pi Herdsman can generate one. The first delegation can create the first linked
+worktree, and an unoccupied existing worktree for the branch is reused.
+
+Resume an existing assignment by branch only. If its worktree is missing,
+Herdsman recreates it from the existing branch and resumes the exact persisted
+Pi session when available. The saved session cwd is used when history exists;
+if the branch itself is unavailable, recreation fails closed.
+
+See [`staff_delegate`](../reference/staff.md#staff_delegate).
+
+## Run independent work in parallel
+
+Independent branches can run concurrently:
+
+```text
+Manager
+├─ feat/api-change → Lead → Agents
+└─ feat/docs       → Lead → Agents
+```
+
+Keep overlapping writers out of the same worktree. Workspace membership does
+not imply ownership, and Manager must not start another writer beside a Lead
+that already occupies the relevant worktree. Use separate Leads when work is
+independent enough to justify separate branch and execution boundaries.
+
+## Coordinate and review
+
+Leads use `supervisor_message` for material decisions, warnings, and review
+handoffs. For an assigned project Lead, messages are retained with the
+assignment, including when no Manager is active, and are available to a
+replacement Manager. Messages are nonterminal: a Lead can report ready for
+review, receive feedback through `staff_message`, and make further revisions
+while the assignment remains open.
+
+Use the current supervision state rather than repeatedly listing or inspecting
+reports to poll for progress. Inspect live terminal or persisted transcript
+evidence only when it materially matters.
+
+## Pause and resume
+
+`staff_stop` stops a Lead and its owned Agent execution tree while preserving
+the assignment, Pi session, Git branch, and worktree. Resume the same work with
+`staff_delegate` using its branch. `staff_stop` does not resolve project work.
+
+See [`staff_stop`](../reference/staff.md#staff_stop) and
+[`staff_delegate`](../reference/staff.md#staff_delegate).
+
+## Complete or abandon
+
+The assignment is the durable indicator that project work remains open. After
+review and any requested corrections, Manager resolves fulfilled work with
+`staff_complete`. Use `staff_discard` when abandoning it. Both stop the exact
+execution tree and remove the assignment only after current topology proves
+execution has stopped. The Git branch and worktree are preserved.
+
+See [`staff_complete`](../reference/staff.md#staff_complete-and-staff_discard)
+and [`staff_discard`](../reference/staff.md#staff_complete-and-staff_discard).
+
+## Leave and return
+
+Run:
+
+```text
+/manager leave
+```
+
+Leaving Manager mode preserves project assignments. Current Herdr topology is
+derived again when work is observed or resumed. A later Manager can continue
+the same repository and branch-based work.
+
+## Use Chief only for the next supervision layer
+
+Chief is separate from project orchestration. It supervises Managers across
+the current Herdr runtime and can directly supervise ordinary Leads only when
+their project scope has no active Manager. A Manager does not become Chief and
+does not forward its direct Leads into a parallel Chief control path.
+
+See [Coordination](../concepts/coordination.md) and
+[Commands](../reference/commands.md).
+
+## Reference
+
+- [Staff tools](../reference/staff.md)
+- [Supervisor tools](../reference/supervisor.md)
+- [Peer tools](../reference/peer.md)
+- [Status widget](../reference/status-widget.md)

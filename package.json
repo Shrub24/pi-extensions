@@ -4,6 +4,7 @@
   "workspaces": [
     "pi-bash-processes",
     "pi-cbmem",
+    "pi-herdsman",
     "pi-jev",
     "pi-otel",
     "pi-output-policy",

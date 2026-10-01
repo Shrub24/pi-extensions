@@ -53,6 +53,7 @@ cd "$(git rev-parse --show-toplevel)"
 MIRRORS="${PI_EXT_MIRRORS:-$HOME/Projects/dev/custom/.pi-ext-mirrors}"
 FORKS=(
   "pi-subagents|pi-subagents|https://github.com/nicobailon/pi-subagents.git|.|964481f4ea5fac2cb8dceaa7ce60547d6c6ffd60 0958598823920997f9a9241c4b2ac367297c95e3 b6bda32f03b7f549623bc404c9be14dca298ddc4"
+  "pi-herdsman|pi-herdsman|https://github.com/boadij/pi-herdsman.git|.|156b1c661a2e147d6bb2ef415abe44dd6b11af2f"
   "pi-otel|pi-otel|https://github.com/stnly/pi-otel.git|.|398d40a72a1ba3a599e8596f26c3f148df1e7296"
   "pi-bash-processes|kendex|https://github.com/vanillagreencom/kendex.git|pi-extensions/pi-background-tasks|8d17265bff800665d97dd41ee6146bcfa5865a5a"
   "pi-tool-renderer|kendex|https://github.com/vanillagreencom/kendex.git|pi-extensions/pi-tool-renderer|781eb4cfed71b1900de359476045953f51ccd545"
@@ -144,7 +145,7 @@ report() {
 }
 
 wanted=("$@")
-[ ${#wanted[@]} -gt 0 ] || wanted=(pi-subagents pi-otel pi-bash-processes pi-tool-renderer pi-output-policy)
+[ ${#wanted[@]} -gt 0 ] || wanted=(pi-subagents pi-herdsman pi-otel pi-bash-processes pi-tool-renderer pi-output-policy)
 
 for entry in "${FORKS[@]}"; do
   IFS='|' read -r pkg mirror url path takes <<<"$entry"

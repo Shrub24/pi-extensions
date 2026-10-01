@@ -8,6 +8,7 @@ repo's history.
 | `pi-bash-processes` | `@vanillagreen/pi-background-tasks` | fork of [vanillagreencom/kendex](https://github.com/vanillagreencom/kendex) `pi-extensions/pi-background-tasks`, extracted at `c9ee5844`, kept current through `#3289` (`8d17265b`); fork reason: see [its README](pi-bash-processes/README.md#fork-delta) |
 | `pi-tool-renderer` | `@vanillagreen/pi-tool-renderer` | fork of kendex `pi-extensions/pi-tool-renderer`, extracted after upstream `#2467`, kept current through `#3312` (`781eb4cf`); fork reason: see [its README](pi-tool-renderer/README.md#fork-delta) |
 | `pi-subagents` | `pi-subagents` | fork of [nicobailon/pi-subagents](https://github.com/nicobailon/pi-subagents), kept current through v0.74.0 (`f68f9edd`); fork reason: see [its README](pi-subagents/README.md) |
+| `pi-herdsman` | `pi-herdsman` | fork of [boadij/pi-herdsman](https://github.com/boadij/pi-herdsman), imported at `156b1c66` (v0.18.0); no fork delta yet — it replaces `pi-subagents` as the delegation layer |
 | `pi-otel` | `pi-otel` | fork of [stnly/pi-otel](https://github.com/stnly/pi-otel) at `398d40a`; fork reason: trace-per-session became trace-per-run with Pi attempt and compaction semantics (`pi-otel/docs/plan.md`) |
 | `pi-output-policy` | `@vanillagreen/pi-output-policy` | fork of `kendex` `pi-extensions/pi-output-policy` at `522c52c`, kept current through `#3312` (`781eb4cf`); fork reason: see [its README](pi-output-policy/README.md#fork-delta) |
 | `pi-jev` | `@vanillagreen/pi-jev` | new; semantic decisions from Jev, as a link in `@gotgenes/pi-permission-system`'s authorizer chain |
@@ -40,8 +41,8 @@ git cherry-pick -n <sha>                                   # take one commit; it
 ```
 
 `scripts/upstream.sh` refreshes the mirrors and the rewrites, and reports per
-package what upstream has after our last take and how many files differ. Five
-upstreams are tracked: `nicobailon/pi-subagents` and `stnly/pi-otel` whole-repo,
+package what upstream has after our last take and how many files differ. Six
+upstreams are tracked: `nicobailon/pi-subagents`, `boadij/pi-herdsman`, and `stnly/pi-otel` whole-repo,
 and `vanillagreencom/kendex` for three packages, where the rewrite also filters —
 kendex keeps its extensions under `pi-extensions/<name>`, so a take is the repo
 state we extracted from and the pivot is that path's last commit at or before it,
