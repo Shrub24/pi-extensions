@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, join, resolve, sep } from "node:path";
 import { homedir, tmpdir } from "node:os";
+import { EventEmitter } from "node:events";
 import { after, mock, test } from "node:test";
 import { Value } from "typebox/value";
 import type {
@@ -689,6 +690,25 @@ export function fakePi(
   } = {},
 ) {
   const events = new Map<string, ((event: any, ctx: Context) => unknown)[]>();
+  // Mirrors Pi's extension EventBus: synchronous emit, synchronous listener
+  // mutations of the payload, and a listener that throws isolated per handler.
+  const busEmitter = new EventEmitter();
+  const eventBus = {
+    emit(channel: string, data: unknown) {
+      busEmitter.emit(channel, data);
+    },
+    on(channel: string, handler: (data: unknown) => void) {
+      const safeHandler = (data: unknown) => {
+        try {
+          handler(data);
+        } catch {
+          // Pi's EventBus logs and swallows listener errors.
+        }
+      };
+      busEmitter.on(channel, safeHandler);
+      return () => busEmitter.off(channel, safeHandler);
+    },
+  };
   const commands: string[] = [];
   const commandOptions = new Map<string, any>();
   const entryRenderers: { customType: string; renderer: unknown }[] = [];
@@ -708,6 +728,7 @@ export function fakePi(
       ? undefined
       : [...(options.activeTools ?? [])];
   const pi = {
+    events: eventBus,
     on(name: string, handler: (event: any, ctx: Context) => unknown) {
       events.set(name, [...(events.get(name) ?? []), handler]);
     },

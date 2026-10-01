@@ -115,6 +115,7 @@ const REGISTERED_ROLE_TOOLS = [
     "agent_close",
     "agent_inspect",
     "agent_transcript",
+    "agent_extend",
     "supervisor_message",
     "peer_list",
     "peer_message",
@@ -180,6 +181,12 @@ const SEMANTIC_TOOL_CASES = [
     ["agent"],
   ],
   [
+    "agent_extend",
+    { agent: "worker", windowMs: 900000 },
+    { agent: "worker", windowMs: 900000, task: "x" },
+    ["agent", "windowMs"],
+  ],
+  [
     "supervisor_message",
     { message: "progress" },
     { message: "progress", question: "x" },
@@ -215,6 +222,50 @@ const STAFF_TOOL_CASES = [
     ["session", "message"],
   ],
 ] as const;
+
+test("the documented agent_extend schema matches the registered tool", () => {
+  const pi = fakePi();
+  registerExtension!(pi.pi as never);
+  const tool = pi.tools.find((candidate: any) => candidate.name === "agent_extend")!;
+  assert.ok(tool, "agent_extend is registered for a control-capable session");
+  const doc = readFileSync(
+    join(import.meta.dirname, "..", "docs", "reference", "agent.md"),
+    "utf8",
+  );
+  const section = doc.slice(doc.indexOf("## `agent_extend`"));
+  assert.ok(section.length > 0, "agent.md documents agent_extend");
+  const fence = section.indexOf("```json");
+  const block = section.slice(
+    fence + "```json".length,
+    section.indexOf("```", fence + "```json".length),
+  );
+  const documented = JSON.parse(block) as Record<string, unknown>;
+  assert.deepEqual(Object.keys(documented).sort(), ["agent", "windowMs"]);
+  assert.equal(
+    Value.Check(tool.parameters, documented),
+    true,
+    "the documented example satisfies the registered schema",
+  );
+  assert.equal(tool.parameters.additionalProperties, false);
+  assert.deepEqual(Object.keys(tool.parameters.properties).sort(), [
+    "agent",
+    "windowMs",
+  ]);
+  assert.equal(tool.parameters.properties.windowMs.type, "integer");
+  const ranges = [...section.matchAll(/from `(\d+)` through\s+`(\d+)`/g)];
+  assert.equal(ranges.length, 1, "the documented window range is stated once");
+  assert.equal(
+    tool.parameters.properties.windowMs.minimum,
+    Number(ranges[0]![1]),
+    "documented minimum matches the registered schema",
+  );
+  assert.equal(
+    tool.parameters.properties.windowMs.maximum,
+    Number(ranges[0]![2]),
+    "documented maximum matches the registered schema",
+  );
+  pi.events.get("session_shutdown")?.[0]();
+});
 
 test("semantic coordination tools expose exact strict object contracts", () => {
   setLeadEnvironment();
@@ -536,6 +587,7 @@ test("registered lead and unmanaged roles expose the correct surface", async () 
       "agent_close",
       "agent_continue",
       "agent_delegate",
+      "agent_extend",
       "agent_inspect",
       "agent_interrupt",
       "agent_list",
@@ -604,6 +656,7 @@ test("registered lead and unmanaged roles expose the correct surface", async () 
       "pi-herdsman-agent-attention",
       "pi-herdsman-agent-lost",
       "pi-herdsman-agent-result",
+      "pi-herdsman-agent-soft-deadline",
       "pi-herdsman-agent-stale",
       "pi-herdsman-stop-summary",
       ...COORDINATION_MESSAGE_KINDS.map((kind) => `pi-herdsman-${kind}`),
@@ -2672,6 +2725,7 @@ test("delegating agents receive only their allowed definition roster", async () 
     "agent_close",
     "agent_inspect",
     "agent_transcript",
+    "agent_extend",
   ])
     assert.ok(
       sharedGuidance.includes(toolName),

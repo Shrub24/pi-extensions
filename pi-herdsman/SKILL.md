@@ -59,9 +59,11 @@ Use `agent_delegate` to start one bounded fresh assignment from an agent definit
 Use `agent_continue` to start one bounded assignment from an exact historical
 managed-agent Pi session.
 
-Each managed agent exists for one assignment only. After its terminal result is
-delivered, Pi Herdsman cleans up that agent automatically. To continue completed
-work with its existing context, use the exact session returned with the result.
+A managed agent executes one assignment at a time. After its terminal result is
+delivered, Pi Herdsman cleans that agent up automatically; when `retainWorkers`
+is enabled the delivered worker instead stays `idle` until a later assignment
+reuses it or you close it. To continue completed work with its existing context,
+use the exact session returned with the result.
 Agent labels control the currently live generation; they are not continuation
 selectors.
 Session continuation inherits the saved definition, cwd, and logical label;
@@ -74,9 +76,10 @@ eligibility. Every operation revalidates exact state and identity before
 mutation.
 
 The live-agent control tools are `agent_steer`, `agent_interrupt`,
-`agent_reply`, and `agent_close`;
+`agent_extend`, `agent_reply`, and `agent_close`;
 these mutate
-live agent execution and are available only when listed. Read-only `agent_inspect` captures bounded live terminal/process evidence.
+live agent execution (or, for `agent_extend`, only its advisory checkpoint) and
+are available only when listed. Read-only `agent_inspect` captures bounded live terminal/process evidence.
 `agent_transcript` captures bounded persisted Pi conversation and tool evidence
 when listed. Neither changes agent
 state. A completed agent does not remain available for another assignment.
@@ -94,6 +97,17 @@ does not prove a hang.
 
 Use `agent_reply` only to answer a valid outstanding `ask_owner` question. Use
 `agent_close` only for intentional teardown or abandonment.
+
+A soft-deadline checkpoint (`pi-herdsman-agent-soft-deadline`) is advisory, not
+a health condition: nothing was aborted, steered, or closed, and waiting is a
+valid response. It arrives on the normal health cadence, so it can lag the
+configured `softTimeoutMs` by up to one scan, and it repeats after every window
+while the assignment stays unresolved. For each listed worker use only its
+listed controls: keep waiting, `agent_steer`, `agent_interrupt`, `agent_extend`,
+or `agent_close`. Use `agent_extend` with `{agent, windowMs}` when current
+evidence still justifies more time; it changes no assignment and is listed only
+for a directly owned worker with an armed window. Never close or interrupt a
+worker solely because a checkpoint fired.
 
 A lost agent is a managed assignment whose exact physical execution is proven
 gone before a durable terminal result resolved it. Loss is not completion or

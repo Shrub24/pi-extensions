@@ -130,6 +130,30 @@ imported at `156b1c66` (v0.18.0). The fork's own changes:
   persistent sessions that compact through their own Pi context stack and stay
   continuable, instead of retiring at the compaction threshold.
 
+- **Retained workers across assignments** — with `retainWorkers` enabled, a
+  delivered worker keeps its verified live process, pane, label, and mailbox and
+  stays `idle` until `agent_continue` reuses it; a drifted or missing launch
+  fingerprint closes it and continues the same session in a new process
+  ([configuration](docs/reference/configuration.md),
+  [handoffs](docs/guides/handoffs.md)). Fork branches: `finalizeDeliveredRoot`
+  (`retainWorkersEnabled`), the `delivered` derivation in `managedAgentSnapshots`
+  and `agentControlState` (`idle`), `listedAgentRecord`, `checkHerdRunFinished`
+  (through `maybeFinishHerdRun`), and the delivered-assignment admission in
+  `action`.
+
+- **Advisory soft-deadline checkpoints** — `softTimeoutMs` arms one advisory
+  window per accepted assignment; expiry publishes a digest that offers *keep
+  waiting*, `agent_steer`, `agent_interrupt`, `agent_extend`, or `agent_close`,
+  and it never aborts, steers, or closes anything
+  ([configuration](docs/reference/configuration.md)). Fork branches:
+  `softWindowsEnabled` (`softTimeoutMs`), `submit`, `scanAgentHealth`,
+  `recoverControllerRuntimes`, and the `agent_extend` listing in
+  `listedAgentRecord`.
+
+Every function named above carries a fork-specific branch: the retention
+branches are either gated by `retainWorkers` or derived from the retained
+mailbox shape, and the soft-deadline branches read `softTimeoutMs`.
+
 ## Community
 
 Questions, workflows, examples, and ideas are welcome in

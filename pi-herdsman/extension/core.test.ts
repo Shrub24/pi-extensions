@@ -224,6 +224,34 @@ test("projects lifecycle and assignment state into control states", () => {
     "settling",
     "result persistence recovery remains non-assignable",
   );
+  // A delivered assignment on a live idle or done worker is reusable rather
+  // than settling; a working pane or a pending result keeps the old states.
+  assert.equal(
+    agentControlState("idle", undefined, false, false, false, false, true),
+    "idle",
+  );
+  assert.equal(
+    agentControlState("done", undefined, false, false, false, false, true),
+    "idle",
+  );
+  assert.equal(
+    agentControlState("working", undefined, false, false, false, false, true),
+    "unknown",
+  );
+  assert.equal(
+    agentControlState("idle", "request", false, false, false, false, true),
+    "settling",
+  );
+  assert.equal(
+    agentControlState("idle", undefined, true, false, false, false, true),
+    "settling",
+    "a pending result outranks a delivered one",
+  );
+  assert.equal(
+    agentControlState("idle", undefined, false, true, false, false, true),
+    "settling",
+    "an unacknowledged handoff outranks a delivered assignment",
+  );
 });
 
 test("rejects invalid file content", () => {

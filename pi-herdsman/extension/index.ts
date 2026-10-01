@@ -101,6 +101,7 @@ import {
 import {
   AGENT_COORDINATION_TOOLS,
   agentLaunchArgs,
+  agentLaunchFingerprint,
   agentDefinitionEnabled,
   agentDefinitionDelegationEnabled,
   agentDefinitionMetadata,
@@ -109,11 +110,13 @@ import {
   discoverAgentDefinitions,
   expandAgentBodyFiles,
   projectAgentDefinition,
+  resolveAgentLaunchInputs,
   resolveChildModel,
   updateAgentOverride,
   validateAgentDefinitionReferences,
   VALID_THINKING_LEVELS,
   writePrivatePromptSnapshots,
+  type AgentDefinition,
 } from "./agent-definitions.ts";
 import {
   captureStartupDiagnostic,
@@ -215,10 +218,12 @@ import {
 } from "./errors.ts";
 import {
   MAX_BYTE_LIMIT,
+  MAX_SOFT_TIMEOUT_MS,
   MIN_BYTE_LIMIT,
   readConfig,
   updateConfig,
   validByteLimit,
+  validSoftTimeout,
 } from "./config.ts";
 
 import {
@@ -231,6 +236,7 @@ import {
   renderAgentAskMessage,
   renderAgentStaleMessage,
   renderAgentLostMessage,
+  renderAgentSoftDeadlineMessage,
   renderAgentAttentionMessage,
   renderCoordinationMessage,
   renderCoordinationCall,
@@ -265,6 +271,12 @@ const PI_SESSION_ID_PATTERN = "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$";
 const HERDSMAN_EXTENSION_PATH = fileURLToPath(import.meta.url);
 const AGENT_DEFINITIONS_ENTRY = "pi-herdsman-agent-definitions";
 const HERD_RUN_ENTRY = "pi-herdsman-herd-run";
+const WORKER_LAUNCH_ENTRY = "pi-herdsman-worker-launch";
+type WorkerLaunchEntry = {
+  runId: string;
+  label: string;
+  fingerprint: string;
+};
 const AGENT_CONTEXT_RETIRED_ENTRY = "pi-herdsman-agent-context-retired";
 const CONTEXT_RETIREMENT_INSTRUCTION =
   "Context pressure has retired this session. Do not start new work or new agents. " +
@@ -347,6 +359,12 @@ function formatAttentionDuration(ms: number): string {
   const seconds = Math.floor(ms / 1000);
   return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
 }
+const SOFT_TIMEOUT_MINUTE_MS = 60_000;
+function formatSoftTimeout(ms: number): string {
+  if (!Number.isInteger(ms) || ms <= 0) return "off";
+  const minutes = ms / SOFT_TIMEOUT_MINUTE_MS;
+  return `${Number.isInteger(minutes) ? minutes : Number(minutes.toFixed(1))} min`;
+}
 function formatMessageLimit(bytes: number): string {
   const tokens = Math.ceil(bytes / TOKEN_ESTIMATE_BYTES);
   return `${bytes / 1024} KiB · ≈${tokens.toLocaleString("en-US")} tokens`;
@@ -380,7 +398,7 @@ const AGENT_HANDOFF_GUIDANCE =
 const AGENT_UNRESOLVED_GUIDANCE =
   "Use agent_list when fresh Agent state or ownership is materially needed for a control or recovery decision, or to refresh the definition roster; do not use it for progress polling. " +
   "Follow current available_tools and revalidation: agent_steer queues a cooperative correction for Pi to deliver after the current assistant turn and its tool calls reach a steering boundary; it does not preempt the current operation. agent_interrupt cancels the current operation and replaces its direction. " +
-  "Use agent_reply only to answer that Agent's exact pending ask_owner question. agent_close destructively closes an eligible Agent generation. agent_inspect provides bounded live terminal/process evidence; agent_transcript provides bounded persisted conversation/tool evidence. " +
+  "Use agent_reply only to answer that Agent's exact pending ask_owner question. agent_close destructively closes an eligible Agent generation. agent_extend replaces one directly owned working Agent's next soft-deadline window and changes no assignment. agent_inspect provides bounded live terminal/process evidence; agent_transcript provides bounded persisted conversation/tool evidence. " +
   "When Agent work is unresolved, handle required control, then continue only necessary work you still own or end the turn without concluding; results or attention resume the session automatically. Do not poll with status requests, sleep, or other waiting mechanisms. " +
   "Stale health attention is diagnosis, not progress polling: use attached evidence first and, when absent or insufficient, perform at most one bounded diagnostic read before passive waiting. A repeated reminder for the same stale episode is additional recovery evidence: unchanged qualifying activity means the Agent has not crossed an execution boundary since the previous reminder. A steer queued during that unchanged episode cannot have taken effect yet. Do not repeat diagnostic reads solely because a reminder fired. Continue waiting only while existing evidence still positively supports a legitimate long-running operation; otherwise use agent_interrupt to stop the current operation and continue the same assignment. " +
   "A proven lost Agent remains unresolved; physical disappearance is not completion. Unknown or conflicting identity remains fail-closed. Do not take over or replace unresolved delegated work until the current generation is resolved or explicitly closed. Do not invent work merely to remain active.";
@@ -550,7 +568,8 @@ type Params =
     }
   | { action: "close"; agent: string }
   | { action: "inspect"; agent: string }
-  | { action: "transcript"; agent: string };
+  | { action: "transcript"; agent: string }
+  | { action: "extend"; agent: string; windowMs: number };
 type StaffParams =
   | { action: "list" }
   | {
@@ -597,6 +616,137 @@ type PendingStart = {
   requestId?: string;
 };
 const runtimes = new Map<string, Runtime>();
+// Advisory soft-deadline windows, keyed by the assignment's request id. The
+// anchor is controller-observed acceptance, not progress, so a window measures
+// elapsed assignment time. Windows re-arm after each delivered digest and stop
+// when the assignment resolves.
+type SoftWindow = {
+  requestId: string;
+  label: string;
+  runId: string;
+  ownerSessionId: string;
+  workspaceId: string;
+  armedAt: number;
+  windowMs: number;
+};
+const SOFT_WINDOW_ENTRY = "pi-herdsman-soft-window";
+const SOFT_DEADLINE_EVENT = "pi-herdsman:soft-deadline";
+const SOFT_DEADLINE_MESSAGE = "pi-herdsman-agent-soft-deadline";
+const softWindows = new Map<string, SoftWindow>();
+
+// Soft windows exist only while the soft timeout is enabled. An unreadable or
+// invalid configuration arms nothing and offers nothing to extend, so the
+// advisory path degrades to upstream behaviour instead of failing a read.
+function softWindowsEnabled(): boolean {
+  try {
+    return readConfig().softTimeoutMs > 0;
+  } catch {
+    return false;
+  }
+}
+
+function dropSoftWindow(requestId: string | undefined): void {
+  if (requestId) softWindows.delete(requestId);
+}
+
+// Retention is decided from the configuration at delivery time, so a repeated
+// delivery cleanup after a crash or restart reaches the same decision. An
+// unreadable or invalid configuration keeps the upstream close-after-delivery
+// behaviour instead of failing a read.
+function retainWorkersEnabled(): boolean {
+  try {
+    return readConfig().retainWorkers;
+  } catch {
+    return false;
+  }
+}
+
+function recordSoftWindow(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  window: SoftWindow,
+  entry: Record<string, unknown>,
+): void {
+  softWindows.set(window.requestId, window);
+  try {
+    pi.appendEntry(SOFT_WINDOW_ENTRY, entry);
+  } catch (error) {
+    appendDurableError(pi, ctx, "pi_herdsman_state_error", error);
+  }
+}
+
+// Arm a fresh window of `windowMs` from `armedAt`. A non-positive length (the
+// disabled configuration) drops any existing window instead.
+function armSoftWindow(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  runtime: Runtime,
+  requestId: string,
+  windowMs: number,
+  armedAt = Date.now(),
+): void {
+  if (windowMs <= 0) {
+    dropSoftWindow(requestId);
+    return;
+  }
+  recordSoftWindow(
+    pi,
+    ctx,
+    {
+      requestId,
+      label: runtime.label,
+      runId: runtime.runId,
+      ownerSessionId: runtime.ownerSessionId,
+      workspaceId: runtime.workspaceId,
+      armedAt,
+      windowMs,
+    },
+    {
+      requestId,
+      label: runtime.label,
+      runId: runtime.runId,
+      armedAt,
+      windowMs,
+    },
+  );
+}
+
+// Replay the last recorded window for one request id from the owner's durable
+// session entries. Delivery entries record the next arming directly, so the
+// latest entry always describes the currently armed window.
+function softWindowFromEntries(
+  entries: readonly unknown[],
+  requestId: string,
+): { armedAt: number; windowMs: number } | undefined {
+  let latest: { armedAt: number; windowMs: number } | undefined;
+  for (const entry of entries) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const record = entry as {
+      type?: unknown;
+      customType?: unknown;
+      data?: unknown;
+    };
+    if (record.type !== "custom" || record.customType !== SOFT_WINDOW_ENTRY)
+      continue;
+    const data = record.data;
+    if (!data || typeof data !== "object" || Array.isArray(data)) continue;
+    const value = data as Record<string, unknown>;
+    if (value.requestId !== requestId) continue;
+    const armedAt = value.armedAt ?? value.nextArmedAt;
+    const windowMs = value.windowMs;
+    if (
+      typeof armedAt !== "number" ||
+      !Number.isFinite(armedAt) ||
+      armedAt < 0 ||
+      typeof windowMs !== "number" ||
+      !Number.isInteger(windowMs) ||
+      windowMs <= 0
+    )
+      continue;
+    latest = { armedAt, windowMs };
+  }
+  return latest;
+}
 const resultWatchers = new Map<
   string,
   (curr: import("node:fs").Stats, prev: import("node:fs").Stats) => void
@@ -2738,6 +2888,7 @@ async function submit(
       runtime.task = text;
       runtime.startedAt = Date.now();
       runtime.contextPercent = undefined;
+      armSoftWindow(pi, ctx, runtime, requestId, readConfig().softTimeoutMs);
       watchResult(pi, runtime, ctx, controllerAbortController?.signal);
       watchAsk(pi, runtime, ctx, controllerAbortController?.signal);
     }
@@ -2905,6 +3056,9 @@ async function managedAgentSnapshots(
       state.completedRequestId,
     );
     const handoffPending = unacknowledgedRequestExists(path, state);
+    // A live worker whose assignment is delivered still owns its resolved
+    // request id, but no result file is pending: that is the retained shape.
+    const delivered = !!state.completedRequestId && !completionPending;
     const liveState = agent
       ? agentControlState(
           lifecycleState,
@@ -2913,6 +3067,7 @@ async function managedAgentSnapshots(
           handoffPending,
           !!state.pendingAskId,
           !!state.resultError,
+          delivered,
         )
       : "unknown";
     const pendingDirectChildWork = hasPendingDirectChildWork(state, mailboxes);
@@ -3039,6 +3194,104 @@ function listedStateIsWorking(
   state: string,
 ): boolean {
   return presence.kind === "live" && state === "working";
+}
+
+/**
+ * The launch fingerprint this controller recorded for a worker process, or
+ * `undefined` when no launch entry proves how it was started. A missing entry
+ * cannot justify reuse, so such a worker is relaunched instead.
+ */
+function recordedLaunchFingerprint(
+  entries: readonly unknown[],
+  runId: string,
+  label: string,
+): string | undefined {
+  let fingerprint: string | undefined;
+  for (const entry of entries) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const record = entry as {
+      type?: unknown;
+      customType?: unknown;
+      data?: unknown;
+    };
+    if (record.type !== "custom" || record.customType !== WORKER_LAUNCH_ENTRY)
+      continue;
+    const data = record.data;
+    if (!data || typeof data !== "object" || Array.isArray(data)) continue;
+    const value = data as Record<string, unknown>;
+    if (value.runId !== runId || value.label !== label) continue;
+    if (typeof value.fingerprint === "string" && value.fingerprint)
+      fingerprint = value.fingerprint;
+  }
+  return fingerprint;
+}
+
+type IdleWorkerDecision =
+  /** Not an idle, directly owned, provably live worker: keep today's busy path. */
+  | { kind: "busy" }
+  /** The worker's process is unchanged: hand it the next assignment. */
+  | { kind: "reuse"; runtime: Runtime }
+  /** The worker's launch configuration is gone or stale: close it and relaunch. */
+  | { kind: "relaunch"; listed: any; state: ManagedAgentState };
+
+/**
+ * Whether a retained worker can take the next assignment in its existing
+ * process. A reused process keeps its launch-time system prompt and in-memory
+ * extension state, so reuse needs the same launch configuration the process
+ * started with; drift or missing launch evidence closes it and continues the
+ * same session in a new process.
+ */
+function resolveIdleWorker(
+  ctx: ExtensionContext,
+  record: ManagedAgentSnapshot,
+  currentDefinition: AgentDefinition,
+): IdleWorkerDecision {
+  const { state } = record;
+  if (state.ownerSessionId !== ctx.sessionManager.getSessionId())
+    return { kind: "busy" };
+  if (record.listed.state !== "idle") return { kind: "busy" };
+  const cwd = record.listed.cwd ?? state.cwd;
+  const fingerprint = recordedLaunchFingerprint(
+    ctx.sessionManager.getEntries(),
+    state.runId,
+    state.agentLabel,
+  );
+  try {
+    const current = agentLaunchFingerprint(
+      resolveAgentLaunchInputs(currentDefinition, { cwd }),
+    );
+    if (fingerprint === undefined || fingerprint !== current)
+      return { kind: "relaunch", listed: record.listed, state };
+    const runtime: Runtime = {
+      label: state.agentLabel,
+      herdrAgent: herdrAgentAlias(
+        state.workspaceId,
+        state.agentLabel,
+        state.runId,
+      ),
+      workspaceId: state.workspaceId,
+      paneId: state.paneId,
+      cwd,
+      runId: state.runId,
+      ownerSessionId: state.ownerSessionId,
+      mailboxPath: agentMailboxPath(state.workspaceId, state.agentLabel),
+      piSessionId: state.piSessionId,
+      piSessionFile: state.piSessionFile,
+      agentDefinition: stateAgentDefinition(state),
+    };
+    validateIdentity(runtime, state, {
+      workspace_id: state.workspaceId,
+      label: state.agentLabel,
+      pane_id: state.paneId,
+      cwd,
+      pi_session_id: state.piSessionId,
+      pi_session_path: state.piSessionFile,
+    });
+    return { kind: "reuse", runtime };
+  } catch {
+    // Malformed or conflicting evidence cannot authorize reuse.
+    return { kind: "busy" };
+  }
 }
 
 function managedAgentPresence(
@@ -3182,28 +3435,44 @@ function listedAgentRecord(
     if (transcriptAvailable) actions.push("transcript");
     if (closeAvailable) actions.push("close");
   } else if (presence.kind === "live" && direct && !listed.recovery_only) {
-    actions.push("inspect");
-    if (transcriptAvailable) actions.push("transcript");
-    if (listed.steerable === true) actions.push("steer");
-    if (listed.state === "working" && !state.pendingAskId)
-      actions.push("interrupt");
-    if (state.pendingAskId) {
-      try {
-        const ask = readPendingAsk(mailbox, state);
-        if (
-          ask?.askId === state.pendingAskId &&
-          ask.requestId === state.activeRequestId &&
-          ask.runId === state.runId &&
-          ask.ownerSessionId === state.ownerSessionId &&
-          ask.workspaceId === state.workspaceId &&
-          ask.agentLabel === state.agentLabel &&
-          ask.paneId === state.paneId &&
-          ask.piSessionId === state.piSessionId
-        )
-          actions.push("reply");
-      } catch {}
+    if (listed.state === "idle") {
+      // A retained worker holds a resolved assignment: only inspection,
+      // transcript, and close apply until new work reuses the process.
+      actions.push("inspect");
+      if (transcriptAvailable) actions.push("transcript");
+      if (closeAvailable) actions.push("close");
+    } else {
+      actions.push("inspect");
+      if (transcriptAvailable) actions.push("transcript");
+      if (listed.steerable === true) actions.push("steer");
+      if (listed.state === "working" && !state.pendingAskId)
+        actions.push("interrupt");
+      // An armed soft window is the only prerequisite: `agent_extend` changes
+      // nothing else, so a resolved or windowless record must not offer it.
+      if (
+        softWindowsEnabled() &&
+        state.activeRequestId &&
+        softWindows.get(state.activeRequestId)?.runId === state.runId
+      )
+        actions.push("extend");
+      if (state.pendingAskId) {
+        try {
+          const ask = readPendingAsk(mailbox, state);
+          if (
+            ask?.askId === state.pendingAskId &&
+            ask.requestId === state.activeRequestId &&
+            ask.runId === state.runId &&
+            ask.ownerSessionId === state.ownerSessionId &&
+            ask.workspaceId === state.workspaceId &&
+            ask.agentLabel === state.agentLabel &&
+            ask.paneId === state.paneId &&
+            ask.piSessionId === state.piSessionId
+          )
+            actions.push("reply");
+        } catch {}
+      }
+      if (closeAvailable) actions.push("close");
     }
-    if (closeAvailable) actions.push("close");
   }
   const {
     label: _label,
@@ -3706,14 +3975,12 @@ async function deliverResultUnsafe(
   }
   if (runtimes.get(runtime.label) !== runtime || !controllerSessionActive)
     return;
+  // The assignment resolved by delivery; its advisory windows stop here.
+  dropSoftWindow(result.requestId);
   stopResultWatcher(runtime, result.requestId);
   stopAskWatcher(runtime);
   cancelAskDeliveryRetries(runtime);
-  runtime.completedRequestId = result.requestId;
-  runtime.activeRequestId = undefined;
-  runtime.task = undefined;
-  runtime.startedAt = undefined;
-  runtime.contextPercent = undefined;
+  clearRuntimeAssignment(runtime, result.requestId);
   if (!(await finalizeDeliveredResult(pi, runtime, result, ctx, signal)))
     scheduleResultCleanupRetry(pi, runtime, result, ctx, signal);
 }
@@ -3783,7 +4050,12 @@ async function finalizeDeliveredRoot(
       throw new Error(
         "Managed agent presence is unresolved during result cleanup",
       );
-    if (presence.kind === "live")
+    // A live worker is retained instead of closed when retention is enabled:
+    // its process, pane, label and mailbox survive so a later assignment can
+    // reuse it. The resolved result still goes away, which is the durable fact
+    // that marks the assignment delivered.
+    const retain = presence.kind === "live" && retainWorkersEnabled();
+    if (presence.kind === "live" && !retain)
       await closeLiveManagedExecution(
         pi,
         ctx,
@@ -3806,6 +4078,15 @@ async function finalizeDeliveredRoot(
     )
       throw new Error("Managed agent changed during result cleanup");
     removeResult(mailbox, requestId);
+    if (retain) {
+      const runtime = runtimes.get(state.agentLabel);
+      if (
+        runtime &&
+        sameManagedAgentIdentity(runtimeIdentityState(runtime), state)
+      )
+        clearRuntimeAssignment(runtime, requestId);
+      return;
+    }
     const after = readAgentState(mailbox);
     if (
       after &&
@@ -4300,6 +4581,15 @@ function settlePendingAsks(
     }
   }
 }
+// The assignment resolved: the runtime keeps no presentation of it. A retained
+// worker keeps the request id so its resolved assignment stays recognisable.
+function clearRuntimeAssignment(runtime: Runtime, requestId: string): void {
+  runtime.completedRequestId = requestId;
+  runtime.activeRequestId = undefined;
+  runtime.task = undefined;
+  runtime.startedAt = undefined;
+  runtime.contextPercent = undefined;
+}
 function invalidateCachedRuntime(label: string): void {
   const runtime = runtimes.get(label);
   if (!runtime) return;
@@ -4421,7 +4711,7 @@ async function resolveRuntime(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   agentLabel: string,
-  operation: "steer" | "interrupt" | "reply" | "inspect",
+  operation: "steer" | "interrupt" | "reply" | "inspect" | "extend",
   signal?: AbortSignal,
 ): Promise<{
   runtime: Runtime;
@@ -4708,6 +4998,7 @@ async function closeManagedAgent(
       }
       throw error;
     }
+    dropSoftWindow(current.activeRequestId);
     if (cached) {
       stopResultWatcher(runtime);
       stopAskWatcher(runtime);
@@ -4787,6 +5078,7 @@ async function closeManagedSnapshot(
         "close",
       );
     removeAgentMailbox(mailbox);
+    dropSoftWindow(current.activeRequestId);
     invalidateCachedRuntime(current.agentLabel);
     stopReport?.onClosed?.(current.agentLabel);
   } finally {
@@ -5834,6 +6126,16 @@ async function actionUnsafe(
         p.action,
       );
     const sessionArgs = resumed ? ["--session", resumed.path] : [];
+    // The launch fingerprint describes the definition rather than one task, so
+    // it reads the raw body and digests the files that body references. The
+    // expanded body would fold in whichever files this assignment inlined.
+    const definitionScope =
+      scope.kind === "managed-agent" ? "leaf" : "delegating";
+    const fingerprintDefinition = projectAgentDefinition(
+      definition,
+      definitionScope,
+    );
+    let relaunchReason: "definition_changed" | undefined;
     let releaseSessionActivation: (() => void) | undefined;
     const live = await listedAgents(pi, ctx, undefined, signal);
     if (!agentDefinitionEnabled(definition))
@@ -5859,6 +6161,9 @@ async function actionUnsafe(
         .map((agent) => agent.label)
         .filter((agent): agent is string => typeof agent === "string"),
     );
+    // A retained worker takes its next assignment in the process that already
+    // holds its session, so continuation reuses it instead of launching.
+    let idleReuseRuntime: Runtime | undefined;
     if (resumed) {
       releaseSessionActivation = claimSessionActivationLock(resumed.path);
       try {
@@ -5897,23 +6202,57 @@ async function actionUnsafe(
             "The assignment session matched multiple managed agents",
             p.action,
           );
-        if (representations.size === 1)
-          fail(
-            "agent_busy",
-            "The exact Pi session is already represented by active managed work",
-            p.action,
-            {
-              nextAction:
-                "Let that assignment finish, or close its exact agent if abandoning it, then retry.",
-            },
-          );
+        if (representations.size === 1) {
+          const single = states.length === 1 ? states[0] : undefined;
+          const record = single
+            ? snapshot.agents.find(
+                (agent) =>
+                  agent.state.runId === single.state.runId &&
+                  agent.state.agentLabel === single.state.agentLabel &&
+                  agent.state.paneId === single.state.paneId,
+              )
+            : undefined;
+          // Only the session's own label may be reused, so the assignment
+          // keeps the worker identity its mailbox and session already carry.
+          const decision =
+            record && single!.state.agentLabel === resumed.label
+              ? resolveIdleWorker(ctx, record, fingerprintDefinition)
+              : ({ kind: "busy" } as const);
+          if (decision.kind === "reuse") idleReuseRuntime = decision.runtime;
+          if (decision.kind === "relaunch") {
+            // A retained process cannot adopt a changed definition: close it
+            // and continue the same session in a new process below.
+            await closeManagedAgent(
+              pi,
+              ctx,
+              decision.listed,
+              decision.state,
+              signal,
+            );
+            relaunchReason = "definition_changed";
+            labels.delete(decision.state.agentLabel);
+            requestStatusRefresh?.();
+          }
+          if (decision.kind === "busy")
+            fail(
+              "agent_busy",
+              "The exact Pi session is already represented by active managed work",
+              p.action,
+              {
+                nextAction:
+                  "Let that assignment finish, or close its exact agent if abandoning it, then retry.",
+              },
+            );
+        }
       } catch (error) {
         releaseSessionActivation();
         releaseSessionActivation = undefined;
         throw error;
       }
     }
-    if (requestedLabel && labels.has(requestedLabel))
+    // Reuse keeps the worker's own label, so an existing live label is expected
+    // there; only a fresh generation must not collide with a live label.
+    if (requestedLabel && labels.has(requestedLabel) && !idleReuseRuntime)
       fail(
         "agent_label_exists",
         `Agent label already exists: ${requestedLabel}`,
@@ -5953,6 +6292,40 @@ async function actionUnsafe(
     // The label is knowable until a mailbox collision changes it; only Herdr's
     // pane identity remains unknown until startup returns.
     assignmentInput = prepareAssignmentInput(label);
+    if (idleReuseRuntime) {
+      // The retained worker keeps its process, label, pane, and Pi session; the
+      // new assignment is submitted into the runtime that is already live.
+      const reused = idleReuseRuntime;
+      releaseSessionActivation?.();
+      releaseSessionActivation = undefined;
+      runtimes.set(reused.label, reused);
+      requestStatusRefresh?.();
+      const requestId = await submit(
+        pi,
+        reused,
+        "task",
+        assignmentInput.text,
+        ctx,
+        signal,
+        undefined,
+        assignment!.createdAt,
+        assignment!.requestId,
+        p.action,
+      );
+      requestStatusRefresh?.();
+      return {
+        ok: true,
+        action: p.action,
+        agent: reused.label,
+        definition: agentDefinition,
+        owner_session_id: reused.ownerSessionId,
+        pane_id: reused.paneId,
+        session_id: reused.piSessionId,
+        session_path: reused.piSessionFile,
+        request_id: requestId,
+        reused: true,
+      };
+    }
     const preparedBody = expandAgentBodyFiles(
       definition.body,
       assignmentInput.canonicalPaths,
@@ -5964,7 +6337,7 @@ async function actionUnsafe(
         : { ...definition, body: preparedBody };
     const effectiveDefinition = projectAgentDefinition(
       preparedDefinition,
-      scope.kind === "managed-agent" ? "leaf" : "delegating",
+      definitionScope,
     );
     const delegationEnabled =
       agentDefinitionDelegationEnabled(effectiveDefinition);
@@ -6140,6 +6513,11 @@ async function actionUnsafe(
         ...(!resumed ? { inheritedThinking: pi.getThinkingLevel() } : {}),
         modelDecision: childModel,
       });
+      // A retained process keeps the launch configuration it started with, so
+      // reuse compares this fingerprint with the then-current definition.
+      const launchFingerprint = agentLaunchFingerprint(
+        resolveAgentLaunchInputs(fingerprintDefinition, { cwd: agentCwd }),
+      );
       started = await startHerdrAgent(pi, ctx, {
         label,
         runId,
@@ -6271,6 +6649,15 @@ async function actionUnsafe(
         pi_session_id: state.piSessionId,
         pi_session_path: state.piSessionFile,
       });
+      try {
+        pi.appendEntry(WORKER_LAUNCH_ENTRY, {
+          runId: state.runId,
+          label,
+          fingerprint: launchFingerprint,
+        } satisfies WorkerLaunchEntry);
+      } catch (error) {
+        appendDurableError(pi, ctx, "pi_herdsman_state_error", error);
+      }
       // Herdr chooses the pane only while starting. Re-render now that the
       // authoritative final envelope identity is known.
       assignmentInput = prepareMessageInput(
@@ -6324,6 +6711,7 @@ async function actionUnsafe(
         session_id: runtime.piSessionId,
         session_path: runtime.piSessionFile,
         request_id: runtime.activeRequestId,
+        ...(relaunchReason ? { relaunched: relaunchReason } : {}),
       };
     } catch (caught) {
       if (promptWriteFailed) throw caught;
@@ -6493,6 +6881,72 @@ async function actionUnsafe(
         ? { recent_output: snapshot.recentOutput }
         : {}),
       ...(snapshot.process ? { process: snapshot.process } : {}),
+    };
+  }
+  if (p.action === "extend") {
+    // Only an armed window can be replaced. A disabled configuration, a
+    // resolved assignment, or an idle worker has no window and no effect.
+    const requestId = runtime.activeRequestId;
+    const armed = softWindowsEnabled() && requestId
+      ? softWindows.get(requestId)
+      : undefined;
+    if (!requestId || !armed || armed.runId !== runtime.runId)
+      fail("agent_busy", "Agent has no armed soft window", "extend", {
+        nextAction:
+          "Use agent_extend only when available_tools includes it; a resolved, idle, or disabled-window Agent has nothing to extend.",
+      });
+    let extendedState: ManagedAgentState | undefined;
+    try {
+      extendedState = readAgentState(runtime.mailboxPath);
+    } catch (error) {
+      fail(
+        "internal_failure",
+        `Agent mailbox state is malformed or oversized: ${String(error)}`,
+        "extend",
+      );
+    }
+    if (!extendedState || extendedState.activeRequestId !== requestId)
+      fail(
+        "target_ambiguous",
+        "Managed agent identity changed during extend",
+        "extend",
+      );
+    validateIdentity(runtime, extendedState);
+    const extendedAt = Date.now();
+    const windowMs = p.windowMs;
+    recordSoftWindow(
+      pi,
+      ctx,
+      {
+        requestId,
+        label: runtime.label,
+        runId: runtime.runId,
+        ownerSessionId: runtime.ownerSessionId,
+        workspaceId: runtime.workspaceId,
+        armedAt: extendedAt,
+        windowMs,
+      },
+      {
+        requestId,
+        label: runtime.label,
+        runId: runtime.runId,
+        armedAt: extendedAt,
+        windowMs,
+        extended: true,
+      },
+    );
+    // The replacement length applies to this window only; the automatic
+    // re-arm after the next digest returns to `softTimeoutMs`.
+    return {
+      ok: true,
+      action: "extend",
+      agent: runtime.label,
+      presentation_agent_definition: presentationAgentDefinition,
+      session_id: runtime.piSessionId,
+      request_id: requestId,
+      pane_id: runtime.paneId,
+      window_ms: windowMs,
+      extended_at: extendedAt,
     };
   }
   if (p.action === "steer" && resolved.agent.steerable !== true)
@@ -6783,6 +7237,11 @@ export default function (pi: ExtensionAPI): void {
     (message, options, theme) =>
       renderAgentAttentionMessage(message, options, theme),
   );
+  pi.registerMessageRenderer(
+    SOFT_DEADLINE_MESSAGE,
+    (message, options, theme) =>
+      renderAgentSoftDeadlineMessage(message, options, theme),
+  );
   const processRole = role();
   if (processRole === "unmanaged") {
     const agentsCommand = {
@@ -6914,6 +7373,18 @@ export default function (pi: ExtensionAPI): void {
   );
   const agentTargetParameters = Type.Object(
     { agent: Type.String({ pattern: AGENT_LABEL_PATTERN.source }) },
+    { additionalProperties: false },
+  );
+  const agentExtendParameters = Type.Object(
+    {
+      agent: Type.String({ pattern: AGENT_LABEL_PATTERN.source }),
+      windowMs: Type.Integer({
+        minimum: 1,
+        maximum: MAX_SOFT_TIMEOUT_MS,
+        description:
+          "Length of the worker's next soft window in milliseconds, measured from this call.",
+      }),
+    },
     { additionalProperties: false },
   );
   const staffTargetParameters = Type.Object(
@@ -9009,17 +9480,68 @@ export default function (pi: ExtensionAPI): void {
       requestStatusRefresh?.();
     };
     const maybeFinishHerdRun = (ctx: ExtensionContext): void => {
+      void finishHerdRunIfOnlyIdleWorkersRemain(ctx);
+    };
+    let herdRunFinishInFlight = false;
+    let herdRunFinishPending = false;
+    const finishHerdRunIfOnlyIdleWorkersRemain = async (
+      ctx: ExtensionContext,
+    ): Promise<void> => {
+      if (herdRunFinishInFlight) {
+        // The check in flight re-reads the projection before it decides, so a
+        // second trigger during that read only has to be recorded.
+        herdRunFinishPending = true;
+        return;
+      }
+      herdRunFinishInFlight = true;
+      try {
+        await checkHerdRunFinished(ctx);
+      } finally {
+        herdRunFinishInFlight = false;
+      }
+      if (herdRunFinishPending) {
+        herdRunFinishPending = false;
+        await finishHerdRunIfOnlyIdleWorkersRemain(ctx);
+      }
+    };
+    const checkHerdRunFinished = async (
+      ctx: ExtensionContext,
+    ): Promise<void> => {
       if (herdRunStartedAt === undefined || !leadSettled) return;
+      if (pendingStarts.size > 0) return;
       const sessionId = ctx.sessionManager.getSessionId();
-      // Direct owned durable state anchors the whole descendant subtree until cleanup.
+      // Direct owned durable state anchors the whole descendant subtree until
+      // cleanup. A retained idle worker has no assignment left to wait for, so
+      // it is the one durable shape that does not keep the run open.
       if (
-        pendingStarts.size > 0 ||
         listAgentStates().some(
           ({ state }) => state.ownerSessionId === sessionId,
         )
-      )
-        return;
+      ) {
+        let snapshot: Awaited<ReturnType<typeof managedAgentSnapshots>>;
+        try {
+          snapshot = await managedAgentSnapshots(
+            pi,
+            ctx,
+            controllerAbortController?.signal,
+            false,
+            true,
+          );
+        } catch {
+          // An unprovable projection must never finish a herd run early.
+          return;
+        }
+        if (herdRunStartedAt === undefined || !leadSettled) return;
+        if (
+          snapshot.agents.some(
+            ({ state, listed }) =>
+              state.ownerSessionId === sessionId && listed.state !== "idle",
+          )
+        )
+          return;
+      }
       const startedAt = herdRunStartedAt;
+      if (startedAt === undefined || !leadSettled) return;
       const completedAt = Date.now();
       try {
         pi.appendEntry(HERD_RUN_ENTRY, {
@@ -11673,7 +12195,16 @@ export default function (pi: ExtensionAPI): void {
                 readConfig().contextRetirement ? "on" : "off"
               }`,
             },
+            {
+              value: "retain-workers",
+              label: `Retain workers  ${readConfig().retainWorkers ? "on" : "off"}`,
+            },
+            {
+              value: "soft-timeout",
+              label: `Soft timeout  ${formatSoftTimeout(readConfig().softTimeoutMs)}`,
+            },
             { value: "message-limits", label: "Message limits" },
+            { value: "clear-idle", label: "Clear idle…" },
             { value: "stop-all", label: "Stop all…" },
           ],
           selectedSection,
@@ -11688,10 +12219,110 @@ export default function (pi: ExtensionAPI): void {
           const enabled = !readConfig().contextRetirement;
           updateConfig("contextRetirement", enabled);
           ctx.ui.notify(`context retirement: ${enabled ? "on" : "off"}`);
+        } else if (selected === "retain-workers") {
+          const enabled = !readConfig().retainWorkers;
+          updateConfig("retainWorkers", enabled);
+          ctx.ui.notify(`retain workers: ${enabled ? "on" : "off"}`);
+        } else if (selected === "soft-timeout") {
+          await openSoftTimeoutMenu(ctx);
         } else if (selected === "message-limits")
           await openMessageLimitsMenu(ctx);
+        else if (selected === "clear-idle")
+          await confirmAndClearIdleWorkers(ctx);
         else if (selected === "stop-all") await confirmAndStopAll(ctx);
       }
+    };
+    const openSoftTimeoutMenu = async (
+      ctx: ExtensionCommandContext,
+    ): Promise<void> => {
+      const maxMinutes = Math.floor(
+        MAX_SOFT_TIMEOUT_MS / SOFT_TIMEOUT_MINUTE_MS,
+      );
+      const choice = await selectMenu(ctx, "Soft timeout", [
+        ...[2, 5, 10].map((minutes) => ({
+          value: String(minutes * SOFT_TIMEOUT_MINUTE_MS),
+          label: `${minutes} min`,
+        })),
+        { value: "off", label: "Off" },
+        { value: "custom", label: "Custom…" },
+        { value: "reset", label: "Reset" },
+      ]);
+      if (!choice) return;
+      let value: number | undefined;
+      if (choice === "reset") value = undefined;
+      else if (choice === "off") value = 0;
+      else if (choice === "custom") {
+        const input = await ctx.ui.input(
+          `Soft timeout in minutes (0–${maxMinutes})`,
+        );
+        if (input === undefined) return;
+        const minutes = Number(input.trim());
+        if (
+          !/^\d+$/u.test(input.trim()) ||
+          !validSoftTimeout(minutes * SOFT_TIMEOUT_MINUTE_MS)
+        ) {
+          ctx.ui.notify(
+            `Enter an integer from 0 through ${maxMinutes} minutes`,
+            "error",
+          );
+          return;
+        }
+        value = minutes * SOFT_TIMEOUT_MINUTE_MS;
+      } else value = Number(choice);
+      updateConfig("softTimeoutMs", value);
+      ctx.ui.notify(
+        `soft timeout: ${value === undefined ? "reset" : formatSoftTimeout(value)}`,
+      );
+    };
+    const confirmAndClearIdleWorkers = async (
+      ctx: ExtensionCommandContext,
+    ): Promise<void> => {
+      const ownerSessionId = ctx.sessionManager.getSessionId();
+      const snapshot = await managedAgentSnapshots(
+        pi,
+        ctx,
+        controllerAbortController?.signal,
+      );
+      const idle = snapshot.agents.filter(
+        (agent) =>
+          agent.state.ownerSessionId === ownerSessionId &&
+          agent.presence.kind === "live" &&
+          agent.listed.state === "idle",
+      );
+      if (!idle.length) {
+        ctx.ui.notify("No idle workers to clear");
+        return;
+      }
+      const confirmed = await ctx.ui.confirm(
+        "Clear idle workers?",
+        `Close ${idle.length} directly owned idle worker${
+          idle.length === 1 ? "" : "s"
+        }. Active assignments are not affected.`,
+      );
+      if (!confirmed) return;
+      let closed = 0;
+      const failures: string[] = [];
+      for (const agent of idle) {
+        try {
+          await closeManagedSnapshot(
+            pi,
+            ctx,
+            agent,
+            controllerAbortController?.signal,
+          );
+          closed += 1;
+        } catch {
+          failures.push(agent.state.agentLabel);
+        }
+      }
+      const summary = `cleared ${closed} idle worker${closed === 1 ? "" : "s"}`;
+      if (failures.length)
+        ctx.ui.notify(
+          `${summary}; could not clear: ${failures.join(", ")}`,
+          "error",
+        );
+      else ctx.ui.notify(summary);
+      requestStatusRefresh?.();
     };
     const showSessionStats = (ctx: ExtensionCommandContext): void => {
       const stats = collectSessionUsage(ctx);
@@ -12696,6 +13327,7 @@ export default function (pi: ExtensionAPI): void {
       sessionSignal: AbortSignal,
     ): Promise<void> => {
       runtimes.clear();
+      softWindows.clear();
 
       let snapshot: Awaited<ReturnType<typeof managedAgentSnapshots>>;
       try {
@@ -12711,6 +13343,7 @@ export default function (pi: ExtensionAPI): void {
       const directStates = snapshot.mailboxes.filter(
         ({ state }) => state.ownerSessionId === owner,
       );
+      const recoveredSoftTimeoutMs = readConfig().softTimeoutMs;
 
       for (const { path, state } of directStates) {
         try {
@@ -12773,6 +13406,27 @@ export default function (pi: ExtensionAPI): void {
           runtimes.set(runtime.label, runtime);
 
           if (runtime.activeRequestId) {
+            // Resume the unresolved assignment's window from its durable
+            // anchor: the last recorded window entry, else the acceptance time
+            // the worker acknowledged. An assignment with neither was never
+            // armed (pre-feature or unacknowledged), so it gets no window.
+            if (recoveredSoftTimeoutMs > 0) {
+              const recorded = softWindowFromEntries(
+                entries,
+                runtime.activeRequestId,
+              );
+              const armedAt = recorded?.armedAt ?? state.lastAck?.acknowledgedAt;
+              if (armedAt !== undefined)
+                softWindows.set(runtime.activeRequestId, {
+                  requestId: runtime.activeRequestId,
+                  label: runtime.label,
+                  runId: runtime.runId,
+                  ownerSessionId: runtime.ownerSessionId,
+                  workspaceId: runtime.workspaceId,
+                  armedAt,
+                  windowMs: recorded?.windowMs ?? recoveredSoftTimeoutMs,
+                });
+            }
             watchResult(pi, runtime, ctx, sessionSignal);
             watchAsk(pi, runtime, ctx, sessionSignal);
             continue;
@@ -13072,6 +13726,7 @@ export default function (pi: ExtensionAPI): void {
           continue;
         }
         if (agent.presence.kind === "lost" && !state.completedRequestId) {
+          dropSoftWindow(state.activeRequestId);
           const episode = "lost";
           if (published || !attentionDue(state.runId, episode, now)) continue;
           const intervalMs = nextAttentionInterval(state.runId, episode);
@@ -13516,6 +14171,159 @@ export default function (pi: ExtensionAPI): void {
           // Publication is best-effort; the next scan retries it.
         }
       }
+      // Advisory soft-deadline digest: a trailing pass, independent of the
+      // one-attention-per-scan gate. It is a distinct message type, so a due
+      // digest coexists with health attention in the same scan and is neither
+      // suppressed by it nor able to suppress it.
+      if (signal.aborted || generation !== healthGeneration || !ctx.isIdle())
+        return;
+      let configuredWindowMs = 0;
+      try {
+        configuredWindowMs = readConfig().softTimeoutMs;
+      } catch {
+        configuredWindowMs = 0;
+      }
+      if (configuredWindowMs <= 0) {
+        softWindows.clear();
+        return;
+      }
+      const dueEntries: Array<Record<string, unknown>> = [];
+      for (const agent of snapshot.agents) {
+        if (signal.aborted || generation !== healthGeneration || !ctx.isIdle())
+          return;
+        const { state } = agent;
+        if (state.ownerSessionId !== ownerSessionId) continue;
+        // Windows cover unresolved live assignments, including one waiting on
+        // an owner question (its entry then lists `reply`, not `interrupt`).
+        // Delivered, settling, lost and idle projections are excluded by the
+        // same lifecycle the owner sees.
+        if (
+          agent.presence.kind !== "live" ||
+          (agent.listed.state !== "working" && agent.listed.state !== "blocked")
+        )
+          continue;
+        const requestId = state.activeRequestId;
+        if (!requestId) continue;
+        const window = softWindows.get(requestId);
+        if (!window || window.runId !== state.runId) continue;
+        const current = currentOwnedState(state, ownerSessionId);
+        if (!current?.activeRequestId || current.activeRequestId !== requestId)
+          continue;
+        const currentWindow = softWindows.get(requestId);
+        if (!currentWindow || currentWindow.runId !== current.runId) continue;
+        const elapsedMs = now - currentWindow.armedAt;
+        if (elapsedMs < currentWindow.windowMs) continue;
+        dueEntries.push({
+          agentLabel: current.agentLabel,
+          agentDefinition: stateAgentDefinition(current),
+          requestId,
+          runId: current.runId,
+          workspaceId: current.workspaceId,
+          elapsedMs,
+          windowMs: currentWindow.windowMs,
+          availableActions: currentAvailableActions(
+            agent,
+            view,
+            ownerSessionId,
+            unresolvedMailboxState,
+          ),
+        });
+      }
+      if (!dueEntries.length) return;
+      if (signal.aborted || generation !== healthGeneration || !ctx.isIdle())
+        return;
+      const annotations: string[] = [];
+      try {
+        pi.events.emit(SOFT_DEADLINE_EVENT, {
+          ownerSessionId,
+          entries: dueEntries,
+          annotations,
+        });
+      } catch {
+        // A listener failure must never block or change digest delivery.
+      }
+      const describeControls = (actions: unknown): string =>
+        Array.isArray(actions) && actions.length
+          ? actions.map((action) => `agent_${String(action)}`).join(", ")
+          : "none";
+      try {
+        pi.sendMessage(
+          {
+            customType: SOFT_DEADLINE_MESSAGE,
+            content: [
+              dueEntries.length === 1
+                ? "Advisory soft-deadline checkpoint: 1 directly owned Agent has been working past its soft window."
+                : `Advisory soft-deadline checkpoint: ${dueEntries.length} directly owned Agents have been working past their soft windows.`,
+              "",
+              "This is advisory. No Agent was aborted, steered, or closed, and continuing to wait is a valid response.",
+              "",
+              ...dueEntries.flatMap((entry) => [
+                `- ${String(entry.agentLabel)} (${String(entry.agentDefinition) || "?"})`,
+                `  working for ${formatAttentionDuration(Number(entry.elapsedMs))} · window ${formatAttentionDuration(Number(entry.windowMs))}`,
+                `  request: ${String(entry.requestId)}`,
+                `  controls: ${describeControls(entry.availableActions)}`,
+              ]),
+              "",
+              "For each Agent choose: keep waiting, agent_steer, agent_interrupt, agent_extend, or agent_close.",
+              "Use only the controls listed for that Agent; agent_extend replaces that Agent's next window without changing its assignment.",
+              "This checkpoint repeats after each window while the assignment stays unresolved.",
+              ...(annotations.length
+                ? [
+                    "",
+                    "Annotations from other extensions:",
+                    ...annotations.map((annotation) => `- ${annotation}`),
+                  ]
+                : []),
+            ].join("\n"),
+            display: true,
+            details: {
+              ownerSessionId,
+              entries: dueEntries.map((entry) => ({
+                agentLabel: entry.agentLabel,
+                agentDefinition: entry.agentDefinition,
+                requestId: entry.requestId,
+                elapsedMs: entry.elapsedMs,
+                windowMs: entry.windowMs,
+                availableActions: entry.availableActions,
+              })),
+              annotations,
+            },
+          },
+          { triggerTurn: true },
+        );
+      } catch {
+        // Best-effort delivery; the next scan retries the digest.
+        return;
+      }
+      // Re-arm only after a successful delivery, so a failed send retries.
+      const nextWindowMs = configuredWindowMs;
+      for (const entry of dueEntries) {
+        const requestId = String(entry.requestId);
+        if (nextWindowMs <= 0) {
+          dropSoftWindow(requestId);
+          continue;
+        }
+        const deliveredAt = Date.now();
+        recordSoftWindow(
+          pi,
+          ctx,
+          {
+            requestId,
+            label: String(entry.agentLabel),
+            runId: String(entry.runId),
+            ownerSessionId,
+            workspaceId: String(entry.workspaceId),
+            armedAt: deliveredAt,
+            windowMs: nextWindowMs,
+          },
+          {
+            requestId,
+            deliveredAt,
+            nextArmedAt: deliveredAt,
+            windowMs: nextWindowMs,
+          },
+        );
+      }
     };
     const runAgentHealthScanner = (
       ctx: ExtensionContext,
@@ -13945,6 +14753,7 @@ export default function (pi: ExtensionAPI): void {
       resultDeliveryEvidence.clear();
       askDeliveryInFlight.clear();
       runtimes.clear();
+      softWindows.clear();
     });
     const agentTool = {
       name: "agent_list",
@@ -14323,6 +15132,28 @@ export default function (pi: ExtensionAPI): void {
         renderCoordinationCall("agent", "transcript", a, t, c),
       renderResult: (r: any, o: any, t: any, c: any) =>
         renderCoordinationResult("agent", "transcript", r, o, t, c),
+    });
+    pi.registerTool({
+      ...agentTool,
+      name: "agent_extend",
+      label: "agent extend",
+      description:
+        "Lengthen one directly owned working Agent's next soft-deadline window.",
+      parameters: agentExtendParameters,
+      promptSnippet: undefined,
+      promptGuidelines: undefined,
+      execute: (
+        id: string,
+        p: any,
+        signal: AbortSignal | undefined,
+        update: unknown,
+        ctx: ExtensionContext,
+      ) =>
+        agentTool.execute(id, { action: "extend", ...p }, signal, update, ctx),
+      renderCall: (a: unknown, t: any, c: any) =>
+        renderCoordinationCall("agent", "extend", a, t, c),
+      renderResult: (r: any, o: any, t: any, c: any) =>
+        renderCoordinationResult("agent", "extend", r, o, t, c),
     });
     if (controllerScope.kind === "lead") {
       pi.registerTool({
@@ -15123,9 +15954,16 @@ export default function (pi: ExtensionAPI): void {
       );
       return { action: "handled" };
     }
+    // A retained worker's previous assignment is delivered once its result file
+    // is gone: the controller removes it only after delivery, so that absence is
+    // a durable, child-readable fact that makes the next task admissible.
+    const deliveredRequestId = state.completedRequestId;
+    const deliveredAssignment =
+      deliveredRequestId !== undefined &&
+      !pendingResultExists(process.env.PI_HERDSMAN_MAILBOX!, deliveredRequestId);
     if (
       request.kind === "task" &&
-      (state.completedRequestId !== undefined ||
+      ((state.completedRequestId !== undefined && !deliveredAssignment) ||
         !taskAcceptanceAllowed(
           ctx.isIdle(),
           state.activeRequestId,
@@ -15138,7 +15976,9 @@ export default function (pi: ExtensionAPI): void {
         ctx,
         "busy",
         state.completedRequestId
-          ? "Agent assignment is already complete"
+          ? deliveredAssignment
+            ? "Agent assignment is still settling"
+            : "Agent assignment is already complete"
           : "Agent already has an active assignment",
       );
       return { action: "handled" };

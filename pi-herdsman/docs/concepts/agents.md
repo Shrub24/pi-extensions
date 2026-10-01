@@ -47,9 +47,10 @@ Every managed agent has an exact Pi session. The list may expose the session
 ID and path for correlation.
 
 A session path or full UUID can be supplied to `agent_continue` to continue
-historical managed-agent work. Continuation creates a new agent generation for
-one new assignment and uses the saved session's cwd, definition, logical label, and
-historical context. The caller cannot rename the continued session. The Pi
+historical managed-agent work. Continuation hands one new assignment to the
+session's agent: it uses the saved session's cwd, definition, logical label, and
+historical context, and either reuses a retained worker's process or starts a new
+generation. The caller cannot rename the continued session. The Pi
 session remains the continuation identity, not a live-control identity. An
 exact active or unresolved managed representation blocks concurrent activation
 of that session.
@@ -104,14 +105,20 @@ evidence fails closed rather than guessing.
 
 ## Agent generations and continuation
 
-Every managed agent generation executes exactly one delegated assignment. Its
-terminal result is delivered once, then the agent's pane, process, mailbox,
-and runtime state are cleaned up. Failed assignments follow the same terminal
-cleanup path.
+A managed agent generation is one process lifetime of a managed agent. It
+executes one delegated assignment at a time. Its terminal result is delivered
+once, then the agent's pane, process, mailbox, and runtime state are cleaned up.
+Failed assignments follow the same terminal cleanup path. With `retainWorkers`
+enabled, delivering the result keeps the verified live process, pane, label, and
+mailbox instead of cleaning them up: the same generation takes the next
+assignment, and the worker projects as `idle` until a later assignment reuses it.
+The cleanup described here happens when that retained worker is closed.
 
-The Pi session remains available after agent cleanup. To continue the same
+The Pi session outlives its generations. To continue the same
 conversational context, use `agent_continue` with the exact session ID or session path
-returned with the result. This creates a new agent generation, which restores
+returned with the result. Continuation of a retained worker whose launch
+configuration still matches the current definition reuses that existing process;
+otherwise it closes the process and starts a new generation, which restores
 the saved session's model and thinking unless the current definition
 explicitly overrides either field. Fresh delegation does not inherit the
 caller's conversation; pass assignment-specific evidence through task text and
@@ -123,6 +130,7 @@ The identities are therefore:
 agent definition → configuration for new work
 Pi session       → durable conversational context and continuation identity
 agent label     → stable logical name across sequential generations; live control target only for the current generation
+generation      → one process lifetime; a retained worker keeps it across assignments until its launch configuration drifts
 ```
 
 ## See also

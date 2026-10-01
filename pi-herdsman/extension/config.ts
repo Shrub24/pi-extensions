@@ -17,10 +17,14 @@ import { isSpawnPlacement, type SpawnPlacement } from "./core.ts";
 const DEFAULT_BYTE_LIMIT = 128 * 1024;
 export const MIN_BYTE_LIMIT = 1024;
 export const MAX_BYTE_LIMIT = 1024 * 1024;
+export const DEFAULT_SOFT_TIMEOUT_MS = 5 * 60_000;
+export const MAX_SOFT_TIMEOUT_MS = 2_147_483_647;
 
 export type HerdsmanConfig = {
   spawnPlacement: SpawnPlacement;
   contextRetirement: boolean;
+  retainWorkers: boolean;
+  softTimeoutMs: number;
   inlineAttachmentLimitBytes: number;
   mailboxPayloadLimitBytes: number;
 };
@@ -28,6 +32,8 @@ export type HerdsmanConfig = {
 export const DEFAULT_CONFIG: HerdsmanConfig = {
   spawnPlacement: "subtree",
   contextRetirement: false,
+  retainWorkers: false,
+  softTimeoutMs: DEFAULT_SOFT_TIMEOUT_MS,
   inlineAttachmentLimitBytes: DEFAULT_BYTE_LIMIT,
   mailboxPayloadLimitBytes: DEFAULT_BYTE_LIMIT,
 };
@@ -41,10 +47,23 @@ export function validByteLimit(value: unknown): value is number {
   );
 }
 
+// Advisory soft-deadline windows accept any non-negative integer; 0 disables
+// the feature entirely, which `validByteLimit`'s 1 KiB floor cannot express.
+export function validSoftTimeout(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isInteger(value) &&
+    value >= 0 &&
+    value <= MAX_SOFT_TIMEOUT_MS
+  );
+}
+
 type ConfigKey = keyof HerdsmanConfig;
 const CONFIG_KEYS = new Set<ConfigKey>([
   "spawnPlacement",
   "contextRetirement",
+  "retainWorkers",
+  "softTimeoutMs",
   "inlineAttachmentLimitBytes",
   "mailboxPayloadLimitBytes",
 ]);
@@ -70,10 +89,16 @@ function parseRawConfig(content: string): Partial<HerdsmanConfig> {
       throw new Error("Invalid Pi Herdsman config field spawnPlacement");
     result.spawnPlacement = record.spawnPlacement;
   }
-  if ("contextRetirement" in record) {
-    if (typeof record.contextRetirement !== "boolean")
-      throw new Error("Invalid Pi Herdsman config field contextRetirement");
-    result.contextRetirement = record.contextRetirement;
+  for (const key of ["contextRetirement", "retainWorkers"] as const)
+    if (key in record) {
+      if (typeof record[key] !== "boolean")
+        throw new Error(`Invalid Pi Herdsman config field ${key}`);
+      result[key] = record[key];
+    }
+  if ("softTimeoutMs" in record) {
+    if (!validSoftTimeout(record.softTimeoutMs))
+      throw new Error("Invalid Pi Herdsman config field softTimeoutMs");
+    result.softTimeoutMs = record.softTimeoutMs;
   }
   for (const key of [
     "inlineAttachmentLimitBytes",
@@ -139,11 +164,18 @@ export function updateConfig<K extends ConfigKey>(
     if (value !== undefined) {
       if (key === "spawnPlacement" && !isSpawnPlacement(value))
         throw new Error("Invalid Pi Herdsman config field spawnPlacement");
-      if (key === "contextRetirement" && typeof value !== "boolean")
-        throw new Error("Invalid Pi Herdsman config field contextRetirement");
+      if (
+        (key === "contextRetirement" || key === "retainWorkers") &&
+        typeof value !== "boolean"
+      )
+        throw new Error(`Invalid Pi Herdsman config field ${key}`);
+      if (key === "softTimeoutMs" && !validSoftTimeout(value))
+        throw new Error("Invalid Pi Herdsman config field softTimeoutMs");
       if (
         key !== "spawnPlacement" &&
         key !== "contextRetirement" &&
+        key !== "retainWorkers" &&
+        key !== "softTimeoutMs" &&
         !validByteLimit(value)
       )
         throw new Error(`Invalid Pi Herdsman config field ${key}`);

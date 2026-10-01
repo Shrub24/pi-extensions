@@ -81,6 +81,7 @@ import support, {
   registerExtension,
   renderRunningOptions,
   resetAgentMailbox,
+  resultEntryDetails,
   leadExec,
   runScopedHerdrAlias,
   setLeadEnvironment,
@@ -305,6 +306,7 @@ const leadTools = [
   "agent_close",
   "agent_inspect",
   "agent_transcript",
+  "agent_extend",
   "supervisor_message",
   "peer_list",
   "peer_message",
@@ -414,6 +416,7 @@ function fakeChiefPi(options: Parameters<typeof fakePi>[0] = {}) {
           "agent_close",
           "agent_inspect",
           "agent_transcript",
+          "agent_extend",
           "supervisor_message",
           "peer_list",
           "peer_message",
@@ -2708,6 +2711,7 @@ test("lead session-start retries an exact baseline after restoration fails", asy
     "agent_close",
     "agent_inspect",
     "agent_transcript",
+    "agent_extend",
     "supervisor_message",
     "peer_list",
     "peer_message",
@@ -2780,6 +2784,7 @@ test("lead session-start continues when chief lease release fails", async () => 
         "agent_close",
         "agent_inspect",
         "agent_transcript",
+        "agent_extend",
         "supervisor_message",
         "peer_list",
         "peer_message",
@@ -2805,6 +2810,7 @@ test("lead session-start continues when chief lease release fails", async () => 
     "agent_close",
     "agent_inspect",
     "agent_transcript",
+    "agent_extend",
     "supervisor_message",
     "peer_list",
     "peer_message",
@@ -3100,6 +3106,7 @@ test("Lead resume repairs stale staff from its durable displaced loadout", async
     "agent_close",
     "agent_inspect",
     "agent_transcript",
+    "agent_extend",
     "supervisor_message",
     "peer_list",
     "peer_message",
@@ -3169,6 +3176,7 @@ test("ordinary branch tool state wins over an older lead checkpoint", async () =
           "agent_close",
           "agent_inspect",
           "agent_transcript",
+          "agent_extend",
           "supervisor_message",
           "peer_list",
           "peer_message",
@@ -3188,6 +3196,7 @@ test("ordinary branch tool state wins over an older lead checkpoint", async () =
     "agent_close",
     "agent_inspect",
     "agent_transcript",
+    "agent_extend",
     "supervisor_message",
     "peer_list",
     "peer_message",
@@ -3548,6 +3557,7 @@ test("persisted chief resume isolates tools and restores its ordinary baseline",
           "agent_close",
           "agent_inspect",
           "agent_transcript",
+          "agent_extend",
           "supervisor_message",
           "peer_list",
           "peer_message",
@@ -3593,6 +3603,7 @@ test("persisted chief resume isolates tools and restores its ordinary baseline",
     "agent_close",
     "agent_inspect",
     "agent_transcript",
+    "agent_extend",
     "supervisor_message",
     "peer_list",
     "peer_message",
@@ -3628,6 +3639,7 @@ test("persisted chief collision is suspended and has no lead authority", async (
           "agent_close",
           "agent_inspect",
           "agent_transcript",
+          "agent_extend",
           "supervisor_message",
         ],
       },
@@ -3652,6 +3664,7 @@ test("persisted chief collision is suspended and has no lead authority", async (
         "agent_close",
         "agent_inspect",
         "agent_transcript",
+        "agent_extend",
         "supervisor_message",
       ],
     });
@@ -3730,7 +3743,10 @@ test("plain agents opens the native management menu", async () => {
       "Definitions",
       "Layout",
       "Context",
+      "Retain",
+      "Soft",
       "Message",
+      "Clear",
       "Stop",
     ],
   );
@@ -4089,6 +4105,196 @@ test("main agents menu toggles context retirement", async () => {
   }
 });
 
+test("main agents menu toggles retain workers", async () => {
+  setLeadEnvironment();
+  updateConfig("retainWorkers", undefined);
+  const pi = fakePi();
+  registerExtension!(pi.pi as never);
+  const context = fakeContext() as any;
+  context.hasUI = true;
+  context.mode = "rpc";
+  const menus: string[][] = [];
+  const notices: string[] = [];
+  context.ui.select = async (_title: string, options: string[]) => {
+    menus.push(options);
+    return menus.length === 1
+      ? options.find((option) => option.includes("Retain workers"))
+      : undefined;
+  };
+  context.ui.notify = (message: string) => notices.push(message);
+  try {
+    await pi.commandOptions.get("agents").handler("", context);
+    assert.match(
+      menus[0]?.find((option) => option.includes("Retain workers")) ?? "",
+      /Retain workers  off/,
+    );
+    assert.equal(readConfig().retainWorkers, true);
+    assert.deepEqual(notices, ["retain workers: on"]);
+    await pi.commandOptions.get("agents").handler("", context);
+    assert.match(
+      menus.at(-1)?.find((option) => option.includes("Retain workers")) ?? "",
+      /Retain workers  on/,
+    );
+    assert.equal(readConfig().retainWorkers, true);
+  } finally {
+    updateConfig("retainWorkers", undefined);
+    await pi.events.get("session_shutdown")?.[0]();
+  }
+});
+
+test("main agents menu sets the soft timeout from presets, off, custom, and reset", async () => {
+  setLeadEnvironment();
+  updateConfig("softTimeoutMs", undefined);
+  const pi = fakePi();
+  registerExtension!(pi.pi as never);
+  const context = fakeContext() as any;
+  context.hasUI = true;
+  context.mode = "rpc";
+  const prompts: { label: string; options: string[] }[] = [];
+  const notices: string[] = [];
+  const choices = ["10 min", "Off", "Custom…", "Reset", "Custom…"];
+  let choice = 0;
+  const inputs: (string | undefined)[] = ["7", "abc"];
+  let rootPending = false;
+  context.ui.input = async () => inputs.shift();
+  context.ui.select = async (label: string, options: string[]) => {
+    prompts.push({ label, options });
+    if (rootPending) {
+      rootPending = false;
+      return options.find((option) => option.includes("Soft timeout"));
+    }
+    if (label !== "Soft timeout") return undefined;
+    const next = choices[choice++];
+    return next
+      ? (options.find((option) => option === next) ?? undefined)
+      : undefined;
+  };
+  context.ui.notify = (message: string, kind?: string) =>
+    notices.push(kind ? `${kind}: ${message}` : message);
+  const rootLabel = (index: number) =>
+    prompts[index]?.options.find((option) => option.includes("Soft timeout")) ??
+    "";
+  const open = () => {
+    rootPending = true;
+    return pi.commandOptions.get("agents").handler("", context);
+  };
+  try {
+    await open();
+    assert.match(rootLabel(0), /Soft timeout  5 min/);
+    assert.equal(prompts[1]?.label, "Soft timeout");
+    assert.deepEqual(prompts[1]?.options, [
+      "2 min",
+      "5 min",
+      "10 min",
+      "Off",
+      "Custom…",
+      "Reset",
+    ]);
+    assert.equal(readConfig().softTimeoutMs, 10 * 60_000);
+    assert.equal(notices.at(-1), "soft timeout: 10 min");
+    assert.match(rootLabel(2), /Soft timeout  10 min/);
+
+    await open();
+    assert.equal(readConfig().softTimeoutMs, 0);
+    assert.equal(notices.at(-1), "soft timeout: off");
+    assert.match(rootLabel(5), /Soft timeout  off/);
+
+    await open();
+    assert.equal(readConfig().softTimeoutMs, 7 * 60_000);
+    assert.equal(notices.at(-1), "soft timeout: 7 min");
+
+    await open();
+    assert.equal(readConfig().softTimeoutMs, 5 * 60_000);
+    assert.equal(notices.at(-1), "soft timeout: reset");
+
+    await open();
+    assert.equal(readConfig().softTimeoutMs, 5 * 60_000);
+    assert.equal(
+      notices.at(-1),
+      "error: Enter an integer from 0 through 35791 minutes",
+    );
+  } finally {
+    updateConfig("softTimeoutMs", undefined);
+    await pi.events.get("session_shutdown")?.[0]();
+  }
+});
+
+test("clear idle closes exactly the directly owned idle workers", async () => {
+  setLeadEnvironment();
+  updateConfig("retainWorkers", true);
+  const labels = [
+    "clear-idle-one-agent",
+    "clear-idle-two-agent",
+    "clear-idle-working-agent",
+    "clear-idle-foreign-agent",
+  ];
+  const workingLabel = "clear-idle-working-agent";
+  const foreignLabel = "clear-idle-foreign-agent";
+  const states = labels.map((label) => {
+    const identity = {
+      ...recoveryIdentity(label),
+      piSessionId: randomUUID(),
+    };
+    writeFileSync(identity.piSessionFile, "{}", "utf8");
+    const mailbox = agentMailboxPath(WORKSPACE, label);
+    resetAgentMailbox(mailbox);
+    const state: ManagedAgentState = managedState(label, undefined, identity);
+    if (label === workingLabel) state.activeRequestId = REQUEST_ID;
+    else state.completedRequestId = REQUEST_ID;
+    if (label === foreignLabel) state.ownerSessionId = PARENT_SESSION_ID;
+    writeAgentState(mailbox, state);
+    return state;
+  });
+  const idleStates = states.filter(
+    (state) => state.agentLabel !== workingLabel,
+  );
+  const entries = idleStates.map((state) => ({
+    customType: "pi-herdsman-agent-result",
+    details: resultEntryDetails(state, REQUEST_ID),
+  }));
+  const lifecycle = cascadeExecutor(states);
+  const pi = fakePi({ entries, exec: lifecycle.exec });
+  registerExtension!(pi.pi as never);
+  const context = fakeContext(entries) as any;
+  context.hasUI = true;
+  context.mode = "rpc";
+  const menus: string[][] = [];
+  const notices: string[] = [];
+  context.ui.select = async (_title: string, options: string[]) => {
+    menus.push(options);
+    return menus.length === 1
+      ? options.find((option) => option.includes("Clear idle"))
+      : undefined;
+  };
+  context.ui.confirm = async () => true;
+  context.ui.notify = (message: string) => notices.push(message);
+  try {
+    await pi.events.get("session_start")![0](undefined, context);
+    await pi.commandOptions.get("agents").handler("", context);
+    assert.deepEqual([...lifecycle.closeOrder].sort(), [
+      "clear-idle-one-agent",
+      "clear-idle-two-agent",
+    ]);
+    assert.equal(notices.at(-1), "cleared 2 idle workers");
+    assert.equal(
+      readAgentState(agentMailboxPath(WORKSPACE, workingLabel))
+        ?.activeRequestId,
+      REQUEST_ID,
+    );
+    assert.ok(
+      readAgentState(agentMailboxPath(WORKSPACE, foreignLabel)),
+      "a foreign-owned idle worker is preserved",
+    );
+  } finally {
+    updateConfig("retainWorkers", undefined);
+    pi.events.get("session_shutdown")?.[0]();
+    for (const label of labels) {
+      resetAgentMailbox(agentMailboxPath(WORKSPACE, label));
+      realFs.rmSync(recoveryIdentity(label).piSessionFile, { force: true });
+    }
+  }
+});
+
 test("message limit edits stay in the submenu with the edited field selected", async () => {
   setLeadEnvironment();
   const pi = fakePi();
@@ -4120,7 +4326,7 @@ test("message limit edits stay in the submenu with the edited field selected", a
           component.handleInput("\r");
           break;
         case 2:
-          component.handleInput("\u001b[B");
+          for (let i = 0; i < 3; i++) component.handleInput("\u001b[B");
           component.handleInput("\r");
           break;
         case 4:

@@ -2,7 +2,7 @@
 
 [Documentation index](../README.md) · [Coordination](../concepts/coordination.md)
 
-Managed-agent operations are exposed as nine distinct tools:
+Managed-agent operations are exposed as ten distinct tools:
 
 ```text
 agent_list
@@ -10,6 +10,7 @@ agent_delegate
 agent_continue
 agent_steer
 agent_interrupt
+agent_extend
 agent_reply
 agent_close
 agent_inspect
@@ -39,8 +40,11 @@ The definition is resolved from the effective roster and delegating agent
 controllers may use only their allowlisted definitions. Project definitions
 still require trusted project approval. A fresh delegation starts a new Pi
 session.
-Each accepted definition delegation creates one agent generation for one
-assignment. The terminal result is delivered once and the agent is cleaned up.
+Each accepted definition delegation creates one agent generation that executes
+one assignment at a time. The terminal result is delivered once and the agent is
+cleaned up. With `retainWorkers` enabled, delivery keeps the verified live
+worker as `idle` instead of cleaning it up, so the worker can take a later
+assignment without a new process.
 
 ## `agent_continue`
 
@@ -53,12 +57,13 @@ assignment. The terminal result is delivered once and the agent is cleaned up.
 
 Call `agent_continue` with `session`, `task`, and optional `files`. The exact
 saved session path or full UUID supplies its cwd, definition identity, and
-historical Pi context. Continuation always creates a new agent generation for
-one assignment with a live label; it never assigns work to an existing agent.
-The cwd comes from the saved session. The saved definition is resolved again
+historical Pi context. Continuation hands one more assignment to the session's
+agent, creating a new agent generation (a new process) when no retained worker
+can take the work; it never assigns work to a working or settling
+agent. The cwd comes from the saved session. The saved definition is resolved again
 from current configuration and must currently be enabled and authorized; its
 current effective configuration
-is used for the new generation. Omitted model and thinking fields restore the
+is used for the continued assignment. Omitted model and thinking fields restore the
 saved session settings, while explicit definition fields override them.
 Concurrent or otherwise conflicting managed representations of the exact
 session fail closed. The controller's own active Pi session cannot be continued
@@ -68,6 +73,20 @@ When `contextRetirement` is enabled, `agent_continue` is rejected for a retired
 managed-agent session; delegate a fresh agent and pass the previous
 handoff/result and relevant files instead. Retired results explicitly instruct
 the controller to delegate a fresh agent.
+
+Continuation reports one of three outcomes:
+
+| Outcome     | Result evidence                      | Behavior                                                                                                                                                                                                                                                                     |
+| ----------- | ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| reused      | `reused: true`                       | With `retainWorkers` enabled, the session's single representation is a directly owned `idle` worker whose recorded launch configuration still matches the current definition: the task is submitted into that existing verified live process, so no new process, pane, or label appears. |
+| relaunched  | `relaunched: "definition_changed"`    | The idle worker's launch configuration drifted (prompt body including `@file` contents, `systemPromptMode`, model, thinking, or the effective tools, skills, extensions, and context inheritance) or its launch record is missing. The worker is closed and a fresh generation continues the same session. |
+| fresh       | neither field                        | The work starts as a new agent generation because no reusable verified live process represents the session.                                                                                                                                                                    |
+
+A reused process keeps its launch-time system prompt and in-memory extension
+state, so reuse requires the same launch configuration the process started with.
+Working, settling, or ambiguously represented sessions still fail closed
+(`agent_busy`), and an occupied logical label still fails
+(`agent_label_exists`).
 
 Fresh delegate assignments receive an automatically chosen logical label when
 no label is supplied. The saved session's logical label is inherited exactly
@@ -179,6 +198,7 @@ Generic attention reasons are:
 Stale and lost assignments, and delivered `ask_owner` questions, retain their
 dedicated message types. Stale attention is advisory and does not by itself
 justify intervention. `settling` alone does not generate generic attention.
+
 The public `blocked` projection can also mean that a delegating parent is
 waiting for direct children; that progress-capable parent state is distinct
 from a live Herdr runtime reporting `blocked`.
@@ -205,6 +225,34 @@ use `agent_interrupt` to preempt the active Pi operation and continue the same
 assignment. It supersedes earlier undelivered steering. Use `agent_close` only
 when abandoning the assignment is intended. Do not poll or create another
 delivery path for health attention.
+
+## Soft deadlines
+
+A soft deadline is an advisory checkpoint that is separate from the health
+conditions above. With `softTimeoutMs` positive (default `300000` milliseconds;
+`0` disables the feature), every accepted assignment arms a window measured from
+the worker's acknowledgement. On the same health cadence, so up to one
+30-second scan after expiry, and only while the owner is idle, the controller
+receives one `pi-herdsman-agent-soft-deadline` message covering every due worker
+it directly owns. Each entry names the worker and its definition, the
+assignment's elapsed time, and the controls that worker currently allows, taken
+from the same eligibility as `agent_list`'s `available_tools`. The message
+states that it is advisory, that no worker was aborted, steered, or closed, and
+that waiting is a valid response. After each delivered digest every included
+window re-arms for another `softTimeoutMs` unless `agent_extend` replaced it, so
+a long assignment is checkpointed periodically until it resolves. Delivery,
+`agent_close`, and proven loss stop the windows, and a resolved assignment never
+appears in a later digest. A due digest and other health attention are delivered
+independently: neither suppresses the other.
+
+Before the digest is delivered, the controller emits it on Pi's extension event
+bus as `pi-herdsman:soft-deadline`. The payload is
+`{ownerSessionId: string, entries: [...] , annotations: string[]}`; `entries`
+are the same entries delivered with the digest, and `annotations` is a mutable
+list that subscribers may append to synchronously. Non-empty annotations render
+as a trailing section of the digest. A listener that throws is isolated and
+does not block delivery, and with no subscriber the delivered digest is
+unchanged.
 
 ## `agent_inspect`
 
@@ -335,6 +383,28 @@ child editor.
 
 Cancellation uses Pi's native abort mechanism. Non-cooperative third-party
 tools may not stop immediately; `agent_close` remains the destructive fallback.
+
+## `agent_extend`
+
+```json
+{
+  "agent": "implementer-1",
+  "windowMs": 1800000
+}
+```
+
+Call `agent_extend` only when `available_tools` lists it. It accepts the exact
+live `agent` identity and an integer `windowMs` from `1` through
+`2147483647`; no other field is accepted. It replaces that worker's current
+soft-deadline window with a fresh window of `windowMs`, measured from the call,
+so the worker is not checkpointed again until that window elapses. It changes
+no assignment, does not steer or interrupt the worker, and creates no result.
+Windows armed after that one use the configured `softTimeoutMs` again.
+
+It is unavailable for any worker that is not directly owned, for a resolved
+assignment, for a closed or proven `lost` record, and whenever `softTimeoutMs`
+is `0`; such a call fails without changing any window. See
+[Soft deadlines](#soft-deadlines).
 
 ## `agent_reply`
 

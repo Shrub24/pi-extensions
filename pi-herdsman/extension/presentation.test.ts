@@ -39,6 +39,7 @@ import {
   renderCompletionMessage,
   renderAgentAskMessage,
   renderAgentAttentionMessage,
+  renderAgentSoftDeadlineMessage,
   renderAgentStaleMessage,
   renderAgentLostMessage,
   renderCoordinationCall,
@@ -770,9 +771,10 @@ test("status projection renders the complete stable tree with aligned columns", 
     assert.equal(
       formatStatusCounts([
         ...agents,
+        { label: "idle", definition: "agent", state: "idle" as const },
         { label: "lost", definition: "agent", state: "lost" as const },
       ]),
-      "1 working · 1 blocked · 1 settling · 1 starting · 1 unknown · 1 lost",
+      "1 working · 1 blocked · 1 settling · 1 starting · 1 idle · 1 unknown · 1 lost",
     );
     const column = (line: string, token: string) => {
       const index = line.indexOf(token);
@@ -796,6 +798,7 @@ test("status projection renders the complete stable tree with aligned columns", 
       ["blocked", "warning", "◐ blocked"],
       ["settling", "accent", "◌ settling"],
       ["starting", "accent", "◌ starting"],
+      ["idle", "muted", "○ idle"],
       ["unknown", "warning", "? unknown"],
       ["lost", "error", "× lost"],
     ] as const;
@@ -4906,4 +4909,81 @@ test("Manager mixed tree has one final connector and independent Leads share the
       "└─ … 1 more · /manager",
     ],
   );
+});
+
+test("soft-deadline digests render one, many, and annotated advisory entries", () => {
+  const digest = (details: Record<string, unknown>) => ({ details });
+  const single = digest({
+    ownerSessionId: "owner-session",
+    entries: [
+      {
+        agentLabel: "implementer",
+        agentDefinition: "worker",
+        requestId: "request-id",
+        elapsedMs: 400_000,
+        windowMs: 300_000,
+        availableActions: ["inspect", "steer", "interrupt", "extend", "close"],
+      },
+    ],
+    annotations: [],
+  });
+  const collapsed = renderedText(
+    renderAgentSoftDeadlineMessage(single, { expanded: false }, presentationTheme),
+  );
+  assert.match(collapsed, /1 Agent is past its soft deadline/);
+  assert.match(collapsed, /advisory/);
+  assert.match(collapsed, /no Agent was aborted, steered, or closed/);
+  assert.doesNotMatch(collapsed, /request-id/);
+
+  const expanded = renderedText(
+    renderAgentSoftDeadlineMessage(single, { expanded: true }, presentationTheme),
+  );
+  assert.match(expanded, /Advisory checkpoint only/);
+  assert.match(expanded, /implementer \(worker\)/);
+  assert.match(expanded, /working for 6m 40s · window 5m 0s/);
+  assert.match(expanded, /request: request-id/);
+  assert.match(
+    expanded,
+    /controls: agent_inspect · agent_steer · agent_interrupt · agent_extend · agent_close/,
+  );
+  assert.doesNotMatch(expanded, /\bnothing was aborted\b/i);
+
+  // A pending ask lists reply and withholds interrupt for that entry.
+  const withAsk = digest({
+    ownerSessionId: "owner-session",
+    entries: [
+      {
+        agentLabel: "asker",
+        agentDefinition: "worker",
+        requestId: "asker-request",
+        elapsedMs: 300_000,
+        windowMs: 300_000,
+        availableActions: ["inspect", "transcript", "reply", "close"],
+      },
+      {
+        agentLabel: "runner",
+        agentDefinition: "worker",
+        requestId: "runner-request",
+        elapsedMs: 900_000,
+        windowMs: 600_000,
+        availableActions: ["inspect", "steer", "interrupt", "extend", "close"],
+      },
+    ],
+    annotations: ["budget window closes in 10 minutes"],
+  });
+  const many = renderedText(
+    renderAgentSoftDeadlineMessage(withAsk, { expanded: true }, presentationTheme),
+  );
+  assert.match(many, /2 Agents are past their soft deadlines/);
+  assert.match(many, /controls: agent_inspect · agent_transcript · agent_reply · agent_close/);
+  assert.doesNotMatch(many, /agent_interrupt · agent_close/);
+  assert.match(many, /runner \(worker\)/);
+  assert.match(many, /working for 15m 0s · window 10m 0s/);
+  assert.match(many, /Annotations:/);
+  assert.match(many, /budget window closes in 10 minutes/);
+  const collapsedMany = renderedText(
+    renderAgentSoftDeadlineMessage(withAsk, { expanded: false }, presentationTheme),
+  );
+  assert.match(collapsedMany, /2 Agents are past their soft deadlines/);
+  assert.doesNotMatch(collapsedMany, /budget window closes/);
 });

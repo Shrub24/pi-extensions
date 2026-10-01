@@ -4553,6 +4553,223 @@ test("session continuation inherits the saved label without an override", async 
   assert.equal(reused.details.agent, label);
 });
 
+const idleRetainedWorkerFixture = async (
+  definition: string,
+  options: { launchedModel?: string; storedFingerprint?: "missing" } = {},
+) => {
+  const label = `${definition}-agent`;
+  const definitionPath = join(PI_AGENTS_DIR, `${definition}.md`);
+  const sourceId = DEFAULT_PI_SESSION_ID;
+  const sourcePath = join(testTmpRoot, `${definition}-${sourceId}.jsonl`);
+  const writeDefinition = (model: string) =>
+    realFs.writeFileSync(
+      definitionPath,
+      `---\nname: ${definition}\nmodel: ${model}\n---\nretained\n`,
+    );
+  writeDefinition("explicit/new");
+  realFs.writeFileSync(sourcePath, "{}", "utf8");
+  nativeSessions.set(sourceId, {
+    id: sourceId,
+    path: sourcePath,
+    cwd: "/tmp",
+    entries: [
+      {
+        type: "custom",
+        customType: "pi-herdsman-agent-definition",
+        data: { sessionId: sourceId, definition, label },
+      },
+    ],
+  });
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  resetAgentMailbox(mailbox);
+  const state = {
+    ...managedState(label, undefined, {
+      paneId: "startup-pane",
+      tabId: "startup-tab",
+      piSessionId: sourceId,
+      piSessionFile: sourcePath,
+    }),
+    completedRequestId: randomUUID(),
+  };
+  writeAgentState(mailbox, state);
+  const { agentLaunchFingerprint, resolveAgentLaunchInputs } = await import(
+    "./agent-definitions.ts"
+  );
+  const entries: any[] = [
+    ownershipResult(sourceId, LEAD_SESSION_ID, {
+      path: sourcePath,
+      label,
+      definition,
+    }),
+  ];
+  if (options.storedFingerprint !== "missing") {
+    const launched = options.launchedModel ?? "explicit/new";
+    entries.push({
+      type: "custom",
+      customType: "pi-herdsman-worker-launch",
+      data: {
+        runId: state.runId,
+        label,
+        fingerprint: agentLaunchFingerprint(
+          resolveAgentLaunchInputs(
+            {
+              name: definition,
+              path: definitionPath,
+              frontmatter: { name: definition, model: launched },
+              body: "retained",
+            },
+            { cwd: "/tmp" },
+          ),
+        ),
+      },
+    });
+  }
+  const retainedExecutor = startupExecutor(
+    label,
+    () => sourceId,
+    undefined,
+    undefined,
+    false,
+    undefined,
+    "/tmp",
+    AGENT_ID,
+    false,
+    true,
+  );
+  let replacementExecutor: ReturnType<typeof startupExecutor> | undefined;
+  const replacement = () =>
+    (replacementExecutor ??= startupExecutor(
+      label,
+      () => sourceId,
+      undefined,
+      undefined,
+      false,
+      undefined,
+      "/tmp",
+      AGENT_ID,
+      false,
+      true,
+    ));
+  let executor: ReturnType<typeof startupExecutor> = retainedExecutor;
+  let closed = false;
+  const pi = fakePi({
+    exec: (command, args) => {
+      const placing =
+        (args[0] === "tab" && args[1] === "create") ||
+        (args[0] === "pane" && args[1] === "split") ||
+        (args[0] === "agent" && args[1] === "start");
+      // Close first, then launch: placement and startup belong to the
+      // replacement process, while the close proof belongs to the old one.
+      if (closed && placing) executor = replacement();
+      const result = executor.exec(command, args);
+      if (args[0] === "pane" && args[1] === "close") closed = true;
+      return result;
+    },
+  });
+  registerExtension!(pi.pi as never);
+  const context = fakeContext(entries) as any;
+  context.model = { provider: "controller-provider", id: "controller-model" };
+  context.thinkingLevel = "high";
+  return {
+    label,
+    definition,
+    definitionPath,
+    sourceId,
+    sourcePath,
+    mailbox,
+    state,
+    pi,
+    context,
+  };
+};
+
+test("definition drift relaunches a retained worker on the same session", async () => {
+  setLeadEnvironment();
+  nativeSessions.clear();
+  const name = `drift-${randomUUID().slice(0, 8)}`;
+  const fixture = await idleRetainedWorkerFixture(name, {
+    launchedModel: "explicit/old",
+  });
+  try {
+    const result = await agentTool(fixture.pi, "continue").execute(
+      "id",
+      { session: fixture.sourcePath, task: "continue after drift" },
+      undefined,
+      undefined,
+      fixture.context,
+    );
+    assert.equal(result.details.ok, true, JSON.stringify(result.details));
+    assert.equal(result.details.relaunched, "definition_changed");
+    assert.equal(result.details.reused, undefined);
+    assert.equal(result.details.agent, fixture.label);
+    const closed = fixture.pi.calls.find(
+      (args) => args[0] === "pane" && args[1] === "close",
+    );
+    assert.ok(closed, "the stale process must be closed");
+    const start = fixture.pi.calls.find(
+      (args) => args[0] === "agent" && args[1] === "start",
+    )!;
+    assert.ok(start, "a new process must start");
+    assert.equal(
+      start[start.indexOf("--session") + 1],
+      fixture.sourcePath,
+      "the new process continues the same session",
+    );
+    assert.equal(start[start.indexOf("--model") + 1], "explicit/new");
+    const restarted = readAgentState(fixture.mailbox)!;
+    assert.notEqual(restarted.runId, fixture.state.runId);
+    assert.equal(restarted.agentLabel, fixture.label);
+    assert.equal(restarted.piSessionId, fixture.sourceId);
+  } finally {
+    fixture.pi.events.get("session_shutdown")?.[0]();
+    nativeSessions.clear();
+    resetAgentMailbox(fixture.mailbox);
+    realFs.rmSync(fixture.definitionPath, { force: true });
+    realFs.rmSync(fixture.sourcePath, { force: true });
+  }
+});
+
+test("a missing launch entry relaunches a retained worker instead of reusing it", async () => {
+  setLeadEnvironment();
+  nativeSessions.clear();
+  const name = `missing-launch-${randomUUID().slice(0, 8)}`;
+  const fixture = await idleRetainedWorkerFixture(name, {
+    storedFingerprint: "missing",
+  });
+  try {
+    const result = await agentTool(fixture.pi, "continue").execute(
+      "id",
+      { session: fixture.sourcePath, task: "continue without launch evidence" },
+      undefined,
+      undefined,
+      fixture.context,
+    );
+    assert.equal(result.details.ok, true, JSON.stringify(result.details));
+    assert.equal(result.details.relaunched, "definition_changed");
+    assert.equal(result.details.agent, fixture.label);
+    assert.ok(
+      fixture.pi.calls.some(
+        (args) => args[0] === "pane" && args[1] === "close",
+      ),
+      "the unproven process must be closed",
+    );
+    const start = fixture.pi.calls.find(
+      (args) => args[0] === "agent" && args[1] === "start",
+    )!;
+    assert.ok(start, "a new process must start");
+    assert.equal(start[start.indexOf("--session") + 1], fixture.sourcePath);
+    const restarted = readAgentState(fixture.mailbox)!;
+    assert.notEqual(restarted.runId, fixture.state.runId);
+    assert.equal(restarted.agentLabel, fixture.label);
+  } finally {
+    fixture.pi.events.get("session_shutdown")?.[0]();
+    nativeSessions.clear();
+    resetAgentMailbox(fixture.mailbox);
+    realFs.rmSync(fixture.definitionPath, { force: true });
+    realFs.rmSync(fixture.sourcePath, { force: true });
+  }
+});
+
 test("session continuation keeps explicit definition execution overrides", async () => {
   setLeadEnvironment();
   nativeSessions.clear();
@@ -5663,6 +5880,7 @@ test("registered lead exposes only explicit live controls", async () => {
     "agent_close",
     "agent_inspect",
     "agent_transcript",
+    "agent_extend",
     "supervisor_message",
     "peer_list",
     "peer_message",
@@ -6653,7 +6871,7 @@ test("assignment status normalization fails closed safely", async () => {
         undefined,
         context,
       );
-      assert.equal(settledList.details.agents[0].state, "settling");
+      assert.equal(settledList.details.agents[0].state, "idle");
       assert.deepEqual(settledList.details.agents[0].available_tools, [
         "agent_inspect",
         "agent_close",
@@ -7026,5 +7244,288 @@ test("transcript projects persisted agent evidence without Herdr terminal reads"
     nativeSessions.delete(identity.piSessionId);
     realFs.rmSync(identity.piSessionFile, { force: true });
     resetAgentMailbox(mailbox);
+  }
+});
+
+test("accepted assignments arm exactly one durable soft window", async () => {
+  setLeadEnvironment();
+  const label = "soft-window-agent";
+  const startup = startupExecutor(label, () => DEFAULT_PI_SESSION_ID);
+  const pi = fakePi({ exec: startup.exec });
+  registerExtension!(pi.pi as never);
+  try {
+    const result = await agentTool(pi, "delegate").execute(
+      "id",
+      { definition: "agent", label, task: "long assignment" },
+      undefined,
+      undefined,
+      fakeContext(),
+    );
+    assert.equal(result.details.ok, true, JSON.stringify(result.details));
+    const windows = pi.entries.filter(
+      (entry: any) => entry.customType === "pi-herdsman-soft-window",
+    );
+    assert.equal(windows.length, 1, "one window entry per accepted assignment");
+    const window = windows[0] as any;
+    assert.equal(window.type, "custom");
+    assert.equal(window.data.requestId, result.details.request_id);
+    assert.equal(window.data.label, label);
+    assert.equal(window.data.windowMs, 300_000);
+    const ack = readAgentState(startup.mailbox)!.lastAck!;
+    assert.equal(ack.requestId, result.details.request_id);
+    assert.equal(typeof window.data.armedAt, "number");
+    assert.ok(
+      window.data.armedAt >= ack.acknowledgedAt &&
+        window.data.armedAt - ack.acknowledgedAt < 1_000,
+      "the window is armed at observed acceptance",
+    );
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    startup.stopMailboxConsumer();
+    resetAgentMailbox(startup.mailbox);
+  }
+});
+
+test("agent_extend defers one worker's next digest and later windows revert", async (t) => {
+  setLeadEnvironment();
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const label = "soft-extend-agent";
+  const startup = startupExecutor(label, () => DEFAULT_PI_SESSION_ID);
+  const pi = fakePi({ exec: startup.exec, persistMessages: true });
+  registerExtension!(pi.pi as never);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const digests = () =>
+    pi.sent.filter(
+      (message: any) => message.customType === "pi-herdsman-agent-soft-deadline",
+    );
+  const windowEntries = () =>
+    pi.entries.filter(
+      (entry: any) => entry.customType === "pi-herdsman-soft-window",
+    );
+  try {
+    const result = await agentTool(pi, "delegate").execute(
+      "id",
+      { definition: "agent", label, task: "long assignment" },
+      undefined,
+      undefined,
+      fakeContext(),
+    );
+    assert.equal(result.details.ok, true, JSON.stringify(result.details));
+    await pi.events.get("session_start")![0](
+      undefined,
+      fakeContext(pi.entries),
+    );
+    for (let index = 0; index < 4; index++)
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(digests().length, 0, "a fresh window is not due");
+
+    const extend = pi.tools.find(
+      (candidate: any) => candidate.name === "agent_extend",
+    )!;
+    const extended = await extend.execute(
+      "id",
+      { agent: label, windowMs: 900_000 },
+      undefined,
+      undefined,
+      fakeContext(),
+    );
+    assert.equal(extended.details.ok, true, JSON.stringify(extended.details));
+    assert.equal(extended.details.window_ms, 900_000);
+    assert.equal(extended.details.request_id, result.details.request_id);
+    assert.equal(extended.details.extended_at, now);
+
+    now += 600_000;
+    t.mock.timers.tick(30_000);
+    for (let index = 0; index < 4; index++)
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(
+      digests().length,
+      0,
+      "the default window elapsed but the extension defers the digest",
+    );
+
+    now += 299_999;
+    t.mock.timers.tick(30_000);
+    for (let index = 0; index < 4; index++)
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(digests().length, 0, "the extended window has not elapsed");
+
+    now += 1;
+    t.mock.timers.tick(30_000);
+    for (let index = 0; index < 4; index++)
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(digests().length, 1, "the extended window delivers one digest");
+    assert.equal(
+      (digests()[0] as any).details.entries[0].windowMs,
+      900_000,
+      "the digest reports the extended window",
+    );
+
+    now += 300_000;
+    t.mock.timers.tick(30_000);
+    for (let index = 0; index < 4; index++)
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(digests().length, 2, "later windows revert to softTimeoutMs");
+    assert.equal(
+      (digests()[1] as any).details.entries[0].windowMs,
+      300_000,
+      "the automatic re-arm uses the configured length again",
+    );
+    assert.deepEqual(
+      windowEntries()
+        .filter((entry: any) => entry.data.extended === true)
+        .map((entry: any) => entry.data.windowMs),
+      [900_000],
+      "the extension is recorded exactly once with its length",
+    );
+    assert.deepEqual(
+      windowEntries().map((entry: any) => [
+        entry.data.windowMs,
+        entry.data.armedAt ?? entry.data.nextArmedAt,
+      ]),
+      [
+        [300_000, now - 1_200_000],
+        [900_000, now - 1_200_000],
+        [300_000, now - 300_000],
+        [300_000, now],
+      ],
+      "arming, extension, and both re-arms are recorded in order",
+    );
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    startup.stopMailboxConsumer();
+    resetAgentMailbox(startup.mailbox);
+  }
+});
+
+test("agent_extend rejects extra fields and every windowless worker", async () => {
+  setLeadEnvironment();
+  const cases: Array<{
+    label: string;
+    state: (label: string, identity: ReturnType<typeof recoveryIdentity>) => ManagedAgentState;
+    category: string;
+  }> = [
+    {
+      label: "extend-other-owner",
+      state: (label, identity) => ({
+        ...managedState(label, REQUEST_ID, identity),
+        ownerSessionId: PARENT_SESSION_ID,
+        lastAck: { requestId: REQUEST_ID, accepted: true, acknowledgedAt: Date.now() },
+      }),
+      category: "target_not_found",
+    },
+    {
+      label: "extend-idle",
+      state: (label, identity) =>
+        managedState(label, undefined, identity),
+      category: "agent_busy",
+    },
+    {
+      label: "extend-resolved",
+      state: (label, identity) => ({
+        ...managedState(label, undefined, identity),
+        completedRequestId: REQUEST_ID,
+      }),
+      category: "agent_busy",
+    },
+  ];
+  for (const value of cases) {
+    const identity = recoveryIdentity(value.label);
+    const mailbox = agentMailboxPath(WORKSPACE, value.label);
+    resetAgentMailbox(mailbox);
+    writeAgentState(mailbox, value.state(value.label, identity));
+    const pi = fakePi({
+      exec: leadExec(
+        value.label,
+        value.state(value.label, identity).activeRequestId
+          ? "working"
+          : "idle",
+        identity.piSessionId,
+        undefined,
+        identity.piSessionId,
+        identity,
+      ),
+    });
+    registerExtension!(pi.pi as never);
+    try {
+      const tool = pi.tools.find(
+        (candidate: any) => candidate.name === "agent_extend",
+      )!;
+      assert.equal(
+        Value.Check(tool.parameters, {
+          agent: value.label,
+          windowMs: 900_000,
+        }),
+        true,
+        `${value.label} valid input`,
+      );
+      assert.equal(
+        Value.Check(tool.parameters, {
+          agent: value.label,
+          windowMs: 900_000,
+          task: "extra",
+        }),
+        false,
+        `${value.label} rejects an extra field`,
+      );
+      const windowsBefore = pi.entries.filter(
+        (entry: any) => entry.customType === "pi-herdsman-soft-window",
+      ).length;
+      const attempted = await tool.execute(
+        "id",
+        { agent: value.label, windowMs: 900_000 },
+        undefined,
+        undefined,
+        fakeContext(),
+      );
+      assert.equal(attempted.details.ok, false, value.label);
+      assert.equal(
+        attempted.details.error.category,
+        value.category,
+        `${value.label}: ${JSON.stringify(attempted.details.error)}`,
+      );
+      assert.equal(
+        pi.entries.filter(
+          (entry: any) => entry.customType === "pi-herdsman-soft-window",
+        ).length,
+        windowsBefore,
+        `${value.label} changed no window`,
+      );
+    } finally {
+      pi.events.get("session_shutdown")?.[0]();
+      resetAgentMailbox(mailbox);
+    }
+  }
+});
+
+test("softTimeoutMs of zero arms no window for an accepted assignment", async () => {
+  setLeadEnvironment();
+  updateConfig("softTimeoutMs", 0);
+  const label = "soft-window-disabled";
+  const startup = startupExecutor(label, () => DEFAULT_PI_SESSION_ID);
+  const pi = fakePi({ exec: startup.exec });
+  registerExtension!(pi.pi as never);
+  try {
+    const result = await agentTool(pi, "delegate").execute(
+      "id",
+      { definition: "agent", label, task: "long assignment" },
+      undefined,
+      undefined,
+      fakeContext(),
+    );
+    assert.equal(result.details.ok, true, JSON.stringify(result.details));
+    assert.ok(readAgentState(startup.mailbox)?.activeRequestId);
+    assert.deepEqual(
+      pi.entries.filter(
+        (entry: any) => entry.customType === "pi-herdsman-soft-window",
+      ),
+      [],
+    );
+  } finally {
+    updateConfig("softTimeoutMs", undefined);
+    pi.events.get("session_shutdown")?.[0]();
+    startup.stopMailboxConsumer();
+    resetAgentMailbox(startup.mailbox);
   }
 });

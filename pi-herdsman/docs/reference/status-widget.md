@@ -101,10 +101,12 @@ Example:
 ```
 
 The header reports exact non-zero lifecycle states in the order `working`,
-`blocked`, `settling`, `starting`, `unknown`, and `lost`. `starting` is a
+`blocked`, `settling`, `starting`, `idle`, `unknown`, and `lost`. `starting` is a
 presentation-only count for controller-local assignments that have begun
-startup but have not yet become active or terminal. It is not mailbox state,
-control authority, or Running inventory.
+startup but have not yet become active or terminal. `idle` counts retained
+workers whose terminal result was delivered and whose verified live process is
+available for one new assignment. Neither is mailbox state, control authority,
+or Running inventory.
 
 Before the first successful refresh, the header says `unavailable`.
 
@@ -130,9 +132,10 @@ every row. The task is the rightmost elastic field and is kept only when it has
 useful room before it is truncated.
 
 Working rows use `● working`, blocked rows use `◐ blocked`, settling rows use
-`◌ settling`, starting rows use `◌ starting`, unknown rows use `? unknown`, and
+`◌ settling`, starting rows use `◌ starting`, idle rows use `○ idle`, unknown
+rows use `? unknown`, and
 lost rows use `× lost` with the theme's attention/error styling. Working,
-settling, and starting animate; blocked, unknown, and lost rows are static.
+settling, and starting animate; idle, blocked, unknown, and lost rows are static.
 While a controller-local start remains pending, an authoritative `settling`
 row is presented as `starting` so launch and request handoff remain visually
 continuous. `working`, `blocked`, and `unknown` authoritative states are never

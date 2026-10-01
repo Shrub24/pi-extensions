@@ -296,6 +296,10 @@ const registeredAgentTool = (
   pi: ReturnType<typeof fakePi>,
   operation: string,
 ) => pi.tools.find((tool) => tool.name === `agent_${operation}`)!;
+const { updateConfig } = await import("./config.ts");
+const { agentLaunchFingerprint, resolveAgentLaunchInputs } = await import(
+  "./agent-definitions.ts"
+);
 
 test("lead direct placement modes use real controller delegation", async () => {
   for (const placement of ["tab", "subtree", "split"] as const) {
@@ -1816,6 +1820,436 @@ test("recovery cleanup finishes an idle restored herd without settlement", async
       0,
     );
   } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(startup.mailbox);
+    delete process.env.HERDR_SOCKET_PATH;
+  }
+});
+
+test("worker launches store one launch fingerprint of the resolved definition", async (t) => {
+  setLeadEnvironment();
+  const definition = "fingerprinted";
+  const referenced = join(testTmpRoot, "fingerprint-body.txt");
+  const writeDefinition = (model: string) =>
+    realFs.writeFileSync(
+      join(PI_AGENTS_DIR, `${definition}.md`),
+      `---\nname: ${definition}\nmodel: ${model}\n---\nFollow the notes.\n@${referenced}\n`,
+      "utf8",
+    );
+  const launches: {
+    label: string;
+    runId: string;
+    entries: any[];
+  }[] = [];
+  const launchOnce = async (model: string, body: string) => {
+    realFs.writeFileSync(referenced, body, "utf8");
+    writeDefinition(model);
+    const label = `fingerprinted-${randomUUID().slice(0, 8)}`;
+    const startup = startupExecutor(
+      label,
+      () => DEFAULT_PI_SESSION_ID,
+      undefined,
+      undefined,
+      false,
+      undefined,
+      "/tmp",
+      AGENT_ID,
+      false,
+      true,
+    );
+    const pi = fakePi({ exec: startup.exec });
+    const context = fakeContext(pi.entries);
+    registerExtension!(pi.pi as never);
+    try {
+      await pi.events.get("session_start")![0](undefined, context);
+      const delegated = await registeredAgentTool(pi, "delegate").execute(
+        "delegate",
+        { definition, label, task: `task for ${label}` },
+        undefined,
+        undefined,
+        context,
+      );
+      assert.equal(delegated.details.ok, true, JSON.stringify(delegated.details));
+      const entries = pi.entries.filter(
+        (entry: any) => entry.customType === "pi-herdsman-worker-launch",
+      );
+      launches.push({
+        label,
+        runId: readAgentState(startup.mailbox)!.runId,
+        entries,
+      });
+    } finally {
+      pi.events.get("session_shutdown")?.[0](undefined, context);
+      resetAgentMailbox(startup.mailbox);
+    }
+  };
+  try {
+    await launchOnce("probe-model-a", "first body");
+    await launchOnce("probe-model-b", "first body");
+    await launchOnce("probe-model-b", "second body");
+    await launchOnce("probe-model-b", "second body");
+
+    const fingerprints = launches.map((launch) => {
+      assert.equal(
+        launch.entries.length,
+        1,
+        `one launch entry per launch: ${JSON.stringify(launch.entries)}`,
+      );
+      const data = launch.entries[0].data;
+      assert.equal(data.label, launch.label);
+      assert.equal(data.runId, launch.runId);
+      assert.match(data.fingerprint, /^[0-9a-f]{64}$/);
+      return data.fingerprint as string;
+    });
+    assert.notEqual(
+      fingerprints[0],
+      fingerprints[1],
+      "a definition model change must change the fingerprint",
+    );
+    assert.notEqual(
+      fingerprints[1],
+      fingerprints[2],
+      "a referenced body file change must change the fingerprint",
+    );
+    assert.equal(
+      fingerprints[2],
+      fingerprints[3],
+      "an unchanged definition must keep the fingerprint",
+    );
+  } finally {
+    realFs.rmSync(referenced, { force: true });
+    realFs.rmSync(join(PI_AGENTS_DIR, `${definition}.md`), { force: true });
+  }
+});
+
+test("continuation reuses an idle retained worker in its existing process", async () => {
+  setLeadEnvironment();
+  updateConfig("retainWorkers", true);
+  const name = `warm-${randomUUID().slice(0, 8)}`;
+  const label = `${name}-agent`;
+  const definitionPath = join(PI_AGENTS_DIR, `${name}.md`);
+  const sessionPath = join(PI_AGENT_ROOT, `${name}-session.jsonl`);
+  realFs.writeFileSync(definitionPath, `---\nname: ${name}\n---\nwarm body\n`);
+  realFs.writeFileSync(sessionPath, "{}", "utf8");
+  const session = {
+    id: DEFAULT_PI_SESSION_ID,
+    path: sessionPath,
+    cwd: "/tmp",
+    entries: [
+      {
+        type: "custom",
+        customType: "pi-herdsman-agent-definition",
+        data: { sessionId: DEFAULT_PI_SESSION_ID, definition: name, label },
+      },
+    ],
+  };
+  nativeSessions.set(session.id, session);
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  const delivered: string[] = [];
+  const startup = startupExecutor(label, () => session.id, undefined, (text) => {
+    delivered.push(text);
+  });
+  const pi = fakePi({ exec: startup.exec });
+  const entries: unknown[] = [];
+  registerExtension!(pi.pi as never);
+  const context = fakeContext(entries);
+  const state = {
+    ...managedState(label, undefined, {
+      paneId: "startup-pane",
+      tabId: "startup-tab",
+      piSessionId: session.id,
+      piSessionFile: sessionPath,
+    }),
+    completedRequestId: randomUUID(),
+  };
+  const listedLabel = async () => {
+    const listed = await registeredAgentTool(pi, "list").execute(
+      "list",
+      {},
+      undefined,
+      undefined,
+      context,
+    );
+    return listed.details.agents.find((agent: any) => agent.agent === label);
+  };
+  const starts = () =>
+    pi.calls.filter((args) => args[0] === "agent" && args[1] === "start")
+      .length;
+  try {
+    for (const handler of pi.events.get("session_start") ?? [])
+      await handler(undefined, context);
+    // The worker delivered its result and was retained: its mailbox keeps the
+    // resolved request id and no result file remains.
+    resetAgentMailbox(mailbox);
+    writeAgentState(mailbox, state);
+    entries.push(
+      {
+        type: "custom_message",
+        message: {
+          customType: "pi-herdsman-agent-result",
+          details: {
+            piSessionId: session.id,
+            piSessionFile: sessionPath,
+            ownerSessionId: LEAD_SESSION_ID,
+            runId: state.runId,
+            requestId: state.completedRequestId,
+            agentLabel: label,
+            agentDefinition: name,
+            status: "completed",
+          },
+        },
+      },
+      {
+        type: "custom",
+        customType: "pi-herdsman-worker-launch",
+        data: {
+          runId: state.runId,
+          label,
+          fingerprint: agentLaunchFingerprint(
+            resolveAgentLaunchInputs(
+              {
+                name,
+                path: definitionPath,
+                frontmatter: { name },
+                body: "warm body",
+              },
+              { cwd: "/tmp" },
+            ),
+          ),
+        },
+      },
+    );
+    assert.equal((await listedLabel())?.state, "idle");
+    const startsBefore = starts();
+
+    const continued = await registeredAgentTool(pi, "continue").execute(
+      "id",
+      { session: sessionPath, task: "second assignment" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(continued.details.ok, true, JSON.stringify(continued.details));
+    assert.equal(continued.details.reused, true);
+    assert.equal(continued.details.agent, label);
+    assert.equal(continued.details.pane_id, "startup-pane");
+    assert.equal(continued.details.session_id, session.id);
+    assert.equal(continued.details.session_path, sessionPath);
+    assert.equal(
+      starts(),
+      startsBefore,
+      "reuse must not start another process",
+    );
+    assert.equal(delivered.length, 1);
+    assert.match(delivered[0]!, /second assignment/);
+    const after = readAgentState(mailbox);
+    assert.equal(after?.activeRequestId, continued.details.request_id);
+    assert.equal(after?.completedRequestId, undefined);
+    assert.equal(after?.runId, state.runId);
+    assert.equal(after?.lastAck?.accepted, true);
+    assert.equal((await listedLabel())?.state, "working");
+  } finally {
+    updateConfig("retainWorkers", undefined);
+    pi.events.get("session_shutdown")?.[0](undefined, context);
+    nativeSessions.delete(session.id);
+    resetAgentMailbox(mailbox);
+    realFs.rmSync(definitionPath, { force: true });
+    realFs.rmSync(sessionPath, { force: true });
+  }
+});
+
+test("continuation rejects a retained worker whose result was not delivered", async () => {
+  setLeadEnvironment();
+  const name = `undelivered-${randomUUID().slice(0, 8)}`;
+  const label = `${name}-agent`;
+  const definitionPath = join(PI_AGENTS_DIR, `${name}.md`);
+  const sessionPath = join(PI_AGENT_ROOT, `${name}-session.jsonl`);
+  realFs.writeFileSync(
+    definitionPath,
+    `---\nname: ${name}\n---\nundelivered body\n`,
+  );
+  realFs.writeFileSync(sessionPath, "{}", "utf8");
+  const session = {
+    id: DEFAULT_PI_SESSION_ID,
+    path: sessionPath,
+    cwd: "/tmp",
+    entries: [
+      {
+        type: "custom",
+        customType: "pi-herdsman-agent-definition",
+        data: { sessionId: DEFAULT_PI_SESSION_ID, definition: name, label },
+      },
+    ],
+  };
+  nativeSessions.set(session.id, session);
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  const startup = startupExecutor(label, () => session.id);
+  const pi = fakePi({ exec: startup.exec });
+  const entries: unknown[] = [];
+  registerExtension!(pi.pi as never);
+  const context = fakeContext(entries);
+  const state = {
+    ...managedState(label, undefined, {
+      paneId: "startup-pane",
+      tabId: "startup-tab",
+      piSessionId: session.id,
+      piSessionFile: sessionPath,
+    }),
+    completedRequestId: randomUUID(),
+  };
+  try {
+    for (const handler of pi.events.get("session_start") ?? [])
+      await handler(undefined, context);
+    // A result file that is still present is pending delivery, not retention.
+    resetAgentMailbox(mailbox);
+    writeAgentState(mailbox, state);
+    writeResult(mailbox, {
+      version: 4,
+      runId: state.runId,
+      requestId: state.completedRequestId,
+      ownerSessionId: state.ownerSessionId,
+      workspaceId: state.workspaceId,
+      agentLabel: state.agentLabel,
+      paneId: state.paneId,
+      status: "completed",
+      text: "not yet delivered",
+      completedAt: Date.now(),
+    });
+    entries.push({
+      type: "custom_message",
+      message: {
+        customType: "pi-herdsman-agent-result",
+        details: {
+          piSessionId: session.id,
+          piSessionFile: sessionPath,
+          ownerSessionId: LEAD_SESSION_ID,
+          runId: state.runId,
+          requestId: state.completedRequestId,
+          agentLabel: label,
+          agentDefinition: name,
+          status: "completed",
+        },
+      },
+    });
+
+    const result = await registeredAgentTool(pi, "continue").execute(
+      "id",
+      { session: sessionPath, task: "must wait for delivery" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(result.details.error.category, "agent_busy");
+    assert.equal(
+      pi.calls.some(
+        (args) =>
+          args[0] === "agent" && ["start", "prompt"].includes(args[1] ?? ""),
+      ),
+      false,
+    );
+    const after = readAgentState(mailbox);
+    assert.equal(after?.activeRequestId, undefined);
+    assert.equal(after?.completedRequestId, state.completedRequestId);
+    assert.equal(readResult(mailbox, state.completedRequestId)?.text, "not yet delivered");
+  } finally {
+    pi.events.get("session_shutdown")?.[0](undefined, context);
+    nativeSessions.delete(session.id);
+    resetAgentMailbox(mailbox);
+    realFs.rmSync(definitionPath, { force: true });
+    realFs.rmSync(sessionPath, { force: true });
+  }
+});
+
+test("all-idle retained workers let the herd run finish", async (t) => {
+  setLeadEnvironment();
+  updateConfig("retainWorkers", true);
+  process.env.HERDR_SOCKET_PATH = join(
+    tmpdir(),
+    `retained-idle-herd-${randomUUID()}.sock`,
+  );
+  const startedAt = 1_700_000_000_000;
+  const requestId = randomUUID();
+  const label = `retained-idle-herd-${randomUUID().slice(0, 8)}`;
+  const identity = {
+    paneId: "startup-pane",
+    tabId: "startup-tab",
+    piSessionId: DEFAULT_PI_SESSION_ID,
+    piSessionFile: "/tmp/registered-agent.jsonl",
+  };
+  const state = {
+    ...managedState(label, undefined, identity),
+    completedRequestId: requestId,
+  };
+  const startup = startupExecutor(
+    label,
+    () => DEFAULT_PI_SESSION_ID,
+    undefined,
+    undefined,
+    false,
+    undefined,
+    "/tmp",
+    AGENT_ID,
+    false,
+    true,
+  );
+  resetAgentMailbox(startup.mailbox);
+  writeAgentState(startup.mailbox, state);
+  const entries: unknown[] = [
+    {
+      type: "custom",
+      customType: "pi-herdsman-herd-run",
+      data: { phase: "started", sessionId: LEAD_SESSION_ID, startedAt },
+    },
+    {
+      type: "custom",
+      customType: "pi-herdsman-agent-result",
+      details: resultEntryDetails(state, requestId),
+    },
+  ];
+  const pi = fakePi({ entries, exec: startup.exec });
+  const context = fakeContext(entries);
+  const herdEntries = () =>
+    entries.filter(
+      (entry: any) => entry.customType === "pi-herdsman-herd-run",
+    ) as any[];
+  registerExtension!(pi.pi as never);
+  try {
+    for (const handler of pi.events.get("session_start") ?? [])
+      await handler(undefined, context);
+    const listed = await registeredAgentTool(pi, "list").execute(
+      "list",
+      {},
+      undefined,
+      undefined,
+      context,
+    );
+    const record = listed.details.agents.find(
+      (agent: any) => agent.agent === label,
+    );
+    assert.equal(record?.state, "idle");
+    assert.equal(readAgentState(startup.mailbox)?.completedRequestId, requestId);
+
+    for (const handler of pi.events.get("agent_settled") ?? [])
+      await handler(undefined, context);
+    await t.waitFor(() =>
+      assert.equal(
+        herdEntries().filter((entry) => entry.data?.phase === "finished")
+          .length,
+        1,
+        "an all-idle herd must not keep its run open",
+      ),
+    );
+    const finished = herdEntries().find(
+      (entry) => entry.data?.phase === "finished",
+    );
+    assert.equal(finished.data.startedAt, startedAt);
+    assert.equal(
+      pi.calls.some((args) => isPaneClose(args)),
+      false,
+      "the idle worker keeps its pane",
+    );
+  } finally {
+    updateConfig("retainWorkers", undefined);
     pi.events.get("session_shutdown")?.[0]();
     resetAgentMailbox(startup.mailbox);
     delete process.env.HERDR_SOCKET_PATH;

@@ -294,6 +294,36 @@ Oversized non-completion registered-tool output may additionally expose
 `full_output_path` when overflow persistence succeeds. Model-visible content
 remains bounded in both cases.
 
+## Retained workers and continuation
+
+With `retainWorkers` enabled, delivering a terminal result keeps the worker's
+verified live process, pane, label, and mailbox instead of cleaning them up. The
+worker projects as `idle`, so its pane stays available for the next assignment
+and the logical label is not released.
+
+Continue such a worker with `agent_continue` and the exact session ID or session
+path from the result. The outcome depends on the retained process's launch
+configuration:
+
+- **reused** (`reused: true`): the launch configuration still matches the current
+definition, so the task is submitted into the existing process. No new process or
+pane starts, and the worker's Pi session keeps its in-memory context.
+- **relaunched** (`relaunched: "definition_changed"`): the definition changed since
+that process started (prompt body including `@file` contents, model, thinking, or
+the effective tools, skills, extensions, and context inheritance), or the launch
+record is gone. The idle worker is closed and the same session continues in a
+fresh process, which restores the saved session's model and thinking unless the
+current definition overrides either field.
+- **fresh** (neither field): no retained process represents the session, so a new
+agent generation starts as usual.
+
+A reused process keeps its launch-time system prompt and in-memory extension
+state, which is why drift forces the relaunch. Hand the next assignment an
+explicit checkpoint in the task text rather than assuming a reused worker still
+holds details from the previous one. Working, settling, or ambiguously
+represented sessions still fail closed, and an occupied logical label still
+fails with `agent_label_exists`.
+
 ## Project-local coordination workspace
 
 Use the project-local `.pi-herdsman/` directory for temporary coordination artifacts

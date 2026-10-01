@@ -45,6 +45,28 @@ unacknowledged request must not be duplicated or resubmitted: timeout or lack
 of acknowledgement does not prove non-delivery. `settling` alone does not
 generate generic attention.
 
+## Soft-deadline advisory
+
+A soft deadline is an advisory checkpoint, not a health condition and not
+evidence that anything is wrong. With `softTimeoutMs` set (default `300000`
+milliseconds; `0` disables the feature), the owning controller receives one
+`pi-herdsman-agent-soft-deadline` digest for every directly owned working
+assignment that has passed its window. The digest rides the same health
+cadence, so it can arrive up to one 30-second scan after the window expires, and
+it is delivered only while the owner is idle. After each delivered digest the
+window re-arms for another `softTimeoutMs`, so a long assignment is
+checkpointed periodically until it resolves, is closed, or is proven lost; a
+resolved assignment never appears again.
+
+For each entry, choose only the controls that entry lists: keep waiting,
+`agent_steer`, `agent_interrupt`, `agent_extend`, or `agent_close`. Waiting is a
+valid response, and nothing was aborted, steered, or closed by the digest
+itself. Use `agent_extend` with a window length when the current evidence still
+justifies more time; it replaces that worker's next window only and changes no
+assignment. Do not treat a checkpoint as a hang, and do not close or interrupt
+a worker solely because its soft window elapsed. A due digest and health
+attention can arrive in the same scan; each is handled on its own evidence.
+
 ## Agent is `blocked`
 
 A blocked agent still has an active assignment.

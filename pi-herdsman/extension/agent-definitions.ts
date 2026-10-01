@@ -8,7 +8,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -116,6 +116,7 @@ export const AGENT_COORDINATION_TOOLS = [
   "agent_close",
   "agent_inspect",
   "agent_transcript",
+  "agent_extend",
 ] as const;
 
 function markdownFiles(root: string): string[] {
@@ -714,6 +715,149 @@ export type AgentLaunchOptions = {
   modelDecision?: ChildModelDecision;
 };
 
+/**
+ * The launch configuration a managed worker process keeps for its whole life.
+ * A reused process still runs the system prompt, model, and extension state it
+ * started with, so reuse compares these inputs instead of re-reading the live
+ * process.
+ */
+export type AgentLaunchInputs = {
+  /** Expanded prompt body, including the contents of files it references. */
+  body: string;
+  /** One `<reference>:<digest>` entry per body file reference, in body order. */
+  bodyFiles: string[];
+  systemPromptMode: string;
+  model?: string;
+  thinking?: string;
+  noTools: boolean;
+  tools: string[];
+  noBuiltinTools: boolean;
+  excludeTools: string[];
+  noSkills: boolean;
+  skills: string[];
+  noExtensions: boolean;
+  extensions: string[];
+  inheritProjectContext: boolean;
+  inheritGlobalContext: boolean;
+};
+
+type ManagedToolSelection = Pick<
+  AgentLaunchInputs,
+  "noTools" | "tools" | "noBuiltinTools" | "excludeTools"
+>;
+
+/** The tool selection `agentLaunchArgs` applies to a managed agent. */
+function managedToolSelection(agent: AgentDefinition): ManagedToolSelection {
+  const { frontmatter } = agent;
+  const explicitTools = frontmatter.tools !== undefined;
+  const noTools =
+    frontmatter.noTools || (explicitTools && frontmatter.tools.length === 0);
+  const requiredTools = agentDefinitionDelegationEnabled(agent)
+    ? [...AGENT_COORDINATION_TOOLS, "ask_owner"]
+    : ["ask_owner"];
+  const configuredTools = normalizedToolNames(frontmatter.tools).filter(
+    (tool) => tool !== "agent" && !requiredTools.includes(tool),
+  );
+  const tools =
+    noTools || explicitTools
+      ? [...new Set([...configuredTools, ...requiredTools])]
+      : [];
+  const required = new Set(requiredTools);
+  const excludeTools = normalizedToolNames(frontmatter.excludeTools)
+    .filter((tool) => !required.has(tool))
+    .filter((tool, index, all) => all.indexOf(tool) === index);
+  return {
+    noTools,
+    tools,
+    noBuiltinTools: frontmatter.noBuiltinTools === true,
+    excludeTools,
+  };
+}
+
+/**
+ * A referenced body file is part of the launch configuration: editing it
+ * changes what the worker was launched with. Missing or unreadable references
+ * digest to a stable marker rather than failing, because the fingerprint is
+ * evidence about a past launch, not a validation gate.
+ */
+function bodyFileDigests(body: string, cwd: string): string[] {
+  return [...body.matchAll(BODY_FILE_REFERENCE)].map((match) => {
+    const reference = match[1]!;
+    const homeRelative =
+      reference.startsWith("~/") || reference.startsWith(`~${sep}`);
+    const expanded = homeRelative
+      ? resolve(homedir(), reference.slice(2))
+      : reference;
+    const path = isAbsolute(expanded) ? expanded : resolve(cwd, expanded);
+    let digest = "unreadable";
+    try {
+      const stats = statSync(path);
+      digest = stats.isFile()
+        ? createHash("sha256").update(readFileSync(path)).digest("hex")
+        : "not-a-file";
+    } catch {
+      digest = "unreadable";
+    }
+    return `${reference}:${digest}`;
+  });
+}
+
+/**
+ * The definition's launch configuration for a managed worker. Resolution mirrors
+ * `agentLaunchArgs`, so a fingerprint change means the next process would start
+ * with different definition-driven launch inputs.
+ *
+ * Values the caller contributes instead of the definition — an inherited model
+ * or thinking level — are deliberately absent: they are not part of the
+ * definition's configuration, and folding them in would make the same worker
+ * fingerprint differently depending on how its process was started.
+ */
+export function resolveAgentLaunchInputs(
+  agent: AgentDefinition,
+  options: { cwd?: string } = {},
+): AgentLaunchInputs {
+  const { frontmatter } = agent;
+  const cwd = options.cwd ?? process.cwd();
+  const model = configuredModel(frontmatter);
+  const inheritProjectContext =
+    frontmatter.inheritProjectContext ?? agent.name === "delegate";
+  const inheritGlobalContext =
+    frontmatter.inheritGlobalContext ?? inheritProjectContext;
+  const thinking = configuredThinking(agent);
+  return {
+    body: agent.body,
+    bodyFiles: bodyFileDigests(agent.body, cwd),
+    systemPromptMode:
+      frontmatter.systemPromptMode ??
+      (agent.name === "delegate" ? "append" : "replace"),
+    ...(model === undefined ? {} : { model }),
+    ...(thinking === undefined ? {} : { thinking }),
+    ...managedToolSelection(agent),
+    noSkills: frontmatter.noSkills ?? frontmatter.inheritSkills !== true,
+    skills: [...(frontmatter.skills ?? [])],
+    noExtensions: frontmatter.noExtensions === true,
+    extensions: [...(frontmatter.extensions ?? [])],
+    inheritProjectContext,
+    inheritGlobalContext,
+  };
+}
+
+/**
+ * Stable identity of a worker's launch configuration. Herdsman stores it with
+ * the launch and recomputes it before reusing a retained worker, because a
+ * reused process keeps its launch-time system prompt and extension state.
+ */
+export function agentLaunchFingerprint(inputs: AgentLaunchInputs): string {
+  const canonical = JSON.stringify({
+    ...inputs,
+    tools: [...inputs.tools].sort(),
+    excludeTools: [...inputs.excludeTools].sort(),
+    skills: [...inputs.skills].sort(),
+    extensions: [...inputs.extensions].sort(),
+  });
+  return createHash("sha256").update(canonical).digest("hex");
+}
+
 export function agentLaunchArgs(
   agent: AgentDefinition,
   options: AgentLaunchOptions,
@@ -795,31 +939,14 @@ export function agentLaunchArgs(
     args.push("--append-system-prompt", `<active_agent name="${agent.name}"/>`);
 
   const explicitTools = frontmatter.tools !== undefined;
-  const noTools =
-    frontmatter.noTools || (explicitTools && frontmatter.tools.length === 0);
-  if (noTools) args.push("--no-tools");
-  if (frontmatter.noBuiltinTools) args.push("--no-builtin-tools");
+  const managedSelection = managedToolSelection(agent);
+  if (managedSelection.noTools) args.push("--no-tools");
+  if (managedSelection.noBuiltinTools) args.push("--no-builtin-tools");
   if (managedAgent) {
-    if (noTools || explicitTools) {
-      const requiredTools = agentDefinitionDelegationEnabled(agent)
-        ? [...AGENT_COORDINATION_TOOLS, "ask_owner"]
-        : ["ask_owner"];
-      const configuredTools = normalizedToolNames(frontmatter.tools).filter(
-        (tool) => tool !== "agent" && !requiredTools.includes(tool),
-      );
-      const tools = [...new Set([...configuredTools, ...requiredTools])];
-      args.push("--tools", tools.join(","));
-    }
-    const requiredTools = new Set([
-      "ask_owner",
-      ...(agentDefinitionDelegationEnabled(agent)
-        ? AGENT_COORDINATION_TOOLS
-        : []),
-    ]);
-    const excluded = normalizedToolNames(frontmatter.excludeTools)
-      .filter((tool) => !requiredTools.has(tool))
-      .filter((tool, index, all) => all.indexOf(tool) === index);
-    if (excluded.length) args.push("--exclude-tools", excluded.join(","));
+    if (managedSelection.noTools || explicitTools)
+      args.push("--tools", managedSelection.tools.join(","));
+    if (managedSelection.excludeTools.length)
+      args.push("--exclude-tools", managedSelection.excludeTools.join(","));
   } else {
     if (frontmatter.tools?.length)
       args.push("--tools", frontmatter.tools.join(","));

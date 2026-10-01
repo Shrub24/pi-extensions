@@ -27,6 +27,8 @@ schema is:
 {
   "spawnPlacement": "subtree",
   "contextRetirement": false,
+  "retainWorkers": false,
+  "softTimeoutMs": 300000,
   "inlineAttachmentLimitBytes": 131072,
   "mailboxPayloadLimitBytes": 131072
 }
@@ -38,6 +40,8 @@ An absent file means these defaults:
 | ---------------------------- | -----------------: | ------------------------------------------------- |
 | `spawnPlacement`             |          `subtree` | `tab`, `subtree`, `split`                         |
 | `contextRetirement`          |              false | boolean                                           |
+| `retainWorkers`              |              false | boolean                                           |
+| `softTimeoutMs`              |          `300000`  | integer from 0 (disabled) through 2147483647      |
 | `inlineAttachmentLimitBytes` | `131072` (128 KiB) | integer from 1024 (1 KiB) through 1048576 (1 MiB) |
 | `mailboxPayloadLimitBytes`   | `131072` (128 KiB) | integer from 1024 (1 KiB) through 1048576 (1 MiB) |
 
@@ -60,6 +64,25 @@ including existing retirement markers, and leaves Pi's native compaction and
 session reuse behavior untouched. This fork ships it disabled: managed agents
 are persistent sessions that compact through the context stack their Pi
 configuration loads, and `agent_continue` stays available after compaction.
+
+`softTimeoutMs` is the length of the advisory soft-deadline window armed for
+each accepted `agent_delegate` or `agent_continue` assignment, measured from the
+worker's acknowledgement. When a window expires while the assignment is still
+unresolved, the idle controller receives one advisory digest listing every due
+worker with the controls it currently allows; the windows then re-arm. The
+window is checked on the health-reconciliation cadence, so delivery can lag
+expiry by up to one scan interval. `agent_extend` replaces one worker's next
+window with a longer one. The window never aborts, steers, or closes anything,
+and `0` disables soft windows entirely. Set the value from the
+`/agents` → `Soft timeout` item or the config file.
+
+`retainWorkers` controls whether a worker's process and pane survive after its
+result is delivered. Left `false`, each managed worker receives exactly one
+assignment and is cleaned up after delivery, which is the default lifecycle.
+Set to `true`, a delivered worker stays running in the public `idle` state under
+its agent label, and a later `agent_continue` for its session delivers the next
+assignment into the same live process. Release an `idle` worker with
+`agent_close` or the `/agents` → `Clear idle` action.
 
 Placement affects future starts, not existing agents. `tab` uses one lead-owned
 agents tab, `subtree` gives each lead-direct agent its own tab, and `split`

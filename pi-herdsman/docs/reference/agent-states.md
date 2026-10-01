@@ -7,6 +7,7 @@ durable assignment/convergence evidence. It is not a raw herdr lifecycle string.
 
 | State      | Meaning                                                                                                  |
 | ---------- | -------------------------------------------------------------------------------------------------------- |
+| `idle`     | A retained worker: its terminal result was delivered and its verified live process is available for one new assignment. |
 | `working`  | An assignment is active; `stale` remains an advisory field on this state.                                |
 | `blocked`  | Active assignment waits for an owner answer or another condition.                                        |
 | `settling` | Assignment handoff, completion/result delivery, launch, direct-agent gate, or cleanup is converging.     |
@@ -24,7 +25,8 @@ superseding earlier undelivered steering with replacement direction,
 `agent_close` means exact direct ownership and the current applicable close
 preflight permit teardown. For a
 Lead-owned parent, that preflight includes its owned descendant cascade.
-`available_tools` never includes `agent_delegate`; an agent generation handles one assignment only. Every operation
+`available_tools` never includes `agent_delegate`; a worker generation handles one assignment at a time, and a
+retained worker takes its next assignment through the controller. Every operation
 revalidates identity, ownership, mailbox state, and lifecycle immediately before
 mutation.
 
@@ -36,8 +38,44 @@ records outside the controller's direct ownership can have an empty action list.
 Directly owned live records may expose the applicable live controls; directly
 owned live or proven `lost` records may expose `agent_close` when the applicable close
 preflight currently succeeds. They may also expose the read-only `agent_transcript`
-action when a materialized persisted Pi session file exists. Unknown records and
+action when a materialized persisted Pi session file exists. `agent_extend`
+appears only for a directly owned record with an armed soft window, so it is
+absent when `softTimeoutMs` is `0`, when the assignment has resolved, and for
+every record that is not directly owned. Unknown records and
 non-direct descendants remain fail-closed with no actions.
+
+## Soft-deadline windows
+
+A soft window is advisory scheduling state, not a public state and not a health
+condition. When `softTimeoutMs` is positive (default `300000` milliseconds; `0`
+disables the feature), an accepted assignment arms a window measured from the
+worker's acknowledgement. Once it elapses, the owning controller receives one
+`pi-herdsman-agent-soft-deadline` digest covering every due worker it owns, on
+the health cadence, so delivery can lag expiry by up to one 30-second scan and
+happens only while the owner is idle. Each entry lists the worker's current
+controls from the same eligibility as `available_tools`, so a record waiting on
+an owner question lists `agent_reply` and not `agent_interrupt`. After a
+delivered digest the window re-arms for another `softTimeoutMs`, so a long
+assignment is checkpointed periodically; delivery, `agent_close`, and proven
+loss end the windows, and a resolved assignment is never listed again.
+`agent_extend` lengthens one worker's next window without changing its
+assignment. A checkpoint does not mean the worker is stale, hung, or safe to
+terminate.
+
+## `idle`
+
+With `retainWorkers` enabled, delivering a worker's terminal result leaves its
+verified live process, pane, label, and mailbox in place, so the same worker can
+take a later assignment. That resolved shape is the public state `idle`: its
+result file is gone, it has no active request and no pending owner question, and
+its process is still proved live. An `idle` worker's `available_tools` is exactly
+`agent_inspect`, `agent_transcript` when its persisted session file exists, and
+`agent_close`; it never lists steering, interrupt, reply, or extend. `idle` is
+not stale, never receives inactivity attention or a soft-deadline digest, and
+does not keep its owner's herd run open. When `retainWorkers` is `false` the
+delivered worker is closed and removed instead, so `idle` never appears. A
+retained worker whose process is proven absent projects as `lost` under the same
+rules as any other worker.
 
 ## `blocked` and owner questions
 
@@ -87,6 +125,7 @@ failed inventory never proves `lost`; relocated or conflicting evidence is
 
 | Record    | Direct-owner actions                                                                                                                                           |
 | --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `idle`    | `agent_inspect`, eligible `agent_transcript`, and `agent_close` when the applicable close preflight succeeds.                                                   |
 | `live`    | `agent_inspect`, eligible `agent_transcript`, `agent_steer`, `agent_interrupt`, `agent_reply`, and `agent_close` when the applicable close preflight succeeds. |
 | `lost`    | eligible `agent_transcript` and `agent_close` when the applicable close preflight succeeds.                                                                    |
 | `unknown` | None.                                                                                                                                                          |

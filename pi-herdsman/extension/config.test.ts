@@ -60,11 +60,14 @@ mock.module("node:fs", {
 
 const {
   DEFAULT_CONFIG,
+  DEFAULT_SOFT_TIMEOUT_MS,
   MAX_BYTE_LIMIT,
+  MAX_SOFT_TIMEOUT_MS,
   MIN_BYTE_LIMIT,
   readConfig,
   updateConfig,
   validByteLimit,
+  validSoftTimeout,
 } = await import("./config.ts");
 const { herdsmanConfigPath, herdsmanDataRoot } = await import("./storage.ts");
 const { claimProcessLock } = await import("./lock.ts");
@@ -81,6 +84,35 @@ test("missing config resolves to defaults without creating storage", () => {
   assert.deepEqual(readConfig(), DEFAULT_CONFIG);
   assert.equal(readConfig().contextRetirement, false);
   assert.equal(realFs.existsSync(herdsmanDataRoot()), false);
+});
+
+test("documented soft-deadline and retention defaults match the configuration", () => {
+  resetConfig();
+  // docs/reference/configuration.md documents exactly these values.
+  assert.equal(DEFAULT_SOFT_TIMEOUT_MS, 300_000);
+  assert.equal(readConfig().softTimeoutMs, 300_000);
+  assert.equal(readConfig().retainWorkers, false);
+});
+
+test("soft-timeout and retain-workers overlays accept only valid values", () => {
+  realFs.mkdirSync(herdsmanDataRoot(), { recursive: true });
+  realFs.writeFileSync(
+    herdsmanConfigPath(),
+    JSON.stringify({ softTimeoutMs: 0, retainWorkers: true }),
+  );
+  assert.deepEqual(readConfig(), {
+    ...DEFAULT_CONFIG,
+    softTimeoutMs: 0,
+    retainWorkers: true,
+  });
+  realFs.writeFileSync(
+    herdsmanConfigPath(),
+    JSON.stringify({ softTimeoutMs: MAX_SOFT_TIMEOUT_MS, retainWorkers: false }),
+  );
+  assert.equal(readConfig().softTimeoutMs, MAX_SOFT_TIMEOUT_MS);
+  assert.equal(readConfig().retainWorkers, false);
+  assert.equal(validSoftTimeout(0), true);
+  assert.equal(validSoftTimeout(MAX_SOFT_TIMEOUT_MS), true);
 });
 
 test("partial and complete valid configs overlay defaults", () => {
@@ -105,6 +137,8 @@ test("partial and complete valid configs overlay defaults", () => {
   assert.deepEqual(readConfig(), {
     spawnPlacement: "tab",
     contextRetirement: false,
+    retainWorkers: false,
+    softTimeoutMs: DEFAULT_SOFT_TIMEOUT_MS,
     inlineAttachmentLimitBytes: MIN_BYTE_LIMIT,
     mailboxPayloadLimitBytes: MAX_BYTE_LIMIT,
   });
@@ -127,6 +161,11 @@ test("invalid values, malformed JSON, non-object roots, and unknown keys fail cl
       "mailboxPayloadLimitBytes",
     ],
     ['{"contextRetirement":"false"}', "contextRetirement"],
+    ['{"retainWorkers":"true"}', "retainWorkers"],
+    ['{"softTimeoutMs":-1}', "softTimeoutMs"],
+    ['{"softTimeoutMs":1.5}', "softTimeoutMs"],
+    ['{"softTimeoutMs":"300000"}', "softTimeoutMs"],
+    [`{"softTimeoutMs":${MAX_SOFT_TIMEOUT_MS + 1}}`, "softTimeoutMs"],
     ["{", "Invalid Pi Herdsman config JSON"],
     ["[]", "root must be an object"],
     ['{"typo":true}', "unknown field typo"],
@@ -137,34 +176,69 @@ test("invalid values, malformed JSON, non-object roots, and unknown keys fail cl
   assert.equal(validByteLimit(MIN_BYTE_LIMIT), true);
   assert.equal(validByteLimit(MAX_BYTE_LIMIT), true);
   assert.equal(validByteLimit(MIN_BYTE_LIMIT + 0.5), false);
+  assert.equal(validSoftTimeout(-1), false);
+  assert.equal(validSoftTimeout(1.5), false);
 });
 
 test("updates preserve configured keys, reset one key, and delete the final config", () => {
   updateConfig("spawnPlacement", "tab");
   updateConfig("contextRetirement", false);
+  updateConfig("retainWorkers", true);
+  updateConfig("softTimeoutMs", 0);
   updateConfig("mailboxPayloadLimitBytes", 64 * 1024);
   assert.deepEqual(
     JSON.parse(realFs.readFileSync(herdsmanConfigPath(), "utf8")),
     {
       spawnPlacement: "tab",
       contextRetirement: false,
+      retainWorkers: true,
+      softTimeoutMs: 0,
       mailboxPayloadLimitBytes: 64 * 1024,
     },
   );
   assert.equal(readConfig().spawnPlacement, "tab");
   assert.equal(readConfig().contextRetirement, false);
+  assert.equal(readConfig().retainWorkers, true);
+  assert.equal(readConfig().softTimeoutMs, 0);
   updateConfig("spawnPlacement", undefined);
   assert.deepEqual(
     JSON.parse(realFs.readFileSync(herdsmanConfigPath(), "utf8")),
     {
       contextRetirement: false,
+      retainWorkers: true,
+      softTimeoutMs: 0,
       mailboxPayloadLimitBytes: 64 * 1024,
     },
   );
+  updateConfig("retainWorkers", undefined);
+  assert.equal(readConfig().retainWorkers, false);
+  updateConfig("softTimeoutMs", undefined);
+  assert.equal(readConfig().softTimeoutMs, DEFAULT_SOFT_TIMEOUT_MS);
   updateConfig("mailboxPayloadLimitBytes", undefined);
   updateConfig("contextRetirement", undefined);
   assert.equal(realFs.existsSync(herdsmanConfigPath()), false);
   assert.deepEqual(readConfig(), DEFAULT_CONFIG);
+});
+
+test("update rejects invalid retain-workers and soft-timeout values", () => {
+  resetConfig();
+  assert.throws(
+    () => updateConfig("retainWorkers", "true" as never),
+    /Invalid Pi Herdsman config field retainWorkers/,
+  );
+  assert.throws(
+    () => updateConfig("softTimeoutMs", -1),
+    /Invalid Pi Herdsman config field softTimeoutMs/,
+  );
+  assert.throws(
+    () => updateConfig("softTimeoutMs", 1.5),
+    /Invalid Pi Herdsman config field softTimeoutMs/,
+  );
+  assert.throws(
+    () => updateConfig("softTimeoutMs", "300000" as never),
+    /Invalid Pi Herdsman config field softTimeoutMs/,
+  );
+  assert.equal(realFs.existsSync(herdsmanConfigPath()), false);
 });
 
 test("a read racing with final reset treats ENOENT as absent", () => {

@@ -662,6 +662,93 @@ test("registered agent writes state, handles input, and settles one result", asy
   assert.equal(readAgentState(mailbox)?.lastActivityAt, undefined);
 });
 
+test("a retained worker accepts a second assignment once its result is gone", async () => {
+  const mailbox = setAgentEnvironment("retained-worker-agent");
+  const agent = fakePi();
+  const context = fakeContext();
+  registerExtension!(agent.pi as never);
+  await agent.events.get("session_start")![0](undefined, context);
+  const started = readAgentState(mailbox)!;
+  const requestFor = (requestId: string, text: string): RequestRecord => ({
+    version: 4,
+    runId: started.runId,
+    requestId,
+    ownerSessionId: started.ownerSessionId,
+    workspaceId: started.workspaceId,
+    agentLabel: started.agentLabel,
+    paneId: started.paneId,
+    kind: "task",
+    text,
+    createdAt: Date.now(),
+  });
+
+  const first = requestFor(REQUEST_ID, "first assignment");
+  writeRequest(mailbox, first);
+  assert.deepEqual(
+    agent.events.get("input")![0](
+      { text: controlMarker(first.requestId) },
+      context,
+    ),
+    { action: "transform", text: first.text },
+  );
+  agent.events.get("message_end")![0](
+    { message: { role: "assistant", content: "first done" } },
+    context,
+  );
+  await agent.events.get("agent_settled")![0](undefined, context);
+  assert.equal(readResult(mailbox, first.requestId)?.text, "first done");
+  assert.equal(readAgentState(mailbox)?.completedRequestId, first.requestId);
+
+  // While the terminal result file exists the assignment is pending work, so a
+  // second task stays busy.
+  const held = requestFor(randomUUID(), "held assignment");
+  writeRequest(mailbox, held);
+  assert.deepEqual(
+    agent.events.get("input")![0](
+      { text: controlMarker(held.requestId) },
+      context,
+    ),
+    { action: "handled" },
+  );
+  const afterRefusal = readAgentState(mailbox)!;
+  assert.equal(afterRefusal.activeRequestId, undefined);
+  assert.equal(afterRefusal.completedRequestId, first.requestId);
+  assert.equal(afterRefusal.lastAck?.requestId, held.requestId);
+  assert.equal(afterRefusal.lastAck?.accepted, false);
+  assert.equal(afterRefusal.lastAck?.code, "busy");
+  assert.equal(readRequest(mailbox, held.requestId), undefined);
+
+  // The controller removes a result only after it delivered it; that absence is
+  // what makes the retained worker reusable for one new assignment.
+  removeResult(mailbox, first.requestId);
+  const second = requestFor(randomUUID(), "second assignment");
+  writeRequest(mailbox, second);
+  assert.deepEqual(
+    agent.events.get("input")![0](
+      { text: controlMarker(second.requestId) },
+      context,
+    ),
+    { action: "transform", text: second.text },
+  );
+  const accepted = readAgentState(mailbox)!;
+  assert.equal(accepted.activeRequestId, second.requestId);
+  assert.equal(accepted.completedRequestId, undefined);
+  assert.equal(accepted.lastAck?.requestId, second.requestId);
+  assert.equal(accepted.lastAck?.accepted, true);
+
+  agent.events.get("message_end")![0](
+    { message: { role: "assistant", content: "second done" } },
+    context,
+  );
+  await agent.events.get("agent_settled")![0](undefined, context);
+  assert.equal(readResult(mailbox, second.requestId)?.text, "second done");
+  assert.equal(readResult(mailbox, first.requestId), undefined);
+  assert.equal(readAgentState(mailbox)?.completedRequestId, second.requestId);
+  assert.equal(readAgentState(mailbox)?.activeRequestId, undefined);
+  agent.events.get("session_shutdown")?.[0]();
+  resetAgentMailbox(mailbox);
+});
+
 test("result persistence waits for the assignment lock", async (t) => {
   t.mock.timers.enable({ apis: ["setInterval"] });
   const mailbox = setAgentEnvironment("locked-result-agent");
@@ -2921,6 +3008,7 @@ test("a stray agent variable does not suppress the active Lead tool surface", as
     "agent_close",
     "agent_inspect",
     "agent_transcript",
+    "agent_extend",
     "supervisor_message",
     "peer_list",
     "peer_message",

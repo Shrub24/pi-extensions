@@ -141,6 +141,23 @@ alone is not a timeout or generic attention condition. A parent projected as
 blocked while waiting for direct children is progress-capable and is not the
 same as Herdr reporting that the managed child runtime is blocked.
 
+A soft deadline is an advisory checkpoint, not a health condition. When
+`softTimeoutMs` (default `300000` milliseconds, `0` disables it) has elapsed
+since a worker acknowledged its assignment, the owning controller receives one
+soft-deadline digest covering every due worker it directly owns. The digest
+rides the same health cadence, so it may be delivered up to one 30-second scan
+after a window expires, and it wakes the owner only while it is idle. It is
+advisory: no worker was aborted, steered, or closed, and continuing to wait is
+a valid response. It names each due worker with its elapsed time and the
+controls that worker currently allows, so a worker waiting on an owner question
+lists `agent_reply` without `agent_interrupt`. After a delivered digest the
+window re-arms for another `softTimeoutMs`, so an unresolved long assignment is
+checkpointed periodically until it resolves; `agent_extend` replaces one
+worker's next window with a longer one without changing its assignment. Because
+the digest is a distinct message type, it neither suppresses nor is suppressed
+by health attention, and an assignment that resolves is never checkpointed
+again.
+
 When attention arrives, the owner handles a required action before ending the
 turn. For stale attention:
 
@@ -188,8 +205,11 @@ active assignment.
 ## Exactly-once assignment result
 
 Each accepted task request maps to one final assignment result. Each managed
-agent generation receives exactly one assignment; a completed agent is not
-available for another task.
+agent generation executes one assignment at a time; while `retainWorkers` is
+`false` (the default) a completed agent is not available for another task.
+With `retainWorkers` enabled, delivering the terminal result leaves the verified
+live worker in place as `idle`, and a later controller assignment starts a new
+assignment on that same process.
 
 Result publication and cleanup are separate convergence steps. An agent may
 therefore appear `settling` after its model has finished. Cleanup follows

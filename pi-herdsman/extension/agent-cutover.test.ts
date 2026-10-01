@@ -106,6 +106,7 @@ test("managed Agent surfaces distinguish delegation capability from leaf access"
     "agent_close",
     "agent_continue",
     "agent_delegate",
+    "agent_extend",
     "agent_inspect",
     "agent_interrupt",
     "agent_list",
@@ -271,6 +272,12 @@ test("each Agent operation has its own strict schema without projection", () => 
       { agent: "worker" },
       { agent: "worker", session: "x" },
       ["agent"],
+    ],
+    [
+      "agent_extend",
+      { agent: "worker", windowMs: 900000 },
+      { agent: "worker", windowMs: 900000, task: "x" },
+      ["agent", "windowMs"],
     ],
   ] as const;
   for (const [name, valid, crossOperation, required] of cases) {

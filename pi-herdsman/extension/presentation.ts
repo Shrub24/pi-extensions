@@ -40,7 +40,13 @@ import type {
 import { herdsmanTempRoot, resultPath, resultRef } from "./storage.ts";
 
 export type AgentLifecycleState =
-  "working" | "blocked" | "settling" | "starting" | "unknown" | "lost";
+  | "idle"
+  | "working"
+  | "blocked"
+  | "settling"
+  | "starting"
+  | "unknown"
+  | "lost";
 export interface StatusAgent {
   label: string;
   state: AgentLifecycleState;
@@ -272,6 +278,7 @@ const STATE_COLOR: Record<string, string> = {
   [lifecycleLabel("blocked")]: "warning",
   [lifecycleLabel("settling")]: "accent",
   [lifecycleLabel("starting")]: "accent",
+  [lifecycleLabel("idle")]: "muted",
   [lifecycleLabel("unknown")]: "warning",
   [lifecycleLabel("lost")]: "error",
 };
@@ -520,6 +527,7 @@ export function formatStatusCounts(agents: readonly StatusAgent[]): string {
     blocked: agents.filter((agent) => agent.state === "blocked").length,
     settling: agents.filter((agent) => agent.state === "settling").length,
     starting: agents.filter((agent) => agent.state === "starting").length,
+    idle: agents.filter((agent) => agent.state === "idle").length,
     unknown: agents.filter((agent) => agent.state === "unknown").length,
     lost: agents.filter((agent) => agent.state === "lost").length,
   };
@@ -2052,6 +2060,8 @@ function renderExpandedCoordinationCall(
     } else if (action === "continue") {
       if (args.session) fields.push(["session", args.session]);
     } else if (args.agent) fields.push(["agent", args.agent]);
+    if (action === "extend" && args.windowMs !== undefined)
+      fields.push(["windowMs", args.windowMs]);
   } else if (tool === "staff" || tool === "peer") {
     if (args.session) fields.push(["session", args.session]);
     if (action === "delegate") {
@@ -3221,6 +3231,84 @@ export function renderAgentLostMessage(
         closeAvailable
           ? "  assignment remains unresolved · close before replacing or continuing"
           : "  assignment remains unresolved · close unavailable; resolve the blocking close-preflight condition first",
+      ];
+  return renderMessageBox(
+    new WidthSafeText(lines.join("\n"), 0, 0),
+    theme,
+    options.outputPad ?? 0,
+  );
+}
+
+// Advisory soft-deadline checkpoint. It never reports a failure and never
+// implies that anything was aborted, steered, or closed.
+export function renderAgentSoftDeadlineMessage(
+  message: { details?: unknown },
+  options: { expanded?: boolean; outputPad?: number },
+  theme: any,
+): TuiBox {
+  const details =
+    message.details && typeof message.details === "object"
+      ? (message.details as Record<string, unknown>)
+      : {};
+  const entries = Array.isArray(details.entries)
+    ? details.entries.filter(
+        (entry): entry is Record<string, unknown> =>
+          !!entry && typeof entry === "object" && !Array.isArray(entry),
+      )
+    : [];
+  const annotations = Array.isArray(details.annotations)
+    ? details.annotations.filter(
+        (annotation): annotation is string =>
+          typeof annotation === "string" && annotation.length > 0,
+      )
+    : [];
+  const heading =
+    entries.length === 1
+      ? "1 Agent is past its soft deadline"
+      : `${entries.length} Agents are past their soft deadlines`;
+  const lines = options.expanded
+    ? [
+        heading,
+        "",
+        "Advisory checkpoint only: no Agent was aborted, steered, or closed, and waiting is a valid response.",
+        ...entries.flatMap((entry) => {
+          const label = value(entry.agentLabel) || "agent";
+          const definition = value(entry.agentDefinition);
+          const elapsed =
+            typeof entry.elapsedMs === "number" &&
+            Number.isFinite(entry.elapsedMs) &&
+            entry.elapsedMs >= 0
+              ? (formatElapsed(0, entry.elapsedMs) ?? "unknown")
+              : "unknown";
+          const window =
+            typeof entry.windowMs === "number" &&
+            Number.isFinite(entry.windowMs) &&
+            entry.windowMs >= 0
+              ? (formatElapsed(0, entry.windowMs) ?? "unknown")
+              : "unknown";
+          const actions = Array.isArray(entry.availableActions)
+            ? entry.availableActions.filter(
+                (action): action is string =>
+                  typeof action === "string" && action.length > 0,
+              )
+            : [];
+          return [
+            "",
+            `${label}${definition ? ` (${definition})` : ""}`,
+            `  working for ${elapsed} · window ${window}`,
+            ...(value(entry.requestId)
+              ? [`  request: ${value(entry.requestId)}`]
+              : []),
+            `  controls: ${actions.map((action) => `agent_${action}`).join(" · ") || "none"}`,
+          ];
+        }),
+        ...(annotations.length
+          ? ["", "Annotations:", ...annotations.map((a) => `  ${a}`)]
+          : []),
+      ]
+    : [
+        statusLine(theme, "accent", "◷", `${heading} (advisory)`),
+        "  no Agent was aborted, steered, or closed; waiting is valid",
       ];
   return renderMessageBox(
     new WidthSafeText(lines.join("\n"), 0, 0),

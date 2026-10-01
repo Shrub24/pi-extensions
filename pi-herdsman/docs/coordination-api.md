@@ -17,11 +17,16 @@ agent_delegate
 agent_continue
 agent_steer
 agent_interrupt
+agent_extend
 agent_reply
 agent_close
 agent_inspect
 agent_transcript
 ```
+
+`agent_extend` appears only for a directly owned worker with an armed soft
+window; it lengthens that worker's next advisory checkpoint without changing
+its assignment.
 
 Managed Agents contact their exact direct owner through
 [`ask_owner`](reference/ask-owner.md).

@@ -47,6 +47,7 @@ import support, {
   readResult,
   readAgentState,
   realFs,
+  watchedResultPaths,
   recoveryIdentity,
   registerExtension,
   removeAsk,
@@ -3346,6 +3347,433 @@ test("result is removed after agent state reaches completed", async (t) => {
   pi.events.get("session_shutdown")?.[0]();
 });
 
+test("retained delivery keeps the worker, pane, and mailbox without the result", async (t) => {
+  setLeadEnvironment();
+  updateConfig("retainWorkers", true);
+  const label = "retained-delivery-agent";
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  resetAgentMailbox(mailbox);
+  const activeState = managedState(label, REQUEST_ID);
+  writeAgentState(mailbox, activeState);
+  writeResult(mailbox, {
+    version: 4,
+    runId: AGENT_ID,
+    requestId: REQUEST_ID,
+    ownerSessionId: LEAD_SESSION_ID,
+    workspaceId: WORKSPACE,
+    agentLabel: label,
+    paneId: "registered-pane",
+    status: "completed",
+    text: "complete",
+    completedAt: Date.now(),
+  });
+  const entries: unknown[] = [];
+  const lifecycle = cascadeExecutor([activeState]);
+  const pi = fakePi({
+    entries,
+    exec: lifecycle.exec,
+    sendMessage: () => {
+      entries.push({
+        customType: "pi-herdsman-agent-result",
+        details: resultEntryDetails(activeState, REQUEST_ID),
+      });
+    },
+  });
+  registerExtension!(pi.pi as never);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    await pi.events.get("session_start")![0](undefined, fakeContext(entries));
+    await Promise.resolve();
+    await Promise.resolve();
+    const completed = managedState(label);
+    completed.completedRequestId = REQUEST_ID;
+    writeAgentState(mailbox, completed);
+    t.mock.timers.tick(250);
+    for (let index = 0; index < 5; index++)
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.equal(readResult(mailbox, REQUEST_ID), undefined);
+    const retained = readAgentState(mailbox);
+    assert.equal(retained?.agentLabel, label);
+    assert.equal(retained?.completedRequestId, REQUEST_ID);
+    assert.equal(retained?.activeRequestId, undefined);
+    assert.equal(lifecycle.live.has(label), true);
+    assert.deepEqual(lifecycle.closeOrder, []);
+    assert.equal(
+      pi.calls.some((args) => isPaneClose(args)),
+      false,
+      "a retained worker keeps its pane",
+    );
+    assert.equal(
+      entries.some(
+        (entry: any) => entry.customType === "pi_herdsman_cleanup_error",
+      ),
+      false,
+    );
+  } finally {
+    updateConfig("retainWorkers", undefined);
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(mailbox);
+  }
+});
+
+test("disabled retention still tears the delivered worker down", async (t) => {
+  setLeadEnvironment();
+  updateConfig("retainWorkers", false);
+  const label = "unretained-delivery-agent";
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  resetAgentMailbox(mailbox);
+  const activeState = managedState(label, REQUEST_ID);
+  writeAgentState(mailbox, activeState);
+  writeResult(mailbox, {
+    version: 4,
+    runId: AGENT_ID,
+    requestId: REQUEST_ID,
+    ownerSessionId: LEAD_SESSION_ID,
+    workspaceId: WORKSPACE,
+    agentLabel: label,
+    paneId: "registered-pane",
+    status: "completed",
+    text: "complete",
+    completedAt: Date.now(),
+  });
+  const entries: unknown[] = [];
+  const lifecycle = cascadeExecutor([activeState]);
+  const pi = fakePi({
+    entries,
+    exec: lifecycle.exec,
+    sendMessage: () => {
+      entries.push({
+        customType: "pi-herdsman-agent-result",
+        details: resultEntryDetails(activeState, REQUEST_ID),
+      });
+    },
+  });
+  registerExtension!(pi.pi as never);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    await pi.events.get("session_start")![0](undefined, fakeContext(entries));
+    await Promise.resolve();
+    await Promise.resolve();
+    const completed = managedState(label);
+    completed.completedRequestId = REQUEST_ID;
+    writeAgentState(mailbox, completed);
+    t.mock.timers.tick(250);
+    for (let index = 0; index < 5; index++)
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.equal(readResult(mailbox, REQUEST_ID), undefined);
+    assert.equal(readAgentState(mailbox), undefined);
+    assert.deepEqual(lifecycle.closeOrder, [label]);
+  } finally {
+    updateConfig("retainWorkers", undefined);
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(mailbox);
+  }
+});
+
+test("repeated delivered-result cleanup after recovery retains and never closes", async (t) => {
+  setLeadEnvironment();
+  updateConfig("retainWorkers", true);
+  const label = "retained-recovery-agent";
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  resetAgentMailbox(mailbox);
+  const state = managedState(label);
+  state.completedRequestId = REQUEST_ID;
+  writeAgentState(mailbox, state);
+  const entries: unknown[] = [
+    { customType: "pi-herdsman-agent-result", details: resultEntryDetails(state, REQUEST_ID) },
+  ];
+  const lifecycle = cascadeExecutor([state]);
+  const pi = fakePi({ entries, exec: lifecycle.exec });
+  registerExtension!(pi.pi as never);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    await pi.events.get("session_start")![0](undefined, fakeContext(entries));
+    for (let index = 0; index < 5; index++)
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.deepEqual(readAgentState(mailbox), state);
+    assert.equal(lifecycle.live.has(label), true);
+    assert.deepEqual(lifecycle.closeOrder, []);
+    assert.equal(
+      entries.some(
+        (entry: any) => entry.customType === "pi_herdsman_recovery_error",
+      ),
+      false,
+    );
+    assert.equal(
+      entries.some(
+        (entry: any) => entry.customType === "pi_herdsman_cleanup_error",
+      ),
+      false,
+    );
+  } finally {
+    updateConfig("retainWorkers", undefined);
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(mailbox);
+  }
+});
+
+test("a delivered worker with a live pane projects idle with its exact tools", async (t) => {
+  setLeadEnvironment();
+  updateConfig("retainWorkers", true);
+  const label = "retained-idle-listed";
+  const identity = recoveryIdentity(label);
+  writeFileSync(identity.piSessionFile, "{}", "utf8");
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  resetAgentMailbox(mailbox);
+  const state = managedState(label, undefined, identity);
+  state.completedRequestId = REQUEST_ID;
+  writeAgentState(mailbox, state);
+  const entries: unknown[] = [
+    {
+      customType: "pi-herdsman-agent-result",
+      details: resultEntryDetails(state, REQUEST_ID),
+    },
+  ];
+  const lifecycle = cascadeExecutor([state]);
+  const pi = fakePi({ entries, exec: lifecycle.exec });
+  registerExtension!(pi.pi as never);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    await pi.events.get("session_start")![0](undefined, fakeContext(entries));
+    for (let index = 0; index < 5; index++)
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    const listed = await agentTool(pi, "list").execute(
+      "id",
+      {},
+      undefined,
+      undefined,
+      fakeContext(entries),
+    );
+    const record = listed.details.agents.find(
+      (agent: any) => agent.agent === label,
+    );
+    assert.ok(record, "the retained worker stays listed");
+    assert.equal(record.state, "idle");
+    assert.deepEqual(record.available_tools, [
+      "agent_inspect",
+      "agent_transcript",
+      "agent_close",
+    ]);
+    assert.equal(record.active_request_id, undefined);
+    assert.equal(record.stale, undefined, "an idle worker is never stale");
+    assert.equal(record.recovery_only, undefined);
+    assert.equal(listed.details.cleanup_errors, undefined);
+  } finally {
+    updateConfig("retainWorkers", undefined);
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(mailbox);
+    realFs.rmSync(identity.piSessionFile, { force: true });
+  }
+});
+
+test("a restart reuses a retained worker in its existing process", async (t) => {
+  setLeadEnvironment();
+  updateConfig("retainWorkers", true);
+  const name = `recovered-${randomUUID().slice(0, 8)}`;
+  const label = `${name}-agent`;
+  const definitionPath = join(PI_AGENTS_DIR, `${name}.md`);
+  const sessionPath = join(testTmpRoot, `${name}-session.jsonl`);
+  writeFileSync(definitionPath, `---\nname: ${name}\n---\nrecovered body\n`);
+  writeFileSync(sessionPath, "{}", "utf8");
+  nativeSessions.set(DEFAULT_PI_SESSION_ID, {
+    id: DEFAULT_PI_SESSION_ID,
+    path: sessionPath,
+    cwd: "/tmp",
+    entries: [
+      {
+        type: "custom",
+        customType: "pi-herdsman-agent-definition",
+        data: {
+          sessionId: DEFAULT_PI_SESSION_ID,
+          definition: name,
+          label,
+        },
+      },
+    ],
+  });
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  resetAgentMailbox(mailbox);
+  const state = {
+    ...managedState(label, undefined, {
+      paneId: "startup-pane",
+      tabId: "startup-tab",
+      piSessionId: DEFAULT_PI_SESSION_ID,
+      piSessionFile: sessionPath,
+    }),
+    completedRequestId: REQUEST_ID,
+  };
+  writeAgentState(mailbox, state);
+  const { agentLaunchFingerprint, resolveAgentLaunchInputs } = await import(
+    "./agent-definitions.ts"
+  );
+  const entries: unknown[] = [
+    {
+      customType: "pi-herdsman-agent-result",
+      details: resultEntryDetails(state, REQUEST_ID),
+    },
+    {
+      type: "custom_message",
+      message: {
+        customType: "pi-herdsman-agent-result",
+        details: {
+          piSessionId: DEFAULT_PI_SESSION_ID,
+          piSessionFile: sessionPath,
+          ownerSessionId: LEAD_SESSION_ID,
+          runId: state.runId,
+          requestId: REQUEST_ID,
+          agentLabel: label,
+          agentDefinition: name,
+          status: "completed",
+        },
+      },
+    },
+    {
+      type: "custom",
+      customType: "pi-herdsman-worker-launch",
+      data: {
+        runId: state.runId,
+        label,
+        fingerprint: agentLaunchFingerprint(
+          resolveAgentLaunchInputs(
+            {
+              name,
+              path: definitionPath,
+              frontmatter: { name },
+              body: "recovered body",
+            },
+            { cwd: "/tmp" },
+          ),
+        ),
+      },
+    },
+  ];
+  const delivered: string[] = [];
+  const worker = startupExecutor(
+    label,
+    () => DEFAULT_PI_SESSION_ID,
+    undefined,
+    (text) => {
+      delivered.push(text);
+    },
+  );
+  const pi = fakePi({ entries, exec: worker.exec });
+  registerExtension!(pi.pi as never);
+  const context = fakeContext(entries);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    await pi.events.get("session_start")![0](undefined, context);
+    for (let index = 0; index < 5; index++)
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    const listed = await agentTool(pi, "list").execute(
+      "id",
+      {},
+      undefined,
+      undefined,
+      context,
+    );
+    const record = listed.details.agents.find(
+      (agent: any) => agent.agent === label,
+    );
+    assert.ok(record, "the restart restores the retained worker");
+    assert.equal(record.state, "idle");
+    const starts = () =>
+      pi.calls.filter((args) => args[0] === "agent" && args[1] === "start")
+        .length;
+    const startsBefore = starts();
+    const continued = await agentTool(pi, "continue").execute(
+      "id",
+      { session: sessionPath, task: "continue after restart" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(continued.details.ok, true, JSON.stringify(continued.details));
+    assert.equal(continued.details.reused, true);
+    assert.equal(continued.details.agent, label);
+    assert.equal(continued.details.session_id, DEFAULT_PI_SESSION_ID);
+    assert.equal(starts(), startsBefore, "reuse must not start a process");
+    assert.equal(delivered.length, 1);
+    assert.match(delivered[0]!, /continue after restart/);
+    const after = readAgentState(mailbox);
+    assert.equal(after?.activeRequestId, continued.details.request_id);
+    assert.equal(after?.completedRequestId, undefined);
+    assert.equal(after?.runId, state.runId);
+  } finally {
+    updateConfig("retainWorkers", undefined);
+    pi.events.get("session_shutdown")?.[0]();
+    nativeSessions.delete(DEFAULT_PI_SESSION_ID);
+    resetAgentMailbox(mailbox);
+    realFs.rmSync(definitionPath, { force: true });
+    realFs.rmSync(sessionPath, { force: true });
+  }
+});
+
+test("an idle retained worker produces no attention or digest while it waits", async (t) => {
+  setLeadEnvironment();
+  updateConfig("retainWorkers", true);
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const label = "retained-idle-quiet";
+  const identity = recoveryIdentity(label);
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  resetAgentMailbox(mailbox);
+  const state = managedState(label, undefined, identity);
+  state.completedRequestId = REQUEST_ID;
+  state.lastActivityAt = now - 1_800_000;
+  writeAgentState(mailbox, state);
+  const entries: unknown[] = [
+    {
+      customType: "pi-herdsman-agent-result",
+      details: resultEntryDetails(state, REQUEST_ID),
+    },
+  ];
+  const pi = fakePi({
+    entries,
+    exec: leadExec(
+      label,
+      "idle",
+      identity.piSessionId,
+      undefined,
+      identity.piSessionId,
+      identity,
+    ),
+  });
+  registerExtension!(pi.pi as never);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    await pi.events.get("session_start")![0](undefined, fakeContext(entries));
+    for (let index = 0; index < 5; index++)
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(readAgentState(mailbox)?.completedRequestId, REQUEST_ID);
+
+    now += 1_800_000;
+    for (const _ of [0, 1]) {
+      t.mock.timers.tick(30_000);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    assert.equal(softDigests(pi).length, 0);
+    assert.equal(
+      pi.sent.some((message: any) =>
+        [
+          "pi-herdsman-agent-attention",
+          "pi-herdsman-agent-stale",
+          "pi-herdsman-agent-lost",
+          "pi-herdsman-agent-soft-deadline",
+        ].includes(message.customType),
+      ),
+      false,
+      "an idle retained worker must not wake its owner",
+    );
+  } finally {
+    updateConfig("retainWorkers", undefined);
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(mailbox);
+  }
+});
+
 test("live result cleanup keeps a later request owned by the mailbox", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   for (const durableSecondResult of [false, true]) {
@@ -6460,4 +6888,898 @@ test("list derives inactivity without changing public state", async () => {
     assert.equal(agent?.inactive_ms, undefined);
   }
   pi.events.get("session_shutdown")?.[0]();
+});
+
+const softWindowEntry = (
+  label: string,
+  requestId: string,
+  armedAt: number,
+  windowMs: number,
+) => ({
+  type: "custom",
+  customType: "pi-herdsman-soft-window",
+  data: { requestId, label, runId: AGENT_ID, armedAt, windowMs },
+});
+
+const softDigests = (pi: ReturnType<typeof fakePi>) =>
+  pi.sent.filter(
+    (message: any) =>
+      message.customType === "pi-herdsman-agent-soft-deadline",
+  );
+
+// Drive one live working agent with an armed soft window through the real
+// controller startup, recovery, and health-scan path.
+function softWindowFixture(
+  label: string,
+  options: { armedAt: number; windowMs?: number; entries?: unknown[] } = {
+    armedAt: Date.now(),
+  },
+) {
+  setLeadEnvironment();
+  const identity = recoveryIdentity(label);
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  resetAgentMailbox(mailbox);
+  writeAgentState(mailbox, {
+    ...managedState(label, REQUEST_ID, identity),
+    lastActivityAt: Date.now(),
+    lastAck: {
+      requestId: REQUEST_ID,
+      accepted: true,
+      acknowledgedAt: options.armedAt,
+    },
+  });
+  const entries = [
+    ...(options.entries ?? []),
+    softWindowEntry(
+      label,
+      REQUEST_ID,
+      options.armedAt,
+      options.windowMs ?? 300_000,
+    ),
+  ];
+  const pi = fakePi({
+    entries,
+    exec: leadExec(
+      label,
+      "working",
+      identity.piSessionId,
+      undefined,
+      identity.piSessionId,
+      identity,
+    ),
+  });
+  registerExtension!(pi.pi as never);
+  return { pi, mailbox, identity, entries, label };
+}
+
+test("agent_list offers agent_extend only for a windowed live assignment", async (t) => {
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const requestId = randomUUID();
+  const { pi, fixtures, entries } = softDeadlineFixture([
+    { label: "soft-extend-listed", requestId, armedAt: now - 10_000 },
+  ]);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  await pi.events.get("session_start")![0](undefined, fakeContext(entries));
+  for (let index = 0; index < 4; index++)
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  const listed = () =>
+    agentTool(pi, "list").execute("id", {}, undefined, undefined, fakeContext());
+  const tools = async () =>
+    (
+      (await listed()).details.agents.find(
+        (agent: any) => agent.agent === "soft-extend-listed",
+      )?.available_tools ?? []
+    ) as string[];
+  assert.deepEqual(await tools(), [
+    "agent_inspect",
+    "agent_steer",
+    "agent_interrupt",
+    "agent_extend",
+    "agent_close",
+  ]);
+
+  // The same live record without a configured window offers no extension.
+  updateConfig("softTimeoutMs", 0);
+  assert.equal(
+    (await tools()).includes("agent_extend"),
+    false,
+    "a disabled soft timeout leaves nothing to extend",
+  );
+  const refusedWhileDisabled = await agentTool(pi, "extend").execute(
+    "id",
+    { agent: "soft-extend-listed", windowMs: 900_000 },
+    undefined,
+    undefined,
+    fakeContext(),
+  );
+  assert.equal(refusedWhileDisabled.details.ok, false);
+  assert.equal(
+    pi.entries.filter(
+      (entry: any) =>
+        entry.customType === "pi-herdsman-soft-window" &&
+        entry.data.extended === true,
+    ).length,
+    0,
+    "a refused extension records no window",
+  );
+  updateConfig("softTimeoutMs", undefined);
+  assert.equal((await tools()).includes("agent_extend"), true);
+
+  pi.events.get("session_shutdown")?.[0]();
+  for (const fixture of fixtures) resetAgentMailbox(fixture.mailbox);
+});
+
+test("a proven lost assignment drops agent_extend from available_tools", async (t) => {
+  setLeadEnvironment();
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const label = "soft-extend-lost";
+  const identity = recoveryIdentity(label);
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  resetAgentMailbox(mailbox);
+  writeAgentState(mailbox, {
+    ...managedState(label, REQUEST_ID, identity),
+    lastActivityAt: now,
+    lastAck: {
+      requestId: REQUEST_ID,
+      accepted: true,
+      acknowledgedAt: now - 10_000,
+    },
+  });
+  const entries = [softWindowEntry(label, REQUEST_ID, now - 10_000, 300_000)];
+  const pi = fakePi({
+    entries,
+    exec: (command, args) => {
+      if (command === "herdr" && isApiSnapshot(args))
+        return {
+          stdout: JSON.stringify({
+            id: AGENT_ID,
+            result: { snapshot: { agents: [], panes: [] } },
+          }),
+          stderr: "",
+          code: 0,
+        };
+      if (command === "herdr" && args[0] === "status")
+        return { stdout: "{}", stderr: "", code: 0 };
+      if (command === "herdr" && args[0] === "--version")
+        return { stdout: "0.8.0", stderr: "", code: 0 };
+      return { stdout: "{}", stderr: "", code: 0 };
+    },
+  });
+  registerExtension!(pi.pi as never);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  await pi.events.get("session_start")![0](undefined, fakeContext(entries));
+  for (let index = 0; index < 4; index++)
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  const listed = await agentTool(pi, "list").execute(
+    "id",
+    {},
+    undefined,
+    undefined,
+    fakeContext(),
+  );
+  const agent = listed.details.agents.find(
+    (candidate: any) => candidate.agent === label,
+  );
+  assert.equal(agent.state, "lost");
+  assert.equal(
+    (agent.available_tools as string[]).includes("agent_extend"),
+    false,
+    `lost records extend nothing: ${JSON.stringify(agent.available_tools)}`,
+  );
+  const attempted = await agentTool(pi, "extend").execute(
+    "id",
+    { agent: label, windowMs: 900_000 },
+    undefined,
+    undefined,
+    fakeContext(),
+  );
+  assert.equal(attempted.details.ok, false);
+  pi.events.get("session_shutdown")?.[0]();
+  resetAgentMailbox(mailbox);
+});
+
+test("a restart mid-window keeps the remaining soft deadline", async (t) => {
+  setLeadEnvironment();
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const { pi, mailbox, entries } = softWindowFixture("soft-window-mid", {
+    armedAt: now - 120_000,
+  });
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  await pi.events.get("session_start")![0](undefined, fakeContext(entries));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(softDigests(pi).length, 0, "120s into a 300s window is not due");
+
+  now += 180_000;
+  t.mock.timers.tick(30_000);
+  await new Promise((resolve) => setImmediate(resolve));
+  const digests = softDigests(pi);
+  assert.equal(digests.length, 1, "the window expires about 180s after restart");
+  assert.equal((digests[0] as any).details.entries.length, 1);
+  assert.equal((digests[0] as any).details.entries[0].agentLabel, "soft-window-mid");
+  assert.equal((digests[0] as any).details.entries[0].elapsedMs, 300_000);
+  assert.equal((digests[0] as any).details.entries[0].windowMs, 300_000);
+  assert.deepEqual(
+    (digests[0] as any).details.entries[0].availableActions,
+    ["inspect", "steer", "interrupt", "extend", "close"],
+  );
+  pi.events.get("session_shutdown")?.[0]();
+  resetAgentMailbox(mailbox);
+});
+
+test("a restart after a delivered window continues from its recorded arming", async (t) => {
+  setLeadEnvironment();
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const { pi, mailbox, entries } = softWindowFixture("soft-window-after", {
+    armedAt: now - 10_000,
+  });
+  // Simulate the durable delivery entry the previous process wrote.
+  (entries[0] as any).data = {
+    requestId: REQUEST_ID,
+    deliveredAt: now - 10_000,
+    nextArmedAt: now - 10_000,
+    windowMs: 300_000,
+  };
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  await pi.events.get("session_start")![0](undefined, fakeContext(entries));
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(softDigests(pi).length, 0, "a delivered window is not redelivered");
+
+  t.mock.timers.tick(30_000);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(softDigests(pi).length, 0);
+
+  now += 290_000;
+  t.mock.timers.tick(30_000);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(softDigests(pi).length, 1, "the next window continues from its arming");
+  pi.events.get("session_shutdown")?.[0]();
+  resetAgentMailbox(mailbox);
+});
+
+test("a window that expired while the lead was down is due at the first scan", async (t) => {
+  setLeadEnvironment();
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const { pi, mailbox, entries } = softWindowFixture("soft-window-expired", {
+    armedAt: now - 400_000,
+  });
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  await pi.events.get("session_start")![0](undefined, fakeContext(entries));
+  await new Promise((resolve) => setImmediate(resolve));
+  const digests = softDigests(pi);
+  assert.equal(digests.length, 1);
+  assert.equal((digests[0] as any).details.entries[0].elapsedMs, 400_000);
+  pi.events.get("session_shutdown")?.[0]();
+  resetAgentMailbox(mailbox);
+});
+
+test("an unrecorded window falls back to the durable acknowledgement time", async (t) => {
+  setLeadEnvironment();
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const label = "soft-window-fallback";
+  const identity = recoveryIdentity(label);
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  resetAgentMailbox(mailbox);
+  writeAgentState(mailbox, {
+    ...managedState(label, REQUEST_ID, identity),
+    lastActivityAt: now,
+    lastAck: {
+      requestId: REQUEST_ID,
+      accepted: true,
+      acknowledgedAt: now - 400_000,
+    },
+  });
+  const pi = fakePi({
+    exec: leadExec(
+      label,
+      "working",
+      identity.piSessionId,
+      undefined,
+      identity.piSessionId,
+      identity,
+    ),
+  });
+  registerExtension!(pi.pi as never);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  await pi.events.get("session_start")![0](undefined, fakeContext());
+  await new Promise((resolve) => setImmediate(resolve));
+  const digests = softDigests(pi);
+  assert.equal(digests.length, 1);
+  assert.equal((digests[0] as any).details.entries[0].elapsedMs, 400_000);
+  assert.equal((digests[0] as any).details.entries[0].windowMs, 300_000);
+  pi.events.get("session_shutdown")?.[0]();
+  resetAgentMailbox(mailbox);
+});
+
+test("softTimeoutMs of zero delivers no digest for an overdue window", async (t) => {
+  setLeadEnvironment();
+  updateConfig("softTimeoutMs", 0);
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const { pi, mailbox, entries } = softWindowFixture("soft-window-off", {
+    armedAt: now - 400_000,
+  });
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  await pi.events.get("session_start")![0](undefined, fakeContext(entries));
+  await new Promise((resolve) => setImmediate(resolve));
+  t.mock.timers.tick(30_000);
+  await new Promise((resolve) => setImmediate(resolve));
+  now += 300_000;
+  t.mock.timers.tick(30_000);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(softDigests(pi).length, 0);
+  updateConfig("softTimeoutMs", undefined);
+  pi.events.get("session_shutdown")?.[0]();
+  resetAgentMailbox(mailbox);
+});
+
+type SoftWindowSpec = {
+  label: string;
+  requestId: string;
+  armedAt?: number;
+  windowMs?: number;
+  lastActivityAt?: number;
+};
+
+// Build a live multi-agent controller fixture whose snapshot lists every spec,
+// so the soft-deadline pass and the health ladder see the same reality.
+function softDeadlineFixture(specs: SoftWindowSpec[]) {
+  setLeadEnvironment();
+  const fixtures = specs.map((spec) => {
+    const identity = recoveryIdentity(spec.label);
+    // Distinct durable identities; a shared session would make presence
+    // ambiguous and neither worker live.
+    identity.piSessionId = randomUUID();
+    const mailbox = agentMailboxPath(WORKSPACE, spec.label);
+    resetAgentMailbox(mailbox);
+    writeAgentState(mailbox, {
+      ...managedState(spec.label, spec.requestId, identity),
+      lastActivityAt: spec.lastActivityAt ?? Date.now(),
+      ...(spec.armedAt === undefined
+        ? {}
+        : {
+            lastAck: {
+              requestId: spec.requestId,
+              accepted: true,
+              acknowledgedAt: spec.armedAt,
+            },
+          }),
+    });
+    const entries = specs
+      .filter((candidate) => candidate.armedAt !== undefined)
+      .map((candidate) => {
+        const target = specs.find(
+          (value) => value.label === candidate.label,
+        )!;
+        return softWindowEntry(
+          target.label,
+          target.requestId,
+          target.armedAt!,
+          target.windowMs ?? 300_000,
+        );
+      });
+    return {
+      spec,
+      identity,
+      mailbox,
+      label: spec.label,
+      entries,
+      // `useAgentStatus` keeps `agent get` reporting the working lifecycle the
+      // stale-attention ladder requires; without it the diagnostic check
+      // treats the pane as unknown and skips the episode.
+      exec: leadExec(
+        spec.label,
+        "working",
+        identity.piSessionId,
+        undefined,
+        identity.piSessionId,
+        identity,
+        true,
+        "working",
+      ),
+    };
+  });
+  const entries = fixtures[0]?.entries ?? [];
+  const snapshot = () => ({
+    stdout: JSON.stringify({
+      id: AGENT_ID,
+      result: {
+        snapshot: {
+          agents: fixtures.map(
+            (fixture) =>
+              JSON.parse(
+                listResponse(
+                  fixture.label,
+                  "working",
+                  fixture.identity.piSessionId,
+                  fixture.identity,
+                ),
+              ).agents[0],
+          ),
+          panes: fixtures.map((fixture) => ({
+            pane_id: fixture.identity.paneId,
+            workspace_id: WORKSPACE,
+            cwd: "/tmp",
+            agent: fixture.label,
+            agent_status: "working",
+            agent_session: {
+              source: "herdr:pi",
+              agent: "pi",
+              kind: "id",
+              value: fixture.identity.piSessionId,
+            },
+          })),
+        },
+      },
+    }),
+    stderr: "",
+    code: 0,
+  });
+  const exec = (command: string, args: string[], options?: any) => {
+    const paneId = args[2];
+    const fixture = fixtures.find(
+      (candidate) => candidate.identity.paneId === paneId,
+    );
+    if (fixture) return fixture.exec(command, args, options);
+    if (command === "herdr" && isApiSnapshot(args)) return snapshot();
+    return fixtures[0]!.exec(command, args, options);
+  };
+  const pi = fakePi({ entries, exec });
+  registerExtension!(pi.pi as never);
+  return { pi, fixtures, entries };
+}
+
+test("two overdue workers produce one digest covering both", async (t) => {
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const { pi, fixtures, entries } = softDeadlineFixture([
+    { label: "soft-multi-one", requestId: randomUUID(), armedAt: now - 400_000 },
+    { label: "soft-multi-two", requestId: randomUUID(), armedAt: now - 350_000 },
+  ]);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  await pi.events.get("session_start")![0](undefined, fakeContext(entries));
+  await new Promise((resolve) => setImmediate(resolve));
+  const digests = softDigests(pi);
+  assert.equal(digests.length, 1, "one digest covers every due worker");
+  const details = (digests[0] as any).details;
+  assert.deepEqual(
+    details.entries
+      .map((entry: any) => [entry.agentLabel, entry.elapsedMs])
+      .sort((left: string[], right: string[]) => left[0]!.localeCompare(right[0]!)),
+    [
+      ["soft-multi-one", 400_000],
+      ["soft-multi-two", 350_000],
+    ],
+  );
+  assert.deepEqual(details.entries[0].availableActions, [
+    "inspect",
+    "steer",
+    "interrupt",
+    "extend",
+    "close",
+  ]);
+  assert.match(
+    String((digests[0] as any).content),
+    /no Agent was aborted, steered, or closed/i,
+  );
+  pi.events.get("session_shutdown")?.[0]();
+  for (const fixture of fixtures) resetAgentMailbox(fixture.mailbox);
+});
+
+test("a busy lead receives no digest until it is idle", async (t) => {
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const { pi, fixtures, entries } = softDeadlineFixture([
+    { label: "soft-busy", requestId: randomUUID(), armedAt: now - 400_000 },
+  ]);
+  const context = fakeContext(entries);
+  let idle = false;
+  context.isIdle = () => idle;
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  await pi.events.get("session_start")![0](undefined, context);
+  await new Promise((resolve) => setImmediate(resolve));
+  t.mock.timers.tick(30_000);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(softDigests(pi).length, 0, "a busy owner is never interrupted");
+  assert.equal(
+    pi.sent.some(
+      (message: any) =>
+        message.customType === "pi-herdsman-agent-attention" ||
+        message.customType === "pi-herdsman-agent-stale",
+    ),
+    false,
+    "no other attention is delivered while the owner is busy",
+  );
+
+  idle = true;
+  now += 30_000;
+  t.mock.timers.tick(30_000);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(softDigests(pi).length, 1, "the digest arrives after idling");
+  pi.events.get("session_shutdown")?.[0]();
+  for (const fixture of fixtures) resetAgentMailbox(fixture.mailbox);
+});
+
+
+test("stale attention and a soft-deadline digest are both delivered in one scan", async (t) => {
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const { pi, fixtures, entries } = softDeadlineFixture([
+    { label: "soft-coexist-stale", requestId: randomUUID(), lastActivityAt: now - 11 * 60_000 },
+    { label: "soft-coexist-due", requestId: randomUUID(), armedAt: now - 400_000 },
+  ]);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  await pi.events.get("session_start")![0](undefined, fakeContext(entries));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(
+    pi.sent.filter(
+      (message: any) => message.customType === "pi-herdsman-agent-stale",
+    ).length,
+    1,
+    "stale attention is still delivered",
+  );
+  const digests = softDigests(pi);
+  assert.equal(digests.length, 1, "the digest is not suppressed by stale attention");
+  assert.deepEqual(
+    (digests[0] as any).details.entries.map((entry: any) => entry.agentLabel),
+    ["soft-coexist-due"],
+  );
+  pi.events.get("session_shutdown")?.[0]();
+  for (const fixture of fixtures) resetAgentMailbox(fixture.mailbox);
+});
+
+test("a digest entry for a worker awaiting an answer lists reply, not interrupt", async (t) => {
+  setLeadEnvironment();
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const label = "soft-ask-controls";
+  const identity = recoveryIdentity(label);
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  resetAgentMailbox(mailbox);
+  const ask = {
+    version: 4 as const,
+    askId: randomUUID(),
+    requestId: REQUEST_ID,
+    runId: AGENT_ID,
+    ownerSessionId: LEAD_SESSION_ID,
+    workspaceId: WORKSPACE,
+    agentLabel: label,
+    paneId: identity.paneId,
+    piSessionId: identity.piSessionId,
+    question: "Keep waiting or change direction?",
+    createdAt: now - 60_000,
+  };
+  writeAgentState(mailbox, {
+    ...managedState(label, REQUEST_ID, identity),
+    lastActivityAt: now,
+    pendingAskId: ask.askId,
+    lastAck: {
+      requestId: REQUEST_ID,
+      accepted: true,
+      acknowledgedAt: now - 400_000,
+    },
+  });
+  writeAsk(mailbox, ask);
+  const entries = [
+    { customType: "pi-herdsman-agent-ask", details: ask },
+    softWindowEntry(label, REQUEST_ID, now - 400_000, 300_000),
+  ];
+  const pi = fakePi({
+    entries,
+    exec: leadExec(
+      label,
+      "blocked",
+      identity.piSessionId,
+      undefined,
+      identity.piSessionId,
+      identity,
+    ),
+  });
+  registerExtension!(pi.pi as never);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  await pi.events.get("session_start")![0](undefined, fakeContext(entries));
+  for (let index = 0; index < 4; index++)
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  const digests = softDigests(pi);
+  assert.equal(digests.length, 1, "an assignment awaiting an answer still gets a digest");
+  const [entry] = (digests[0] as any).details.entries;
+  assert.equal(entry.agentLabel, label);
+  assert.ok(
+    entry.availableActions.includes("reply"),
+    `reply is listed: ${JSON.stringify(entry.availableActions)}`,
+  );
+  assert.equal(
+    entry.availableActions.includes("interrupt"),
+    false,
+    "interrupt is withheld while the worker awaits an answer",
+  );
+  pi.events.get("session_shutdown")?.[0]();
+  resetAgentMailbox(mailbox);
+});
+
+test("soft-deadline listeners annotate the digest before delivery", async (t) => {
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const { pi, fixtures, entries } = softDeadlineFixture([
+    { label: "soft-annotated", requestId: randomUUID(), armedAt: now - 400_000 },
+  ]);
+  const payloads: any[] = [];
+  const off = (pi.pi as any).events.on("pi-herdsman:soft-deadline", (payload: any) => {
+    payloads.push(payload);
+    payload.annotations.push("peer extension: budget window closes soon");
+  });
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  await pi.events.get("session_start")![0](undefined, fakeContext(entries));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(payloads.length, 1, "the digest is published before delivery");
+  assert.deepEqual(
+    payloads[0].entries.map((entry: any) => entry.agentLabel),
+    ["soft-annotated"],
+  );
+  const digest = softDigests(pi)[0] as any;
+  assert.deepEqual(digest.details.annotations, [
+    "peer extension: budget window closes soon",
+  ]);
+  assert.match(
+    String(digest.content),
+    /peer extension: budget window closes soon/,
+  );
+  assert.doesNotMatch(String(digest.content), /budget window closes soon.*undefined/);
+  off();
+  pi.events.get("session_shutdown")?.[0]();
+  for (const fixture of fixtures) resetAgentMailbox(fixture.mailbox);
+});
+
+test("a throwing soft-deadline listener never blocks the digest", async (t) => {
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const { pi, fixtures, entries } = softDeadlineFixture([
+    { label: "soft-throwing-listener", requestId: randomUUID(), armedAt: now - 400_000 },
+  ]);
+  let deliveries = 0;
+  (pi.pi as any).events.on("pi-herdsman:soft-deadline", () => {
+    deliveries++;
+    throw new Error("listener failure");
+  });
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  await pi.events.get("session_start")![0](undefined, fakeContext(entries));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(deliveries, 1, "the failing listener was invoked");
+  const digests = softDigests(pi);
+  assert.equal(digests.length, 1, "the digest is still delivered");
+  assert.deepEqual((digests[0] as any).details.annotations, []);
+  pi.events.get("session_shutdown")?.[0]();
+  for (const fixture of fixtures) resetAgentMailbox(fixture.mailbox);
+});
+
+test("three consecutive windows produce three digests", async (t) => {
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const requestId = randomUUID();
+  const label = "soft-periodic";
+  const { pi, fixtures, entries } = softDeadlineFixture([
+    { label, requestId, armedAt: now - 300_000 },
+  ]);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  await pi.events.get("session_start")![0](undefined, fakeContext(entries));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(softDigests(pi).length, 1);
+  for (let round = 1; round < 3; round++) {
+    now += 300_000;
+    writeAgentState(fixtures[0]!.mailbox, {
+      ...readAgentState(fixtures[0]!.mailbox)!,
+      lastActivityAt: now,
+      updatedAt: now,
+    });
+    t.mock.timers.tick(30_000);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(
+      softDigests(pi).length,
+      round + 1,
+      `window ${round + 1} delivers exactly one more digest`,
+    );
+    assert.equal(
+      (softDigests(pi).at(-1) as any).details.entries[0].windowMs,
+      300_000,
+      "later windows use the configured length again",
+    );
+  }
+  pi.events.get("session_shutdown")?.[0]();
+  for (const fixture of fixtures) resetAgentMailbox(fixture.mailbox);
+});
+
+test("a resolved assignment is never included in a later digest", async (t) => {
+  setLeadEnvironment();
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+
+  // Result delivered: recovery arms the window, then the child's durable
+  // result is delivered through the exact controller delivery path.
+  {
+    const label = "soft-resolved-delivered";
+    const identity = recoveryIdentity(label);
+    const mailbox = agentMailboxPath(WORKSPACE, label);
+    resetAgentMailbox(mailbox);
+    writeAgentState(mailbox, {
+      ...managedState(label, REQUEST_ID, identity),
+      lastActivityAt: now,
+      lastAck: {
+        requestId: REQUEST_ID,
+        accepted: true,
+        acknowledgedAt: now,
+      },
+    });
+    const entries: unknown[] = [];
+    const pi = fakePi({
+      entries,
+
+      persistMessages: true,
+    });
+    registerExtension!(pi.pi as never);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    try {
+      await pi.events.get("session_start")![0](undefined, fakeContext(entries));
+      for (let index = 0; index < 4; index++)
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(softDigests(pi).length, 0, "a fresh window is not due");
+      const armed = readAgentState(mailbox)!;
+      assert.equal(armed.activeRequestId, REQUEST_ID);
+      writeAgentState(mailbox, {
+        ...armed,
+        activeRequestId: undefined,
+        completedRequestId: REQUEST_ID,
+        updatedAt: Date.now(),
+      });
+      writeResult(mailbox, {
+        version: 4,
+        runId: armed.runId,
+        requestId: REQUEST_ID,
+        ownerSessionId: armed.ownerSessionId,
+        workspaceId: armed.workspaceId,
+        agentLabel: armed.agentLabel,
+        paneId: armed.paneId,
+        status: "completed",
+        text: "delivered",
+        completedAt: Date.now(),
+      });
+      watchedResultPaths.get(`${mailbox}/result-${REQUEST_ID}.json`)?.({}, {});
+      for (let index = 0; index < 12; index++)
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(
+        pi.sent.filter(
+          (message: any) => message.customType === "pi-herdsman-agent-result",
+        ).length,
+        1,
+        "the terminal result was delivered",
+      );
+      now += 400_000;
+      t.mock.timers.tick(30_000);
+      for (let index = 0; index < 4; index++)
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(
+        softDigests(pi).length,
+        0,
+        "a delivered assignment produces no later digest",
+      );
+    } finally {
+      pi.events.get("session_shutdown")?.[0]();
+      resetAgentMailbox(mailbox);
+      t.mock.timers.reset();
+    }
+  }
+
+  // Explicit close after the window would already be due.
+  {
+    const label = "soft-resolved-closed";
+    const identity = recoveryIdentity(label);
+    const mailbox = agentMailboxPath(WORKSPACE, label);
+    resetAgentMailbox(mailbox);
+    writeAgentState(mailbox, {
+      ...managedState(label, REQUEST_ID, identity),
+      lastActivityAt: now,
+      lastAck: {
+        requestId: REQUEST_ID,
+        accepted: true,
+        acknowledgedAt: now,
+      },
+    });
+    const pi = fakePi({
+      exec: cascadeExecutor([readAgentState(mailbox)!]).exec,
+    });
+    registerExtension!(pi.pi as never);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    try {
+      await pi.events.get("session_start")![0](undefined, fakeContext());
+      for (let index = 0; index < 4; index++)
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(softDigests(pi).length, 0, "a fresh window is not due");
+      const closed = await agentTool(pi, "close").execute(
+        "id",
+        { agent: label },
+        undefined,
+        undefined,
+        fakeContext(),
+      );
+      assert.equal(closed.details.ok, true, JSON.stringify(closed.details));
+      assert.equal(readAgentState(mailbox), undefined);
+      now += 400_000;
+      t.mock.timers.tick(30_000);
+      for (let index = 0; index < 4; index++)
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(
+        softDigests(pi).length,
+        0,
+        "a closed assignment produces no later digest",
+      );
+    } finally {
+      pi.events.get("session_shutdown")?.[0]();
+      resetAgentMailbox(mailbox);
+      t.mock.timers.reset();
+    }
+  }
+
+  // Proven lost with an already-overdue window.
+  {
+    const label = "soft-resolved-lost";
+    const identity = recoveryIdentity(label);
+    const mailbox = agentMailboxPath(WORKSPACE, label);
+    resetAgentMailbox(mailbox);
+    writeAgentState(mailbox, {
+      ...managedState(label, REQUEST_ID, identity),
+      lastActivityAt: now,
+      lastAck: {
+        requestId: REQUEST_ID,
+        accepted: true,
+        acknowledgedAt: now - 400_000,
+      },
+    });
+    const pi = fakePi({
+      exec: (command, args) => {
+        if (command === "herdr" && isApiSnapshot(args))
+          return {
+            stdout: JSON.stringify({
+              id: AGENT_ID,
+              result: { snapshot: { agents: [], panes: [] } },
+            }),
+            stderr: "",
+            code: 0,
+          };
+        if (command === "herdr" && args[0] === "status")
+          return { stdout: "{}", stderr: "", code: 0 };
+        if (command === "herdr" && args[0] === "--version")
+          return { stdout: "0.8.0", stderr: "", code: 0 };
+        return { stdout: "{}", stderr: "", code: 0 };
+      },
+    });
+    registerExtension!(pi.pi as never);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    await pi.events.get("session_start")![0](undefined, fakeContext());
+    for (let index = 0; index < 4; index++)
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(
+      pi.sent.filter(
+        (message: any) => message.customType === "pi-herdsman-agent-lost",
+      ).length,
+      1,
+      "loss still receives its dedicated attention",
+    );
+    now += 30_000;
+    t.mock.timers.tick(30_000);
+    for (let index = 0; index < 4; index++)
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(
+      softDigests(pi).length,
+      0,
+      "a proven-lost assignment produces no digest",
+    );
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(mailbox);
+    t.mock.timers.reset();
+  }
 });

@@ -64,6 +64,14 @@ Maintainer-only material stays separate from product use:
 - [Documentation maintenance](development/documentation.md)
 - [Instruction and interface design](development/instruction-interface-design.md)
 
+## Architecture decisions
+
+[Architecture decision records](adr/) capture decisions that constrain the
+implementation, including the upstream behavior a fork decision supersedes.
+
+- [0013 Retain workers across assignments](adr/0013-retain-workers-across-assignments.md)
+- [0014 Advisory soft-deadline checkpoints](adr/0014-advisory-soft-deadline-checkpoints.md)
+
 The repository directories are organized by content type. The index is
 task-first so readers do not need to understand that structure before finding
 the right page.

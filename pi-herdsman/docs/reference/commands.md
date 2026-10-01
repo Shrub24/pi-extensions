@@ -30,7 +30,8 @@ diagnostic that includes the running Pi Herdsman package version.
 
 The plain command opens a native Pi selection menu titled with the running
 Pi Herdsman package version for both `/agents` and `/herdsman`, with `Running`,
-`Session stats`, `Definitions`, `Layout`, `Context retirement  on|off`, `Message limits`,
+`Session stats`, `Definitions`, `Layout`, `Context retirement  on|off`,
+`Retain workers  on|off`, `Soft timeout  <value>`, `Message limits`, `Clear idle…`,
 and `Stop all…` destinations. The
 Message limits view edits the user-wide inline attachment and mailbox payload
 limits. It is available only to a lead Pi session with UI. Current
@@ -142,6 +143,25 @@ Explicit values continue to set directly:
 ```
 
 See [Configuration](configuration.md).
+
+## `/agents` retention and soft timeout
+
+`Retain workers  on|off` toggles `retainWorkers`. Enabled, a delivered worker
+keeps its verified live process, pane, label, and mailbox and stays in the
+public `idle` state until a later `agent_continue` reuses it. Disabled, each
+worker is cleaned up after its result is delivered. See
+[Configuration](configuration.md) and [Handoffs and files](../guides/handoffs.md).
+
+`Soft timeout  <value>` edits `softTimeoutMs` from `2 min`, `5 min`, `10 min`,
+`Off`, `Custom…`, or `Reset`. `Off` writes `0`, `Reset` restores the default,
+and `Custom…` accepts an integer number of minutes. The value is the advisory
+soft-deadline window armed for each accepted assignment; expiry sends the idle
+controller one digest and never aborts, steers, or closes an agent.
+
+`Clear idle…` asks for confirmation, closes exactly the directly owned `idle`
+workers, and reports how many were cleared. Working, settling, foreign-owned,
+and durably owned descendant workers are left untouched, and no active
+assignment is interrupted. Close one exact worker with `agent_close`.
 
 ## `/agents stop`
 
