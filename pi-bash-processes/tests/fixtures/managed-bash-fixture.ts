@@ -83,19 +83,7 @@ try {
 	// A real onUpdate callback, like the TUI passes: the streaming path must be
 	// exercised, not skipped because the fixture sent undefined.
 	const partialUpdates: unknown[] = [];
-	let seededLogPath: string | undefined;
-	let command = input.command ?? "fixture command";
-	if (input.scenario === "sleep-intercept") {
-		// Seed a running task through bg_task so the intercept gate has a real
-		// managed log to match; the sleep command then references its log.
-		await bgTask.execute("seed-1", { action: "spawn", command: "sleep 120", notifyOnExit: true }, controller.signal, undefined, ctx);
-		const seeded = native.children[native.children.length - 1];
-		if (!seeded) throw new Error("managed_bash_fixture.bg_spawn_missing");
-
-		seededLogPath = (await bgTask.execute("seed-list", { action: "list" }, controller.signal, undefined, ctx) as unknown as { details: { tasks: { logFile: string }[] } }).details.tasks[0]?.logFile;
-		if (!seededLogPath) throw new Error("managed_bash_fixture.log_missing");
-		command = `sleep 60 && tail -n 5 ${seededLogPath}`;
-	}
+	const command = input.command ?? "fixture command";
 	const pending = bash.execute("bash-call-1", { command, ...(input.timeout !== undefined ? { timeout: input.timeout } : {}) }, controller.signal, (partial: unknown) => partialUpdates.push(partial), ctx);
 	let settled = false;
 	void pending.then(() => { settled = true; }, () => {});
@@ -107,18 +95,7 @@ try {
 
 	let result: ToolResult | undefined;
 	let resultError: string | undefined;
-	if (input.scenario === "sleep-intercept") {
-		// The gate substitutes a bounded wait for the sleep: the bash tool result
-		// is the label + wait output, and no second child is spawned for it.
-		// The wait attaches synchronously inside execute; once it is awaiting,
-		// complete the seeded task so the wait resolves without firing the
-		// captured 30s expiry.
-		queueMicrotask(() => queueMicrotask(() => native.children[0]?.emit("close", 0)));
-		result = await pending;
-		if (native.children.length !== 1) throw new Error(`managed_bash_fixture.unexpected_spawn=${native.children.length}`);
-		await Promise.resolve();
-	}
-	else if (input.scenario === "abort") {
+	if (input.scenario === "abort") {
 		controller.abort();
 		try { result = await pending; }
 		catch (error) { resultError = error instanceof Error ? error.message : String(error); }
@@ -201,7 +178,6 @@ try {
 		resultAction: result?.details.action,
 		resultTask: result?.details.task,
 		resultError,
-		seededLogPath,
 		composedCommand: command,
 		finalTasks: tasks,
 		exitWakeCount: exitWakes.length,

@@ -30,21 +30,10 @@ const bashRun = async (command: string) => {
 
 const spawned = (result: { details: Record<string, unknown> }) => result.details.task as { id: string };
 
-/** Bounded wait for a task's own terminal record; never part of the surface. */
-async function untilSettled(id: string, budgetMs = 20_000): Promise<void> {
-	const deadline = Date.now() + budgetMs;
-	for (;;) {
-		const task = (await host.listTasks()).find((candidate) => candidate.id === id);
-		if (task && task.status !== "running") return;
-		if (Date.now() >= deadline) return;
-		await Bun.sleep(5);
-	}
-}
-
 test("a managed command can ask the session about its own task", async () => {
 	const running = spawned(await bgTask().execute("managed-spawn", { action: "spawn", command: "sleep 30" }));
 	const done = spawned(await bgTask().execute("managed-spawn-done", { action: "spawn", command: "printf 'alpha\\nbeta\\n'" }));
-	await untilSettled(done.id);
+	await host.settledTask(done.id);
 
 	// `list` names the task and its lifecycle position, and the manager answered
 	// this from its own managed-bash call while both tasks were live.
@@ -87,7 +76,7 @@ test("a managed task can query the endpoint while it runs, and still complete", 
 	// while holding the task, this command would block until its deadline and
 	// come back as a failure instead of a result.
 	const target = spawned(await bgTask().execute("managed-target", { action: "spawn", command: "printf 'gamma\\n'" }));
-	await untilSettled(target.id);
+	await host.settledTask(target.id);
 
 	const query = spawned(await bgTask().execute("managed-query", { action: "spawn", command: `pi-bg get ${target.id} && pi-bg list` }));
 	const waited = await bgTask().execute("managed-wait", { action: "wait", id: query.id, waitSeconds: 20 }, undefined, undefined, host.ctx);

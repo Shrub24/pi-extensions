@@ -7,8 +7,8 @@ import { sendDeps } from "./fixtures/wake.js";
 test("budget exhaustion notice content and once-only delivery", () => {
 	const cap = WAKE_MANIFEST_FIELD_MAX_CHARS;
 	const rows = [
-		{ name: "short log notice", command: "printf ready", title: "task", log: "/private/log", expectedCommand: "printf ready", expectedTitle: "task", expectedLog: "/private/log" },
-		{ name: "bounded log notice", command: "Q".repeat(200_000), title: "T".repeat(5_000), log: "/tmp/" + "B".repeat(5_000), expectedCommand: "Q".repeat(cap - 1) + "…", expectedTitle: "T".repeat(cap - 1) + "…", expectedLog: "/tmp/" + "B".repeat(cap - 6) + "…" },
+		{ name: "short log notice", command: "printf ready", title: "task", log: "/private/log", expectedCommand: "printf ready", expectedTitle: "task" },
+		{ name: "bounded log notice", command: "Q".repeat(200_000), title: "T".repeat(5_000), log: "/tmp/" + "B".repeat(5_000), expectedCommand: "Q".repeat(cap - 1) + "…", expectedTitle: "T".repeat(cap - 1) + "…" },
 	];
 	expect.assertions(rows.length + 1);
 	expect(rows.length).toBeGreaterThan(0);
@@ -19,12 +19,18 @@ test("budget exhaustion notice content and once-only delivery", () => {
 		const { deps, messages } = sendDeps("ready\n", diagnostics);
 		const first = sendOutputWakeBudgetExhaustedNotice(deps, task, { maxWakes: 20, maxBytes: 20_000 });
 		const second = sendOutputWakeBudgetExhaustedNotice(deps, task, { maxWakes: 20, maxBytes: 20_000 });
-		const d = messages[0]!.message.details as { eventType: string; logFile: string; task: BackgroundTaskSnapshot };
-		expect({ first, second, count: messages.length, event: d.eventType, log: d.logFile, command: d.task.command, title: d.task.title,
-			content: messages[0]!.message.content, budget: task.outputWakeBudget, reasons: diagnostics.map((d) => d.reason),
-		}, row.name).toStrictEqual({ first: true, second: false, count: 1, event: "output-budget-exhausted", log: row.expectedLog,
+		const d = messages[0]!.message.details as { eventType: string; task: BackgroundTaskSnapshot };
+		const content = messages[0]!.message.content as string;
+		expect({ first, second, count: messages.length, event: d.eventType, command: d.task.command, title: d.task.title,
+			contentNamesTaskGet: content.includes(`bg_task action:"get" id: bg-budget`),
+			// The live log path is not a retrieval route in any mode: neither the
+			// notice text nor its details may offer one.
+			detailsCarryLiveLog: "logFile" in d,
+			contentAdvertisesLiveLog: content.includes("/private/log") || content.includes("on disk at") || content.includes(row.log),
+			budget: task.outputWakeBudget, reasons: diagnostics.map((d) => d.reason),
+		}, row.name).toStrictEqual({ first: true, second: false, count: 1, event: "output-budget-exhausted",
 			command: row.expectedCommand, title: row.expectedTitle,
-			content: expect.stringContaining(row.expectedLog),
+			contentNamesTaskGet: true, detailsCarryLiveLog: false, contentAdvertisesLiveLog: false,
 			budget: { wakes: 20, bytes: 0, exhausted: true, announcedAt: 2_000 }, reasons: ["wake-budget-exhausted"] });
 	}
 });

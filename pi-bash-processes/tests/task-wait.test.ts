@@ -102,7 +102,9 @@ test("running wait text is truthful and bounded", () => {
 	expect(text).toContain("completion wakes you as a new turn");
 	expect(text).toContain("never poll");
 	expect(text).toContain("Output so far (bounded tail):\npartial output");
-	expect(text).toContain("Full log: /tmp/bg-3.log");
+	// No live-log advertisement: the running text names the task and its tail,
+	// and the declared operations are the retrieval route.
+	expect(text).not.toContain("/tmp/bg-3.log");
 	expect(text).not.toContain("completed (exit");
 });
 

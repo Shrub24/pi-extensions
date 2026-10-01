@@ -148,3 +148,38 @@ test("output activity never resets the review interval", async () => {
 	await execute({ action: "stop", id: "all" });
 	await untilSettled([noisy.id]);
 });
+
+/**
+ * Task 3.5: the hard ceiling is absolute. Repeated inspection while the deadline
+ * approaches cannot move it, and the process is signalled at the deadline the
+ * spawn recorded — a get/list storm is not a way to keep a task alive past its
+ * budget. The legacy soft reset is exercised in the test above; this one drives
+ * the deadline itself.
+ */
+test("repeated inspection never moves the absolute hard limit", async () => {
+	const task = spawned(await execute({ action: "spawn", command: "sleep 60", timeoutSeconds: 1 }));
+	const original = task.expiresAt as number;
+	expect(original, "the spawn recorded an absolute deadline").toBeGreaterThan(Date.now() - 1_000);
+
+	const deadline = Date.now() + 20_000;
+	let inspections = 0;
+	let observed: Record<string, any> | undefined;
+	while (Date.now() < deadline) {
+		observed = await listed(task.id);
+		expect(observed?.expiresAt, "no inspection moves the recorded deadline").toBe(original);
+		inspections += 1;
+		if (observed?.status !== "running") break;
+		await Bun.sleep(5);
+	}
+
+	// A `get` storm across the deadline: the ceiling is the spawn's, not the
+	// inspection's.
+	await execute({ action: "log", id: task.id });
+	await untilSettled([task.id]);
+	const final = await listed(task.id);
+	expect(
+		{ inspections: inspections > 5, status: final?.status, reason: final?.terminationReason, hard: final?.expiresAt },
+		"the task ended at its own hard ceiling despite continuous inspection",
+	).toStrictEqual({ inspections: true, status: "timed_out", reason: "timeout", hard: original });
+	expect(final?.updatedAt, "and it ended around the deadline it recorded, not later").toBeLessThanOrEqual(original + 5_000);
+});

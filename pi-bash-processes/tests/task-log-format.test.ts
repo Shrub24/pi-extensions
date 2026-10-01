@@ -22,13 +22,12 @@ test("log formatting and descriptor rows", () => {
 		for (const row of rows) {
 			const formatted = formatTaskLog(row.output, row.path, cwd);
 			const descriptor = taskLogTruncation(row.output, row.path, cwd);
-			const safePath = row.path.length <= fieldCap ? row.path : row.path.slice(0, fieldCap - 1) + "…";
 			const expected = row.clipped
-				? `[...truncated]\n${tail}\n\n[Background log truncated. Showing last ${cap} of ${row.output.length} character(s). Full log: ${safePath}]`
+				? `[...truncated]\n${tail}\n\n[Background log truncated. Showing last ${cap} of ${row.output.length} character(s). The complete captured snapshot is available with bg_task action:"get" output:"full".]`
 				: row.output || "(empty)";
 			expect({ formatted, descriptor, bounded: formatted.length < cap + (row.path.length > fieldCap ? fieldCap : 0) + 256, excludesLongPath: !formatted.includes("L".repeat(fieldCap + 1)) }, row.name).toStrictEqual({
 				formatted: expected,
-				descriptor: row.clipped ? { direction: "tail", truncated: true, fullOutputPath: safePath, shownChars: cap, totalChars: row.output.length } : undefined,
+				descriptor: row.clipped ? { direction: "tail", truncated: true, shownChars: cap, totalChars: row.output.length } : undefined,
 				bounded: true, excludesLongPath: true,
 			});
 		}

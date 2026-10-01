@@ -17,14 +17,18 @@ const stall = { kind: "timeout", ms: LOG_WRITE_STALL_MS };
 const persist = { kind: "timeout", ms: 1_000 };
 const set = (timer: object) => ({ action: "set", ...timer });
 const clear = (timer: object) => ({ action: "clear", ...timer });
+// The tool's stop awaits the bounded termination it initiated, so it arms its own
+// wait deadline (forceKillGraceMs + the 5s confirmation window) beside the
+// task's forced-kill timer. Shutdown never does: no caller is waiting on it.
+const stopBound = { kind: "timeout", ms: 5000 + 5000 };
 // Where the row first appends a log line decides when the log flush timer is
 // armed; the task's close clears its timers and then flushes its log, the
 // fixture drains the log before reading it, and shutdown drains it. Each log
 // write arms its stall deadline and clears it when it settles.
 const timerEvents = {
-	none: [set(interval), set(persist), clear(persist), clear(interval)],
-	escalation: [set(interval), set(persist), clear(persist), set(timeout), set(flush), clear(timeout), set(stall), clear(flush), clear(stall), clear(interval)],
-	stop: [set(interval), set(persist), clear(persist), set(flush), clear(flush), set(stall), clear(stall), clear(interval), set(flush), clear(flush), set(stall), clear(stall)],
+	none: [set(interval), set(persist), set(stopBound), clear(persist), clear(stopBound), clear(interval)],
+	escalation: [set(interval), set(persist), set(stopBound), clear(persist), set(timeout), set(flush), clear(timeout), set(stall), clear(flush), clear(stall), clear(stopBound), clear(interval)],
+	stop: [set(interval), set(persist), set(stopBound), clear(persist), set(flush), clear(stopBound), clear(flush), set(stall), clear(stall), clear(interval), set(flush), clear(flush), set(stall), clear(stall)],
 	shutdown: [set(interval), set(persist), clear(interval), set(flush), clear(persist), clear(flush), set(stall), clear(stall)],
 	shutdownQuiet: [set(interval), set(persist), clear(interval), clear(persist)],
 } as const;
@@ -66,7 +70,7 @@ test("registered resource stop and shutdown rows", () => {
 		expect({ before: result.before, outcome: { kind: outcome.kind, action: outcome.action, failureValue: outcome.message?.includes("fixture_systemctl.exit=1") ?? false }, after: result.after, escalated: result.escalated, final: result.final, failureLogValues: (result.log as string).split("fixture_systemctl.exit=1").length - 1, stoppedTimers: result.stoppedTimers, stopCalls: result.stopCalls, signals: result.signals, childSignals: result.childSignals, timerEvents: result.timerEvents, remainingTimers: result.remainingTimers, unexpected: result.unexpected }, row.name).toStrictEqual({
 			before: running,
 			outcome: { kind: shutdown ? "shutdown" : row.stopFails ? "error" : "tool", action: shutdown || row.stopFails ? undefined : "stop", failureValue: !shutdown && row.stopFails },
-			after: { state: afterState, timers: shutdown ? [] : row.escalate ? [interval, timeout] : row.logFlush === "stop" ? [interval, flush] : [interval], signals: afterSignals, childSignals: [], unitCalls: afterUnits },
+			after: { state: afterState, timers: shutdown ? [] : row.escalate ? [interval, stopBound, timeout] : row.logFlush === "stop" ? [interval, flush] : [interval], signals: afterSignals, childSignals: [], unitCalls: afterUnits },
 			escalated: row.escalate ? { state: afterState, signals: allSignals, unitCalls: allUnits } : undefined,
 			final: { ...running, status: row.finalStatus, reason: row.reason, ...(stopSuppressed && row.finalStatus !== "running" ? { exitNotified: true } : {}) },
 			failureLogValues: row.failureLogValues, stoppedTimers: shutdown ? [] : [interval], stopCalls: allUnits, signals: allSignals, childSignals: [],

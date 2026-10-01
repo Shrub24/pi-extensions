@@ -2,6 +2,8 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
+import { createToolRegistry, declaredActionEnum } from "./tool-surface-harness.js";
+
 /**
  * In-process host for the background-tasks extension: the real extension
  * loaded against a minimal Pi surface, with the package's own settings file,
@@ -25,6 +27,16 @@ export interface HostTool {
 	outputSchema?: unknown;
 	/** The parameter schema Pi validates a call against before `execute`. */
 	parameters?: unknown;
+	/** Description declared to Pi, for the effective-prompt audit. */
+	description?: string;
+	/** One-line "Available tools" snippet Pi shows for an active tool. */
+	promptSnippet?: string;
+	/** Guideline bullets Pi appends while this tool is active. */
+	promptGuidelines?: string[];
+	/** How the model reaches the tool. Default: `"direct"`. */
+	exposure?: string;
+	/** Pi's `defaultActive === false` opt-out from activation on registration. */
+	defaultActive?: boolean;
 	execute(
 		toolCallId: string,
 		params: Record<string, unknown>,
@@ -57,12 +69,49 @@ export interface ExtensionHost {
 	dispatch(event: string, payload?: unknown): Promise<unknown[]>;
 	/** `bg_task list` tasks, as the model would see them. */
 	listTasks(): Promise<Record<string, any>[]>;
+	/** The names Pi declares to the model, in registration order. */
+	activeTools(): string[];
+	/** Every registered tool, whether active or not, as Pi reports it. */
+	allTools(): { name: string; description?: string; promptGuidelines?: string[]; exposure: string; actionEnum: string[] | null }[];
+	/**
+	 * The model-visible prompt surface: the "Available tools" snippet and the
+	 * Guidelines bullets Pi builds from the ACTIVE tools only. This is the audit
+	 * surface a mode's guidance has to be judged on — not the TypeBox literal a
+	 * tool happened to be registered with.
+	 */
+	systemPromptSurface(): { availableTools: string[]; guidelines: string[] };
+	/**
+	 * Bounded wait for a task's terminal record *and* its certified capture.
+	 *
+	 * `status !== "running"` alone is not terminal readiness: the process can be
+	 * closed while the writer still holds its last bytes, in which case the
+	 * product's own rule says the capture is not a complete handoff yet. A test
+	 * that waits only on `status` can therefore read a log whose final bytes have
+	 * not landed and mis-attribute a fixture race to the product. This waits on
+	 * the readiness the contract actually names, and fails loudly rather than
+	 * returning with the precondition unmet.
+	 */
+	settledTask(id: string, budgetMs?: number): Promise<Record<string, any>>;
 	dispose(): Promise<void>;
 }
 
 export interface ExtensionHostOptions {
 	/** Package settings merged over the host defaults. */
 	settings?: Record<string, unknown>;
+	/**
+	 * The session mode Pi reports on `ctx.mode`. Defaults to `"print"`, the
+	 * conservative compatibility mode, so a test opts in to the TUI surface
+	 * explicitly instead of inheriting it.
+	 */
+	mode?: string;
+	/**
+	 * An explicit tool allowlist, as `--tools` or a configured selection supplies.
+	 * Pi activates a newly registered tool only when the allowlist names it, and
+	 * never registers an excluded one.
+	 */
+	activeTools?: string[];
+	/** An explicit tool exclusion, as a configured `disabledTools` entry supplies. */
+	excludedTools?: string[];
 	/**
 	 * Extra `kendex.extensionManager.config` entries, by package id. The intent
 	 * argument's mode is read by `pi-tool-renderer` from its own package config,
@@ -132,6 +181,7 @@ export async function startExtensionHost(options: ExtensionHostOptions = {}): Pr
 	const ctx = {
 		cwd,
 		hasUI: false,
+		mode: options.mode ?? "print",
 		isIdle: () => true,
 		isProjectTrusted: () => true,
 		hasPendingMessages: () => false,
@@ -151,7 +201,20 @@ export async function startExtensionHost(options: ExtensionHostOptions = {}): Pr
 	const pi = {
 		registerTool(tool: HostTool) {
 			tools.set(tool.name, tool);
+			registry.register(tool);
 		},
+		getActiveTools: () => registry.getActiveTools(),
+		getAllTools: () =>
+			registry.getAllTools().map((tool) => ({
+				description: tool.description,
+				exposure: tool.exposure ?? "direct",
+				name: tool.name,
+				parameters: tool.parameters,
+				promptGuidelines: tool.promptGuidelines,
+				sourceInfo: { extensionPath: PACKAGE_ID, source: "extension" },
+			})),
+		setActiveTools: (names: string[]) => registry.setActiveTools(names),
+		refreshTools: () => registry.refresh(),
 		registerCommand() {},
 		registerShortcut() {},
 		registerMessageRenderer() {},
@@ -170,6 +233,9 @@ export async function startExtensionHost(options: ExtensionHostOptions = {}): Pr
 		events: { on: () => () => {} },
 	} as unknown as ExtensionAPI;
 
+	// Pi's real registry and prompt rules, shared with the surface tests.
+	const registry = createToolRegistry({ activeTools: options.activeTools, excludedTools: options.excludedTools });
+
 	const dispatch = async (event: string, payload?: unknown): Promise<unknown[]> => {
 		const results: unknown[] = [];
 		for (const handler of handlers.get(event) ?? []) results.push(await handler(payload ?? {}, ctx));
@@ -186,6 +252,12 @@ export async function startExtensionHost(options: ExtensionHostOptions = {}): Pr
 		throw error;
 	}
 
+	const readTasks = async (): Promise<Record<string, any>[]> => {
+		const listed = await tools.get("bg_task")!.execute("list-tasks", { action: "list" });
+		const tasks = listed.details.tasks;
+		return Array.isArray(tasks) ? tasks : [];
+	};
+
 	const host: ExtensionHost = {
 		root,
 		cwd,
@@ -195,10 +267,27 @@ export async function startExtensionHost(options: ExtensionHostOptions = {}): Pr
 		entries,
 		settle: () => dispatch("agent_settled"),
 		dispatch,
-		async listTasks() {
-			const listed = await tools.get("bg_task")!.execute("list-tasks", { action: "list" });
-			const tasks = listed.details.tasks;
-			return Array.isArray(tasks) ? tasks : [];
+		listTasks: readTasks,
+		activeTools: () => registry.getActiveTools(),
+		allTools: () =>
+			registry.getAllTools().map((tool) => ({
+				actionEnum: declaredActionEnum(tool),
+				description: tool.description,
+				exposure: tool.exposure ?? "direct",
+				name: tool.name,
+				promptGuidelines: tool.promptGuidelines,
+			})),
+		systemPromptSurface: () => registry.systemPromptSurface(),
+		async settledTask(id, budgetMs = 20_000) {
+			const deadline = Date.now() + budgetMs;
+			for (;;) {
+				const task = (await readTasks()).find((candidate) => candidate.id === id);
+				if (task && task.status !== "running" && task.resultReady === true) return task;
+				if (Date.now() >= deadline) {
+					throw new Error(`task ${id} did not reach a certified terminal record within ${budgetMs}ms: ${JSON.stringify(task ?? null)}`);
+				}
+				await Bun.sleep(5);
+			}
 		},
 		async dispose() {
 			try {

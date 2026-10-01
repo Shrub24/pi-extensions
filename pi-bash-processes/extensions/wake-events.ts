@@ -13,6 +13,7 @@ import type {
 	WakeEventRecord,
 	WakePendingRecord,
 } from "./types.js";
+import { taskSurfaceGuidance, type TaskToolSurface } from "./tool-surface.js";
 
 export const NOTIFY_MODES = ["always", "transition", "first-match-only"] as const;
 const MAX_WAKE_EVENTS = 50;
@@ -329,6 +330,12 @@ export interface SendTaskWakeDeps {
 	isShuttingDown: () => boolean;
 	logDiagnostic: (diagnostic: WakeDiagnostic) => void;
 	messageType: string;
+	/**
+	 * The session's declared surface, so the wake names only callable
+	 * operations. Omitted means the conservative compatibility surface, which is
+	 * what a caller with no session mode has.
+	 */
+	surface?: () => TaskToolSurface;
 	now?: () => number;
 	/**
 	 * Bounded full-output tail used as the fallback `outputTail` payload.
@@ -474,6 +481,7 @@ export function sendTaskWake(
 ): boolean {
 	ensureWakeState(task);
 	const now = deps.now ?? Date.now;
+	const guidance = taskSurfaceGuidance(deps.surface?.() ?? "compat");
 	if (eventType === "soft-timeout") {
 		if (deps.isShuttingDown() || task.status !== "running" || task.stopReason != null) return false;
 		const deliveredAt = now();
@@ -504,9 +512,9 @@ export function sendTaskWake(
 			`Background task ${task.id} is still running after ${formatElapsed(softTimeout.elapsedMs)} (soft reminder at ${formatElapsed(softTimeout.softTimeoutMs)}).`,
 			`Command: ${commandPreview}`,
 			`Output so far:\n${tail || "(no output yet)"}`,
-			`Full log: ${task.logFile}`,
+			`Inspect it with ${guidance.inspect} id: ${task.id} — Running is not success, so do not read a partial result as one.`,
 			...(hardRemaining != null ? [`Hard timeout backstop: about ${formatElapsed(hardRemaining)} remaining; it will kill the task if you let it lapse.`] : []),
-			'Choose one: continue (optionally extend with bg_task action:"extend"), inspect the log, or stop the task with bg_task action:"stop". Nothing was stopped; the exit wake is still armed.',
+			guidance.softReminderChoices,
 		].join("\n");
 		deps.sendMessage({
 			content,
@@ -587,7 +595,7 @@ export function sendTaskWake(
 			? "\nNo result will arrive; rerun the work if it is still needed."
 			: (task.exitCode ?? 0) === 0
 				? "\nIf you already consumed this result, nothing more to do; stop lingering tasks you no longer need with bg_task stop."
-				: "\nReview with bg_task log (or pi-bg read <id>); stop lingering tasks you no longer need with bg_task stop.";
+				: `\n${guidance.reviewFailures} (the failed task is ${task.id}); stop lingering tasks you no longer need with bg_task stop.`;
 	const inventory = deps.runningInventory?.();
 	const commandPreview = truncateField(task.command, WAKE_CONTENT_COMMAND_MAX_CHARS) ?? "";
 
@@ -604,9 +612,10 @@ export function sendTaskWake(
 }
 
 /**
- * Build the concise "wake budget exhausted" notice. Emitted once
- * per task when the budget guard trips, instead of further inline-tail wakes.
- * The notice points at the on-disk log so callers can recover full output.
+ * Build the concise "wake budget exhausted" notice. Emitted once per task when
+ * the budget guard trips, instead of further inline-tail wakes. The notice
+ * points at the declared result operation — never at the live log path, which is
+ * a file the manager keeps appending to, not a retrieval route.
  */
 export interface SendBudgetExhaustedNoticeDeps {
 	logDiagnostic: (diagnostic: WakeDiagnostic) => void;
@@ -614,6 +623,12 @@ export interface SendBudgetExhaustedNoticeDeps {
 	now?: () => number;
 	rememberSnapshot: (task: ManagedTask) => BackgroundTaskSnapshot;
 	sendMessage: (message: Record<string, unknown>, options: Record<string, unknown>) => void;
+	/**
+	 * The mode's declared surface, read lazily so the notice names the operation
+	 * the session actually has. Absent means the conservative compatibility
+	 * surface, which is what a caller that does not know its mode must get.
+	 */
+	surface?: () => TaskToolSurface;
 }
 
 export function sendOutputWakeBudgetExhaustedNotice(
@@ -627,10 +642,9 @@ export function sendOutputWakeBudgetExhaustedNotice(
 	const timestamp = now();
 	budget.exhausted = true;
 	budget.announcedAt = timestamp;
-	const boundedLogFile = truncateField(task.logFile, WAKE_MANIFEST_FIELD_MAX_CHARS) ?? "";
 	const content = [
 		`Background task ${task.id} output wake budget exhausted; further output wakes suppressed.`,
-		`Inspect the full log with bg_task log id: ${task.id} (or pid: ${task.pid}); on disk at ${boundedLogFile}.`,
+		`Inspect it with ${taskSurfaceGuidance(deps.surface?.() ?? "compat").inspect} id: ${task.id} (or pid: ${task.pid}).`,
 		`Budget caps: ${Math.max(0, Math.floor(limits.maxWakes))} wakes / ${Math.max(0, Math.floor(limits.maxBytes))} inline bytes.`,
 	].join("\n");
 	const compactTask = compactBackgroundTaskSnapshot(deps.rememberSnapshot(task));
@@ -641,7 +655,6 @@ export function sendOutputWakeBudgetExhaustedNotice(
 			details: {
 				deliveredAt: timestamp,
 				eventType: "output-budget-exhausted",
-				logFile: boundedLogFile,
 				outputBytes: task.outputBytes,
 				task: compactTask,
 				wakeBudget: {

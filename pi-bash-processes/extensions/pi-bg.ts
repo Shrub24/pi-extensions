@@ -1,16 +1,18 @@
 // The generated `pi-bg` CLI: a POSIX shell wrapper plus the Node client it
 // delegates to.
 //
-// Two halves, for two different jobs:
+// One surface, declared:
 //
-//   * `path|peek|read` are the legacy log-file helpers. They are what the
-//     inferred-read channel knows about today, so they stay until the declared
-//     operations have passed their acknowledgment gate. `read` still appends to
-//     the consume log.
-//   * `get|list|stop` are the declared operations. They cannot be answered from
-//     the filesystem — readiness, the review clock, and a confirmed stop live in
-//     the manager — so they are sent over the session-private socket from
+//   * `get|list|stop` are the operations. They cannot be answered from the
+//     filesystem — readiness, the review clock, and a confirmed stop live in the
+//     manager — so they are sent over the session-private socket from
 //     `bridge.ts`.
+//
+// The former `path|peek|read` log-file helpers are gone. They read the live log
+// straight off disk, which bypassed the completion acknowledgment entirely
+// (`read` even cleared the exit wake from another channel), so the wrapper now
+// answers them with a migration error rather than quietly handing back a log the
+// manager has not certified.
 //
 // The client is a plain Node program rather than a shell one because a POSIX
 // shell cannot open a Unix socket without an extra tool, and because the
@@ -47,18 +49,28 @@ export function piBgWrapperScript(): string {
 #   pi-bg list                   running and finished tasks in this session
 #   pi-bg stop <task-id>         stop a task and report the confirmed result
 #
-# Legacy log helpers (kept for the pre-declaration surface):
-#   pi-bg path <task-id>         print the log file path (no consumption)
-#   pi-bg peek <task-id> [n]     print the last n lines (default 40), no consumption
-#   pi-bg read <task-id> [n]     print the last n lines and consume the exit wake
 set -uo pipefail
 usage() {
 	cat >&2 <<'USAGE'
 usage: pi-bg get <task-id> [--output]
        pi-bg list
        pi-bg stop <task-id>
-       pi-bg path|peek|read <task-id> [lines]
 USAGE
+	exit 2
+}
+# A retired live-path helper. Reading a task's log file directly would bypass the
+# completion acknowledgment (the result is only certified once the manager has
+# settled its capture), so it is refused with the operation that replaces it
+# instead of quietly returning a file the manager has not certified.
+retired() {
+	cat >&2 <<'RETIRED'
+pi-bg: the log-file helpers (path, peek, read) were removed: they read a task's live log
+        directly, which bypassed completion acknowledgment. Use:
+          pi-bg get <task-id>            the task's result, readiness, and output preview
+          pi-bg get <task-id> --output   the complete immutable captured snapshot on stdout
+          pi-bg list                     running and finished tasks in this session
+          pi-bg stop <task-id>           stop a task and report the confirmed result
+RETIRED
 	exit 2
 }
 client() {
@@ -77,34 +89,9 @@ client() {
 	fi
 	exec "$runtime" "$here/${PI_BG_CLIENT_FILE}" "$@"
 }
-# pi-bg reads log files itself; it must not go through the read shims or its
-# own peek would count as a shim-reported read.
-real_tail() { PATH="\${PI_BG_REAL_PATH:-$PATH}" command -v tail; }
-legacy() {
-	local cmd="$1"; shift
-	local id="\${1:-}"; [ -n "$id" ] || usage; shift || true
-	local lines="\${1:-40}"
-	local dir="\${PI_BG_LOG_DIR:?PI_BG_LOG_DIR not set}"
-	local file
-	file="$(ls -1t "$dir/$id"-*.log 2>/dev/null | head -n 1 || true)"
-	if [ -z "$file" ]; then echo "pi-bg: no log for $id in $dir" >&2; exit 1; fi
-	case "$cmd" in
-		path) printf '%s\\n' "$file" ;;
-		peek) printf '%s\\n' "$file"; "$("real_tail")" -n "$lines" "$file" ;;
-		read)
-			printf '%s\\n' "$file"
-			$("real_tail") -n "$lines" "$file"
-			if [ -n "\${PI_BG_CONSUME_LOG:-}" ]; then
-				printf '%s\\n' "$file" >>"$PI_BG_CONSUME_LOG"
-				echo "kendex: consumed the exit wake for $id — you will not be woken for it." >&2
-			fi
-			;;
-		*) usage ;;
-	esac
-}
 cmd="\${1:-}"; [ -n "$cmd" ] || usage; shift || true
 case "$cmd" in
-	path|peek|read) legacy "$cmd" "$@" ;;
+	path|peek|read) retired ;;
 	get|list|stop) client "$cmd" "$@" ;;
 	*) usage ;;
 esac

@@ -71,7 +71,6 @@ export function settleTaskWaitWaiter(
 export interface TaskWaitRunningText {
 	elapsedText: string;
 	id: string;
-	logFile: string;
 	outputTail: string;
 	pid: number;
 	waitSeconds: number;
@@ -88,7 +87,6 @@ export function formatTaskWaitRunningText(text: TaskWaitRunningText): string {
 	const lines = [
 		`Still Running ${text.id} (pid ${text.pid}) after a ${text.elapsedText} bounded wait (wait window ${text.waitSeconds}s). The command has not finished; Running is not success, and its output or artifacts are not usable yet.`,
 		`Do not call wait again as the default. If other work remains, continue it now — remaining tasks keep running and each completion wakes you as a new turn. End the turn when nothing independent is left; another bounded wait only for the narrow case where this turn cannot proceed (never poll).`,
-		`Full log: ${text.logFile}`,
 	];
 	if (text.outputTail) lines.splice(1, 0, `Output so far (bounded tail):\n${text.outputTail}`);
 	return lines.join("\n\n");

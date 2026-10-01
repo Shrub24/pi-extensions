@@ -1,6 +1,6 @@
 import { afterAll, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -15,7 +15,8 @@ import {
 	taskGeneration,
 } from "../extensions/bridge.js";
 import { PI_BG_CLIENT_FILE } from "../extensions/pi-bg.js";
-import { installReadShims } from "../extensions/read-shim.js";
+import { installDeclaredCli } from "../extensions/cli-install.js";
+import { declaredCliEnv } from "../extensions/settings.js";
 
 // The declared CLI's transport, and the early feasibility gate for the whole
 // phase: two sessions answering side by side without seeing each other's tasks,
@@ -26,7 +27,7 @@ import { installReadShims } from "../extensions/read-shim.js";
 const root = mkdtempSync(join(tmpdir(), "pi-bg-bridge-"));
 afterAll(() => rmSync(root, { recursive: true, force: true }));
 
-const shimDir = installReadShims(join(root, "shims"))!;
+const binDir = installDeclaredCli(join(root, "bin"))!;
 
 interface FakeTask {
 	id: string;
@@ -103,6 +104,11 @@ test("a request line is validated before any handler sees it", () => {
 		['{"v":1,"op":"stop","id":"  "}', "malformed"],
 		['{"v":1,"op":"get","id":"bg-1","output":"scrollback"}', "malformed"],
 		['{"v":1,"op":"get","id":"bg-1","session":7}', "malformed"],
+		// The receipt is its own operation: a token is what it carries, and an
+		// output selection on it is a caller confusing it with a read.
+		['{"v":1,"op":"receipt"}', "malformed"],
+		['{"v":1,"op":"receipt","token":"  "}', "malformed"],
+		['{"v":1,"op":"receipt","token":"t","output":"full"}', "malformed"],
 	];
 	for (const [line, code] of cases) {
 		const parsed = parseBridgeRequest(line);
@@ -112,6 +118,9 @@ test("a request line is validated before any handler sees it", () => {
 	const ok = parseBridgeRequest('{"v":1,"op":"get","id":"bg-3","output":"full","session":"s","generation":"bg-3@1"}');
 	expect(ok.ok).toBe(true);
 	if (ok.ok) expect(ok.request).toEqual({ v: 1, op: "get", id: "bg-3", output: "full", session: "s", generation: "bg-3@1" });
+	const receipt = parseBridgeRequest('{"v":1,"op":"receipt","token":"bg-3:bg-3@1:abc"}');
+	expect(receipt.ok).toBe(true);
+	if (receipt.ok) expect(receipt.request).toEqual({ v: 1, op: "receipt", token: "bg-3:bg-3@1:abc" });
 	// A response is validated the same way, so a wrong-version endpoint cannot be
 	// mistaken for a live one.
 	expect(parseBridgeResponse('{"v":1,"ok":false,"error":{"code":"unknown-task","message":"nope"}}')).toStrictEqual({
@@ -243,23 +252,20 @@ const bashBin = (() => {
 })();
 
 /**
- * The PATH a managed shell sees. The ambient PATH may already carry this
- * machine's own shim directory, and a shim that finds *itself* as the real
- * binary recurses forever; the product avoids that by exporting
- * PI_BG_REAL_PATH, so the fixture does the same and drops any outer shim
- * overlay from the base.
+ * The PATH a managed shell sees, minus any outer installation of this package's
+ * own bin directory: a wrapper that finds *itself* on PATH would answer its own
+ * lookup, so the fixture starts from the ambient PATH with that overlay removed.
  */
 const basePath = (process.env.PATH ?? "")
 	.split(":")
 	.filter((entry) => entry && !entry.includes("kendex-pi-bg"))
 	.join(":");
-const managedPath = [shimDir, basePath].filter(Boolean).join(":");
+const managedPath = [binDir, basePath].filter(Boolean).join(":");
 
 /** The environment a managed command runs with, as the product assembles it. */
 const managedEnv = (extra: Record<string, string | undefined> = {}): Record<string, string | undefined> => ({
 	HOME: root,
 	PATH: managedPath,
-	PI_BG_REAL_PATH: basePath,
 	PI_BG_RUNTIME: process.execPath,
 	...extra,
 });
@@ -268,7 +274,7 @@ const managedEnv = (extra: Record<string, string | undefined> = {}): Record<stri
 async function runCli(args: string[], env: Record<string, string | undefined>): Promise<CliRun> {
 	const { spawn } = await import("node:child_process");
 	return new Promise<CliRun>((resolve, reject) => {
-		const child = spawn(bashBin, [join(shimDir, "pi-bg"), ...args], { env: managedEnv(env) });
+		const child = spawn(bashBin, [join(binDir, "pi-bg"), ...args], { env: managedEnv(env) });
 		let stdout = "";
 		let stderr = "";
 		const timer = setTimeout(() => {
@@ -329,6 +335,11 @@ test("pi-bg list, get and stop are answered by the session endpoint", async () =
 		const usage = await runCli(["frobnicate"], env);
 		expect(usage.status).toBe(2);
 		expect(usage.stderr).toContain("usage: pi-bg");
+		// The documented surface is the installed surface: every command and flag
+		// the README names is one this CLI accepts.
+		for (const documented of ["pi-bg get <task-id> [--output]", "pi-bg list", "pi-bg stop <task-id>"]) {
+			expect(usage.stderr, `the usage text documents ${documented}`).toContain(documented);
+		}
 	} finally {
 		await server.stop();
 	}
@@ -372,7 +383,7 @@ test("without an endpoint or an interpreter the CLI says so instead of guessing"
 	// fallback to something that might answer differently.
 	const { spawn } = await import("node:child_process");
 	const noRuntime = await new Promise<CliRun>((resolve, reject) => {
-		const child = spawn(bashBin, [join(shimDir, "pi-bg"), "list"], {
+		const child = spawn(bashBin, [join(binDir, "pi-bg"), "list"], {
 			env: { HOME: root, PATH: "/nonexistent", PI_BG_SOCKET: join(root, "nothing.sock") },
 		});		let stderr = "";
 		child.stderr?.on("data", (chunk: Buffer) => {
@@ -387,6 +398,74 @@ test("without an endpoint or an interpreter the CLI says so instead of guessing"
 
 test("the endpoint is installed beside the CLI and reachable only from this session", () => {
 	// The client ships with the wrapper, so a PATH lookup finds both.
-	expect(existsSync(join(shimDir, PI_BG_CLIENT_FILE))).toBe(true);
-	expect(existsSync(join(shimDir, "pi-bg"))).toBe(true);
+	expect(existsSync(join(binDir, PI_BG_CLIENT_FILE))).toBe(true);
+	expect(existsSync(join(binDir, "pi-bg"))).toBe(true);
+});
+
+test("assembling the managed-shell environment signals nothing", () => {
+	// Socket hygiene must not become an observable side effect of building an
+	// environment. Probing another process with `kill(pid, 0)` *is* a process
+	// signal to every caller that watches them, and a managed shell is handed its
+	// environment on unrelated code paths — spawn, wait, review. Nothing here has
+	// any business signalling a process.
+	const previousTaskDir = process.env.PI_BG_TASK_DIR;
+	const previousHome = process.env.HOME;
+	const isolation = mkdtempSync(join(tmpdir(), "managed-env-"));
+	// A stale endpoint file whose owning pid is certainly gone: this is exactly
+	// what a liveness probe would have been tempted to signal.
+	const runtimeDir = join(process.env.XDG_RUNTIME_DIR?.startsWith("/") ? process.env.XDG_RUNTIME_DIR : tmpdir(), "kendex-pi-bg-ipc");
+	mkdirSync(runtimeDir, { recursive: true });
+	const staleSocket = join(runtimeDir, `signals-guard-999999.sock`);
+	writeFileSync(staleSocket, "");
+	const realKill = process.kill;
+	const signalled: unknown[] = [];
+	process.kill = ((...args: unknown[]) => {
+		signalled.push(args);
+		return true;
+	}) as unknown as typeof process.kill;
+	try {
+		process.env.PI_BG_TASK_DIR = isolation;
+		process.env.HOME = isolation;
+		const env = declaredCliEnv({ sessionId: "sess-A", socketPath: join(isolation, "session.sock") });
+		expect(env.PI_BG_SESSION).toBe("sess-A");
+		expect(env.PI_BG_SOCKET).toBe(join(isolation, "session.sock"));
+	} finally {
+		process.kill = realKill;
+		if (previousTaskDir === undefined) delete process.env.PI_BG_TASK_DIR;
+		else process.env.PI_BG_TASK_DIR = previousTaskDir;
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+		rmSync(staleSocket, { force: true });
+		rmSync(isolation, { recursive: true, force: true });
+	}
+	expect(signalled, "building the environment must not signal any process").toEqual([]);
+});
+
+/**
+ * Task 4.4: the retired live-path helpers are refused with an actionable
+ * migration instead of quietly returning a log the manager has not certified.
+ * Reading a task's log file directly would bypass the completion acknowledgment,
+ * so no compatibility path may still offer it.
+ */
+test("the retired live-path CLI helpers refuse with a migration, not a bypass", async () => {
+	for (const helper of ["path", "peek", "read"]) {
+		const run = await runCli([helper, "bg-1"], {});
+		expect(run.status, `pi-bg ${helper} must be a usage refusal`).toBe(2);
+		expect(run.stdout, `pi-bg ${helper} must write no path or output`).toBe("");
+		expect(run.stderr).toContain("were removed");
+		expect(run.stderr, "the refusal names the replacement operation").toContain("pi-bg get <task-id>");
+		expect(run.stderr, "the refusal says why it is gone").toContain("bypassed completion acknowledgment");
+		// No contact with any endpoint: the refusal happens before the CLI is even
+		// consulted, so no receipt can be produced for it.
+		expect(run.stderr).not.toContain("kendex: result=ok");
+	}
+});
+
+test("the installed CLI offers only the declared operations in its help", async () => {
+	const run = await runCli([], {});
+	expect(run.status).toBe(2);
+	expect(run.stderr).toContain("usage: pi-bg get <task-id> [--output]");
+	expect(run.stderr).toContain("pi-bg list");
+	expect(run.stderr).toContain("pi-bg stop <task-id>");
+	expect(run.stderr, "the removed helpers are not advertised as usage").not.toContain("pi-bg path|peek|read");
 });

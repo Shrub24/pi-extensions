@@ -326,7 +326,15 @@ export interface BackgroundTaskEventDetails {
 
 export interface BackgroundLogTruncation {
 	direction: "tail";
-	fullOutputPath: string;
+	/**
+	 * Where a complete snapshot can be read, and only when that is an immutable
+	 * artifact the caller can hand over. A mutable live log is never advertised
+	 * here: it is not a complete result, and naming it invites a read of a file
+	 * the producer may still be appending to. Absent means the complete result is
+	 * available through the declared retrieval
+	 * (`bg_task action:"get" output:"full"`).
+	 */
+	fullOutputPath?: string;
 	shownChars: number;
 	totalChars: number;
 	truncated: true;

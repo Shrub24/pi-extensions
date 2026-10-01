@@ -1,5 +1,12 @@
 import { expect, test } from "bun:test";
 import { WAKE_MANIFEST_FIELD_MAX_CHARS as cap } from "../extensions/wake-events.js";
+
+// A stop/get result is now a whole result envelope around the bounded command —
+// identity, state, outcome, output, acknowledgment — so its budget is a small
+// multiple of the command's own bound rather than a single line's. The point of
+// the bound is unchanged and is what the rows assert directly: the 100k command
+// is retained only in its bounded form and never leaks whole.
+const envelopeCap = cap * 4;
 import { runSpawnFixture, SPAWN_FIXTURE_TIMEOUT_MS } from "./fixtures/spawn-child-runner.js";
 
 interface StopObservation {
@@ -30,9 +37,9 @@ test("registered stop content rows", () => {
 		const result = observed.stopResult;
 		expect({
 			kind: observed.outcome.kind,
-			content: result?.content.map((part) => ({ type: part.type, bounded: part.text.length < cap + 128, commandRetained: part.text.includes(expectedCommand), taskRetained: part.text.includes("bg-1"), excludesBomb: !part.text.includes(row.bomb.repeat(cap + 1)) })),
+			content: result?.content.map((part) => ({ type: part.type, bounded: part.text.length < envelopeCap, commandRetained: part.text.includes(expectedCommand), taskRetained: part.text.includes("bg-1"), excludesBomb: !part.text.includes(row.bomb.repeat(cap + 1)) })),
 			details: result ? { action: result.details.action, id: result.details.task.id, command: result.details.task.command, bounded: result.details.task.command.length <= cap, excludesBomb: !result.details.task.command.includes(row.bomb.repeat(cap + 1)) } : undefined,
-			notifications: observed.notifications.map(([text, kind]) => ({ kind, bounded: text.length < cap + 128, commandRetained: text.includes(expectedCommand), taskRetained: text.includes("bg-1"), excludesBomb: !text.includes(row.bomb.repeat(cap + 1)) })),
+			notifications: observed.notifications.map(([text, kind]) => ({ kind, bounded: text.length < envelopeCap, commandRetained: text.includes(expectedCommand), taskRetained: text.includes("bg-1"), excludesBomb: !text.includes(row.bomb.repeat(cap + 1)) })),
 			state: { id: observed.after.state.id, status: observed.after.state.status },
 			remainingTimers: observed.remainingTimers, unexpected: observed.unexpected,
 		}, row.name).toStrictEqual({

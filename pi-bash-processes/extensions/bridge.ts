@@ -76,6 +76,13 @@ export type BridgeErrorCode =
 	| "expired"
 	| "unconfirmed-stop"
 	| "capture-incomplete"
+	/**
+	 * The session's receipt store is saturated with handoffs that cannot be
+	 * retired, so a read could be served but never acknowledged. Distinct from
+	 * `unavailable`: the endpoint answered, and the answer is that this read
+	 * cannot be made settleable.
+	 */
+	| "capacity"
 	| "unavailable"
 	| "receipt-unaccepted"
 	| "internal";
@@ -422,9 +429,13 @@ export function createBridgeServer(deps: BridgeServerDeps): BridgeServer {
 			const active = server;
 			server = null;
 			serving = false;
-			if (active) await new Promise<void>((resolve) => active.close(() => resolve()));
+			// Tear the live connections down *before* waiting on the listener: a
+			// socket whose client is still attached keeps `close` pending, and
+			// stopping happens on the session-shutdown path, which must not wait on a
+			// client that may never hang up.
 			for (const socket of [...connections]) socket.destroy();
 			connections.clear();
+			if (active) await new Promise<void>((resolve) => active.close(() => resolve()));
 			try {
 				unlinkSync(deps.socketPath);
 			} catch {

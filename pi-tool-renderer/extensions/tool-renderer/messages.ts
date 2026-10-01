@@ -872,6 +872,23 @@ function padAnsiLine(line: string, width: number): string {
 const codeHighlightCache = new Map<string, string[]>();
 const CODE_HIGHLIGHT_CACHE_MAX = 120;
 
+/**
+ * Read-only size of the code-highlight cache, for `/renderdebug memory`. The key
+ * is a copy of the block's code and the value its highlighted lines, so both
+ * character totals are reported: they are what the cache holds now, capped by
+ * entry count only. `String.length` is O(1), so this costs one pass over at most
+ * `CODE_HIGHLIGHT_CACHE_MAX` entries and never runs on a render path.
+ */
+export function codeHighlightCacheStats(): { entries: number; keyChars: number; valueChars: number } {
+	let keyChars = 0;
+	let valueChars = 0;
+	for (const [key, lines] of codeHighlightCache) {
+		keyChars += key.length;
+		for (const line of lines) valueChars += line.length;
+	}
+	return { entries: codeHighlightCache.size, keyChars, valueChars };
+}
+
 function highlightCodeCached(markdownTheme: any, code: string, lang: string | undefined): string[] {
 	const key = `${lang ?? ""}\u0000${code}`;
 	const cached = codeHighlightCache.get(key);

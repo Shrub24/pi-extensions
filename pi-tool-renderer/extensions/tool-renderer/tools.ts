@@ -80,6 +80,16 @@ export function getBuiltInTool(agent: any, cwd: string, toolName: BuiltInToolNam
 }
 
 /**
+ * Read-only size of the built-in tool cache, for `/renderdebug memory`. One entry
+ * per distinct working directory, each holding the seven host tool objects this
+ * package delegates execution to. Never cleared, so the count is a good
+ * cross-session indicator rather than a per-session one.
+ */
+export function builtInToolCacheStats(): { cwds: number } {
+	return { cwds: builtInToolCache.size };
+}
+
+/**
  * Fields of the wrapped AgentTool that Pi's agent loop reads, which a
  * replacement definition carries unchanged. `description`, `parameters` and
  * `constrainedSampling` are the tool as declared to the model, the last being

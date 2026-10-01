@@ -226,7 +226,7 @@ try {
 			await settle();
 			await settle();
 		} else {
-			stopMessage = (await execute({ action: "stop", id: "bg-1" })).content[0]!.text;
+			stopMessage = (await execute({ action: "stop", id: "bg-1" })).details.stopMessage as string;
 			timeoutArmed = native.activeTimers().some((timer) => timer.kind === "timeout" && timer.ms === 60_000);
 			if (timeoutArmed) native.fireTimeout(60_000);
 			signals = [...native.signals];
@@ -254,11 +254,17 @@ try {
 			await settle();
 		}
 		const whileHeld = { heldAppends: native.heldAppends(), stdoutPaused: child.stdout.isPaused() };
-		const stopMessage = (await execute({ action: "stop", id: "bg-1" })).content[0]!.text.split(" ")[0];
+		const signalsBefore = native.signals.length;
+		const pendingStop = execute({ action: "stop", id: "bg-1" });
+		// The stop is pending until the task reaches a terminal state, so its signal
+		// has to be out before the boundary below is driven.
+		for (let spin = 0; spin < 400 && native.signals.length === signalsBefore; spin++) await Bun.sleep(5);
 		native.fireTimeout(LOG_WRITE_STALL_MS);
 		await settleUntil(() => !child.stdout.isPaused());
 		const afterStall = { heldAppends: native.heldAppends(), stdoutPaused: child.stdout.isPaused() };
+		// The end the stop is waiting for.
 		child.emit("close", null);
+		const stopMessage = ((await pendingStop).details.stopMessage as string).split(" ")[0];
 		// The stop was agent-authored, so this exit sends no wake: the bg_task
 		// stop result already reported it. The stall deadline still has to let
 		// the task finalize, which the outcome below reads.

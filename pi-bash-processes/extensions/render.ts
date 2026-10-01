@@ -46,7 +46,7 @@ export function splitOutputLines(output: string): string[] {
 	const lines = text.split(/\r?\n/);
 	const maxLines = Math.max(20, Math.floor(settingNumber("dashboardOutputMaxLines", 800)));
 	if (lines.length <= maxLines) return lines;
-	return [`${glyphs().ellipsis} ${lines.length - maxLines} older line(s) omitted from dashboard; use bg_task log or the Log file for full output`, ...lines.slice(-maxLines)];
+	return [`${glyphs().ellipsis} ${lines.length - maxLines} older line(s) omitted from dashboard; use bg_task get output:"full" for the complete capture`, ...lines.slice(-maxLines)];
 }
 
 export function acquirekendexModalLock(): () => void {
@@ -200,7 +200,6 @@ export function renderTaskDetails(task: BackgroundTaskSnapshot, theme: Theme, cw
 	}
 	lines.push(
 		`${bgTree(theme, "├", cwd)}${theme.fg("muted", "Cwd")}: ${current.cwd}`,
-		`${bgTree(theme, "├", cwd)}${theme.fg("muted", "Log")}: ${current.logFile}`,
 	);
 	if (current.status === "running" && current.expiresAt != null) lines.push(`${bgTree(theme, "├", cwd)}${theme.fg("muted", "Timeout")}: ${formatRelativeTime(current.expiresAt)}`);
 	lines.push(
@@ -336,9 +335,9 @@ export function renderTaskEventMessage(
 	const lineLimit = outputLineLimit();
 	const output = takeTailLines(preview, lineLimit);
 	lines.push("", theme.fg("accent", theme.bold("Recent output")));
-	if (output.hidden > 0) lines.push(`${bgTree(theme, "│")}${theme.fg("muted", `… ${output.hidden} older line(s); full log: ${task.logFile}`)}`);
+	if (output.hidden > 0) lines.push(`${bgTree(theme, "│")}${theme.fg("muted", `… ${output.hidden} older line(s)`)}`);
 	lines.push(...(output.lines.length ? output.lines : ["(no output yet)"]).map((line) => `${bgTree(theme, "│")}${theme.fg("dim", line)}`));
-	if (output.total >= lineLimit) lines.push(`${bgTree(theme, "└")}${theme.fg("muted", `Full background log: ${task.logFile}`)}`);
+	if (output.total >= lineLimit) lines.push(`${bgTree(theme, "└")}${theme.fg("muted", "Full result: bg_task get output:\"full\"")}`);
 	return renderRuledBackgroundMessage(lines.join("\n"), theme);
 }
 
@@ -364,9 +363,9 @@ function renderBgLogResult(task: BackgroundTaskSnapshot | undefined, output: str
 	)}`;
 	if (expanded && task) text += `\n${renderTaskDetails(task, theme, cwd).join("\n")}`;
 	if (expanded && output) {
-		if (outputLines.hidden > 0) text += `\n${bgTree(theme, "│", cwd)}${theme.fg("muted", `… ${outputLines.hidden} older line(s); full log: ${task?.logFile ?? "available in details"}`)}`;
+		if (outputLines.hidden > 0) text += `\n${bgTree(theme, "│", cwd)}${theme.fg("muted", `… ${outputLines.hidden} older line(s)`)}`;
 		text += `\n${outputLines.lines.map((line) => `${bgTree(theme, "│", cwd)}${theme.fg("dim", line)}`).join("\n")}`;
-		if (task) text += `\n${bgTree(theme, "└", cwd)}${theme.fg("muted", `Full background log: ${task.logFile}`)}`;
+		if (task) text += `\n${bgTree(theme, "└", cwd)}${theme.fg("muted", "Full result: bg_task get output:\"full\"")}`;
 	} else if (!expanded && output && toolRenderMode(cwd) === "stacked") {
 		if (outputLines.lines.length > 0) text += `\n${bgTree(theme, "└", cwd)}${theme.fg("muted", compactText(outputLines.lines[outputLines.lines.length - 1] ?? "", 120))}`;
 	}

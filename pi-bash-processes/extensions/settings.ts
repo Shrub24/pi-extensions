@@ -1,10 +1,10 @@
-import { existsSync, readdirSync, rmSync, statSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
 
 import { CONFIG_ID } from "./constants.js";
 import { expandHome, piUserDir, readPackageConfig } from "./package-config.js";
-import { installReadShims } from "./read-shim.js";
+import { installDeclaredCli } from "./cli-install.js";
 import { BRIDGE_SOCKET_SUFFIX } from "./bridge.js";
 import type { kendexConfig } from "./types.js";
 
@@ -54,9 +54,9 @@ export function taskLanesRoot(): string {
 	return join(taskDir(), "lanes");
 }
 
-/** Directory holding the managed-bash read shims (cat/tail/head/…, pi-bg). */
-export function shimDir(): string {
-	return join(taskDir(), "shims");
+/** Directory holding the declared `pi-bg` CLI installed for managed shells. */
+export function binDir(): string {
+	return join(taskDir(), "bin");
 }
 
 /**
@@ -86,92 +86,17 @@ function safeSessionName(sessionId: string): string {
 	return sessionId.replace(/[^\w.-]+/g, "_") || "session";
 }
 
-let prunedBridgeSockets = false;
-/**
- * Drops control sockets whose owning process is gone. Best effort, once per
- * process. Liveness is the pid the name records, so this needs no probing: a
- * socket left by a crashed session is removed the next time any session starts,
- * and one still owned by a live process is left alone.
- */
-function pruneStaleBridgeSockets(): void {
-	if (prunedBridgeSockets) return;
-	prunedBridgeSockets = true;
-	const dir = bridgeRuntimeDir();
-	let entries: string[];
-	try {
-		entries = readdirSync(dir);
-	} catch {
-		return;
-	}
-	for (const entry of entries) {
-		if (!entry.endsWith(BRIDGE_SOCKET_SUFFIX)) continue;
-		const owner = /-([0-9]+)\.sock$/.exec(entry);
-		if (!owner) continue;
-		const pid = Number(owner[1]);
-		if (pid === process.pid) continue;
-		let alive = true;
-		try {
-			process.kill(pid, 0);
-		} catch (error) {
-			alive = (error as NodeJS.ErrnoException).code === "EPERM";
-		}
-		if (alive) continue;
-		try {
-			rmSync(join(dir, entry), { force: true });
-		} catch {
-			// Best effort.
-		}
-	}
-}
-
-/**
- * Append-only file the read shims write to when a managed log is read.
- * Drained (and truncated) before any wake is handed over, so a read that
- * happened while the run was still going cancels that task's wake.
- *
- * Per process, not one shared file: the task dir is shared by every Pi session
- * on the machine, while a drain matches records against its own task map and
- * truncates whatever it read. With one shared file, any other session's flush
- * could swallow a record before the session that owns the task saw it — the
- * read was silently lost and the exit wake fired anyway.
- */
-export function consumeLogPath(): string {
-	return join(taskDir(), `consumed-${process.pid}.log`);
-}
-
-let prunedConsumeLogs = false;
-/** Drops per-process consume logs whose session is long gone. Best effort, once per process. */
-function pruneStaleConsumeLogs(): void {
-	if (prunedConsumeLogs) return;
-	prunedConsumeLogs = true;
-	try {
-		const dir = taskDir();
-		const cutoff = Date.now() - 24 * 60 * 60 * 1000;
-		for (const entry of readdirSync(dir)) {
-			if (!/^consumed-\d+\.log$/.test(entry) || entry === `consumed-${process.pid}.log`) continue;
-			const file = join(dir, entry);
-			try {
-				if (statSync(file).mtimeMs < cutoff) rmSync(file, { force: true });
-			} catch {
-				// Best effort.
-			}
-		}
-	} catch {
-		// Best effort.
-	}
-}
-
 /** The directory one session's task logs live in, under taskLanesRoot. */
 export function taskLaneDir(sessionId: string): string {
 	return join(taskLanesRoot(), sessionId.replace(/[^\w.-]+/g, "_"));
 }
 
 /**
- * The environment for a managed shell. `laneDir` is the task lane whose logs
- * the read shims must recognise, so a read of a task log is recorded against
- * the session that owns it.
+ * The environment for a managed shell. `bridge` is the declared CLI's half:
+ * without it a `pi-bg get|list|stop` reports an unavailable endpoint instead of
+ * guessing at live state.
  */
-export function taskEnv(laneDir: string, bridge?: { socketPath: string; sessionId: string }): NodeJS.ProcessEnv {
+export function taskEnv(_laneDir: string, bridge?: { socketPath: string; sessionId: string }): NodeJS.ProcessEnv {
 	const env = { ...process.env };
 	const binDir = join(piUserDir(), "bin");
 	if (existsSync(binDir)) {
@@ -179,33 +104,29 @@ export function taskEnv(laneDir: string, bridge?: { socketPath: string; sessionI
 		const parts = current.split(delimiter).filter(Boolean);
 		if (!parts.includes(binDir)) env.PATH = [binDir, ...parts].join(delimiter);
 	}
-	// Managed bash gets the read shims on PATH so a plain `tail`/`cat`/`grep`
-	// read of a task log is observable without guessing at command strings.
-	return { ...env, ...readShimEnv(laneDir, bridge) };
+	// Managed bash gets the declared CLI on PATH. Nothing else is interposed: a
+	// plain read of a log file is just a read and changes no notification state.
+	return { ...env, ...declaredCliEnv(bridge) };
 }
 
 /**
- * PATH overlay that installs the managed-bash read shims and tells them which
- * paths count as task logs and where to report a read. The shims exec the real
- * binary, so behavior is unchanged except for the side-channel append.
+ * PATH overlay that puts the declared `pi-bg` CLI on a managed shell's PATH and
+ * names the session endpoint it must speak to.
  *
- * `bridgeSocketPath`/`sessionId` are the declared CLI's half: without them
- * `pi-bg get|list|stop` reports an unavailable endpoint instead of guessing.
+ * Nothing else is exported any more. The retired read shims also exported
+ * `PI_BG_CONSUME_LOG`, `PI_BG_LOG_DIR`, `PI_BG_LOG_GLOB` and `PI_BG_REAL_PATH`
+ * so wrappers could report which log a command opened; with the wrappers gone
+ * those exports would advertise a live-log path nothing acts on, so they are
+ * gone with them.
  */
-export function readShimEnv(laneDir: string, bridge?: { socketPath: string; sessionId: string }): Record<string, string> {
-	pruneStaleConsumeLogs();
-	pruneStaleBridgeSockets();
-	const dir = installReadShims(shimDir());
+export function declaredCliEnv(bridge?: { socketPath: string; sessionId: string }): Record<string, string> {
 	const env = bridge
 		? { PI_BG_SOCKET: bridge.socketPath, PI_BG_SESSION: bridge.sessionId }
 		: {};
+	const dir = installDeclaredCli(binDir());
 	if (!dir) return env;
 	return {
 		...env,
 		PATH: [dir, process.env.PATH ?? ""].filter(Boolean).join(delimiter),
-		PI_BG_CONSUME_LOG: consumeLogPath(),
-		PI_BG_LOG_DIR: laneDir,
-		PI_BG_LOG_GLOB: `${laneDir}/*`,
-		PI_BG_REAL_PATH: process.env.PATH ?? "",
 	};
 }

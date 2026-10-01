@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
-import { tmpdir } from "node:os";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-
-import { consumeLogPath } from "../extensions/settings.js";
+import { tmpdir } from "node:os";
+import { declaredCliEnv } from "../extensions/settings.js";
 import { runSpawnFixture, SPAWN_FIXTURE_TIMEOUT_MS } from "./fixtures/spawn-child-runner.js";
 
 /**
@@ -64,51 +64,31 @@ test("three staggered mid-run exits produce one grouped wake", () => {
 }, SPAWN_FIXTURE_TIMEOUT_MS);
 
 /**
- * Reading a finished task's log through a managed-bash read tool (`cat`, `tail`,
- * `head`, `grep`, `less`, or `pi-bg read`) is the same consumption as
- * `bg_task log`, so it must drop the pending wake — otherwise the agent is
- * woken for output it already read. The read shims report the exact path they
- * opened; nothing here guesses at command text.
- */
-test("a read reported by the log shims consumes the pending wake", () => {
-	const result = runSpawnFixture("spawn-extension.ts", {
-		mode: "deferred-raw-read",
-		command: "sleep 30 && echo done",
-	}) as { deferred: { afterExit: unknown[]; afterLog: unknown[]; afterTurnEnd: unknown[] } };
-	expect(result.deferred.afterExit).toHaveLength(0);
-	expect(result.deferred.afterTurnEnd, "the bash read already delivered this exit").toHaveLength(0);
-}, SPAWN_FIXTURE_TIMEOUT_MS);
-
-/**
- * Regression (bg-2191/bg-2204, 2026-09-29): the read shims and the drain used
- * ONE task-dir-wide `consumed.log`, while every Pi session on the machine
- * drains the file it reads and truncates it. Any other session's flush could
- * therefore swallow a record before the owning session's run ended — the read
- * was lost, and the agent was woken for a result it had already read. The live
- * proof: this session recorded a shimmed read mid-run and the file was empty
- * before this session had settled once.
+ * The inferred-read channel is retired, so no consume log exists to race over.
  *
- * The consume log is now per process, so a record can only be matched (and
- * truncated) by the session that wrote it.
+ * The defect these tests existed for was real: reading a task's log through the
+ * managed-bash read shims appended the path it opened to a consume log drained
+ * before a wake was handed over, and with one shared file per task directory a
+ * second session's flush could swallow the record — the read was lost and the
+ * agent was woken for a result it had already read. C removed the premise rather
+ * than the symptom: no shim reports a read, nothing drains a consume log, and a
+ * plain read of a log file changes no notification state at all, so the race
+ * cannot exist. This asserts the surface is closed, not merely unused.
  */
-test("the consume log is per process, so no other session can swallow a read", () => {
-	expect(consumeLogPath().endsWith(`consumed-${process.pid}.log`), "one consume log per Pi session").toBe(true);
-	expect(consumeLogPath()).not.toBe(join(tmpdir(), "kendex-pi-bg", "consumed.log"));
+test("no inferred-read consume log exists to race over any more", () => {
+	const settings = readFileSync(new URL("../extensions/settings.ts", import.meta.url), "utf8");
+	const extension = readFileSync(new URL("../extensions/background-tasks.ts", import.meta.url), "utf8");
+	const cli = readFileSync(new URL("../extensions/pi-bg.ts", import.meta.url), "utf8");
+	// The names may still appear in the prose that explains the retirement; what
+	// must be gone is every place that *exports*, assigns or drains them.
+	expect(settings, "no consume-log export survives").not.toContain("export function consumeLogPath");
+	expect(extension, "nothing drains a consume log").not.toContain("drainConsumedLogPaths");
+	expect(settings, "no live-log env export survives").not.toMatch(/PI_BG_CONSUME_LOG:|PI_BG_LOG_DIR:|PI_BG_LOG_GLOB:|PI_BG_REAL_PATH:/);
+	expect(cli, "the CLI no longer reports a read to a consume log").not.toMatch(/PI_BG_CONSUME_LOG|PI_BG_REAL_PATH/);
+	const exported = Object.keys(declaredCliEnv({ sessionId: "s", socketPath: "/tmp/s.sock" }));
+	expect(exported, "the managed-shell env names the endpoint and the PATH only").toStrictEqual(["PI_BG_SOCKET", "PI_BG_SESSION", "PATH"]);
+	expect(existsSync(join(tmpdir(), "kendex-pi-bg", "consumed.log")), "no legacy shared consume file is written").toBe(false);
 });
-
-/**
- * The other half of the same invariant: a record that lands in some other
- * session's file (here the legacy shared name) is neither acted on nor able to
- * mask ours — the wake this session owes still flushes at run end.
- */
-test("a record in a foreign consume file does not touch this session's wake", () => {
-	const result = runSpawnFixture("spawn-extension.ts", {
-		mode: "deferred-raw-read-foreign",
-		command: "sleep 30 && echo done",
-	}) as { deferred: { afterExit: unknown[]; afterLog: unknown[]; afterTurnEnd: unknown[] } };
-	expect(result.deferred.afterExit).toHaveLength(0);
-	expect(result.deferred.afterTurnEnd, "a foreign file neither consumes nor hides our wake").toHaveLength(1);
-}, SPAWN_FIXTURE_TIMEOUT_MS);
 
 /**
  * Regression (bg-424): the exit is already deferred when a bounded wait attaches

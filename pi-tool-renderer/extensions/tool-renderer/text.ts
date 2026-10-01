@@ -180,6 +180,16 @@ export function clearBlink(context: any): void {
 	}
 }
 
+/**
+ * Read-only size of the blink store, for `/renderdebug memory`. Entries hold one
+ * `invalidate` closure each, so the entry count is the honest number: no byte
+ * total is reported for closures. The store is populated only while
+ * `pendingStatusAnimation` is on.
+ */
+export function blinkStoreStats(): { entries: number; timerRunning: boolean } {
+	return { entries: blinkEntries.size, timerRunning: blinkTimer !== undefined };
+}
+
 export function blinkingPrefix(theme: any, context: any, cwd?: string): string {
 	trackBlink(context);
 	const on = Math.floor(Date.now() / 450) % 2 === 0;

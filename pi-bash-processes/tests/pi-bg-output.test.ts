@@ -36,14 +36,32 @@ const bashRun = async (command: string) => {
 
 const listed = async (id: string) => (await host.listTasks()).find((task) => task.id === id);
 
-/** Bounded wait for a task's terminal record; never part of the product surface. */
-async function untilSettled(id: string, budgetMs = 20_000): Promise<void> {
+/** Wait until a task's retained log has grown to at least `minBytes`. */
+async function awaitLogBytes(id: string, minBytes: number, budgetMs = 30_000): Promise<number> {
 	const deadline = Date.now() + budgetMs;
 	for (;;) {
-		const task = await listed(id);
-		if (task && task.status !== "running") return;
-		if (Date.now() >= deadline) return;
-		await Bun.sleep(5);
+		const record = await listed(id);
+		const size = record?.logFile ? statSync(record.logFile as string).size : 0;
+		if (size >= minBytes) return size;
+		if (Date.now() >= deadline) return size;
+		await Bun.sleep(10);
+	}
+}
+
+/**
+ * Wait until a task's retained log holds `needle`, or the budget lapses. A
+ * running capture reaches the file through a coalescing writer, so a read
+ * issued before the flush would snapshot a boundary the task has already
+ * passed.
+ */
+async function awaitLogContains(id: string, needle: string, budgetMs = 20_000): Promise<string> {
+	const deadline = Date.now() + budgetMs;
+	for (;;) {
+		const record = await listed(id);
+		const text = record?.logFile ? readFileSync(record.logFile as string, "utf8") : "";
+		if (needle === "" || text.includes(needle)) return text;
+		if (Date.now() >= deadline) return text;
+		await Bun.sleep(10);
 	}
 }
 
@@ -59,7 +77,7 @@ test("a full read redirects the capture byte-for-byte, with no retrieval metadat
 		"printf 'stderr-marker\\n' >&2",
 	].join("; ");
 	const task = spawned(await bgTask().execute("output-spawn", { action: "spawn", command }));
-	await untilSettled(task.id);
+	await host.settledTask(task.id);
 	const record = await listed(task.id);
 	const captured = readFileSync(record!.logFile as string, "utf8");
 
@@ -90,13 +108,13 @@ test("output larger than 1 MiB keeps its prefix, middle and suffix", async () =>
 	// a streamed copy that stopped early would lose the suffix.
 	const command = [
 		"printf 'PREFIX-MARKER\\n'",
-		"printf 'A%.0s' $(seq 1 2000000) | tr -d '\\n'",
+		"head -c 2000000 /dev/zero | tr '\\0' 'a'",
 		"printf '\\nMIDDLE-MARKER\\n'",
-		"printf 'B%.0s' $(seq 1 2000000) | tr -d '\\n'",
+		"head -c 2000000 /dev/zero | tr '\\0' 'b'",
 		"printf '\\nSUFFIX-MARKER\\n'",
 	].join("; ");
 	const task = spawned(await bgTask().execute("output-large", { action: "spawn", command }));
-	await untilSettled(task.id);
+	await host.settledTask(task.id);
 	const record = await listed(task.id);
 
 	const file = join(scratch, "large.txt");
@@ -120,7 +138,9 @@ test("a running snapshot is immutable: output produced later cannot change it", 
 			command: "printf 'FIRST-HALF\\n'; sleep 3; printf 'SECOND-HALF\\n'",
 		}),
 	);
-	await Bun.sleep(400);
+	// Wait for the prefix to be captured rather than guessing at a sleep: the
+	// snapshot boundary must be taken after the flush that carries it.
+	await awaitLogContains(task.id, "FIRST-HALF");
 
 	const file = join(scratch, "partial.txt");
 	const first = await bashRun(`pi-bg get ${task.id} --output > ${file}`);
@@ -129,7 +149,7 @@ test("a running snapshot is immutable: output produced later cannot change it", 
 	expect(snapshot).toBe("FIRST-HALF\n");
 	expect(first.output, "a running handoff is labelled partial").toContain("kendex: readiness=running");
 
-	await untilSettled(task.id, 20_000);
+	await host.settledTask(task.id, 20_000);
 	// The task finished, but the artifact handed over earlier did not change.
 	expect(readFileSync(file, "utf8")).toBe(snapshot);
 
@@ -160,7 +180,7 @@ test("a running full read resets the review clock and never acknowledges the com
 	expect(after!.exitNotified, "the completion stays owed").toBeFalsy();
 
 	// The task still finishes on its own and its exit wake is still delivered.
-	await untilSettled(task.id);
+	await host.settledTask(task.id);
 	expect((await listed(task.id))?.exitCode).toBe(0);
 });
 
@@ -168,9 +188,11 @@ test("a closed pipe leaves the handoff uncommitted, and a completed read then co
 	// A running task: its review clock is the observable that a successful
 	// handoff moves and a failed one must not, and its output is large enough
 	// that `head` really does close the pipe early.
-	const command = "printf 'z%.0s' $(seq 1 3000000) | tr -d '\\n'; printf '\\nTAIL-MARKER\\n'; sleep 60";
+	const command = "head -c 3000000 /dev/zero | tr '\\0' 'z'; printf '\\nTAIL-MARKER\\n'; sleep 60";
 	const task = spawned(await bgTask().execute("output-epipe", { action: "spawn", command }));
-	await Bun.sleep(1_500);
+	// Wait for a genuinely large capture: an empty or short one could not fill the
+	// pipe, and a "successful" write to a pipe nobody closed proves nothing.
+	await awaitLogBytes(task.id, 1_000_000);
 	expect((await listed(task.id))?.lastReviewedAt, "nothing has been reviewed yet").toBeUndefined();
 
 	// `head` closes the pipe after the first bytes. The write fails, so the CLI
@@ -180,12 +202,19 @@ test("a closed pipe leaves the handoff uncommitted, and a completed read then co
 	expect(piped.output, "the failure is reported as a pipe failure").toContain("epipe");
 	expect((await listed(task.id))?.lastReviewedAt, "an interrupted handoff never commits the review").toBeUndefined();
 
-	// The same read, completed, is a successful handoff and does commit it.
+	// The same read, completed, is a successful handoff and does commit it. The
+	// task is still running, so the artifact must be the flushed capture's own
+	// bytes up to the boundary the manager reported.
+	const captured = await awaitLogContains(task.id, "TAIL-MARKER");
 	const file = join(scratch, "epipe-recovered.txt");
 	const complete = await bashRun(`pi-bg get ${task.id} --output > ${file}`);
 	expect(complete.exitCode, complete.output).toBe(0);
 	expect(complete.output).toContain("kendex: ack=review");
-	expect(readFileSync(file, "utf8")).toContain("TAIL-MARKER");
+	const boundary = Number(/kendex: outputBytes=(\d+)/.exec(complete.output)?.[1] ?? -1);
+	expect(boundary).toBeGreaterThan(3_000_000);
+	const written = readFileSync(file, "utf8");
+	expect(written).toContain("TAIL-MARKER");
+	expect(written, "the artifact holds the flushed capture, not a stale prefix").toBe(captured.slice(0, written.length));
 	expect((await listed(task.id))?.lastReviewedAt, "the committed handoff records the review").toBeGreaterThan(0);
 
 	await bgTask().execute("output-epipe-stop", { action: "stop", id: task.id });
@@ -212,7 +241,7 @@ test("stop returns the result under the same id, and a full read of it still suc
 
 test("a naturally finished task reports its real exit code through the same stop/get surface", async () => {
 	const task = spawned(await bgTask().execute("output-natural", { action: "spawn", command: "printf 'bye\\n'; exit 7" }));
-	await untilSettled(task.id);
+	await host.settledTask(task.id);
 
 	// Stopping something already finished is a successful report of the real
 	// outcome, not a fabricated termination.

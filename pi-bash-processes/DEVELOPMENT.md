@@ -5,6 +5,14 @@ For maintainers. What it does for a consumer is [README.md](README.md); the agen
 ## Invariants
 
 - After registering its managed `bash`, the extension publishes `Symbol.for("kendex.background-tasks.managed-bash")` on `globalThis` until `session_shutdown`. Renderer packages defer their Bash decision until `session_start`, so either package order sees the marker; shutdown removes it before Pi loads a fresh extension runtime.
+- The declared tool surface is a function of the session mode, and it is declared at
+  `session_start`, never at factory load: the factory knows no mode, so it registers
+  `bg_task` alone and the mode branch adds `bg_status` only where it belongs. That is
+  why the TUI can satisfy "`bg_status` is absent" without an unregister API that does
+  not exist. `extensions/tool-surface.ts` is the single spelling of the surface, the
+  action enums and every mode-dependent phrase; `registrations.ts` declares from it,
+  and the wake, acknowledgement, managed-bash and schema-description text all read it,
+  so a mode is never handed prose for an operation it cannot call.
 - A wake never depends on `pi-output-policy`. Wakes go out through `pi.sendMessage`, which that policy does not see, so every byte a wake adds to the transcript is bounded here: one inline tail capped by `outputAlertMaxChars`, a task manifest whose long fields are cut at `WAKE_MANIFEST_FIELD_MAX_CHARS`, a headline command preview cut at `WAKE_CONTENT_COMMAND_MAX_CHARS`, and a per-task output-wake budget after which one exhaustion notice is sent and further output wakes are dropped. `extensions/wake-events.ts::compactBackgroundTaskSnapshot`, `shouldEmitOutputWake`, `sendOutputWakeBudgetExhaustedNotice`. The same compact manifest is what `bg_task` and `bg_status` return in `details`, so a log-polling loop cannot grow the transcript through tool results either.
 - Exit wakes are durable and fire exactly once. A task's snapshot carries `exitNotified`; a terminal task that never fired its exit wake is replayed on the next `session_start`. Exit wakes ignore the output-wake budget. `extensions/lifecycle.ts::closeTaskLifecycle` sets a task's terminal state and `sendExitWakeLifecycle` sends its exit wake; the record-and-persist tail of `sendExitWakeLifecycle` is the shared acknowledgment (`extensions/task-result.ts::acknowledgeCompletion`), so host submission, terminal retrieval, a confirmed stop, and a foreground delivery all settle the same obligation. `extensions/background-tasks.ts::finalizeTask` (exit, spawn error, timeout, stop) and `extensions/lifecycle.ts::finalizeTaskLifecycle` (orphan watcher) call both. Restore (`extensions/snapshot.ts::restoredTaskFromSnapshot`) and `session_shutdown` set status themselves, and `extensions/lifecycle.ts::replayMissedExitsLifecycle` sends the wakes restore finds missing. See "Completion lifecycle" below for how process exit, output readiness, acknowledgment, and retention differ.
 - The orphan watcher observes and never signals. A task whose child outlived Pi rehydrates as `running` and `extensions/orphan-watcher.ts` polls an asynchronous identity probe (pid plus process start time; the kernel comm name is recorded but is not part of identity, because `exec` rotates it) until the process is gone or the pid was reused, then finalizes through the lifecycle. Adding a `kill` there resurrects a failure where a snapshot flicker terminates a live workload.
@@ -33,7 +41,11 @@ the wait result becomes the delivery channel).
   that owned the writer is gone, so the state can never advance).
   `status !== "running"` is deliberately *not* the readiness signal, because it
   is true during the flush window; a retrieval that races the flush may report
-  `finalizing`, never a complete result whose last bytes are still queued. A log
+  `finalizing`, never a complete result whose last bytes are still queued. Tests
+  inherit the same rule: `tests/fixtures/extension-host.ts::settledTask` is the
+  only wait for a terminal record, because a fixture that waited on status alone
+  could read a log inside that window and report a product failure where the
+  bytes were simply still in the writer's queue. A log
   write that stalls past `LOG_WRITE_STALL_MS` still resolves the barrier, so a
   slow disk never holds a task's close. That leaves the second half of the
   question to `buildTaskResultObservation`: `outputComplete` is true only when

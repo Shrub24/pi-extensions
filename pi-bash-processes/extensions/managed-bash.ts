@@ -1,6 +1,7 @@
 import { Type } from "typebox";
 
-import { ANTI_POLL_LINE } from "./auto-background.js";
+import { antiPollLine } from "./auto-background.js";
+import type { TaskToolSurface } from "./tool-surface.js";
 import type { ForegroundOutcome, ForegroundWaiter } from "./types.js";
 
 /**
@@ -204,21 +205,19 @@ export function buildManagedBashEnv(
 export interface ManagedBashCompletionText {
 	elapsedText: string;
 	id: string;
-	logFile: string;
 	outputTail: string;
 	statusText: string;
 }
 
 /** Truthful fast-path text: actual (bounded) output plus real status. */
 export function formatManagedBashCompletionText(text: ManagedBashCompletionText): string {
-	const footer = `[${text.id}: ${text.statusText} in ${text.elapsedText}; log: ${text.logFile}]`;
+	const footer = `[${text.id}: ${text.statusText} in ${text.elapsedText}]`;
 	return text.outputTail ? `${text.outputTail}\n\n${footer}` : `(no output)\n\n${footer}`;
 }
 
 export interface ManagedBashRunningText {
 	elapsedText: string;
 	id: string;
-	logFile: string;
 	outputTail: string;
 	pid: number;
 }
@@ -228,11 +227,10 @@ export interface ManagedBashRunningText {
  * yet, polling is forbidden, only independent work may continue, and
  * completion arrives automatically as a wake message.
  */
-export function formatManagedBashRunningText(text: ManagedBashRunningText): string {
+export function formatManagedBashRunningText(text: ManagedBashRunningText, surface: TaskToolSurface = "compat"): string {
 	const lines = [
 		`Running ${text.id} (pid ${text.pid}) after ${text.elapsedText}. The command is still executing and has not finished yet.`,
-		ANTI_POLL_LINE,
-		`Full log: ${text.logFile}`,
+		antiPollLine(surface),
 	];
 	if (text.outputTail) lines.splice(1, 0, `Output so far (bounded tail):\n${text.outputTail}`);
 	return lines.join("\n\n");

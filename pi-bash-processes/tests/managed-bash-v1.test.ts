@@ -99,14 +99,18 @@ test("managed bash v1: input timeout is hard runtime, PI env mirrors built-in co
 
 /**
  * `sleep N && tail <managed log>` is the hand-written poll the anti-poll
- * contract bans. The gate replaces it with a bounded wait on the task and
- * labels the substitution; the sleep bash never spawns.
+ * contract bans, and it is now the *only* thing that happens: the retired
+ * sleep-as-wait substitution used to rewrite the command into a bounded wait by
+ * pattern-matching its text. It is gone — a managed command runs exactly as
+ * written, and the poll costs its author the sleep it asked for instead of being
+ * silently redirected. The declared alternatives are bg_task get/wait/stop.
  */
-test("managed bash v1: sleep+log-read is intercepted into a bounded wait with a label", () => {
-	const result = runScenario({ mode: "spawn", scenario: "sleep-intercept", command: "sleep 60 && tail -n 5 /tmp/placeholder/bg-1-1700000000000.log" });
-	expect(result.resultText).toContain("intercepted sleep 60");
-	expect(result.resultText).toContain("bg_task action:\"wait\"");
-	expect(result.resultText).not.toContain("still executing");
+test("managed bash v1: a hand-written sleep+read poll runs as written, with no substitution", () => {
+	const command = "sleep 60 && tail -n 5 /tmp/placeholder/bg-1-1700000000000.log";
+	const result = runScenario({ mode: "spawn", scenario: "slow", command });
+	expect(result.composedCommand, "the command reaches the shell unmodified").toBe(command);
+	expect(result.resultText).not.toContain("intercepted sleep");
+	expect(result.resultText).toContain("still executing");
 }, SPAWN_FIXTURE_TIMEOUT_MS);
 
 /**

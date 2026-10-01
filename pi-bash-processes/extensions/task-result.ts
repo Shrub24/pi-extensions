@@ -230,6 +230,35 @@ export interface TaskResultObservation {
 	completionOwed: boolean;
 }
 
+/** What a successful handoff settled. */
+export interface TaskResultAck {
+	acknowledged: boolean;
+	/** `terminal` committed the completion; `review` only reset the review
+	 *  clock; `none` settled nothing. */
+	committed: "terminal" | "review" | "none";
+	reviewed: boolean;
+}
+
+/**
+ * The shared get operation's outcome: the one prepared result both adapters
+ * hand to a caller. The `bg_task` tool and the declared `pi-bg` CLI differ in
+ * transport, never in what a prepared handoff is or what commits one.
+ *
+ * Preparing commits nothing. A caller that did deliver the output commits the
+ * handoff through the shared commit rule; a caller that could not must not.
+ */
+export interface TaskResultHandoff {
+	observation: TaskResultObservation;
+	/** Present for a full read: an immutable artifact, never a live log path the
+	 *  producer may still be writing. */
+	artifact?: { bytes: number; complete: boolean; partial: boolean; path: string };
+	/** Set when the capture cannot be certified complete. The bytes are real, but
+	 *  they are not a complete result, so no handoff may be committed from them. */
+	captureError?: string;
+	/** Set when the output could not be handed over at all. */
+	failure?: { code: "expired" | "internal"; message: string };
+}
+
 export interface BuildTaskResultInput {
 	task: TaskResultTask;
 	now: number;

@@ -10,8 +10,17 @@
  *   tool chrome cache hits/misses, gutter cache state
  *
  * Numbers print via ctx.ui.notify; counters keep accumulating until /renderdebug reset.
+ *
+ * `/renderdebug memory` prints the memory section instead of the CPU one:
+ * `process.memoryUsage()` plus the live sizes of this package's strong stores.
+ * `memory gc` first runs a forced collection, when the runtime exposes one.
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+
+import { codeHighlightCacheStats } from "./messages.js";
+import { stackStoreStats } from "./stack.js";
+import { blinkStoreStats } from "./text.js";
+import { builtInToolCacheStats } from "./tools.js";
 
 interface FrameSample {
 	at: number;
@@ -123,14 +132,19 @@ export function installRenderDebugOnSessionStart(pi: ExtensionAPI): void {
 
 export function registerRenderDebugCommand(pi: ExtensionAPI): void {
 	pi.registerCommand("renderdebug", {
-		description: "Show live TUI render diagnostics (frames, redraws, cache hit rates)",
+		description: "Show live TUI render diagnostics (frames, redraws, cache hit rates; memory with 'memory')",
 		handler: async (args: string, ctx: ExtensionContext) => {
-			const sub = args.trim().toLowerCase();
+			const parts = args.trim().toLowerCase().split(/\s+/).filter(Boolean);
+			const sub = parts[0];
 			if (sub === "reset") {
 				state.frames.length = 0;
 				state.gutter = { hits: 0, misses: 0 };
 				state.chrome = { hits: 0, misses: 0 };
 				ctx.ui.notify("Render diagnostics reset", "info");
+				return;
+			}
+			if (sub === "memory") {
+				for (const line of memoryDebugReportLines(parts.includes("gc"))) ctx.ui.notify(line, "info");
 				return;
 			}
 			for (const line of formatRenderDebugReport(ctx.cwd)) ctx.ui.notify(line, "info");
@@ -152,4 +166,107 @@ export function recordChromeHit(): void {
 
 export function recordChromeMiss(): void {
 	state.chrome.misses += 1;
+}
+
+/**
+ * The memory half of `/renderdebug`: `process.memoryUsage()` plus the live sizes
+ * of this package's strong stores, and an explicit, user-requested GC.
+ *
+ * Labels are deliberately narrow. `rss` is the whole process, including Bun's
+ * native allocations, V8/Bun heap pages and the loaded extensions; `heapUsed` is
+ * the JavaScript heap alone, so it is always smaller and never the whole story.
+ * A drop in `heapUsed` across `gc()` is *reclaimed* heap, not the live set: it
+ * says how much garbage was reachable-then-dropped, not how much this extension
+ * retains. Nothing here is a leak measurement; a leak is a store that keeps
+ * growing across a session, which only repeated readings can show.
+ */
+
+/** One MB value with one decimal, so repeated reports are comparable by eye. */
+export function megabytes(bytes: number): string {
+	return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+let gcWarned = false;
+
+/**
+ * The runtime's forced collector, feature-detected: Bun exposes `Bun.gc(force)`, a
+ * Node host exposes `global.gc` only when started with `--expose-gc`. Returning
+ * `undefined` is the honest answer when neither exists, and the report says so
+ * rather than showing a zero-byte "reclaimed" number that never happened.
+ */
+export function resolveForcedGc(): ((force?: boolean) => void) | undefined {
+	const bunGc = (globalThis as { Bun?: { gc?: (force?: boolean) => void } }).Bun?.gc;
+	if (typeof bunGc === "function") return (force = true) => bunGc(force);
+	const nodeGc = (globalThis as { gc?: (force?: boolean) => void }).gc;
+	if (typeof nodeGc === "function") return (force = true) => nodeGc(force);
+	return undefined;
+}
+
+export interface MemoryUsageLine {
+	rss: number;
+	heapUsed: number;
+	heapTotal: number;
+	external: number;
+	arrayBuffers: number;
+}
+
+/** The five `process.memoryUsage()` fields the report shows, in report order. */
+export function readMemoryUsage(): MemoryUsageLine {
+	const usage = process.memoryUsage();
+	return {
+		rss: usage.rss,
+		heapUsed: usage.heapUsed,
+		heapTotal: usage.heapTotal,
+		external: usage.external,
+		arrayBuffers: usage.arrayBuffers,
+	};
+}
+
+/**
+ * The memory report. `after` is present only when the caller ran a forced GC, and
+ * `heapBefore` is the reading taken immediately before it.
+ */
+export function formatMemoryDebugReport(gcRan: boolean, heapBefore?: number): string[] {
+	const now = readMemoryUsage();
+	const blink = blinkStoreStats();
+	const highlights = codeHighlightCacheStats();
+	const stack = stackStoreStats();
+	const tools = builtInToolCacheStats();
+
+	const lines = [
+		`memory — rss: ${megabytes(now.rss)} (whole process) · heapUsed: ${megabytes(now.heapUsed)} (JS heap only)`,
+		`memory — heapTotal: ${megabytes(now.heapTotal)} · external: ${megabytes(now.external)} · arrayBuffers: ${megabytes(now.arrayBuffers)}`,
+		`strong stores — blink entries: ${blink.entries} (timer ${blink.timerRunning ? "running" : "stopped"}) · only while pendingStatusAnimation is on`,
+		`strong stores — code highlight cache: ${highlights.entries} entries · ${highlights.keyChars} source chars + ${highlights.valueChars} rendered chars (entry-capped at 120)`,
+		`strong stores — stack items: ${stack.items} · batches: ${stack.batches} · ${stack.resultChars} result chars (only while stackToolCalls is on)`,
+		`strong stores — built-in tool sets: ${tools.cwds} (one per distinct cwd, 7 host tool objects each)`,
+	];
+
+	lines.push("not measured — per-row render caches are WeakMaps keyed by Pi's components and have no live size; they die with the row");
+
+	if (gcRan && heapBefore !== undefined) {
+		const reclaimed = heapBefore - now.heapUsed;
+		lines.push(`gc — explicit gc() ran: heapUsed ${megabytes(heapBefore)} → ${megabytes(now.heapUsed)} (delta ${megabytes(reclaimed)} = reclaimed heap, not this extension's retained set)`);
+	}
+
+	return lines;
+}
+
+/**
+ * The `memory` subcommand: report, or run a forced GC first when the user asked
+ * for it. GC is opt-in because it costs a full collection and changes timing.
+ */
+export function memoryDebugReportLines(runGc: boolean): string[] {
+	const gc = runGc ? resolveForcedGc() : undefined;
+	if (!runGc) return formatMemoryDebugReport(false);
+	if (!gc) {
+		if (!gcWarned) {
+			gcWarned = true;
+			return [...formatMemoryDebugReport(false), "gc — unavailable: no Bun.gc and no global.gc (a Node host needs --expose-gc); no collection was forced"];
+		}
+		return [...formatMemoryDebugReport(false), "gc — unavailable in this runtime; no collection was forced"];
+	}
+	const before = readMemoryUsage();
+	gc(true);
+	return formatMemoryDebugReport(true, before.heapUsed);
 }

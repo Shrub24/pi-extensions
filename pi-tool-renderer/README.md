@@ -38,6 +38,17 @@ Pi runs a tool and gives its call and result to the display extension. The exten
 - At most 256 grouped calls are kept, in groups of at most 64; older groups are dropped. Each keeps at most 16,384 characters of its result for the preview: the start for read and search calls, the end for bash.
 - A dropped call that Pi draws again (ctrl+o, a resize) is shown on its own and is not kept.
 - Grouped calls and the list of tool displays to refresh are cleared when a session starts or ends. A tool display Pi no longer shows is not kept alive.
+- Code blocks keep at most 120 highlighted results, keyed by language and source text. The entry count is capped, not the characters, so a few very large blocks are held until 120 newer ones displace them.
+
+## Diagnostics
+
+`/renderdebug` prints live draw diagnostics: frames in the last ten seconds, full redraws, render-time percentiles, and the assistant-gutter and tool-chrome cache hit rates. `/renderdebug reset` clears the counters.
+
+`/renderdebug memory` prints memory instead. It reports `process.memoryUsage()` — `rss` is the whole Pi process, `heapUsed` is the JavaScript heap alone, and `external`/`arrayBuffers` cover off-heap buffers — and the live size of this package's strong stores: blink entries, the code-highlight cache's entries and characters, the stack store's items and kept result characters, and the built-in tool sets held per working directory.
+
+The per-row render caches are `WeakMap`s keyed by Pi's own components. JavaScript cannot count a `WeakMap`'s live entries, so the report names them as not measured rather than showing a number that does not mean anything.
+
+`/renderdebug memory gc` additionally runs a forced collection first, when the runtime exposes one (`Bun.gc`, or `global.gc` on a Node host started with `--expose-gc`), and prints the `heapUsed` change. Read that change as *reclaimed* heap — memory that became unreachable — never as this extension's retained set. Where no collector is exposed, the report says none was forced instead of showing a zero-byte result.
 
 ## Settings
 

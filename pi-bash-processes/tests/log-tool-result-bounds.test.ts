@@ -11,16 +11,20 @@ import { SPAWN_FIXTURE_TIMEOUT_MS } from "./fixtures/spawn-child-runner.js";
 const logFile = "/tmp/kendex-pi-bg/bg-log-1-1700000000000.log";
 const marker = "retained log tail\n";
 const tail = marker + "z".repeat(cap - marker.length - 1) + "!";
+// `bg_task action:"log"` is the retained raw-tail read; `bg_status action:"log"` is
+// the compatibility surface, which routes through the same shared get operation as
+// `bg_task action:"get"`. Both are transcript-bounded, and neither may advertise the
+// mutable live log path as the way to read a result.
 const rows = [
-	{ name: "bg_task huge log and metadata", tool: "bg_task", output: "z".repeat(cap * 3) + tail, huge: true, path: logFile },
-	{ name: "bg_status huge log and metadata", tool: "bg_status", output: "z".repeat(cap * 3) + tail, huge: true, path: logFile },
-	{ name: "bg_task long log path", tool: "bg_task", output: "z".repeat(cap * 3) + tail, huge: true, path: "/tmp/" + "L".repeat(5_000) },
-	{ name: "bg_status long log path", tool: "bg_status", output: "z".repeat(cap * 3) + tail, huge: true, path: "/tmp/" + "L".repeat(5_000) },
-	{ name: "bg_task small output", tool: "bg_task", output: "all good\n", huge: false, path: logFile },
-	{ name: "bg_status small output", tool: "bg_status", output: "all good\n", huge: false, path: logFile },
-	{ name: "bg_task empty output", tool: "bg_task", output: "", huge: false, path: logFile },
-	{ name: "bg_status empty output", tool: "bg_status", output: "", huge: false, path: logFile },
-];
+	{ name: "bg_task huge log and metadata", tool: "bg_task", kind: "raw-log", output: "z".repeat(cap * 3) + tail, huge: true, path: logFile },
+	{ name: "bg_task long log path", tool: "bg_task", kind: "raw-log", output: "z".repeat(cap * 3) + tail, huge: true, path: "/tmp/" + "L".repeat(5_000) },
+	{ name: "bg_task small output", tool: "bg_task", kind: "raw-log", output: "all good\n", huge: false, path: logFile },
+	{ name: "bg_task empty output", tool: "bg_task", kind: "raw-log", output: "", huge: false, path: logFile },
+	{ name: "bg_status huge log and metadata", tool: "bg_status", kind: "shared-get", output: "z".repeat(cap * 3) + tail, huge: true, path: logFile },
+	{ name: "bg_status long log path", tool: "bg_status", kind: "shared-get", output: "z".repeat(cap * 3) + tail, huge: true, path: "/tmp/" + "L".repeat(5_000) },
+	{ name: "bg_status small output", tool: "bg_status", kind: "shared-get", output: "all good\n", huge: false, path: logFile },
+	{ name: "bg_status empty output", tool: "bg_status", kind: "shared-get", output: "", huge: false, path: logFile },
+] as const;
 
 interface ChildResult {
 	result: { content: { type: string; text: string }[]; details: { action: string; task: BackgroundTaskSnapshot; fullOutputPath?: string; truncation?: BackgroundLogTruncation } };
@@ -54,22 +58,62 @@ test("registered log tool result rows", () => {
 			const { result, calls } = results[index]!;
 			const task = result.details.task;
 			const safePath = row.path.length <= fieldCap ? row.path : "/tmp/" + "L".repeat(fieldCap - 6) + "…";
-			const text = row.huge
-				? `[...truncated]\n${tail}\n\n[Background log truncated. Showing last ${cap} of ${row.output.length} character(s). Full log: ${safePath}]`
-				: row.output || "(empty)";
+			if (row.kind === "raw-log") {
+				const text = row.huge
+					? `[...truncated]\n${tail}\n\n[Background log truncated. Showing last ${cap} of ${row.output.length} character(s). The complete captured snapshot is available with bg_task action:"get" output:"full".]`
+					: row.output || "(empty)";
+				expect({
+					content: result.content, action: result.details.action,
+					task: { id: task.id, pid: task.pid, command: task.command, title: task.title, cwd: task.cwd, logFile: task.logFile },
+					truncation: result.details.truncation, advertisesLiveLogPath: text.includes(row.path),
+					bounded: Buffer.byteLength(JSON.stringify(result), "utf8") < 16_384,
+					internalIdentity: task.procIdent, calls,
+				}, row.name).toStrictEqual({
+					content: [{ type: "text", text }], action: "log",
+					task: { id: "bg-log-1", pid: 4242, command: row.huge ? "Q".repeat(fieldCap - 1) + "…" : "echo log", title: row.huge ? "T".repeat(fieldCap - 1) + "…" : "log", cwd: row.huge ? "/" + "C".repeat(fieldCap - 2) + "…" : "/path/work", logFile: safePath },
+					advertisesLiveLogPath: false,
+					truncation: row.huge ? { direction: "tail", truncated: true, shownChars: cap, totalChars: row.output.length } : undefined,
+					bounded: true, internalIdentity: undefined,
+					calls: [{ id: "bg-log-1", pid: null }, { outputSameTask: true }, { rememberSameTask: true }],
+				});
+				continue;
+			}
+			// The compatibility surface hands over the shared prepared result. Its
+			// contract is the shared get's, so what matters here is that the raw live
+			// log path is not advertised, the agent-controlled metadata stays bounded,
+			// and the read is the shared acknowledgment path rather than a second one.
+			const text = result.content[0]!.text;
 			expect({
-				content: result.content, action: result.details.action,
-				task: { id: task.id, pid: task.pid, command: task.command, title: task.title, cwd: task.cwd, logFile: task.logFile },
-				fullOutputPath: result.details.fullOutputPath, truncation: result.details.truncation,
+				action: result.details.action,
+				mentionsTaskId: text.includes("bg-log-1"),
+				// The rule is about model-facing prose: no text may invite a read of the
+				// mutable live log. The structured task snapshot keeps `logFile` as bounded
+				// machine metadata for the renderer and dashboard, which is not an
+				// advertisement and is asserted separately below.
+				advertisesLiveLogPath: text.includes(row.path),
+				metadataLogPath: task.logFile,
+				hasFullOutputPath: "fullOutputPath" in result.details,
+				hasRawTailTruncation: "truncation" in result.details,
 				bounded: Buffer.byteLength(JSON.stringify(result), "utf8") < 16_384,
-				internalIdentity: task.procIdent, calls,
+				containsRawCommand: text.includes("Q".repeat(1_000)),
+				containsRawTitle: text.includes("T".repeat(1_000)),
+				containsRawCwd: text.includes("C".repeat(1_000)),
+				nestedCalls: calls.filter((call) => {
+					const entry = call as Record<string, unknown>;
+					return entry.id != null || entry.pid != null || entry.outputSameTask != null || entry.readSameTask != null;
+				}),
 			}, row.name).toStrictEqual({
-				content: [{ type: "text", text }], action: "log",
-				task: { id: "bg-log-1", pid: 4242, command: row.huge ? "Q".repeat(fieldCap - 1) + "…" : "echo log", title: row.huge ? "T".repeat(fieldCap - 1) + "…" : "log", cwd: row.huge ? "/" + "C".repeat(fieldCap - 2) + "…" : "/path/work", logFile: safePath },
-				fullOutputPath: row.huge ? safePath : undefined,
-				truncation: row.huge ? { direction: "tail", truncated: true, fullOutputPath: safePath, shownChars: cap, totalChars: row.output.length } : undefined,
-				bounded: true, internalIdentity: undefined,
-				calls: [{ id: row.tool === "bg_task" ? "bg-log-1" : null, pid: row.tool === "bg_status" ? 4242 : null }, { outputSameTask: true }, { rememberSameTask: true }],
+				action: "log",
+				mentionsTaskId: true,
+				advertisesLiveLogPath: false,
+				metadataLogPath: safePath,
+				hasFullOutputPath: false,
+				hasRawTailTruncation: false,
+				bounded: true,
+				containsRawCommand: false,
+				containsRawTitle: false,
+				containsRawCwd: false,
+				nestedCalls: [{ id: null, pid: 4242 }, { readSameTask: true }],
 			});
 		}
 	} finally {

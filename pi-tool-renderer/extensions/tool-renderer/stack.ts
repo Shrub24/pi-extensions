@@ -185,6 +185,18 @@ export function clearStackState(): void {
 	stackEvicted = false;
 }
 
+/**
+ * Read-only size of the stack store, for `/renderdebug memory`. The store exists
+ * only while `stackToolCalls` is on and is cleared on session boundaries, so a
+ * count above zero with the setting off means the store outlived its session.
+ * `resultChars` totals the kept, already-capped preview text.
+ */
+export function stackStoreStats(): { items: number; batches: number; resultChars: number } {
+	let resultChars = 0;
+	for (const item of stackItems.values()) resultChars += item.resultText.length;
+	return { items: stackItems.size, batches: stackBatches.size, resultChars };
+}
+
 export function contextToolCallId(context: any, toolName: string, args: any): string {
 	return String(context?.toolCallId ?? context?.id ?? `${toolName}:${JSON.stringify(args ?? {})}`);
 }

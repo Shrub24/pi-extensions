@@ -201,3 +201,34 @@ test("a review discards an armed stale reminder and starts the interval from the
 	expect({ wakes: afterWake.wakes, timers: afterWake.timers, softExpiresAt: afterWake.state.softExpiresAt }, "the new interval fired once and re-armed from its own delivery")
 		.toStrictEqual({ wakes: 1, timers: 1, softExpiresAt: 1_700_000_090_000 });
 }, SPAWN_FIXTURE_TIMEOUT_MS);
+
+/**
+ * Task 3.3: the reminder a task holds is a single one, and it is a reminder
+ * about the interval measured from the last review rather than a second parallel
+ * timer. Output bursts inside the interval add nothing, a delivered reminder
+ * re-arms exactly one in its place, and the second interval is measured from the
+ * first delivery.
+ */
+test("a task holds at most one reminder, and output noise adds none", () => {
+	const result = runSpawnFixture("spawn-extension.ts", { mode: "soft-one-reminder", softTimeoutMs: 60_000 }) as SoftFixtureResult;
+	const { atSpawn, afterNoise, afterFirst, afterSecond } = soft(result) as {
+		atSpawn: { timers: number };
+		afterNoise: { timers: number; wakes: number; timerCounts: number[] };
+		afterFirst: { timers: number; wakes: number; softExpiresAt: number | null };
+		afterSecond: { timers: number; wakes: number };
+	};
+	expect(atSpawn.timers, "one armed reminder at spawn").toBe(1);
+	// Two streams of output per burst, three bursts: never a second timer.
+	expect(afterNoise.timerCounts, "output activity neither arms a reminder nor discharges the armed one").toStrictEqual([1, 1, 1]);
+	expect({ timers: afterNoise.timers, wakes: afterNoise.wakes }, "output alone produces no reminder").toStrictEqual({ timers: 1, wakes: 0 });
+	expect({ timers: afterFirst.timers, wakes: afterFirst.wakes }, "delivery replaced the fired reminder with exactly one rearmed one")
+		.toStrictEqual({ timers: 1, wakes: 1 });
+	// The fixture clock is frozen, so the delivery instant IS the spawn instant and
+	// the re-armed deadline coincides with the original one. That the interval is
+	// measured from the delivery rather than from the spawn is pinned where the
+	// clock moves: `soft-review-reset` below moves the deadline to
+	// 1_700_000_090_000, and `tests/task-result.test.ts` pins the same rule.
+	expect(afterFirst.softExpiresAt, "the surviving reminder keeps the deadline its own interval ends on").toBe(1_700_000_060_000);
+	expect({ timers: afterSecond.timers, wakes: afterSecond.wakes }, "the rearmed reminder fired once and rearmed again")
+		.toStrictEqual({ timers: 1, wakes: 2 });
+}, SPAWN_FIXTURE_TIMEOUT_MS);

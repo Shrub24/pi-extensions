@@ -4,6 +4,8 @@
 
 ### Unreleased
 
+- The declared tool surface now depends on the Pi session mode. An interactive TUI session gets `bg_task` with exactly `spawn`, `get`, `stop` and `list`, and no `bg_status` tool; `print`, `json`, `rpc` and any mode this build does not recognize keep the compatibility surface — the full action set including the bounded `wait`, plus `bg_status`. There is nothing to configure, and an explicit `--tools`/`--exclude-tools` selection is preserved rather than repaired. The guidance the model reads follows the surface: no wake, acknowledgement or schema text names an operation the mode does not declare.
+- Reading a task's log file no longer acknowledges its completion. The `pi-bg path`, `pi-bg peek` and `pi-bg read` helpers, the managed-bash read shim, the per-process consume logs and the interactive sleep-as-wait path are removed; those helpers now exit `2` with a migration message naming `pi-bg get <task-id> [--output]`. `pi-bg get` remains the supported route, and it acknowledges only after the requested write succeeds.
 - Every background task now gets a soft timeout (10 minutes by default; `defaultSoftTimeoutMs`, per-spawn `softTimeoutMs`, 0 disables). At soft expiry the process keeps running and the agent receives exactly one progress wake asking it to continue (optionally extend via `bg_task action: "extend"`, which starts a fresh window from now and never changes the hard timeout), inspect the log, or stop. The reminder is one-shot, persisted across restarts, re-armed for restored live tasks, and excluded from exit/output wake accounting — a later real exit still wakes normally.
 - Publishes the managed-Bash interop marker so `@vanillagreen/pi-tool-renderer` leaves its execution override intact.
 

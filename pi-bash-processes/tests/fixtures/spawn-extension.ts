@@ -1,11 +1,11 @@
 import { mock } from "bun:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { appendFileSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { DEFAULT_SOFT_TIMEOUT_MS } from "../../extensions/constants.js";
 import { interceptNativeEffects, fixtureNow, fixturePid } from "./spawn-native.js";
 
-interface Input { mode: "spawn" | "stop" | "duplicate" | "wait-any" | "rerun" | "deferred" | "deferred-unobserved" | "deferred-group" | "deferred-wait" | "deferred-raw-read" | "deferred-settle-hold" | "staggered-exits" | "soft-expiry" | "soft-extend" | "soft-terminal" | "soft-restore" | "soft-restore-notified" | "soft-review-reset"; platform?: string; resource?: boolean; caller?: "tool" | "shutdown" | "slash"; command?: string; command2?: string; stopFails?: boolean; killFails?: boolean; signalGone?: boolean; softTimeoutMs?: number | null; extendSoftTimeoutMs?: number; timeoutSeconds?: number }
+interface Input { mode: "spawn" | "stop" | "duplicate" | "wait-any" | "rerun" | "deferred" | "deferred-unobserved" | "deferred-group" | "deferred-wait" | "deferred-settle-hold" | "staggered-exits" | "soft-expiry" | "soft-extend" | "soft-terminal" | "soft-restore" | "soft-restore-notified" | "soft-review-reset" | "soft-one-reminder"; platform?: string; resource?: boolean; caller?: "tool" | "shutdown" | "slash"; command?: string; command2?: string; stopFails?: boolean; killFails?: boolean; signalGone?: boolean; softTimeoutMs?: number | null; extendSoftTimeoutMs?: number; timeoutSeconds?: number }
 const input: Input = JSON.parse(await Bun.stdin.text());
 const native = await interceptNativeEffects(input);
 const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
@@ -117,7 +117,7 @@ try {
 	started = true;
 	// Only the platform-sensitive spawn call runs under this row's platform.
 	if (input.platform) Object.defineProperty(process, "platform", { ...originalPlatform, value: input.platform });
-	const wantsExitWake = input.mode === "deferred" || input.mode === "deferred-unobserved" || input.mode === "deferred-wait" || input.mode === "deferred-raw-read" || input.mode === "deferred-raw-read-foreign" || input.mode === "deferred-settle-hold" || input.mode === "operator-stop" || input.mode === "soft-expiry" || input.mode === "soft-extend" || input.mode === "soft-restore" || input.mode === "soft-terminal";
+	const wantsExitWake = input.mode === "deferred" || input.mode === "deferred-unobserved" || input.mode === "deferred-wait" || input.mode === "deferred-settle-hold" || input.mode === "operator-stop" || input.mode === "soft-expiry" || input.mode === "soft-extend" || input.mode === "soft-restore" || input.mode === "soft-terminal";
 	// Legacy scenarios pin the soft reminder off (`softTimeoutMs: 0`) so their
 	// exact timer sets stay about the behavior under test; `softTimeoutMs: null`
 	// exercises the extension default, and a number is passed through.
@@ -136,7 +136,7 @@ try {
 	let supersede: { wakes: unknown[]; listText: string } | undefined;
 	let operatorStop: { messages: unknown[]; activeStopKey: boolean } | undefined;
 	let deferred: { afterExit: unknown[]; afterLog: unknown[]; afterTurnEnd: unknown[] } | undefined;
-	if (input.mode === "deferred" || input.mode === "deferred-unobserved" || input.mode === "deferred-wait" || input.mode === "deferred-raw-read" || input.mode === "deferred-raw-read-foreign" || input.mode === "deferred-settle-hold" ) {
+	if (input.mode === "deferred" || input.mode === "deferred-unobserved" || input.mode === "deferred-wait" || input.mode === "deferred-settle-hold" ) {
 		// Run in flight: the exit arrives mid-run. The run boundary is
 		// before_agent_start → agent_end → agent_settled (Pi emits turn_end per tool round, so
 		// flushing there would split one run's completions across wakes).
@@ -147,29 +147,6 @@ try {
 		let afterLog: unknown[] = [];
 		if (input.mode === "deferred") {
 			await execute({ action: "log", id: "bg-1" });
-			afterLog = messages.slice(afterExit.length);
-		}
-		if (input.mode === "deferred-raw-read") {
-			// The agent read the log through a shimmed tool (cat/tail/head/grep/less
-			// or `pi-bg read`): the wrapper appended the exact path it opened to the
-			// consuming session's own consume log (consumed-<pid>.log — one file per
-			// Pi session, since the task dir is shared by every session on the
-			// machine and a drain truncates what it reads). That read is the delivery
-			// and must drop the pending wake.
-			const logFile = spawned.details.task!.logFile as string;
-			const dir = process.env.PI_BG_TASK_DIR!;
-			appendFileSync(join(dir, `consumed-${process.pid}.log`), `${logFile}\n`);
-			afterLog = messages.slice(afterExit.length);
-		}
-		if (input.mode === "deferred-raw-read-foreign") {
-			// Regression (cross-session consume theft): a record in some other
-			// session's consume file — here the legacy shared `consumed.log` — must
-			// be invisible to this session both ways: it cannot consume our wake, and
-			// (per-process files) no other session can truncate ours before we match
-			// it. The wake therefore still flushes at run end.
-			const logFile = spawned.details.task!.logFile as string;
-			const dir = process.env.PI_BG_TASK_DIR!;
-			appendFileSync(join(dir, "consumed.log"), `${logFile}\n`);
 			afterLog = messages.slice(afterExit.length);
 		}
 		if (input.mode === "deferred-wait") {
@@ -260,6 +237,27 @@ try {
 		await dispatch("agent_end");
 		await dispatch("agent_settled");
 		soft = { atSpawn, afterWake, afterExit: { state: await softState(), exitWakes: exitWakeCount(), softWakes: softWakeTexts().length } };
+	} else if (input.mode === "soft-one-reminder") {
+		// One held reminder per task: output bursts during the interval add no
+		// timer, each delivered reminder re-arms exactly one in its place, and the
+		// second interval is measured from the first delivery.
+		const atSpawn = { timers: softTimers(softMs).length, state: await softState() };
+		const timerCounts: number[] = [];
+		for (let burst = 0; burst < 3; burst++) {
+			native.children[0]?.stdout?.emit("data", Buffer.from(`noise ${burst}\n`));
+			native.children[0]?.stderr?.emit("data", Buffer.from(`noise-e ${burst}\n`));
+			await Promise.resolve();
+			timerCounts.push(softTimers(softMs).length);
+		}
+		const afterNoise = { timers: softTimers(softMs).length, wakes: softWakeTexts().length, timerCounts };
+		native.fireTimeout(softMs);
+		await Promise.resolve();
+		const afterFirst = { timers: softTimers(softMs).length, wakes: softWakeTexts().length, state: await softState(), softExpiresAt: (await softState()).softExpiresAt };
+		// A second interval: the rearmed reminder is the only one, and it fires once.
+		native.fireTimeout(softMs);
+		await Promise.resolve();
+		const afterSecond = { timers: softTimers(softMs).length, wakes: softWakeTexts().length, texts: softWakeTexts(), state: await softState() };
+		soft = { atSpawn, afterFirst, afterNoise, afterSecond };
 	} else if (input.mode === "soft-extend") {
 		// extend clears the fired deadline, re-arms a fresh window, and leaves the
 		// hard timeout budget untouched.
@@ -409,11 +407,17 @@ try {
 	// Full soft state of the spawned task, read before any shutdown can mutate it.
 	const spawnSoftState = input.softTimeoutMs !== undefined || input.defaultSoftTimeoutMs !== undefined ? await softState() : undefined;
 	const stopStart = native.syncCalls.length;
+	const signalsBefore = native.signals.length;
 	let outcome: unknown;
 	let stopResult: ToolResult | undefined;
 	let after: unknown;
 	let escalated: unknown;
 	if (input.mode === "stop") {
+		// The tool's stop awaits the bounded termination it initiated, so its child
+		// end has to be produced while the call is pending — which is what a real
+		// child does when its process actually ends. Shutdown and the slash command
+		// are not awaited by a caller here, so they keep the direct sequence.
+		let pendingStop: Promise<ToolResult> | undefined;
 		if (input.caller === "shutdown") {
 			await dispatch("session_shutdown");
 			shutDown = true;
@@ -424,8 +428,10 @@ try {
 			await command.handler("bg-1", ctx);
 			outcome = { kind: "slash" };
 		} else {
-			try { const result = await execute({ action: "stop", id: "bg-1" }); stopResult = result; outcome = { kind: "tool", action: result.details.action, text: result.content[0]?.text }; }
-			catch (error) { outcome = { kind: "error", message: error instanceof Error ? error.message : String(error) }; }
+			pendingStop = execute({ action: "stop", id: "bg-1" });
+			// Wait until the stop has tried to signal: the intermediate state below
+			// is the state a stop leaves behind once its signal is out.
+			for (let spin = 0; spin < 400 && native.signals.length === signalsBefore && native.syncCalls.length === stopStart; spin++) await Bun.sleep(5);
 		}
 		after = { state: await state(), timers: native.activeTimers(), signals: [...native.signals], childSignals: [...native.childSignals], unitCalls: native.syncCalls.slice(stopStart) };
 		if (input.caller !== "shutdown" && !input.stopFails && !input.signalGone) {
@@ -433,6 +439,10 @@ try {
 			escalated = { state: await state(), signals: [...native.signals], unitCalls: native.syncCalls.slice(stopStart) };
 			child.emit("close", null);
 			await finalized();
+		}
+		if (pendingStop) {
+			try { const result = await pendingStop; stopResult = result; outcome = { kind: "tool", action: result.details.action, text: result.content[0]?.text }; if (process.env.FIXTURE_DEBUG_TEXT) process.stderr.write(`LEN=${(result.content[0]?.text ?? "").length}\n${result.content[0]?.text}\n---\n`); }
+			catch (error) { outcome = { kind: "error", message: error instanceof Error ? error.message : String(error) }; }
 		}
 	}
 	if (input.mode === "spawn") child.emit("close", 0);
@@ -448,7 +458,7 @@ try {
 	// Soft scenarios already finalized bg-1 (or deliberately did not): the
 	// generic shutdown/finalize tail below would mutate wake counts, so those
 	// scenarios report their own `final` and skip the trailing kill.
-	if (input.mode === "soft-expiry" || input.mode === "soft-extend" || input.mode === "soft-terminal" || input.mode === "soft-restore" || input.mode === "soft-restore-notified" || input.mode === "soft-review-reset") {
+	if (input.mode === "soft-expiry" || input.mode === "soft-extend" || input.mode === "soft-terminal" || input.mode === "soft-restore" || input.mode === "soft-restore-notified" || input.mode === "soft-review-reset" || input.mode === "soft-one-reminder") {
 		const softChild = native.children[0]!;
 		const softSpawn = native.spawns[0]!;
 		process.stdout.write(JSON.stringify({

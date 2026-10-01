@@ -2,6 +2,10 @@
 
 ## Consumer-impacting changes
 
+### Unreleased
+
+- `/renderdebug memory` reports process memory and the live sizes of the renderer's strong stores; `/renderdebug memory gc` also runs a forced collection and prints the reclaimed JavaScript heap. The existing `/renderdebug` output is unchanged.
+
 ### 2.0.9
 
 - Batch children now run through Pi's tool-call guards and result handlers. Guard-refused bash commands no longer run inside `tool_batch`. Requires Pi 0.99.0 or later; upgrade Pi before using this package.

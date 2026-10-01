@@ -4,6 +4,7 @@ import {
 	DEFAULT_OUTPUT_BUFFER_MAX_CHARS,
 } from "./constants.js";
 import { settingNumber } from "./settings.js";
+import type { TaskResultAck, TaskResultHandoff } from "./task-result.js";
 import type { BackgroundLogTruncation, BackgroundTaskSnapshot, BackgroundTaskStatus } from "./types.js";
 import { WAKE_MANIFEST_FIELD_MAX_CHARS, truncateForTranscript } from "./wake-events.js";
 
@@ -26,16 +27,14 @@ export function taskLogTruncation(output: string, logFile: string, cwd?: string)
 	// descriptor lives in tool-result details where an agent-controlled
 	// `cwd`/`taskDir` setting could otherwise pump a multi-KB string per
 	// inspection.
-	const safeLogFile = truncateForTranscript(logFile, WAKE_MANIFEST_FIELD_MAX_CHARS) ?? "";
-	return { direction: "tail", fullOutputPath: safeLogFile, shownChars: maxChars, totalChars: output.length, truncated: true };
+	return { direction: "tail", shownChars: maxChars, totalChars: output.length, truncated: true };
 }
 
 export function formatTaskLog(output: string, logFile: string, cwd?: string): string {
 	if (!output) return "(empty)";
 	const truncation = taskLogTruncation(output, logFile, cwd);
 	if (!truncation) return output;
-	const safeLogFile = truncateForTranscript(logFile, WAKE_MANIFEST_FIELD_MAX_CHARS) ?? "";
-	return `[...truncated]\n${output.slice(-truncation.shownChars)}\n\n[Background log truncated. Showing last ${truncation.shownChars} of ${truncation.totalChars} character(s). Full log: ${safeLogFile}]`;
+	return `[...truncated]\n${output.slice(-truncation.shownChars)}\n\n[Background log truncated. Showing last ${truncation.shownChars} of ${truncation.totalChars} character(s). The complete captured snapshot is available with bg_task action:"get" output:"full".]`;
 }
 
 export function trimOutputBuffer(output: string, lastAnnouncedLength: number): { output: string; lastAnnouncedLength: number } {
@@ -91,6 +90,57 @@ export function parseOutputMatcher(pattern: string | undefined): ((text: string)
 
 	const lower = needle.toLowerCase();
 	return (text: string) => text.toLowerCase().includes(lower);
+}
+
+/**
+ * Model-facing text for a `get`/`stop` result. Reports the task's identity,
+ * state, outcome, the output it is handing over, and — separately — whether that
+ * output is a complete result. A short capture is never described as a settled
+ * one: the warning line says what is missing and no completion is implied.
+ */
+export function formatTaskResultText(handoff: TaskResultHandoff, ack: TaskResultAck | undefined, now = Date.now()): string {
+	const o = handoff.observation;
+	// Every field that can carry agent-controlled text into the transcript is
+	// bounded here. `command` in particular can be a 100KB heredoc, and this text
+	// is what the model reads.
+	const bound = (value: string) => truncateForTranscript(value, WAKE_MANIFEST_FIELD_MAX_CHARS) ?? "";
+	const lines = [
+		`${o.id} — ${summarizeTaskStatus(o.status, o.exitCode, o.terminationReason)}, ${formatDuration(o.elapsedMs)} elapsed (${o.readiness})`,
+		`command: ${bound(o.command)}`,
+		`cwd: ${bound(o.cwd)}`,
+	];
+	if (o.reviewDeadlineAt != null) lines.push(`next review: ${formatRelativeTime(o.reviewDeadlineAt, now)}`);
+	if (o.hardDeadlineAt != null) lines.push(`hard deadline: ${formatRelativeTime(o.hardDeadlineAt, now)}`);
+	if (o.completionOwed) lines.push("completion: still owed a notification");
+
+	const changed = o.outputChanged ? "changed since the last review" : "unchanged since the last review";
+	const bytes = `${o.outputBytes} byte${o.outputBytes === 1 ? "" : "s"}`;
+	if (handoff.artifact) {
+		const { bytes: size, complete, partial, path } = handoff.artifact;
+		lines.push(
+			`output: full immutable snapshot — ${bound(path)} (${size} byte${size === 1 ? "" : "s"}, ${complete ? "complete" : "not certified complete"}, ${partial ? "partial" : "final"}, ${changed})`,
+		);
+	} else {
+		const partial = o.readiness !== "terminal";
+		lines.push(`output: ${bytes} captured, ${partial ? "partial" : "final"}, ${changed}`);
+	}
+	if (handoff.captureError) {
+		lines.push(`warning: ${handoff.captureError} — this is not a complete result and nothing was acknowledged as settled`);
+	}
+
+	const preview = o.outputPreview;
+	if (preview) lines.push("", o.outputPreviewTruncated ? `[preview truncated]\n${preview}` : preview);
+	else if (!handoff.artifact) lines.push("", "(no output captured)");
+
+	if (ack) {
+		lines.push(
+			"",
+			ack.committed === "terminal"
+				? `acknowledged: completion ${ack.acknowledged ? "settled" : "settled elsewhere"}`
+				: `acknowledged: nothing (this read reset the review clock; the completion stays owed)`,
+		);
+	}
+	return lines.join("\n");
 }
 
 export function summarizeTaskStatus(

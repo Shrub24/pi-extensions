@@ -15,17 +15,18 @@ import {
 	type Theme,
 } from "@earendil-works/pi-coding-agent";
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { Type } from "typebox";
 import { openLaneDir, pruneLanes } from "../scripts/lane-retention.js";
 
 import { shouldAdoptActiveContext } from "./active-context.js";
-import { createBridgeServer, taskGeneration, type BridgeHandler, type BridgeServer, type BridgeTaskSummary } from "./bridge.js";
+import { createBridgeServer, taskGeneration, type BridgeFailure, type BridgeHandler, type BridgeHandlerResult, type BridgeServer, type BridgeTaskSummary } from "./bridge.js";
 import {
 	autoBackgroundDecision,
 	bashBackgroundAckText,
+	duplicateTaskNote,
 	forcedBackgroundDecision,
 } from "./auto-background.js";
 import { publishBackgroundTaskActivity, publishBackgroundTaskStarted } from "./activity.js";
@@ -82,12 +83,13 @@ import {
 	renderTaskEventMessage,
 } from "./render.js";
 import { logBackgroundDiagnostic } from "./diagnostics.js";
-import { registerAll } from "./registrations.js";
+// The surface type is the leaf module's; `registrations.ts` re-exports it for
+// its own deps, and importing it from both places is a duplicate binding.
+import { applyTaskToolSurface, bashPromptGuidelines, registerAll, type RegistrationDeps } from "./registrations.js";
 import { closeTaskLifecycle, replayMissedExitsLifecycle, sendExitWakeLifecycle, type LifecycleHooks } from "./lifecycle.js";
 import { taskLogs } from "./log-writer.js";
 import { BASH_OUTPUT_SCHEMA, buildManagedBashEnv, createForegroundWaiter, formatManagedBashCompletionText, formatManagedBashRunningText, isCodemodeCall, normalizeManagedBashTimeoutSeconds, settleForegroundWaiter, STRUCTURED_OUTPUT_MAX_BYTES, structuredOutputFor, structuredOutputOmittedMarker } from "./managed-bash.js";
 import { emulateTruncation, stripTerminalTruncation } from "./pipe-strip.js";
-import { matchSleepIntercept } from "./sleep-intercept.js";
 import type * as ManagedBashPresentation from "@vanillagreen/pi-tool-renderer/managed-bash";
 import { getIntent, intentModeFor, intentParameters, intentPrepare, intentSuffix, stripIntent, withIntentParameter } from "@vanillagreen/pi-tool-renderer/intent";
 let managedBashPresentation: typeof ManagedBashPresentation | undefined;
@@ -105,8 +107,7 @@ import { applyCustomEntryWithBarrier, createPersistence, sessionIdForContext, si
 import { mapWithConcurrency, PROBE_CONCURRENCY } from "./probes.js";
 import { defaultSystemdUnitActive, planResourceControlledSpawn, stopResourceControlledTask } from "./resource-control.js";
 import { installSettingsCacheRefresh, recordProjectTrust } from "./package-config.js";
-import { bridgeSocketPath, consumeLogPath, logFilePath, settingBoolean, settingEnum, settingNumber, settingString, taskEnv, taskLaneDir, taskLanesRoot } from "./settings.js";
-import { drainConsumedLogPaths } from "./read-shim.js";
+import { bridgeSocketPath, logFilePath, settingBoolean, settingEnum, settingNumber, settingString, taskEnv, taskLaneDir, taskLanesRoot } from "./settings.js";
 import { prepareSnapshot } from "./snapshot-artifact.js";
 import { clampTaskWaitSeconds, createTaskWaitWaiter, DEFAULT_TASK_WAIT_SECONDS, formatTaskWaitRunningText, MAX_TASK_WAIT_SECONDS, settleTaskWaitWaiter, TASK_WAIT_PENDING_POLL_MS } from "./task-wait.js";
 import {
@@ -120,6 +121,8 @@ import {
 	selectPrunableFinishedTasks,
 	taskReadiness,
 	type TaskReadiness,
+	type TaskResultAck,
+	type TaskResultHandoff,
 	type TaskResultObservation,
 } from "./task-result.js";
 import { applyBgToolResultTasksWithBarrier } from "./tool-result-details.js";
@@ -168,6 +171,16 @@ import {
 	WAKE_MANIFEST_FIELD_MAX_CHARS,
 	type OutputWakeBudgetLimits,
 } from "./wake-events.js";
+import { taskSurfaceGuidance, type TaskToolSurface } from "./tool-surface.js";
+
+/**
+ * The surface the current session declared, resolved once at `session_start`.
+ * Wake and acknowledgement text is generated long after registration, so it
+ * reads this rather than a captured mode: a wake may only name operations the
+ * model can actually call. The load-time value is the conservative compatibility
+ * surface, which is also what a session that never reports a mode keeps.
+ */
+let taskToolSurface: TaskToolSurface = "compat";
 
 /**
  * Clamp the rendered line count of an aboveEditor widget so it can never push
@@ -356,7 +369,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 	// that token arrives nothing is committed, so a transport failure, an EPIPE,
 	// or a snapshot the CLI could not open leaves the completion obligation
 	// exactly where it was.
-	type ReceiptCommit = { acknowledged: boolean; reviewed: boolean; committed: "terminal" | "review" };
+	type ReceiptCommit = TaskResultAck;
 	interface PreparedReceipt {
 		taskId: string;
 		generation: string;
@@ -365,6 +378,15 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		preparedAt: number;
 		/** Set once a receipt settled it; a retry replays this instead of redoing it. */
 		commit: ReceiptCommit | null;
+		/**
+		 * When the owning task was pruned. Set only on an accepted token, which keeps
+		 * its record so a retry is told the *task* expired — never that the
+		 * acknowledgment was never accepted, which would read as though it had been
+		 * rolled back. Never aged out: the spec's answer for a pruned task is an
+		 * explicit task expiry, and deleting the record would replace that with an
+		 * unaccepted-preparation error for a token that was in fact accepted.
+		 */
+		prunedAt?: number;
 	}
 	const preparedReceipts = new Map<string, PreparedReceipt>();
 	const RECEIPT_TTL_MS = 15 * 60_000;
@@ -372,30 +394,109 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 
 	const prunePreparedReceipts = (now: number): void => {
 		for (const [token, receipt] of preparedReceipts) {
-			// Accepted receipts survive until their task is gone: a retry has to be
-			// able to replay the committed outcome. Only abandoned preparations age
-			// out, and they were never acknowledged in the first place.
-			if (receipt.commit) continue;
-			if (now - receipt.preparedAt > RECEIPT_TTL_MS) preparedReceipts.delete(token);
+			// Only an abandoned preparation ages out. It committed nothing, so its
+			// record only has to outlive the caller's retry window; an accepted one is
+			// the record a retry replays, and the spec keeps that answer due for the
+			// task's retained lifetime and reports an explicit task expiry after it.
+			if (!receipt.commit && now - receipt.preparedAt > RECEIPT_TTL_MS) preparedReceipts.delete(token);
 		}
-		while (preparedReceipts.size > RECEIPT_MAX_PENDING) {
-			const oldestPending = [...preparedReceipts].find(([, receipt]) => !receipt.commit);
-			if (!oldestPending) break;
-			preparedReceipts.delete(oldestPending[0]);
+		// The bound is `RECEIPT_MAX_PENDING` records *including* the one about to be
+		// minted, so this pass leaves a slot free. It only ever retires records
+		// nothing can still depend on: the accepted handoff of a task that is already
+		// out of the retained map. A live
+		// preparation is never retired — its caller holds the token and is entitled
+		// to have it settle — and neither is an accepted handoff of a retained task,
+		// which is what makes a retry idempotent throughout that task's retained
+		// lifetime. When nothing is retirable the cap is not enforced by eviction;
+		// `mintReceipt` reports an explicit capacity failure instead.
+		while (preparedReceipts.size >= RECEIPT_MAX_PENDING) {
+			const retirable = [...preparedReceipts].find(([, receipt]) => receipt.commit && receipt.prunedAt !== undefined);
+			if (!retirable) break;
+			preparedReceipts.delete(retirable[0]);
 		}
 	};
 
-	/** Drop a task's receipts once the task itself is gone from the retained map. */
-	const forgetTaskReceipts = (taskId: string): void => {
+	/**
+	 * Retire a pruned task's receipts. An unaccepted preparation is dropped
+	 * outright — it committed nothing, so there is nothing left to tell a retry.
+	 * An accepted one keeps its record, marked pruned, so a retry is answered with
+	 * the task's expiry rather than with an unaccepted-preparation error.
+	 */
+	const forgetTaskReceipts = (taskId: string, now: number = Date.now()): void => {
 		for (const [token, receipt] of preparedReceipts) {
-			if (receipt.taskId === taskId) preparedReceipts.delete(token);
+			if (receipt.taskId !== taskId) continue;
+			if (!receipt.commit) {
+				preparedReceipts.delete(token);
+				continue;
+			}
+			receipt.prunedAt ??= now;
 		}
 	};
 
-	const mintReceipt = (task: ManagedTask, readiness: TaskReadiness, outputWasFull: boolean): string => {
+	// A token has to be recognizable as one this session issued even after the
+	// record behind it is gone. Otherwise a retry of an accepted handoff that the
+	// store's cap has since retired is indistinguishable from a token that was
+	// never issued, and the only available answer — "nothing is recorded as
+	// acknowledged" — would assert something false about a settled handoff. The
+	// tag is a keyed digest over the token's own task identity, so verification
+	// needs no stored per-token state and the cap stays a real memory bound.
+	const receiptKey = randomBytes(32);
+	/** The digest covers the *whole* token body, nonce included. */
+	const receiptTag = (body: string): string =>
+		createHmac("sha256", receiptKey).update(body).digest("base64url");
+
+	/**
+	 * Whether a token is one this session minted, read from the token itself.
+	 *
+	 * The digest authenticates the complete issued token — its nonce too — so any
+	 * altered token fails verification and is refused as never issued, rather than
+	 * being accepted as one of this session's own. That has to hold for every part
+	 * of the token, because the answer for an authenticated-but-unheld token
+	 * asserts it was issued here.
+	 */
+	const issuedTokenBody = (token: string): string | null => {
+		const cut = token.lastIndexOf(":");
+		if (cut <= 0) return null;
+		const body = token.slice(0, cut);
+		if (body.split(":").length !== 3) return null;
+		const given = Buffer.from(token.slice(cut + 1));
+		const want = Buffer.from(receiptTag(body));
+		if (given.length !== want.length || !timingSafeEqual(given, want)) return null;
+		return body;
+	};
+
+	/**
+	 * The store is full of handoffs that cannot be retired — every one of them an
+	 * accepted handoff for a task this session still retains. A read can still be
+	 * served, but it cannot be made settleable, so it is reported as a capacity
+	 * failure instead of being handed a receipt that could never commit.
+	 */
+	const receiptCapacityFailure: BridgeFailure = {
+		code: "capacity",
+		message: `this session is holding the maximum of ${RECEIPT_MAX_PENDING} unsettled result handoffs; this read cannot be acknowledged, and no receipt was issued for it`,
+	};
+
+	/** Whether a new prepared handoff could be stored right now. */
+	const receiptIsStorable = (): boolean => {
+		prunePreparedReceipts(Date.now());
+		return preparedReceipts.size < RECEIPT_MAX_PENDING;
+	};
+
+	/**
+	 * Store a prepared handoff and return its token, or `null` when the store is
+	 * saturated.
+	 *
+	 * The store is a memory bound, so a preparation that cannot be stored must fail
+	 * explicitly: handing back a token whose record was not kept — or evicting the
+	 * token just minted, or another caller's live preparation — would present a
+	 * token as valid that can never settle what it promises.
+	 */
+	const mintReceipt = (task: ManagedTask, readiness: TaskReadiness, outputWasFull: boolean): string | null => {
 		const now = Date.now();
 		prunePreparedReceipts(now);
-		const token = `${task.id}:${taskGeneration(task)}:${randomUUID()}`;
+		if (preparedReceipts.size >= RECEIPT_MAX_PENDING) return null;
+		const body = `${task.id}:${taskGeneration(task)}:${randomUUID()}`;
+		const token = `${body}:${receiptTag(body)}`;
 		preparedReceipts.set(token, {
 			commit: null,
 			generation: taskGeneration(task),
@@ -435,12 +536,11 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		return undefined;
 	};
 
-	const bridgePrepared = (task: ManagedTask) => {
-		const observation = observeTaskResult(task);
-		const captureError = captureErrorFor(observation);
+	const bridgePrepared = async (task: ManagedTask) => {
+		const handoff = await prepareTaskHandoff(task, "preview");
 		return {
-			captureError,
-			observation,
+			captureError: handoff.captureError,
+			observation: handoff.observation,
 			task: bridgeSummary(task),
 		};
 	};
@@ -450,15 +550,54 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 	 * acknowledgment or a review, and it is idempotent: a caller whose connection
 	 * dropped after the request landed can retry the same token and get the same
 	 * committed outcome rather than a second, or a refused, one.
+	 *
+	 * Only a token this session never accepted answers `receipt-unaccepted`. An
+	 * accepted token always answers with its committed outcome while its task is
+	 * retained, and with an explicit task expiry after the task is pruned — never
+	 * with the unaccepted-preparation error, which would describe a committed
+	 * acknowledgment as one that had never been recorded.
 	 */
 	const settleReceipt = (token: string): BridgeHandlerResult => {
 		const receipt = preparedReceipts.get(token);
 		if (!receipt) {
+			// No record. Two different situations reach here and they must not be
+			// given the same answer:
+			//
+			// - the token is not one this session minted, so nothing was ever
+			//   recorded for it and refusing it claims nothing false;
+			// - the token *is* this session's, but the store's cap has since retired
+			//   its record. Calling that an unaccepted preparation would describe a
+			//   possibly-settled handoff as one that was never accepted, so this
+			//   answer keeps the memory bound while saying only what is known: the
+			//   handoff cannot be replayed, and nothing here is a claim about
+			//   whether it was acknowledged.
+			if (!issuedTokenBody(token)) {
+				return {
+					ok: false,
+					error: {
+						code: "receipt-unaccepted",
+						message: "this token names no preparation this session holds; nothing is recorded as acknowledged or unacknowledged for it",
+					},
+				};
+			}
 			return {
 				ok: false,
 				error: {
-					code: "receipt-unaccepted",
-					message: "this receipt was never prepared, or its preparation expired without committing anything",
+					code: "expired",
+					message: "this token was issued by this session, but the record that could replay it is no longer held; the handoff cannot be replayed, and this answer makes no claim about whether it was acknowledged",
+				},
+			};
+		}
+		if (receipt.prunedAt !== undefined) {
+			// The task outlived its retention window. The commit that happened still
+			// happened; what is gone is the task it belonged to. `prunedAt` is set only
+			// for an accepted token, so this is an expiry of the task, not of a
+			// preparation the session never accepted.
+			return {
+				ok: false,
+				error: {
+					code: "expired",
+					message: `task ${receipt.taskId} is no longer retained; its accepted handoff cannot be replayed, and its acknowledgment stands`,
 				},
 			};
 		}
@@ -491,26 +630,10 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		// Revalidate at commit time. A handoff prepared while the task ran streamed
 		// a partial capture, so even if the task finished mid-stream it may only ever
 		// reset the review clock — never acknowledge a completion whose bytes the
-		// caller did not receive in full.
+		// caller did not receive in full. The commit rule is shared with the tool
+		// adapter, so both settle a handoff identically.
 		const observation = observeTaskResult(task);
-		const completionWon = receipt.readinessAtPrepare === "terminal";
-		let committed: ReceiptCommit;
-		if (completionWon) {
-			ackCompletion(task, "retrieval");
-			// The obligation is settled whether this handoff settled it or an earlier
-			// delivery already had: the caller is told the result's completion is
-			// accounted for, not that this call happened to flip the bit.
-			committed = { acknowledged: task.exitNotified === true, committed: "terminal", reviewed: false };
-		} else {
-			committed = { acknowledged: false, committed: "review", reviewed: true };
-		}
-		if (!completionWon) {
-			// A successful running handoff resets only the review clock; the completion
-			// stays owed, and any held wake for it stays held.
-			recordReview(task);
-			rememberSnapshot(task);
-			persistSnapshots();
-		}
+		const committed = commitTaskHandoff(task, receipt.readinessAtPrepare);
 		receipt.commit = committed;
 		logBackgroundDiagnostic("bridge receipt accepted", {
 			acknowledged: committed.acknowledged,
@@ -533,12 +656,20 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 	};
 
 	/**
-	 * Prepare the artifact a full read hands over. A running capture is flushed to
-	 * a boundary first, so the snapshot holds everything captured so far instead of
-	 * whatever happened to have reached the file; the boundary is then fixed at the
-	 * flushed size, so later output cannot change this artifact.
+	 * The one prepared-result operation: what a `get` hands over, shared by the
+	 * `bg_task` tool and the declared CLI. Transport is the only thing that
+	 * differs between them, so it is the only thing that lives outside this.
+	 *
+	 * Preparing commits nothing — not an acknowledgment, not a review. A full read
+	 * is flushed to a boundary first, so the snapshot holds everything captured so
+	 * far instead of whatever happened to have reached the file, and the boundary
+	 * is then fixed at the flushed size so later output cannot change the artifact.
 	 */
-	const bridgeSnapshot = async (task: ManagedTask): Promise<BridgeHandlerResult> => {
+	const prepareTaskHandoff = async (task: ManagedTask, output: "preview" | "full"): Promise<TaskResultHandoff> => {
+		if (output === "preview") {
+			const observation = observeTaskResult(task);
+			return { captureError: captureErrorFor(observation), observation };
+		}
 		if (task.status === "running") {
 			// `flush` returns null when there is nothing pending, in which case the
 			// file already holds every appended chunk.
@@ -546,28 +677,56 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		}
 		const observation = observeTaskResult(task);
 		const certified = observation.readiness === "terminal" && observation.outputComplete;
-		const handoff = await prepareSnapshot({
+		const snapshot = await prepareSnapshot({
 			generation: taskGeneration(task),
 			laneDir: ownLaneDir(),
 			logFile: task.logFile,
 			partial: !certified,
 			taskId: task.id,
 		});
-		if (!handoff.ok) {
-			return { ok: false, error: { code: handoff.code, message: handoff.message } };
+		if (!snapshot.ok) return { failure: { code: snapshot.code, message: snapshot.message }, observation };
+		return { artifact: snapshot.artifact, captureError: certified ? undefined : captureErrorFor(observation), observation };
+	};
+
+	/**
+	 * Commit a handoff whose output actually reached the caller. A terminal
+	 * handoff settles the completion; a running one resets only the review clock
+	 * and leaves the completion owed. The observation the handoff was *prepared*
+	 * at decides which, never the task's state at commit time: a partial stream
+	 * cannot become a completion acknowledgment because the task finished while it
+	 * was being written.
+	 */
+	const commitTaskHandoff = (task: ManagedTask, readinessAtPrepare: TaskReadiness): TaskResultAck => {
+		if (readinessAtPrepare !== "terminal") {
+			recordReview(task);
+			rememberSnapshot(task);
+			persistSnapshots();
+			return { acknowledged: false, committed: "review", reviewed: true };
 		}
+		ackCompletion(task, "retrieval");
+		// The obligation is settled whether this handoff settled it or an earlier
+		// delivery already had: the caller is told the result's completion is
+		// accounted for, not that this call happened to flip the bit.
+		return { acknowledged: task.exitNotified === true, committed: "terminal", reviewed: false };
+	};
+
+	const bridgeSnapshot = async (task: ManagedTask): Promise<BridgeHandlerResult> => {
+		const handoff = await prepareTaskHandoff(task, "full");
+		if (handoff.failure) return { ok: false, error: { code: handoff.failure.code, message: handoff.failure.message } };
+		if (!receiptIsStorable()) return { ok: false, error: receiptCapacityFailure };
+		const artifact = handoff.artifact!;
 		return {
 			ok: true,
 			result: {
-				captureError: certified ? undefined : captureErrorFor(observation),
+				captureError: handoff.captureError,
 				output: {
-					bytes: handoff.artifact.bytes,
-					complete: handoff.artifact.complete,
+					bytes: artifact.bytes,
+					complete: artifact.complete,
 					kind: "snapshot",
-					partial: handoff.artifact.partial,
-					path: handoff.artifact.path,
+					partial: artifact.partial,
+					path: artifact.path,
 				},
-				receipt: mintReceipt(task, observation.readiness, true),
+				receipt: mintReceipt(task, handoff.observation.readiness, true),
 				task: bridgeSummary(task),
 			},
 		};
@@ -594,13 +753,17 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			// A full read hands over an artifact, never the live file: the caller must
 			// not be reading a log the producer is still writing.
 			if (request.output === "full") return bridgeSnapshot(task);
-			const prepared = bridgePrepared(task);
+			const prepared = await bridgePrepared(task);
+			const receipt = mintReceipt(task, prepared.observation.readiness, false);
+			// A read with no storable receipt is reported as a capacity failure: it cannot
+			// be acknowledged, so it must not look like a handoff that will commit.
+			if (!receipt) return { ok: false, error: receiptCapacityFailure };
 			return {
 				ok: true,
 				result: {
 					captureError: prepared.captureError,
 					output: { kind: "preview", partial: prepared.observation.readiness !== "terminal", text: prepared.observation.outputPreview, truncated: prepared.observation.outputPreviewTruncated },
-					receipt: mintReceipt(task, prepared.observation.readiness, false),
+					receipt,
 					task: prepared.task,
 				},
 			};
@@ -615,13 +778,17 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		// A confirmed stop returns a terminal task, so its capture is the same
 		// immutable artifact a full get hands over.
 		if (request.output === "full") return bridgeSnapshot(task);
-		const prepared = bridgePrepared(task);
+		const prepared = await bridgePrepared(task);
+		const receipt = mintReceipt(task, prepared.observation.readiness, false);
+		// A read with no storable receipt is reported as a capacity failure: it cannot
+		// be acknowledged, so it must not look like a handoff that will commit.
+		if (!receipt) return { ok: false, error: receiptCapacityFailure };
 		return {
 			ok: true,
 			result: {
 				captureError: prepared.captureError,
 				output: { kind: "preview", partial: prepared.observation.readiness !== "terminal", text: prepared.observation.outputPreview, truncated: prepared.observation.outputPreviewTruncated },
-				receipt: mintReceipt(task, prepared.observation.readiness, false),
+				receipt,
 				task: prepared.task,
 			},
 		};
@@ -660,27 +827,37 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		terminalWaiters.delete(task.id);
 		for (const resolve of waiters) resolve();
 	};
-	const awaitTerminal = (task: ManagedTask, timeoutMs: number): Promise<boolean> =>
-		new Promise<boolean>((resolve) => {
+	/**
+	 * A bounded wait for a task's terminal state, as a promise and the handle that
+	 * cancels it. The cancel exists for a caller whose wait stops applying before
+	 * it settles — a stop whose signal was refused has no termination left to wait
+	 * for, and its timer must not outlive the refusal.
+	 */
+	const awaitTerminal = (task: ManagedTask, timeoutMs: number): { cancel: () => void; settled: Promise<boolean> } => {
+		let cancel = (): void => {};
+		const settled = new Promise<boolean>((resolve) => {
 			if (taskReadiness(task) === "terminal" || task.status !== "running") {
 				resolve(true);
 				return;
 			}
 			const waiters = terminalWaiters.get(task.id) ?? new Set<() => void>();
-			let settled = false;
+			let done = false;
 			const finish = (confirmed: boolean): void => {
-				if (settled) return;
-				settled = true;
+				if (done) return;
+				done = true;
 				waiters.delete(onTerminal);
 				if (waiters.size === 0) terminalWaiters.delete(task.id);
 				clearTimeout(timer);
 				resolve(confirmed);
 			};
 			const onTerminal = (): void => finish(true);
+			cancel = () => finish(false);
 			waiters.add(onTerminal);
 			terminalWaiters.set(task.id, waiters);
 			const timer = setTimeout(() => finish(false), Math.max(0, timeoutMs));
 		});
+		return { cancel: () => cancel(), settled };
+	};
 
 	/**
 	 * Stop bounded by the existing termination procedure: SIGTERM now, the
@@ -691,7 +868,9 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 	 */
 	const stopTaskForBridge = async (task: ManagedTask): Promise<{ confirmed: boolean; message: string }> => {
 		if (taskReadiness(task) === "terminal" || task.status !== "running") {
-			return { confirmed: true, message: `${task.id} was already ${summarizeTaskStatus(task.status, task.exitCode, task.terminationReason)}` };
+			// The same wording the direct stop uses, so one stop outcome reads one
+			// way however the caller reached it.
+			return { confirmed: true, message: `${task.id} is already ${summarizeTaskStatus(task.status, task.exitCode, task.terminationReason)}.` };
 		}
 		const graceMs = settingNumber("forceKillGraceMs", DEFAULT_FORCE_KILL_GRACE_MS, activeCtx?.cwd);
 		const boundMs = graceMs + 5_000;
@@ -699,10 +878,12 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		const signalled = requestStop(task, "user", "agent");
 		if (!signalled.ok) {
 			// No signal was sent and nothing was confirmed: the task is exactly as
-			// it was, and the caller must not treat this as a stopped task.
+			// it was, and the caller must not treat this as a stopped task. Nothing
+			// is pending termination, so the wait armed above is retired with it.
+			pending.cancel();
 			return { confirmed: false, message: signalled.message };
 		}
-		if (!(await pending)) {
+		if (!(await pending.settled)) {
 			return {
 				confirmed: false,
 				message: `${task.id} did not confirm termination within ${boundMs}ms; it is not reported stopped and its outcome stays outstanding`,
@@ -1088,6 +1269,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		const announced = sendOutputWakeBudgetExhaustedNotice({
 			logDiagnostic: logWakeDiagnostic,
 			messageType: BG_MESSAGE_TYPE,
+			surface: () => taskToolSurface,
 			rememberSnapshot,
 			sendMessage: (message, messageOptions) => pi.sendMessage(message as any, messageOptions as any),
 		}, task, limits);
@@ -1149,6 +1331,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			isShuttingDown: () => shuttingDown,
 			logDiagnostic: logWakeDiagnostic,
 			messageType: BG_MESSAGE_TYPE,
+			surface: () => taskToolSurface,
 			outputTail: (target) => tailText(getTaskOutput(target), settingNumber("outputAlertMaxChars", DEFAULT_OUTPUT_ALERT_MAX_CHARS, activeCtx?.cwd)),
 			rememberSnapshot,
 			sendMessage: (message, messageOptions) => pi.sendMessage(message as any, messageOptions as any),
@@ -1674,7 +1857,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 	// Render-ready view of the task's *current* state. The transcript row keeps
 	// its place, but status, exit code and tail always come from the live task,
 	// so a row that yielded as "running" later expands to the finished output.
-	const managedBashRowFor = (task: ManagedTask, cwd?: string): ManagedBashRowTask => {
+	const managedBashRowFor = (task: ManagedTask, cwd?: string): ManagedBashPresentation.ManagedBashRowTask => {
 		const output = getTaskOutput(task);
 		return {
 			elapsedMs: (task.status === "running" ? Date.now() : task.updatedAt) - task.startedAt,
@@ -1694,7 +1877,6 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		formatManagedBashCompletionText({
 			elapsedText: formatDuration(elapsedMs),
 			id: task.id,
-			logFile: task.logFile,
 			outputTail: managedBashOutputTail(task, cwd),
 			statusText: summarizeTaskStatus(task.status, task.exitCode, task.terminationReason),
 		});
@@ -1703,37 +1885,9 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		formatManagedBashRunningText({
 			elapsedText: formatDuration(elapsedMs),
 			id: task.id,
-			logFile: task.logFile,
 			outputTail: managedBashOutputTail(task, cwd),
 			pid: task.pid,
-		});
-
-	const basenameTaskLog = (logFile: string): string => logFile.split("/").pop() ?? logFile;
-
-	/**
-	 * Runs the read remainder of an intercepted sleep command through /bin/sh
-	 * and returns bounded stdout. The gate has already proven every segment is
-	 * a pure read, so this cannot mutate anything.
-	 */
-	const executeReadRemainder = async (remainder: string, cwd: string): Promise<string> => {
-		try {
-			const child = spawn("/bin/sh", ["-c", remainder], { cwd, stdio: ["ignore", "pipe", "pipe"] });
-			let out = "";
-			const collect = (chunk: Buffer) => {
-				out += chunk.toString();
-				if (out.length > 8_000) out = out.slice(0, 8_000);
-			};
-			child.stdout?.on("data", collect);
-			child.stderr?.on("data", collect);
-			const done = new Promise<void>((resolve) => child.on("close", () => resolve()));
-			const timeout = new Promise<void>((resolve) => setTimeout(resolve, 5_000).unref?.());
-			await Promise.race([done, timeout]);
-			child.kill("SIGKILL");
-			return out.trim();
-		} catch (error) {
-			return `[intercepted read failed: ${error instanceof Error ? error.message : String(error)}]`;
-		}
-	};
+		}, taskToolSurface);
 
 	/**
 	 * Pi's own bash tool definition, typed from the module's export without
@@ -1788,39 +1942,6 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		if (!command.trim()) throw new Error("command is required");
 		recordProjectTrust(ctx);
 		if (shouldAdoptActiveContext(activeCtx, ctx)) activeCtx = ctx;
-
-		// Intercept-substitute-label: `sleep N && <reads of managed logs>` is a
-		// hand-written poll. Run the reads against the task now (bounded wait if
-		// it is still running) and tell the agent what happened, instead of
-		// burning N seconds in a foreground window. Anything the gate cannot
-		// parse with certainty runs exactly as written (fail open).
-		const intercept = matchSleepIntercept(command);
-		if (intercept) {
-			const referenced = [...tasks.values()].filter((task) =>
-				intercept.logPaths.some((path) => path.includes(basenameTaskLog(task.logFile)) || task.logFile.includes(path.trim()))
-			);
-			const target = referenced.at(-1);
-			if (target && target.status === "running") {
-				const result = await waitForTask(target, Math.min(intercept.sleepSeconds, 30), signal, ctx);
-				const label = `kendex: intercepted sleep ${intercept.sleepSeconds}; bg_task action:"wait" ran against ${target.id} instead. Next time call bg_task action:\"wait\" directly.`;
-				return {
-					content: [{ type: "text", text: `${label}\n\n${result.content[0]?.text ?? ""}` }],
-					details: result.details,
-				} as AgentToolResult<unknown>;
-			}
-			if (target) {
-				const label = `kendex: intercepted sleep ${intercept.sleepSeconds}; ${target.id} already finished, so the reads ran now. Next time read the log directly — no sleep needed.`;
-				const readResult = await executeReadRemainder(intercept.remainder, ctx.cwd);
-				// The reads just ran are the delivery for this exit: acknowledge through
-				// the shared entry point, which also drops any wake still held.
-				ackCompletion(target, "retrieval");
-				return {
-					content: [{ type: "text", text: `${label}\n\n${readResult}` }],
-					details: { action: "bash", intercepted: true, task: compactBackgroundTaskSnapshot(rememberSnapshot(target)) },
-				} as AgentToolResult<unknown>;
-			}
-			// Read targets matched no managed task: fail open — run as written.
-		}
 
 		const timeoutSeconds = normalizeManagedBashTimeoutSeconds(params.timeout);
 		const yieldMs = managedBashYieldMs(ctx.cwd);
@@ -1998,7 +2119,6 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 				formatTaskWaitRunningText({
 					elapsedText: formatDuration(Date.now() - waitStartedAt),
 					id: task.id,
-					logFile: task.logFile,
 					outputTail: managedBashOutputTail(task, ctx.cwd),
 					pid: task.pid,
 					waitSeconds,
@@ -2024,7 +2144,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 	 * single prompt, so a wake sent while another is queued still reaches the
 	 * agent merged, not stacked.
 	 */
-	const flushDeferredExitWakes = (): void => {		drainShimConsumedReads();
+	const flushDeferredExitWakes = (): void => {
 		if (deferredExitWakes.size === 0) return;
 		const pending = [...deferredExitWakes.entries()];
 		deferredExitWakes.clear();
@@ -2042,6 +2162,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 				isShuttingDown: () => shuttingDown,
 				logDiagnostic: logWakeDiagnostic,
 				messageType: BG_MESSAGE_TYPE,
+				surface: () => taskToolSurface,
 				outputTail: (target) => tailText(getTaskOutput(target), settingNumber("outputAlertMaxChars", DEFAULT_OUTPUT_ALERT_MAX_CHARS, activeCtx?.cwd)),
 				rememberSnapshot,
 				sendMessage: (message, messageOptions) => pi.sendMessage(message as any, messageOptions as any),
@@ -2063,7 +2184,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			`${finished.length} background tasks finished.`,
 			...summaries.map((line) => `• ${line}`),
 			failures.length > 0
-				? `${failures.length} failed: review with bg_task log.`
+				? `${failures.length} failed: ${taskSurfaceGuidance(taskToolSurface).reviewFailures}.`
 				: "If these results are already consumed, nothing more to do; stop lingering tasks with bg_task stop.",
 			runningInventory(),
 		].join("\n");
@@ -2098,7 +2219,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 
 	/**
 	 * Drops a deferred/idle exit wake because the agent already observed the
-	 * task's result (bg_task log/wait, an intercepted sleep, or a shimmed read).
+	 * task's result through a declared operation (bg_task get/log/wait/stop).
 	 * Returns true when this process was actually holding one, which is also when
 	 * the shared acknowledgment is recorded: observing an already-acknowledged
 	 * task changes nothing.
@@ -2109,30 +2230,6 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		if (!held || !task) return false;
 		ackCompletion(task, "retrieval", { cancelHeld: false });
 		return true;
-	};
-
-	/**
-	 * Drops pending wakes for tasks whose log the agent has already read through
-	 * the managed-bash read shims (cat/tail/head/grep/less, pi-bg read). The shims
-	 * report the exact path they opened, so this is the real read — not a guess
-	 * about command text.
-	 */
-	const drainShimConsumedReads = (): void => {
-		let paths: Set<string>;
-		try {
-			paths = drainConsumedLogPaths(consumeLogPath());
-		} catch {
-			return;
-		}
-		if (paths.size === 0) return;
-		for (const task of tasks.values()) {
-			if (task.status === "running" || !task.logFile) continue;
-			if (!paths.has(task.logFile)) continue;
-			// The read is the delivery: consumeObservedExitWake records the shared
-			// acknowledgment when a wake was still held, so nothing here has to
-			// remember or persist separately.
-			consumeObservedExitWake(task.id);
-		}
 	};
 
 	/**
@@ -2432,7 +2529,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		if (!command.trim()) return null;
 		if (consumeForcedBackground(cwd)) return forcedBackgroundDecision(command, cwd);
 		if (!settingBoolean("autoBackgroundBash", true, cwd)) return null;
-		return autoBackgroundDecision(command, cwd);
+		return autoBackgroundDecision(command, cwd, taskToolSurface);
 	};
 
 	const dashboardDeps = {
@@ -2443,6 +2540,54 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		requestStop: (task: ManagedTask | null, reason: "user", author?: "agent" | "operator") => requestStop(task, reason, author ?? "agent"),
 		sortedTasks,
 	};
+	// The registration surface is built once and shared: `registerAll` uses it at
+	// load and `session_start` uses it again to declare the mode's tool surface.
+	const registrationDeps: RegistrationDeps = {
+		getActiveCtx: () => activeCtx,
+		setActiveCtx: (ctx) => { activeCtx = ctx; },
+		rememberSnapshot,
+		sortedTasks,
+		formatTaskListText,
+		getTaskOutput,
+		resolveTask,
+		requestStop: (task, _reason, author) => requestStop(task, "user", author ?? "agent"),
+		readTaskResult: async (task, output) => {
+			const handoff = await prepareTaskHandoff(task, output);
+			// A handoff the caller cannot certify is still handed over — the surviving
+			// bytes and the loss metadata are the truth — but it commits nothing, so a
+			// short capture is never reported as a settled result.
+			if (handoff.failure || handoff.captureError) return { handoff };
+			const ack = commitTaskHandoff(task, handoff.observation.readiness);
+			// The observation describes the result *as handed over*, which is what
+			// makes its changed-output indicator meaningful — a post-commit re-read is
+			// always unchanged and would say nothing. The one field this handoff did
+			// change is reported as it now stands, so the result cannot claim both that
+			// the completion is settled and that it is still owed.
+			return {
+				ack,
+				handoff: ack.committed === "terminal" ? { ...handoff, observation: { ...handoff.observation, completionOwed: false } } : handoff,
+			};
+		},
+		stopTaskConfirmed: stopTaskForBridge,
+		extendSoftTimeout,
+		similarRunningTasks,
+		recentlyFinishedTasks,
+		spawnTask,
+		oldestRunningTask,
+		waitForTask,
+		consumeObservedExitWake,
+		clearFinishedTasks,
+		armForcedBackground,
+		toggleWidget: () => {
+			toggleBackgroundWidgetVisibility(widgetVisibility);
+			if (activeCtx) syncWidget(activeCtx);
+		},
+		dashboardDeps,
+		dashboardShortcut,
+		backgroundBashShortcut,
+		widgetToggleShortcut,
+	};
+
 
 	pi.registerMessageRenderer(BG_MESSAGE_TYPE, (message, { expanded }, theme) => renderTaskEventMessage(message, expanded, theme));
 
@@ -2468,6 +2613,12 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		shuttingDown = false;
 		recordProjectTrust(ctx);
 		activeCtx = ctx;
+		// The session mode is known only here, and it decides the declared tool
+		// surface: the TUI gets `bg_task` with exactly spawn/get/stop/list and no
+		// `bg_status`, while print/json/rpc/unknown keep the compatibility surface
+		// with `bg_status` and the bounded wait. This runs before the first agent
+		// turn, so no request is ever assembled against the wrong declaration.
+		registerBashTool(taskToolSurface = applyTaskToolSurface(pi, registrationDeps, ctx.mode));
 		const pruned = pruneLanes(taskLanesRoot());
 		for (const failure of pruned.failed) logBackgroundDiagnostic("task log prune failed", { path: failure.path, error: failure.error });
 		await restoreSnapshots(ctx);
@@ -2606,8 +2757,8 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		const identical = similar.identical.filter((t) => t.id !== task.id).map((t) => t.id);
 		const related = similar.similar.filter((t) => t.id !== task.id).map((t) => t.id);
 		const reran = recentlyFinishedTasks(command, task.cwd).filter((t) => t.id !== task.id);
-		const duplicateNote = duplicateTaskNote(identical, related, reran);
-		const output = bashBackgroundAckText(rememberSnapshot(task), decision, otherRunning, duplicateNote);
+		const duplicateNote = duplicateTaskNote(identical, related, reran, taskToolSurface);
+		const output = bashBackgroundAckText(rememberSnapshot(task), decision, otherRunning, duplicateNote, taskToolSurface);
 		if (ctx.hasUI) {
 			const label = decision.forced ? "Shortcut moved user bash to background" : "Auto-backgrounded user bash";
 			ctx.ui.notify(`${label}: ${task.id} (pid ${task.pid})`, "info");
@@ -2615,16 +2766,16 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		return { result: { output, exitCode: 0, cancelled: false, truncated: false } };
 	});
 
-	pi.registerTool({
+	// `bash` is declared in every mode, so it is re-declared with the mode's own
+	// guidance: its "what to do with a Running result" bullet is where a TUI could
+	// otherwise be told about the compatibility wait it does not have.
+	const registerBashTool = (surface: TaskToolSurface): void => pi.registerTool({
 		name: "bash",
 		label: "bash",
 		renderShell: "self",
 		description: "Run builds, tests, programs, diagnostics, and system commands. Do not use shell grep/find/cat/ls as substitutes for dedicated retrieval or code-intelligence tools. Commands run under the background-task manager: a command that finishes within the foreground wait returns its stdout/stderr and exit status directly, while a command still running after that returns a Running result with a task id, keeps running under the manager, and wakes the agent automatically on completion. Optionally provide a timeout in seconds as a hard runtime limit.",
 		promptSnippet: "Run builds, tests, programs, diagnostics, and system commands. Do not use shell grep/find/cat/ls as substitutes for dedicated retrieval or code-intelligence tools.",
-		promptGuidelines: [
-			"You can inspect PI_* environment variables for current model and session details.",
-			"If a bash result says Running, it is not success. If the result is a dependency barrier, call bg_task action:\"wait\" once with a bounded waitSeconds; otherwise continue only independent work. If nothing independent remains, finish the turn with a brief waiting status and go idle; completion will wake the agent in a new turn. Do not repeatedly call list/log/wait in a polling loop.",
-		],
+		promptGuidelines: bashPromptGuidelines(surface),
 		parameters: intentParameters("bash", Type.Object({
 			command: Type.String({ description: "Shell command to execute" }),
 			timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (optional, no default timeout); enforced as hard process runtime" })),
@@ -2667,32 +2818,9 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		},
 	});
 	interop[MANAGED_BASH_SYMBOL] = true;
+	// The load-time declaration is the conservative one; `session_start` replaces
+	// it with the mode's own surface through `applyTaskToolSurface`.
+	registerBashTool("compat");
 
-	registerAll(pi, {
-		getActiveCtx: () => activeCtx,
-		setActiveCtx: (ctx) => { activeCtx = ctx; },
-		rememberSnapshot,
-		sortedTasks,
-		formatTaskListText,
-		getTaskOutput,
-		resolveTask,
-		requestStop: (task, _reason, author) => requestStop(task, "user", author ?? "agent"),
-		extendSoftTimeout,
-		similarRunningTasks,
-		recentlyFinishedTasks,
-		spawnTask,
-		oldestRunningTask,
-		waitForTask,
-		consumeObservedExitWake,
-		clearFinishedTasks,
-		armForcedBackground,
-		toggleWidget: () => {
-			toggleBackgroundWidgetVisibility(widgetVisibility);
-			if (activeCtx) syncWidget(activeCtx);
-		},
-		dashboardDeps,
-		dashboardShortcut,
-		backgroundBashShortcut,
-		widgetToggleShortcut,
-	});
+	registerAll(pi, registrationDeps);
 }
