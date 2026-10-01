@@ -4462,7 +4462,7 @@ test("context retirement rejects managed session continuation only when enabled"
     }),
   ]);
   try {
-    updateConfig("contextRetirement", undefined);
+    updateConfig("contextRetirement", true);
     assert.throws(
       () => resolveAssignmentSession(context, session.path),
       /retired after context pressure/,

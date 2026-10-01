@@ -79,7 +79,7 @@ test.afterEach(resetConfig);
 test("missing config resolves to defaults without creating storage", () => {
   resetConfig();
   assert.deepEqual(readConfig(), DEFAULT_CONFIG);
-  assert.equal(readConfig().contextRetirement, true);
+  assert.equal(readConfig().contextRetirement, false);
   assert.equal(realFs.existsSync(herdsmanDataRoot()), false);
 });
 
@@ -104,7 +104,7 @@ test("partial and complete valid configs overlay defaults", () => {
   );
   assert.deepEqual(readConfig(), {
     spawnPlacement: "tab",
-    contextRetirement: true,
+    contextRetirement: false,
     inlineAttachmentLimitBytes: MIN_BYTE_LIMIT,
     mailboxPayloadLimitBytes: MAX_BYTE_LIMIT,
   });

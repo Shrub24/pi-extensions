@@ -26,7 +26,7 @@ schema is:
 ```json
 {
   "spawnPlacement": "subtree",
-  "contextRetirement": true,
+  "contextRetirement": false,
   "inlineAttachmentLimitBytes": 131072,
   "mailboxPayloadLimitBytes": 131072
 }
@@ -37,7 +37,7 @@ An absent file means these defaults:
 | Field                        |            Default | Allowed values                                    |
 | ---------------------------- | -----------------: | ------------------------------------------------- |
 | `spawnPlacement`             |          `subtree` | `tab`, `subtree`, `split`                         |
-| `contextRetirement`          |               true | boolean                                           |
+| `contextRetirement`          |              false | boolean                                           |
 | `inlineAttachmentLimitBytes` | `131072` (128 KiB) | integer from 1024 (1 KiB) through 1048576 (1 MiB) |
 | `mailboxPayloadLimitBytes`   | `131072` (128 KiB) | integer from 1024 (1 KiB) through 1048576 (1 MiB) |
 
@@ -55,9 +55,11 @@ When `contextRetirement` is enabled, automatic context pressure retires a
 managed-agent session. Herdsman suppresses preventive threshold compaction
 while the assignment finalizes and leaves Pi's overflow recovery available.
 The session receives a finalization instruction, and its result requires a
-fresh agent for follow-up. Disabling it bypasses retirement completely,
+fresh agent for follow-up. Disabled, it bypasses retirement completely,
 including existing retirement markers, and leaves Pi's native compaction and
-session reuse behavior untouched.
+session reuse behavior untouched. This fork ships it disabled: managed agents
+are persistent sessions that compact through the context stack their Pi
+configuration loads, and `agent_continue` stays available after compaction.
 
 Placement affects future starts, not existing agents. `tab` uses one lead-owned
 agents tab, `subtree` gives each lead-direct agent its own tab, and `split`

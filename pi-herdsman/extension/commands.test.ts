@@ -4073,15 +4073,15 @@ test("main agents menu toggles context retirement", async () => {
     await pi.commandOptions.get("agents").handler("", context);
     assert.match(
       menus[0]?.find((option) => option.includes("Context retirement")) ?? "",
-      /Context retirement  on/,
+      /Context retirement  off/,
     );
-    assert.equal(readConfig().contextRetirement, false);
-    assert.deepEqual(notices, ["context retirement: off"]);
+    assert.equal(readConfig().contextRetirement, true);
+    assert.deepEqual(notices, ["context retirement: on"]);
     await pi.commandOptions.get("agents").handler("", context);
     assert.match(
       menus.at(-1)?.find((option) => option.includes("Context retirement")) ??
         "",
-      /Context retirement  off/,
+      /Context retirement  on/,
     );
   } finally {
     updateConfig("contextRetirement", undefined);

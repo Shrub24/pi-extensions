@@ -120,6 +120,16 @@ workflow.
 | Deploy an SSH-ready environment            | [Container deployment](docs/guides/container-deployment.md)   |
 | Contribute to Pi Herdsman                  | [Documentation index](docs/README.md#develop-pi-herdsman)     |
 
+## Fork delta
+
+This package is a fork of [boadij/pi-herdsman](https://github.com/boadij/pi-herdsman),
+imported at `156b1c66` (v0.18.0). The fork's own changes:
+
+- **Context retirement off by default** — `contextRetirement` defaults to `false`
+  ([configuration](docs/reference/configuration.md)): managed agents are
+  persistent sessions that compact through their own Pi context stack and stay
+  continuable, instead of retiring at the compaction threshold.
+
 ## Community
 
 Questions, workflows, examples, and ideas are welcome in

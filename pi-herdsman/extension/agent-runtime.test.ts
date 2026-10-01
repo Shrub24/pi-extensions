@@ -3052,7 +3052,9 @@ test("session agent identity reads the session-wide entry array", () => {
   );
 });
 
-test("retired active sessions suppress threshold compaction until completion", async () => {
+test("retired active sessions suppress threshold compaction until completion", async (t) => {
+  updateConfig("contextRetirement", true);
+  t.after(() => updateConfig("contextRetirement", undefined));
   const mailbox = setAgentEnvironment("retirement-agent");
   const agent = fakePi();
   registerExtension!(agent.pi as never);
@@ -3178,7 +3180,9 @@ test("context retirement bypasses compaction behavior when disabled", async () =
   }
 });
 
-test("overflow retires without cancellation and inactive sessions stay untouched", async () => {
+test("overflow retires without cancellation and inactive sessions stay untouched", async (t) => {
+  updateConfig("contextRetirement", true);
+  t.after(() => updateConfig("contextRetirement", undefined));
   const mailbox = setAgentEnvironment("retirement-overflow-agent");
   const agent = fakePi();
   registerExtension!(agent.pi as never);
