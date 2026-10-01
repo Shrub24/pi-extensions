@@ -23,7 +23,8 @@ import { handleManagementAction } from "../../agents/agent-management.ts";
 import { handleRefinementAction } from "../../agents/agent-refinements.ts";
 import { buildDoctorReport } from "../../extension/doctor.ts";
 import { readSubagentGuide } from "../../extension/subagent-guide.ts";
-import { normalizePublicSubagentExecution, validateWorkflowCapacityOverrides } from "../../extension/public-execution.ts";
+import { isWorkflowScriptPath, normalizePublicSubagentExecution, validateWorkflowCapacityOverrides } from "../../extension/public-execution.ts";
+import { readReplyWorkflowScript } from "../../extension/reply-workflow-script.ts";
 import { disabledFeatureNotice, disabledFeatureUseError, resolveDisabledFeatureSurface, type DisabledFeatureSurface } from "../../shared/disabled-features.ts";
 import { runSync } from "./execution.ts";
 import { handleWatchdogToolAction, WATCHDOG_TOOL_ACTIONS } from "../../watchdog/tool-actions.ts";
@@ -143,7 +144,7 @@ import {
 	type WorkflowResourceAuthority,
 	type WorkflowResourcePermit,
 } from "../../shared/workflow-child-permit.ts";
-import { deepFreezeWorkflowArgs, normalizeWorkflowArgs, resolveWorkflowResource } from "../../workflows/workflow-resources.ts";
+import { deepFreezeWorkflowArgs, normalizeWorkflowArgs, resolveStructuredWorkflowResource, resolveWorkflowResource } from "../../workflows/workflow-resources.ts";
 import { stableJsonDigest } from "../../shared/launch-contract.ts";
 import {
 	cleanupWorktrees,
@@ -346,8 +347,8 @@ export interface SubagentParamsLike {
 	mode?: SteerDeliveryMode | "plan" | "apply";
 	repo?: string;
 	planId?: string;
+	/** Internal script carrier (slash, prompt-workflow, scheduled, RPC, named resources). The model-facing tool rejects it. */
 	workflowScript?: string;
-	workflowScriptPath?: string;
 	globalConcurrencyLimit?: number;
 	maxSubagentSpawnsPerRun?: number;
 	preflight?: import("../../shared/types.ts").WorkflowPreflight;
@@ -373,7 +374,7 @@ export interface SubagentParamsLike {
 	runFanoutAdmitted?: boolean;
 	/** Internal inherited tool/agent ceiling for delegated child launches. */
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
-	/** Internal durable-run compatibility fields. Public callers must use workflowScript. */
+	/** Internal durable-run compatibility fields. Public callers must use workflow. */
 	chain?: ChainStep[];
 	tasks?: TaskParam[];
 	concurrency?: number;
@@ -411,8 +412,8 @@ export interface SubagentParamsLike {
 	modelOrigin?: ModelOrigin;
 	fast?: boolean;
 	thinking?: string | false;
-	/** Public named workflow resource. Resolved before entering the workflow sandbox. */
-	workflow?: string;
+	/** true = the ```js workflow block in the calling reply; a string containing "/" or "\" = script path; otherwise a named workflow resource. */
+	workflow?: string | true;
 	args?: Record<string, unknown>;
 	scope?: string;
 	target?: string;
@@ -555,18 +556,16 @@ function resolveRequestedCwd(runtimeCwd: string, requestedCwd: string | undefine
 	return requestedCwd ? path.resolve(runtimeCwd, requestedCwd) : runtimeCwd;
 }
 
-function loadWorkflowScriptPath(params: SubagentParamsLike, runtimeCwd: string): { params?: SubagentParamsLike; error?: string } {
-	if (params.workflowScriptPath === undefined) return { params };
-	const scriptPath = path.resolve(resolveRequestedCwd(runtimeCwd, params.cwd), params.workflowScriptPath);
-	let workflowScript: string;
+function readWorkflowScriptFile(requestedPath: string, requestedCwd: string | undefined, runtimeCwd: string): { script: string } | { error: string } {
+	const scriptPath = path.resolve(resolveRequestedCwd(runtimeCwd, requestedCwd), requestedPath);
+	let script: string;
 	try {
-		workflowScript = fs.readFileSync(scriptPath, "utf8");
+		script = fs.readFileSync(scriptPath, "utf8");
 	} catch (error) {
-		return { error: `Failed to read workflowScriptPath '${scriptPath}': ${error instanceof Error ? error.message : String(error)}` };
+		return { error: `Failed to read workflow script '${scriptPath}': ${error instanceof Error ? error.message : String(error)}` };
 	}
-	if (!workflowScript.trim()) return { error: `workflowScriptPath file '${scriptPath}' is empty.` };
-	const { workflowScriptPath: _workflowScriptPath, ...rest } = params;
-	return { params: { ...rest, workflowScript } };
+	if (!script.trim()) return { error: `Workflow script file '${scriptPath}' is empty.` };
+	return { script };
 }
 
 export function removeForegroundControlIfIdle(state: SubagentState, runId: string, trackRetainedNestedRoute?: (rootRunId: string) => void): boolean {
@@ -2331,16 +2330,11 @@ async function resumeAsyncRun(input: {
 		const asyncDir = result.details.asyncDir;
 		const resultPath = workflowAwaitedAsyncResultPath(asyncDir);
 		const stopListener = stopAwaitedAsyncChildOnAbort(input.signal, input.deps.state, revivedId, asyncDir, input.deps.kill);
-		let completed: Awaited<ReturnType<typeof waitForImportedAsyncRoot>>;
-		try {
-			completed = await waitForImportedAsyncRoot({ runId: revivedId, asyncDir, resultPath, index: 0 }, {
-				shouldAbort: () => input.signal?.aborted === true,
-				timeoutMessage: "Workflow stopped before async child completed.",
-				abortedAsStopped: true,
-			});
-		} finally {
-			stopListener.remove();
-		}
+		const completed = await waitForImportedAsyncRoot({ runId: revivedId, asyncDir, resultPath, index: 0 }, {
+			shouldAbort: () => input.signal?.aborted === true,
+			timeoutMessage: "Workflow stopped before async child completed.",
+			abortedAsStopped: true,
+		}).finally(stopListener.remove);
 		const details: Details = { ...result.details };
 		if (target.launchContractDigest) details.sourceLaunchContractDigest = target.launchContractDigest;
 		return importWorkflowAwaitedChildResult(completed, { runId: revivedId, asyncDir, resultPath, task: effectiveFollowUp, parentWorkflowRunId: input.params.workflowParentRunId, details, emptyOutputText: `Revived ${target.source} subagent ${revivedId} completed without output.`, state: input.deps.state, pi: input.deps.pi });
@@ -3481,16 +3475,11 @@ async function waitForWorkflowAsyncSingleResult(
 	const asyncDir = launchResult.details.asyncDir;
 	const resultPath = workflowAwaitedAsyncResultPath(asyncDir);
 	const stopListener = stopAwaitedAsyncChildOnAbort(options.signal, options.state, options.runId, asyncDir, options.kill);
-	let completed: Awaited<ReturnType<typeof waitForImportedAsyncRoot>>;
-	try {
-		completed = await waitForImportedAsyncRoot({ runId: options.runId, asyncDir, resultPath, index: 0 }, omitUndefinedProperties({
-			shouldAbort: () => options.signal?.aborted === true,
-			timeoutMessage: "Workflow stopped before async child completed.",
-			abortedAsStopped: true,
-		}));
-	} finally {
-		stopListener.remove();
-	}
+	const completed = await waitForImportedAsyncRoot({ runId: options.runId, asyncDir, resultPath, index: 0 }, omitUndefinedProperties({
+		shouldAbort: () => options.signal?.aborted === true,
+		timeoutMessage: "Workflow stopped before async child completed.",
+		abortedAsStopped: true,
+	})).finally(stopListener.remove);
 	return importWorkflowAwaitedChildResult(completed, { runId: options.runId, asyncDir, resultPath, task: options.task, parentWorkflowRunId: params.workflowParentRunId, details: launchResult.details, state: options.state, pi: options.pi });
 }
 
@@ -4510,7 +4499,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 }
 
 function inferExecutionMode(params: SubagentParamsLike): Details["mode"] {
-	if (params.workflowScript !== undefined || params.workflowScriptPath !== undefined || params.workflow !== undefined) return "workflow";
+	if (params.workflowScript !== undefined || params.workflow !== undefined) return "workflow";
 	if ((params.chain?.length ?? 0) > 0) return "chain";
 	if ((params.tasks?.length ?? 0) > 0) return "parallel";
 	return "single";
@@ -5357,8 +5346,8 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 					: rememberParentModel(deps.state, resolveCurrentSessionId(ctx.sessionManager), currentParentModel)) ?? null;
 			})();
 		try {
-			if (requestParams.preflight !== undefined && requestParams.workflowScript === undefined && requestParams.workflowScriptPath === undefined) {
-				throw new Error("preflight requires workflowScript or workflowScriptPath.");
+			if (requestParams.preflight !== undefined && requestParams.workflowScript === undefined) {
+				throw new Error("preflight requires workflow: true or a workflow script path.");
 			}
 			workflowPreflight = normalizeWorkflowPreflight(requestParams.preflight);
 			if (workflowPreflight) requestParams = { ...requestParams, preflight: workflowPreflight };
@@ -5399,7 +5388,11 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			if (launchBlockingErrors.length > 0) {
 				return buildRequestedModeError(requestParams, `Workflow '${_id}' validation failed before child launch; no children launched. ${launchBlockingErrors.map((error) => error.message).join(" ")}`);
 			}
-			for (const warning of workflowValidation.warnings ?? []) console.warn(`[pi-subagents] ${warning.message}`);
+			// A package chain's per-step stop check defeats static launch counting; runtime fan-out enforcement still applies.
+			const structuredResource = workflowResource?.provenance.name === "chain" || workflowResource?.provenance.name === "tasks";
+			for (const warning of workflowValidation.warnings ?? []) {
+				if (!(structuredResource && warning.kind === "dynamic-spawn-count")) console.warn(`[pi-subagents] ${warning.message}`);
+			}
 			const acceptanceErrors = validateAcceptanceInput(requestParams.acceptance);
 			if (acceptanceErrors.length > 0) return buildRequestedModeError(requestParams, acceptanceErrors.join(" "));
 			const foregroundWorkflowRunId = encodeIndexSegment(_id);
@@ -7925,28 +7918,43 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 	): Promise<AgentToolResult<Details>> => {
 		const disabledFeatureError = disabledFeatureResult(params);
 		if (disabledFeatureError) return Promise.resolve(disabledFeatureError);
-		const normalized = normalizePublicSubagentExecution(params);
+		const normalized = normalizePublicSubagentExecution(params, { structuredWorkflows: disabledFeatures.features.has("workflow-scripts") });
 		if (!normalized.ok) {
 			return Promise.resolve({ content: [{ type: "text", text: normalized.error }], isError: true, details: { mode: normalized.mode, results: [] } });
 		}
 		let publicParams = normalized.params as SubagentParamsLike;
-		if (publicParams.workflow !== undefined) {
-			const resolved = resolveWorkflowResource(publicParams.workflow, publicParams.args, ctx.sessionManager.getSessionId() ?? undefined);
-			if (!resolved.ok) return Promise.resolve({ content: [{ type: "text", text: resolved.error }], isError: true, details: { mode: "workflow", results: [] } });
+		const workflow = publicParams.workflow;
+		const errorResult = (text: string): Promise<AgentToolResult<Details>> => Promise.resolve({ content: [{ type: "text", text }], isError: true, details: { mode: publicParams.action ? "management" : "workflow", results: [] } });
+		// Models tend to put script text in the workflow string; say how to pass it instead.
+		const scriptTextHint = " A workflow string is a named workflow resource or a script file path. To run script text, write it in one ```js workflow block in the same reply and call subagent({ workflow: true }).";
+		if (publicParams.tasks !== undefined || publicParams.chain !== undefined) {
+			// Normalization admits chain/tasks only with workflow scripts disabled; the original input was checked above.
+			const kind = publicParams.tasks !== undefined ? "tasks" : "chain";
+			const resolved = resolveStructuredWorkflowResource({ kind, steps: publicParams[kind], task: publicParams.task });
+			if (!resolved.ok) return errorResult(resolved.error);
+			const { tasks: _tasks, chain: _chain, task: _task, ...withoutStructuredInput } = publicParams;
+			publicParams = { ...withoutStructuredInput, workflowScript: resolved.resource.script };
+			workflowResourcePermits.set(publicParams, resolved.resource.permit);
+		} else if (typeof workflow === "string" && !isWorkflowScriptPath(workflow)) {
+			const resolved = resolveWorkflowResource(workflow, publicParams.args, ctx.sessionManager.getSessionId() ?? undefined);
+			if (!resolved.ok) return Promise.resolve({ content: [{ type: "text", text: resolved.error + scriptTextHint }], isError: true, details: { mode: "workflow", results: [] } });
 			const { workflow: _workflow, args: _args, ...withoutResourceInput } = publicParams;
 			publicParams = { ...withoutResourceInput, workflowScript: resolved.resource.script };
 			workflowResourcePermits.set(publicParams, resolved.resource.permit);
-		} else if (publicParams.workflowScript !== undefined || publicParams.workflowScriptPath !== undefined) {
+		} else if (workflow !== undefined || publicParams.workflowScript !== undefined) {
 			const normalizedArgs = normalizeWorkflowArgs(publicParams.args);
-			if ("error" in normalizedArgs) return Promise.resolve({ content: [{ type: "text", text: normalizedArgs.error }], isError: true, details: { mode: publicParams.action ? "management" : "workflow", results: [] } });
-			publicParams = { ...publicParams, args: deepFreezeWorkflowArgs(normalizedArgs.args) };
+			if ("error" in normalizedArgs) return errorResult(normalizedArgs.error);
+			let workflowScript = publicParams.workflowScript;
+			if (workflow !== undefined) {
+				const source = workflow === true ? readReplyWorkflowScript(ctx.sessionManager, id) : readWorkflowScriptFile(workflow, publicParams.cwd, ctx.cwd);
+				if ("error" in source) return errorResult(workflow === true ? source.error : source.error + scriptTextHint);
+				workflowScript = source.script;
+			}
+			const { workflow: _workflow, ...withoutWorkflowSource } = publicParams;
+			publicParams = { ...withoutWorkflowSource, workflowScript, args: deepFreezeWorkflowArgs(normalizedArgs.args) };
 		}
-		const loaded = loadWorkflowScriptPath(publicParams, ctx.cwd);
-		if (loaded.error) {
-			return Promise.resolve({ content: [{ type: "text", text: loaded.error }], isError: true, details: { mode: publicParams.action ? "management" : "workflow", results: [] } });
-		}
-		publicExecutions.add(loaded.params!);
-		return executeWithSingleDispatchGuard(id, loaded.params!, signal, onUpdate, ctx);
+		publicExecutions.add(publicParams);
+		return executeWithSingleDispatchGuard(id, publicParams, signal, onUpdate, ctx);
 	};
 
 	const executeDelegated = async (

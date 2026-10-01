@@ -254,6 +254,15 @@ npm test
 
 Tests span seven layers: config resolution, attribute helpers, the span tracker, metric instrument naming, the SDK lifecycle, the `/otel-status` command, and an end-to-end run over a loopback OTLP/HTTP sink. The end-to-end test replays a full session — including a provider-error auto-retry re-run — through a fake `ExtensionAPI` and asserts that traces, metrics, and logs all arrive over HTTP with the documented span names and that retried runs stay inside one interaction. `npm run typecheck` covers `src/` and `test/`; `npm run coverage` prints a per-file coverage report. CI runs both on Node 22 and 24. Requires Node 22+.
 
+## Fork delta
+
+This package is a fork of [stnly/pi-otel](https://github.com/stnly/pi-otel) at
+`398d40a` (release 0.3.1). The fork's organising change: upstream roots one trace
+per session — wrong for hours-long Pi sessions — while the fork roots one trace
+per user-driven run, with Pi attempt semantics, claimed generations, and
+compaction/branch-summary usage attribution. The design and its rationale live in
+`docs/plan.md`.
+
 ## License
 
 MIT

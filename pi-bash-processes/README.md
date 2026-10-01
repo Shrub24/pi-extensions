@@ -59,3 +59,25 @@ Open `/extensions:settings`; settings appear under the **Background Tasks** tab.
 Maintainer notes are in [DEVELOPMENT.md](DEVELOPMENT.md). The package is kendex's own, based on the MIT-licensed `@ifi/pi-background-tasks`; see `THIRD_PARTY_NOTICES.md`.
 
 - `wakeMessageStyle`: `line` (default) renders each wake as one dim line, `card` restores the ruled banner, `hidden` renders nothing (the agent is still woken).
+
+## Fork delta
+
+This package is a fork of kendex `pi-extensions/pi-background-tasks`, kept
+current through upstream `#3289`. The fork's own features (upstream has no
+equivalent — each is fork-only source plus its tests):
+
+- **Managed bash** (`extensions/managed-bash.ts`) — the extension's own bash
+  tool wrapping pi-bash-processes semantics, with pipe stripping
+  (`pipe-strip.ts`), a read shim (`read-shim.ts`) so a log read never consumes
+  the exit wake, sleep interception (`sleep-intercept.ts`), and a bounded task
+  wait (`task-wait.ts`).
+- **Soft timeouts** — an advisory per-task reminder that surfaces a decision
+  (extend, stop, let it run) before the hard kill; the "Soft timeouts" section
+  above documents the behaviour.
+- **Configurable task policy** — task retention and auto-background behaviour
+  exposed through settings.
+- **Bounded foreground wait** — foreground bash calls that background themselves
+  report a bounded wait instead of blocking the turn.
+- **Per-process consume logs** (`log-writer.ts` region) — exit wakes are
+  recorded per Pi process (`consumed-<pid>.log`, pruned after 24h), so one
+  session's log flush cannot consume another session's wake.

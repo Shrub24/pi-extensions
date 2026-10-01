@@ -59,3 +59,28 @@ Open `/extensions:settings`; settings appear under the **Tool Renderer** tab. Pr
 - `stackToolCalls`, `stackChildDisplay`, `hideStackChildRows`: the stacking of consecutive native tool calls.
 
 Maintainer notes are in [DEVELOPMENT.md](DEVELOPMENT.md).
+
+## Fork delta
+
+This package is a fork of kendex `pi-extensions/pi-tool-renderer`, kept current
+through upstream `#3312`. The fork's own features, all in `extensions/tool-renderer/`:
+
+- **Intent argument** (`intent.ts`) — read/edit/write/search rows accept an
+  `intent` parameter describing why the tool is called; the renderer shows it on
+  the tool row and batches carry it through to guard rules.
+- **Managed bash row** (`managed-bash.ts`) — a dedicated renderer for the
+  background-task bash tool, including the deferral interop guard that keeps
+  pi-bash-processes rows stable across upstream's tool-registration timing.
+- **Panel chrome** (`chrome.ts`, `settings-revision.ts`) — panel-mode rendering
+  with revision-based cache invalidation shared across the renderers.
+- **cbm/fff adapters** (`cbm.ts`, `fff.ts` and their `-patch` wrappers) —
+  first-class rows for codebase-memory and fff tools.
+- **Stamps** (`stamps.ts`) — marker decorations on rendered rows.
+- **Structured content forwarding** — the `piToolContract` spread forwards
+  `outputSchema`/`structuredContent` so Pi 0.99 codemode sees structured results
+  through the wrapped tools (upstream fixed the same defect as KEN-2231; our
+  forward predates it).
+- **Bash failure verdicts honour `isError`** — the row derives failure from Pi's
+  own `context.isError` rather than re-parsing output text for an exit code.
+- **Registration deferred to `session_start`** — the bash tool registers after
+  the session starts so earlier extension registration order cannot shadow it.

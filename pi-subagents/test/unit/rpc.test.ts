@@ -14,6 +14,7 @@ import {
 	subagentRpcReplyEvent,
 	type SubagentRpcReplyEnvelope,
 } from "../../src/extension/rpc.ts";
+import type { SubagentParamsLike } from "../../src/runs/foreground/subagent-executor.ts";
 import { DIRS, SUBAGENT_CHILD_STATUS_EVENT, type Details, type SubagentChildStatusEvent, type SubagentState } from "../../src/shared/types.ts";
 
 class FakeEvents {
@@ -347,7 +348,7 @@ describe("subagent extension RPC bridge", () => {
 
 			const quiet = request(events, "run-quiet", "manage", { action: "schedule.run", id: "quiet-hourly", quiet: true });
 			for (let i = 0; i < 8; i++) await Promise.resolve();
-			assert.deepEqual(launches[1]?.params.scheduleOrigin, { id: "quiet-hourly", name: "workflowScript -> agent worker", quiet: true });
+			assert.deepEqual(launches[1]?.params.scheduleOrigin, { id: "quiet-hourly", name: "workflow -> agent worker", quiet: true });
 			launches[1]!.resolve({ content: [{ type: "text", text: "Async" }], details: { mode: "single", results: [], asyncId: "rpc-quiet" } });
 			assert.equal((await quiet).success, true);
 		} finally {
@@ -569,29 +570,42 @@ describe("subagent extension RPC bridge", () => {
 		bridge.dispose();
 	});
 
-	it("forces spawn requests onto the existing async execution path", async () => {
+	it("forces spawn requests onto the existing async execution path and takes scripts as script or a workflow path", async () => {
 		const events = new FakeEvents();
-		let executedParams: any;
+		const executed: SubagentParamsLike[] = [];
 		const bridge = registerSubagentRpcBridge({
 			events,
 			getContext: () => ctx(),
 			execute: async (_id, params) => {
-				executedParams = params;
+				executed.push(params);
 				return {
 					content: [{ type: "text", text: "Async: worker [run-1]" }],
 					details: { mode: "single", results: [], asyncId: "run-1", asyncDir: "/tmp/run-1" },
-				} as any;
+				};
 			},
 		});
 
-		const reply = await request(events, "spawn-1", "spawn", { workflowScript: "return runs.run('main', { agent: 'worker', task: 'Do work' })" });
+		const reply = await request(events, "spawn-1", "spawn", { script: "return runs.run('main', { agent: 'worker', task: 'Do work' })" });
 
 		assert.equal(reply.success, true);
-		assert.equal(executedParams.workflowScript, "return runs.run('main', { agent: 'worker', task: 'Do work' })");
-		assert.equal(executedParams.async, true);
-		assert.equal("clarify" in executedParams, false);
+		assert.equal(executed[0]?.workflowScript, "return runs.run('main', { agent: 'worker', task: 'Do work' })");
+		assert.equal(executed[0]?.async, true);
+		assert.equal("clarify" in executed[0]!, false);
 		assert.equal((reply as { data: { details?: { asyncId?: string } } }).data.details?.asyncId, "run-1");
 
+		assert.equal((await request(events, "spawn-path", "spawn", { workflow: "./ci/sweep.js" })).success, true);
+		assert.deepEqual([executed[1]?.workflow, executed[1]?.workflowScript], ["./ci/sweep.js", undefined]);
+		for (const [params, message] of [
+			[{ workflowScript: "return 1" }, /workflowScript was removed; pass inline script text as script/],
+			[{ workflowScriptPath: "ci/sweep.js" }, /workflowScriptPath was removed; pass the file as workflow: "\.\/path\/to\/script\.js"/],
+			[{ workflow: true }, /no reply block for workflow: true/],
+			[{ script: "return 1", workflow: "./ci/sweep.js" }, /script cannot be combined with workflow/],
+		] as const) {
+			const rejected = await request(events, "spawn-rejected", "spawn", params);
+			assert.equal(rejected.success, false);
+			assert.match((rejected as { error?: { message?: string } }).error?.message ?? "", message);
+		}
+		assert.equal(executed.length, 2);
 		bridge.dispose();
 	});
 
@@ -607,7 +621,7 @@ describe("subagent extension RPC bridge", () => {
 			},
 		});
 
-		const reply = await request(events, "spawn-worktree", "spawn", { workflowScript: "return runs.run('main', { agent: 'worker', task: 'Do work' })", worktree: true });
+		const reply = await request(events, "spawn-worktree", "spawn", { script: "return runs.run('main', { agent: 'worker', task: 'Do work' })", worktree: true });
 
 		assert.equal(reply.success, true);
 		assert.equal(executedParams.worktree, true);
@@ -631,7 +645,7 @@ describe("subagent extension RPC bridge", () => {
 		assert.equal(chainReply.success, false);
 		assert.equal(parallelReply.success, false);
 		assert.equal(worktreeReply.success, false);
-		assert.match((chainReply as { error?: { message?: string } }).error?.message ?? "", /workflowScript/);
+		assert.match((chainReply as { error?: { message?: string } }).error?.message ?? "", /removed; use a workflow script/);
 		assert.equal(executeCalls, 0);
 		bridge.dispose();
 	});

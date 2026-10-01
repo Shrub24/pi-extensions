@@ -44,7 +44,7 @@ Pi is the parent session. A subagent is a focused child Pi session with its own 
 
 When you ask for a subagent, Pi starts the child, gives it the task, and brings the result back. Foreground children run as sessions inside the parent Pi process and stream in the conversation. Background children run as sessions inside a detached runner process that keeps working and can be checked later.
 
-Installing the extension does not start an automatic reviewer in the background. Fresh parent sessions initially expose the small `subagents_enable` loader instead of the full `subagent` schema. When your request or applicable instructions authorize delegation, Pi can call the loader itself; the unchanged `subagent` tool is available on the next model request. Complexity alone does not authorize delegation. `bg_wait` and supervisor replies remain available without activation.
+Installing the extension does not start an automatic reviewer in the background. When the session's model can take a new tool mid-conversation, fresh parent sessions initially expose the small `subagents_enable` loader instead of the full `subagent` schema. When your request or applicable instructions authorize delegation, Pi can call the loader itself; the unchanged `subagent` tool is available on the next model request. With other models, fresh sessions start with `subagent` active, because adding a tool later would make the provider miss its prompt cache. The [`toolActivation`](docs/configuration.md#toolactivation) setting changes this. Complexity alone does not authorize delegation. `bg_wait` and supervisor replies remain available without activation.
 
 If you want every implementation reviewed, say so in your prompt or project instructions:
 
@@ -127,3 +127,28 @@ The full reference lives in `docs/`:
 | [Missions and schedules](https://github.com/nicobailon/pi-subagents/blob/main/docs/missions.md) | Durable mission records, delivery receipts, timed and recurring runs. |
 | [Configuration](https://github.com/nicobailon/pi-subagents/blob/main/docs/configuration.md) | Every `config.json` key and environment variable. |
 | [Extension API](https://github.com/nicobailon/pi-subagents/blob/main/docs/extension-api.md) | The RPC, delegation API, preflight, capability ceilings, [trusted workflow resources](docs/extension-api.md#trusted-workflow-resources), background-work providers, Herdr integration. |
+
+## Fork delta
+
+This package is a fork of [nicobailon/pi-subagents](https://github.com/nicobailon/pi-subagents),
+kept current through upstream `#2586` (v0.74.0). The fork's own features:
+
+- **Child context budget** — a mid-run budget that compacts a child before it
+  exhausts its window: `childContextBudget: { ratio, capTokens }` in the
+  subagents config (default 30% of the window, capped at 250k), an env escape
+  hatch (`PI_SUBAGENTS_CHILD_CONTEXT_BUDGET`), and a `context_budget`
+  `needs_attention` wake telling the orchestrator its view of the child's
+  working memory is stale. Implementation in `src/runs/shared/child-compaction.ts`
+  with the vendored pi-vcc pipeline under `src/runs/shared/pi-vcc/`.
+- **Advisory soft deadline** — `softTimeoutMs` on every launch (default 600000,
+  0 disables): expiry wakes the parent once with continue/steer/extend/stop
+  choices and never aborts the run; `subagent({ action: "extend", softTimeoutMs })`
+  re-arms a fresh window without touching the hard timeout. Documented in
+  `skills/pi-subagents/references/execution-controls.md`.
+- **`read_` resource naming** — MCP resource grants generate `read_<resource>`
+  names to match pi-mcp-adapter 3.2.0's direct-tool surface, where upstream still
+  generates `get_<resource>`.
+
+Behaviour carried deliberately against upstream: `childContextBudget` and
+`toolActivation` both appear in the fail-closed config key list, and the
+`reason` union on control events carries `soft_deadline` and `context_budget`.

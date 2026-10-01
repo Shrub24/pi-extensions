@@ -5,7 +5,7 @@
  * - Sync (default): Streams output, renders markdown, tracks usage
  * - Async: Background execution, emits events when done
  *
- * Public execution mode: workflow (workflowScript)
+ * Public execution mode: workflow (workflow: true reply block, script path, or named resource)
  * Toggle: async parameter (default: true; set asyncByDefault:false in config.json to opt out)
  *
  * Config file: ~/.pi/agent/extensions/subagent/config.json
@@ -79,6 +79,7 @@ import { buildSubagentToolDescription, buildSubagentToolPromptMetadata } from ".
 import { formatWorkflowPreflightSummary, normalizeWorkflowPreflight } from "../workflows/workflow-preflight.ts";
 import { runtimeReplacedAbortReason } from "../workflows/workflow-reuse.ts";
 import { finalizeToolResult } from "./tool-result.ts";
+import { removedModelWorkflowFieldError } from "./public-execution.ts";
 import { collectGoalContinuationNotices } from "../missions/goal-driver.ts";
 import { restoreForegroundRunHistory } from "../runs/foreground/foreground-history.ts";
 import { resolveMissionStoreLocation } from "../missions/store.ts";
@@ -110,6 +111,8 @@ import { showUpgradeNotice } from "./upgrade-notice.ts";
 export { loadConfig, resolveAsyncByDefault } from "./config.ts";
 
 const SLOW_RELOAD_PHASE_MS = 250;
+// Long enough for Pi to finish starting; loading the executor blocks the event loop for tens of ms.
+const MODULE_PRELOAD_DELAY_MS = 1_000;
 const RUNTIME_REGISTRY_STORE_KEY = "__piSubagentRuntimeRegistry";
 
 type SubagentExecutorModule = typeof import("../runs/foreground/subagent-executor.ts");
@@ -151,128 +154,6 @@ function logSlowPhase(label: string, startedAt: number): void {
 	if (elapsed >= SLOW_RELOAD_PHASE_MS) console.error(`Subagent reload phase '${label}' took ${elapsed}ms.`);
 }
 
-function workflowLaneKeys(script: string): string[] {
-	const keys: string[] = [];
-	const seen = new Set<string>();
-	const add = (key: string): void => {
-		if (!seen.has(key)) {
-			seen.add(key);
-			keys.push(key);
-		}
-	};
-	const isIdentifier = (char: string | undefined): boolean => char !== undefined && /[\w$]/.test(char);
-	const skipTrivia = (start: number): number => {
-		let index = start;
-		while (index < script.length) {
-			if (/\s/.test(script[index]!)) index += 1;
-			else if (script.startsWith("//", index)) {
-				const end = script.indexOf("\n", index + 2);
-				index = end === -1 ? script.length : end + 1;
-			} else if (script.startsWith("/*", index)) {
-				const end = script.indexOf("*/", index + 2);
-				index = end === -1 ? script.length : end + 2;
-			} else break;
-		}
-		return index;
-	};
-	const readLiteral = (start: number): { key?: string; end: number } | undefined => {
-		const quote = script[start];
-		if (quote !== "'" && quote !== '"' && quote !== "`") return undefined;
-		let index = start + 1;
-		let dynamicTemplate = false;
-		while (index < script.length) {
-			if (script[index] === "\\") {
-				index += 2;
-				continue;
-			}
-			if (quote === "`" && script.startsWith("${", index)) dynamicTemplate = true;
-			if (script[index] === quote) return { key: dynamicTemplate ? undefined : script.slice(start + 1, index), end: index + 1 };
-			if (quote !== "`" && /[\r\n]/.test(script[index]!)) return { end: index + 1 };
-			index += 1;
-		}
-		return { end: script.length };
-	};
-
-	const collectRunsAllKeys = (start: number): number => {
-		let index = skipTrivia(start);
-		if (script[index] !== "(") return start;
-		index = skipTrivia(index + 1);
-		if (script[index] !== "[") return start;
-		let arrayDepth = 1;
-		let objectDepth = 0;
-		let directChildObject = false;
-		let expectingElement = true;
-		for (index += 1; index < script.length; index += 1) {
-			index = skipTrivia(index);
-			const literal = readLiteral(index);
-			if (literal) {
-				index = literal.end - 1;
-				continue;
-			}
-			if (script[index] === "[") {
-				arrayDepth += 1;
-				expectingElement = false;
-				continue;
-			}
-			if (script[index] === "]") {
-				arrayDepth -= 1;
-				if (arrayDepth === 0) return index + 1;
-				continue;
-			}
-			if (script[index] === "{") {
-				objectDepth += 1;
-				if (objectDepth === 1) directChildObject = arrayDepth === 1 && expectingElement;
-				expectingElement = false;
-				continue;
-			}
-			if (script[index] === "}") {
-				objectDepth -= 1;
-				if (objectDepth === 0) directChildObject = false;
-				continue;
-			}
-			if (script[index] === "," && arrayDepth === 1 && objectDepth === 0) {
-				expectingElement = true;
-				continue;
-			}
-			if (directChildObject && objectDepth === 1 && !isIdentifier(script[index - 1]) && script.startsWith("key", index) && !isIdentifier(script[index + 3])) {
-				const colon = skipTrivia(index + 3);
-				const key = script[colon] === ":" ? readLiteral(skipTrivia(colon + 1)) : undefined;
-				if (key) {
-					const next = skipTrivia(key.end);
-					if (key.key !== undefined && (script[next] === "," || script[next] === "}")) add(key.key);
-					index = key.end - 1;
-				}
-			}
-		}
-		return index;
-	};
-
-	for (let index = 0; index < script.length;) {
-		index = skipTrivia(index);
-		const literal = readLiteral(index);
-		if (literal) {
-			index = literal.end;
-			continue;
-		}
-		if (!isIdentifier(script[index - 1]) && script.startsWith("runs.run", index) && !isIdentifier(script[index + 8])) {
-			const open = skipTrivia(index + 8);
-			const key = script[open] === "(" ? readLiteral(skipTrivia(open + 1)) : undefined;
-			if (key) {
-				const next = skipTrivia(key.end);
-				if (key.key !== undefined && (script[next] === "," || script[next] === ")")) add(key.key);
-				index = key.end;
-				continue;
-			}
-		}
-		if (!isIdentifier(script[index - 1]) && script.startsWith("runs.all", index) && !isIdentifier(script[index + 8])) {
-			index = collectRunsAllKeys(index + 8);
-			continue;
-		}
-		index += 1;
-	}
-	return keys;
-}
-
 function formatWorkflowPreflightCall(input: unknown): string {
 	if (input === undefined) return "";
 	try {
@@ -280,18 +161,6 @@ function formatWorkflowPreflightCall(input: unknown): string {
 	} catch (error) {
 		return `preflight · rejected: ${error instanceof Error ? error.message : String(error)}`;
 	}
-}
-
-function formatWorkflowManifest(script: string, async: unknown, clarify: unknown, preflightInput?: unknown): string {
-	if (clarify === true) return "workflow script · rejected: clarify UI unsupported";
-	const keys = workflowLaneKeys(script);
-	// The workflow executor starts background work unless callers pass async:false.
-	const mode = async === false ? "foreground" : "background";
-	const preflight = formatWorkflowPreflightCall(preflightInput);
-	if (keys.length === 0) return `workflow script · ${mode}${preflight ? ` · ${preflight}` : ""}`;
-	const visibleKeys = keys.slice(0, 4).join(", ");
-	const remainder = keys.length > 4 ? `, +${keys.length - 4}` : "";
-	return `workflow · ${mode} · ${keys.length} lane${keys.length === 1 ? "" : "s"}: ${visibleKeys}${remainder}${preflight ? ` · ${preflight}` : ""}`;
 }
 
 /**
@@ -697,12 +566,28 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	};
 	let executor: SubagentExecutor | undefined;
 	let executorPromise: Promise<SubagentExecutor> | undefined;
+	let executorModulePromise: Promise<SubagentExecutorModule> | undefined;
+	const loadExecutorModule = () => executorModulePromise ??= import("../runs/foreground/subagent-executor.ts");
 	const getExecutor = (): Promise<SubagentExecutor> => {
-		executorPromise ??= import("../runs/foreground/subagent-executor.ts").then(({ createSubagentExecutor }) => {
+		executorPromise ??= loadExecutorModule().then(({ createSubagentExecutor }) => {
 			executor = createSubagentExecutor(executorDeps);
 			return executor;
 		});
 		return executorPromise;
+	};
+	// Loading these on first use could happen days after startup, when pi-subagents may have
+	// changed on disk and the new files would import stale cached copies of modules loaded at
+	// startup. Load them shortly after a session starts instead, off Pi's startup path; child
+	// runtimes return before registration and never schedule this.
+	let modulePreloadTimer: ReturnType<typeof setTimeout> | undefined;
+	const scheduleModulePreload = () => {
+		if (executorModulePromise || modulePreloadTimer) return;
+		modulePreloadTimer = setTimeout(() => {
+			// Errors surface from the first call that needs the module.
+			loadExecutorModule().catch(() => {});
+			if (fleetViewEnabled) import("../tui/fleet.ts").catch(() => {});
+		}, MODULE_PRELOAD_DELAY_MS);
+		modulePreloadTimer.unref?.();
 	};
 
 	pi.registerMessageRenderer<SupervisorRequestMessageDetails>(SUPERVISOR_REQUEST_MESSAGE_TYPE, renderSupervisorRequest);
@@ -833,10 +718,12 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		...MODEL_ONLY_TOOL,
 		label: "Subagent",
 		description: buildSubagentToolDescription(config, { disabledFeatures }),
-		...buildSubagentToolPromptMetadata(config),
+		...buildSubagentToolPromptMetadata(config, disabledFeatures),
 		parameters,
 
 		async execute(id, params, signal, onUpdate, ctx) {
+			const removedField = removedModelWorkflowFieldError(params);
+			if (removedField) throw new Error(removedField);
 			return finalizeToolResult(await executeSubagentCollapsed(id, params as SubagentParamsLike, signal ?? new AbortController().signal, onUpdate, ctx));
 		},
 
@@ -850,15 +737,9 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 					0, 0,
 				);
 			}
-			if (args.workflowScript)
+			if (args.workflow !== undefined)
 				return new Text(
-					`${title}${gap}${formatWorkflowManifest(args.workflowScript, args.async, false, args.preflight)}`,
-					0,
-					0,
-				);
-			if (args.workflowScriptPath)
-				return new Text(
-					`${title}${gap}${theme.fg("accent", args.workflowScriptPath)}${args.async === true ? `${gap}${theme.fg("warning", "[async]")}` : ""}${args.preflight !== undefined ? `${gap}${theme.fg("dim", formatWorkflowPreflightCall(args.preflight))}` : ""}`,
+					`${title}${gap}${theme.fg("accent", args.workflow === true ? "workflow (reply block)" : `workflow ${String(args.workflow)}`)}${args.async === true ? `${gap}${theme.fg("warning", "[async]")}` : ""}${args.preflight !== undefined ? `${gap}${theme.fg("dim", formatWorkflowPreflightCall(args.preflight))}` : ""}`,
 					0,
 					0,
 				);
@@ -919,6 +800,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	const disposeSlashCommands = registerSlashCommands(pi, state, {
 		fleetKeybindings: config.fleetKeybindings,
 		foregroundDetachShortcut: config.foregroundDetachShortcut,
+		workflowScriptsDisabled: disabledFeatures.features.has("workflow-scripts"),
 	});
 
 	let visibleControlNotices = new Set<string>();
@@ -1110,6 +992,8 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			resultIndexCleanupTimer = undefined;
 			if (asyncRetentionTimer) clearTimeout(asyncRetentionTimer);
 			asyncRetentionTimer = undefined;
+			if (modulePreloadTimer) clearTimeout(modulePreloadTimer);
+			modulePreloadTimer = undefined;
 			asyncRetentionAbort.abort();
 			stopResultWatcher();
 			resultDeliveryOwnership.clear();
@@ -1216,6 +1100,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	pi.on("session_start", (event, ctx) => {
 		installRuntime(ctx);
 		startSessionMaintenance();
+		scheduleModulePreload();
 		const recovering = event.reason === "startup" || event.reason === "reload" || event.reason === "resume";
 		resetSessionState(ctx, recovering, event.previousSessionFile);
 		releaseHostSessionLiveness();
@@ -1257,6 +1142,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	pi.on("session_start", (_event, ctx) => beginAdvertisement(ctx));
 
 	registerSubagentToolActivation(pi, {
+		mode: config.toolActivation,
 		advertisedPrompt: async () => {
 			await waitForAdvertisement();
 			return buildAdvertisedAgentPrompt(advertisedAgents, resolveCurrentSubagentCapabilityCeiling(state.currentSessionId ?? undefined));

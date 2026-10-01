@@ -45,3 +45,15 @@ Open `/extensions:settings`; settings appear under the **Output Policy** tab. Pr
 - Shell minimizer: `shellMinimizer.enabled`, `shellMinimizer.only`, `shellMinimizer.except`, `shellMinimizer.maxCaptureBytes`.
 
 Maintainer notes are in [DEVELOPMENT.md](DEVELOPMENT.md).
+
+## Fork delta
+
+This package is a fork of kendex `pi-extensions/pi-output-policy`, kept current
+through upstream `#3312`. Three files differ from upstream, all downstream of one
+behaviour change: **thinking deltas do not count toward the 96K visible-output
+cap**. Reasoning models legitimately stream 100K+ thinking characters, so the
+fork splits the stream into visible and thinking deltas (`streamDelta.thinking`),
+counts them separately, and adds its own cap — `maxThinkingChars`, default
+600,000, overridable per settings — with a third trip reason `max-thinking-chars`
+alongside upstream's `max-chars` and `repetition`. The detector and handler tests
+cover the split.

@@ -5,11 +5,11 @@ repo's history.
 
 | Package | npm name | Provenance |
 |---|---|---|
-| `pi-bash-processes` | `@vanillagreen/pi-background-tasks` | fork of [vanillagreencom/kendex](https://github.com/vanillagreencom/kendex) `pi-extensions/pi-background-tasks`, extracted at `c9ee5844`; fork reason: a bounded foreground wait, configurable task policy, and log reads that consume the exit wake |
-| `pi-tool-renderer` | `@vanillagreen/pi-tool-renderer` | fork of kendex `pi-extensions/pi-tool-renderer`, extracted after upstream `#2467` and kept current through `#3255` (`f5a2cd0a`); fork reason: the intent argument on the read/edit/write/search tools, the managed-bash row, panel chrome, and the bash registration deferred to `session_start` |
-| `pi-subagents` | `pi-subagents` | fork of [nicobailon/pi-subagents](https://github.com/nicobailon/pi-subagents), vendored at upstream `#2586`; fork reason: an advisory per-run soft deadline and a mid-run child context budget; upstream is active |
+| `pi-bash-processes` | `@vanillagreen/pi-background-tasks` | fork of [vanillagreencom/kendex](https://github.com/vanillagreencom/kendex) `pi-extensions/pi-background-tasks`, extracted at `c9ee5844`, kept current through `#3289` (`8d17265b`); fork reason: see [its README](pi-bash-processes/README.md#fork-delta) |
+| `pi-tool-renderer` | `@vanillagreen/pi-tool-renderer` | fork of kendex `pi-extensions/pi-tool-renderer`, extracted after upstream `#2467`, kept current through `#3312` (`781eb4cf`); fork reason: see [its README](pi-tool-renderer/README.md#fork-delta) |
+| `pi-subagents` | `pi-subagents` | fork of [nicobailon/pi-subagents](https://github.com/nicobailon/pi-subagents), kept current through v0.74.0 (`f68f9edd`); fork reason: see [its README](pi-subagents/README.md) |
 | `pi-otel` | `pi-otel` | fork of [stnly/pi-otel](https://github.com/stnly/pi-otel) at `398d40a`; fork reason: trace-per-session became trace-per-run with Pi attempt and compaction semantics (`pi-otel/docs/plan.md`) |
-| `pi-output-policy` | `@vanillagreen/pi-output-policy` | fork of `kendex` `pi-extensions/pi-output-policy` at `522c52c`, kept current through `#3213` (`6948c0f3`); fork reason: thinking deltas counted toward the 96K visible-output cap |
+| `pi-output-policy` | `@vanillagreen/pi-output-policy` | fork of `kendex` `pi-extensions/pi-output-policy` at `522c52c`, kept current through `#3312` (`781eb4cf`); fork reason: see [its README](pi-output-policy/README.md#fork-delta) |
 | `pi-jev` | `@vanillagreen/pi-jev` | new; semantic decisions from Jev, as a link in `@gotgenes/pi-permission-system`'s authorizer chain |
 | `pi-cbmem` | `@vanillagreen/pi-cbmem` | new; codebase-memory MCP tools behind a short tool list, with a self-healing server |
 
@@ -47,16 +47,7 @@ kendex keeps its extensions under `pi-extensions/<name>`, so a take is the repo
 state we extracted from and the pivot is that path's last commit at or before it,
 which is content we actually have.
 
-Right now `pi-subagents` and `pi-otel` are level with their upstreams (92 and 11
-files differ — the 92 is our own delta, not lag). Two of the three kendex
-packages were taken on 2026-10-01: `pi-tool-renderer` at `f5a2cd0a` (#3255) and
-`pi-output-policy` at `6948c0f3` (#3213), both merging cleanly with this fork's
-own work. `pi-bash-processes` is the last one — it needs a real merge rather than
-a take, because the fork carries four commits upstream never adopted (a bounded
-foreground wait, configurable task policy, soft timeouts, and the read shims
-that stop a log read from consuming the exit wake) while upstream refactored
-several of its concerns out into new modules. `pi-jev` and `pi-cbmem` were never
-forks of anything.
+Right now every fork is level with its upstream — `pi-subagents` through v0.74.0 (`f68f9edd`, 2026-09-30), `pi-otel` at `398d40a` (0.3.1), and the three kendex packages through `#3289`/`#3312` (2026-09-30). What remains different from upstream is the forks' own delta, documented per package under "Fork delta" headings: `pi-bash-processes` (49 files — the bounded foreground wait, task policy, soft deadlines, read shims), `pi-tool-renderer` (62 files — the intent argument, managed-bash row, panel chrome, structured-content forwarding), `pi-subagents` (43 files — the child context budget with its vendored pi-vcc pipeline, the advisory soft deadline, the `read_` resource naming pi-mcp-adapter 3.2.0 expects), `pi-output-policy` (3 files — thinking deltas counted toward the 96K visible-output cap, plus structured-content forwarding), and `pi-otel` (11 files — the run-trace model). `pi-jev` and `pi-cbmem` were never forks of anything.
 
 The branch that carries a fork's lineage is `refs/heads/import-<package>`, not the
 current tree: the `pi-subagents` directory arrived here as one commit even though
@@ -74,14 +65,15 @@ same upstream commit different ids — `#2350` is `868e45be2` in the import bran
 and `528029351` in the mirror — so an id from one is meaningless in the other;
 `scripts/upstream.sh` resolves each in its own id space by subject.
 
-A rebase replays only what the branch carries, and for `pi-subagents` that is no
-longer what this tree differs by: the branch stops at `#2350`, one soft-deadline
-commit past it, while the tree has since taken upstream twice and grown the
-context-budget feature — 305 files apart. `pi-otel` is one file apart. The script
-prints that gap for each fork, because the tree, not the branch, is where a
-fork's work now lives: hence the 2026-09-30 syncs took upstream's tree whole and
-re-applied the delta, which cost a hand resolution in the files both sides
-changed and left the import branch behind.
+A rebase replays only what the branch carries, and for most forks that is no
+longer what this tree differs by: the import branches stop at the extraction
+point, while the trees have since taken upstream and grown features of their
+own. The script prints that gap for each fork, because the tree, not the
+branch, is where a fork's work now lives. Taking upstream is therefore a
+tree-level operation — checkout upstream's tree, restore the files only the
+fork changed, hand-merge the files both sides touched — and the import branches
+are lineage reference, not a rebase base. (`pi-tool-renderer`'s import branch
+matches its tree, so the rebase recipe genuinely works there.)
 
 ## Develop
 

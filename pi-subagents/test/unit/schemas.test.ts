@@ -24,22 +24,8 @@ interface SubagentParamsSchema {
 			minimum?: number;
 			description?: string;
 		};
-		workflow?: {
-			type?: string;
-			minLength?: number;
-			description?: string;
-		};
+		workflow?: JsonSchemaNode;
 		args?: JsonSchemaNode;
-		workflowScript?: {
-			type?: string;
-			minLength?: number;
-			description?: string;
-		};
-		workflowScriptPath?: {
-			type?: string;
-			minLength?: number;
-			description?: string;
-		};
 		globalConcurrencyLimit?: {
 			type?: string;
 			minimum?: number;
@@ -196,10 +182,6 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.equal(validator.Check({ ...base, outputSchema: { type: "object" } }), true);
 		assert.equal(validator.Check({ ...base, outputSchema: false }), true);
 		assert.equal(validator.Check({ ...base, outputSchema: null }), false);
-		assert.equal(validator.Check({ task: "work", chain: [{ agent: "worker", outputSchema: false }] }), true);
-		const collectSchema = schemas.DynamicCollectSchema;
-		assert.ok(collectSchema);
-		assert.equal(CompileSchema!(collectSchema).Check({ as: "all", outputSchema: false }), false);
 	});
 
 	it("includes context field and default precedence for fresh/fork execution mode", () => {
@@ -218,29 +200,19 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.match(description, /else fresh/);
 	});
 
-	it("exposes named resources plus raw inline and file workflow script modes", () => {
+	it("exposes one workflow field for the reply block, script paths, and named resources", () => {
 		const workflow = SubagentParams?.properties?.workflow;
-		assert.equal(workflow?.type, "string");
-		assert.equal(workflow?.minLength, 1);
-		assert.match(String(workflow?.description ?? ""), /extension-owned workflow resource/i);
+		assert.equal(hasAnyOfType(workflow, "boolean"), true);
+		assert.equal(anyOfBranches(workflow).find((branch) => branch.type === "string")?.minLength, 1);
+		assert.match(String(workflow?.description ?? ""), /true: run the one ```js workflow block written in this same reply/);
+		assert.match(String(workflow?.description ?? ""), /String with '\/': script file read from request cwd/);
+		assert.match(String(workflow?.description ?? ""), /Other string: named workflow resource/);
+		assert.match(String(workflow?.description ?? ""), /no runs.host/);
 		const args = SubagentParams?.properties?.args;
 		assert.equal(args?.type, "object");
 		assert.equal(args?.maxProperties, 16);
 		assert.match(String(args?.description ?? ""), /bounded plain-JSON/i);
-		assert.match(String(args?.description ?? ""), /inline.*file-backed.*deeply frozen.*persisted.*secrets/i);
-		const workflowScript = SubagentParams?.properties?.workflowScript;
-		assert.equal(workflowScript?.type, "string");
-		assert.equal(workflowScript?.minLength, 1);
-		assert.match(String(workflowScript?.description ?? ""), /Inline JavaScript statement body/);
-		assert.match(String(workflowScript?.description ?? ""), /top-level await/);
-		assert.match(String(workflowScript?.description ?? ""), /no runs.host/);
-		assert.match(String(workflowScript?.description ?? ""), /guide workflows/);
-		const workflowScriptPath = SubagentParams?.properties?.workflowScriptPath;
-		assert.equal(workflowScriptPath?.type, "string");
-		assert.equal(workflowScriptPath?.minLength, 1);
-		assert.match(String(workflowScriptPath?.description ?? ""), /mutually exclusive with workflowScript/i);
-		assert.match(String(workflowScriptPath?.description ?? ""), /request cwd/i);
-		assert.match(String(workflowScriptPath?.description ?? ""), /host reads.*before sandbox/i);
+		assert.match(String(args?.description ?? ""), /raw-script.*deeply frozen.*persisted.*secrets/i);
 		for (const name of ["globalConcurrencyLimit", "maxSubagentSpawnsPerRun"] as const) {
 			const capacity = SubagentParams?.properties?.[name];
 			assert.equal(capacity?.type, "integer");
@@ -284,7 +256,7 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 	});
 
 	it("omits removed legacy and workflow-child-only fields", () => {
-		for (const name of ["tasks", "chain", "concurrency", "chainDir", "step", "schedule", "scheduleName", "resume"]) {
+		for (const name of ["tasks", "chain", "concurrency", "chainDir", "step", "schedule", "scheduleName", "resume", "workflowScript", "workflowScriptPath"]) {
 			assert.equal((SubagentParams?.properties as Record<string, unknown> | undefined)?.[name], undefined, `${name} should not be public`);
 		}
 	});
@@ -297,7 +269,7 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.equal(actionSchema.enum, undefined);
 		const description = String(actionSchema.description ?? "");
 		assert.match(description, /Management\/control only; omit for execution/);
-		assert.match(description, /validate accepts either script input/);
+		assert.match(description, /validate accepts workflow: true or a script path/);
 		assert.match(description, /guide topic tool-reference/);
 		assert.doesNotMatch(description, /orchestration\./);
 	});
@@ -493,11 +465,7 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.ok(SubagentParams, "SubagentParams schema should exist");
 		const schema = SubagentParams as unknown as JsonSchemaNode;
 		const serialized = JSON.stringify(schema);
-		// Upstream's budget plus this fork's `softTimeoutMs`. The allowance stays
-		// named and explicit so the guard still catches unreviewed growth in the
-		// parameters upstream owns.
-		const schemaBudget = 13_010 + 180;
-		assert.ok(serialized.length <= schemaBudget, `expected concise schema at or under ${schemaBudget.toLocaleString("en-US")} chars, got ${serialized.length}`);
+		assert.ok(serialized.length <= 13_010, `expected concise schema at or under 13,010 chars, got ${serialized.length}`);
 		assert.equal(serialized.includes('"$ref"'), false);
 		assert.equal(serialized.includes('"$defs"'), false);
 		assert.equal(serialized.split("Evidence policy;").length - 1, 1);
@@ -648,11 +616,11 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		}
 		const validValues = [
 			{ skill: "review" },
-			{ workflowScript: "return await runs.run(\"one\", {agent: \"reviewer\", task: \"check\"})" },
-			{ workflowScriptPath: "workflows/review.js" },
+			{ workflow: true },
+			{ workflow: "workflows/review.js" },
 			{ skill: false },
 			{ action: "get", agent: "worker" },
-			{ workflowScript: "return runs.run('main', { agent: 'worker', task: 'Fix', acceptance: false })", timeoutMs: 1000 },
+			{ workflow: true, timeoutMs: 1000 },
 			{ action: "steer", id: "run-1", message: "focus on tests" },
 			{ action: "steer", id: "run-1", index: 0, message: "focus on tests" },
 			{ action: "not-a-real-action" },
@@ -661,6 +629,8 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 			{ agent: "worker", task: "Fix", acceptance: JSON.stringify({ level: "checked", evidence: ["commands-run"] }) },
 		];
 		const invalidValues = [
+			{ workflow: "" },
+			{ workflow: 123 },
 			{ skill: 123 },
 			{ skill: [123] },
 			{ output: 123 },
