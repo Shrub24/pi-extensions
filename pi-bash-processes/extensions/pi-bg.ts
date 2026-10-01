@@ -189,7 +189,13 @@ function request(payload) {
 			try {
 				const parsed = JSON.parse(buffer.slice(0, newline));
 				if (parsed && parsed.ok === true) finish({ ok: true, response: parsed });
-				else finish({ ok: false, error: (parsed && parsed.error) || { code: "malformed", message: "endpoint response is malformed" } });
+				else finish({
+					ok: false,
+					error: (parsed && parsed.error) || { code: "malformed", message: "endpoint response is malformed" },
+					// A failure that prepared one (a failed full read) still hands the
+					// caller the token that confirms the error was delivered.
+					receipt: parsed && typeof parsed.receipt === "string" ? parsed.receipt : undefined,
+				});
 			} catch (error) {
 				finish({ ok: false, error: { code: "malformed", message: "endpoint response is not JSON: " + error.message } });
 			}
@@ -297,7 +303,15 @@ async function acceptReceipt(token) {
 
 const run = async () => {
 	const outcome = await request(op === "list" ? { op } : { op, id, output });
-	if (!outcome.ok) return fail(outcome.error);
+	if (!outcome.ok) {
+		// A get/stop failure that prepared a receipt is an error the worker
+		// actually received: confirm it so the manager records the error as
+		// delivered (tasks 2.3) instead of trapping the assignment awaiting a
+		// retrieval that can never certify. A failed handoff (epipe) never
+		// carries one, so it stays unresolved and retryable.
+		if (op !== "list" && outcome.receipt) await request({ op: "receipt", token: outcome.receipt, delivered: "error" });
+		return fail(outcome.error);
+	}
 	const { response } = outcome;
 	if (op === "list") {
 		const tasks = response.result.tasks || [];
@@ -322,9 +336,13 @@ const run = async () => {
 
 	// An uncertified capture is a management failure even though the partial
 	// bytes above were handed over: the obligation must not look settled, so no
-	// receipt is sent and none is committed.
+	// result receipt is sent and none is committed. The failure itself is
+	// still a delivered result — confirm it as an error delivery (tasks 2.3)
+	// so the task resolves as an error instead of waiting forever. Best-effort:
+	// the exit below stays a failure either way.
 	if (captureError) {
 		meta({ result: "incomplete-capture", op, code: "capture-incomplete" });
+		if (response.result.receipt) await request({ op: "receipt", token: response.result.receipt, delivered: "error" });
 		return EXIT.failure;
 	}
 

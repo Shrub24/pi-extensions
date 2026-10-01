@@ -36,6 +36,11 @@ export function taskSnapshot(task: ManagedTask): BackgroundTaskSnapshot {
 		reviewedOutputBytes: task.reviewedOutputBytes,
 		reviewRevision: task.reviewRevision ?? 0,
 		resultReady: task.resultReady === true,
+		// Task → assignment association and result resolution (openspec tasks
+		// 2.1-2.3) are durable settlement state: written at spawn / at an
+		// observed handoff, they must survive the restart they are recorded for.
+		assignmentRequestId: task.assignmentRequestId,
+		resultResolution: task.resultResolution,
 		// Only a terminal task has an established capture record; a running task
 		// writes none, so restore reads "not recorded" and reconciles.
 		outputComplete: task.status === "running" ? undefined : task.outputComplete === true,
@@ -369,6 +374,17 @@ export async function restoredTaskFromSnapshot(snapshot: BackgroundTaskSnapshot,
 		// nothing (legacy) is the one case reconciliation may resolve as ready.
 		resultReady: pidStillAlive ? false : !captureRecorded || snapshot.resultReady === true,
 		outputComplete: pidStillAlive ? false : !captureUnestablished && !captureShort,
+		// Settlement state rides the spread, but is re-narrowed here: a snapshot
+		// from disk must not be able to smuggle a non-string association or an
+		// unknown resolution into the live map. Anything unrecognizable reads as
+		// absent, which fails closed — an unassociated task stays quarantined and
+		// an unresolved task stays outstanding.
+		assignmentRequestId: typeof snapshot.assignmentRequestId === "string" && snapshot.assignmentRequestId.length > 0
+			? snapshot.assignmentRequestId
+			: undefined,
+		resultResolution: snapshot.resultResolution === "delivered" || snapshot.resultResolution === "error"
+			? snapshot.resultResolution
+			: undefined,
 		pendingWakes: [],
 		status: pidStillAlive ? "running" : (wasRunning ? "stopped" : snapshot.status),
 		stopReason: pidStillAlive ? null : (coercedFromRunning ? "shutdown" : null),

@@ -83,6 +83,14 @@ import {
 	renderTaskEventMessage,
 } from "./render.js";
 import { logBackgroundDiagnostic } from "./diagnostics.js";
+import {
+	BACKGROUND_WORK_MAX_OUTSTANDING,
+	registerBackgroundWorkProvider,
+	type BackgroundWorkOutstandingTask,
+	type BackgroundWorkProvider,
+	type BackgroundWorkReconciliation,
+	type BackgroundWorkRegistration,
+} from "./background-work.js";
 // The surface type is the leaf module's; `registrations.ts` re-exports it for
 // its own deps, and importing it from both places is a duplicate binding.
 import { applyTaskToolSurface, bashPromptGuidelines, registerAll, type RegistrationDeps } from "./registrations.js";
@@ -117,6 +125,8 @@ import {
 	completeResultFinalization,
 	readRetainedOutput,
 	reviewDeadlineFor,
+	resultIsResolved,
+	resultResolutionForDelivery,
 	reviewReminderArmed,
 	selectPrunableFinishedTasks,
 	taskReadiness,
@@ -244,6 +254,248 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 	// Track the active session id so spawn/restore/replay can scope snapshots
 	// to the current Pi session and reject cross-session leaks.
 	let activeSessionId: string | null = null;
+
+	// --- Background settlement provider (public seam) ---------------------
+	//
+	// Registers this lifecycle on the settlement seam in
+	// `extensions/background-work.ts` (protocol `background-work/v1`) so a
+	// consumer can tell an absent provider from this registered one. Group 2 of
+	// openspec `herdsman-background-handoffs` (tasks 2.1-2.4); every answer is
+	// fail-closed and nothing is inferred that the lifecycle did not record:
+	// - `bind` adopts task→assignment association: spawned tasks inherit the
+	//   bound request id (`task.assignmentRequestId`, written once at spawn),
+	//   and binding refuses while unresolved work exists that is NOT
+	//   attributable to the request — foreign-request tasks and unassociated
+	//   tasks (restored pre-Group-2 work, or spawns from before the first bind)
+	//   are quarantined for explicit reconciliation, never silently adopted.
+	// - Result resolution (`task.resultResolution`) is the only thing that
+	//   retires a task from `outstanding`: a durable observation that a
+	//   certified result reached the worker (`delivered`, tasks 2.2) or that
+	//   an unrecoverable capture error was actually handed over (`error`,
+	//   tasks 2.3). `exitNotified` is notification state and never settles
+	//   anything: a notified-but-unretrieved terminal task stays
+	//   `awaiting-result-review` (design D2's terminal-ready condition).
+	// - An empty unresolved map answers `ready` for ANY request — completed
+	//   history is history and may be re-queried; while unresolved work exists,
+	//   an unbound scope answers `error`, never inferred emptiness.
+	// - `protect` marks the bound assignment settlement-waiting so its tasks'
+	//   exit wakes are mandatory even under `notifyOnExit: false` (tasks 2.4).
+	// `ready` still requires the exact active session (identity-mismatch at
+	// the helper) and a completed successful restore. Registration is replaced
+	// at every `session_start` and disposed first at `session_shutdown`, so a
+	// stale registration never answers while the task map is being emptied.
+	// Consumers arrive with the Herdsman settlement guard (Group 3); nothing
+	// here wires waiting or settlement itself.
+	const SETTLEMENT_PROVIDER_ID = "pi-bash-processes";
+	const SETTLEMENT_PROVIDER_VERSION = 1;
+	let settlementRestore: { state: "pending" } | { state: "done" } | { state: "failed"; reason: string } = { state: "pending" };
+	let settlementRevision = 0;
+	let settlementRegistration: BackgroundWorkRegistration | null = null;
+	/** The accepted assignment request currently bound for spawn association; null before the first bind (or after a session restart). */
+	let boundAssignment: string | null = null;
+	/** The bound assignment marked settlement-waiting; only its tasks' exit wakes are mandatory. */
+	let protectedAssignment: string | null = null;
+	/** Monotonic snapshot revision: bumps on every transition that can change the answer. */
+	const bumpSettlementRevision = (): void => {
+		settlementRevision += 1;
+	};
+
+	/**
+	 * Record a result-resolution observation (openspec tasks 2.2-2.3).
+	 * Eligibility is decided by the centralized `resultResolutionForDelivery`
+	 * rule at each delivery site — a flushing (`finalizing`) handoff passes
+	 * `null` and records nothing. Written once — the first actual handoff
+	 * stands (`delivered` and `error` never overwrite each other) — and
+	 * durable, so a restart cannot un-resolve a result that was already handed
+	 * over. Deliberately separate from `acknowledgeCompletion`: a host wake is
+	 * notification, not settlement. Never applies to a running task: running
+	 * work is inspected, not resolved.
+	 */
+	const recordResultResolution = (task: ManagedTask, kind: "delivered" | "error" | null): boolean => {
+		if (kind === null) return false;
+		if (task.status === "running") return false;
+		if (task.resultResolution !== undefined) return false;
+		task.resultResolution = kind;
+		rememberSnapshot(task);
+		persistSnapshots();
+		bumpSettlementRevision();
+		return true;
+	};
+
+	/** Whether this task's exit wake is mandatory despite `notifyOnExit: false` (protected assignment, tasks 2.4). */
+	const exitWakeIsMandatory = (task: ManagedTask): boolean =>
+		protectedAssignment !== null && task.assignmentRequestId !== undefined && task.assignmentRequestId === protectedAssignment;
+
+	/** Everything unresolved in the map, classified against one scope's request id. */
+	type SettlementClassification = {
+		/** Unresolved tasks associated with this request, in snapshot form. */
+		outstanding: BackgroundWorkOutstandingTask[];
+		/** Unresolved tasks with no association at all: quarantined, never adopted. */
+		unassociated: string[];
+		/** Unresolved tasks associated with a different request: unattributable to this scope. */
+		unattributable: string[];
+	};
+	const classifySettlementTasks = (requestId: string): SettlementClassification => {
+		const classification: SettlementClassification = { outstanding: [], unassociated: [], unattributable: [] };
+		for (const task of tasks.values()) {
+			if (resultIsResolved(task)) continue;
+			if (task.assignmentRequestId === undefined) {
+				classification.unassociated.push(task.id);
+				continue;
+			}
+			if (task.assignmentRequestId !== requestId) {
+				classification.unattributable.push(task.id);
+				continue;
+			}
+			if (task.status === "running") {
+				classification.outstanding.push({
+					taskId: task.id,
+					state: "running",
+					reason: "managed task spawned under this assignment is running",
+				});
+				continue;
+			}
+			if (task.resultReady !== true) {
+				classification.outstanding.push(
+					taskReadiness(task) === "incomplete"
+						? {
+							taskId: task.id,
+							state: "awaiting-result-review",
+							reason: "terminal capture was never certified (readiness incomplete after restore); awaiting explicit result resolution (tasks 2.2-2.3)",
+						}
+						: {
+							taskId: task.id,
+							state: "flushing",
+							reason: "process ended; output capture is still settling (resultReady not established)",
+						},
+				);
+				continue;
+			}
+			classification.outstanding.push({
+				taskId: task.id,
+				state: "awaiting-result-review",
+				reason: "terminal capture ready; awaiting an actual result handoff (tasks 2.2) — a host wake or an inspection does not resolve it",
+			});
+		}
+		return classification;
+	};
+	/** A bounded, stable id list for a reconciliation reason. */
+	const idList = (ids: string[]): string => {
+		const shown = ids.slice(0, 8).join(", ");
+		return ids.length > 8 ? `${shown} (+${ids.length - 8} more)` : shown;
+	};
+
+	const settlementProvider: BackgroundWorkProvider = {
+		id: SETTLEMENT_PROVIDER_ID,
+		version: SETTLEMENT_PROVIDER_VERSION,
+		snapshot(scope) {
+			if (activeSessionId == null) {
+				throw new Error("background-work: no active session id; session_start has not established one");
+			}
+			const classified = classifySettlementTasks(scope.requestId);
+			if (classified.outstanding.length > BACKGROUND_WORK_MAX_OUTSTANDING) {
+				// Fail closed rather than truncate the bounded snapshot list.
+				throw new Error(`background-work: ${classified.outstanding.length} outstanding tasks for this request exceed the ${BACKGROUND_WORK_MAX_OUTSTANDING}-task snapshot bound`);
+			}
+			let reconciliation: BackgroundWorkReconciliation;
+			if (settlementRestore.state === "pending") {
+				reconciliation = { state: "reconciling", reason: "task snapshot restore has not completed" };
+			} else if (settlementRestore.state === "failed") {
+				reconciliation = { state: "error", reason: settlementRestore.reason };
+			} else {
+				const quarantine = [...classified.unassociated, ...classified.unattributable];
+				if (quarantine.length === 0) {
+					// Nothing unresolved outside this request (and nothing
+					// unassociated): either the bound view with its own
+					// outstanding list, or a scope re-querying after every task
+					// was resolved. Resolved history never blocks it.
+					reconciliation = { state: "ready" };
+				} else if (scope.requestId === boundAssignment) {
+					// Bound, but unresolved work is not attributable to it:
+					// quarantined for explicit reconciliation, never counted as
+					// this request's outstanding and never silently cleared.
+					reconciliation = {
+						state: "reconciling",
+						reason: `${quarantine.length} unresolved task(s) are not associated with the bound assignment and are quarantined for explicit reconciliation: ${idList(quarantine)}`,
+					};
+				} else if (boundAssignment !== null) {
+					reconciliation = {
+						state: "error",
+						reason: `request "${scope.requestId}" is not the bound assignment ("${boundAssignment}") while ${quarantine.length} unresolved task(s) exist: ${idList(quarantine)}`,
+					};
+				} else {
+					reconciliation = {
+						state: "error",
+						reason: `no assignment is bound; ${quarantine.length} unresolved task(s) require explicit reconciliation before any request can be answered: ${idList(quarantine)}`,
+					};
+				}
+			}
+			return {
+				provider: { id: SETTLEMENT_PROVIDER_ID, version: SETTLEMENT_PROVIDER_VERSION },
+				sessionId: activeSessionId,
+				requestId: scope.requestId,
+				revision: settlementRevision,
+				reconciliation,
+				outstanding: classified.outstanding,
+			};
+		},
+		bind(scope) {
+			if (activeSessionId == null) {
+				return { ok: false, reason: "background-work: no active session id; session_start has not established one" };
+			}
+			if (scope.sessionId !== activeSessionId) {
+				return { ok: false, reason: `background-work: query session "${scope.sessionId}" does not match the active session` };
+			}
+			const classified = classifySettlementTasks(scope.requestId);
+			const blockers = [...classified.unassociated, ...classified.unattributable];
+			if (blockers.length > 0) {
+				return {
+					ok: false,
+					reason: `unresolved work not attributable to request "${scope.requestId}" blocks binding: ${idList(blockers)}; reconcile it explicitly (bg_task get/stop/clear) before binding`,
+				};
+			}
+			if (boundAssignment !== scope.requestId) {
+				boundAssignment = scope.requestId;
+				// Protection belonged to the previous assignment; the new binding
+				// must opt in again rather than inherit mandatory wakes.
+				protectedAssignment = null;
+				bumpSettlementRevision();
+			}
+			return { ok: true };
+		},
+		protect(scope, protect) {
+			if (activeSessionId == null) {
+				return { ok: false, reason: "background-work: no active session id; session_start has not established one" };
+			}
+			if (scope.sessionId !== activeSessionId) {
+				return { ok: false, reason: `background-work: query session "${scope.sessionId}" does not match the active session` };
+			}
+			if (boundAssignment !== scope.requestId) {
+				return { ok: false, reason: `background-work: request "${scope.requestId}" is not the bound assignment; bind it before protecting it` };
+			}
+			protectedAssignment = protect ? scope.requestId : null;
+			if (protect) {
+				// Protection must reconcile work that already ended BEFORE it was
+				// set: a suppressed exit wake (notifyOnExit:false) or one that
+				// was never sent leaves terminal, unresolved, associated tasks
+				// with no wake queued, and settlement would wait on a wake that
+				// is never coming. Re-enter them through the normal exit path —
+				// mid-turn they hold, idle they batch — where the exitMandatory
+				// gate now forces delivery. `exitNotified` covers both an
+				// already-delivered wake and a held one still queued (both ack'd
+				// when placed/sent), and re-entering an entry already in a
+				// deferred/idle map only overwrites it, so this never duplicates
+				// a wake; a resolved task is never resurrected.
+				for (const task of tasks.values()) {
+					if (task.assignmentRequestId !== scope.requestId) continue;
+					if (task.status === "running" || task.resultResolution !== undefined) continue;
+					if (task.exitNotified === true || task.supersededBy !== undefined) continue;
+					sendTaskEvent("exit", task);
+				}
+			}
+			return { ok: true };
+		},
+	};
 
 	const persistenceLayer = createPersistence({
 		pi,
@@ -557,7 +809,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 	 * with the unaccepted-preparation error, which would describe a committed
 	 * acknowledgment as one that had never been recorded.
 	 */
-	const settleReceipt = (token: string): BridgeHandlerResult => {
+	const settleReceipt = (token: string, delivered?: "error"): BridgeHandlerResult => {
 		const receipt = preparedReceipts.get(token);
 		if (!receipt) {
 			// No record. Two different situations reach here and they must not be
@@ -612,6 +864,44 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 						acknowledged: receipt.commit.acknowledged,
 						committed: "replayed",
 						reviewed: receipt.commit.reviewed,
+						task: task ? bridgeSummary(task) : undefined,
+					},
+				},
+			};
+		}
+		if (delivered === "error") {
+			// The declared CLI confirms it handed over an unrecoverable capture
+			// error (openspec tasks 2.3). This is an error delivery, NOT a
+			// completion settlement: it records the durable `error` resolution
+			// and commits no acknowledgment or review. The receipt's own
+			// generation must still name this task, and the centralized rule
+			// must say the delivery was an error — a certified capture would
+			// make this confirmation meaningless, and a still-flushing one is
+			// not a resolution at all.
+			const resolution = task && taskGeneration(task) === receipt.generation
+				? resultResolutionForDelivery(observeTaskResult(task))
+				: null;
+			if (task && resolution === "error") {
+				const recorded = recordResultResolution(task, resolution);
+				return {
+					ok: true,
+					result: {
+						ack: {
+							acknowledged: task.exitNotified === true,
+							committed: recorded ? "error" : "replayed",
+							reviewed: false,
+							task: bridgeSummary(task),
+						},
+					},
+				};
+			}
+			return {
+				ok: true,
+				result: {
+					ack: {
+						acknowledged: task?.exitNotified === true,
+						committed: "none",
+						reviewed: false,
 						task: task ? bridgeSummary(task) : undefined,
 					},
 				},
@@ -704,6 +994,10 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			return { acknowledged: false, committed: "review", reviewed: true };
 		}
 		ackCompletion(task, "retrieval");
+		// A certified terminal result just reached the caller: record the
+		// durable resolution through the centralized rule (openspec tasks
+		// 2.2-2.3), distinct from the completion acknowledgment above it.
+		recordResultResolution(task, resultResolutionForDelivery(observeTaskResult(task)));
 		// The obligation is settled whether this handoff settled it or an earlier
 		// delivery already had: the caller is told the result's completion is
 		// accounted for, not that this call happened to flip the bit.
@@ -712,7 +1006,16 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 
 	const bridgeSnapshot = async (task: ManagedTask): Promise<BridgeHandlerResult> => {
 		const handoff = await prepareTaskHandoff(task, "full");
-		if (handoff.failure) return { ok: false, error: { code: handoff.failure.code, message: handoff.failure.message } };
+		if (handoff.failure) {
+			// A failed preparation is still an answer the worker actually receives
+			// (openspec tasks 2.3): carry a receipt so the declared CLI can
+			// confirm the error was delivered and the task resolves as `error`
+			// instead of being trapped awaiting a retrieval that can never
+			// certify. Minting can still decline at capacity; the client then
+			// sends no receipt and the failure simply stays unresolved and
+			// retryable.
+			return { ok: false, error: { code: handoff.failure.code, message: handoff.failure.message }, receipt: mintReceipt(task, handoff.observation.readiness, true) ?? undefined };
+		}
 		if (!receiptIsStorable()) return { ok: false, error: receiptCapacityFailure };
 		const artifact = handoff.artifact!;
 		return {
@@ -733,7 +1036,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 	};
 
 	const bridgeHandler: BridgeHandler = async (request) => {
-		if (request.op === "receipt") return settleReceipt(request.token ?? "");
+		if (request.op === "receipt") return settleReceipt(request.token ?? "", request.delivered);
 		if (request.op === "list") {
 			// Listing is inspection only: it never acknowledges, resets a review,
 			// or advances any clock.
@@ -1093,6 +1396,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		voidPendingTaskWakes(task, "clear", logWakeDiagnostic);
 		clearTaskTimers(task);
 		tasks.delete(task.id);
+		bumpSettlementRevision();
 		forgetSnapshot(task.id);
 		// A pruned task cannot settle a handoff any more, so its unaccepted
 		// preparations go with it rather than lingering as tokens for a task the
@@ -1298,8 +1602,14 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			if (foregroundOwnsExit || waitOwnsExit) {
 				// The foreground/wait tool result IS this exit's delivery channel:
 				// acknowledge through the shared entry point, which also drops any
-				// completion wake this process still holds for the task.
+				// completion wake this process still holds for the task. The result
+				// resolution travels with it (openspec tasks 2.2-2.3) — but only as
+				// far as the centralized delivery rule allows: a certified capture
+				// delivers, an unrecoverable one delivers as `error`, and a flush
+				// still settling records nothing (the task stays outstanding until
+				// a certified handoff completes it).
 				ackCompletion(task, "foreground-delivery");
+				recordResultResolution(task, resultResolutionForDelivery(observeTaskResult(task)));
 				publishBackgroundTaskActivity(eventType, task, { ...options, sequence: options.sequence ?? task.wakeSequence ?? 0 });
 				return true;
 			}
@@ -1336,6 +1646,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			rememberSnapshot,
 			sendMessage: (message, messageOptions) => pi.sendMessage(message as any, messageOptions as any),
 			runningInventory,
+			exitMandatory: exitWakeIsMandatory,
 		}, eventType, task, options);
 		publishBackgroundTaskActivity(eventType, task, { ...options, sequence: options.sequence ?? task.wakeSequence ?? 0 });
 		rememberSnapshot(task);
@@ -1604,6 +1915,9 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 	const finalizeTask = (task: ManagedTask, exitCode: number | null, statusOverride?: BackgroundTaskStatus): void => {
 		beginResultFinalization(task);
 		if (!closeTaskLifecycle(task, exitCode, lifecycleHooks, statusOverride)) return;
+		// The terminal transition changes which snapshot states are decidable
+		// (running → settling/terminal), so the settlement revision follows it.
+		bumpSettlementRevision();
 		clearRunningMarker(task);
 		task.child = null;
 		refreshUi();
@@ -2071,6 +2385,12 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			// pinged at turn end for a result this call already handed it. The
 			// preparation lease keeps retention from pruning the task mid-read.
 			consumeObservedExitWake(task.id);
+			// This wait's result is an actual handoff of the terminal result —
+			// eligibility decided by the centralized rule: certified delivers,
+			// unrecoverable delivers as `error`, a still-flushing capture
+			// records nothing (openspec tasks 2.2-2.3). A wait that returns a
+			// still-running task below resolves nothing either.
+			recordResultResolution(task, resultResolutionForDelivery(observeTaskResult(task)));
 			const text = withResultPreparationLease(task, () => formatManagedBashCompletion(task, Date.now() - task.startedAt, ctx.cwd));
 			return makeToolResult(text, details());
 		}
@@ -2112,7 +2432,11 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			if (outcome.kind === "aborted") throw new Error("Operation aborted");
 			if (task.status !== "running") {
 				// Terminal delivery keeps total task age; only the Running
-				// text below is scoped to the wait attachment.
+				// text below is scoped to the wait attachment. Eligibility for
+				// the durable resolution follows the centralized rule (tasks
+				// 2.2-2.3): certified → delivered, unrecoverable → error,
+				// still-flushing → nothing recorded.
+				recordResultResolution(task, resultResolutionForDelivery(observeTaskResult(task)));
 				return makeToolResult(formatManagedBashCompletion(task, Date.now() - task.startedAt, ctx.cwd), details());
 			}
 			return makeToolResult(
@@ -2167,6 +2491,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 				rememberSnapshot,
 				sendMessage: (message, messageOptions) => pi.sendMessage(message as any, messageOptions as any),
 				runningInventory,
+				exitMandatory: exitWakeIsMandatory,
 			}, "exit", task, options);
 			// The send is the delivery: acknowledge through the shared entry point so
 			// a restart cannot replay a wake the agent already received.
@@ -2363,6 +2688,10 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			notifyPattern: options.notifyPattern?.trim() || undefined,
 			notifyMode: resolveNotifyMode(options.notifyMode, options.notifyPattern),
 			origin: options.origin ?? "bg_task",
+			// Task → assignment association (openspec tasks 2.1): every spawn
+			// inherits the currently bound accepted assignment, or none when
+			// nothing is bound yet. Written once; never rewritten.
+			assignmentRequestId: boundAssignment ?? undefined,
 			dedupeKey: options.dedupeKey?.trim() || undefined,
 			output: "",
 			outputBytes: 0,
@@ -2387,6 +2716,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			updatedAt: now,
 		};
 		tasks.set(task.id, task);
+		bumpSettlementRevision();
 		markTaskRunning(task);
 		// Supersede older runs of the identical command in the same cwd. Two
 		// identical commands cannot both inform a decision: the older result
@@ -2481,16 +2811,26 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		return task;
 	};
 
-	const clearFinishedTasks = (): number => {
+	const clearFinishedTasks = (): { removed: number; kept: number } => {
 		let removed = 0;
+		let kept = 0;
 		for (const task of [...tasks.values()]) {
 			if (task.status === "running") continue;
+			// An assignment-owned terminal result that was never delivered is
+			// outstanding evidence, not finished clutter (openspec tasks 2.1-2.2):
+			// `clear` skips it so an explicit clear can never turn owned outstanding
+			// work into apparent completion. Resolved history and unassociated tasks
+			// clear as before; retrieve the kept task (get/stop) to clear it after.
+			if (task.assignmentRequestId !== undefined && !resultIsResolved(task)) {
+				kept += 1;
+				continue;
+			}
 			forgetFinishedTask(task);
 			removed += 1;
 		}
 		persistSnapshots();
 		refreshUi();
-		return removed;
+		return { removed, kept };
 	};
 
 	const formatTaskListText = (): string => {
@@ -2556,7 +2896,17 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			// A handoff the caller cannot certify is still handed over — the surviving
 			// bytes and the loss metadata are the truth — but it commits nothing, so a
 			// short capture is never reported as a settled result.
-			if (handoff.failure || handoff.captureError) return { handoff };
+			//
+			// Handing that failure over IS a delivery of the result's final
+			// state (openspec tasks 2.3): the centralized rule records `error`
+			// for a terminal or restored-incomplete capture that will never
+			// certify, so an assignment cannot be trapped awaiting a retrieval
+			// that can never succeed. A running or still-flushing task's read
+			// error is inspection, not a resolution, and records nothing.
+			if (handoff.failure || handoff.captureError) {
+				recordResultResolution(task, resultResolutionForDelivery(handoff.observation));
+				return { handoff };
+			}
 			const ack = commitTaskHandoff(task, handoff.observation.readiness);
 			// The observation describes the result *as handed over*, which is what
 			// makes its changed-output indicator meaningful — a post-commit re-read is
@@ -2613,6 +2963,26 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		shuttingDown = false;
 		recordProjectTrust(ctx);
 		activeCtx = ctx;
+		// The settlement provider is session-scoped: reset its restore state and
+		// replace any live registration before restore, so a query during the
+		// async restore window is answered by a current registration as
+		// explicitly reconciling — never as absence or a stale answer. The
+		// assignment binding and its protection are session-scoped state too:
+		// after a restart nothing has been accepted yet, so a consumer must bind
+		// (and re-protect) again while restore settles the map.
+		boundAssignment = null;
+		protectedAssignment = null;
+		settlementRestore = { state: "pending" };
+		settlementRegistration?.dispose();
+		settlementRegistration = null;
+		try {
+			settlementRegistration = registerBackgroundWorkProvider(pi.events, settlementProvider);
+		} catch (error) {
+			// No registration beats a broken one: a consumer that expects this
+			// provider then reads `missing` (fail closed), an ordinary session
+			// keeps its normal lifecycle, and the failure stays on record.
+			logBackgroundDiagnostic("background settlement provider registration failed", { error: error instanceof Error ? error.message : String(error) });
+		}
 		// The session mode is known only here, and it decides the declared tool
 		// surface: the TUI gets `bg_task` with exactly spawn/get/stop/list and no
 		// `bg_status`, while print/json/rpc/unknown keep the compatibility surface
@@ -2621,7 +2991,19 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		registerBashTool(taskToolSurface = applyTaskToolSurface(pi, registrationDeps, ctx.mode));
 		const pruned = pruneLanes(taskLanesRoot());
 		for (const failure of pruned.failed) logBackgroundDiagnostic("task log prune failed", { path: failure.path, error: failure.error });
-		await restoreSnapshots(ctx);
+		try {
+			await restoreSnapshots(ctx);
+			settlementRestore = { state: "done" };
+		} catch (error) {
+			// A failed restore must never read as an empty successful snapshot:
+			// record the actionable failure, keep the registration (queries then
+			// fail closed as provider error), and preserve the existing control
+			// flow by rethrowing exactly as before.
+			settlementRestore = { state: "failed", reason: `task snapshot restore failed: ${error instanceof Error ? error.message : String(error)}` };
+			bumpSettlementRevision();
+			throw error;
+		}
+		bumpSettlementRevision();
 		replayMissedExits();
 		if (boundFinishedTasks() > 0) persistSnapshots();
 		// The declared CLI's endpoint comes up with the session, after restore, so
@@ -2649,6 +3031,11 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		syncWidget(ctx);
 	});
 	pi.on("session_shutdown", async () => {
+		// Dispose the settlement registration first: a query arriving while the
+		// task map is emptied must read absence (ordinary lifecycle), never a
+		// half-torn-down snapshot from a stale registration.
+		settlementRegistration?.dispose();
+		settlementRegistration = null;
 		// A script cannot outlive its session, so neither can its provenance.
 		codemodeCallIds.clear();
 		deferredExitWakes.clear();

@@ -1,8 +1,9 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { createEventBus, type EventBus, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 import { createToolRegistry, declaredActionEnum } from "./tool-surface-harness.js";
+import { sidecarStatePath } from "../../extensions/persistence.js";
 
 /**
  * In-process host for the background-tasks extension: the real extension
@@ -64,6 +65,8 @@ export interface ExtensionHost {
 	messages: unknown[][];
 	/** Every `pi.appendEntry` call: the extension's persisted state. */
 	entries: unknown[];
+	/** The shared `pi.events` bus the extension registers its settlement provider on. */
+	events: EventBus;
 	/** The handler results of one `agent_settled` boundary. */
 	settle(): Promise<unknown[]>;
 	dispatch(event: string, payload?: unknown): Promise<unknown[]>;
@@ -198,6 +201,7 @@ export async function startExtensionHost(options: ExtensionHostOptions = {}): Pr
 			setWidget() {},
 		},
 	} as unknown as ExtensionContext;
+	const events = createEventBus();
 	const pi = {
 		registerTool(tool: HostTool) {
 			tools.set(tool.name, tool);
@@ -230,7 +234,10 @@ export async function startExtensionHost(options: ExtensionHostOptions = {}): Pr
 			entriesForBranch.push(entry);
 		},
 		sendMessage: (...args: unknown[]) => messages.push(args),
-		events: { on: () => () => {} },
+		// Pi's real shared event bus: the background settlement provider
+		// registers on it through the same public `pi.events` surface production
+		// uses, so tests query the actual registration lifecycle.
+		events,
 	} as unknown as ExtensionAPI;
 
 	// Pi's real registry and prompt rules, shared with the surface tests.
@@ -255,7 +262,17 @@ export async function startExtensionHost(options: ExtensionHostOptions = {}): Pr
 	const readTasks = async (): Promise<Record<string, any>[]> => {
 		const listed = await tools.get("bg_task")!.execute("list-tasks", { action: "list" });
 		const tasks = listed.details.tasks;
-		return Array.isArray(tasks) ? tasks : [];
+		if (Array.isArray(tasks)) return tasks;
+		// Past the details bounding threshold (>50 tasks or >64KB) the list
+		// action carries only a bounded marker, not the records. The sidecar
+		// keeps every snapshot and is written synchronously with each
+		// structural change, so it is the complete view for those runs.
+		try {
+			const payload = JSON.parse(readFileSync(sidecarStatePath(ctx), "utf8"));
+			return Array.isArray(payload?.tasks) ? payload.tasks : [];
+		} catch {
+			return [];
+		}
 	};
 
 	const host: ExtensionHost = {
@@ -265,6 +282,7 @@ export async function startExtensionHost(options: ExtensionHostOptions = {}): Pr
 		tools,
 		messages,
 		entries,
+		events,
 		settle: () => dispatch("agent_settled"),
 		dispatch,
 		listTasks: readTasks,

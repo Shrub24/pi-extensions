@@ -42,7 +42,7 @@ export interface DashboardDeps {
 	getTask(id: string): ManagedTask | null;
 	getTaskOutput(task: ManagedTask): string;
 	requestStop(task: ManagedTask | null, reason: "user", author?: "agent" | "operator"): { ok: boolean; message: string };
-	clearFinishedTasks(): number;
+	clearFinishedTasks(): { removed: number; kept: number };
 	formatTaskListText(): string;
 }
 

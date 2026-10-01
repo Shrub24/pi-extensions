@@ -90,10 +90,63 @@ they now fail with exit `2` and an actionable migration message naming
 read any more: reading a retained capture — with `cat`, `tail` or any other
 command — changes no notification state.
 
+### Background settlement interface
+
+`extensions/background-work.ts` is the package's public settlement seam: a
+session-local, provider-owned view of outstanding managed work for consumers
+such as a settlement guard. It speaks the versioned
+`background-work/v1` protocol over Pi's own `pi.events` bus (snapshot query,
+bind, protect and reply channels plus identity/revision-only change
+metadata); it adds no registry, timer, polling loop or second task map. The
+provider is this extension itself (`id: "pi-bash-processes"`, version `1`),
+registered at `session_start` and disposed first at `session_shutdown`, so an
+absent provider is never confused with a registered one.
+
+A snapshot query answers one of: `ready` (the exact active session, a
+completed successful restore, and no unresolved work unattributable to the
+request), `reconciling` (restore pending, or unresolved tasks quarantined
+away from the bound assignment), `error` (a failed restore, a scope asking
+over another request's unresolved work, or no binding while unattributable
+work exists), `missing` (a provider was expected but nothing current
+answered) or `absent` (nothing registered, nothing attached). A query for
+another session is rejected as `identity-mismatch`, oversized or malformed
+replies fail closed, and no path reports an empty successful snapshot for
+work the provider cannot account for.
+
+Binding (`bind`) adopts the assignment: every task spawned afterward records
+`assignmentRequestId` in its durable snapshot, and binding refuses while
+unresolved work exists that the request cannot claim — foreign-request tasks
+and unassociated tasks (restored pre-Group-2 work, or spawns from before the
+first bind) must be reconciled explicitly with `get`, `stop` or `clear`
+first. Resolved tasks are history: they neither block a later bind nor re-enter
+any snapshot.
+
+A task leaves `outstanding` only through a durable result resolution: a
+certified result that actually reached the worker — a terminal tool
+`get`/`stop`/`wait`/foreground delivery or a declared-CLI receipt
+(`resultResolution: "delivered"`) — or an unrecoverable capture error that was
+actually handed over (`"error"`, confirmed by the CLI's error receipt).
+Host wakes, `list`/`log` inspection and failed handoffs (an early pipe
+closure) resolve nothing: a notified-but-unretrieved terminal task stays
+`awaiting-result-review`. An observation taken while the 250 ms output flush
+is still settling is not a result at all: it records nothing until the
+capture certifies — or fails as an `error` — so a flushing inspection is
+never delivered as a result.
+
+`protect(scope, true)` marks the bound assignment settlement-waiting: its
+tasks' exit wakes become mandatory even under `notifyOnExit: false` (grouped
+and coalesced as usual), so the terminal result can be retrieved and
+resolved; protection ends with an unprotect or the next bind. Protecting an
+assignment also reconciles work that ended before protection existed: a
+suppressed terminal task gets its one wake immediately (a held, mid-turn one
+at the run boundary), and never again once its result is retrieved. Herdsman-side
+settlement consumption arrives with Group 3; ordinary unprotected task and
+CLI behavior is unchanged today.
+
 ## Memory and disk use
 
 - A finished task's output is read from its log file; the process handle and the in-memory output are released once the task has exited and its last log write has finished. A task whose last log write failed or stalled keeps its in-memory output instead.
-- At most 50 finished tasks are kept; past that, the oldest finished task is removed with its log. `clear` also deletes the logs of the tasks it removes. A forked session removes the tasks it copied from the original session but keeps their logs, which the original session still reads.
+- At most 50 finished tasks are kept; past that, the oldest finished task is removed with its log. `clear` also deletes the logs of the tasks it removes. Neither path may ever remove a terminal result that belongs to a bound assignment and has not been delivered yet: the retention bound keeps it past the 50-task limit, and `clear` skips it and reports a `Kept …` line instead (retrieve it with `get`, then `clear` again to drop it as ordinary history). A forked session removes the tasks it copied from the original session but keeps their logs, which the original session still reads.
 - Logs live in one directory per session in the `lanes/` folder of the task directory (`taskDir`, default the system temporary directory's `kendex-pi-bg`). A session's directory is deleted once its working directory is gone (a merged worktree), and any log older than 5 days is deleted. Pi applies both rules when a session starts, to `lanes/` only, and only to directories the package made there.
 - A log written before 2.1.0 stays directly in the task directory. The prune, `clear` and the 50-task bound do not delete it; a task restored with such a log is removed from the list without its log.
 

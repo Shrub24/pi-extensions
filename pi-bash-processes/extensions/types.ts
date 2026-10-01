@@ -201,6 +201,31 @@ export interface BackgroundTaskSnapshot {
 	 * reconciliation.
 	 */
 	outputComplete?: boolean;
+	/**
+	 * Task → assignment association (openspec `herdsman-background-handoffs`
+	 * tasks 2.1): the accepted assignment request id this task was spawned
+	 * under, taken from the settlement provider's active binding at spawn
+	 * time. Tasks spawned before a binding existed (and tasks restored from
+	 * snapshots written before this field) carry no association: they stay
+	 * quarantined from any later bind until the agent reconciles them
+	 * explicitly, because nothing observed records which request they were
+	 * launched for. This is *association*, not ownership history: it is
+	 * written once at spawn and never rewritten, and a resolved task keeps it
+	 * as history.
+	 */
+	assignmentRequestId?: string;
+	/**
+	 * Durable result-resolution observation (openspec `herdsman-background-
+	 * handoffs` tasks 2.2-2.3), deliberately distinct from `exitNotified`:
+	 * that one records whether a *host wake* was sent (notification), while
+	 * this records that a terminal result was actually handed to the worker
+	 * ("delivered": certified bytes/outcome through a completed get, bounded
+	 * wait, foreground wait, or declared-CLI receipt) or that an unrecoverable
+	 * capture/read error was actually handed over ("error"). Absent means
+	 * unresolved — inspection (`list`), a queued or delivered host wake, and a
+	 * failed handoff never set it. Written once; the first observation stands.
+	 */
+	resultResolution?: "delivered" | "error";
 	/** Set when a newer identical task superseded this one; suppresses its exit wake. */
 	supersededBy?: string;
 	// True after sendTaskEvent('exit') has fired for this task. Persisted so

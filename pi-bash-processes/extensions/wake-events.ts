@@ -346,6 +346,16 @@ export interface SendTaskWakeDeps {
 	sendMessage: (message: Record<string, unknown>, options: Record<string, unknown>) => void;
 	/** Optional one-line inventory of other still-running tasks, appended to the wake text. */
 	runningInventory?: () => string;
+	/**
+	 * Whether an exit wake for this task is mandatory despite
+	 * `notifyOnExit: false` — the protected-assignment bypass (openspec
+	 * `herdsman-background-handoffs` tasks 2.4): a settlement-waiting
+	 * assignment's tasks must wake the model exactly once at terminal-ready so
+	 * the terminal result can be retrieved and resolved, and a suppressed wake
+	 * would leave that assignment waiting forever. Only the `exit` gate below
+	 * consults it; output and soft-timeout events are unaffected.
+	 */
+	exitMandatory?: (task: ManagedTask) => boolean;
 }
 
 export interface SendTaskWakeOptions {
@@ -545,7 +555,7 @@ export function sendTaskWake(
 		recordWakeDrop(task, pending, "output-after-stop-suppressed", deps.logDiagnostic, now, { stopReason: task.stopReason ?? undefined });
 		return false;
 	}
-	if (eventType === "exit" && !task.notifyOnExit) {
+	if (eventType === "exit" && !task.notifyOnExit && !(deps.exitMandatory?.(task) ?? false)) {
 		recordWakeDrop(task, pending, "notify-exit-disabled", deps.logDiagnostic, now);
 		return false;
 	}

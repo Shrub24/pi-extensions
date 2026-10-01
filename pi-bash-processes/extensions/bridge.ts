@@ -63,6 +63,11 @@ export interface BridgeRequest {
 	/** For `receipt`: the prepared-result token, sent only after the output
 	 *  handoff finished. */
 	token?: string;
+	/** For `receipt`: `"error"` confirms an unrecoverable capture error was
+	 *  handed to the caller (openspec tasks 2.3) instead of a result — it
+	 *  records an error delivery and commits no acknowledgment. Absent means
+	 *  the result handoff itself. */
+	delivered?: "error";
 }
 
 /** Why a request could not be served. Every one of these is a client outcome. */
@@ -141,14 +146,16 @@ export interface BridgeAck {
 	/** `terminal` committed the completion; `review` only reset the review
 	 *  clock; `replayed` repeats an earlier accepted outcome; `none` settled
 	 *  nothing (the prepared job could not be committed). */
-	committed: "terminal" | "review" | "replayed" | "none";
+	committed: "terminal" | "review" | "replayed" | "error" | "none";
 	/** Where the record now stands, when the receipt settled it. */
 	task?: BridgeTaskSummary;
 }
 
 export type BridgeHandlerResult =
 	| { ok: true; result: BridgeResultPayload }
-	| { ok: false; error: BridgeFailure };
+	/** The receipt: a failure that prepared one (a failed full read, tasks 2.3)
+	 *  carries it so the caller can confirm the error was delivered. */
+	| { ok: false; error: BridgeFailure; receipt?: string };
 
 export type BridgeHandler = (request: BridgeRequest) => Promise<BridgeHandlerResult>;
 
@@ -156,7 +163,11 @@ export type BridgeHandler = (request: BridgeRequest) => Promise<BridgeHandlerRes
  *  one operation's payload with another's. */
 export type BridgeWireResponse =
 	| { v: number; ok: true; op: BridgeOp; session: string; result: BridgeResultPayload }
-	| { v: number; ok: false; error: BridgeFailure };
+	/** `op`/`session` echo when the failure is answerable against a parsed
+	 *  request; a request that never parsed carries neither. `receipt` rides a
+	 *  failure that prepared one (a failed full read, tasks 2.3) so the caller
+	 *  can confirm the error was delivered. */
+	| { v: number; ok: false; op?: BridgeOp; session?: string; error: BridgeFailure; receipt?: string };
 
 export type BridgeClientOutcome =
 	| { ok: true; response: BridgeWireResponse }
@@ -201,6 +212,9 @@ export function parseBridgeRequest(line: string): { ok: true; request: BridgeReq
 	if (op === "receipt" && (typeof record.token !== "string" || record.token.trim() === "")) {
 		return { ok: false, error: { code: "malformed", message: "op receipt requires a token" } };
 	}
+	if (op === "receipt" && record.delivered !== undefined && record.delivered !== "error") {
+		return { ok: false, error: { code: "malformed", message: "receipt delivered must be \"error\" when present" } };
+	}
 	if (op === "receipt" && record.output !== undefined) {
 		return { ok: false, error: { code: "malformed", message: "op receipt does not take an output selection" } };
 	}
@@ -223,6 +237,7 @@ export function parseBridgeRequest(line: string): { ok: true; request: BridgeReq
 			session: typeof record.session === "string" ? record.session : undefined,
 			generation: typeof record.generation === "string" ? record.generation : undefined,
 			token: typeof record.token === "string" ? record.token : undefined,
+			delivered: record.delivered === "error" ? "error" : undefined,
 		},
 	};
 }
@@ -340,7 +355,7 @@ export function createBridgeServer(deps: BridgeServerDeps): BridgeServer {
 			});
 			return;
 		}
-		writeResponse(socket, { v: BRIDGE_PROTOCOL_VERSION, ok: false, error: outcome.error });
+		writeResponse(socket, { v: BRIDGE_PROTOCOL_VERSION, ok: false, op: request.op, session: deps.session, error: outcome.error, receipt: outcome.receipt });
 	}
 
 	function onConnection(socket: Socket): void {
