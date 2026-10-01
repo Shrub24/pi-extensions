@@ -215,8 +215,21 @@ function toolRenderMode(cwd?: string): "compact" | "stacked" {
 	return settingEnum("toolRenderMode", ["compact", "stacked"] as const, "stacked", cwd);
 }
 
-export function makeToolResult(text: string, details: Record<string, unknown> = {}): AgentToolResult<unknown> {
-	return { content: [{ type: "text", text }], details };
+/**
+ * Tool result with the text the model reads. `structuredContent` is the
+ * machine-readable value a programmatic caller (a codemode script, for example)
+ * receives instead of the text when the tool declares an `outputSchema`.
+ */
+export function makeToolResult(
+	text: string,
+	details: Record<string, unknown> = {},
+	structuredContent?: AgentToolResult<unknown>["structuredContent"],
+): AgentToolResult<unknown> {
+	return {
+		content: [{ type: "text", text }],
+		details,
+		...(structuredContent === undefined ? {} : { structuredContent }),
+	};
 }
 
 function backgroundRule(theme: Theme, width: number): string {

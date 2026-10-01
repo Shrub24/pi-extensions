@@ -32,6 +32,13 @@ export function taskSnapshot(task: ManagedTask): BackgroundTaskSnapshot {
 		pendingWakes: task.pendingWakes ?? [],
 		lastOutputDedupeHash: task.lastOutputDedupeHash,
 		lastOutputDedupeByKey: task.lastOutputDedupeByKey,
+		lastReviewedAt: task.lastReviewedAt,
+		reviewedOutputBytes: task.reviewedOutputBytes,
+		reviewRevision: task.reviewRevision ?? 0,
+		resultReady: task.resultReady === true,
+		// Only a terminal task has an established capture record; a running task
+		// writes none, so restore reads "not recorded" and reconciles.
+		outputComplete: task.status === "running" ? undefined : task.outputComplete === true,
 		outputPatternMatched: task.outputPatternMatched === true,
 		outputWakeBudget: task.outputWakeBudget ? normalizeOutputWakeBudget(task.outputWakeBudget) : undefined,
 		softExpiresAt: task.softExpiresAt,
@@ -252,6 +259,12 @@ export interface RestoreOptions {
 // snapshot that never carried the field is replay-eligible, as is a fresh
 // running->stopped coercion.
 //
+// Readiness is read back from the snapshot rather than recomputed: a snapshot
+// that recorded an unsettled flush (`resultReady === false`) restores as an
+// unrecoverable incomplete capture, and one that recorded a short capture
+// (`outputComplete === false`) restores as ready but explicitly short. See the
+// `captureRecorded` / `captureUnestablished` derivation below.
+//
 // Only a same-session running snapshot is probed, so a restore probes each
 // task of its final set at most once.
 export async function restoredTaskFromSnapshot(snapshot: BackgroundTaskSnapshot, options: RestoreOptions = {}): Promise<ManagedTask> {
@@ -260,9 +273,13 @@ export async function restoredTaskFromSnapshot(snapshot: BackgroundTaskSnapshot,
 	const softTimeoutMs = Number.isFinite(snapshot.softTimeoutMs)
 		? Math.max(0, snapshot.softTimeoutMs ?? 0)
 		: DEFAULT_SOFT_TIMEOUT_MS;
+	// The persisted deadline wins over a recomputation, so a snapshot written by
+	// an older version (no lastReviewedAt) restores exactly the interval it was
+	// carrying rather than re-deriving it from startedAt.
 	const softExpiresAt = softTimeoutMs > 0
 		? (snapshot.softExpiresAt ?? snapshot.startedAt + softTimeoutMs)
 		: null;
+	const lastReviewedAt = snapshot.lastReviewedAt ?? (softExpiresAt != null ? softExpiresAt - softTimeoutMs : undefined);
 	const wasRunning = snapshot.status === "running";
 	const foreignSession = typeof options.sessionId === "string"
 		&& typeof snapshot.sessionId === "string"
@@ -275,6 +292,30 @@ export async function restoredTaskFromSnapshot(snapshot: BackgroundTaskSnapshot,
 		pidStillAlive = verdict === "alive" || verdict === "unknown";
 	}
 	const coercedFromRunning = wasRunning && !pidStillAlive;
+
+	// What the snapshot itself recorded about the capture, honoured instead of
+	// re-derived. A rehydrated task has no process left to flush and a fresh,
+	// empty writer queue, so nothing here can re-establish either fact —
+	// recomputing would answer "ready and complete" for bytes that never
+	// reached disk.
+	//
+	// `resultReady` is written by every snapshot this version takes, so its
+	// presence is what marks a snapshot as modern; a snapshot that does not
+	// carry it recorded nothing and is reconciled below.
+	//
+	//   captureUnestablished — the process had not reached its flush barrier
+	//     (`resultReady === false`). Live, that is finalizeTask's mid-flush
+	//     window or the session_shutdown coercion, which stamps a terminal
+	//     status without awaiting the flush it later drains; it is also every
+	//     running task. A writer this process owns can still settle those
+	//     bytes. Rehydrated, the process that owned that writer is gone, the
+	//     bytes are unrecoverable, and the task must not come back ready.
+	//   captureShort — the writer dropped bytes before the barrier
+	//     (`resultReady === true` with `outputComplete === false`). Readiness
+	//     landed, capture integrity did not.
+	const captureRecorded = typeof snapshot.resultReady === "boolean";
+	const captureUnestablished = captureRecorded && snapshot.resultReady === false;
+	const captureShort = captureRecorded && snapshot.resultReady === true && snapshot.outputComplete === false;
 
 	// A same-session snapshot is replay-eligible unless its persisted
 	// exitNotified is true: the running->stopped coercion forces false, and an
@@ -307,6 +348,7 @@ export async function restoredTaskFromSnapshot(snapshot: BackgroundTaskSnapshot,
 		lastAnnouncedLength: snapshot.outputBytes,
 		lastOutputDedupeHash: snapshot.lastOutputDedupeHash,
 		lastOutputDedupeByKey: snapshot.lastOutputDedupeByKey ?? {},
+		lastReviewedAt,
 		matcher: parseOutputMatcher(snapshot.notifyPattern),
 		notifyMode: normalizeNotifyMode(snapshot.notifyMode),
 		output: "",
@@ -317,6 +359,16 @@ export async function restoredTaskFromSnapshot(snapshot: BackgroundTaskSnapshot,
 		softExpiresAt,
 		softTimeoutNotified: snapshot.softTimeoutNotified === true,
 		softTimeoutMs,
+		reviewedOutputBytes: snapshot.reviewedOutputBytes,
+		reviewRevision: snapshot.reviewRevision ?? 0,
+		// A rehydrated task has no process left to flush, so a snapshot that
+		// recorded a certified capture is the terminal record. A snapshot that
+		// recorded an unsettled flush or a short capture stays exactly that:
+		// reconciliation may establish *unknown* readiness, never overwrite a
+		// known incomplete capture with a complete one. A snapshot that recorded
+		// nothing (legacy) is the one case reconciliation may resolve as ready.
+		resultReady: pidStillAlive ? false : !captureRecorded || snapshot.resultReady === true,
+		outputComplete: pidStillAlive ? false : !captureUnestablished && !captureShort,
 		pendingWakes: [],
 		status: pidStillAlive ? "running" : (wasRunning ? "stopped" : snapshot.status),
 		stopReason: pidStillAlive ? null : (coercedFromRunning ? "shutdown" : null),

@@ -81,3 +81,10 @@ equivalent — each is fork-only source plus its tests):
 - **Per-process consume logs** (`log-writer.ts` region) — exit wakes are
   recorded per Pi process (`consumed-<pid>.log`, pruned after 24h), so one
   session's log flush cannot consume another session's wake.
+- **Structured bash results and codemode** — bash declares Pi's output schema
+  and returns structured output for completed commands; a yielded task still
+  returns a Running acknowledgment. Codemode calls use Pi's foreground bash
+  executor, with normal timeout, cancellation, and structured results, rather
+  than starting managed tasks. `bg_task` spawn is blocked inside codemode,
+  including through nested wrappers. This does not restrict shell syntax such
+  as `cmd &`. Scripts must supply `intent` when `intentMode: "required"` is set.

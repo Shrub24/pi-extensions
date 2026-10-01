@@ -161,6 +161,46 @@ export interface BackgroundTaskSnapshot {
 	softTimeoutMs?: number;
 	softExpiresAt?: number | null;
 	softTimeoutNotified?: boolean;
+	/**
+	 * When the last successful review of this running task happened, and the
+	 * output length it observed. The next progress-review deadline is measured
+	 * from `lastReviewedAt` (falling back to `startedAt`); output activity never
+	 * moves it. Absent on snapshots written before this field existed, which
+	 * restores to the previous `startedAt + softTimeoutMs` deadline.
+	 */
+	lastReviewedAt?: number;
+	reviewedOutputBytes?: number;
+	/**
+	 * Bumps on every successful review and on every delivered progress
+	 * reminder, so an armed reminder that was overtaken by a review (or by a
+	 * terminal transition) is recognisably stale at dispatch time.
+	 */
+	reviewRevision?: number;
+	/**
+	 * Output readiness latch: true once the process has ended *and* its log
+	 * flush settled. `status !== "running"` alone is not a terminal-ready
+	 * signal, because finalizeTask closes the process before awaiting the
+	 * flush. Absent means not yet established (see taskReadiness). Written by
+	 * every snapshot this version takes, so its presence marks a snapshot as
+	 * modern: a rehydrated task whose record says `false` restores as an
+	 * unrecoverable incomplete capture (readiness `incomplete`), because the
+	 * process that owned the writer is gone and nothing can settle it.
+	 */
+	resultReady?: boolean;
+	/**
+	 * Durable capture-integrity record: true only when the process had ended,
+	 * its log flush had settled, and the writer kept every byte of this file.
+	 * Persisted so a restore cannot upgrade a short capture into a complete
+	 * one: a rehydrated task has no process left to flush and a fresh, empty
+	 * writer queue, so re-deriving completeness after a restart answers
+	 * "complete" for bytes that never reached disk. Written only for terminal
+	 * tasks — a running snapshot records neither a certified capture nor
+	 * completeness, so its restore is resolved by `resultReady` alone. Absent
+	 * on snapshots written before this field existed, which
+	 * `restoredTaskFromSnapshot` reads as "not recorded" and resolves by
+	 * reconciliation.
+	 */
+	outputComplete?: boolean;
 	/** Set when a newer identical task superseded this one; suppresses its exit wake. */
 	supersededBy?: string;
 	// True after sendTaskEvent('exit') has fired for this task. Persisted so

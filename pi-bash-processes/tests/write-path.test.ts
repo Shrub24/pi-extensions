@@ -98,25 +98,30 @@ test("a task that outruns its log writes pauses its output until the write in fl
 }, SPAWN_FIXTURE_TIMEOUT_MS);
 
 test("a task that exits while its last log write is in flight shows closed at once, takes no stop, timeout or shutdown signal and ends completed", () => {
-	const completed = { status: "completed", reason: "self-exit", exitCode: 0 };
+	// `ready` is the output-readiness latch: false while the file's write is
+	// still held, true only after the flush that carries the last line.
+	const completed = { status: "completed", reason: "self-exit", exitCode: 0, ready: true };
 	const rows = [
 		{
 			name: "stop and timeout",
 			during: "stop-and-timeout",
 			expected: { stopMessage: "bg-1 is already completed (exit 0).", timeoutArmed: false, outcome: completed, logsAtWake: ["final line\n"] },
 		},
-		{ name: "shutdown", during: "shutdown", expected: { stopMessage: null, timeoutArmed: null, outcome: completed, logsAtWake: [] } },
+		// Shutdown persists the close before the held write lands, so that
+		// snapshot is still finalizing; restore normalizes it (see
+		// restore-replay.test.ts).
+		{ name: "shutdown", during: "shutdown", expected: { stopMessage: null, timeoutArmed: null, outcome: { ...completed, ready: false }, logsAtWake: [] } },
 		// A cleared task is forgotten: no wake, no persist brings it back, and
 		// its log is deleted after the held write lands instead of that write
 		// creating it again.
-		{ name: "clear", during: "clear", expected: { stopMessage: null, timeoutArmed: null, outcome: {}, logsAtWake: [], log: null } },
+		{ name: "clear", during: "clear", expected: { stopMessage: null, timeoutArmed: null, outcome: { ready: false }, logsAtWake: [], log: null } },
 	];
 	expect.assertions(rows.length + 1);
 	expect(rows.length, "exit window table must contain cases").toBeGreaterThan(0);
 	for (const row of rows) {
 		const result = runSpawnFixture("write-path-extension.ts", { mode: "exit-held", during: row.during });
 		expect(result, row.name).toStrictEqual({
-			heldAppends: 1, widgetBeforeClose: { running: 1, finished: 0 }, widgetAtClose: { running: 0, finished: 1 },
+			readyAtClose: false, heldAppends: 1, widgetBeforeClose: { running: 1, finished: 0 }, widgetAtClose: { running: 0, finished: 1 },
 			log: "final line\n", ...row.expected, signals: [], childSignals: [], unexpected: [],
 		});
 	}
@@ -135,7 +140,9 @@ test("a task stopped while its log write never settles resumes output at the sta
 		whileHeld: { heldAppends: 1, stdoutPaused: true },
 		stopMessage: "Stopping",
 		afterStall: { heldAppends: 1, stdoutPaused: false },
-		atWake: { outcome: { status: "stopped", reason: "extension-stop", exitCode: null }, logsAtWake: [] },
+		// Readiness follows the flush barrier, which the stall deadline releases;
+		// the bytes it dropped are counted in the log itself.
+		atWake: { outcome: { status: "stopped", reason: "extension-stop", exitCode: null, ready: true }, logsAtWake: [] },
 		logIsKeptTextThenMarker: true,
 		unexpected: [],
 	});

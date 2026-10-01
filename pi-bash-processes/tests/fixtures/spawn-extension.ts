@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { DEFAULT_SOFT_TIMEOUT_MS } from "../../extensions/constants.js";
 import { interceptNativeEffects, fixtureNow, fixturePid } from "./spawn-native.js";
 
-interface Input { mode: "spawn" | "stop" | "duplicate" | "wait-any" | "rerun" | "deferred" | "deferred-unobserved" | "deferred-group" | "deferred-wait" | "deferred-raw-read" | "deferred-settle-hold" | "staggered-exits" | "soft-expiry" | "soft-extend" | "soft-terminal" | "soft-restore" | "soft-restore-notified"; platform?: string; resource?: boolean; caller?: "tool" | "shutdown" | "slash"; command?: string; command2?: string; stopFails?: boolean; killFails?: boolean; signalGone?: boolean; softTimeoutMs?: number | null; extendSoftTimeoutMs?: number; timeoutSeconds?: number }
+interface Input { mode: "spawn" | "stop" | "duplicate" | "wait-any" | "rerun" | "deferred" | "deferred-unobserved" | "deferred-group" | "deferred-wait" | "deferred-raw-read" | "deferred-settle-hold" | "staggered-exits" | "soft-expiry" | "soft-extend" | "soft-terminal" | "soft-restore" | "soft-restore-notified" | "soft-review-reset"; platform?: string; resource?: boolean; caller?: "tool" | "shutdown" | "slash"; command?: string; command2?: string; stopFails?: boolean; killFails?: boolean; signalGone?: boolean; softTimeoutMs?: number | null; extendSoftTimeoutMs?: number; timeoutSeconds?: number }
 const input: Input = JSON.parse(await Bun.stdin.text());
 const native = await interceptNativeEffects(input);
 const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
@@ -312,6 +312,23 @@ try {
 			exitWakes,
 			timers: native.activeTimers(),
 		};
+	} else if (input.mode === "soft-review-reset") {
+		// A review (the legacy soft reset) while a reminder is still armed must
+		// discard that armed reminder rather than leaving it to fire: one timer
+		// remains, and it belongs to the new interval.
+		const atSpawn = { timers: softTimers(softMs).length, state: await softState() };
+		const resetMs = input.extendSoftTimeoutMs ?? softMs;
+		const reset = await execute({ action: "extend", id: "bg-1", softTimeoutMs: resetMs });
+		const afterReset = {
+			state: await softState(),
+			staleTimers: softTimers(softMs).length,
+			timers: softTimers(resetMs).length,
+			text: reset.content[0]?.text ?? "",
+		};
+		native.fireTimeout(resetMs);
+		await Promise.resolve();
+		const afterWake = { state: await softState(), wakes: softWakeTexts().length, timers: softTimers(resetMs).length };
+		soft = { atSpawn, afterReset, afterWake };
 	} else if (input.mode === "soft-restore") {
 		// A live task restored from a snapshot re-arms its soft reminder exactly
 		// once, and the restore must not double-arm it.
@@ -431,7 +448,7 @@ try {
 	// Soft scenarios already finalized bg-1 (or deliberately did not): the
 	// generic shutdown/finalize tail below would mutate wake counts, so those
 	// scenarios report their own `final` and skip the trailing kill.
-	if (input.mode === "soft-expiry" || input.mode === "soft-extend" || input.mode === "soft-terminal" || input.mode === "soft-restore" || input.mode === "soft-restore-notified") {
+	if (input.mode === "soft-expiry" || input.mode === "soft-extend" || input.mode === "soft-terminal" || input.mode === "soft-restore" || input.mode === "soft-restore-notified" || input.mode === "soft-review-reset") {
 		const softChild = native.children[0]!;
 		const softSpawn = native.spawns[0]!;
 		process.stdout.write(JSON.stringify({

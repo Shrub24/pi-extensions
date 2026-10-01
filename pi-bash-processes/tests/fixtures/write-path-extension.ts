@@ -125,7 +125,7 @@ const persistedTask = (id: string) => {
 const persistedProcIdent = (id: string) => persistedTask(id)?.procIdent ?? null;
 const persistedOutcome = (id: string) => {
 	const task = persistedTask(id);
-	return { status: task?.status, reason: task?.terminationReason, exitCode: task?.exitCode };
+	return { status: task?.status, reason: task?.terminationReason, exitCode: task?.exitCode, ready: task?.resultReady === true };
 };
 let result: unknown;
 try {
@@ -205,6 +205,8 @@ try {
 		await settle();
 		const heldAppends = native.heldAppends();
 		const widgetAtClose = widgetCounts();
+		// Process half closed, write still held: the retained result is not ready.
+		const readyAtClose = persistedTask("bg-1")?.resultReady === true;
 		let stopMessage: string | null = null;
 		let timeoutArmed: boolean | null = null;
 		let signals: unknown[];
@@ -232,7 +234,7 @@ try {
 			await settleUntil(() => logsAtWake.length > 0);
 		}
 		result = {
-			heldAppends, widgetBeforeClose, widgetAtClose, stopMessage, timeoutArmed, signals, childSignals: native.childSignals,
+			readyAtClose, heldAppends, widgetBeforeClose, widgetAtClose, stopMessage, timeoutArmed, signals, childSignals: native.childSignals,
 			outcome: persistedOutcome("bg-1"), logsAtWake, log: existsSync(logFile) ? readFileSync(logFile, "utf8") : null,
 		};
 	} else if (input.mode === "log-stall") {

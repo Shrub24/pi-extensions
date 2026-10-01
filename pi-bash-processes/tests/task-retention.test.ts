@@ -13,7 +13,9 @@ test("task logs follow the lane retention rule, and finished tasks are bounded a
 		logInLane: true,
 		laneCwd: true,
 		logsBeforeClear: MAX_FINISHED_TASKS,
-		newestLog: "(empty)",
+		// A retained log that was removed reads as an explicit expiry error, never
+		// as a successful empty result.
+		newestLog: "explicit-expiry-error",
 		logsAfterClear: 0,
 		longLog: { tail: true, head: false },
 		unloggedLog: "late-output",

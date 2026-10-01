@@ -22,6 +22,12 @@ export interface LifecycleHooks {
 	sendTaskEvent: (eventType: TaskEventType, task: ManagedTask) => boolean;
 	refreshUi: () => void;
 	clearTaskTimers: (task: ManagedTask) => void;
+	/**
+	 * Single idempotent completion-acknowledgment entry point (see
+	 * task-result.ts `acknowledgeCompletion`). Optional so a test hook can
+	 * observe the plain record-and-persist fallback.
+	 */
+	acknowledgeCompletion?: (task: ManagedTask) => unknown;
 }
 
 // Mirror the bash daemon's finalize contract:
@@ -93,12 +99,21 @@ export function closeTaskLifecycle(
 // A suppressed wake is still recorded as notified, otherwise the missed-exit
 // replay treats it as undelivered and resurrects it after a restart.
 //
+// The record-and-persist tail is the completion acknowledgment. Production
+// supplies `acknowledgeCompletion`, which is idempotent and also drops any
+// completion wake the extension still holds; the fallback keeps the
+// obligation recorded when a caller wires only the base hooks.
+//
 // Callers run closeTaskLifecycle first, which resolves task.terminationReason,
 // so the explicit reason reaches this check without being passed again.
 export function sendExitWakeLifecycle(task: ManagedTask, hooks: LifecycleHooks): void {
 	const agentAuthoredStop = task.stopReason === "user" && task.terminationReason === "extension-stop";
 	if (!agentAuthoredStop && !task.supersededBy) {
 		if (!hooks.sendTaskEvent("exit", task)) return;
+	}
+	if (hooks.acknowledgeCompletion) {
+		hooks.acknowledgeCompletion(task);
+		return;
 	}
 	task.exitNotified = true;
 	hooks.rememberSnapshot(task);
@@ -132,6 +147,12 @@ function resolveTerminationReason(
 // without an exit notification. Returns the number of tasks replayed.
 // selectMissedExits gates on (status != running, notifyOnExit, exitNotified === false)
 // so cross-session leaks are filtered upstream.
+//
+// Each replayed wake settles its obligation through the same idempotent
+// `acknowledgeCompletion` the live exit wake uses — a replayed wake and a
+// delivered one must not be able to disagree about what the record means. The
+// trailing batch persist is what keeps the hook-less fallback batched, and it
+// is idempotent for an acknowledgment that already persisted.
 export function replayMissedExitsLifecycle(
 	tasks: Iterable<ManagedTask>,
 	hooks: LifecycleHooks,
@@ -140,8 +161,11 @@ export function replayMissedExitsLifecycle(
 	for (const task of selectMissedExits(tasks)) {
 		const notified = hooks.sendTaskEvent("exit", task);
 		if (!notified) continue;
-		task.exitNotified = true;
-		hooks.rememberSnapshot(task);
+		if (hooks.acknowledgeCompletion) hooks.acknowledgeCompletion(task);
+		else {
+			task.exitNotified = true;
+			hooks.rememberSnapshot(task);
+		}
 		replayed += 1;
 	}
 	if (replayed > 0) hooks.persistSnapshots();

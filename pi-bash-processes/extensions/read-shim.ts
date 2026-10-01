@@ -1,6 +1,8 @@
 import { chmodSync, mkdirSync, readFileSync, truncateSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { PI_BG_CLIENT_FILE, piBgClientSource, piBgWrapperScript } from "./pi-bg.js";
+
 /**
  * Read shims for managed bash.
  *
@@ -50,44 +52,11 @@ exec "$real" "$@"
 `;
 }
 
-/** `pi-bg` helper: resolve a task's log path, or read it with or without consuming. */
-function piBgScript(): string {
-	return `#!/usr/bin/env bash
-# kendex managed-bash log helper.
-#   pi-bg path <task-id>        print the log file path (no consumption)
-#   pi-bg peek <task-id> [n]    print the last n lines (default 40), no consumption
-#   pi-bg read <task-id> [n]    print the last n lines and consume the exit wake
-set -euo pipefail
-usage() { echo "usage: pi-bg path|peek|read <task-id> [lines]" >&2; exit 2; }
-# pi-bg reads log files itself; it must not go through the read shims or its
-# own peek would count as a shim-reported read.
-real_tail() { PATH="\${PI_BG_REAL_PATH:-$PATH}" command -v tail; }
-cmd="\${1:-}"; [ -n "$cmd" ] || usage; shift
-id="\${1:-}"; [ -n "$id" ] || usage; shift || true
-lines="\${1:-40}"
-dir="\${PI_BG_LOG_DIR:?PI_BG_LOG_DIR not set}"
-file="$(ls -1t "$dir/$id"-*.log 2>/dev/null | head -n 1 || true)"
-if [ -z "$file" ]; then echo "pi-bg: no log for $id in $dir" >&2; exit 1; fi
-case "$cmd" in
-	path) printf '%s\\n' "$file" ;;
-	peek) printf '%s\\n' "$file"; "$("real_tail")" -n "$lines" "$file" ;;
-	read)
-		printf '%s\\n' "$file"
-		$("real_tail") -n "$lines" "$file"
-		if [ -n "\${PI_BG_CONSUME_LOG:-}" ]; then
-			printf '%s\\n' "$file" >>"$PI_BG_CONSUME_LOG"
-			echo "kendex: consumed the exit wake for $id — you will not be woken for it." >&2
-		fi
-		;;
-	*) usage ;;
-esac
-`;
-}
-
 /**
- * Writes the read wrappers and the helper once per task dir. Returns the shim
- * directory, or null where the platform has no POSIX shell to wrap (Windows
- * falls back to the previous behavior: no interception at all).
+ * Writes the read wrappers and the `pi-bg` CLI once per task dir. Returns the
+ * shim directory, or null where the platform has no POSIX shell to wrap
+ * (Windows falls back to the previous behavior: no interception at all, and no
+ * declared CLI — the Pi-tool operations keep their existing platform support).
  */
 export function installReadShims(dir: string): string | null {
 	if (process.platform === "win32") return null;
@@ -99,8 +68,14 @@ export function installReadShims(dir: string): string | null {
 			chmodSync(file, 0o700);
 		}
 		const helper = join(dir, "pi-bg");
-		writeFileSync(helper, piBgScript(), { mode: 0o700 });
+		writeFileSync(helper, piBgWrapperScript(), { mode: 0o700 });
 		chmodSync(helper, 0o700);
+		// The declared operations are answered by the session's socket, so the
+		// CLI needs a real program to speak it: a POSIX shell cannot open a Unix
+		// socket without an extra tool on the host.
+		const client = join(dir, PI_BG_CLIENT_FILE);
+		writeFileSync(client, piBgClientSource(), { mode: 0o700 });
+		chmodSync(client, 0o700);
 		return dir;
 	} catch {
 		return null;

@@ -105,9 +105,14 @@ const listedCount = Array.isArray(listedTasks) ? listedTasks.length : listedTask
 const newest = (await execute({ action: "log", id: `bg-${spawned}` })).details.task!;
 const laneDir = join(lanes, "retention-session");
 const logsBeforeClear = readdirSync(laneDir).filter((name) => name.endsWith(".log")).length;
-// A finished task's output is read from its log: with the log gone, nothing is left in memory.
+// A finished task's output is read from its log: with the log gone, the read
+// must report the expiry explicitly instead of succeeding with empty output.
 unlinkSync(newest.logFile as string);
 const newestLog = (await execute({ action: "log", id: newest.id })).content[0]!.text;
+// Normalized so the expectation does not embed a temp-directory path.
+const newestLogOutcome = /retained output is gone/.test(newestLog) && !/\(empty\)/.test(newestLog)
+	? "explicit-expiry-error"
+	: newestLog;
 await execute({ action: "clear" });
 const logsAfterClear = readdirSync(laneDir).filter((name) => name.endsWith(".log")).length;
 
@@ -159,7 +164,7 @@ process.stdout.write(JSON.stringify({
 	logInLane: (newest.logFile as string).startsWith(`${laneDir}/`),
 	laneCwd: existsSync(join(laneDir, ".lane-cwd")),
 	logsBeforeClear,
-	newestLog,
+	newestLog: newestLogOutcome,
 	logsAfterClear,
 	longLog: { tail: longLog.includes("TAIL-END"), head: longLog.includes("HEAD") },
 	unloggedLog,

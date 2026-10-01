@@ -8,6 +8,7 @@ import {
 	MANAGED_BASH_PI_ENV_KEYS,
 	normalizeManagedBashTimeoutSeconds,
 	settleForegroundWaiter,
+	structuredOutputFor,
 } from "../extensions/managed-bash.js";
 import { DEFAULT_FOREGROUND_YIELD_MS } from "../extensions/constants.js";
 
@@ -123,4 +124,46 @@ test("completion text is truthful, running text forbids polling", () => {
 	expect(running).toContain("end the turn");
 	expect(running).toContain("the exit wake arrives with an output tail");
 	expect(running).not.toMatch(/success|completed|exited/i);
+});
+
+// The structured result of a finished command must never claim more than the
+// caller can back: an exit code it does not have, or an output the task log
+// does not hold.
+test("structured output carries a real exit code and the log's own truncation", () => {
+	const log = "/tmp/bg-1.log";
+	const structured = structuredOutputFor(
+		{ logFile: log, outputBytes: 3, read: { output: "hi\n", truncated: false }, text: "hi\n" },
+		0,
+		1234,
+	);
+	expect(structured).toEqual({ output: "hi\n", truncated: false, exit_code: 0, wall_time_seconds: 1.2 });
+
+	// Truncated by the structured cap: the log holds the whole output, so it is
+	// named as such, as Pi's own bash does.
+	const capped = structuredOutputFor(
+		{ logFile: log, outputBytes: 4_000_000, read: { output: "head\n\n[... x bytes omitted ...]\n\ntail\n", truncated: true }, text: "tail\n" },
+		2,
+		500,
+	);
+	expect(capped.truncated).toBe(true);
+	expect(capped.full_output_path).toBe(log);
+	expect(capped.exit_code).toBe(2);
+});
+
+test("structured output without a trustworthy log read never claims completeness", () => {
+	const log = "/tmp/bg-2.log";
+	// The log writer reports the file unsettled (a failed or stalled last
+	// write), so the read is skipped: the bounded text is all there is, the
+	// dropped bytes make it truncated, and the log is not offered as the full
+	// output because it is missing them.
+	const partial = structuredOutputFor({ logFile: log, outputBytes: 900_000, read: null, text: "tail only\n" }, 0, 3000);
+	expect(partial.output).toBe("tail only\n");
+	expect(partial.truncated).toBe(true);
+	expect(partial.full_output_path).toBeUndefined();
+	expect(partial.exit_code).toBe(0);
+
+	// The same fallback with nothing dropped: complete, and still no
+	// `full_output_path`, which the schema only promises when truncated.
+	const whole = structuredOutputFor({ logFile: log, outputBytes: 10, read: null, text: "tail only\n" }, 7, 3000);
+	expect(whole).toEqual({ output: "tail only\n", truncated: false, exit_code: 7, wall_time_seconds: 3 });
 });
