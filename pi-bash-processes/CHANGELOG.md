@@ -4,8 +4,12 @@
 
 ### Unreleased
 
-- Publishes the managed-Bash interop marker so `@vanillagreen/pi-tool-renderer` leaves its execution override intact.
 - Every background task now gets a soft timeout (10 minutes by default; `defaultSoftTimeoutMs`, per-spawn `softTimeoutMs`, 0 disables). At soft expiry the process keeps running and the agent receives exactly one progress wake asking it to continue (optionally extend via `bg_task action: "extend"`, which starts a fresh window from now and never changes the hard timeout), inspect the log, or stop. The reminder is one-shot, persisted across restarts, re-armed for restored live tasks, and excluded from exit/output wake accounting — a later real exit still wakes normally.
+- Publishes the managed-Bash interop marker so `@vanillagreen/pi-tool-renderer` leaves its execution override intact.
+
+### 2.1.1
+
+- Session startup keeps fresh task logs when their working directory exists and its name ends in whitespace. Cleanup previously trimmed the name and could delete these files.
 
 ### 2.1.0
 
