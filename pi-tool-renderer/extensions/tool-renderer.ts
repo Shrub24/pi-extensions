@@ -64,5 +64,5 @@ export default async function toolRenderer(pi: ExtensionAPI): Promise<void> {
 	registerReadOnly(pi, agent, cwd, "grep");
 	registerReadOnly(pi, agent, cwd, "find");
 	registerReadOnly(pi, agent, cwd, "ls");
-	if (settingBoolean("registerBatchTool", true, cwd)) registerToolBatch(pi, agent, cwd);
+	if (settingBoolean("registerBatchTool", true, cwd)) registerToolBatch(pi, cwd);
 }

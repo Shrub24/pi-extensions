@@ -80,21 +80,14 @@ export function getBuiltInTool(agent: any, cwd: string, toolName: BuiltInToolNam
 }
 
 /**
- * The fields of the wrapped AgentTool that Pi's agent loop reads, which a
+ * Fields of the wrapped AgentTool that Pi's agent loop reads, which a
  * replacement definition carries unchanged. `description`, `parameters` and
  * `constrainedSampling` are the tool as declared to the model, the last being
  * Pi's schema-sampling choice, strict-prefer on read, bash, edit and write.
  * `prepareArguments` runs before arguments validate against `parameters`, so
  * without it the shapes Pi's own tool accepts fail before `execute` delegates.
- *
- * `outputSchema` arrived in Pi 0.99 and is not decoration: a tool that declares
- * it returns matching `structuredContent`, and codemode scripts receive THAT
- * instead of the text content — "Tools without `outputSchema` are passed to
- * scripts as their text content" (docs/extensions.md). Dropping it while
- * wrapping therefore changes what a script gets, silently: a wrapped `bash`
- * hands back a text blob where Pi's own returns `{stdout, stderr, exitCode}`.
- * Forwarded only when the wrapped tool declares one, so this file keeps
- * working against 0.87, where the field does not exist.
+ * `outputSchema` lets codemode read the unchanged result's `structuredContent`;
+ * on Pi below 0.99.0 the wrapped tool leaves it undefined.
  */
 function piToolContract(original: any) {
 	return {
@@ -102,7 +95,7 @@ function piToolContract(original: any) {
 		parameters: original.parameters,
 		constrainedSampling: original.constrainedSampling,
 		prepareArguments: original.prepareArguments,
-		...(original.outputSchema === undefined ? {} : { outputSchema: original.outputSchema }),
+		outputSchema: original.outputSchema,
 	};
 }
 

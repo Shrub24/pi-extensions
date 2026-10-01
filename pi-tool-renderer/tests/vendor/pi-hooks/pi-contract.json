@@ -1,0 +1,25 @@
+{
+  "uses": {
+
+    "extensions/dispatch.ts": {
+      "events": [],
+      "calls": ["@earendil-works/pi-coding-agent.formatSize", "@earendil-works/pi-coding-agent.truncateTail"]
+    },
+    "extensions/hooks.ts": {
+      "events": ["agent_before_settle", "agent_settled", "session_start", "tool_call", "tool_result", "turn_end"],
+      "calls": ["@earendil-works/pi-coding-agent.VERSION", "ctx.signal", "ctx.ui.notify", "pi.on", "pi.sendMessage"]
+    },
+    "extensions/lane-mail-wake.ts": {
+      "events": ["agent_settled", "session_shutdown", "session_start"],
+      "calls": ["ctx.isIdle", "ctx.ui.notify", "pi.on", "pi.sendMessage", "pi.sendUserMessage"]
+    },
+    "extensions/package-config.ts": {
+      "events": ["session_shutdown", "session_start"],
+      "calls": ["ctx.isProjectTrusted", "pi.events.on", "pi.on"]
+    },
+    "extensions/vocab.ts": {
+      "events": [],
+      "calls": ["ctx.getContextUsage", "ctx.sessionManager.getSessionFile", "ctx.sessionManager.getSessionId"]
+    }
+  }
+}
