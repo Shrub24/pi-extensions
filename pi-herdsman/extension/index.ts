@@ -39,12 +39,18 @@ import {
   watchFile,
   unwatchFile,
 } from "node:fs";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { homedir } from "node:os";
 import { setTimeout as delay } from "node:timers/promises";
 import { isDeepStrictEqual } from "node:util";
 import { fileURLToPath } from "node:url";
 import packageMetadata from "../package.json" with { type: "json" };
+import {
+  bindBackgroundWorkAssignment,
+  protectBackgroundWorkAssignment,
+  queryBackgroundWorkSnapshot,
+  subscribeBackgroundWorkChanges,
+} from "../../pi-bash-processes/extensions/background-work.ts";
 import {
   herdsmanTempRoot,
   resultPath as canonicalResultPath,
@@ -63,9 +69,12 @@ import {
 } from "@earendil-works/pi-tui";
 import {
   controlMarker,
+  MAILBOX_CONTROL_PREFIX,
+  LEGACY_MAILBOX_CONTROL_PREFIX,
   claimAgentMailbox,
   MailboxClaimOccupiedError,
   parseControlMarker,
+  parseControlMarkerVersion,
   readUnacknowledgedRequest,
   readRequest,
   readPendingAsk,
@@ -101,6 +110,7 @@ import {
   steerAcceptanceAllowed,
   taskAcceptanceAllowed,
   agentControlState,
+  snapshotTextFiles,
   isSpawnPlacement,
   type SpawnPlacement,
 } from "./core.ts";
@@ -124,6 +134,21 @@ import {
   writePrivatePromptSnapshots,
   type AgentDefinition,
 } from "./agent-definitions.ts";
+import {
+  BRIEF_PROFILES,
+  parseDelegationBrief,
+  type BriefProfile,
+  type DelegationBrief,
+} from "./briefs.ts";
+import {
+  createAcceptedAssignmentContract,
+  validateAcceptedAssignmentContract,
+  validateResponse,
+  ResponseValidationError,
+  type AcceptedAssignmentContract,
+  type AcceptedContextSnapshot,
+  type ResponseDiagnostic,
+} from "./response-validation.ts";
 import {
   captureStartupDiagnostic,
   closeHerdrPane,
@@ -269,7 +294,10 @@ import {
 import type { SupervisionContextStatus } from "./presentation.ts";
 
 const HERDSMAN_VERSION = packageMetadata.version;
-const RESERVED_PREFIX = "__PI_HERDSMAN_AGENT_V4__:";
+const RESERVED_PREFIXES = [
+  MAILBOX_CONTROL_PREFIX,
+  LEGACY_MAILBOX_CONTROL_PREFIX,
+] as const;
 const LEAD_INSTANCE_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 // Keep model-facing lead handles aligned with Pi's SessionManager grammar.
@@ -356,6 +384,8 @@ const ATTENTION_REPEAT_MIN_MS = 60_000;
 const ATTENTION_FIRST_REPEAT_MS = STALE_AFTER_MS / 2;
 const ACTIVITY_WRITE_MIN_MS = 5_000;
 const RESULT_WRITE_MAX_ATTEMPTS = 8;
+const MAX_RESPONSE_INLINE_BYTES = 1024 * 1024;
+const MAX_RESPONSE_ARTIFACT_BYTES = 1024 * 1024;
 const TOKEN_ESTIMATE_BYTES = 4;
 const TRANSCRIPT_MAX_BYTES = 16 * 1024;
 const TRANSCRIPT_TOOL_RESULT_MAX_BYTES = 4 * 1024;
@@ -382,11 +412,17 @@ const AGENT_EXECUTION_OWNERSHIP_GUIDANCE =
 const AGENT_HANDOFF_GUIDANCE =
   "Use agent_delegate to start a fresh bounded assignment from a definition; " +
   "use agent_continue to resume an exact historical managed-Agent Pi session " +
-  "with a new bounded assignment. Each live Agent generation exists for one " +
-  "assignment; after its terminal result is delivered, Herdsman cleans up that " +
-  "generation. Agent labels identify the current live generation; exact Pi " +
-  "sessions identify historical context and continuation. For new or updated " +
-  "assignments, `task`/`message` and `files` carry assignment evidence. Pass " +
+  "with a new bounded assignment. Every task and eligible interrupt replacement " +
+  "requires a complete versioned Markdown delegation brief in `task` or `message`; " +
+  "plain task sentences are rejected before assignment side effects. Include the " +
+  "definition's required role profile, explicit empty lists, scope, acceptance, " +
+  "and either required context inputs or an explicit no-context declaration. " +
+  "Brief context inputs are privately snapshotted at acceptance; the response " +
+  "contract is separate and may use the role default or an explicit brief override. " +
+  "Each live Agent generation exists for one assignment; after its terminal result " +
+  "is delivered, Herdsman cleans it up. Agent labels identify the current live " +
+  "generation; exact Pi sessions identify historical context and continuation. " +
+  "For new or updated assignments, `files` carries additional assignment evidence. Pass " +
   "every user-supplied or already-available artifact relevant to the target's " +
   "work through `files`; do not assume the caller's conversation or attachments " +
   "are inherited. `files` carries relevant assignment evidence, not runtime " +
@@ -403,8 +439,8 @@ const AGENT_HANDOFF_GUIDANCE =
   "selected definition does not already provide that skill.";
 const AGENT_UNRESOLVED_GUIDANCE =
   "Use agent_list when fresh Agent state or ownership is materially needed for a control or recovery decision, or to refresh the definition roster; do not use it for progress polling. " +
-  "Follow current available_tools and revalidation: agent_steer queues a cooperative correction for Pi to deliver after the current assistant turn and its tool calls reach a steering boundary; it does not preempt the current operation. agent_interrupt cancels the current operation and replaces its direction. " +
-  "Use agent_reply only to answer that Agent's exact pending ask_owner question. agent_close destructively closes an eligible Agent generation. agent_extend replaces one directly owned working Agent's next soft-deadline window and changes no assignment. agent_inspect provides bounded live terminal/process evidence; agent_transcript provides bounded persisted conversation/tool evidence. " +
+  "Follow current available_tools and revalidation: agent_steer queues a cooperative correction for Pi to deliver after the current assistant turn and its tool calls reach a steering boundary; it does not preempt the current operation. agent_interrupt cancels the current operation and replaces its direction, and is unavailable while the worker waits on background tasks. " +
+  "Use agent_reply only to answer that Agent's exact pending ask_owner question. agent_close destructively closes an eligible Agent generation. agent_extend replaces one directly owned unresolved Agent's next soft-deadline window and changes no assignment. agent_inspect provides bounded live terminal/process evidence; agent_transcript provides bounded persisted conversation/tool evidence. " +
   "When Agent work is unresolved, handle required control, then continue only necessary work you still own or end the turn without concluding; results or attention resume the session automatically. Do not poll with status requests, sleep, or other waiting mechanisms. " +
   "Stale health attention is diagnosis, not progress polling: use attached evidence first and, when absent or insufficient, perform at most one bounded diagnostic read before passive waiting. A repeated reminder for the same stale episode is additional recovery evidence: unchanged qualifying activity means the Agent has not crossed an execution boundary since the previous reminder. A steer queued during that unchanged episode cannot have taken effect yet. Do not repeat diagnostic reads solely because a reminder fired. Continue waiting only while existing evidence still positively supports a legitimate long-running operation; otherwise use agent_interrupt to stop the current operation and continue the same assignment. " +
   "A proven lost Agent remains unresolved; physical disappearance is not completion. Unknown or conflicting identity remains fail-closed. Do not take over or replace unresolved delegated work until the current generation is resolved or explicitly closed. Do not invent work merely to remain active.";
@@ -970,6 +1006,11 @@ function managedAgentEnvironmentError(): string | undefined {
     return "PI_HERDSMAN_MAILBOX does not match workspace/label";
   if (!e.PI_HERDSMAN_AGENT_DEFINITION?.trim())
     return "PI_HERDSMAN_AGENT_DEFINITION missing";
+  if (
+    e.PI_HERDSMAN_BRIEF_PROFILE !== undefined &&
+    !BRIEF_PROFILES.includes(e.PI_HERDSMAN_BRIEF_PROFILE as BriefProfile)
+  )
+    return "PI_HERDSMAN_BRIEF_PROFILE invalid";
   if (!e.HERDR_PANE_ID?.trim()) return "HERDR_PANE_ID missing";
   try {
     parseAllowedAgentDefinitions(e.PI_HERDSMAN_ALLOWED_AGENT_DEFINITIONS);
@@ -2497,7 +2538,7 @@ function envManagedAgent(ctx: ExtensionContext): ManagedAgentState | undefined {
   const e = process.env;
   if (managedAgentEnvironmentError()) return undefined;
   return {
-    version: 4,
+    version: 5,
     runId: e.PI_HERDSMAN_RUN_ID,
     ownerSessionId: e.PI_HERDSMAN_OWNER_SESSION_ID,
     workspaceId: e.PI_HERDSMAN_WORKSPACE_ID,
@@ -2506,6 +2547,9 @@ function envManagedAgent(ctx: ExtensionContext): ManagedAgentState | undefined {
     piSessionId: ctx.sessionManager.getSessionId(),
     piSessionFile: ctx.sessionManager.getSessionFile(),
     agentDefinition: e.PI_HERDSMAN_AGENT_DEFINITION,
+    ...(e.PI_HERDSMAN_BRIEF_PROFILE
+      ? { briefProfile: e.PI_HERDSMAN_BRIEF_PROFILE as BriefProfile }
+      : {}),
     cwd: ctx.cwd,
     updatedAt: Date.now(),
   };
@@ -2543,7 +2587,7 @@ function sameManagedAgentDurableState(
 }
 function runtimeIdentityState(runtime: Runtime): ManagedAgentState {
   return {
-    version: 4,
+    version: 5,
     runId: runtime.runId,
     ownerSessionId: runtime.ownerSessionId,
     workspaceId: runtime.workspaceId,
@@ -2566,13 +2610,14 @@ async function submit(
   createdAt = Date.now(),
   requestId = randomUUID(),
   operation = kind === "task" ? "delegate" : kind,
+  acceptedAssignment?: AcceptedAssignmentContract,
 ): Promise<string> {
   if (!text.trim())
     fail("invalid_request", "Message must not be empty", operation);
   if (kind === "reply" && !askId)
     fail("invalid_request", "Reply request is missing its ask ID", operation);
   const request: RequestRecord = {
-    version: 4,
+    version: 5,
     runId: runtime.runId,
     requestId,
     ownerSessionId: runtime.ownerSessionId,
@@ -2581,6 +2626,7 @@ async function submit(
     paneId: runtime.paneId,
     kind,
     ...(kind === "reply" ? { askId } : {}),
+    ...(acceptedAssignment ? { acceptedAssignment } : {}),
     text,
     createdAt,
   };
@@ -2855,6 +2901,7 @@ async function managedAgentSnapshots(
           !!state.pendingAskId,
           !!state.resultError,
           delivered,
+          !!state.backgroundWaiting,
         )
       : "unknown";
     const pendingDirectChildWork = hasPendingDirectChildWork(state, mailboxes);
@@ -2877,7 +2924,9 @@ async function managedAgentSnapshots(
     const steerable =
       presence.kind === "live" &&
       !state.pendingAskId &&
-      (projectedState === "working" || waitingForChildren);
+      (projectedState === "working" ||
+        projectedState === "waiting" ||
+        waitingForChildren);
     const now = Date.now();
     const listed = {
       label: state.agentLabel,
@@ -3232,7 +3281,11 @@ function listedAgentRecord(
       actions.push("inspect");
       if (transcriptAvailable) actions.push("transcript");
       if (listed.steerable === true) actions.push("steer");
-      if (listed.state === "working" && !state.pendingAskId)
+      if (
+        listed.state === "working" &&
+        !state.pendingAskId &&
+        !state.backgroundWaiting
+      )
         actions.push("interrupt");
       // An armed soft window is the only prerequisite: `agent_extend` changes
       // nothing else, so a resolved or windowless record must not offer it.
@@ -3632,10 +3685,21 @@ async function deliverResultUnsafe(
       result.completedAt >= runtime.startedAt
         ? result.completedAt - runtime.startedAt
         : undefined;
+    const validationDiagnostics = result.responseValidation?.diagnostics;
+    const failureText = [
+      result.error?.message ?? "Agent failed",
+      ...(validationDiagnostics?.length
+        ? [
+            "Validation diagnostics:",
+            ...validationDiagnostics.map(
+              (diagnostic) =>
+                `- ${diagnostic.field}${diagnostic.path ? ` (${diagnostic.path})` : ""}: ${diagnostic.message}`,
+            ),
+          ]
+        : []),
+    ].join("\n");
     const completion = truncateModelText(
-      result.status === "completed"
-        ? result.text!
-        : (result.error?.message ?? "Agent failed"),
+      result.status === "completed" ? result.text! : failureText,
       {
         keep: "head",
         sessionId: runtime.piSessionId ?? runtime.runId,
@@ -3652,6 +3716,7 @@ async function deliverResultUnsafe(
                   ...(runtime.piSessionId !== undefined
                     ? { piSessionId: runtime.piSessionId }
                     : {}),
+                  responseValidation: result.responseValidation,
                 })}`,
                 result.text!,
               ].join("\n\n"),
@@ -3756,6 +3821,7 @@ async function deliverResultUnsafe(
               }
             : {}),
           error: result.error,
+          responseValidation: result.responseValidation,
         },
       },
       { triggerTurn: true, deliverAs: "steer" },
@@ -3867,6 +3933,27 @@ async function finalizeDeliveredRoot(
     )
       throw new Error("Managed agent changed during result cleanup");
     removeResult(mailbox, requestId);
+    if (current.legacyAcceptedRequestIds?.includes(requestId)) {
+      try {
+        const legacyAcceptedRequestIds =
+          current.legacyAcceptedRequestIds.filter((id) => id !== requestId);
+        writeAgentState(mailbox, {
+          ...current,
+          legacyAcceptedRequestIds:
+            legacyAcceptedRequestIds.length > 0
+              ? legacyAcceptedRequestIds
+              : undefined,
+          updatedAt: Date.now(),
+        });
+      } catch (error) {
+        appendDurableError(
+          pi,
+          ctx,
+          "pi_herdsman_state_error",
+          `could not clear delivered V4 assignment identity: ${String(error).slice(0, 256)}`,
+        );
+      }
+    }
     if (retain) {
       const runtime = runtimes.get(state.agentLabel);
       if (
@@ -4505,6 +4592,7 @@ async function resolveRuntime(
 ): Promise<{
   runtime: Runtime;
   agent: any;
+  state: ManagedAgentState;
   controlState: import("./core.ts").AgentControlState;
 }> {
   const snapshot = await managedAgentSnapshots(pi, ctx, signal);
@@ -4589,7 +4677,7 @@ async function resolveRuntime(
   runtimes.set(runtime.label, runtime);
   validateIdentity(runtime, state, agent);
   await validateIntegration(pi, runtime, ctx, { signal });
-  return { runtime, agent, controlState: agent.state };
+  return { runtime, agent, state, controlState: agent.state };
 }
 function runtimeForListedAgent(
   agent: any,
@@ -5574,6 +5662,109 @@ async function rollbackUnknownStartedAgent(
     );
   removeMailboxAfterRollback(mailbox);
 }
+function validateAcceptedContextSnapshots(
+  accepted: AcceptedAssignmentContract,
+): void {
+  if (accepted.contextSnapshots.length === 0) return;
+  const promptRoot = realpathSync(resolve(herdsmanTempRoot(), "prompts"));
+  if ((statSync(promptRoot).mode & 0o077) !== 0)
+    throw new Error("accepted context snapshot directory permissions changed");
+  for (const [index, snapshot] of accepted.contextSnapshots.entries()) {
+    const path = realpathSync(snapshot.snapshotPath);
+    const withinRoot = relative(promptRoot, path);
+    if (!withinRoot || withinRoot.startsWith("..") || isAbsolute(withinRoot))
+      throw new Error(`accepted context snapshot ${index} is outside private storage`);
+    const info = statSync(path);
+    if (!info.isFile() || (info.mode & 0o077) !== 0)
+      throw new Error(`accepted context snapshot ${index} is not a private regular file`);
+    const text = readFileSync(path, "utf8");
+    if (
+      Buffer.byteLength(text, "utf8") !== snapshot.bytes ||
+      createHash("sha256").update(text, "utf8").digest("hex") !== snapshot.sha256
+    )
+      throw new Error(`accepted context snapshot ${index} changed after acceptance`);
+  }
+}
+
+function formatAcceptedAssignmentPrompt(
+  accepted: AcceptedAssignmentContract,
+): string {
+  const { brief, responseContract } = accepted;
+  return [
+    "Framework-validated assignment. Follow this brief and the separate response contract.",
+    "",
+    "## Objective",
+    brief.objective,
+    "",
+    "## Context",
+    brief.context.summary,
+    ...(accepted.contextSnapshots.length
+      ? [
+          "",
+          "Context snapshots attached:",
+          ...accepted.contextSnapshots.map(
+            (snapshot) => `- ${snapshot.reference}: ${snapshot.purpose}`,
+          ),
+        ]
+      : []),
+    "",
+    "## Scope",
+    "Allowed:",
+    ...brief.scope.allowed.map((item) => `- ${item}`),
+    "Excluded:",
+    ...brief.scope.excluded.map((item) => `- ${item}`),
+    "",
+    "## Constraints",
+    ...brief.constraints.map((item) => `- ${item}`),
+    "",
+    "## Acceptance criteria",
+    ...brief.acceptance.map((item) => `- ${item}`),
+    ...(brief.investigation
+      ? [
+          "",
+          "## Investigation",
+          "Questions:",
+          ...brief.investigation.questions.map((question) => `- ${question}`),
+          "Target locations:",
+          ...brief.investigation.targetLocations.map((location) => `- ${location}`),
+        ]
+      : []),
+    ...(brief.research
+      ? [
+          "",
+          "## Research",
+          "Questions:",
+          ...brief.research.questions.map((question) => `- ${question}`),
+          "Source constraints:",
+          ...brief.research.sourceConstraints.map((constraint) => `- ${constraint}`),
+        ]
+      : []),
+    ...(brief.execution
+      ? [
+          "",
+          "## Execution",
+          `Affected area: ${brief.execution.affectedArea}`,
+          "Validation expectations:",
+          ...brief.execution.validationExpectations.map((expectation) => `- ${expectation}`),
+        ]
+      : []),
+    ...(brief.review
+      ? [
+          "",
+          "## Review",
+          `Baseline: ${brief.review.baseline}`,
+          "Criteria:",
+          ...brief.review.criteria.map((criterion) => `- ${criterion}`),
+        ]
+      : []),
+    ...(brief.body ? ["", "## Additional task detail", brief.body] : []),
+    "",
+    "## Response contract",
+    JSON.stringify(responseContract, null, 2),
+    "The framework validates this response contract before publishing success.",
+  ].join("\n");
+}
+
 function requestRecordBytesFor(
   runtime: Runtime,
   kind: "task" | "steer" | "interrupt" | "reply",
@@ -5581,9 +5772,10 @@ function requestRecordBytesFor(
   askId: string | undefined,
   createdAt: number,
   requestId: string,
+  acceptedAssignment?: AcceptedAssignmentContract,
 ): number {
   return mailboxRecordBytes({
-    version: 4,
+    version: 5,
     runId: runtime.runId,
     requestId,
     ownerSessionId: runtime.ownerSessionId,
@@ -5592,6 +5784,7 @@ function requestRecordBytesFor(
     paneId: runtime.paneId,
     kind,
     ...(kind === "reply" ? { askId } : {}),
+    ...(acceptedAssignment ? { acceptedAssignment } : {}),
     text,
     createdAt,
   });
@@ -5606,11 +5799,12 @@ function prospectiveAssignmentFits(
   paneId: string,
   createdAt: number,
   requestId: string,
+  acceptedAssignment: AcceptedAssignmentContract,
   mailboxLimitBytes: number,
 ): boolean {
   return (
     mailboxRecordBytes({
-      version: 4,
+      version: 5,
       runId,
       requestId,
       ownerSessionId,
@@ -5618,6 +5812,7 @@ function prospectiveAssignmentFits(
       agentLabel: label,
       paneId,
       kind: "task",
+      acceptedAssignment,
       text,
       createdAt,
     }) <= mailboxLimitBytes
@@ -5631,7 +5826,7 @@ function askRecordBytesFor(
   createdAt: number,
 ): number {
   return mailboxRecordBytes({
-    version: 4,
+    version: 5,
     askId,
     requestId: state.activeRequestId!,
     runId: state.runId,
@@ -5850,6 +6045,56 @@ async function actionUnsafe(
     };
   }
   const limits = await messageLimits(ctx);
+  const acceptBrief = (
+    brief: DelegationBrief,
+    requestId: string,
+    roleInputs: ReturnType<typeof resolveAgentLaunchInputs>,
+    workCwd: string,
+    operation: string,
+  ): { accepted: AcceptedAssignmentContract; contextPaths: string[] } => {
+    const files = snapshotTextFiles(
+      brief.context.inputs.map((input) => input.reference),
+      ctx.cwd,
+      operation,
+      { maxBytes: limits.mailbox.bytes },
+    );
+    const descriptors: AcceptedContextSnapshot[] = files.map((file, index) => ({
+      reference: brief.context.inputs[index]!.reference,
+      purpose: brief.context.inputs[index]!.purpose,
+      snapshotPath: `pending-context-${index}`,
+      bytes: file.bytes,
+      sha256: createHash("sha256").update(file.text, "utf8").digest("hex"),
+    }));
+    let provisional: AcceptedAssignmentContract;
+    try {
+      provisional = createAcceptedAssignmentContract(
+        requestId,
+        brief,
+        roleInputs.responseContract,
+        workCwd,
+        MAX_RESPONSE_ARTIFACT_BYTES,
+        descriptors,
+      );
+    } catch (error) {
+      fail(
+        "invalid_request",
+        error instanceof Error ? error.message : String(error),
+        operation,
+      );
+    }
+    const contextPaths = writePrivatePromptSnapshots(
+      files.map((file) => file.text),
+    );
+    const accepted = Object.freeze({
+      ...provisional,
+      contextSnapshots: Object.freeze(
+        provisional.contextSnapshots.map((snapshot, index) =>
+          Object.freeze({ ...snapshot, snapshotPath: contextPaths[index]! }),
+        ),
+      ),
+    });
+    return { accepted, contextPaths };
+  };
   const assignment =
     p.action === "delegate" || p.action === "continue"
       ? {
@@ -5861,6 +6106,8 @@ async function actionUnsafe(
         }
       : undefined;
   let assignmentInput: ReturnType<typeof prepareMessageInput> | undefined;
+  let acceptedAssignment: AcceptedAssignmentContract | undefined;
+  let assignmentFileCount = 0;
   if (p.action === "delegate" || p.action === "continue") {
     if (!scope)
       fail(
@@ -5887,6 +6134,22 @@ async function actionUnsafe(
         `Agent definition ${agentDefinition} was not found`,
         p.action,
       );
+    const acceptedTaskText = p.task;
+    const roleLaunchInputs = resolveAgentLaunchInputs(definition, {
+      cwd: agentCwd,
+    });
+    let brief: DelegationBrief;
+    try {
+      brief = parseDelegationBrief(acceptedTaskText, {
+        minimumProfile: roleLaunchInputs.briefProfile,
+      });
+    } catch (error) {
+      fail(
+        "invalid_request",
+        error instanceof Error ? error.message : String(error),
+        p.action,
+      );
+    }
     if (
       scope.kind === "managed-agent" &&
       !scope.allowedAgentDefinitions.has(agentDefinition)
@@ -5896,6 +6159,7 @@ async function actionUnsafe(
         `Agent definition ${agentDefinition} is not allowed for this delegating agent`,
         p.action,
       );
+    p.task = "Use the validated assignment brief and attached context snapshots.";
     if (definition.projectSource && !sameCwd(agentCwd, ctx.cwd))
       fail(
         "invalid_request",
@@ -6048,6 +6312,8 @@ async function actionUnsafe(
         p.action,
       );
     const workspaceId = assignment!.workspaceId;
+    const explicitMessageFiles = resolveMessageFiles(ctx, p.files, p.action);
+    assignmentFileCount = explicitMessageFiles.length;
     let label = requestedLabel ?? chooseLabel(agentDefinition, labels);
     if (!validAgentLabel(label))
       fail(
@@ -6055,9 +6321,19 @@ async function actionUnsafe(
         'Agent label must start with a lowercase letter, contain only lowercase letters, digits, "_" or "-", and be at most 32 characters',
         p.action,
       );
+    const acceptedBrief = acceptBrief(
+      brief,
+      assignment!.requestId,
+      roleLaunchInputs,
+      agentCwd,
+      p.action,
+    );
+    acceptedAssignment = acceptedBrief.accepted;
+    const contextPaths = acceptedBrief.contextPaths;
+    p.files = [...explicitMessageFiles, ...contextPaths];
     const prepareAssignmentInput = (assignmentLabel: string) =>
       prepareMessageInput(
-        p.task,
+        formatAcceptedAssignmentPrompt(acceptedAssignment!),
         resolveMessageFiles(ctx, p.files, p.action),
         ctx.cwd,
         p.action,
@@ -6074,6 +6350,7 @@ async function actionUnsafe(
               "",
               assignment!.createdAt,
               assignment!.requestId,
+              acceptedAssignment!,
               limits.mailbox.bytes,
             ),
         },
@@ -6100,6 +6377,7 @@ async function actionUnsafe(
         assignment!.createdAt,
         assignment!.requestId,
         p.action,
+        acceptedAssignment,
       );
       requestStatusRefresh?.();
       return {
@@ -6117,7 +6395,7 @@ async function actionUnsafe(
     }
     const preparedBody = expandAgentBodyFiles(
       definition.body,
-      assignmentInput.canonicalPaths,
+      assignmentInput.canonicalPaths.slice(0, assignmentFileCount),
       p.action,
     );
     const preparedDefinition =
@@ -6230,7 +6508,7 @@ async function actionUnsafe(
     const pendingStart: PendingStart = {
       label,
       definition: agentDefinition,
-      ...(p.task !== undefined ? { task: p.task } : {}),
+      ...(acceptedTaskText !== undefined ? { task: acceptedTaskText } : {}),
       startedAt: Date.now(),
       ...(scope.kind === "managed-agent" && process.env.PI_HERDSMAN_LABEL
         ? { parentLabel: process.env.PI_HERDSMAN_LABEL }
@@ -6267,6 +6545,7 @@ async function actionUnsafe(
         `PI_HERDSMAN_LABEL=${label}`,
         `PI_HERDSMAN_WORKSPACE_ID=${workspaceId}`,
         `PI_HERDSMAN_AGENT_DEFINITION=${agentDefinition}`,
+        `PI_HERDSMAN_BRIEF_PROFILE=${roleLaunchInputs.briefProfile}`,
         `PI_HERDSMAN_ALLOWED_AGENT_DEFINITIONS=${JSON.stringify(
           delegationEnabled ? effectiveDefinition.frontmatter.agents : [],
         )}`,
@@ -6450,7 +6729,7 @@ async function actionUnsafe(
       // Herdr chooses the pane only while starting. Re-render now that the
       // authoritative final envelope identity is known.
       assignmentInput = prepareMessageInput(
-        p.task,
+        formatAcceptedAssignmentPrompt(acceptedAssignment!),
         resolveMessageFiles(ctx, p.files, p.action),
         ctx.cwd,
         p.action,
@@ -6466,6 +6745,7 @@ async function actionUnsafe(
               undefined,
               assignment!.createdAt,
               assignment!.requestId,
+              acceptedAssignment,
             ),
         },
       );
@@ -6486,6 +6766,7 @@ async function actionUnsafe(
         assignment!.createdAt,
         assignment!.requestId,
         p.action,
+        acceptedAssignment,
       );
       pendingStart.requestId = requestId;
       accepted = true;
@@ -6751,6 +7032,16 @@ async function actionUnsafe(
     );
   if (p.action === "steer" && !runtime.activeRequestId)
     fail("agent_busy", "Agent has no active assignment", "steer");
+  if (p.action === "interrupt" && resolved.state.backgroundWaiting)
+    fail(
+      "agent_busy",
+      "Agent is waiting on background work; use cooperative steering instead",
+      "interrupt",
+      {
+        nextAction:
+          "Use agent_steer for cooperative changes while background work is unresolved.",
+      },
+    );
   if (p.action === "interrupt" && resolved.controlState !== "working")
     fail(
       "agent_busy",
@@ -6846,9 +7137,47 @@ async function actionUnsafe(
   const requestCreatedAt = Date.now();
   const controlRequestId = randomUUID();
   const controlAction = p.action;
+  let controlFiles = resolveMessageFiles(ctx, p.files, controlAction);
+  if (controlAction === "interrupt") {
+    let roleLaunchInputs: ReturnType<typeof resolveAgentLaunchInputs>;
+    try {
+      roleLaunchInputs = resolveAgentLaunchInputs(
+        discoverAgent(runtime.agentDefinition, { projectRoot: ctx.cwd }),
+        { cwd: runtime.cwd },
+      );
+    } catch (error) {
+      fail(
+        "invalid_request",
+        `Agent definition ${runtime.agentDefinition} cannot be resolved: ${error instanceof Error ? error.message : String(error)}`,
+        controlAction,
+      );
+    }
+    let controlBrief: DelegationBrief;
+    try {
+      controlBrief = parseDelegationBrief(p.message, {
+        minimumProfile: roleLaunchInputs.briefProfile,
+      });
+    } catch (error) {
+      fail(
+        "invalid_request",
+        error instanceof Error ? error.message : String(error),
+        controlAction,
+      );
+    }
+    const acceptedBrief = acceptBrief(
+      controlBrief,
+      runtime.activeRequestId!,
+      roleLaunchInputs,
+      runtime.cwd,
+      controlAction,
+    );
+    acceptedAssignment = acceptedBrief.accepted;
+    p.message = formatAcceptedAssignmentPrompt(acceptedAssignment!);
+    controlFiles = [...controlFiles, ...acceptedBrief.contextPaths];
+  }
   const messageInput = prepareMessageInput(
     p.message,
-    resolveMessageFiles(ctx, p.files, controlAction),
+    controlFiles,
     ctx.cwd,
     controlAction,
     controlAction === "interrupt" ? "Interrupt" : "Steer",
@@ -6863,6 +7192,7 @@ async function actionUnsafe(
           undefined,
           requestCreatedAt,
           controlRequestId,
+          acceptedAssignment,
         ),
     },
   );
@@ -6877,6 +7207,7 @@ async function actionUnsafe(
     requestCreatedAt,
     controlRequestId,
     controlAction,
+    acceptedAssignment,
   );
   return {
     ok: true,
@@ -7249,7 +7580,7 @@ export default function (pi: ExtensionAPI): void {
               pattern: "\\S",
             }),
       task: Type.String({
-        description: "Non-empty assignment.",
+        description: "Complete versioned Markdown delegation brief; plain task sentences are rejected.",
         pattern: "\\S",
       }),
       label: Type.Optional(
@@ -7270,7 +7601,7 @@ export default function (pi: ExtensionAPI): void {
         pattern: "\\S",
       }),
       task: Type.String({
-        description: "Non-empty assignment.",
+        description: "Complete versioned Markdown delegation brief; plain task sentences are rejected.",
         pattern: "\\S",
       }),
       files: FILES_SCHEMA,
@@ -7280,7 +7611,11 @@ export default function (pi: ExtensionAPI): void {
   const agentMessageParameters = Type.Object(
     {
       agent: Type.String({ pattern: AGENT_LABEL_PATTERN.source }),
-      message: Type.String({ pattern: "\\S" }),
+      message: Type.String({
+        description:
+          "Free-form steering/reply text; agent_interrupt requires a fresh versioned Markdown delegation brief.",
+        pattern: "\\S",
+      }),
       files: FILES_SCHEMA,
     },
     { additionalProperties: false },
@@ -9777,8 +10112,10 @@ export default function (pi: ExtensionAPI): void {
             : {}),
           agentCounts: {
             active:
-              ownedAgents.filter(({ listed }) => listed.state === "working")
-                .length +
+              ownedAgents.filter(
+                ({ listed }) =>
+                  listed.state === "working" || listed.state === "waiting",
+              ).length +
               leads.reduce((n, lead) => n + lead.agentCounts.active, 0),
             blocked:
               ownedAgents.filter(({ listed }) => listed.state === "blocked")
@@ -11379,6 +11716,7 @@ export default function (pi: ExtensionAPI): void {
         const resolved =
           pending.requestId !== undefined &&
           (agent?.state === "working" ||
+            agent?.state === "waiting" ||
             agent?.state === "blocked" ||
             (runtime?.activeRequestId === pending.requestId &&
               agent !== undefined &&
@@ -14118,7 +14456,9 @@ export default function (pi: ExtensionAPI): void {
         // same lifecycle the owner sees.
         if (
           agent.presence.kind !== "live" ||
-          (agent.listed.state !== "working" && agent.listed.state !== "blocked")
+          (agent.listed.state !== "working" &&
+            agent.listed.state !== "waiting" &&
+            agent.listed.state !== "blocked")
         )
           continue;
         const requestId = state.activeRequestId;
@@ -14854,7 +15194,7 @@ export default function (pi: ExtensionAPI): void {
       name: "agent_delegate",
       label: "agent delegate",
       description:
-        "Start one fresh bounded assignment from an Agent definition.",
+        "Start one fresh bounded assignment from an Agent definition. `task` must be a complete delegation-brief/v1 Markdown document; plain task sentences are rejected.",
       parameters: agentDelegateParameters,
       promptSnippet: undefined,
       promptGuidelines: undefined,
@@ -14882,7 +15222,7 @@ export default function (pi: ExtensionAPI): void {
       name: "agent_continue",
       label: "agent continue",
       description:
-        "Start one bounded assignment from an exact historical managed-Agent Pi session.",
+        "Start one bounded assignment from an exact historical managed-Agent Pi session. `task` must be a fresh, role-valid delegation-brief/v1 Markdown document.",
       parameters: agentContinueParameters,
       promptSnippet: undefined,
       promptGuidelines: undefined,
@@ -14938,7 +15278,7 @@ export default function (pi: ExtensionAPI): void {
       name: "agent_interrupt",
       label: "agent interrupt",
       description:
-        "Cancel a live Agent's current Pi operation and continue the same assignment with replacement direction.",
+        "Cancel a live Agent's current Pi operation and continue the same assignment with a fresh delegation-brief/v1 Markdown replacement in `message`.",
       parameters: agentMessageParameters,
       promptSnippet: undefined,
       promptGuidelines: undefined,
@@ -15161,11 +15501,13 @@ export default function (pi: ExtensionAPI): void {
   let retryTimer: ReturnType<typeof setInterval> | undefined;
   let stateRetryTimer: ReturnType<typeof setInterval> | undefined;
   let requestPumpTimer: ReturnType<typeof setInterval> | undefined;
+  let backgroundWorkChangeUnsubscribe: (() => void) | undefined;
   let requestPumpErrorReported = false;
   let acknowledgementErrorReported = false;
   let pendingStateTransition = false;
   let stateErrorReported = false;
   let resultErrorReported = false;
+  let settlementHoldReported = false;
   let agentContext: ExtensionContext | undefined;
   let agentStartedAt: number | undefined;
   const delegationEnabled = allowedAgentDefinitions.length > 0;
@@ -15303,10 +15645,12 @@ export default function (pi: ExtensionAPI): void {
     accepted: boolean,
     code?: "busy" | "idle" | "invalid" | "identity" | "delivery",
     message?: string,
+    assignmentPatch?: { acceptedAssignment?: AcceptedAssignmentContract },
   ): boolean => {
     if (!state) return false;
     const candidate = mutateAgentState((current) => ({
       ...current,
+      ...assignmentPatch,
       lastAck: {
         requestId,
         accepted,
@@ -15369,7 +15713,7 @@ export default function (pi: ExtensionAPI): void {
         acknowledgementErrorReported = false;
         return;
       }
-      pi.sendUserMessage(controlMarker(request.requestId), {
+      pi.sendUserMessage(controlMarker(request.requestId, request.version), {
         deliverAs: "steer",
       });
     } catch (error) {
@@ -15450,7 +15794,7 @@ export default function (pi: ExtensionAPI): void {
       const askCreatedAt = Date.now();
       const limits = await messageLimits(ctx);
       const ask: AskRecord = {
-        version: 4,
+        version: 5,
         askId,
         requestId: state.activeRequestId,
         runId: state.runId,
@@ -15561,9 +15905,11 @@ export default function (pi: ExtensionAPI): void {
   });
   pi.on("session_before_switch", () => ({ cancel: true }));
   pi.on("session_before_fork", () => ({ cancel: true }));
+  pi.on("session_shutdown", () => stopBackgroundWorkChangeSubscription());
   pi.on("session_start", async (_e: unknown, ctx: ExtensionContext) => {
     preparePaneMetadata(ctx);
     resetRequestPump();
+    stopBackgroundWorkChangeSubscription();
     resetLeafStatus();
     ownTools = undefined;
     if (delegationEnabled) clearAgentRuntimes();
@@ -15593,6 +15939,8 @@ export default function (pi: ExtensionAPI): void {
       state = candidate;
       if (existing && sameManagedAgentIdentity(existing, candidate)) {
         state = { ...candidate, ...existing, updatedAt: Date.now() };
+        if (state.activeRequestId && state.acceptedAssignment)
+          validateAcceptedContextSnapshots(state.acceptedAssignment);
         forceActivityTouch = !!state.activeRequestId;
         if (state.activeRequestId && !state.pendingAskId) {
           try {
@@ -15612,6 +15960,7 @@ export default function (pi: ExtensionAPI): void {
               state = {
                 ...state,
                 activeRequestId: undefined,
+                acceptedAssignment: undefined,
                 completedRequestId: result.requestId,
                 lastActivityAt: undefined,
                 updatedAt: Date.now(),
@@ -15683,6 +16032,7 @@ export default function (pi: ExtensionAPI): void {
       if (delegationEnabled)
         startAgentHealthScanner?.(ctx, metadataAbortController.signal);
       initialized = true;
+      watchBackgroundWorkChanges(ctx);
       pumpRequest(ctx);
       requestPumpTimer = setInterval(() => pumpRequest(ctx), 250);
       requestPumpTimer.unref?.();
@@ -15746,10 +16096,14 @@ export default function (pi: ExtensionAPI): void {
   });
   pi.on("input", (event: any, ctx: ExtensionContext) => {
     const text = event.text;
-    if (typeof text !== "string" || !text.startsWith(RESERVED_PREFIX))
+    if (
+      typeof text !== "string" ||
+      !RESERVED_PREFIXES.some((prefix) => text.startsWith(prefix))
+    )
       return { action: "continue" };
-    const id = parseControlMarker(text);
-    if (!id) return { action: "handled" };
+    const marker = parseControlMarkerVersion(text);
+    if (!marker) return { action: "handled" };
+    const id = marker.requestId;
     let request: RequestRecord | undefined;
     try {
       request = readRequest(process.env.PI_HERDSMAN_MAILBOX!, id);
@@ -15766,10 +16120,39 @@ export default function (pi: ExtensionAPI): void {
     if (!request) {
       return { action: "handled" };
     }
+    if (marker.version !== request.version) {
+      acknowledgeAndDiscard(
+        id,
+        false,
+        ctx,
+        "invalid",
+        "Control marker version did not match the request record",
+      );
+      return { action: "handled" };
+    }
     if (!initialized || !state) {
       return { action: "handled" };
     }
     if (state.lastAck?.requestId === id) return { action: "handled" };
+    if (request.version === 4) {
+      const legacyActive =
+        !!state.activeRequestId &&
+        !!state.legacyAcceptedRequestIds?.includes(state.activeRequestId);
+      const permitted =
+        legacyActive &&
+        (request.kind !== "task" ||
+          request.requestId === state.activeRequestId);
+      if (!permitted) {
+        acknowledgeAndDiscard(
+          id,
+          false,
+          ctx,
+          "invalid",
+          "V4 request is not part of the migrated active assignment",
+        );
+        return { action: "handled" };
+      }
+    }
     if (
       request.runId !== state.runId ||
       request.ownerSessionId !== state.ownerSessionId ||
@@ -15785,6 +16168,37 @@ export default function (pi: ExtensionAPI): void {
         "Request identity did not match agent state",
       );
       return { action: "handled" };
+    }
+    let acceptedRequestAssignment: AcceptedAssignmentContract | undefined;
+    if (
+      request.version === 5 &&
+      (request.kind === "task" || request.kind === "interrupt")
+    ) {
+      try {
+        const assignmentRequestId =
+          request.kind === "task"
+            ? request.requestId
+            : (state.activeRequestId ?? state.completedRequestId);
+        if (!state.briefProfile || !assignmentRequestId)
+          throw new Error("worker state has no active briefing profile");
+        acceptedRequestAssignment = validateAcceptedAssignmentContract(
+          request.acceptedAssignment,
+          {
+            requestId: assignmentRequestId,
+            minimumProfile: state.briefProfile,
+          },
+        );
+        validateAcceptedContextSnapshots(acceptedRequestAssignment);
+      } catch (error) {
+        acknowledgeAndDiscard(
+          id,
+          false,
+          ctx,
+          "invalid",
+          `Accepted assignment validation failed: ${String(error).slice(0, 240)}`,
+        );
+        return { action: "handled" };
+      }
     }
     if (request.kind === "reply") {
       let ask: AskRecord | undefined;
@@ -15935,6 +16349,16 @@ export default function (pi: ExtensionAPI): void {
       );
       return { action: "handled" };
     }
+    if (request.kind === "interrupt" && state.backgroundWaiting) {
+      acknowledgeAndDiscard(
+        id,
+        false,
+        ctx,
+        "busy",
+        "Agent is waiting on background work; use cooperative steering instead",
+      );
+      return { action: "handled" };
+    }
     const isIdle = ctx.isIdle();
     if (
       request.kind === "interrupt" &&
@@ -15955,7 +16379,10 @@ export default function (pi: ExtensionAPI): void {
         isIdle,
         state.activeRequestId,
         pendingStateTransition,
-        isIdle && hasPendingDirectChildWork(state),
+        // A worker held for background work is idle by design; the owner's
+        // cooperative steer is how it is told to retrieve or stop its tasks.
+        isIdle &&
+          (hasPendingDirectChildWork(state) || !!state.backgroundWaiting),
       )
     ) {
       acknowledgeAndDiscard(
@@ -15968,9 +16395,81 @@ export default function (pi: ExtensionAPI): void {
       return { action: "handled" };
     }
     if (request.kind === "task") {
+      // Bind the accepted assignment to the background-work provider before
+      // any task can spawn (openspec herdsman-background-handoffs D1), and
+      // protect it so terminal wakes stay mandatory even under
+      // notifyOnExit: false (task 2.4). No live provider is the normal
+      // no-provider lifecycle; a refusal or provider error keeps unresolved
+      // work from being silently adopted by this assignment.
+      const assignmentScope = {
+        sessionId: ctx.sessionManager.getSessionId(),
+        requestId: id,
+      };
+      let bind: ReturnType<typeof bindBackgroundWorkAssignment>;
+      try {
+        bind = bindBackgroundWorkAssignment(pi.events, assignmentScope);
+      } catch (error) {
+        acknowledgeAndDiscard(
+          id,
+          false,
+          ctx,
+          "busy",
+          `background settlement unavailable: ${String(error).slice(0, 200)}`,
+        );
+        return { action: "handled" };
+      }
+      if (
+        bind.state === "refused" ||
+        bind.state === "error" ||
+        bind.state === "missing"
+      ) {
+        const detail =
+          bind.state === "refused"
+            ? bind.reason
+            : bind.state === "error"
+              ? `${bind.error.code}: ${bind.error.message}`
+              : "registered background-work provider did not answer the binding request";
+        acknowledgeAndDiscard(id, false, ctx, "busy", detail);
+        return { action: "handled" };
+      }
+      let backgroundWorkProvider: ManagedAgentState["backgroundWorkProvider"];
+      if (bind.state === "bound") {
+        const protection = protectBackgroundWorkAssignment(
+          pi.events,
+          assignmentScope,
+          true,
+        );
+        if (protection.state !== "bound") {
+          const detail =
+            protection.state === "error"
+              ? `${protection.error.code}: ${protection.error.message}`
+              : protection.state === "refused"
+                ? protection.reason
+                : `background wake protection unavailable: ${protection.state}`;
+          acknowledgeAndDiscard(id, false, ctx, "busy", detail);
+          return { action: "handled" };
+        }
+        const snapshot = queryBackgroundWorkSnapshot(
+          pi.events,
+          assignmentScope,
+        );
+        if (snapshot.state !== "ready") {
+          const detail =
+            snapshot.state === "error"
+              ? `${snapshot.error.code}: ${snapshot.error.message}`
+              : `background settlement is ${snapshot.state}`;
+          acknowledgeAndDiscard(id, false, ctx, "busy", detail);
+          return { action: "handled" };
+        }
+        backgroundWorkProvider = snapshot.snapshot.provider;
+      }
       const candidate = mutateAgentState((current) => ({
         ...current,
         activeRequestId: id,
+        acceptedAssignment: acceptedRequestAssignment,
+        legacyAcceptedRequestIds: undefined,
+        backgroundWorkProvider,
+        backgroundWaiting: undefined,
         completedRequestId: undefined,
         lastActivityAt: Date.now(),
         lastAck: {
@@ -15986,6 +16485,7 @@ export default function (pi: ExtensionAPI): void {
       }
       acknowledgementErrorReported = false;
       agentStartedAt = Date.now();
+      watchBackgroundWorkChanges(ctx);
       const model = ctx.model
         ? `${ctx.model.provider}/${ctx.model.id}`
         : undefined;
@@ -16002,7 +16502,18 @@ export default function (pi: ExtensionAPI): void {
       });
     }
     if (request.kind === "steer" || request.kind === "interrupt") {
-      if (!acknowledge(id, true)) return { action: "handled" };
+      if (
+        !acknowledge(
+          id,
+          true,
+          undefined,
+          undefined,
+          request.kind === "interrupt" && acceptedRequestAssignment
+            ? { acceptedAssignment: acceptedRequestAssignment }
+            : undefined,
+        )
+      )
+        return { action: "handled" };
       latest = "";
       if (request.kind === "interrupt") {
         const editorText =
@@ -16116,6 +16627,9 @@ export default function (pi: ExtensionAPI): void {
         ...current,
         completedRequestId: requestId,
         activeRequestId: undefined,
+        acceptedAssignment: undefined,
+        backgroundWorkProvider: undefined,
+        backgroundWaiting: undefined,
         lastActivityAt: undefined,
         updatedAt: Date.now(),
       };
@@ -16148,6 +16662,78 @@ export default function (pi: ExtensionAPI): void {
       release?.();
     }
   };
+  const stopBackgroundWorkChangeSubscription = (): void => {
+    backgroundWorkChangeUnsubscribe?.();
+    backgroundWorkChangeUnsubscribe = undefined;
+  };
+  const refreshBackgroundWaitingEvidence = (scope: {
+    sessionId: string;
+    requestId: string;
+    expectedProviderId: string;
+  }): void => {
+    const current = state;
+    if (
+      !current ||
+      current.activeRequestId !== scope.requestId ||
+      current.backgroundWaiting?.sessionId !== scope.sessionId ||
+      current.backgroundWaiting.requestId !== scope.requestId ||
+      current.backgroundWorkProvider?.id !== scope.expectedProviderId
+    )
+      return;
+    let result: ReturnType<typeof queryBackgroundWorkSnapshot>;
+    try {
+      result = queryBackgroundWorkSnapshot(pi.events, scope);
+    } catch {
+      return;
+    }
+    if (!("snapshot" in result)) return;
+    const snapshot = result.snapshot;
+    const expected = current.backgroundWorkProvider;
+    if (
+      !expected ||
+      snapshot.provider.id !== expected.id ||
+      snapshot.provider.version !== expected.version
+    )
+      return;
+    const evidence = {
+      sessionId: scope.sessionId,
+      requestId: scope.requestId,
+      provider: snapshot.provider,
+      revision: snapshot.revision,
+      taskIds: snapshot.outstanding.map((task) => task.taskId),
+    };
+    if (isDeepStrictEqual(current.backgroundWaiting, evidence)) return;
+    const persisted = mutateAgentState((latest) => {
+      if (
+        latest.activeRequestId !== scope.requestId ||
+        latest.backgroundWaiting?.sessionId !== scope.sessionId ||
+        latest.backgroundWaiting.requestId !== scope.requestId ||
+        latest.backgroundWorkProvider?.id !== expected.id ||
+        latest.backgroundWorkProvider.version !== expected.version ||
+        isDeepStrictEqual(latest.backgroundWaiting, evidence)
+      )
+        return latest;
+      return { ...latest, backgroundWaiting: evidence, updatedAt: Date.now() };
+    });
+    if (persisted && isDeepStrictEqual(persisted.backgroundWaiting, evidence))
+      requestStatusRefresh?.();
+  };
+  const watchBackgroundWorkChanges = (ctx: ExtensionContext): void => {
+    stopBackgroundWorkChangeSubscription();
+    const current = state;
+    if (!current?.activeRequestId || !current.backgroundWorkProvider) return;
+    const scope = {
+      sessionId: ctx.sessionManager.getSessionId(),
+      requestId: current.activeRequestId,
+      expectedProviderId: current.backgroundWorkProvider.id,
+    };
+    backgroundWorkChangeUnsubscribe = subscribeBackgroundWorkChanges(
+      pi.events,
+      scope,
+      () => refreshBackgroundWaitingEvidence(scope),
+    );
+    queueMicrotask(() => refreshBackgroundWaitingEvidence(scope));
+  };
   const settleCurrentAgent = (ctx: ExtensionContext): void => {
     if (
       !state?.activeRequestId ||
@@ -16161,23 +16747,258 @@ export default function (pi: ExtensionAPI): void {
       hasUndeliveredDirectChildWork(state, ctx.sessionManager.getEntries())
     )
       return;
+    // A bound provider is revalidated at every settlement, including after a
+    // worker restart. Missing, stale, or unprotected providers can never look
+    // like an empty task set.
+    let settlement: ReturnType<typeof queryBackgroundWorkSnapshot>;
+    const sessionId = ctx.sessionManager.getSessionId();
+    const assignmentScope = {
+      sessionId,
+      requestId: state.activeRequestId,
+      ...(state.backgroundWorkProvider
+        ? { expectedProviderId: state.backgroundWorkProvider.id }
+        : {}),
+    };
+    const unavailable = (
+      message: string,
+    ): ReturnType<typeof queryBackgroundWorkSnapshot> => ({
+      state: "error",
+      error: { code: "provider-error", message: message.slice(0, 512) },
+    });
+    try {
+      const binding = bindBackgroundWorkAssignment(pi.events, assignmentScope);
+      if (binding.state === "absent") {
+        settlement = state.backgroundWorkProvider
+          ? {
+              state: "missing",
+              expectedProviderId: state.backgroundWorkProvider.id,
+            }
+          : { state: "absent" };
+      } else if (binding.state === "missing") {
+        settlement = binding;
+      } else if (binding.state === "error") {
+        settlement = { state: "error", error: binding.error };
+      } else if (binding.state === "refused") {
+        settlement = unavailable(binding.reason);
+      } else {
+        const protection = protectBackgroundWorkAssignment(
+          pi.events,
+          assignmentScope,
+          true,
+        );
+        if (protection.state === "bound") {
+          settlement = queryBackgroundWorkSnapshot(pi.events, assignmentScope);
+        } else if (protection.state === "error") {
+          settlement = { state: "error", error: protection.error };
+        } else if (protection.state === "missing") {
+          settlement = {
+            state: "missing",
+            expectedProviderId: state.backgroundWorkProvider?.id,
+          };
+        } else {
+          settlement = unavailable(
+            protection.state === "refused"
+              ? protection.reason
+              : "background wake protection is unavailable",
+          );
+        }
+      }
+    } catch (error) {
+      settlement = {
+        state: "error",
+        error: {
+          code: "provider-exception",
+          message: String(error).slice(0, 512),
+        },
+      };
+    }
+    let snapshot = "snapshot" in settlement ? settlement.snapshot : undefined;
+    if (snapshot) {
+      const expected = state.backgroundWorkProvider;
+      if (
+        expected &&
+        (snapshot.provider.id !== expected.id ||
+          snapshot.provider.version !== expected.version)
+      ) {
+        settlement = {
+          state: "error",
+          error: {
+            code: "identity-mismatch",
+            message: "background provider identity changed during assignment",
+          },
+        };
+        snapshot = undefined;
+      } else if (!expected) {
+        const adopted = mutateAgentState((current) => ({
+          ...current,
+          backgroundWorkProvider: snapshot!.provider,
+          updatedAt: Date.now(),
+        }));
+        if (!adopted) {
+          settlement = unavailable(
+            "could not persist recovered background provider identity",
+          );
+          snapshot = undefined;
+        }
+      }
+    }
+    if (snapshot) {
+      const waiting =
+        settlement.state === "reconciling" ||
+        settlement.state === "error" ||
+        (settlement.state === "ready" && snapshot.outstanding.length > 0);
+      if (waiting) {
+        const evidence = {
+          sessionId,
+          requestId: state.activeRequestId,
+          provider: snapshot.provider,
+          revision: snapshot.revision,
+          taskIds: snapshot.outstanding.map((task) => task.taskId),
+        };
+        if (!isDeepStrictEqual(state.backgroundWaiting, evidence)) {
+          const persisted = mutateAgentState((current) => ({
+            ...current,
+            backgroundWaiting: evidence,
+            updatedAt: Date.now(),
+          }));
+          if (!persisted)
+            settlement = unavailable(
+              "could not persist background waiting evidence",
+            );
+        }
+      }
+    }
+    if (
+      !snapshot &&
+      settlement.state !== "absent" &&
+      state.backgroundWorkProvider
+    ) {
+      const evidence = {
+        sessionId,
+        requestId: state.activeRequestId,
+        provider: state.backgroundWorkProvider,
+        // Zero means no authoritative provider revision has been recovered.
+        revision: state.backgroundWaiting?.revision ?? 0,
+        taskIds: state.backgroundWaiting?.taskIds ?? [],
+      };
+      if (!isDeepStrictEqual(state.backgroundWaiting, evidence)) {
+        const persisted = mutateAgentState((current) => ({
+          ...current,
+          backgroundWaiting: evidence,
+          updatedAt: Date.now(),
+        }));
+        if (!persisted)
+          settlement = unavailable(
+            "could not persist blocked background waiting evidence",
+          );
+      }
+    }
+    const settled =
+      settlement.state === "absent" ||
+      (settlement.state === "ready" &&
+        settlement.snapshot.outstanding.length === 0);
+    // Keep the marker until a fresh post-review answer is available.
+    if (settled && state.backgroundWaiting && latest.trim()) {
+      const cleared = mutateAgentState((current) => ({
+        ...current,
+        backgroundWaiting: undefined,
+        updatedAt: Date.now(),
+      }));
+      if (!cleared)
+        settlement = unavailable(
+          "could not clear resolved background waiting evidence",
+        );
+    }
+    if (
+      settlement.state !== "absent" &&
+      !(
+        settlement.state === "ready" &&
+        settlement.snapshot.outstanding.length === 0
+      )
+    ) {
+      if (settlement.state !== "ready" && !settlementHoldReported) {
+        settlementHoldReported = true;
+        const detail =
+          settlement.state === "error"
+            ? `${settlement.error.code}: ${settlement.error.message}`
+            : settlement.state;
+        appendDurableError(
+          pi,
+          ctx,
+          "pi_herdsman_state_error",
+          `background settlement withheld completion: ${detail}`,
+        );
+      }
+      latest = "";
+      return;
+    }
+    settlementHoldReported = false;
+    let resultStatus: ResultRecord["status"] = "failed";
+    let resultText: string | undefined;
+    let resultError: ResultRecord["error"];
+    let responseValidation: ResultRecord["responseValidation"];
+    const accepted = state.acceptedAssignment;
+    if (accepted) {
+      try {
+        const validated = validateResponse({
+          contract: accepted.responseContract,
+          baseline: accepted.artifactBaseline,
+          inlineText: latest,
+          cwd: state.cwd,
+          maxInlineBytes: MAX_RESPONSE_INLINE_BYTES,
+          maxArtifactBytes: MAX_RESPONSE_ARTIFACT_BYTES,
+        });
+        if (validated.contractHash !== accepted.responseContractHash)
+          throw new Error("Validated response contract identity changed");
+        resultStatus = "completed";
+        resultText = latest.trim()
+          ? latest
+          : `Artifact validated: ${validated.artifacts[0]!.path}`;
+        responseValidation = {
+          contractHash: validated.contractHash,
+          briefHash: accepted.briefHash,
+          workerSessionId: state.piSessionId,
+          target: accepted.responseContract.target,
+          textSource: latest.trim() ? "worker" : "framework",
+          artifacts: validated.artifacts,
+        };
+      } catch (error) {
+        if (!(error instanceof ResponseValidationError)) throw error;
+        resultError = {
+          code: error.code,
+          message: error.message.slice(0, 512),
+        };
+        responseValidation = {
+          contractHash: accepted.responseContractHash,
+          briefHash: accepted.briefHash,
+          workerSessionId: state.piSessionId,
+          target: accepted.responseContract.target,
+          textSource: "worker",
+          artifacts: [],
+          diagnostics: error.diagnostics,
+        };
+      }
+    } else if (latest.trim()) {
+      resultStatus = "completed";
+      resultText = latest;
+    } else {
+      resultError = {
+        code: "empty_result",
+        message: "Agent produced no assistant text",
+      };
+    }
     const result: ResultRecord = {
-      version: 4,
+      version: 5,
       runId: state.runId,
       requestId: state.activeRequestId,
       ownerSessionId: state.ownerSessionId,
       workspaceId: state.workspaceId,
       agentLabel: state.agentLabel,
       paneId: state.paneId,
-      status: latest ? "completed" : "failed",
-      ...(latest
-        ? { text: latest }
-        : {
-            error: {
-              code: "empty_result",
-              message: "Agent produced no assistant text",
-            },
-          }),
+      status: resultStatus,
+      ...(resultText ? { text: resultText } : {}),
+      ...(resultError ? { error: resultError } : {}),
+      ...(responseValidation ? { responseValidation } : {}),
       contextUsage: ctx.getContextUsage(),
       completedAt: Date.now(),
     };
@@ -16204,6 +17025,106 @@ export default function (pi: ExtensionAPI): void {
           if (retryTimer) clearInterval(retryTimer);
           retryTimer = undefined;
           return;
+        }
+        if (currentState.backgroundWorkProvider) {
+          const workScope = {
+            sessionId,
+            requestId: current.requestId,
+            expectedProviderId: currentState.backgroundWorkProvider.id,
+          };
+          let currentWork = queryBackgroundWorkSnapshot(pi.events, workScope);
+          if (
+            currentWork.state === "ready" &&
+            (currentWork.snapshot.provider.id !==
+              currentState.backgroundWorkProvider.id ||
+              currentWork.snapshot.provider.version !==
+                currentState.backgroundWorkProvider.version)
+          ) {
+            currentWork = {
+              state: "error",
+              error: {
+                code: "identity-mismatch",
+                message:
+                  "background provider identity changed during assignment",
+              },
+            };
+          }
+          if (
+            currentWork.state !== "ready" ||
+            currentWork.snapshot.outstanding.length > 0
+          ) {
+            const backgroundWaiting =
+              currentWork.state === "ready"
+                ? {
+                    sessionId,
+                    requestId: current.requestId,
+                    provider: currentWork.snapshot.provider,
+                    revision: currentWork.snapshot.revision,
+                    taskIds: currentWork.snapshot.outstanding.map(
+                      (task) => task.taskId,
+                    ),
+                  }
+                : {
+                    sessionId,
+                    requestId: current.requestId,
+                    provider: currentState.backgroundWorkProvider,
+                    revision: currentState.backgroundWaiting?.revision ?? 0,
+                    taskIds: currentState.backgroundWaiting?.taskIds ?? [],
+                  };
+            const waitingState: ManagedAgentState = {
+              ...currentState,
+              backgroundWaiting,
+              updatedAt: Date.now(),
+            };
+            writeAgentState(mailbox, waitingState);
+            state = waitingState;
+            pendingResult = undefined;
+            if (retryTimer) clearInterval(retryTimer);
+            retryTimer = undefined;
+            latest = "";
+            if (currentWork.state !== "ready" && !settlementHoldReported) {
+              settlementHoldReported = true;
+              const detail =
+                currentWork.state === "error"
+                  ? `${currentWork.error.code}: ${currentWork.error.message}`
+                  : currentWork.state;
+              appendDurableError(
+                pi,
+                ctx,
+                "pi_herdsman_state_error",
+                `background settlement withheld completion: ${detail}`,
+              );
+            }
+            return;
+          }
+          if (currentState.backgroundWaiting && !latest.trim()) {
+            const waitingState: ManagedAgentState = {
+              ...currentState,
+              backgroundWaiting: {
+                sessionId,
+                requestId: current.requestId,
+                provider: currentWork.snapshot.provider,
+                revision: currentWork.snapshot.revision,
+                taskIds: [],
+              },
+              updatedAt: Date.now(),
+            };
+            writeAgentState(mailbox, waitingState);
+            state = waitingState;
+            pendingResult = undefined;
+            if (retryTimer) clearInterval(retryTimer);
+            retryTimer = undefined;
+            return;
+          }
+          if (currentState.backgroundWaiting) {
+            const settledState: ManagedAgentState = {
+              ...currentState,
+              backgroundWaiting: undefined,
+              updatedAt: Date.now(),
+            };
+            writeAgentState(mailbox, settledState);
+            state = settledState;
+          }
         }
         resultWriteAttempts++;
         writeResult(mailbox, current);
@@ -16252,6 +17173,9 @@ export default function (pi: ExtensionAPI): void {
             const nextState: ManagedAgentState = {
               ...state!,
               activeRequestId: undefined,
+              acceptedAssignment: undefined,
+              backgroundWorkProvider: undefined,
+              backgroundWaiting: undefined,
               completedRequestId: undefined,
               lastActivityAt: undefined,
               resultError: recovery,

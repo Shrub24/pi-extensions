@@ -9,6 +9,7 @@ import { makeStrictJsonSchema } from "@earendil-works/pi-ai/api/constrained-samp
 import { Value } from "typebox/value";
 import { acquireProcessLock } from "./lock.ts";
 import { resultPath, resultRef } from "./storage.ts";
+import { DELEGATION_BRIEF_EXAMPLES } from "./briefs.ts";
 import {
   COORDINATION_MESSAGE_KINDS,
   claimChiefLease,
@@ -505,7 +506,7 @@ test("Herdr preflight gates minimum client version and server compatibility", as
           {
             definition: "agent",
             label,
-            task: "preflight",
+            task: DELEGATION_BRIEF_EXAMPLES.common,
           },
           undefined,
           undefined,
@@ -3202,18 +3203,15 @@ test("agent input accepts only the v3 Herdr control marker", async () => {
     registerExtension!(agent.pi as never);
     await agent.events.get("session_start")![0](undefined, context);
     const started = readAgentState(mailbox)!;
-    const request: RequestRecord = {
-      version: 4,
-      runId: started.runId,
-      requestId: REQUEST_ID,
-      ownerSessionId: started.ownerSessionId,
-      workspaceId: started.workspaceId,
-      agentLabel: started.agentLabel,
-      paneId: started.paneId,
-      kind: "task",
-      text: "process this assignment",
-      createdAt: Date.now(),
-    };
+    const request: RequestRecord = { version: 5, runId: started.runId,
+    requestId: REQUEST_ID,
+    ownerSessionId: started.ownerSessionId,
+    workspaceId: started.workspaceId,
+    agentLabel: started.agentLabel,
+    paneId: started.paneId,
+    kind: "task",
+    text: "process this assignment",
+    createdAt: Date.now(), };
     writeRequest(mailbox, request);
     const input = agent.events.get("input")![0];
 
@@ -3249,19 +3247,16 @@ test("delivered owner asks retain the question in visible message details", asyn
   const identity = recoveryIdentity(label);
   const mailbox = agentMailboxPath(WORKSPACE, label);
   resetAgentMailbox(mailbox);
-  const ask: AskRecord = {
-    version: 4,
-    askId: "99999999-9999-4999-8999-999999999999",
-    requestId: REQUEST_ID,
-    runId: managedState(label, REQUEST_ID, identity).runId,
-    ownerSessionId: LEAD_SESSION_ID,
-    workspaceId: WORKSPACE,
-    agentLabel: label,
-    paneId: identity.paneId,
-    piSessionId: identity.piSessionId,
-    question: "Choose ALPHA or BETA",
-    createdAt: Date.now(),
-  };
+  const ask: AskRecord = { version: 5, askId: "99999999-9999-4999-8999-999999999999",
+  requestId: REQUEST_ID,
+  runId: managedState(label, REQUEST_ID, identity).runId,
+  ownerSessionId: LEAD_SESSION_ID,
+  workspaceId: WORKSPACE,
+  agentLabel: label,
+  paneId: identity.paneId,
+  piSessionId: identity.piSessionId,
+  question: "Choose ALPHA or BETA",
+  createdAt: Date.now(), };
   writeAgentState(mailbox, {
     ...managedState(label, REQUEST_ID, identity),
     pendingAskId: ask.askId,
@@ -3328,7 +3323,7 @@ test("registered delegate embeds text and references binary evidence", async () 
         {
           definition: "agent",
           label,
-          task: "Inspect these.",
+          task: DELEGATION_BRIEF_EXAMPLES.common,
           files: [textPath, binaryPath],
         },
         undefined,

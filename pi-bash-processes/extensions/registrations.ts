@@ -64,7 +64,7 @@ export interface RegistrationDeps {
 		signal: AbortSignal | undefined,
 		ctx: ExtensionContext,
 	) => Promise<AgentToolResult<unknown>>;
-	clearFinishedTasks: () => number;
+	clearFinishedTasks: () => { removed: number; kept: number };
 	/** True when a deferred exit wake for this task was dropped. */
 	consumeObservedExitWake: (taskId: string) => boolean;
 	armForcedBackground: (ctx: ExtensionContext, source: "shortcut" | "command") => void;
@@ -268,16 +268,21 @@ function registerBgTaskTool(pi: ExtensionAPI, deps: RegistrationDeps, surface: T
 				return makeToolResult(deps.formatTaskListText(), { action: "list", tasks: bgToolResultTasks(tasks) });
 			}
 			if (params.action === "clear") {
-				const removed = deps.clearFinishedTasks();
+				const { removed, kept } = deps.clearFinishedTasks();
 				// Clearing only drops finished rows. When running tasks remain, say so
 				// and name the action that actually silences them: the reported failure
 				// (a clear that looked like it had dealt with the tasks, followed by a
-				// wake per remaining task) came from that gap.
+				// wake per remaining task) came from that gap. Tasks kept because an
+				// assignment-owned result was never delivered are named as counts too:
+				// a skip the caller cannot see would make the clear look stuck.
 				const running = deps.sortedTasks().filter((candidate) => candidate.status === "running" && candidate.stopReason == null);
 				const stillRunning = running.length > 0
 					? `\nStill running: ${running.map((candidate) => candidate.id).join(", ")} — clear does not touch running tasks. Each will send an exit wake; use bg_task stop id:"all" to end them without a wake.`
 					: "";
-				return makeToolResult(`Removed ${removed} finished background task(s).${stillRunning}`, { action: "clear", removed });
+				const keptNote = kept > 0
+					? `\nKept ${kept} task(s) whose assignment-owned result has never been delivered — retrieve them with get (or stop) before they clear.`
+					: "";
+				return makeToolResult(`Removed ${removed} finished background task(s).${keptNote}${stillRunning}`, { action: "clear", removed, ...(kept > 0 ? { kept } : {}) });
 			}
 			if (params.action === "spawn") {
 				const task = deps.spawnTask({
@@ -492,7 +497,7 @@ function registerCommands(pi: ExtensionAPI, deps: RegistrationDeps): void {
 			if (!trimmed) { await openDashboard(ctx, deps.dashboardDeps); return; }
 			if (trimmed === "list") { ctx.ui.notify(deps.formatTaskListText(), "info"); return; }
 			if (trimmed === "next") { deps.armForcedBackground(ctx, "command"); return; }
-			if (trimmed === "clear") { ctx.ui.notify(`Removed ${deps.clearFinishedTasks()} finished background task(s).`, "info"); return; }
+			if (trimmed === "clear") { const { removed, kept } = deps.clearFinishedTasks(); ctx.ui.notify(`Removed ${removed} finished background task(s).${kept > 0 ? ` Kept ${kept} assignment-owned result(s) awaiting delivery.` : ""}`, "info"); return; }
 			if (trimmed.startsWith("run ")) {
 				const task = deps.spawnTask({ command: trimmed.slice(4), cwd: ctx.cwd });
 				ctx.ui.notify(`Started ${task.id} (pid ${task.pid}) in the background.`, "info");
@@ -525,7 +530,7 @@ function registerCommands(pi: ExtensionAPI, deps: RegistrationDeps): void {
 	});
 	pi.registerCommand(`${BG_COMMAND}:clear`, {
 		description: "Remove finished background tasks",
-		handler: async (_args, ctx) => { deps.setActiveCtx(ctx); ctx.ui.notify(`Removed ${deps.clearFinishedTasks()} finished background task(s).`, "info"); },
+		handler: async (_args, ctx) => { deps.setActiveCtx(ctx); const { removed, kept } = deps.clearFinishedTasks(); ctx.ui.notify(`Removed ${removed} finished background task(s).${kept > 0 ? ` Kept ${kept} assignment-owned result(s) awaiting delivery.` : ""}`, "info"); },
 	});
 	pi.registerCommand(`${BG_COMMAND}:run`, {
 		description: "Spawn a background shell task: /bg:run <command>",

@@ -377,6 +377,11 @@ export interface CompletionAckResult {
  * `outputComplete: false`, or readiness `incomplete`) is not a successful
  * handoff of the result and must not call this: the bytes it could not retain
  * are unrecoverable, so the completion obligation stays where it is.
+ *
+ * Acknowledgment is *notification* state and never implies settlement: it
+ * does not write `resultResolution`, so a notified-but-unretrieved task stays
+ * outstanding for assignment settlement (openspec tasks 2.2) until an actual
+ * result handoff is observed there.
  */
 export function acknowledgeCompletion<T extends { id: string; exitNotified?: boolean }>(
 	task: T,
@@ -395,16 +400,72 @@ export function acknowledgeCompletion<T extends { id: string; exitNotified?: boo
 }
 
 /**
+ * Whether a task's result has been *resolved* for assignment settlement
+ * (openspec tasks 2.2-2.3): a terminal task whose `resultResolution` records
+ * an actual delivery (`delivered`) or a delivered unrecoverable error
+ * (`error`). A running task is never resolved, however its flags read, and a
+ * terminal task without a recorded resolution is outstanding — waiting,
+ * flushing, or awaiting result review — regardless of `exitNotified`.
+ */
+export function resultIsResolved<T extends { status: BackgroundTaskStatus; resultResolution?: "delivered" | "error" }>(
+	task: T,
+): boolean {
+	if (task.status === "running") return false;
+	return task.resultResolution !== undefined;
+}
+
+/**
+ * The single eligibility rule for recording a result resolution from a
+ * delivered handoff (openspec tasks 2.2-2.3), shared by every delivery path
+ * — foreground/wait-owned exit, bounded wait, certified get/stop, declared-CLI
+ * receipts — so they cannot disagree about what a delivery means:
+ *
+ *   running / finalizing → `null`: the capture has not settled, so a
+ *                           flushing inspection records nothing and the task
+ *                           stays outstanding until a certified handoff.
+ *   incomplete           → `"error"`: the process is gone and the capture
+ *                           can never certify; handing that over delivers an
+ *                           unrecoverable error, never a successful result.
+ *   terminal             → `"delivered"` only when the retained capture is
+ *                           certified complete and free of read errors;
+ *                           otherwise `"error"` — a short or unreadable
+ *                           capture handed over as the failure it is.
+ */
+export function resultResolutionForDelivery(
+	observation: Pick<TaskResultObservation, "readiness" | "outputComplete" | "outputError">,
+): "delivered" | "error" | null {
+	if (observation.readiness === "running" || observation.readiness === "finalizing") return null;
+	if (observation.readiness === "incomplete") return "error";
+	return observation.outputComplete && !observation.outputError ? "delivered" : "error";
+}
+
+/**
  * Oldest finished tasks that exceed the retention bound, in removal order.
  * Running work and any task whose result is still being prepared are never
  * returned, so a terminal retrieval racing the bound keeps its task and log.
  */
-export function selectPrunableFinishedTasks<T extends { id: string; status: BackgroundTaskStatus; updatedAt: number }>(
+export function selectPrunableFinishedTasks<T extends {
+	id: string;
+	status: BackgroundTaskStatus;
+	updatedAt: number;
+	assignmentRequestId?: string;
+	resultResolution?: "delivered" | "error";
+}>(
 	tasks: Iterable<T>,
 	options: { maxFinished: number; protectedIds?: ReadonlySet<string> },
 ): T[] {
 	const protectedIds = options.protectedIds ?? new Set<string>();
-	const finished = [...tasks].filter((task) => task.status !== "running" && !protectedIds.has(task.id));
+	const finished = [...tasks].filter(
+		(task) =>
+			task.status !== "running" &&
+			!protectedIds.has(task.id) &&
+			// Assignment-owned evidence is never prunable: a terminal task whose
+			// result was never delivered is an assignment's outstanding work
+			// (openspec tasks 2.1-2.2), and eviction would let a provider query
+			// read its disappearance as completion. Resolved history and
+			// unassociated tasks remain prunable as before.
+			!(task.assignmentRequestId !== undefined && !resultIsResolved(task)),
+	);
 	const excess = finished.length - Math.max(0, Math.floor(options.maxFinished));
 	if (excess <= 0) return [];
 	return finished.sort((a, b) => a.updatedAt - b.updatedAt).slice(0, excess);

@@ -10,6 +10,11 @@ file after delivery, and the retained shape is derived rather than stored —
 verified process. The new public `idle` state projects that shape, and its only
 eligible controls are `agent_inspect`, `agent_transcript`, and `agent_close`.
 
+Background-work waiting is not the retained `idle` shape. Its request remains
+active and unresolved until provider work is resolved and the worker publishes a
+fresh post-review result. It is not eligible for continuation or Clear idle;
+`agent_close` and explicit shutdown remain cancellation, not successful delivery.
+
 `agent_continue` for a session whose single representation is a directly owned
 `idle` worker submits the next assignment into that existing process through the
 normal `submit` path, bypassing the busy and label-collision rejections and
@@ -76,7 +81,8 @@ composition, which a raw file comparison would miss.
 - A worker's logical label stays occupied while it is `idle`, so continuation of
   that session keeps its label and a different label cannot reuse it.
 - `idle` workers are excluded from stale and soft-deadline attention and from
-  herd-run completion checks.
+  herd-run completion checks. A `waiting` assignment remains unresolved for
+  herd-run completion and stays eligible for its soft-deadline digest.
 - `available_tools` for an `idle` worker is inspect, transcript, and close only.
 - An operator who does not want retained panes must disable `retainWorkers` or
   clear idle workers explicitly.

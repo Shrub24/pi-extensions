@@ -21,14 +21,16 @@ task acknowledgement it records `pi-herdsman-soft-window {requestId, label,
 runId, armedAt, windowMs}` in the lead's own session; each delivery appends
 `{requestId, deliveredAt, nextArmedAt, windowMs}`, and `agent_extend` appends
 `{requestId, armedAt, windowMs, extended: true}`. Recovery replays the last entry
-per unresolved `requestId`, falling back to `state.lastAck.acknowledgedAt` when a
-working runtime has no entry.
+per unresolved `requestId`, falling back to `state.lastAck.acknowledgedAt` when an
+unresolved live assignment has no entry.
 
 The digest is a new custom message type, `pi-herdsman-agent-soft-deadline`,
-delivered with `triggerTurn: true`, whose entries list each worker's
-`available_tools` and word the choices as *keep waiting*, `agent_steer`,
-`agent_interrupt`, `agent_extend`, `agent_close`. "Continue" is avoided because
-`agent_continue` already means a new assignment.
+delivered with `triggerTurn: true`, whose entries list each worker's current
+`available_tools` and describe only choices that worker currently allows. A
+background-work waiter remains digest- and extend-eligible, but never lists
+`agent_interrupt`. When `agent_close` is available, it is explicit abandonment,
+not completion. "Continue" is avoided because `agent_continue` already means a new
+assignment.
 
 `agent_extend` is a tenth controller tool with the strict schema
 `{agent: string, windowMs: integer 1..2147483647}` and
@@ -84,8 +86,8 @@ digest never offers a control the worker cannot accept.
 
 - Soft windows are checked on the health-reconciliation cadence, so a digest can
   arrive up to one scan interval late.
-- The pass runs only for an idle controller with a direct owner, and only for
-  working assignments with an armed window.
+- The pass runs only for an idle controller with a direct owner, and for
+  unresolved `working`, `blocked`, or `waiting` assignments with an armed window.
 - `agent_extend` becomes part of the strict per-operation tool schema set and the
   extension contract.
 - The digest is model-facing: a controller that ignores it simply waits, and the

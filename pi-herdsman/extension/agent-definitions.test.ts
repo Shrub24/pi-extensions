@@ -22,6 +22,7 @@ import {
   expandAgentBodyFiles,
   mergeFrontmatter,
   projectAgentDefinition,
+  resolveAgentLaunchInputs,
   resolveChildModel,
   updateAgentOverride,
   validateAgentDefinitionReferences,
@@ -462,6 +463,82 @@ test("discovers the five portable bundled definitions without a user agents dire
       discoverAgentDefinitions().map((definition) => definition.name),
     ),
     ["generalist", "implementer", "researcher", "reviewer", "scout"],
+  );
+});
+
+test("validates and fingerprints briefing and response defaults", () => {
+  assert.throws(
+    () => discoverAgentDefinitionsWithContents(`---
+name: custom
+briefProfile: unknown
+---`),
+    /field briefProfile: must be a supported briefing profile/,
+  );
+  assert.throws(
+    () =>
+      discoverAgentDefinitionsWithContents(
+        `---
+name: custom
+responseContract: {schema: response-contract/v1, target: inline}
+---`,
+      ),
+    /field responseContract: must be a complete response-contract\/v1 object/,
+  );
+
+  const definitions = discoverAgentDefinitionsWithContents(
+    `---
+name: custom
+---
+Body`,
+  );
+  const custom = definitions.find(({ name }) => name === "custom")!;
+  const defaults = resolveAgentLaunchInputs(custom, { cwd: "/tmp" });
+  assert.equal(defaults.briefProfile, "common");
+  assert.deepEqual(defaults.responseContract, {
+    schema: "response-contract/v1",
+    target: "inline",
+    format: "text",
+    requiredSections: [],
+  });
+
+  const profiles = Object.fromEntries(
+    definitions
+      .filter(({ name }) => name !== "custom")
+      .map(({ name, frontmatter }) => [name, frontmatter.briefProfile]),
+  );
+  assert.deepEqual(profiles, {
+    generalist: "common",
+    implementer: "execution",
+    researcher: "research",
+    reviewer: "review",
+    scout: "investigation",
+  });
+
+  const changedProfile = {
+    ...custom,
+    frontmatter: { ...custom.frontmatter, briefProfile: "execution" as const },
+  };
+  assert.notDeepEqual(
+    resolveAgentLaunchInputs(custom, { cwd: "/tmp" }),
+    resolveAgentLaunchInputs(changedProfile, { cwd: "/tmp" }),
+    "a briefing-profile policy change changes resolved launch inputs",
+  );
+  const changedContract = {
+    ...custom,
+    frontmatter: {
+      ...custom.frontmatter,
+      responseContract: {
+        schema: "response-contract/v1",
+        target: "inline",
+        format: "markdown",
+        requiredSections: [],
+      },
+    },
+  };
+  assert.notDeepEqual(
+    resolveAgentLaunchInputs(custom, { cwd: "/tmp" }),
+    resolveAgentLaunchInputs(changedContract, { cwd: "/tmp" }),
+    "a role-default response-policy change changes resolved launch inputs",
   );
 });
 

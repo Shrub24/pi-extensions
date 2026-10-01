@@ -8,9 +8,13 @@ let failConfigRename = false;
 let configPath: string | undefined;
 const testAgentDir =
   process.env.PI_CODING_AGENT_DIR ?? "/tmp/pi-herdsman-config-test";
+const { parseFrontmatter: nativeParseFrontmatter } = await import(
+  "@earendil-works/pi-coding-agent"
+);
 mock.module("@earendil-works/pi-coding-agent", {
   namedExports: {
     getAgentDir: () => testAgentDir,
+    parseFrontmatter: nativeParseFrontmatter,
   },
 });
 mock.module("node:fs", {
@@ -21,6 +25,7 @@ mock.module("node:fs", {
     existsSync: realFs.existsSync,
     fsyncSync: realFs.fsyncSync,
     fstatSync: realFs.fstatSync,
+    lstatSync: realFs.lstatSync,
     mkdirSync: realFs.mkdirSync,
     openSync: realFs.openSync,
     readFileSync: (path: string, encoding: BufferEncoding) => {

@@ -101,7 +101,9 @@ Example:
 ```
 
 The header reports exact non-zero lifecycle states in the order `working`,
-`blocked`, `settling`, `starting`, `idle`, `unknown`, and `lost`. `starting` is a
+`waiting`, `blocked`, `settling`, `starting`, `idle`, `unknown`, and `lost`.
+`waiting` counts active assignments whose model turn has yielded while provider
+work or its required post-review response remains unresolved. `starting` is a
 presentation-only count for controller-local assignments that have begun
 startup but have not yet become active or terminal. `idle` counts retained
 workers whose terminal result was delivered and whose verified live process is
@@ -131,11 +133,11 @@ then elapsed time, then context percentage; the same column choice is used for
 every row. The task is the rightmost elastic field and is kept only when it has
 useful room before it is truncated.
 
-Working rows use `● working`, blocked rows use `◐ blocked`, settling rows use
-`◌ settling`, starting rows use `◌ starting`, idle rows use `○ idle`, unknown
-rows use `? unknown`, and
-lost rows use `× lost` with the theme's attention/error styling. Working,
-settling, and starting animate; idle, blocked, unknown, and lost rows are static.
+Working rows use `● working`, waiting rows use `◷ waiting`, blocked rows use
+`◐ blocked`, settling rows use `◌ settling`, starting rows use `◌ starting`,
+idle rows use `○ idle`, unknown rows use `? unknown`, and lost rows use `× lost`
+with the theme's attention/error styling. Working, settling, and starting
+animate; waiting, idle, blocked, unknown, and lost rows are static.
 While a controller-local start remains pending, an authoritative `settling`
 row is presented as `starting` so launch and request handoff remain visually
 continuous. `working`, `blocked`, and `unknown` authoritative states are never

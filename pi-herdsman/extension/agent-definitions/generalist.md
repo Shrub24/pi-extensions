@@ -1,5 +1,6 @@
 ---
 name: generalist
+briefProfile: common
 description: General-purpose execution agent for scoped tasks that do not fit scout, researcher, implementer, or reviewer
 agents: ["scout", "researcher"]
 systemPromptMode: replace

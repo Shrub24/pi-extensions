@@ -4,6 +4,9 @@ import { dirname, join, sep } from "node:path";
 import { mock, test } from "node:test";
 
 const realFs = await import("node:fs");
+const { parseFrontmatter: nativeParseFrontmatter } = await import(
+  "@earendil-works/pi-coding-agent"
+);
 const {
   mkdirSync,
   mkdtempSync,
@@ -31,6 +34,7 @@ const syntheticCanonicalPaths = new Map<string, string>();
 mock.module("@earendil-works/pi-coding-agent", {
   namedExports: {
     getAgentDir: () => process.env.PI_CODING_AGENT_DIR ?? tmpdir(),
+    parseFrontmatter: nativeParseFrontmatter,
   },
 });
 mock.module("node:fs", {
@@ -117,6 +121,7 @@ mock.module("node:fs", {
       syntheticCanonicalPaths.get(path) ?? realFs.realpathSync(path, ...args),
     renameSync: realFs.renameSync,
     rmdirSync: realFs.rmdirSync,
+    lstatSync: realFs.lstatSync,
     statSync: (path: any, ...args: any[]) => {
       const physicalPath =
         typeof path === "string"
@@ -220,6 +225,16 @@ test("projects lifecycle and assignment state into control states", () => {
     "unknown",
   );
   assert.equal(
+    agentControlState("idle", "request", false, false, false, false, false, true),
+    "waiting",
+    "background waiting is not surfaced as idle",
+  );
+  assert.equal(
+    agentControlState("unknown", "request", false, false, false, false, false, true),
+    "unknown",
+    "unavailable lifecycle evidence remains unknown",
+  );
+  assert.equal(
     agentControlState("idle", undefined, false, false, false, true),
     "settling",
     "result persistence recovery remains non-assignable",
@@ -251,6 +266,20 @@ test("projects lifecycle and assignment state into control states", () => {
     agentControlState("idle", undefined, false, true, false, false, true),
     "settling",
     "an unacknowledged handoff outranks a delivered assignment",
+  );
+  assert.equal(
+    agentControlState("idle", "request", false, false, false, false, false, true),
+    "waiting",
+  );
+  assert.equal(
+    agentControlState("working", "request", false, false, false, false, false, true),
+    "working",
+    "an active review turn stays working",
+  );
+  assert.equal(
+    agentControlState("idle", "request", false, false, true, false, false, true),
+    "blocked",
+    "pending owner questions retain their reply state",
   );
 });
 

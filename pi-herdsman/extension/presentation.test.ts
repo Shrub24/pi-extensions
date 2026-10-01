@@ -763,6 +763,19 @@ test("status projection renders the complete stable tree with aligned columns", 
       rows[3]!.text,
     );
     assert.match(rows[4]!.text, /◌ starting/);
+    const waitingRows = renderStatusRows(
+      [{ label: "waiting", definition: "agent", state: "waiting" }],
+      { now: 0, frame: 0 },
+    );
+    assert.match(waitingRows[0]!.text, /◷ waiting/);
+    assert.equal(
+      renderStatusRows(
+        [{ label: "waiting", definition: "agent", state: "waiting" }],
+        { now: 0, frame: 1 },
+      )[0]!.text,
+      waitingRows[0]!.text,
+      "waiting rows do not animate like active model work",
+    );
     assert.notEqual(
       renderStatusRows(agents, { now: 0, frame: 1 })[0]!.text,
       rows[0]!.text,
@@ -771,10 +784,11 @@ test("status projection renders the complete stable tree with aligned columns", 
     assert.equal(
       formatStatusCounts([
         ...agents,
+        { label: "waiting", definition: "agent", state: "waiting" as const },
         { label: "idle", definition: "agent", state: "idle" as const },
         { label: "lost", definition: "agent", state: "lost" as const },
       ]),
-      "1 working · 1 blocked · 1 settling · 1 starting · 1 idle · 1 unknown · 1 lost",
+      "1 working · 1 waiting · 1 blocked · 1 settling · 1 starting · 1 idle · 1 unknown · 1 lost",
     );
     const column = (line: string, token: string) => {
       const index = line.indexOf(token);
@@ -795,6 +809,7 @@ test("status projection renders the complete stable tree with aligned columns", 
   {
     const expected = [
       ["working", "success", "● working"],
+      ["waiting", "accent", "◷ waiting"],
       ["blocked", "warning", "◐ blocked"],
       ["settling", "accent", "◌ settling"],
       ["starting", "accent", "◌ starting"],

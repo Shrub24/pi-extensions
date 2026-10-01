@@ -98,6 +98,7 @@ import support, {
   writeResult,
   writeAgentState,
 } from "./support.ts";
+import { DELEGATION_BRIEF_EXAMPLES } from "./briefs.ts";
 const { readConfig, updateConfig } = await import("./config.ts");
 const agentTool = (pi: ReturnType<typeof fakePi>, name: string) =>
   pi.tools.find((candidate) => candidate.name === `agent_${name}`)!;
@@ -4235,9 +4236,11 @@ test("clear idle closes exactly the directly owned idle workers", async () => {
     "clear-idle-one-agent",
     "clear-idle-two-agent",
     "clear-idle-working-agent",
+    "clear-idle-waiting-agent",
     "clear-idle-foreign-agent",
   ];
   const workingLabel = "clear-idle-working-agent";
+  const waitingLabel = "clear-idle-waiting-agent";
   const foreignLabel = "clear-idle-foreign-agent";
   const states = labels.map((label) => {
     const identity = {
@@ -4248,14 +4251,27 @@ test("clear idle closes exactly the directly owned idle workers", async () => {
     const mailbox = agentMailboxPath(WORKSPACE, label);
     resetAgentMailbox(mailbox);
     const state: ManagedAgentState = managedState(label, undefined, identity);
-    if (label === workingLabel) state.activeRequestId = REQUEST_ID;
+    if (label === workingLabel || label === waitingLabel)
+      state.activeRequestId = REQUEST_ID;
     else state.completedRequestId = REQUEST_ID;
+    if (label === waitingLabel) {
+      const provider = { id: "clear-idle-background-provider", version: 1 };
+      state.backgroundWorkProvider = provider;
+      state.backgroundWaiting = {
+        sessionId: identity.piSessionId,
+        requestId: REQUEST_ID,
+        provider,
+        revision: 1,
+        taskIds: ["still-running"],
+      };
+    }
     if (label === foreignLabel) state.ownerSessionId = PARENT_SESSION_ID;
     writeAgentState(mailbox, state);
     return state;
   });
   const idleStates = states.filter(
-    (state) => state.agentLabel !== workingLabel,
+    (state) =>
+      state.agentLabel !== workingLabel && state.agentLabel !== waitingLabel,
   );
   const entries = idleStates.map((state) => ({
     customType: "pi-herdsman-agent-result",
@@ -4289,6 +4305,12 @@ test("clear idle closes exactly the directly owned idle workers", async () => {
       readAgentState(agentMailboxPath(WORKSPACE, workingLabel))
         ?.activeRequestId,
       REQUEST_ID,
+    );
+    assert.equal(
+      readAgentState(agentMailboxPath(WORKSPACE, waitingLabel))
+        ?.activeRequestId,
+      REQUEST_ID,
+      "Clear idle leaves the unresolved background assignment untouched",
     );
     assert.ok(
       readAgentState(agentMailboxPath(WORKSPACE, foreignLabel)),
@@ -5638,18 +5660,15 @@ test("lead agents stop reports cleanup failures and preserves accurate discarded
   mailboxes.forEach(resetAgentMailbox);
   writeAgentState(mailboxes[0]!, failed);
   writeAgentState(mailboxes[1]!, pending);
-  writeResult(mailboxes[1]!, {
-    version: 4,
-    runId: pending.runId,
-    requestId: pending.completedRequestId,
-    ownerSessionId: pending.ownerSessionId,
-    workspaceId: pending.workspaceId,
-    agentLabel: pending.agentLabel,
-    paneId: pending.paneId,
-    status: "completed",
-    text: "durable result",
-    completedAt: Date.now(),
-  });
+  writeResult(mailboxes[1]!, { version: 5, runId: pending.runId,
+  requestId: pending.completedRequestId,
+  ownerSessionId: pending.ownerSessionId,
+  workspaceId: pending.workspaceId,
+  agentLabel: pending.agentLabel,
+  paneId: pending.paneId,
+  status: "completed",
+  text: "durable result",
+  completedAt: Date.now(), });
   const lifecycle = cascadeExecutor([failed, pending], {
     failCloseLabel: failed.agentLabel,
   });
@@ -5878,7 +5897,8 @@ test("valid managed leaf agents receive identity-only TUI presentation", async (
   ]);
   assert.equal(pi.tools.filter((tool) => tool.name === "ask_owner").length, 1);
   assert.ok(activeToolsCalls > 0);
-  await pi.events.get("session_shutdown")?.[0]();
+  for (const listener of pi.events.get("session_shutdown") ?? [])
+    await listener();
   resetAgentMailbox(mailbox);
   setLeadEnvironment();
 });
@@ -6695,18 +6715,15 @@ test("fresh assignment refreshes the widget after validation", async (t) => {
         };
       if (command === "herdr" && args[0] === "agent" && args[1] === "start") {
         live = true;
-        writeAgentState(mailbox, {
-          version: 4,
-          runId: startedRunId,
-          ownerSessionId: startedOwnerSessionId,
-          workspaceId: WORKSPACE,
-          agentLabel: label,
-          paneId: "startup-pane",
-          piSessionId: DEFAULT_PI_SESSION_ID,
-          piSessionFile: sessionPath,
-          cwd: requestedCwd,
-          updatedAt: Date.now(),
-        });
+        writeAgentState(mailbox, { version: 5, runId: startedRunId,
+        ownerSessionId: startedOwnerSessionId,
+        workspaceId: WORKSPACE,
+        agentLabel: label,
+        paneId: "startup-pane",
+        piSessionId: DEFAULT_PI_SESSION_ID,
+        piSessionFile: sessionPath,
+        cwd: requestedCwd,
+        updatedAt: Date.now(), });
         return {
           stdout: JSON.stringify({
             id: AGENT_ID,
@@ -6753,7 +6770,7 @@ test("fresh assignment refreshes the widget after validation", async (t) => {
       {
         definition: "agent",
         label,
-        task: "fresh task",
+        task: DELEGATION_BRIEF_EXAMPLES.common,
       },
       undefined,
       undefined,
@@ -6830,7 +6847,7 @@ test("fresh assignment refreshes the widget after validation", async (t) => {
       {
         definition: "agent",
         label,
-        task: "fail this task",
+        task: DELEGATION_BRIEF_EXAMPLES.common,
       },
       undefined,
       undefined,
@@ -6849,7 +6866,7 @@ test("fresh assignment refreshes the widget after validation", async (t) => {
       {
         definition: "agent",
         label,
-        task: "invalid identity",
+        task: DELEGATION_BRIEF_EXAMPLES.common,
       },
       undefined,
       undefined,

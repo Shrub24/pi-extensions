@@ -1,5 +1,6 @@
 ---
 name: reviewer
+briefProfile: review
 description: Independent read-only reviewer for plans, diffs, implementations, and codebase health; use when work needs verification, missing-case analysis, or regression review rather than modification
 agents: ["scout", "researcher"]
 systemPromptMode: replace

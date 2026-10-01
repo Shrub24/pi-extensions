@@ -13,6 +13,7 @@ import type {
 } from "./mailbox.ts";
 import { claimProcessLock } from "./lock.ts";
 import support from "./support.ts";
+import { DELEGATION_BRIEF_EXAMPLES } from "./briefs.ts";
 import {
   CHILD_SESSION_ID,
   DEFAULT_PI_SESSION_ID,
@@ -150,9 +151,7 @@ test("parent delegates two same-definition children with exact ownership", async
     for (const handler of pi.events.get("session_start") ?? [])
       await handler(undefined, context);
     for (const task of ["first child", "second child"]) {
-      const started = await pi.tools
-        .find((tool) => tool.name === "agent_delegate")!
-        .execute(
+      const started = await registeredAgentTool(pi, "delegate").execute(
           "start",
           { definition: "child", task },
           undefined,
@@ -185,7 +184,7 @@ test("parent delegates two same-definition children with exact ownership", async
       .promptGuidelines!.join(" ");
     for (const phrase of [
       "Use agent_delegate to start a fresh bounded assignment from a definition; use agent_continue to resume an exact historical managed-Agent Pi session with a new bounded assignment.",
-      "Each live Agent generation exists for one assignment; after its terminal result is delivered, Herdsman cleans up that generation.",
+      "Each live Agent generation exists for one assignment; after its terminal result is delivered, Herdsman cleans it up.",
       "Agent labels identify the current live generation; exact Pi sessions identify historical context and continuation.",
       "`files` carries relevant assignment evidence, not runtime capability.",
       "Do not attach or mention agent instruction files such as AGENTS.md, CLAUDE.md, GEMINI.md, or equivalents merely because they exist.",
@@ -292,10 +291,33 @@ async function liveAgentList(pi: ReturnType<typeof fakePi>) {
   return JSON.parse(response.stdout).result.agents as Record<string, unknown>[];
 }
 
+// These lifecycle tests predate typed briefs; keep their task labels as body text.
+const testBrief = (task: string) =>
+  `${DELEGATION_BRIEF_EXAMPLES.common.trimEnd()}\n\nAssignment-specific detail:\n${task}`;
+
 const registeredAgentTool = (
   pi: ReturnType<typeof fakePi>,
   operation: string,
-) => pi.tools.find((tool) => tool.name === `agent_${operation}`)!;
+) => {
+  const tool = pi.tools.find((candidate) => candidate.name === `agent_${operation}`)!;
+  if (operation !== "delegate" && operation !== "continue") return tool;
+  return {
+    ...tool,
+    execute: (...args: any[]) => {
+      const params = args[1];
+      if (
+        params &&
+        typeof params === "object" &&
+        typeof params.task === "string" &&
+        params.task.trim() &&
+        !params.task.trimStart().startsWith("---")
+      ) {
+        args[1] = { ...params, task: testBrief(params.task) };
+      }
+      return tool.execute(...args);
+    },
+  };
+};
 const { updateConfig } = await import("./config.ts");
 const { agentLaunchFingerprint, resolveAgentLaunchInputs } =
   await import("./agent-definitions.ts");
@@ -1109,7 +1131,7 @@ test("cascade close keeps the parent when descendant mailbox cleanup is unresolv
   writeAgentState(parentMailbox, parent);
   writeAgentState(childMailbox, child);
   writeRequest(childMailbox, {
-    version: 4,
+    version: 5,
     runId: child.runId,
     requestId: REQUEST_ID,
     ownerSessionId: child.ownerSessionId,
@@ -1303,7 +1325,7 @@ test("fixture mailbox consumer retries a failed acknowledgement callback", async
   const state = managedState("fixture-retry-agent");
   writeAgentState(mailbox, state);
   const request: RequestRecord = {
-    version: 4,
+    version: 5,
     runId: state.runId,
     requestId: randomUUID(),
     ownerSessionId: state.ownerSessionId,
@@ -1772,7 +1794,7 @@ test("recovery cleanup finishes an idle restored herd without settlement", async
   resetAgentMailbox(startup.mailbox);
   writeAgentState(startup.mailbox, state);
   writeResult(startup.mailbox, {
-    version: 4,
+    version: 5,
     runId: state.runId,
     requestId,
     ownerSessionId: state.ownerSessionId,
@@ -2112,7 +2134,7 @@ test("continuation rejects a retained worker whose result was not delivered", as
     resetAgentMailbox(mailbox);
     writeAgentState(mailbox, state);
     writeResult(mailbox, {
-      version: 4,
+      version: 5,
       runId: state.runId,
       requestId: state.completedRequestId,
       ownerSessionId: state.ownerSessionId,
@@ -2545,7 +2567,7 @@ test("registered extensions preserve adjacent ask escalation and assignment resu
       "working",
       parent.piSessionId,
       (requestMailbox, marker) => {
-        const requestId = marker.slice("__PI_HERDSMAN_AGENT_V4__:".length);
+        const requestId = marker.slice("__PI_HERDSMAN_AGENT_V5__:".length);
         leadReply = readRequest(requestMailbox, requestId);
         const current = readAgentState(requestMailbox)!;
         writeAgentState(requestMailbox, {
@@ -3036,9 +3058,7 @@ test("historical session with its inherited label rejects an active managed repr
   try {
     const controllerContext = fakeContext();
     controllerContext.sessionManager.getSessionId = () => session.id;
-    const ownSession = await pi.tools
-      .find((tool) => tool.name === "agent_continue")!
-      .execute(
+    const ownSession = await registeredAgentTool(pi, "continue").execute(
         "controller-session",
         {
           session: session.id,
@@ -3050,9 +3070,7 @@ test("historical session with its inherited label rejects an active managed repr
       );
     assert.equal(ownSession.details.error.category, "invalid_request");
     const before = pi.calls.length;
-    const result = await pi.tools
-      .find((tool) => tool.name === "agent_continue")!
-      .execute(
+    const result = await registeredAgentTool(pi, "continue").execute(
         "id",
         { session: session.path, task: "must wait" },
         undefined,
@@ -3888,7 +3906,7 @@ test("session continuation starts a new agent generation with current prompt con
     assert.equal((result.details as any).reusable, undefined);
     assert.equal((result.details as any).keepAlive, undefined);
     const state = readAgentState(startup.mailbox)!;
-    assert.equal(state.version, 4);
+    assert.equal(state.version, 5);
     assert.equal(state.piSessionId, session.id);
     assert.match(launched[0].contents[0]!, /definition body/);
     assert.match(launched[0].contents[0]!, /current saved-session prompt/);
@@ -4427,7 +4445,7 @@ test("revalidates automatic-label collision sizing before startup", async () => 
   realFs.rmSync(replacementMailbox, { recursive: true, force: true });
   writeAgentState(occupiedMailbox, occupiedState);
   writeRequest(occupiedMailbox, {
-    version: 4,
+    version: 5,
     runId: occupiedState.runId,
     requestId: REQUEST_ID,
     ownerSessionId: occupiedState.ownerSessionId,
@@ -4507,7 +4525,7 @@ test("lost mailbox labels remain reserved until explicit close", async () => {
   }
 });
 
-test("rolls back fresh assignment when the authoritative pane makes the request too large", async () => {
+test("rejects an oversized assignment brief before lifecycle mutation", async () => {
   setLeadEnvironment();
   const label = "agent";
   const startup = startupExecutor(
@@ -4526,10 +4544,7 @@ test("rolls back fresh assignment when the authoritative pane makes the request 
   realFs.rmSync(startup.mailbox, { recursive: true, force: true });
   const pi = fakePi({ exec: startup.exec });
   registerExtension!(pi.pi as never);
-  const preflightEnvelope = requestRecordBytes(label, "", "");
-  const task = "x".repeat(131072 - preflightEnvelope);
-  assert.equal(requestRecordBytes(label, "", task) <= 131072, true);
-  assert.equal(requestRecordBytes(label, "startup-pane", task) > 131072, true);
+  const task = testBrief("x".repeat(64 * 1024));
   try {
     const result = await registeredAgentTool(pi, "delegate").execute(
       "id",
@@ -4538,15 +4553,10 @@ test("rolls back fresh assignment when the authoritative pane makes the request 
       undefined,
       fakeContext(),
     );
-    assert.equal(result.details.error.category, "rollback_failure");
-    assert.equal(result.details.error.rollbackOccurred, true);
-    assert.ok(startup.getCount() > 0, "overflow must reach authoritative pane");
-    assert.deepEqual(
-      realFs.existsSync(startup.mailbox)
-        ? realFs.readdirSync(startup.mailbox)
-        : [],
-      ["state.json"],
-    );
+    assert.equal(result.details.error.category, "invalid_request");
+    assert.match(result.details.error.message, /exceeds the 65536-byte brief limit/);
+    assert.equal(startup.getCount(), 0, "oversized brief must fail before launch");
+    assert.equal(realFs.existsSync(startup.mailbox), false);
   } finally {
     pi.events.get("session_shutdown")?.[0]();
     resetAgentMailbox(startup.mailbox);
@@ -4570,6 +4580,56 @@ test("rolls back fresh assignment when the authoritative pane makes the request 
   } finally {
     reusePi.events.get("session_shutdown")?.[0]();
     resetAgentMailbox(reuse.mailbox);
+  }
+});
+
+test("plain task text and unavailable brief context are rejected before lifecycle mutation", async () => {
+  setLeadEnvironment();
+  const label = "agent";
+  const startup = startupExecutor(
+    label,
+    () => DEFAULT_PI_SESSION_ID,
+    undefined,
+    undefined,
+    false,
+    undefined,
+    "/tmp",
+    AGENT_ID,
+    false,
+    false,
+    true,
+  );
+  realFs.rmSync(startup.mailbox, { recursive: true, force: true });
+  const pi = fakePi({ exec: startup.exec });
+  registerExtension!(pi.pi as never);
+  // Bypass registeredAgentTool, which wraps plain text into a valid brief.
+  const delegate = pi.tools.find((tool) => tool.name === "agent_delegate")!;
+  const missing = join(testTmpRoot, "absent-brief-input.md");
+  const unavailableContext = DELEGATION_BRIEF_EXAMPLES.common.replace(
+    "inputs: []",
+    `inputs:\n    - reference: ${missing}\n      purpose: required background`,
+  );
+  assert.notEqual(unavailableContext, DELEGATION_BRIEF_EXAMPLES.common);
+  try {
+    for (const [task, expected] of [
+      ["Just do the work", /schema/],
+      [unavailableContext, new RegExp(missing.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))],
+    ] as const) {
+      const result = await delegate.execute(
+        "id",
+        { definition: "agent", label, task },
+        undefined,
+        undefined,
+        fakeContext(),
+      );
+      assert.equal(result.details.error.category, "invalid_request");
+      assert.match(result.details.error.message, expected);
+      assert.equal(startup.getCount(), 0, "rejection must precede launch");
+      assert.equal(realFs.existsSync(startup.mailbox), false);
+    }
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(startup.mailbox);
   }
 });
 
@@ -4601,7 +4661,7 @@ test("rejects invalid assignment prerequisites before lifecycle mutation", async
     {
       operation: "delegate",
       params: { definition: "agent", task: " \t" },
-      message: "Message must not be empty",
+      message: "brief.schema: expected delegation-brief/v1",
     },
   ];
 

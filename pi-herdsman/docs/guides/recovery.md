@@ -229,7 +229,8 @@ not the normal model orchestration interface.
 
 ## Historical session failure
 
-`agent_continue` requires an exact session path or full UUID.
+`agent_continue` requires an exact session path or full UUID and a fresh
+`delegation-brief/v1` valid for the saved definition's required role profile.
 
 The saved session header must contain a non-empty working directory. Session
 continuation uses that saved cwd and does not accept a caller-supplied `cwd`.

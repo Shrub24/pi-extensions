@@ -28,14 +28,21 @@ controller and authorized delegating-agent controllers.
 {
   "definition": "implementer",
   "label": "approved-change",
-  "task": "Implement the approved change"
+  "task": "---\nschema: delegation-brief/v1\nprofile: execution\nobjective: Implement the approved change\ncontext:\n  summary: none\n  inputs: []\nscope:\n  allowed: [\"pi-herdsman/extension\"]\n  excluded: []\nconstraints: []\nacceptance: [\"The targeted behavior is implemented and verified\"]\nresponse: role-defaults\nexecution:\n  affectedArea: \"pi-herdsman/extension\"\n  validationExpectations: [\"Run the focused test and package check\"]\n---\nMake the requested change."
 }
 ```
 
-Call `agent_delegate` with `definition`, `task`, and optional `label` and
-`files`. The optional `label` must match `^[a-z][a-z0-9_-]{0,31}$` and sets
-the requested logical agent label; an existing live-label collision fails.
-Fresh delegation runs in the calling controller's cwd.
+Call `agent_delegate` with `definition`, a complete versioned Markdown brief in
+`task`, and optional `label` and `files`. A plain task sentence is rejected with
+field-specific guidance before a pane, request, or advisory window is created.
+The brief must satisfy the selected definition's profile; custom definitions use
+the common profile unless configured stricter. Include all common fields, even
+when lists are intentionally empty, and use `context.summary: none` with
+`inputs: []` when no context is required. Context inputs are privately
+snapshotted and bound to the accepted request. Use `files` for additional
+assignment evidence. The optional `label` must match
+`^[a-z][a-z0-9_-]{0,31}$` and sets the requested logical agent label; an existing
+live-label collision fails. Fresh delegation runs in the calling controller's cwd.
 The definition is resolved from the effective roster and delegating agent
 controllers may use only their allowlisted definitions. Project definitions
 still require trusted project approval. A fresh delegation starts a new Pi
@@ -48,16 +55,22 @@ assignment without a new process.
 
 ## `agent_continue`
 
+This example targets a common-profile worker; use the profile required by the
+saved definition for other workers.
+
 ```json
 {
   "session": "<exact .jsonl path or full UUID>",
-  "task": "Continue the investigation"
+  "task": "---\nschema: delegation-brief/v1\nprofile: common\nobjective: Continue the investigation\ncontext:\n  summary: The exact saved session contains the prior investigation.\n  inputs: []\nscope:\n  allowed: [\"the stated investigation\"]\n  excluded: []\nconstraints: []\nacceptance: [\"Return the requested findings with evidence\"]\nresponse: role-defaults\n---\nContinue from the saved history and report the requested findings."
 }
 ```
 
-Call `agent_continue` with `session`, `task`, and optional `files`. The exact
-saved session path or full UUID supplies its cwd, definition identity, and
-historical Pi context. Continuation hands one more assignment to the session's
+Call `agent_continue` with an exact `session`, a fresh complete versioned
+Markdown brief in `task`, and optional `files`. Continuation never inherits the
+previous assignment's scope or response override; the new brief must satisfy the
+saved definition's role profile. The exact saved session path or full UUID
+supplies its cwd, definition identity, and historical Pi context. Continuation
+hands one more assignment to the session's
 agent, creating a new agent generation (a new process) when no retained worker
 can take the work; it never assigns work to a working or settling
 agent. The cwd comes from the saved session. The saved definition is resolved again
@@ -99,6 +112,56 @@ evidence where available. All return after atomic
 recording for controller restart recovery, not completion. A terminal result
 makes the exact session identity
 prominent for a later `agent_continue` call.
+
+## Separate response contracts
+
+The incoming delegation brief defines the assignment; its `response` field is
+`role-defaults` or an explicit versioned `response-contract/v1` override. This
+outgoing contract is independent of the required brief fields and cannot weaken
+the role's incoming brief profile. It selects `inline`, `artifact`, or `both`,
+`text` or `markdown`, required Markdown sections and an optional registered
+metadata schema. Artifact targets also name a workspace-relative path and state
+whether an unchanged pre-existing artifact may be reused. A short inline answer
+needs no file; reports are required only when the accepted contract says so.
+
+Before publishing success, the worker validates the actual inline response and/or
+requested artifact. Artifact validation checks canonical containment, regular-file
+identity, symlinks, baseline freshness, bounded bytes, Markdown structure and
+metadata. Success details include framework-owned contract and brief hashes,
+worker session identity, text origin, and observed artifact path, hash, byte count,
+and created/reused disposition. Model-authored claims about checks are not
+execution evidence. Invalid output produces a one-shot failed result with a typed
+`invalid_response` or `artifact_error` code and bounded field diagnostics; Herdsman
+does not ask the worker to repair output automatically.
+
+## Background-work waiting
+
+A registered background-work provider binds spawned tasks to the accepted
+request. An exit notification records that a wake was delivered; it does not
+resolve the task. A protected waiter receives one mandatory terminal-resolution
+wake even when `notifyOnExit` is false; the shared scheduler coalesces it with
+existing exit notifications and cancels a held wake if `get` or confirmed `stop`
+resolves the task first. Resolution requires a certified result handoff or
+delivery of an unrecoverable-error notice. While assigned work is running, flushing, or
+awaiting review, the worker remains on the same request and no successful final
+result is published. While its model turn has yielded but provider completion or
+the required post-review answer is still outstanding, `agent_list` reports
+`waiting`: the assignment stays busy, cannot be interrupted, continued, replaced,
+or selected by Clear idle. The owner may inspect or transcribe it, steer it,
+extend an armed soft window, or explicitly close it as cancellation.
+Herdsman persists the provider, revision, and outstanding task IDs, then
+revalidates them during recovery and immediately before result
+persistence. A missing, failing, or identity-changed provider for a bound
+request fails closed. After the work resolves, the worker reviews it and emits
+a post-review response before the assignment settles. Assignments accepted
+without a provider keep the ordinary lifecycle; `retainWorkers` affects only
+post-delivery cleanup and does not abandon an unresolved request.
+
+Mailbox envelopes use protocol v5 while retaining the existing `mailboxes-v4`
+storage directory for in-place migration. A migrated v4 artifact is accepted
+only for an exact active or completed request id in the bounded legacy allowlist;
+a legacy control cannot admit a new task, and the marker clears after result
+delivery.
 
 ## `agent_list`
 
@@ -329,9 +392,12 @@ Pi shell execution. Direct calls from a managed agent to the Pi built-in
 `bash` or `powershell` tool receive a default 600-second timeout when the call
 omits `timeout`; an explicit timeout is kept unchanged. Current message limits
 are governed by the Herdsman config file and its defaults, plus the fixed
-mailbox protocol ceiling. Managed mailbox records use protocol V4 in the
-`mailboxes-v4` namespace, and control requests use the marker prefix
-`__PI_HERDSMAN_AGENT_V4__:`.
+mailbox protocol ceiling. Mailbox records now use protocol V5 while retaining
+the `mailboxes-v4` storage path so existing assignments can migrate in place.
+Reading V4 state carries forward only its exact active and completed request
+IDs to authorize legacy V4 request, ask, and result artifacts; unrelated V4
+records remain rejected. V4 control markers remain readable during migration,
+while new control requests use `__PI_HERDSMAN_AGENT_V5__:`.
 
 Do not attach or mention agent instruction files such as `AGENTS.md`, `CLAUDE.md`,
 `GEMINI.md`, or equivalents merely because they exist. Rely on normal project or
@@ -365,13 +431,15 @@ wedged tool.
 ```json
 {
   "agent": "implementer-1",
-  "message": "Stop the hanging command and continue with a different approach."
+  "message": "---\nschema: delegation-brief/v1\nprofile: execution\nobjective: Replace the current approach and finish the assignment\ncontext:\n  summary: The current approach is blocked by a hanging command.\n  inputs: []\nscope:\n  allowed: [\"the existing assignment\"]\n  excluded: []\nconstraints: [\"Stop the hanging command before proceeding\"]\nacceptance: [\"Complete the assignment using the replacement approach\"]\nresponse: role-defaults\nexecution:\n  affectedArea: \"the current assignment\"\n  validationExpectations: [\"Verify the replacement approach\"]\n---\nStop the hanging command and continue with a different approach."
 }
 ```
 
-`agent_interrupt` accepts the exact live `agent` and a required non-empty
-`message`, and optional `files`. It is available only to the exact direct owner
-while the agent has a currently working Pi operation.
+`agent_interrupt` accepts the exact live `agent` and a fresh complete versioned
+Markdown brief in `message`, plus optional `files`. The replacement brief and
+response requirements are bound to the same active request; it is available only
+to the exact direct owner while the agent has a currently working Pi operation.
+`agent_steer` and `agent_reply` remain free-form and do not replace the assignment brief.
 
 Interrupt is preemptive: it requests Pi cancellation of the current operation,
 supersedes earlier steering Pi has not yet delivered, and continues the same
@@ -443,8 +511,12 @@ non-actionable.
 
 An accepted delegated task remains the internal mailbox `kind: "task"` request
 and has one correlated final result. Delivery goes to the exact owning Pi
-session and occurs exactly once. A persisted reusable completion's
-model-visible wording is:
+session and occurs exactly once. Success is published only after the accepted
+response contract validates the requested inline and/or artifact output. Invalid
+responses produce one terminal `invalid_response` or `artifact_error` result with
+bounded field diagnostics; Herdsman does not automatically repair or re-prompt.
+Correction requires a new valid assignment or an eligible interrupt replacement.
+A persisted reusable completion's model-visible wording is:
 
 ```text
 Agent result · agent=<agent> · definition=<definition> · session=<id> · status=completed
@@ -454,11 +526,16 @@ Result ref: result:<agent>#<index>
 
 Reusable result artifacts persist the source agent label, definition, assignment
 cwd, and producing Pi session ID (when available) with the agent-authored result
-so later `files` handoffs retain their provenance.
+so later `files` handoffs retain their provenance. The framework-owned
+`responseValidation` details include accepted contract/brief hashes, worker
+session identity, text source, and observed artifact hashes, sizes, and
+created/reused dispositions. These records attest to output structure and
+artifact identity, not the truth of worker claims or whether claimed checks ran.
 
 Details retain durable `agentLabel`, `resultIndex` when present,
 `agentDefinition`, `piSessionId`, `piSessionFile`, canonical result references,
-elapsed time, context usage, truncation, and persistence-error evidence. The
+elapsed time, context usage, truncation, response-validation provenance and
+diagnostics, and persistence-error evidence. The
 agent is cleaned up after the terminal result is delivered; the Pi session
 remains available for continuation.
 

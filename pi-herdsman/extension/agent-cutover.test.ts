@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { makeStrictJsonSchema } from "@earendil-works/pi-ai/api/constrained-sampling";
 import { Value } from "typebox/value";
+import { DELEGATION_BRIEF_EXAMPLES } from "./briefs.ts";
 import { parseControlMarker } from "./mailbox.ts";
 import {
   controlMarker,
@@ -168,7 +169,7 @@ test("current error codes replace the legacy label and busy codes", async () => 
       {
         definition: "agent",
         label: duplicateLabel,
-        task: "duplicate",
+        task: DELEGATION_BRIEF_EXAMPLES.common,
       },
       undefined,
       undefined,

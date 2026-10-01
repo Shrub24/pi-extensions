@@ -368,7 +368,7 @@ export function chooseLabel(base: string, labels: Set<string>): string {
   throw new Error("Unable to choose agent label");
 }
 export type ManagedAgentControlState =
-  "idle" | "working" | "blocked" | "settling" | "unknown";
+  "idle" | "working" | "blocked" | "waiting" | "settling" | "unknown";
 export function agentControlState(
   lifecycle: "idle" | "working" | "blocked" | "done" | "unknown",
   activeRequestId: string | undefined,
@@ -377,6 +377,7 @@ export function agentControlState(
   waitingForOwner = false,
   recoveryPending = false,
   delivered = false,
+  waitingForBackgroundWork = false,
 ): ManagedAgentControlState {
   if (completionPending || handoffPending || recoveryPending) return "settling";
   if (activeRequestId) {
@@ -384,6 +385,10 @@ export function agentControlState(
     if (waitingForOwner) {
       if (lifecycle === "unknown") return "unknown";
       return "blocked";
+    }
+    if (waitingForBackgroundWork) {
+      if (lifecycle === "unknown") return "unknown";
+      return "waiting";
     }
     if (lifecycle === "blocked") return "blocked";
     if (lifecycle === "idle" || lifecycle === "done") return "settling";

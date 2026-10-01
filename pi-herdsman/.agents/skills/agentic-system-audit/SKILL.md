@@ -33,6 +33,20 @@ Start with:
 
 Use effective capabilities from the current context. Do not assume definition-level delegation, tools, skills, or extensions survive overrides or depth.
 
+## Assignment briefs
+
+Every `agent_delegate` and `agent_continue` task, and every eligible
+`agent_interrupt` replacement, must carry a complete `delegation-brief/v1`
+Markdown document in `task` or `message`; plain task sentences are rejected
+before assignment side effects. Use the role profile required by the selected
+reviewer, scout, or researcher definition, include every common field and any
+role-specific fields, and state empty lists explicitly. Put required source
+files in `context.inputs` so admission privately snapshots them; `files` remains
+available for additional evidence. Use `response: role-defaults` unless this
+assignment needs a specific outgoing artifact contract. A continuation or
+interrupt replacement requires its own fresh brief. The public tool reference
+contains the canonical profile examples and response-contract fields.
+
 ## Preferred topology
 
 ```text

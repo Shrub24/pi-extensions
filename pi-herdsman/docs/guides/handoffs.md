@@ -2,22 +2,28 @@
 
 [Documentation index](../README.md)
 
-Pi Herdsman has two text-file mechanisms with different purposes:
+Pi Herdsman has distinct assignment and definition file mechanisms:
 
-- `files` supplies evidence to `agent_delegate`, `agent_continue`,
-  `agent_steer`, `agent_interrupt`, `agent_reply`, or `ask_owner`.
+- every `agent_delegate`/`agent_continue` task and eligible `agent_interrupt`
+  replacement is a complete versioned Markdown delegation brief;
+- `brief.context.inputs` are validated, privately snapshotted, and bound to the
+  accepted request so recovery sees the exact accepted bytes;
+- `files` supplies additional evidence to assignment and owner-message tools;
 - whole-line body `@file` references put definition-owned text into the agent
   system prompt when a new agent generation is built.
 
-Strict UTF-8 text is embedded when it fits; non-text and non-fitting files are
-canonical local references and are not copied or snapshotted.
+For the `files` channel, strict UTF-8 text is embedded when it fits; non-text and
+non-fitting files remain canonical local references and are not copied or
+snapshotted. This is separate from the brief's required context snapshots.
 
 ## Message `files`
 
 Agent-session context crosses boundaries explicitly.
 
-- task or message text and `files` carry assignment-specific evidence;
-- `agent_continue` resumes an exact managed-agent Pi session;
+- `task` or interrupt `message` contains a complete `delegation-brief/v1`;
+- brief context inputs are immutable private snapshots, while `files` carries
+  additional explicit evidence;
+- `agent_continue` resumes an exact managed-agent Pi session with a fresh brief;
 - the caller's conversation and caller-side attachments are not implicitly
   copied into another agent session.
 
@@ -276,19 +282,21 @@ agent-authored result with source context containing the logical agent label,
 agent definition, assignment cwd, and producing Pi session ID when available:
 
 ```text
-Agent result source: {"agent":"researcher","definition":"scout","cwd":"/project","piSessionId":"<producing-session-id>"}
+Agent result source: {"agent":"researcher","definition":"scout","cwd":"/project","piSessionId":"<producing-session-id>","responseValidation":{"contractHash":"<sha256>","briefHash":"<sha256>","workerSessionId":"<producing-session-id>","target":"artifact","textSource":"worker","artifacts":[{"path":"reports/result.md","canonicalPath":"/project/reports/result.md","sha256":"<sha256>","bytes":123,"disposition":"created"}]}}
 
 <agent-authored result>
 ```
 
 This context is part of the durable result artifact, so it survives semantic-ref
-resolution and transitive canonical-ref forwarding through `files`. For a
-reference-only result, the provenance is available with the body when the
-referenced artifact is read; it is not separately embedded. The context is
-informational model evidence, not authorization: an exact session ID or path
-does not authorize `agent_continue` without durable ownership ancestry. The normal
-completion shown to the owning session
-remains unchanged.
+resolution and transitive canonical-ref forwarding through `files`. The
+framework-owned `responseValidation` record preserves the accepted contract and
+brief hashes, worker session identity, text source, and observed artifact hashes,
+sizes, and created/reused dispositions. These observations establish output
+identity and shape, not the truth of model-authored claims or proof that claimed
+checks ran. For a reference-only result, provenance is available with the body
+when the referenced artifact is read; it is not separately embedded. The context
+is informational model evidence, not authorization: an exact session ID or path
+does not authorize `agent_continue` without durable ownership ancestry.
 
 Oversized non-completion registered-tool output may additionally expose
 `full_output_path` when overflow persistence succeeds. Model-visible content

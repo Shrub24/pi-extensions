@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { mock, test } from "node:test";
 import { Value } from "typebox/value";
+import { DELEGATION_BRIEF_EXAMPLES } from "./briefs.ts";
 import type {
   AskRecord,
   RequestRecord,
@@ -69,8 +70,24 @@ import support, {
   writeAgentState,
 } from "./support.ts";
 const { updateConfig } = await import("./config.ts");
-const agentTool = (pi: ReturnType<typeof fakePi>, name: string) =>
-  pi.tools.find((candidate) => candidate.name === `agent_${name}`)!;
+const agentTool = (pi: ReturnType<typeof fakePi>, name: string) => {
+  const tool = pi.tools.find((candidate) => candidate.name === `agent_${name}`)!;
+  if (name !== "delegate" && name !== "continue") return tool;
+  return {
+    ...tool,
+    execute: async (...args: Parameters<typeof tool.execute>) => {
+      const params = args[1] as Record<string, unknown> | undefined;
+      if (typeof params?.task !== "string" || params.task.trimStart().startsWith("---"))
+        return tool.execute(...args);
+      const next = [...args] as Parameters<typeof tool.execute>;
+      next[1] = {
+        ...params,
+        task: `${DELEGATION_BRIEF_EXAMPLES.common.trimEnd()}\n\nAssignment-specific detail:\n${params.task}`,
+      } as never;
+      return tool.execute(...next);
+    },
+  };
+};
 
 test("combined status reports a completed agent as pending, not active", async () => {
   setAgentEnvironment("status-pending-parent", ["child"]);
@@ -123,18 +140,15 @@ test("combined status reports a completed agent as pending, not active", async (
     requestId: string,
     text: string,
   ) =>
-    writeResult(mailbox, {
-      version: 4,
-      runId: state.runId,
-      requestId,
-      ownerSessionId: state.ownerSessionId,
-      workspaceId: state.workspaceId,
-      agentLabel: state.agentLabel,
-      paneId: state.paneId,
-      status: "completed",
-      text,
-      completedAt: Date.now(),
-    });
+    writeResult(mailbox, { version: 5, runId: state.runId,
+    requestId,
+    ownerSessionId: state.ownerSessionId,
+    workspaceId: state.workspaceId,
+    agentLabel: state.agentLabel,
+    paneId: state.paneId,
+    status: "completed",
+    text,
+    completedAt: Date.now(), });
   writeChildResult(trigger, mailboxes[1], triggerRequestId, "trigger");
   writeChildResult(pending, mailboxes[2], pendingRequestId, "pending");
   const entries: unknown[] = [
@@ -243,18 +257,15 @@ test("conflicting same-request entries do not suppress an exact combined result"
   const childMailbox = agentMailboxPath(WORKSPACE, child.agentLabel);
   resetAgentMailbox(childMailbox);
   writeAgentState(childMailbox, child);
-  writeResult(childMailbox, {
-    version: 4,
-    runId: child.runId,
-    requestId: REQUEST_ID,
-    ownerSessionId: child.ownerSessionId,
-    workspaceId: child.workspaceId,
-    agentLabel: child.agentLabel,
-    paneId: child.paneId,
-    status: "completed",
-    text: "queued child result",
-    completedAt: Date.now(),
-  });
+  writeResult(childMailbox, { version: 5, runId: child.runId,
+  requestId: REQUEST_ID,
+  ownerSessionId: child.ownerSessionId,
+  workspaceId: child.workspaceId,
+  agentLabel: child.agentLabel,
+  paneId: child.paneId,
+  status: "completed",
+  text: "queued child result",
+  completedAt: Date.now(), });
   const entries: unknown[] = [
     {
       type: "custom",
@@ -368,18 +379,15 @@ test("reload result recovery rejects wrong owners and replacement identities", a
   const label = "reload-proof-child";
   const identity = recoveryIdentity(label);
   const mailbox = agentMailboxPath(WORKSPACE, label);
-  const resultFor = (state: ManagedAgentState): ResultRecord => ({
-    version: 4,
-    runId: state.runId,
-    requestId: REQUEST_ID,
-    ownerSessionId: state.ownerSessionId,
-    workspaceId: state.workspaceId,
-    agentLabel: state.agentLabel,
-    paneId: state.paneId,
-    status: "completed",
-    text: "must not replay",
-    completedAt: Date.now(),
-  });
+  const resultFor = (state: ManagedAgentState): ResultRecord => ({ version: 5, runId: state.runId,
+  requestId: REQUEST_ID,
+  ownerSessionId: state.ownerSessionId,
+  workspaceId: state.workspaceId,
+  agentLabel: state.agentLabel,
+  paneId: state.paneId,
+  status: "completed",
+  text: "must not replay",
+  completedAt: Date.now(), });
 
   setLeadEnvironment();
   const wrongOwner = {
@@ -696,18 +704,15 @@ test("malformed disappearance proof retains failed-launch cleanup evidence", asy
         return { stdout: "{}", stderr: "", code: 0 };
       }
       started = true;
-      writeAgentState(mailbox, {
-        version: 4,
-        runId,
-        ownerSessionId,
-        workspaceId: WORKSPACE,
-        agentLabel: label,
-        paneId: "pane-start",
-        piSessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-        piSessionFile: "/tmp/registered-agent.jsonl",
-        cwd: "/tmp",
-        updatedAt: Date.now(),
-      });
+      writeAgentState(mailbox, { version: 5, runId,
+      ownerSessionId,
+      workspaceId: WORKSPACE,
+      agentLabel: label,
+      paneId: "pane-start",
+      piSessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      piSessionFile: "/tmp/registered-agent.jsonl",
+      cwd: "/tmp",
+      updatedAt: Date.now(), });
       return {
         stdout: JSON.stringify({
           id: AGENT_ID,
@@ -1168,18 +1173,15 @@ test("assignment rollback retains primary failure and actionable cleanup details
           stderr: `error: preserved pane identity did not settle: {"pane_id":"detail-pane","workspace_id":"${WORKSPACE}"}`,
           code: 1,
         };
-      writeAgentState(mailbox, {
-        version: 4,
-        runId,
-        ownerSessionId,
-        workspaceId: WORKSPACE,
-        agentLabel: label,
-        paneId: "detail-pane",
-        piSessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-        piSessionFile: "/tmp/registered-agent.jsonl",
-        cwd: "/tmp",
-        updatedAt: Date.now(),
-      });
+      writeAgentState(mailbox, { version: 5, runId,
+      ownerSessionId,
+      workspaceId: WORKSPACE,
+      agentLabel: label,
+      paneId: "detail-pane",
+      piSessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      piSessionFile: "/tmp/registered-agent.jsonl",
+      cwd: "/tmp",
+      updatedAt: Date.now(), });
       return {
         stdout: JSON.stringify({
           id: AGENT_ID,
@@ -1280,18 +1282,15 @@ test("recovery requires the official session and retries one failed delivery", a
   });
   assert.equal(scoutPresentation.resultRef, `result:${REQUEST_ID}`);
   assert.equal(readFileSync(resultPath(REQUEST_ID), "utf8"), scoutText);
-  const result: ResultRecord = {
-    version: 4,
-    runId: AGENT_ID,
-    requestId: REQUEST_ID,
-    ownerSessionId: LEAD_SESSION_ID,
-    workspaceId: WORKSPACE,
-    agentLabel: label,
-    paneId: identity.paneId,
-    status: "completed",
-    text: scoutText,
-    completedAt: Date.now(),
-  };
+  const result: ResultRecord = { version: 5, runId: AGENT_ID,
+  requestId: REQUEST_ID,
+  ownerSessionId: LEAD_SESSION_ID,
+  workspaceId: WORKSPACE,
+  agentLabel: label,
+  paneId: identity.paneId,
+  status: "completed",
+  text: scoutText,
+  completedAt: Date.now(), };
   writeResult(mailbox, result);
   const mismatch = fakePi({
     exec: leadExec(
@@ -1420,18 +1419,15 @@ test("in-place branch history does not reuse a result index", async () => {
   realFs.writeFileSync(identity.piSessionFile, "{}", "utf8");
   resetAgentMailbox(mailbox);
   writeAgentState(mailbox, state);
-  writeResult(mailbox, {
-    version: 4,
-    runId: state.runId,
-    requestId: REQUEST_ID,
-    ownerSessionId: state.ownerSessionId,
-    workspaceId: state.workspaceId,
-    agentLabel: state.agentLabel,
-    paneId: state.paneId,
-    status: "completed",
-    text: "new branch result",
-    completedAt: Date.now(),
-  });
+  writeResult(mailbox, { version: 5, runId: state.runId,
+  requestId: REQUEST_ID,
+  ownerSessionId: state.ownerSessionId,
+  workspaceId: state.workspaceId,
+  agentLabel: state.agentLabel,
+  paneId: state.paneId,
+  status: "completed",
+  text: "new branch result",
+  completedAt: Date.now(), });
   const firstRequestId = randomUUID();
   const secondRequestId = randomUUID();
   const first = {
@@ -1509,25 +1505,22 @@ test("completed and failed one-shot agents converge after durable delivery", asy
     .entries()) {
     resetAgentMailbox(mailbox);
     writeAgentState(mailbox, child);
-    writeResult(mailbox, {
-      version: 4,
-      runId: child.runId,
-      requestId: child.completedRequestId!,
-      ownerSessionId: child.ownerSessionId,
-      workspaceId: child.workspaceId,
-      agentLabel: child.agentLabel,
-      paneId: child.paneId,
-      status: index === 0 ? "completed" : "failed",
-      ...(index === 0
-        ? { text: child.agentLabel }
-        : {
-            error: {
-              code: "empty_result" as const,
-              message: "agent returned no result",
-            },
-          }),
-      completedAt: Date.now(),
-    });
+    writeResult(mailbox, { version: 5, runId: child.runId,
+    requestId: child.completedRequestId!,
+    ownerSessionId: child.ownerSessionId,
+    workspaceId: child.workspaceId,
+    agentLabel: child.agentLabel,
+    paneId: child.paneId,
+    status: index === 0 ? "completed" : "failed",
+    ...(index === 0
+      ? { text: child.agentLabel }
+      : {
+          error: {
+            code: "empty_result" as const,
+            message: "agent returned no result",
+          },
+        }),
+    completedAt: Date.now(), });
   }
   const entries: unknown[] = [
     {
@@ -1595,18 +1588,15 @@ test("one-shot close failure retains the result for exact cleanup retry", async 
   const mailbox = agentMailboxPath(WORKSPACE, label);
   resetAgentMailbox(mailbox);
   writeAgentState(mailbox, child);
-  writeResult(mailbox, {
-    version: 4,
-    runId: child.runId,
-    requestId: REQUEST_ID,
-    ownerSessionId: child.ownerSessionId,
-    workspaceId: child.workspaceId,
-    agentLabel: child.agentLabel,
-    paneId: child.paneId,
-    status: "completed",
-    text: "retry close",
-    completedAt: Date.now(),
-  });
+  writeResult(mailbox, { version: 5, runId: child.runId,
+  requestId: REQUEST_ID,
+  ownerSessionId: child.ownerSessionId,
+  workspaceId: child.workspaceId,
+  agentLabel: child.agentLabel,
+  paneId: child.paneId,
+  status: "completed",
+  text: "retry close",
+  completedAt: Date.now(), });
   const entries: unknown[] = [];
   const lifecycle = cascadeExecutor([child]);
   let failClose = true;
@@ -1686,18 +1676,15 @@ test("delivered-result cascade retries descendant mailbox cleanup failure", asyn
   realFs.mkdirSync(obstruction);
   writeAgentState(parentMailbox, parent);
   writeAgentState(childMailbox, child);
-  writeResult(parentMailbox, {
-    version: 4,
-    runId: parent.runId,
-    requestId: REQUEST_ID,
-    ownerSessionId: parent.ownerSessionId,
-    workspaceId: parent.workspaceId,
-    agentLabel: parent.agentLabel,
-    paneId: parent.paneId,
-    status: "completed",
-    text: "delivered parent result",
-    completedAt: Date.now(),
-  });
+  writeResult(parentMailbox, { version: 5, runId: parent.runId,
+  requestId: REQUEST_ID,
+  ownerSessionId: parent.ownerSessionId,
+  workspaceId: parent.workspaceId,
+  agentLabel: parent.agentLabel,
+  paneId: parent.paneId,
+  status: "completed",
+  text: "delivered parent result",
+  completedAt: Date.now(), });
   const lifecycle = cascadeExecutor([parent, child]);
   const entries: unknown[] = [];
   const pi = fakePi({
@@ -1781,18 +1768,15 @@ test("recovery redelivers an unpersisted child result and then cleans it safely"
   resetAgentMailbox(siblingMailbox);
   writeAgentState(childMailbox, child);
   writeAgentState(siblingMailbox, sibling);
-  const result: ResultRecord = {
-    version: 4,
-    runId: child.runId,
-    requestId: REQUEST_ID,
-    ownerSessionId: child.ownerSessionId,
-    workspaceId: child.workspaceId,
-    agentLabel: child.agentLabel,
-    paneId: child.paneId,
-    status: "completed",
-    text: "durable child result",
-    completedAt: Date.now(),
-  };
+  const result: ResultRecord = { version: 5, runId: child.runId,
+  requestId: REQUEST_ID,
+  ownerSessionId: child.ownerSessionId,
+  workspaceId: child.workspaceId,
+  agentLabel: child.agentLabel,
+  paneId: child.paneId,
+  status: "completed",
+  text: "durable child result",
+  completedAt: Date.now(), };
   writeResult(childMailbox, result);
   const lifecycle = cascadeExecutor([child, sibling]);
   const firstEntries: unknown[] = [];
@@ -1909,18 +1893,15 @@ test("settlement redelivers an unpersisted child result in the same session", as
 
   resetAgentMailbox(mailbox);
   writeAgentState(mailbox, child);
-  writeResult(mailbox, {
-    version: 4,
-    runId: child.runId,
-    requestId: REQUEST_ID,
-    ownerSessionId: child.ownerSessionId,
-    workspaceId: child.workspaceId,
-    agentLabel: child.agentLabel,
-    paneId: child.paneId,
-    status: "completed",
-    text: "durable child result",
-    completedAt: Date.now(),
-  });
+  writeResult(mailbox, { version: 5, runId: child.runId,
+  requestId: REQUEST_ID,
+  ownerSessionId: child.ownerSessionId,
+  workspaceId: child.workspaceId,
+  agentLabel: child.agentLabel,
+  paneId: child.paneId,
+  status: "completed",
+  text: "durable child result",
+  completedAt: Date.now(), });
 
   const lifecycle = cascadeExecutor([child]);
   const entries: unknown[] = [];
@@ -2002,18 +1983,15 @@ test("recovered no-live result removal retry never cleans up a replacement", asy
   const mailbox = agentMailboxPath(WORKSPACE, label);
   resetAgentMailbox(mailbox);
   writeAgentState(mailbox, state);
-  writeResult(mailbox, {
-    version: 4,
-    runId: state.runId,
-    requestId: REQUEST_ID,
-    ownerSessionId: state.ownerSessionId,
-    workspaceId: state.workspaceId,
-    agentLabel: state.agentLabel,
-    paneId: state.paneId,
-    status: "completed",
-    text: "no live agent",
-    completedAt: Date.now(),
-  });
+  writeResult(mailbox, { version: 5, runId: state.runId,
+  requestId: REQUEST_ID,
+  ownerSessionId: state.ownerSessionId,
+  workspaceId: state.workspaceId,
+  agentLabel: state.agentLabel,
+  paneId: state.paneId,
+  status: "completed",
+  text: "no live agent",
+  completedAt: Date.now(), });
   const lifecycle = cascadeExecutor([]);
   const entries: unknown[] = [];
   const pi = fakePi({
@@ -2127,19 +2105,16 @@ test("controller reply submits the normal request and preserves the assignment",
     pendingAskId: "99999999-9999-4999-8999-999999999999",
   };
   writeAgentState(mailbox, waiting);
-  writeAsk(mailbox, {
-    version: 4,
-    askId: waiting.pendingAskId!,
-    requestId: REQUEST_ID,
-    runId: waiting.runId,
-    ownerSessionId: waiting.ownerSessionId,
-    workspaceId: waiting.workspaceId,
-    agentLabel: waiting.agentLabel,
-    paneId: waiting.paneId,
-    piSessionId: waiting.piSessionId,
-    question: "Choose ALPHA or BETA",
-    createdAt: Date.now(),
-  });
+  writeAsk(mailbox, { version: 5, askId: waiting.pendingAskId!,
+  requestId: REQUEST_ID,
+  runId: waiting.runId,
+  ownerSessionId: waiting.ownerSessionId,
+  workspaceId: waiting.workspaceId,
+  agentLabel: waiting.agentLabel,
+  paneId: waiting.paneId,
+  piSessionId: waiting.piSessionId,
+  question: "Choose ALPHA or BETA",
+  createdAt: Date.now(), });
   const replyFile = join(testTmpRoot, `${label}-decision.md`);
   realFs.writeFileSync(replyFile, "decision evidence");
   let submitted: RequestRecord | undefined;
@@ -2149,7 +2124,7 @@ test("controller reply submits the normal request and preserves the assignment",
       "working",
       identity.piSessionId,
       (requestMailbox, marker) => {
-        const requestId = marker.slice("__PI_HERDSMAN_AGENT_V4__:".length);
+        const requestId = marker.slice("__PI_HERDSMAN_AGENT_V5__:".length);
         submitted = readRequest(requestMailbox, requestId);
         const current = readAgentState(requestMailbox)!;
         writeAgentState(requestMailbox, {
@@ -2278,18 +2253,15 @@ test("controller cleanup barrier blocks newer work until stale acknowledgement c
   };
   writeAgentState(mailbox, staleState);
   const stalePath = join(mailbox, `request-${staleRequestId}.json`);
-  writeRequest(mailbox, {
-    version: 4,
-    runId: staleState.runId,
-    requestId: staleRequestId,
-    ownerSessionId: staleState.ownerSessionId,
-    workspaceId: WORKSPACE,
-    agentLabel: label,
-    paneId: identity.paneId,
-    kind: "task",
-    text: "already accepted",
-    createdAt: Date.now(),
-  });
+  writeRequest(mailbox, { version: 5, runId: staleState.runId,
+  requestId: staleRequestId,
+  ownerSessionId: staleState.ownerSessionId,
+  workspaceId: WORKSPACE,
+  agentLabel: label,
+  paneId: identity.paneId,
+  kind: "task",
+  text: "already accepted",
+  createdAt: Date.now(), });
   let submitted: RequestRecord | undefined;
   const pi = fakePi({
     exec: leadExec(
@@ -2297,7 +2269,7 @@ test("controller cleanup barrier blocks newer work until stale acknowledgement c
       "working",
       identity.piSessionId,
       (requestMailbox, marker) => {
-        const requestId = marker.slice("__PI_HERDSMAN_AGENT_V4__:".length);
+        const requestId = marker.slice("__PI_HERDSMAN_AGENT_V5__:".length);
         submitted = readRequest(requestMailbox, requestId);
         const current = readAgentState(requestMailbox)!;
         writeAgentState(requestMailbox, {
@@ -2945,18 +2917,15 @@ test("result cleanup retains durable delivery across agent identity changes", as
   };
   resetAgentMailbox(mailbox);
   writeAgentState(mailbox, initial);
-  writeResult(mailbox, {
-    version: 4,
-    runId: initial.runId,
-    requestId: REQUEST_ID,
-    ownerSessionId: initial.ownerSessionId,
-    workspaceId: initial.workspaceId,
-    agentLabel: initial.agentLabel,
-    paneId: initial.paneId,
-    status: "completed",
-    text: "retain this result",
-    completedAt: Date.now(),
-  });
+  writeResult(mailbox, { version: 5, runId: initial.runId,
+  requestId: REQUEST_ID,
+  ownerSessionId: initial.ownerSessionId,
+  workspaceId: initial.workspaceId,
+  agentLabel: initial.agentLabel,
+  paneId: initial.paneId,
+  status: "completed",
+  text: "retain this result",
+  completedAt: Date.now(), });
   const entries: unknown[] = [];
   const lifecycle = cascadeExecutor([initial]);
   const pi = fakePi({
@@ -3006,18 +2975,15 @@ test("delivered result remains while agent state is active", async () => {
   writeAgentState(parentMailbox, parent);
   const activeState = managedState(label, REQUEST_ID);
   writeAgentState(mailbox, activeState);
-  writeResult(mailbox, {
-    version: 4,
-    runId: AGENT_ID,
-    requestId: REQUEST_ID,
-    ownerSessionId: LEAD_SESSION_ID,
-    workspaceId: WORKSPACE,
-    agentLabel: label,
-    paneId: "registered-pane",
-    status: "completed",
-    text: "anchor",
-    completedAt: Date.now(),
-  });
+  writeResult(mailbox, { version: 5, runId: AGENT_ID,
+  requestId: REQUEST_ID,
+  ownerSessionId: LEAD_SESSION_ID,
+  workspaceId: WORKSPACE,
+  agentLabel: label,
+  paneId: "registered-pane",
+  status: "completed",
+  text: "anchor",
+  completedAt: Date.now(), });
   const entries: unknown[] = [];
   const pi = fakePi({
     entries,
@@ -3070,18 +3036,15 @@ test("result delivery identifies retired sessions and honors the disabled settin
     const mailbox = agentMailboxPath(WORKSPACE, label);
     resetAgentMailbox(mailbox);
     writeAgentState(mailbox, child);
-    writeResult(mailbox, {
-      version: 4,
-      runId: child.runId,
-      requestId: REQUEST_ID,
-      ownerSessionId: child.ownerSessionId,
-      workspaceId: child.workspaceId,
-      agentLabel: child.agentLabel,
-      paneId: child.paneId,
-      status: "completed",
-      text: "completed child work",
-      completedAt: Date.now(),
-    });
+    writeResult(mailbox, { version: 5, runId: child.runId,
+    requestId: REQUEST_ID,
+    ownerSessionId: child.ownerSessionId,
+    workspaceId: child.workspaceId,
+    agentLabel: child.agentLabel,
+    paneId: child.paneId,
+    status: "completed",
+    text: "completed child work",
+    completedAt: Date.now(), });
     nativeSessions.set(identity.piSessionFile!, {
       id: identity.piSessionId,
       path: identity.piSessionFile!,
@@ -3179,18 +3142,15 @@ test("accepted result delivery survives session identity failure in status guida
     completedRequestId: REQUEST_ID,
   };
   writeAgentState(mailbox, resultState);
-  writeResult(mailbox, {
-    version: 4,
-    runId: AGENT_ID,
-    requestId: REQUEST_ID,
-    ownerSessionId: LEAD_SESSION_ID,
-    workspaceId: WORKSPACE,
-    agentLabel: label,
-    paneId: "registered-pane",
-    status: "completed",
-    text: "accepted before status failure",
-    completedAt: Date.now(),
-  });
+  writeResult(mailbox, { version: 5, runId: AGENT_ID,
+  requestId: REQUEST_ID,
+  ownerSessionId: LEAD_SESSION_ID,
+  workspaceId: WORKSPACE,
+  agentLabel: label,
+  paneId: "registered-pane",
+  status: "completed",
+  text: "accepted before status failure",
+  completedAt: Date.now(), });
   const entries: unknown[] = [];
   const context = fakeContext(entries);
   let identityLookupFailed = false;
@@ -3249,18 +3209,15 @@ test("result is removed after agent state reaches completed", async (t) => {
   resetAgentMailbox(mailbox);
   const activeState = managedState(label, REQUEST_ID);
   writeAgentState(mailbox, activeState);
-  writeResult(mailbox, {
-    version: 4,
-    runId: AGENT_ID,
-    requestId: REQUEST_ID,
-    ownerSessionId: LEAD_SESSION_ID,
-    workspaceId: WORKSPACE,
-    agentLabel: label,
-    paneId: "registered-pane",
-    status: "completed",
-    text: "complete",
-    completedAt: Date.now(),
-  });
+  writeResult(mailbox, { version: 5, runId: AGENT_ID,
+  requestId: REQUEST_ID,
+  ownerSessionId: LEAD_SESSION_ID,
+  workspaceId: WORKSPACE,
+  agentLabel: label,
+  paneId: "registered-pane",
+  status: "completed",
+  text: "complete",
+  completedAt: Date.now(), });
   const entries: unknown[] = [];
   const lifecycle = cascadeExecutor([activeState]);
   const pi = fakePi({
@@ -3355,18 +3312,15 @@ test("retained delivery keeps the worker, pane, and mailbox without the result",
   resetAgentMailbox(mailbox);
   const activeState = managedState(label, REQUEST_ID);
   writeAgentState(mailbox, activeState);
-  writeResult(mailbox, {
-    version: 4,
-    runId: AGENT_ID,
-    requestId: REQUEST_ID,
-    ownerSessionId: LEAD_SESSION_ID,
-    workspaceId: WORKSPACE,
-    agentLabel: label,
-    paneId: "registered-pane",
-    status: "completed",
-    text: "complete",
-    completedAt: Date.now(),
-  });
+  writeResult(mailbox, { version: 5, runId: AGENT_ID,
+  requestId: REQUEST_ID,
+  ownerSessionId: LEAD_SESSION_ID,
+  workspaceId: WORKSPACE,
+  agentLabel: label,
+  paneId: "registered-pane",
+  status: "completed",
+  text: "complete",
+  completedAt: Date.now(), });
   const entries: unknown[] = [];
   const lifecycle = cascadeExecutor([activeState]);
   const pi = fakePi({
@@ -3425,18 +3379,15 @@ test("disabled retention still tears the delivered worker down", async (t) => {
   resetAgentMailbox(mailbox);
   const activeState = managedState(label, REQUEST_ID);
   writeAgentState(mailbox, activeState);
-  writeResult(mailbox, {
-    version: 4,
-    runId: AGENT_ID,
-    requestId: REQUEST_ID,
-    ownerSessionId: LEAD_SESSION_ID,
-    workspaceId: WORKSPACE,
-    agentLabel: label,
-    paneId: "registered-pane",
-    status: "completed",
-    text: "complete",
-    completedAt: Date.now(),
-  });
+  writeResult(mailbox, { version: 5, runId: AGENT_ID,
+  requestId: REQUEST_ID,
+  ownerSessionId: LEAD_SESSION_ID,
+  workspaceId: WORKSPACE,
+  agentLabel: label,
+  paneId: "registered-pane",
+  status: "completed",
+  text: "complete",
+  completedAt: Date.now(), });
   const entries: unknown[] = [];
   const lifecycle = cascadeExecutor([activeState]);
   const pi = fakePi({
@@ -3469,6 +3420,62 @@ test("disabled retention still tears the delivered worker down", async (t) => {
     updateConfig("retainWorkers", undefined);
     pi.events.get("session_shutdown")?.[0]();
     resetAgentMailbox(mailbox);
+  }
+});
+
+test("unresolved background work remains active with retention enabled or disabled", async (t) => {
+  setLeadEnvironment();
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+
+  for (const retainWorkers of [true, false]) {
+    updateConfig("retainWorkers", retainWorkers);
+    const label = `waiting-retention-${retainWorkers}`;
+    const mailbox = agentMailboxPath(WORKSPACE, label);
+    resetAgentMailbox(mailbox);
+    const activeState = managedState(label, REQUEST_ID);
+    const provider = { id: "test-background-provider", version: 1 };
+    activeState.backgroundWorkProvider = provider;
+    activeState.backgroundWaiting = {
+      sessionId: activeState.piSessionId,
+      requestId: REQUEST_ID,
+      provider,
+      revision: 1,
+      taskIds: ["bg-1"],
+    };
+    writeAgentState(mailbox, activeState);
+    const entries: unknown[] = [];
+    const lifecycle = cascadeExecutor([activeState]);
+    const pi = fakePi({ entries, exec: lifecycle.exec });
+    registerExtension!(pi.pi as never);
+
+    try {
+      await pi.events.get("session_start")![0](undefined, fakeContext(entries));
+      const listed = await agentTool(pi, "list").execute(
+        "id",
+        {},
+        undefined,
+        undefined,
+        fakeContext(entries),
+      );
+      t.mock.timers.tick(250);
+      for (let index = 0; index < 5; index++)
+        await new Promise<void>((resolve) => setImmediate(resolve));
+
+      assert.equal(listed.details.agents[0]?.state, "waiting");
+      assert.equal(readAgentState(mailbox)?.activeRequestId, REQUEST_ID);
+      assert.deepEqual(
+        readAgentState(mailbox)?.backgroundWaiting?.taskIds,
+        ["bg-1"],
+      );
+      assert.equal(readResult(mailbox, REQUEST_ID), undefined);
+      assert.equal(lifecycle.live.has(label), true);
+      assert.deepEqual(lifecycle.closeOrder, []);
+      assert.equal(pi.calls.some((args) => isPaneClose(args)), false);
+    } finally {
+      updateConfig("retainWorkers", undefined);
+      pi.events.get("session_shutdown")?.[0]();
+      resetAgentMailbox(mailbox);
+    }
   }
 });
 
@@ -3784,18 +3791,15 @@ test("live result cleanup keeps a later request owned by the mailbox", async (t)
     const secondRequestId = randomUUID();
     resetAgentMailbox(mailbox);
     writeAgentState(mailbox, state);
-    writeResult(mailbox, {
-      version: 4,
-      runId: state.runId,
-      requestId: REQUEST_ID,
-      ownerSessionId: state.ownerSessionId,
-      workspaceId: state.workspaceId,
-      agentLabel: state.agentLabel,
-      paneId: state.paneId,
-      status: "completed",
-      text: "delivered root result",
-      completedAt: Date.now(),
-    });
+    writeResult(mailbox, { version: 5, runId: state.runId,
+    requestId: REQUEST_ID,
+    ownerSessionId: state.ownerSessionId,
+    workspaceId: state.workspaceId,
+    agentLabel: state.agentLabel,
+    paneId: state.paneId,
+    status: "completed",
+    text: "delivered root result",
+    completedAt: Date.now(), });
     const lifecycle = cascadeExecutor([state]);
     const entries: unknown[] = [];
     let secondRequestWritten = false;
@@ -3812,31 +3816,25 @@ test("live result cleanup keeps a later request owned by the mailbox", async (t)
           (message as any).customType === "pi-herdsman-agent-result"
         ) {
           secondRequestWritten = true;
-          writeRequest(mailbox, {
-            version: 4,
-            runId: state.runId,
+          writeRequest(mailbox, { version: 5, runId: state.runId,
+          requestId: secondRequestId,
+          ownerSessionId: state.ownerSessionId,
+          workspaceId: state.workspaceId,
+          agentLabel: state.agentLabel,
+          paneId: state.paneId,
+          kind: "task",
+          text: "later request",
+          createdAt: Date.now(), });
+          if (durableSecondResult)
+            writeResult(mailbox, { version: 5, runId: state.runId,
             requestId: secondRequestId,
             ownerSessionId: state.ownerSessionId,
             workspaceId: state.workspaceId,
             agentLabel: state.agentLabel,
             paneId: state.paneId,
-            kind: "task",
-            text: "later request",
-            createdAt: Date.now(),
-          });
-          if (durableSecondResult)
-            writeResult(mailbox, {
-              version: 4,
-              runId: state.runId,
-              requestId: secondRequestId,
-              ownerSessionId: state.ownerSessionId,
-              workspaceId: state.workspaceId,
-              agentLabel: state.agentLabel,
-              paneId: state.paneId,
-              status: "completed",
-              text: "later result",
-              completedAt: Date.now(),
-            });
+            status: "completed",
+            text: "later result",
+            completedAt: Date.now(), });
         }
       },
     });
@@ -3884,18 +3882,15 @@ test("lost result cleanup keeps a later request owned by the mailbox", async (t)
     const secondRequestId = randomUUID();
     resetAgentMailbox(mailbox);
     writeAgentState(mailbox, state);
-    writeResult(mailbox, {
-      version: 4,
-      runId: state.runId,
-      requestId: REQUEST_ID,
-      ownerSessionId: state.ownerSessionId,
-      workspaceId: state.workspaceId,
-      agentLabel: state.agentLabel,
-      paneId: state.paneId,
-      status: "completed",
-      text: "delivered root result",
-      completedAt: Date.now(),
-    });
+    writeResult(mailbox, { version: 5, runId: state.runId,
+    requestId: REQUEST_ID,
+    ownerSessionId: state.ownerSessionId,
+    workspaceId: state.workspaceId,
+    agentLabel: state.agentLabel,
+    paneId: state.paneId,
+    status: "completed",
+    text: "delivered root result",
+    completedAt: Date.now(), });
     const entries: unknown[] = [];
     let secondRequestWritten = false;
     const pi = fakePi({
@@ -3911,31 +3906,25 @@ test("lost result cleanup keeps a later request owned by the mailbox", async (t)
           (message as any).customType === "pi-herdsman-agent-result"
         ) {
           secondRequestWritten = true;
-          writeRequest(mailbox, {
-            version: 4,
-            runId: state.runId,
+          writeRequest(mailbox, { version: 5, runId: state.runId,
+          requestId: secondRequestId,
+          ownerSessionId: state.ownerSessionId,
+          workspaceId: state.workspaceId,
+          agentLabel: state.agentLabel,
+          paneId: state.paneId,
+          kind: "task",
+          text: "later request",
+          createdAt: Date.now(), });
+          if (durableSecondResult)
+            writeResult(mailbox, { version: 5, runId: state.runId,
             requestId: secondRequestId,
             ownerSessionId: state.ownerSessionId,
             workspaceId: state.workspaceId,
             agentLabel: state.agentLabel,
             paneId: state.paneId,
-            kind: "task",
-            text: "later request",
-            createdAt: Date.now(),
-          });
-          if (durableSecondResult)
-            writeResult(mailbox, {
-              version: 4,
-              runId: state.runId,
-              requestId: secondRequestId,
-              ownerSessionId: state.ownerSessionId,
-              workspaceId: state.workspaceId,
-              agentLabel: state.agentLabel,
-              paneId: state.paneId,
-              status: "completed",
-              text: "later result",
-              completedAt: Date.now(),
-            });
+            status: "completed",
+            text: "later result",
+            completedAt: Date.now(), });
         }
       },
     });
@@ -4006,18 +3995,15 @@ test("parent cascade keeps a later parent request during result cleanup", async 
   resetAgentMailbox(childMailbox);
   writeAgentState(parentMailbox, parent);
   writeAgentState(childMailbox, child);
-  writeResult(parentMailbox, {
-    version: 4,
-    runId: parent.runId,
-    requestId: REQUEST_ID,
-    ownerSessionId: parent.ownerSessionId,
-    workspaceId: parent.workspaceId,
-    agentLabel: parent.agentLabel,
-    paneId: parent.paneId,
-    status: "completed",
-    text: "delivered parent result",
-    completedAt: Date.now(),
-  });
+  writeResult(parentMailbox, { version: 5, runId: parent.runId,
+  requestId: REQUEST_ID,
+  ownerSessionId: parent.ownerSessionId,
+  workspaceId: parent.workspaceId,
+  agentLabel: parent.agentLabel,
+  paneId: parent.paneId,
+  status: "completed",
+  text: "delivered parent result",
+  completedAt: Date.now(), });
   const lifecycle = cascadeExecutor([child]);
   const entries: unknown[] = [];
   const pi = fakePi({
@@ -4029,18 +4015,15 @@ test("parent cascade keeps a later parent request during result cleanup", async 
         details: resultEntryDetails(parent, REQUEST_ID),
       });
       if ((message as any).customType === "pi-herdsman-agent-result")
-        writeRequest(parentMailbox, {
-          version: 4,
-          runId: parent.runId,
-          requestId: secondRequestId,
-          ownerSessionId: parent.ownerSessionId,
-          workspaceId: parent.workspaceId,
-          agentLabel: parent.agentLabel,
-          paneId: parent.paneId,
-          kind: "task",
-          text: "later parent request",
-          createdAt: Date.now(),
-        });
+        writeRequest(parentMailbox, { version: 5, runId: parent.runId,
+        requestId: secondRequestId,
+        ownerSessionId: parent.ownerSessionId,
+        workspaceId: parent.workspaceId,
+        agentLabel: parent.agentLabel,
+        paneId: parent.paneId,
+        kind: "task",
+        text: "later parent request",
+        createdAt: Date.now(), });
     },
   });
   registerExtension!(pi.pi as never);
@@ -4093,18 +4076,15 @@ test("completed lost parent cleanup resolves descendants before its mailbox", as
     resetAgentMailbox(childMailbox);
     writeAgentState(parentMailbox, parent);
     writeAgentState(childMailbox, child);
-    writeResult(parentMailbox, {
-      version: 4,
-      runId: parent.runId,
-      requestId: REQUEST_ID,
-      ownerSessionId: parent.ownerSessionId,
-      workspaceId: parent.workspaceId,
-      agentLabel: parent.agentLabel,
-      paneId: parent.paneId,
-      status: "completed",
-      text: "completed before the parent pane disappeared",
-      completedAt: Date.now(),
-    });
+    writeResult(parentMailbox, { version: 5, runId: parent.runId,
+    requestId: REQUEST_ID,
+    ownerSessionId: parent.ownerSessionId,
+    workspaceId: parent.workspaceId,
+    agentLabel: parent.agentLabel,
+    paneId: parent.paneId,
+    status: "completed",
+    text: "completed before the parent pane disappeared",
+    completedAt: Date.now(), });
     const lifecycle = cascadeExecutor(childLive ? [child] : []);
     const entries: unknown[] = [];
     const pi = fakePi({
@@ -4151,18 +4131,15 @@ test("automatic close invokes the exact lifecycle only after live identity proof
     completedRequestId: REQUEST_ID,
   };
   writeAgentState(mailbox, resultState);
-  writeResult(mailbox, {
-    version: 4,
-    runId: AGENT_ID,
-    requestId: REQUEST_ID,
-    ownerSessionId: LEAD_SESSION_ID,
-    workspaceId: WORKSPACE,
-    agentLabel: label,
-    paneId: identity.paneId,
-    status: "completed",
-    text: "close me",
-    completedAt: Date.now(),
-  });
+  writeResult(mailbox, { version: 5, runId: AGENT_ID,
+  requestId: REQUEST_ID,
+  ownerSessionId: LEAD_SESSION_ID,
+  workspaceId: WORKSPACE,
+  agentLabel: label,
+  paneId: identity.paneId,
+  status: "completed",
+  text: "close me",
+  completedAt: Date.now(), });
   let live = true;
   let closeCalls = 0;
   let closeArgs: string[] | undefined;
@@ -4389,18 +4366,15 @@ test("managed child automatic cleanup respects the parent delegation lock", asyn
   resetAgentMailbox(childMailbox);
   writeAgentState(parentMailbox, parent);
   writeAgentState(childMailbox, child);
-  writeResult(childMailbox, {
-    version: 4,
-    runId: child.runId,
-    requestId: REQUEST_ID,
-    ownerSessionId: child.ownerSessionId,
-    workspaceId: child.workspaceId,
-    agentLabel: child.agentLabel,
-    paneId: child.paneId,
-    status: "completed",
-    text: "close the child",
-    completedAt: Date.now(),
-  });
+  writeResult(childMailbox, { version: 5, runId: child.runId,
+  requestId: REQUEST_ID,
+  ownerSessionId: child.ownerSessionId,
+  workspaceId: child.workspaceId,
+  agentLabel: child.agentLabel,
+  paneId: child.paneId,
+  status: "completed",
+  text: "close the child",
+  completedAt: Date.now(), });
   const entries: unknown[] = [
     {
       type: "custom",
@@ -5375,19 +5349,16 @@ test("delivered owner asks repeat without duplicating first delivery", async (t)
   };
   const mailbox = agentMailboxPath(WORKSPACE, label);
   writeAgentState(mailbox, state);
-  const ask = {
-    version: 4 as const,
-    askId: state.pendingAskId!,
-    requestId: REQUEST_ID,
-    runId: state.runId,
-    ownerSessionId: state.ownerSessionId,
-    workspaceId: state.workspaceId,
-    agentLabel: state.agentLabel,
-    paneId: state.paneId,
-    piSessionId: state.piSessionId,
-    question: "Choose ALPHA or BETA",
-    createdAt: now,
-  };
+  const ask = { version: 5 as const, askId: state.pendingAskId!,
+  requestId: REQUEST_ID,
+  runId: state.runId,
+  ownerSessionId: state.ownerSessionId,
+  workspaceId: state.workspaceId,
+  agentLabel: state.agentLabel,
+  paneId: state.paneId,
+  piSessionId: state.piSessionId,
+  question: "Choose ALPHA or BETA",
+  createdAt: now, };
   writeAsk(mailbox, ask);
   const entries = [{ customType: "pi-herdsman-agent-ask", details: ask }];
   const pi = fakePi({
@@ -5447,18 +5418,15 @@ test("old unacknowledged requests get attention without being resubmitted", asyn
   const identity = recoveryIdentity(label);
   const state = managedState(label, REQUEST_ID, identity);
   const mailbox = agentMailboxPath(WORKSPACE, label);
-  const request: RequestRecord = {
-    version: 4,
-    runId: state.runId,
-    requestId: REQUEST_ID,
-    ownerSessionId: state.ownerSessionId,
-    workspaceId: state.workspaceId,
-    agentLabel: state.agentLabel,
-    paneId: state.paneId,
-    kind: "task",
-    text: "retain this exact intent",
-    createdAt: Date.now() - 11 * 60_000,
-  };
+  const request: RequestRecord = { version: 5, runId: state.runId,
+  requestId: REQUEST_ID,
+  ownerSessionId: state.ownerSessionId,
+  workspaceId: state.workspaceId,
+  agentLabel: state.agentLabel,
+  paneId: state.paneId,
+  kind: "task",
+  text: "retain this exact intent",
+  createdAt: Date.now() - 11 * 60_000, };
   writeAgentState(mailbox, state);
   writeRequest(mailbox, request);
   const pi = fakePi({
@@ -5755,18 +5723,15 @@ test("lost parent health attention omits close when a descendant has an unread d
   resetAgentMailbox(childMailbox);
   writeAgentState(parentMailbox, parent);
   writeAgentState(childMailbox, child);
-  writeResult(childMailbox, {
-    version: 4,
-    runId: child.runId,
-    requestId: REQUEST_ID,
-    ownerSessionId: child.ownerSessionId,
-    workspaceId: child.workspaceId,
-    agentLabel: child.agentLabel,
-    paneId: child.paneId,
-    status: "completed",
-    text: "child durable result",
-    completedAt: Date.now(),
-  });
+  writeResult(childMailbox, { version: 5, runId: child.runId,
+  requestId: REQUEST_ID,
+  ownerSessionId: child.ownerSessionId,
+  workspaceId: child.workspaceId,
+  agentLabel: child.agentLabel,
+  paneId: child.paneId,
+  status: "completed",
+  text: "child durable result",
+  completedAt: Date.now(), });
   const pi = fakePi({ exec: cascadeExecutor([child]).exec });
   registerExtension!(pi.pi as never);
   try {
@@ -5804,18 +5769,15 @@ test("live agents with an unread durable result do not advertise close", async (
   const mailbox = agentMailboxPath(WORKSPACE, label);
   resetAgentMailbox(mailbox);
   writeAgentState(mailbox, state);
-  writeResult(mailbox, {
-    version: 4,
-    runId: state.runId,
-    requestId: REQUEST_ID,
-    ownerSessionId: state.ownerSessionId,
-    workspaceId: state.workspaceId,
-    agentLabel: state.agentLabel,
-    paneId: state.paneId,
-    status: "completed",
-    text: "durable result",
-    completedAt: Date.now(),
-  });
+  writeResult(mailbox, { version: 5, runId: state.runId,
+  requestId: REQUEST_ID,
+  ownerSessionId: state.ownerSessionId,
+  workspaceId: state.workspaceId,
+  agentLabel: state.agentLabel,
+  paneId: state.paneId,
+  status: "completed",
+  text: "durable result",
+  completedAt: Date.now(), });
   const pi = fakePi({ exec: cascadeExecutor([state]).exec });
   registerExtension!(pi.pi as never);
   try {
@@ -5863,18 +5825,15 @@ test("lead list hides close when a descendant has an unread durable result", asy
   resetAgentMailbox(childMailbox);
   writeAgentState(parentMailbox, parent);
   writeAgentState(childMailbox, child);
-  writeResult(childMailbox, {
-    version: 4,
-    runId: child.runId,
-    requestId: REQUEST_ID,
-    ownerSessionId: child.ownerSessionId,
-    workspaceId: child.workspaceId,
-    agentLabel: child.agentLabel,
-    paneId: child.paneId,
-    status: "completed",
-    text: "child durable result",
-    completedAt: Date.now(),
-  });
+  writeResult(childMailbox, { version: 5, runId: child.runId,
+  requestId: REQUEST_ID,
+  ownerSessionId: child.ownerSessionId,
+  workspaceId: child.workspaceId,
+  agentLabel: child.agentLabel,
+  paneId: child.paneId,
+  status: "completed",
+  text: "child durable result",
+  completedAt: Date.now(), });
   const pi = fakePi({
     exec: cascadeExecutor([parent, child]).exec,
   });
@@ -5908,18 +5867,15 @@ test("lost agents with an unread durable result cannot be closed", async () => {
   const mailbox = agentMailboxPath(WORKSPACE, label);
   resetAgentMailbox(mailbox);
   writeAgentState(mailbox, state);
-  writeResult(mailbox, {
-    version: 4,
-    runId: state.runId,
-    requestId: REQUEST_ID,
-    ownerSessionId: state.ownerSessionId,
-    workspaceId: state.workspaceId,
-    agentLabel: state.agentLabel,
-    paneId: state.paneId,
-    status: "completed",
-    text: "durable result",
-    completedAt: Date.now(),
-  });
+  writeResult(mailbox, { version: 5, runId: state.runId,
+  requestId: REQUEST_ID,
+  ownerSessionId: state.ownerSessionId,
+  workspaceId: state.workspaceId,
+  agentLabel: state.agentLabel,
+  paneId: state.paneId,
+  status: "completed",
+  text: "durable result",
+  completedAt: Date.now(), });
   const pi = fakePi({ exec: cascadeExecutor([]).exec });
   registerExtension!(pi.pi as never);
   try {
@@ -5980,18 +5936,15 @@ test("cascade preflight keeps descendants when a lost parent has a pending resul
     completedRequestId: REQUEST_ID,
   });
   writeAgentState(childMailbox, child);
-  writeResult(parentMailbox, {
-    version: 4,
-    runId: parent.runId,
-    requestId: REQUEST_ID,
-    ownerSessionId: parent.ownerSessionId,
-    workspaceId: parent.workspaceId,
-    agentLabel: parent.agentLabel,
-    paneId: parent.paneId,
-    status: "completed",
-    text: "parent durable result",
-    completedAt: Date.now(),
-  });
+  writeResult(parentMailbox, { version: 5, runId: parent.runId,
+  requestId: REQUEST_ID,
+  ownerSessionId: parent.ownerSessionId,
+  workspaceId: parent.workspaceId,
+  agentLabel: parent.agentLabel,
+  paneId: parent.paneId,
+  status: "completed",
+  text: "parent durable result",
+  completedAt: Date.now(), });
   const lifecycle = cascadeExecutor([child]);
   const pi = fakePi({ exec: lifecycle.exec });
   registerExtension!(pi.pi as never);
@@ -6037,18 +5990,15 @@ test("lost close fails closed when a result appears during its final proof", asy
       const result = cascadeExecutor([]).exec(command, args, options);
       if (command === "herdr" && isApiSnapshot(args) && ++snapshots === 5) {
         writeAgentState(mailbox, racedState);
-        writeResult(mailbox, {
-          version: 4,
-          runId: state.runId,
-          requestId: REQUEST_ID,
-          ownerSessionId: state.ownerSessionId,
-          workspaceId: state.workspaceId,
-          agentLabel: state.agentLabel,
-          paneId: state.paneId,
-          status: "completed",
-          text: "raced durable result",
-          completedAt: Date.now(),
-        });
+        writeResult(mailbox, { version: 5, runId: state.runId,
+        requestId: REQUEST_ID,
+        ownerSessionId: state.ownerSessionId,
+        workspaceId: state.workspaceId,
+        agentLabel: state.agentLabel,
+        paneId: state.paneId,
+        status: "completed",
+        text: "raced durable result",
+        completedAt: Date.now(), });
       }
       return result;
     },
@@ -6071,7 +6021,9 @@ test("lost close fails closed when a result appears during its final proof", asy
       fakeContext(),
     );
     assert.equal(closed.details.error.category, "target_ambiguous");
-    assert.deepEqual(readAgentState(mailbox), racedState);
+    const completedState = { ...racedState };
+    delete completedState.acceptedAssignment;
+    assert.deepEqual(readAgentState(mailbox), completedState);
     assert.ok(readResult(mailbox, REQUEST_ID));
   } finally {
     pi.events.get("session_shutdown")?.[0]();
@@ -7225,6 +7177,8 @@ type SoftWindowSpec = {
   armedAt?: number;
   windowMs?: number;
   lastActivityAt?: number;
+  waiting?: boolean;
+  lifecycle?: "idle" | "working";
 };
 
 // Build a live multi-agent controller fixture whose snapshot lists every spec,
@@ -7238,8 +7192,23 @@ function softDeadlineFixture(specs: SoftWindowSpec[]) {
     identity.piSessionId = randomUUID();
     const mailbox = agentMailboxPath(WORKSPACE, spec.label);
     resetAgentMailbox(mailbox);
+    const state = managedState(spec.label, spec.requestId, identity);
+    if (spec.waiting) {
+      const provider = {
+        id: `soft-deadline-provider-${spec.label}`,
+        version: 1,
+      };
+      state.backgroundWorkProvider = provider;
+      state.backgroundWaiting = {
+        sessionId: identity.piSessionId,
+        requestId: spec.requestId,
+        provider,
+        revision: 1,
+        taskIds: ["background-task"],
+      };
+    }
     writeAgentState(mailbox, {
-      ...managedState(spec.label, spec.requestId, identity),
+      ...state,
       lastActivityAt: spec.lastActivityAt ?? Date.now(),
       ...(spec.armedAt === undefined
         ? {}
@@ -7275,13 +7244,13 @@ function softDeadlineFixture(specs: SoftWindowSpec[]) {
       // treats the pane as unknown and skips the episode.
       exec: leadExec(
         spec.label,
-        "working",
+        spec.lifecycle ?? "working",
         identity.piSessionId,
         undefined,
         identity.piSessionId,
         identity,
         true,
-        "working",
+        spec.lifecycle ?? "working",
       ),
     };
   });
@@ -7296,7 +7265,7 @@ function softDeadlineFixture(specs: SoftWindowSpec[]) {
               JSON.parse(
                 listResponse(
                   fixture.label,
-                  "working",
+                  fixture.spec.lifecycle ?? "working",
                   fixture.identity.piSessionId,
                   fixture.identity,
                 ),
@@ -7307,7 +7276,7 @@ function softDeadlineFixture(specs: SoftWindowSpec[]) {
             workspace_id: WORKSPACE,
             cwd: "/tmp",
             agent: fixture.label,
-            agent_status: "working",
+            agent_status: fixture.spec.lifecycle ?? "working",
             agent_session: {
               source: "herdr:pi",
               agent: "pi",
@@ -7368,6 +7337,62 @@ test("two overdue workers produce one digest covering both", async (t) => {
     String((digests[0] as any).content),
     /no Agent was aborted, steered, or closed/i,
   );
+  pi.events.get("session_shutdown")?.[0]();
+  for (const fixture of fixtures) resetAgentMailbox(fixture.mailbox);
+});
+
+test("background-waiting workers keep digest/extend eligibility but reject interrupt", async (t) => {
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const label = "soft-waiting-worker";
+  const requestId = randomUUID();
+  const { pi, fixtures, entries } = softDeadlineFixture([
+    {
+      label,
+      requestId,
+      armedAt: now - 400_000,
+      waiting: true,
+      lifecycle: "idle",
+    },
+  ]);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  await pi.events.get("session_start")![0](undefined, fakeContext(entries));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const listed = await agentTool(pi, "list").execute(
+    "waiting-list",
+    {},
+    undefined,
+    undefined,
+    fakeContext(entries),
+  );
+  const worker = listed.details.agents.find(
+    (agent: any) => agent.agent === label,
+  );
+  assert.equal(worker?.state, "waiting");
+  assert.ok(worker?.available_tools.includes("agent_inspect"));
+  assert.ok(worker?.available_tools.includes("agent_steer"));
+  assert.ok(worker?.available_tools.includes("agent_extend"));
+  assert.equal(worker?.available_tools.includes("agent_interrupt"), false);
+  assert.equal(worker?.available_tools.includes("agent_continue"), false);
+  // Explicit close remains the cancellation/abandon path; it is not Clear idle.
+  assert.ok(worker?.available_tools.includes("agent_close"));
+
+  const digest = softDigests(pi)[0] as any;
+  const entry = digest.details.entries.find(
+    (candidate: any) => candidate.agentLabel === label,
+  );
+  assert.deepEqual(entry.availableActions, ["inspect", "steer", "extend", "close"]);
+  const refused = await agentTool(pi, "interrupt").execute(
+    "waiting-interrupt",
+    { agent: label, message: "Stop the waiting assignment." },
+    undefined,
+    undefined,
+    fakeContext(entries),
+  );
+  assert.equal(refused.details.error.category, "agent_busy");
+  assert.equal(readAgentState(fixtures[0]!.mailbox)?.activeRequestId, requestId);
+
   pi.events.get("session_shutdown")?.[0]();
   for (const fixture of fixtures) resetAgentMailbox(fixture.mailbox);
 });
@@ -7442,19 +7467,16 @@ test("a digest entry for a worker awaiting an answer lists reply, not interrupt"
   const identity = recoveryIdentity(label);
   const mailbox = agentMailboxPath(WORKSPACE, label);
   resetAgentMailbox(mailbox);
-  const ask = {
-    version: 4 as const,
-    askId: randomUUID(),
-    requestId: REQUEST_ID,
-    runId: AGENT_ID,
-    ownerSessionId: LEAD_SESSION_ID,
-    workspaceId: WORKSPACE,
-    agentLabel: label,
-    paneId: identity.paneId,
-    piSessionId: identity.piSessionId,
-    question: "Keep waiting or change direction?",
-    createdAt: now - 60_000,
-  };
+  const ask = { version: 5 as const, askId: randomUUID(),
+  requestId: REQUEST_ID,
+  runId: AGENT_ID,
+  ownerSessionId: LEAD_SESSION_ID,
+  workspaceId: WORKSPACE,
+  agentLabel: label,
+  paneId: identity.paneId,
+  piSessionId: identity.piSessionId,
+  question: "Keep waiting or change direction?",
+  createdAt: now - 60_000, };
   writeAgentState(mailbox, {
     ...managedState(label, REQUEST_ID, identity),
     lastActivityAt: now,
@@ -7636,18 +7658,15 @@ test("a resolved assignment is never included in a later digest", async (t) => {
         completedRequestId: REQUEST_ID,
         updatedAt: Date.now(),
       });
-      writeResult(mailbox, {
-        version: 4,
-        runId: armed.runId,
-        requestId: REQUEST_ID,
-        ownerSessionId: armed.ownerSessionId,
-        workspaceId: armed.workspaceId,
-        agentLabel: armed.agentLabel,
-        paneId: armed.paneId,
-        status: "completed",
-        text: "delivered",
-        completedAt: Date.now(),
-      });
+      writeResult(mailbox, { version: 5, runId: armed.runId,
+      requestId: REQUEST_ID,
+      ownerSessionId: armed.ownerSessionId,
+      workspaceId: armed.workspaceId,
+      agentLabel: armed.agentLabel,
+      paneId: armed.paneId,
+      status: "completed",
+      text: "delivered",
+      completedAt: Date.now(), });
       watchedResultPaths.get(`${mailbox}/result-${REQUEST_ID}.json`)?.({}, {});
       for (let index = 0; index < 12; index++)
         await new Promise<void>((resolve) => setImmediate(resolve));

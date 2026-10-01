@@ -5,6 +5,13 @@ import { join, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { mock, test } from "node:test";
 import { Value } from "typebox/value";
+import {
+  DELEGATION_BRIEF_EXAMPLES,
+  normalizeDelegationBrief,
+  parseDelegationBrief,
+} from "./briefs.ts";
+import { DEFAULT_RESPONSE_CONTRACT } from "./response-contracts.ts";
+import "./support.ts";
 import type {
   AskRecord,
   RequestRecord,
@@ -12,6 +19,7 @@ import type {
   ManagedAgentState,
 } from "./mailbox.ts";
 import { claimProcessLock } from "./lock.ts";
+import { registerBackgroundWorkProvider } from "../../pi-bash-processes/extensions/background-work.ts";
 import support, {
   CHILD_SESSION_ID,
   REQUEST_ID,
@@ -46,14 +54,50 @@ import support, {
   agentMailboxPath,
   writeAsk,
   writeMetadataTask,
-  writeRequest,
+  writeRequest as writeMailboxRequest,
   writeResult,
   writeAgentState,
   testTmpRoot,
 } from "./support.ts";
+const { createAcceptedAssignmentContract } = await import(
+  "./response-validation.ts"
+);
+const { writePrivatePromptSnapshots } = await import(
+  "./agent-definitions.ts"
+);
 const { updateConfig } = await import("./config.ts");
+function writeRequest(mailbox: string, request: RequestRecord): void {
+  if (
+    request.version === 5 &&
+    (request.kind === "task" || request.kind === "interrupt") &&
+    !request.acceptedAssignment
+  ) {
+    const state = readAgentState(mailbox);
+    request = {
+      ...request,
+      acceptedAssignment: createAcceptedAssignmentContract(
+        request.kind === "task"
+          ? request.requestId
+          : (state?.activeRequestId ??
+            state?.completedRequestId ??
+            request.requestId),
+        parseDelegationBrief(DELEGATION_BRIEF_EXAMPLES.common),
+        DEFAULT_RESPONSE_CONTRACT,
+        process.cwd(),
+        1024 * 1024,
+      ),
+    };
+  }
+  writeMailboxRequest(mailbox, request);
+}
 const agentTool = (pi: ReturnType<typeof fakePi>, name: string) =>
   pi.tools.find((candidate) => candidate.name === `agent_${name}`)!;
+
+// Worker mode registers more than one session_shutdown listener; tests must
+// run them all or a surviving request pump leaks into the next test.
+function fireShutdown(agent: { events: Map<string, Array<(...args: never[]) => unknown>> }): void {
+  for (const listener of agent.events.get("session_shutdown") ?? []) listener();
+}
 
 test("managed agents cancel native session replacement", () => {
   setAgentEnvironment();
@@ -67,7 +111,7 @@ test("managed agents cancel native session replacement", () => {
     agent.events.get("session_before_fork")![0](undefined, fakeContext()),
     { cancel: true },
   );
-  agent.events.get("session_shutdown")?.[0]();
+  fireShutdown(agent);
 });
 
 test("managed requests pump through Pi semantic input", async (t) => {
@@ -88,7 +132,7 @@ test("managed requests pump through Pi semantic input", async (t) => {
     await agent.events.get("session_start")![0](undefined, context);
     const state = readAgentState(mailbox)!;
     const request: RequestRecord = {
-      version: 4,
+      version: 5,
       runId: state.runId,
       requestId: randomUUID(),
       ownerSessionId: state.ownerSessionId,
@@ -173,9 +217,558 @@ test("managed requests pump through Pi semantic input", async (t) => {
       },
     ]);
   } finally {
-    agent.events.get("session_shutdown")?.[0]();
+    fireShutdown(agent);
     resetAgentMailbox(mailbox);
   }
+});
+
+test("a previously notified terminal task remains waiting until result review", async () => {
+  const mailbox = setAgentEnvironment("background-waiting-agent");
+  const providerId = "test-background-provider";
+  const agent = fakePi();
+  let revision = 1;
+  let outstanding: { taskId: string; state: string; reason: string }[] = [];
+  let snapshotsUntilLateWork = 0;
+  let protectedAssignment = false;
+  let providerRegistration = registerBackgroundWorkProvider(
+    agent.pi.events as never,
+    {
+      id: providerId,
+      version: 1,
+      snapshot(scope: { sessionId: string; requestId: string }) {
+        if (snapshotsUntilLateWork > 0) {
+          snapshotsUntilLateWork -= 1;
+          if (snapshotsUntilLateWork === 0) {
+            outstanding = [
+              {
+                taskId: "late-task",
+                state: "running",
+                reason: "task spawned during final response",
+              },
+            ];
+            revision++;
+          }
+        }
+        return {
+          provider: { id: providerId, version: 1 },
+          sessionId: scope.sessionId,
+          requestId: scope.requestId,
+          revision,
+          reconciliation: { state: "ready" },
+          outstanding,
+        };
+      },
+      bind() {
+        return { ok: true };
+      },
+      protect(_scope: unknown, protect: boolean) {
+        protectedAssignment = protect;
+        return { ok: true };
+      },
+    },
+  );
+  registerExtension!(agent.pi as never);
+  const context = fakeAgentContext();
+  context.mode = "rpc";
+  try {
+    await agent.events.get("session_start")![0](undefined, context);
+    const initial = readAgentState(mailbox)!;
+    const request: RequestRecord = {
+      version: 5,
+      runId: initial.runId,
+      requestId: randomUUID(),
+      ownerSessionId: initial.ownerSessionId,
+      workspaceId: initial.workspaceId,
+      agentLabel: initial.agentLabel,
+      paneId: initial.paneId,
+      kind: "task",
+      text: "retrieve and review the task result",
+      createdAt: Date.now(),
+    };
+    writeRequest(mailbox, request);
+    assert.deepEqual(
+      agent.events.get("input")![0](
+        { text: controlMarker(request.requestId) },
+        context,
+      ),
+      { action: "transform", text: request.text },
+      JSON.stringify(readAgentState(mailbox)?.lastAck),
+    );
+    assert.deepEqual(readAgentState(mailbox)?.backgroundWorkProvider, {
+      id: providerId,
+      version: 1,
+    });
+    assert.equal(protectedAssignment, true);
+
+    outstanding = [
+      {
+        taskId: "terminal-task",
+        state: "awaiting-result-review",
+        reason: "exit wake was already delivered",
+      },
+    ];
+    revision++;
+    agent.events.get("message_end")![0](
+      { message: { role: "assistant", content: "premature completion" } },
+      context,
+    );
+    await agent.events.get("agent_settled")![0](undefined, context);
+
+    const waiting = readAgentState(mailbox)!;
+    assert.equal(readResult(mailbox, request.requestId), undefined);
+    assert.equal(waiting.activeRequestId, request.requestId);
+    assert.equal(waiting.completedRequestId, undefined);
+    assert.deepEqual(waiting.backgroundWaiting, {
+      sessionId: context.sessionManager.getSessionId(),
+      requestId: request.requestId,
+      provider: { id: providerId, version: 1 },
+      revision,
+      taskIds: ["terminal-task"],
+    });
+
+    outstanding = [];
+    revision++;
+    assert.equal(
+      providerRegistration.notifyChange({
+        sessionId: context.sessionManager.getSessionId(),
+        requestId: request.requestId,
+      }),
+      true,
+    );
+    assert.deepEqual(readAgentState(mailbox)?.backgroundWaiting, {
+      sessionId: context.sessionManager.getSessionId(),
+      requestId: request.requestId,
+      provider: { id: providerId, version: 1 },
+      revision,
+      taskIds: [],
+    });
+    assert.deepEqual(agent.sentUsers, []);
+
+    outstanding = [
+      {
+        taskId: "flushing-task",
+        state: "flushing",
+        reason: "result bytes are not yet reviewable",
+      },
+    ];
+    revision++;
+    agent.events.get("message_end")![0](
+      {
+        message: {
+          role: "assistant",
+          content: "continue waiting while output flushes",
+        },
+      },
+      context,
+    );
+    await agent.events.get("agent_settled")![0](undefined, context);
+    assert.equal(readResult(mailbox, request.requestId), undefined);
+    assert.deepEqual(readAgentState(mailbox)?.backgroundWaiting?.taskIds, [
+      "flushing-task",
+    ]);
+
+    // The already-delivered exit wake is not duplicated; the unresolved result
+    // still keeps the assignment open for the owner to steer or the worker to resume.
+    await agent.events.get("agent_settled")![0](undefined, context);
+    assert.equal(readResult(mailbox, request.requestId), undefined);
+    assert.deepEqual(agent.sentUsers, []);
+
+    outstanding = [];
+    revision++;
+    snapshotsUntilLateWork = 2;
+    agent.events.get("message_end")![0](
+      { message: { role: "assistant", content: "reviewed task result" } },
+      context,
+    );
+    await agent.events.get("agent_settled")![0](undefined, context);
+    assert.equal(readResult(mailbox, request.requestId), undefined);
+    assert.deepEqual(readAgentState(mailbox)?.backgroundWaiting?.taskIds, [
+      "late-task",
+    ]);
+
+    outstanding = [];
+    revision++;
+    agent.events.get("message_end")![0](
+      { message: { role: "assistant", content: "reviewed late task result" } },
+      context,
+    );
+    await agent.events.get("agent_settled")![0](undefined, context);
+    assert.equal(
+      readResult(mailbox, request.requestId)?.text,
+      "reviewed late task result",
+    );
+    const settled = readAgentState(mailbox)!;
+    assert.equal(settled.activeRequestId, undefined);
+    assert.equal(settled.backgroundWaiting, undefined);
+    assert.equal(settled.backgroundWorkProvider, undefined);
+    removeResult(mailbox, request.requestId);
+
+    const driftRequest: RequestRecord = {
+      version: 5,
+      runId: settled.runId,
+      requestId: randomUUID(),
+      ownerSessionId: settled.ownerSessionId,
+      workspaceId: settled.workspaceId,
+      agentLabel: settled.agentLabel,
+      paneId: settled.paneId,
+      kind: "task",
+      text: "verify provider identity before publication",
+      createdAt: Date.now(),
+    };
+    writeRequest(mailbox, driftRequest);
+    assert.deepEqual(
+      agent.events.get("input")![0](
+        { text: controlMarker(driftRequest.requestId) },
+        context,
+      ),
+      { action: "transform", text: driftRequest.text },
+    );
+    assert.equal(readAgentState(mailbox)?.backgroundWorkProvider?.version, 1);
+
+    providerRegistration.dispose();
+    providerRegistration = registerBackgroundWorkProvider(
+      agent.pi.events as never,
+      {
+        id: providerId,
+        version: 2,
+        snapshot(scope: { sessionId: string; requestId: string }) {
+          return {
+            provider: { id: providerId, version: 2 },
+            sessionId: scope.sessionId,
+            requestId: scope.requestId,
+            revision: 1,
+            reconciliation: { state: "ready" },
+            outstanding: [],
+          };
+        },
+        bind() {
+          return { ok: true };
+        },
+        protect() {
+          return { ok: true };
+        },
+      },
+    );
+    agent.events.get("message_end")![0](
+      { message: { role: "assistant", content: "stale provider response" } },
+      context,
+    );
+    await agent.events.get("agent_settled")![0](undefined, context);
+    const blocked = readAgentState(mailbox)!;
+    assert.equal(readResult(mailbox, driftRequest.requestId), undefined);
+    assert.equal(blocked.activeRequestId, driftRequest.requestId);
+    assert.equal(blocked.backgroundWaiting?.provider.version, 1);
+  } finally {
+    fireShutdown(agent);
+    providerRegistration.dispose();
+    resetAgentMailbox(mailbox);
+  }
+});
+
+test("post-review settlement requires a fresh response in either listener order", async () => {
+  for (const listenerOrder of ["provider-first", "herdsman-first"] as const) {
+    const mailbox = setAgentEnvironment(`post-review-${listenerOrder}`);
+    const providerId = `post-review-provider-${listenerOrder}`;
+    const agent = fakePi();
+    let revision = 1;
+    let resolveOnNextSettlement = false;
+    let outstanding = [
+      {
+        taskId: "review-result",
+        state: "awaiting-result-review",
+        reason: "terminal output still needs a successful read",
+      },
+    ];
+    const resolveBackgroundWork = () => {
+      if (!resolveOnNextSettlement) return;
+      resolveOnNextSettlement = false;
+      outstanding = [];
+      revision++;
+    };
+    if (listenerOrder === "provider-first") {
+      agent.pi.on("agent_settled", resolveBackgroundWork);
+    }
+    const providerRegistration = registerBackgroundWorkProvider(
+      agent.pi.events as never,
+      {
+        id: providerId,
+        version: 1,
+        snapshot(scope: { sessionId: string; requestId: string }) {
+          return {
+            provider: { id: providerId, version: 1 },
+            sessionId: scope.sessionId,
+            requestId: scope.requestId,
+            revision,
+            reconciliation: { state: "ready" },
+            outstanding,
+          };
+        },
+        bind() {
+          return { ok: true };
+        },
+        protect() {
+          return { ok: true };
+        },
+      },
+    );
+    registerExtension!(agent.pi as never);
+    if (listenerOrder === "herdsman-first") {
+      agent.pi.on("agent_settled", resolveBackgroundWork);
+    }
+    const context = fakeAgentContext();
+    context.mode = "rpc";
+    const settleListeners = async () => {
+      for (const listener of agent.events.get("agent_settled") ?? []) {
+        await listener(undefined, context);
+      }
+    };
+    try {
+      await agent.events.get("session_start")![0](undefined, context);
+      const initial = readAgentState(mailbox)!;
+      const request: RequestRecord = {
+        version: 5,
+        runId: initial.runId,
+        requestId: randomUUID(),
+        ownerSessionId: initial.ownerSessionId,
+        workspaceId: initial.workspaceId,
+        agentLabel: initial.agentLabel,
+        paneId: initial.paneId,
+        kind: "task",
+        text: "review the completed task before answering",
+        createdAt: Date.now(),
+      };
+      writeRequest(mailbox, request);
+      assert.deepEqual(
+        agent.events.get("input")![0](
+          { text: controlMarker(request.requestId) },
+          context,
+        ),
+        { action: "transform", text: request.text },
+      );
+
+      agent.events.get("message_end")![0](
+        { message: { role: "assistant", content: "I will retry the failed result read." } },
+        context,
+      );
+      await settleListeners();
+      assert.equal(readResult(mailbox, request.requestId), undefined);
+      assert.deepEqual(
+        readAgentState(mailbox)?.backgroundWaiting?.taskIds,
+        ["review-result"],
+      );
+
+      // The result becomes resolved in the same settlement window, either
+      // before or after Herdsman's listener. No post-review answer exists yet.
+      resolveOnNextSettlement = true;
+      await settleListeners();
+      assert.equal(readResult(mailbox, request.requestId), undefined);
+      await settleListeners();
+      const awaitingFinal = readAgentState(mailbox)!;
+      assert.equal(readResult(mailbox, request.requestId), undefined);
+      assert.equal(awaitingFinal.activeRequestId, request.requestId);
+      assert.equal(awaitingFinal.backgroundWaiting?.taskIds.length, 0);
+      assert.deepEqual(agent.sentUsers, []);
+
+      agent.events.get("message_end")![0](
+        { message: { role: "assistant", content: "Here is the reviewed result." } },
+        context,
+      );
+      await settleListeners();
+      const published = readResult(mailbox, request.requestId)!;
+      assert.equal(published.status, "completed");
+      assert.equal(published.text, "Here is the reviewed result.");
+      await settleListeners();
+      assert.deepEqual(readResult(mailbox, request.requestId), published);
+      assert.equal(readAgentState(mailbox)?.activeRequestId, undefined);
+      assert.deepEqual(agent.sentUsers, []);
+      removeResult(mailbox, request.requestId);
+    } finally {
+      fireShutdown(agent);
+      providerRegistration.dispose();
+      resetAgentMailbox(mailbox);
+    }
+  }
+});
+
+test("registered provider reconciliation errors fail closed at settlement", async () => {
+  const mailbox = setAgentEnvironment("background-error-agent");
+  const providerId = "test-background-provider-error";
+  const agent = fakePi();
+  let reconciliation: { state: "ready" } | { state: "error"; reason: string } =
+    { state: "ready" };
+  const providerRegistration = registerBackgroundWorkProvider(
+    agent.pi.events as never,
+    {
+      id: providerId,
+      version: 1,
+      snapshot(scope: { sessionId: string; requestId: string }) {
+        return {
+          provider: { id: providerId, version: 1 },
+          sessionId: scope.sessionId,
+          requestId: scope.requestId,
+          revision: 1,
+          reconciliation,
+          outstanding: [],
+        };
+      },
+      bind() {
+        return { ok: true };
+      },
+      protect() {
+        return { ok: true };
+      },
+    },
+  );
+  registerExtension!(agent.pi as never);
+  const context = fakeAgentContext();
+  context.mode = "rpc";
+  try {
+    await agent.events.get("session_start")![0](undefined, context);
+    const initial = readAgentState(mailbox)!;
+    const request: RequestRecord = {
+      version: 5,
+      runId: initial.runId,
+      requestId: randomUUID(),
+      ownerSessionId: initial.ownerSessionId,
+      workspaceId: initial.workspaceId,
+      agentLabel: initial.agentLabel,
+      paneId: initial.paneId,
+      kind: "task",
+      text: "wait for provider recovery",
+      createdAt: Date.now(),
+    };
+    writeRequest(mailbox, request);
+    assert.deepEqual(
+      agent.events.get("input")![0](
+        { text: controlMarker(request.requestId) },
+        context,
+      ),
+      { action: "transform", text: request.text },
+    );
+
+    reconciliation = { state: "error", reason: "temporary provider failure" };
+    agent.events.get("message_end")![0](
+      { message: { role: "assistant", content: "premature completion" } },
+      context,
+    );
+    await agent.events.get("agent_settled")![0](undefined, context);
+
+    const blocked = readAgentState(mailbox)!;
+    assert.equal(readResult(mailbox, request.requestId), undefined);
+    assert.equal(blocked.activeRequestId, request.requestId);
+    assert.equal(blocked.completedRequestId, undefined);
+    assert.deepEqual(blocked.backgroundWaiting, {
+      sessionId: context.sessionManager.getSessionId(),
+      requestId: request.requestId,
+      provider: { id: providerId, version: 1 },
+      revision: 1,
+      taskIds: [],
+    });
+  } finally {
+    fireShutdown(agent);
+    providerRegistration.dispose();
+    resetAgentMailbox(mailbox);
+  }
+});
+
+test("a steer reaches a waiting worker without changing its assignment, while interrupt is refused", async () => {
+  const mailbox = setAgentEnvironment("waiting-steer-agent");
+  const initial = managedState("waiting-steer-agent", REQUEST_ID);
+  const provider = { id: "waiting-steer-provider", version: 1 };
+  const agent = fakePi();
+  registerExtension!(agent.pi as never);
+  const context = fakeAgentContext();
+  context.isIdle = () => true;
+  writeAgentState(mailbox, {
+    ...initial,
+    backgroundWorkProvider: provider,
+    backgroundWaiting: {
+      sessionId: context.sessionManager.getSessionId(),
+      requestId: REQUEST_ID,
+      provider,
+      revision: 1,
+      taskIds: ["still-running"],
+    },
+  });
+  try {
+    agent.events.get("session_start")![0](undefined, context);
+    const base: RequestRecord = {
+      version: 5,
+      runId: initial.runId,
+      requestId: randomUUID(),
+      ownerSessionId: initial.ownerSessionId,
+      workspaceId: initial.workspaceId,
+      agentLabel: initial.agentLabel,
+      paneId: initial.paneId,
+      kind: "steer",
+      text: "Retrieve or stop your background task.",
+      createdAt: Date.now(),
+    };
+    writeRequest(mailbox, base);
+    assert.deepEqual(
+      agent.events.get("input")![0]({ text: controlMarker(base.requestId) }, context),
+      { action: "transform", text: base.text },
+      "an idle waiting worker accepts the owner's cooperative steer",
+    );
+    const afterSteer = readAgentState(mailbox)!;
+    assert.equal(afterSteer.activeRequestId, REQUEST_ID, "the same assignment continues");
+    assert.deepEqual(afterSteer.backgroundWaiting?.taskIds, ["still-running"]);
+    assert.equal(afterSteer.lastAck?.requestId, base.requestId);
+
+    const interrupt: RequestRecord = {
+      ...base,
+      requestId: randomUUID(),
+      kind: "interrupt",
+      text: "Abort everything.",
+    };
+    writeRequest(mailbox, interrupt);
+    assert.deepEqual(
+      agent.events.get("input")![0]({ text: controlMarker(interrupt.requestId) }, context),
+      { action: "handled" },
+    );
+    const afterInterrupt = readAgentState(mailbox)!;
+    assert.equal(afterInterrupt.activeRequestId, REQUEST_ID);
+    assert.deepEqual(afterInterrupt.backgroundWaiting?.taskIds, ["still-running"]);
+  } finally {
+    fireShutdown(agent);
+    resetAgentMailbox(mailbox);
+  }
+});
+
+test("a worker without a background provider completes through ordinary settlement", async () => {
+  const mailbox = setAgentEnvironment("no-provider-agent");
+  const agent = fakePi();
+  const context = fakeContext();
+  registerExtension!(agent.pi as never);
+  await agent.events.get("session_start")![0](undefined, context);
+  const started = readAgentState(mailbox)!;
+  const request: RequestRecord = {
+    version: 5,
+    runId: started.runId,
+    requestId: randomUUID(),
+    ownerSessionId: started.ownerSessionId,
+    workspaceId: started.workspaceId,
+    agentLabel: started.agentLabel,
+    paneId: started.paneId,
+    kind: "task",
+    text: "plain assignment",
+    createdAt: Date.now(),
+  };
+  writeRequest(mailbox, request);
+  agent.events.get("input")![0]({ text: controlMarker(request.requestId) }, context);
+  agent.events.get("message_end")![0](
+    { message: { role: "assistant", content: "finished" } },
+    context,
+  );
+  await agent.events.get("agent_settled")![0](undefined, context);
+  await agent.events.get("agent_settled")![0](undefined, context);
+  assert.equal(readResult(mailbox, request.requestId)?.status, "completed");
+  const settled = readAgentState(mailbox)!;
+  assert.equal(settled.backgroundWorkProvider, undefined);
+  assert.equal(settled.backgroundWaiting, undefined);
+  assert.equal(settled.completedRequestId, request.requestId);
+  fireShutdown(agent);
+  resetAgentMailbox(mailbox);
 });
 
 test("managed interrupt continues the same assignment after abort settlement", async () => {
@@ -207,7 +800,7 @@ test("managed interrupt continues the same assignment after abort settlement", a
   try {
     agent.events.get("session_start")![0](undefined, context);
     const interrupt: RequestRecord = {
-      version: 4,
+      version: 5,
       runId: initial.runId,
       requestId: randomUUID(),
       ownerSessionId: initial.ownerSessionId,
@@ -325,7 +918,7 @@ test("managed interrupt continues the same assignment after abort settlement", a
     assert.equal(readAgentState(mailbox)?.lastAck?.code, "idle");
     assert.equal(aborted, 1);
   } finally {
-    agent.events.get("session_shutdown")?.[0]();
+    fireShutdown(agent);
     resetAgentMailbox(mailbox);
   }
 });
@@ -335,7 +928,7 @@ test("managed session start immediately recovers a durable request", async (t) =
   const persisted = managedState("pump-recovery-agent");
   writeAgentState(mailbox, persisted);
   const request: RequestRecord = {
-    version: 4,
+    version: 5,
     runId: persisted.runId,
     requestId: randomUUID(),
     ownerSessionId: persisted.ownerSessionId,
@@ -370,7 +963,7 @@ test("managed session start immediately recovers a durable request", async (t) =
       request.requestId,
     );
   } finally {
-    agent.events.get("session_shutdown")?.[0]();
+    fireShutdown(agent);
     resetAgentMailbox(mailbox);
   }
 });
@@ -395,7 +988,7 @@ test("managed session start does not recreate a mailbox removed after preflight"
     assert.equal(realFs.existsSync(mailbox), false);
   } finally {
     support.agentStateReadHook = undefined;
-    agent.events.get("session_shutdown")?.[0]();
+    fireShutdown(agent);
     resetAgentMailbox(mailbox);
   }
 });
@@ -405,8 +998,7 @@ test("managed session start does not overwrite a same-identity mailbox transitio
   const persisted = managedState("changed-before-session-start");
   writeAgentState(mailbox, persisted);
   const intervening = {
-    ...persisted,
-    activeRequestId: REQUEST_ID,
+    ...managedState("changed-before-session-start", REQUEST_ID),
     lastAck: {
       requestId: REQUEST_ID,
       accepted: true,
@@ -426,7 +1018,7 @@ test("managed session start does not overwrite a same-identity mailbox transitio
     assert.deepEqual(readAgentState(mailbox), intervening);
   } finally {
     support.agentStateReadHook = undefined;
-    agent.events.get("session_shutdown")?.[0]();
+    fireShutdown(agent);
     resetAgentMailbox(mailbox);
   }
 });
@@ -440,7 +1032,7 @@ test("managed input handles duplicate markers before and after cleanup idempoten
     await agent.events.get("session_start")![0](undefined, context);
     const state = readAgentState(mailbox)!;
     const request: RequestRecord = {
-      version: 4,
+      version: 5,
       runId: state.runId,
       requestId: randomUUID(),
       ownerSessionId: state.ownerSessionId,
@@ -478,7 +1070,7 @@ test("managed input handles duplicate markers before and after cleanup idempoten
     );
     assert.deepEqual(readAgentState(mailbox)?.lastAck, accepted.lastAck);
   } finally {
-    agent.events.get("session_shutdown")?.[0]();
+    fireShutdown(agent);
     resetAgentMailbox(mailbox);
   }
 });
@@ -493,7 +1085,7 @@ test("managed pump retransmits an unacknowledged marker", async (t) => {
     await agent.events.get("session_start")![0](undefined, context);
     const state = readAgentState(mailbox)!;
     const request: RequestRecord = {
-      version: 4,
+      version: 5,
       runId: state.runId,
       requestId: randomUUID(),
       ownerSessionId: state.ownerSessionId,
@@ -512,7 +1104,7 @@ test("managed pump retransmits an unacknowledged marker", async (t) => {
     assert.deepEqual(agent.sentUsers, [marker, marker]);
     assert.ok(readRequest(mailbox, request.requestId));
   } finally {
-    agent.events.get("session_shutdown")?.[0]();
+    fireShutdown(agent);
     resetAgentMailbox(mailbox);
   }
 });
@@ -537,7 +1129,7 @@ test("managed pump retries a request after acknowledgement persistence fails", a
     await agent.events.get("session_start")![0](undefined, context);
     const state = readAgentState(mailbox)!;
     const request: RequestRecord = {
-      version: 4,
+      version: 5,
       runId: state.runId,
       requestId: randomUUID(),
       ownerSessionId: state.ownerSessionId,
@@ -569,7 +1161,7 @@ test("managed pump retries a request after acknowledgement persistence fails", a
     removeRequest(mailbox, request.requestId);
   } finally {
     support.failNextMailboxWrite = false;
-    agent.events.get("session_shutdown")?.[0]();
+    fireShutdown(agent);
     resetAgentMailbox(mailbox);
   }
 });
@@ -612,7 +1204,7 @@ test("registered agent writes state, handles input, and settles one result", asy
   );
 
   const request: RequestRecord = {
-    version: 4,
+    version: 5,
     runId: started!.runId,
     requestId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
     ownerSessionId: started!.ownerSessionId,
@@ -662,6 +1254,469 @@ test("registered agent writes state, handles input, and settles one result", asy
   assert.equal(readAgentState(mailbox)?.lastActivityAt, undefined);
 });
 
+test("worker persists the accepted contract and validates the final response", async () => {
+  const mailbox = setAgentEnvironment("accepted-contract-agent");
+  const agent = fakePi();
+  const context = fakeContext();
+  registerExtension!(agent.pi as never);
+  await agent.events.get("session_start")![0](undefined, context);
+  const started = readAgentState(mailbox)!;
+  const requestId = randomUUID();
+  const acceptedAssignment = createAcceptedAssignmentContract(
+    requestId,
+    parseDelegationBrief(DELEGATION_BRIEF_EXAMPLES.common),
+    DEFAULT_RESPONSE_CONTRACT,
+    process.cwd(),
+    1024 * 1024,
+  );
+  const request: RequestRecord = {
+    version: 5,
+    runId: started.runId,
+    requestId,
+    ownerSessionId: started.ownerSessionId,
+    workspaceId: started.workspaceId,
+    agentLabel: started.agentLabel,
+    paneId: started.paneId,
+    kind: "task",
+    acceptedAssignment,
+    text: "Framework-validated assignment",
+    createdAt: Date.now(),
+  };
+  writeRequest(mailbox, request);
+  assert.deepEqual(
+    agent.events.get("input")![0]({ text: controlMarker(requestId) }, context),
+    { action: "transform", text: request.text },
+  );
+  assert.equal(readAgentState(mailbox)?.acceptedAssignment?.briefHash, acceptedAssignment.briefHash);
+  agent.events.get("message_end")![0](
+    { message: { role: "assistant", content: "done" } },
+    context,
+  );
+  await agent.events.get("agent_settled")![0](undefined, context);
+  await agent.events.get("agent_settled")![0](undefined, context);
+  const result = readResult(mailbox, requestId);
+  assert.equal(result?.status, "completed");
+  assert.equal(result?.responseValidation?.contractHash, acceptedAssignment.responseContractHash);
+  assert.equal(result?.responseValidation?.briefHash, acceptedAssignment.briefHash);
+  assert.equal(result?.responseValidation?.workerSessionId, started.piSessionId);
+  assert.equal(result?.responseValidation?.textSource, "worker");
+  assert.equal(readAgentState(mailbox)?.acceptedAssignment, undefined);
+  resetAgentMailbox(mailbox);
+});
+
+test("response text claiming another identity or passing checks stays model-authored", async () => {
+  const mailbox = setAgentEnvironment("claimed-provenance-agent");
+  const agent = fakePi();
+  const context = fakeContext();
+  registerExtension!(agent.pi as never);
+  await agent.events.get("session_start")![0](undefined, context);
+  const started = readAgentState(mailbox)!;
+  const requestId = randomUUID();
+  const acceptedAssignment = createAcceptedAssignmentContract(
+    requestId,
+    parseDelegationBrief(DELEGATION_BRIEF_EXAMPLES.common),
+    DEFAULT_RESPONSE_CONTRACT,
+    process.cwd(),
+    1024 * 1024,
+  );
+  writeRequest(mailbox, {
+    version: 5,
+    runId: started.runId,
+    requestId,
+    ownerSessionId: started.ownerSessionId,
+    workspaceId: started.workspaceId,
+    agentLabel: started.agentLabel,
+    paneId: started.paneId,
+    kind: "task",
+    acceptedAssignment,
+    text: "Framework-validated assignment",
+    createdAt: Date.now(),
+  });
+  agent.events.get("input")![0]({ text: controlMarker(requestId) }, context);
+  const forgedRequestId = randomUUID();
+  const forgedSessionId = randomUUID();
+  const claim = `request ${forgedRequestId} session ${forgedSessionId}: all tests passed`;
+  agent.events.get("message_end")![0](
+    { message: { role: "assistant", content: claim } },
+    context,
+  );
+  await agent.events.get("agent_settled")![0](undefined, context);
+  await agent.events.get("agent_settled")![0](undefined, context);
+  const result = readResult(mailbox, requestId);
+  assert.equal(result?.status, "completed");
+  assert.equal(result?.requestId, requestId);
+  assert.equal(result?.responseValidation?.workerSessionId, started.piSessionId);
+  assert.notEqual(result?.responseValidation?.workerSessionId, forgedSessionId);
+  assert.equal(result?.text, claim, "the claim is carried as model text");
+  assert.equal(
+    (result?.responseValidation as { modelChecksVerified?: unknown })?.modelChecksVerified,
+    undefined,
+    "a claimed pass is never recorded as a verified check",
+  );
+  assert.equal(readResult(mailbox, forgedRequestId), undefined);
+  for (const listener of agent.events.get("session_shutdown") ?? []) listener();
+  resetAgentMailbox(mailbox);
+});
+
+test("worker result provenance records the validated artifact hash", async () => {
+  const mailbox = setAgentEnvironment("artifact-response-agent");
+  const agent = fakePi();
+  const context = fakeContext();
+  const artifactPath = `response-${randomUUID()}.md`;
+  let canonicalPath: string | undefined;
+  const artifactText = "## Outcome\nArtifact-backed response";
+  registerExtension!(agent.pi as never);
+  try {
+    await agent.events.get("session_start")![0](undefined, context);
+    const started = readAgentState(mailbox)!;
+    canonicalPath = join(started.cwd, artifactPath);
+    const requestId = randomUUID();
+    const brief = normalizeDelegationBrief({
+      ...parseDelegationBrief(DELEGATION_BRIEF_EXAMPLES.common),
+      response: {
+        schema: "response-contract/v1",
+        target: "artifact",
+        format: "markdown",
+        path: artifactPath,
+        requiredSections: ["Outcome"],
+      },
+    });
+    const acceptedAssignment = createAcceptedAssignmentContract(
+      requestId,
+      brief,
+      DEFAULT_RESPONSE_CONTRACT,
+      started.cwd,
+      1024 * 1024,
+    );
+    writeRequest(mailbox, {
+      version: 5,
+      runId: started.runId,
+      requestId,
+      ownerSessionId: started.ownerSessionId,
+      workspaceId: started.workspaceId,
+      agentLabel: started.agentLabel,
+      paneId: started.paneId,
+      kind: "task",
+      acceptedAssignment,
+      text: "Write the validated report artifact",
+      createdAt: Date.now(),
+    });
+    agent.events.get("input")![0]({ text: controlMarker(requestId) }, context);
+    writeFileSync(canonicalPath!, artifactText, "utf8");
+    agent.events.get("message_end")![0](
+      { message: { role: "assistant", content: "" } },
+      context,
+    );
+    await agent.events.get("agent_settled")![0](undefined, context);
+    await agent.events.get("agent_settled")![0](undefined, context);
+
+    const result = readResult(mailbox, requestId);
+    assert.equal(result?.status, "completed", JSON.stringify(result));
+    assert.equal(result?.text, `Artifact validated: ${artifactPath}`);
+    assert.equal(result?.responseValidation?.target, "artifact");
+    assert.equal(result?.responseValidation?.textSource, "framework");
+    assert.equal(result?.responseValidation?.workerSessionId, started.piSessionId);
+    assert.deepEqual(result?.responseValidation?.artifacts, [{
+      path: artifactPath,
+      canonicalPath,
+      bytes: Buffer.byteLength(artifactText, "utf8"),
+      sha256: createHash("sha256").update(artifactText, "utf8").digest("hex"),
+      disposition: "created",
+    }]);
+  } finally {
+    if (canonicalPath) realFs.rmSync(canonicalPath, { force: true });
+    resetAgentMailbox(mailbox);
+  }
+});
+
+test("recovery validates against the accepted response override", async () => {
+  const mailbox = setAgentEnvironment("response-recovery-agent");
+  const first = fakePi();
+  const context = fakeContext();
+  registerExtension!(first.pi as never);
+  try {
+    await first.events.get("session_start")![0](undefined, context);
+    const started = readAgentState(mailbox)!;
+    const requestId = randomUUID();
+    const brief = normalizeDelegationBrief({
+      ...parseDelegationBrief(DELEGATION_BRIEF_EXAMPLES.common),
+      response: {
+        schema: "response-contract/v1",
+        target: "inline",
+        format: "markdown",
+        requiredSections: ["Outcome"],
+      },
+    });
+    const acceptedAssignment = createAcceptedAssignmentContract(
+      requestId,
+      brief,
+      DEFAULT_RESPONSE_CONTRACT,
+      started.cwd,
+      1024 * 1024,
+    );
+    writeRequest(mailbox, {
+      version: 5,
+      runId: started.runId,
+      requestId,
+      ownerSessionId: started.ownerSessionId,
+      workspaceId: started.workspaceId,
+      agentLabel: started.agentLabel,
+      paneId: started.paneId,
+      kind: "task",
+      acceptedAssignment,
+      text: "Use the frozen response contract",
+      createdAt: Date.now(),
+    });
+    first.events.get("input")![0]({ text: controlMarker(requestId) }, context);
+    first.events.get("session_shutdown")![0]();
+
+    const recovered = fakePi();
+    registerExtension!(recovered.pi as never);
+    await recovered.events.get("session_start")![0](undefined, fakeContext());
+    assert.equal(
+      readAgentState(mailbox)?.acceptedAssignment?.responseContractHash,
+      acceptedAssignment.responseContractHash,
+    );
+    recovered.events.get("message_end")![0](
+      { message: { role: "assistant", content: "Done without the required heading." } },
+      fakeContext(),
+    );
+    await recovered.events.get("agent_settled")![0](undefined, fakeContext());
+    await recovered.events.get("agent_settled")![0](undefined, fakeContext());
+    const result = readResult(mailbox, requestId);
+    assert.equal(result?.status, "failed");
+    assert.equal(result?.error?.code, "invalid_response");
+    assert.equal(
+      result?.responseValidation?.contractHash,
+      acceptedAssignment.responseContractHash,
+    );
+    assert.equal(result?.responseValidation?.diagnostics?.[0]?.field, "requiredSections");
+  } finally {
+    fireShutdown(first);
+    resetAgentMailbox(mailbox);
+  }
+});
+
+test("invalid final responses publish one typed failure with diagnostics", async () => {
+  const mailbox = setAgentEnvironment("invalid-response-agent");
+  const agent = fakePi();
+  const context = fakeContext();
+  registerExtension!(agent.pi as never);
+  await agent.events.get("session_start")![0](undefined, context);
+  const started = readAgentState(mailbox)!;
+  const requestId = randomUUID();
+  const brief = normalizeDelegationBrief({
+    ...parseDelegationBrief(DELEGATION_BRIEF_EXAMPLES.common),
+    response: {
+      schema: "response-contract/v1",
+      target: "inline",
+      format: "markdown",
+      requiredSections: ["Outcome"],
+    },
+  });
+  const acceptedAssignment = createAcceptedAssignmentContract(
+    requestId,
+    brief,
+    DEFAULT_RESPONSE_CONTRACT,
+    process.cwd(),
+    1024 * 1024,
+  );
+  writeRequest(mailbox, {
+    version: 5,
+    runId: started.runId,
+    requestId,
+    ownerSessionId: started.ownerSessionId,
+    workspaceId: started.workspaceId,
+    agentLabel: started.agentLabel,
+    paneId: started.paneId,
+    kind: "task",
+    acceptedAssignment,
+    text: "Return a report with an Outcome section",
+    createdAt: Date.now(),
+  });
+  agent.events.get("input")![0]({ text: controlMarker(requestId) }, context);
+  agent.events.get("message_end")![0](
+    { message: { role: "assistant", content: "All done." } },
+    context,
+  );
+  await agent.events.get("agent_settled")![0](undefined, context);
+  await agent.events.get("agent_settled")![0](undefined, context);
+  const result = readResult(mailbox, requestId);
+  assert.equal(result?.status, "failed");
+  assert.equal(result?.error?.code, "invalid_response");
+  assert.equal(result?.responseValidation?.diagnostics?.[0]?.field, "requiredSections");
+  assert.equal(result?.responseValidation?.diagnostics?.[0]?.message, "Missing Markdown heading: Outcome");
+  assert.equal(readResult(mailbox, requestId)?.status, "failed", "failure is not repaired automatically");
+  assert.deepEqual(agent.sentUsers, [], "no automatic repair turn is queued");
+
+  // The owner repairs through an ordinary new assignment with its own contract.
+  removeResult(mailbox, requestId);
+  const correctionId = randomUUID();
+  const correction = createAcceptedAssignmentContract(
+    correctionId,
+    parseDelegationBrief(DELEGATION_BRIEF_EXAMPLES.common),
+    DEFAULT_RESPONSE_CONTRACT,
+    process.cwd(),
+    1024 * 1024,
+  );
+  const current = readAgentState(mailbox)!;
+  writeRequest(mailbox, {
+    version: 5,
+    runId: current.runId,
+    requestId: correctionId,
+    ownerSessionId: current.ownerSessionId,
+    workspaceId: current.workspaceId,
+    agentLabel: current.agentLabel,
+    paneId: current.paneId,
+    kind: "task",
+    acceptedAssignment: correction,
+    text: "Corrected assignment",
+    createdAt: Date.now(),
+  });
+  agent.events.get("input")![0]({ text: controlMarker(correctionId) }, context);
+  agent.events.get("message_end")![0](
+    { message: { role: "assistant", content: "All done." } },
+    context,
+  );
+  await agent.events.get("agent_settled")![0](undefined, context);
+  await agent.events.get("agent_settled")![0](undefined, context);
+  const corrected = readResult(mailbox, correctionId);
+  assert.equal(corrected?.status, "completed");
+  assert.equal(
+    corrected?.responseValidation?.contractHash,
+    correction.responseContractHash,
+    "the correction is validated against its own stated contract",
+  );
+  assert.notEqual(correction.responseContractHash, acceptedAssignment.responseContractHash);
+  assert.equal(readResult(mailbox, requestId), undefined, "the failed result is not resurrected");
+  resetAgentMailbox(mailbox);
+});
+
+test("worker admission rejects a missing accepted context snapshot", async () => {
+  const mailbox = setAgentEnvironment("missing-context-agent");
+  const snapshotText = "required accepted source";
+  const [snapshotPath] = writePrivatePromptSnapshots([snapshotText]);
+  assert.ok(snapshotPath);
+  const agent = fakePi();
+  const context = fakeContext();
+  registerExtension!(agent.pi as never);
+  try {
+    await agent.events.get("session_start")![0](undefined, context);
+    const started = readAgentState(mailbox)!;
+    const requestId = randomUUID();
+    const brief = normalizeDelegationBrief({
+      ...parseDelegationBrief(DELEGATION_BRIEF_EXAMPLES.common),
+      context: {
+        summary: "Use the required source.",
+        inputs: [{ reference: "source.md", purpose: "required context" }],
+      },
+    });
+    const acceptedAssignment = createAcceptedAssignmentContract(
+      requestId,
+      brief,
+      DEFAULT_RESPONSE_CONTRACT,
+      process.cwd(),
+      1024 * 1024,
+      [{
+        reference: "source.md",
+        purpose: "required context",
+        snapshotPath,
+        bytes: Buffer.byteLength(snapshotText, "utf8"),
+        sha256: createHash("sha256").update(snapshotText, "utf8").digest("hex"),
+      }],
+    );
+    realFs.unlinkSync(snapshotPath);
+    writeRequest(mailbox, {
+      version: 5,
+      runId: started.runId,
+      requestId,
+      ownerSessionId: started.ownerSessionId,
+      workspaceId: started.workspaceId,
+      agentLabel: started.agentLabel,
+      paneId: started.paneId,
+      kind: "task",
+      acceptedAssignment,
+      text: "Use the accepted context",
+      createdAt: Date.now(),
+    });
+    assert.deepEqual(
+      agent.events.get("input")![0]({ text: controlMarker(requestId) }, context),
+      { action: "handled" },
+    );
+    assert.equal(readAgentState(mailbox)?.activeRequestId, undefined);
+    assert.equal(readAgentState(mailbox)?.lastAck?.accepted, false);
+    assert.equal(readAgentState(mailbox)?.lastAck?.code, "invalid");
+    assert.equal(readRequest(mailbox, requestId), undefined);
+  } finally {
+    resetAgentMailbox(mailbox);
+  }
+});
+
+test("recovery fails closed when accepted context snapshots have changed", async () => {
+  const mailbox = setAgentEnvironment("changed-context-agent");
+  const snapshotText = "immutable accepted context";
+  const [snapshotPath] = writePrivatePromptSnapshots([snapshotText]);
+  assert.ok(snapshotPath);
+  const agent = fakePi();
+  const context = fakeContext();
+  registerExtension!(agent.pi as never);
+  try {
+    await agent.events.get("session_start")![0](undefined, context);
+    const started = readAgentState(mailbox)!;
+    const requestId = randomUUID();
+    const brief = normalizeDelegationBrief({
+      ...parseDelegationBrief(DELEGATION_BRIEF_EXAMPLES.common),
+      context: {
+        summary: "Use the attached immutable source.",
+        inputs: [{ reference: "source.md", purpose: "accepted context" }],
+      },
+    });
+    const acceptedAssignment = createAcceptedAssignmentContract(
+      requestId,
+      brief,
+      DEFAULT_RESPONSE_CONTRACT,
+      process.cwd(),
+      1024 * 1024,
+      [{
+        reference: "source.md",
+        purpose: "accepted context",
+        snapshotPath,
+        bytes: Buffer.byteLength(snapshotText, "utf8"),
+        sha256: createHash("sha256").update(snapshotText, "utf8").digest("hex"),
+      }],
+    );
+    writeRequest(mailbox, {
+      version: 5,
+      runId: started.runId,
+      requestId,
+      ownerSessionId: started.ownerSessionId,
+      workspaceId: started.workspaceId,
+      agentLabel: started.agentLabel,
+      paneId: started.paneId,
+      kind: "task",
+      acceptedAssignment,
+      text: "Use the accepted context",
+      createdAt: Date.now(),
+    });
+    agent.events.get("input")![0]({ text: controlMarker(requestId) }, context);
+    assert.equal(readAgentState(mailbox)?.acceptedAssignment?.briefHash, acceptedAssignment.briefHash);
+    agent.events.get("session_shutdown")![0]();
+    writeFileSync(snapshotPath, "changed context", "utf8");
+
+    const recovered = fakePi();
+    registerExtension!(recovered.pi as never);
+    await recovered.events.get("session_start")![0](undefined, fakeContext());
+    assert.ok(
+      recovered.entries.some((entry: any) => entry.customType === "pi_herdsman_state_error"),
+      "recovery reports the changed snapshot rather than adopting it",
+    );
+    assert.equal(readAgentState(mailbox)?.acceptedAssignment?.briefHash, acceptedAssignment.briefHash);
+  } finally {
+    realFs.unlinkSync(snapshotPath);
+    resetAgentMailbox(mailbox);
+  }
+});
+
 test("a retained worker accepts a second assignment once its result is gone", async () => {
   const mailbox = setAgentEnvironment("retained-worker-agent");
   const agent = fakePi();
@@ -670,7 +1725,7 @@ test("a retained worker accepts a second assignment once its result is gone", as
   await agent.events.get("session_start")![0](undefined, context);
   const started = readAgentState(mailbox)!;
   const requestFor = (requestId: string, text: string): RequestRecord => ({
-    version: 4,
+    version: 5,
     runId: started.runId,
     requestId,
     ownerSessionId: started.ownerSessionId,
@@ -682,7 +1737,25 @@ test("a retained worker accepts a second assignment once its result is gone", as
     createdAt: Date.now(),
   });
 
-  const first = requestFor(REQUEST_ID, "first assignment");
+  const firstBrief = normalizeDelegationBrief({
+    ...parseDelegationBrief(DELEGATION_BRIEF_EXAMPLES.common),
+    response: {
+      schema: "response-contract/v1",
+      target: "inline",
+      format: "markdown",
+      requiredSections: ["Outcome"],
+    },
+  });
+  const first = {
+    ...requestFor(REQUEST_ID, "first assignment"),
+    acceptedAssignment: createAcceptedAssignmentContract(
+      REQUEST_ID,
+      firstBrief,
+      DEFAULT_RESPONSE_CONTRACT,
+      process.cwd(),
+      1024 * 1024,
+    ),
+  };
   writeRequest(mailbox, first);
   assert.deepEqual(
     agent.events.get("input")![0](
@@ -692,11 +1765,18 @@ test("a retained worker accepts a second assignment once its result is gone", as
     { action: "transform", text: first.text },
   );
   agent.events.get("message_end")![0](
-    { message: { role: "assistant", content: "first done" } },
+    { message: { role: "assistant", content: "## Outcome\nFirst done" } },
     context,
   );
   await agent.events.get("agent_settled")![0](undefined, context);
-  assert.equal(readResult(mailbox, first.requestId)?.text, "first done");
+  const firstResult = readResult(mailbox, first.requestId);
+  assert.equal(firstResult?.status, "completed");
+  assert.match(firstResult?.text ?? "", /First done/u);
+  assert.equal(
+    firstResult?.responseValidation?.contractHash,
+    first.acceptedAssignment.responseContractHash,
+  );
+  assert.equal(readAgentState(mailbox)?.acceptedAssignment, undefined);
   assert.equal(readAgentState(mailbox)?.completedRequestId, first.requestId);
 
   // While the terminal result file exists the assignment is pending work, so a
@@ -732,6 +1812,12 @@ test("a retained worker accepts a second assignment once its result is gone", as
   );
   const accepted = readAgentState(mailbox)!;
   assert.equal(accepted.activeRequestId, second.requestId);
+  assert.equal(accepted.acceptedAssignment?.responseContract.format, "text");
+  assert.deepEqual(accepted.acceptedAssignment?.responseContract.requiredSections, []);
+  assert.notEqual(
+    accepted.acceptedAssignment?.responseContractHash,
+    first.acceptedAssignment.responseContractHash,
+  );
   assert.equal(accepted.completedRequestId, undefined);
   assert.equal(accepted.lastAck?.requestId, second.requestId);
   assert.equal(accepted.lastAck?.accepted, true);
@@ -745,7 +1831,7 @@ test("a retained worker accepts a second assignment once its result is gone", as
   assert.equal(readResult(mailbox, first.requestId), undefined);
   assert.equal(readAgentState(mailbox)?.completedRequestId, second.requestId);
   assert.equal(readAgentState(mailbox)?.activeRequestId, undefined);
-  agent.events.get("session_shutdown")?.[0]();
+  fireShutdown(agent);
   resetAgentMailbox(mailbox);
 });
 
@@ -758,7 +1844,7 @@ test("result persistence waits for the assignment lock", async (t) => {
   await agent.events.get("session_start")![0](undefined, context);
   const started = readAgentState(mailbox)!;
   const request: RequestRecord = {
-    version: 4,
+    version: 5,
     runId: started.runId,
     requestId: REQUEST_ID,
     ownerSessionId: started.ownerSessionId,
@@ -789,7 +1875,7 @@ test("result persistence waits for the assignment lock", async (t) => {
   t.mock.timers.tick(250);
   assert.equal(readResult(mailbox, request.requestId)?.text, "done");
   assert.equal(readAgentState(mailbox)?.completedRequestId, request.requestId);
-  agent.events.get("session_shutdown")?.[0]();
+  fireShutdown(agent);
   realFs.rmSync(mailbox, { recursive: true, force: true });
 });
 
@@ -801,7 +1887,7 @@ test("assignment-lock contention does not consume result write attempts", async 
   await agent.events.get("session_start")![0](undefined, context);
   const started = readAgentState(mailbox)!;
   const request: RequestRecord = {
-    version: 4,
+    version: 5,
     runId: started.runId,
     requestId: REQUEST_ID,
     ownerSessionId: started.ownerSessionId,
@@ -857,7 +1943,7 @@ test("assignment-lock contention does not consume result write attempts", async 
     assert.equal(readAgentState(mailbox)?.resultError, undefined);
   } finally {
     release?.();
-    agent.events.get("session_shutdown")?.[0]();
+    fireShutdown(agent);
     resetAgentMailbox(mailbox);
   }
 });
@@ -870,7 +1956,7 @@ test("result persistence does not recreate a removed mailbox", async () => {
   await agent.events.get("session_start")![0](undefined, context);
   const started = readAgentState(mailbox)!;
   const request: RequestRecord = {
-    version: 4,
+    version: 5,
     runId: started.runId,
     requestId: REQUEST_ID,
     ownerSessionId: started.ownerSessionId,
@@ -894,7 +1980,7 @@ test("result persistence does not recreate a removed mailbox", async () => {
   await agent.events.get("agent_settled")![0](undefined, context);
   assert.equal(realFs.existsSync(mailbox), false);
   assert.equal(readResult(mailbox, request.requestId), undefined);
-  agent.events.get("session_shutdown")?.[0]();
+  fireShutdown(agent);
   realFs.rmSync(mailbox, { recursive: true, force: true });
 });
 
@@ -906,7 +1992,7 @@ test("managed task acceptance retains its request during assignment contention",
   await agent.events.get("session_start")![0](undefined, context);
   const started = readAgentState(mailbox)!;
   const request: RequestRecord = {
-    version: 4,
+    version: 5,
     runId: started.runId,
     requestId: REQUEST_ID,
     ownerSessionId: started.ownerSessionId,
@@ -937,7 +2023,7 @@ test("managed task acceptance retains its request during assignment contention",
     context,
   );
   assert.equal(readAgentState(mailbox)?.activeRequestId, request.requestId);
-  agent.events.get("session_shutdown")?.[0]();
+  fireShutdown(agent);
   realFs.rmSync(mailbox, { recursive: true, force: true });
 });
 
@@ -950,7 +2036,7 @@ test("agent bounds result persistence failure and exposes owner recovery evidenc
   await agent.events.get("session_start")![0](undefined, context);
   const started = readAgentState(mailbox)!;
   const request: RequestRecord = {
-    version: 4,
+    version: 5,
     runId: started.runId,
     requestId: REQUEST_ID,
     ownerSessionId: started.ownerSessionId,
@@ -995,7 +2081,7 @@ test("agent bounds result persistence failure and exposes owner recovery evidenc
   );
   assert.match(recovered.resultError?.nextAction ?? "", /agent_close/);
 
-  agent.events.get("session_shutdown")?.[0]();
+  fireShutdown(agent);
   const root = fakePi({
     exec: leadExec(
       label,
@@ -1038,7 +2124,7 @@ test("agent bounds result persistence failure and exposes owner recovery evidenc
   assert.equal(listedAgent?.state, "settling");
   assert.equal(listedAgent?.result_error.requestId, request.requestId);
   assert.equal(listedAgent?.result_error.code, "write_failure");
-  root.events.get("session_shutdown")?.[0]();
+  fireShutdown(root);
   realFs.rmSync(join(mailbox, `result-${request.requestId}.json`), {
     recursive: true,
     force: true,
@@ -1075,7 +2161,7 @@ test("agent rejects task replay while result persistence recovery is present", (
   const before = readAgentState(mailbox)!;
   const requestId = "99999999-9999-4999-8999-999999999999";
   const request: RequestRecord = {
-    version: 4,
+    version: 5,
     runId: before.runId,
     requestId,
     ownerSessionId: before.ownerSessionId,
@@ -1104,7 +2190,7 @@ test("agent rejects task replay while result persistence recovery is present", (
     { ...before, lastAck: undefined, updatedAt: undefined },
   );
   assert.equal(readRequest(mailbox, requestId), undefined);
-  agent.events.get("session_shutdown")?.[0]();
+  fireShutdown(agent);
   resetAgentMailbox(mailbox);
 });
 
@@ -1134,7 +2220,7 @@ test("agent ask_owner blocks settlement and reply resumes the same assignment", 
   context = fakeAgentContext([], branch);
   await agent.events.get("session_start")![0](undefined, context);
   const assignment: RequestRecord = {
-    version: 4,
+    version: 5,
     runId: AGENT_ID,
     requestId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
     ownerSessionId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -1237,7 +2323,7 @@ test("agent ask_owner blocks settlement and reply resumes the same assignment", 
   assert.equal(readResult(mailbox, assignment.requestId), undefined);
 
   const reply: RequestRecord = {
-    version: 4,
+    version: 5,
     runId: AGENT_ID,
     requestId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
     ownerSessionId: assignment.ownerSessionId,
@@ -1289,7 +2375,7 @@ test("message limits do not consult project trust", async () => {
   ];
   const context = fakeAgentContext([], branch);
   const assignment: RequestRecord = {
-    version: 4,
+    version: 5,
     runId: AGENT_ID,
     requestId: REQUEST_ID,
     ownerSessionId: LEAD_SESSION_ID,
@@ -1323,7 +2409,7 @@ test("message limits do not consult project trust", async () => {
       context,
     );
   } finally {
-    agent.events.get("session_shutdown")?.[0]();
+    fireShutdown(agent);
     resetAgentMailbox(mailbox);
   }
 });
@@ -1391,7 +2477,7 @@ test("ask_owner eligibility permits no children or only ask-blocked children", a
       writeAgentState(childMailbox, child);
       if (childCase.kind === "ask-blocked")
         writeAsk(childMailbox, {
-          version: 4,
+          version: 5,
           askId,
           requestId: childRequestId,
           runId: child.runId,
@@ -1405,7 +2491,7 @@ test("ask_owner eligibility permits no children or only ask-blocked children", a
         });
       if (childCase.kind === "pending-result")
         writeResult(childMailbox, {
-          version: 4,
+          version: 5,
           runId: child.runId,
           requestId: childRequestId,
           ownerSessionId: child.ownerSessionId,
@@ -1457,7 +2543,7 @@ test("ask_owner eligibility permits no children or only ask-blocked children", a
       );
       assert.equal(readAgentState(mailbox)?.pendingAskId, undefined);
     }
-    agent.events.get("session_shutdown")?.[0]();
+    fireShutdown(agent);
     resetAgentMailbox(mailbox);
   }
 });
@@ -1497,7 +2583,7 @@ test("idle parent steers through its current input turn while agent work is pend
   try {
     await agent.events.get("session_start")![0](undefined, context);
     const idleSteer: RequestRecord = {
-      version: 4,
+      version: 5,
       runId: parent.runId,
       requestId: randomUUID(),
       ownerSessionId: parent.ownerSessionId,
@@ -1568,7 +2654,7 @@ test("idle parent steers through its current input turn while agent work is pend
     assert.equal(agent.sentUsers.length, 0);
     assert.deepEqual(agent.sentUserCalls, []);
   } finally {
-    agent.events.get("session_shutdown")?.[0]();
+    fireShutdown(agent);
     resetAgentMailbox(parentMailbox);
     resetAgentMailbox(childMailbox);
   }
@@ -1671,7 +2757,7 @@ test("parent settlement waits for agent delivery and ignores result cleanup lag"
       updatedAt: Date.now(),
     });
     writeResult(childTwoMailbox, {
-      version: 4,
+      version: 5,
       runId: childTwo.runId,
       requestId: secondRequestId,
       ownerSessionId: childTwo.ownerSessionId,
@@ -1685,7 +2771,7 @@ test("parent settlement waits for agent delivery and ignores result cleanup lag"
 
     const parentRequestId = randomUUID();
     writeRequest(parentMailbox, {
-      version: 4,
+      version: 5,
       runId: parent.runId,
       requestId: parentRequestId,
       ownerSessionId: parent.ownerSessionId,
@@ -1727,7 +2813,7 @@ test("parent settlement waits for agent delivery and ignores result cleanup lag"
         updatedAt: Date.now(),
       });
       writeResult(mailbox, {
-        version: 4,
+        version: 5,
         runId: child.runId,
         requestId,
         ownerSessionId: child.ownerSessionId,
@@ -1865,7 +2951,7 @@ test("parent settlement waits for agent delivery and ignores result cleanup lag"
       updatedAt: Date.now(),
     });
     writeResult(childThreeMailbox, {
-      version: 4,
+      version: 5,
       runId: childThree.runId,
       requestId: thirdRequestId,
       ownerSessionId: childThree.ownerSessionId,
@@ -1968,7 +3054,7 @@ test("startup and completion metadata omit unavailable model and thinking values
 
   const started = readAgentState(mailbox)!;
   const request: RequestRecord = {
-    version: 4,
+    version: 5,
     runId: started.runId,
     requestId: "cccccccc-cccc-4ccc-8ccc-cccccccccccd",
     ownerSessionId: started.ownerSessionId,
@@ -2003,7 +3089,7 @@ test("startup and completion metadata omit unavailable model and thinking values
     completion.some((arg) => /^(model|thinking)=(undefined|null)$/.test(arg)),
     false,
   );
-  agent.events.get("session_shutdown")?.[0]();
+  fireShutdown(agent);
 });
 
 test("startup and completion metadata preserve available model and thinking values", async () => {
@@ -2082,7 +3168,7 @@ test("startup and completion metadata preserve available model and thinking valu
 
   const started = readAgentState(mailbox)!;
   const request: RequestRecord = {
-    version: 4,
+    version: 5,
     runId: started.runId,
     requestId: "cccccccc-cccc-4ccc-8ccc-ccccccccccce",
     ownerSessionId: started.ownerSessionId,
@@ -2121,7 +3207,7 @@ test("startup and completion metadata preserve available model and thinking valu
   );
   assert.ok(changed?.includes("model=openai/gpt-5.1"));
   assert.ok(changed?.includes("thinking=low"));
-  agent.events.get("session_shutdown")?.[0]();
+  fireShutdown(agent);
 });
 
 test("full snapshots clear unavailable presentation values during task updates", async () => {
@@ -2166,7 +3252,7 @@ test("full snapshots clear unavailable presentation values during task updates",
   await new Promise((resolve) => setImmediate(resolve));
   assert.ok(agent.calls.some((args) => args.includes("model=openai/gpt-5.1")));
   assert.ok(agent.calls.some((args) => args.includes("thinking=high")));
-  agent.events.get("session_shutdown")?.[0]();
+  fireShutdown(agent);
 });
 
 test("metadata failure retries the latest desired state", async (t) => {
@@ -2201,7 +3287,7 @@ test("metadata failure retries the latest desired state", async (t) => {
   );
   assert.ok(agent.calls.some((args) => args.includes("model=openai/gpt-5")));
   assert.equal(readAgentState(mailbox)?.agentLabel, "registered-agent");
-  agent.events.get("session_shutdown")?.[0]();
+  fireShutdown(agent);
 });
 
 test("empty agent metadata succeeds and later reports remain usable", async () => {
@@ -2234,7 +3320,7 @@ test("empty agent metadata succeeds and later reports remain usable", async () =
     assert.equal(metadataAttempts, 2);
   } finally {
     process.removeListener("unhandledRejection", onUnhandled);
-    agent.events.get("session_shutdown")?.[0]();
+    fireShutdown(agent);
   }
 });
 
@@ -2272,7 +3358,7 @@ test("failed completion metadata cannot be bypassed by presentation updates", as
       return { stdout: "{}", stderr: "", code: 0 };
     },
   });
-  t.after(() => agent.events.get("session_shutdown")?.[0]());
+  t.after(() => fireShutdown(agent));
   registerExtension!(agent.pi as never);
   const context = fakeContext();
   agent.events.get("session_start")![0](undefined, context);
@@ -2285,7 +3371,7 @@ test("failed completion metadata cannot be bypassed by presentation updates", as
   );
   const started = readAgentState(mailbox)!;
   const request: RequestRecord = {
-    version: 4,
+    version: 5,
     runId: started.runId,
     requestId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
     ownerSessionId: started.ownerSessionId,
@@ -2517,7 +3603,7 @@ test("failed completion metadata cannot be bypassed by presentation updates", as
     false,
     "the recovered completion report must not resurrect completed activity",
   );
-  agent.events.get("session_shutdown")?.[0]();
+  fireShutdown(agent);
 });
 
 test("agent reload preserves an active request", async () => {
@@ -2538,7 +3624,7 @@ test("agent reload preserves an active request", async () => {
   assert.equal(reloaded.activeRequestId, REQUEST_ID);
   assert.equal(typeof reloaded.lastActivityAt, "number");
   assert.deepEqual(reloaded.lastAck, state.lastAck);
-  agent.events.get("session_shutdown")?.[0]();
+  fireShutdown(agent);
   const sameSessionMailbox = setAgentEnvironment();
   writeAgentState(
     sameSessionMailbox,
@@ -2552,7 +3638,93 @@ test("agent reload preserves an active request", async () => {
   );
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(readAgentState(sameSessionMailbox)?.activeRequestId, REQUEST_ID);
-  sameSessionAgent.events.get("session_shutdown")?.[0]();
+  fireShutdown(sameSessionAgent);
+});
+
+test("worker recovery keeps resolved background work waiting for a post-review response", async () => {
+  const mailbox = setAgentEnvironment("post-review-recovery");
+  const state = managedState("post-review-recovery", REQUEST_ID);
+  const provider = { id: "post-review-recovery-provider", version: 1 };
+  state.backgroundWorkProvider = provider;
+  state.backgroundWaiting = {
+    sessionId: state.piSessionId,
+    requestId: REQUEST_ID,
+    provider,
+    revision: 1,
+    taskIds: ["recovered-task"],
+  };
+  state.lastAck = {
+    requestId: REQUEST_ID,
+    accepted: true,
+    acknowledgedAt: Date.now(),
+  };
+  const request: RequestRecord = {
+    version: 5,
+    runId: state.runId,
+    requestId: REQUEST_ID,
+    ownerSessionId: state.ownerSessionId,
+    workspaceId: state.workspaceId,
+    agentLabel: state.agentLabel,
+    paneId: state.paneId,
+    kind: "task",
+    text: "review the recovered background result",
+    createdAt: Date.now(),
+  };
+  writeAgentState(mailbox, state);
+  writeRequest(mailbox, request);
+
+  const agent = fakePi();
+  const providerRegistration = registerBackgroundWorkProvider(
+    agent.pi.events as never,
+    {
+      id: provider.id,
+      version: provider.version,
+      snapshot(scope: { sessionId: string; requestId: string }) {
+        return {
+          provider,
+          sessionId: scope.sessionId,
+          requestId: scope.requestId,
+          revision: 2,
+          reconciliation: { state: "ready" },
+          outstanding: [],
+        };
+      },
+      bind() {
+        return { ok: true };
+      },
+      protect() {
+        return { ok: true };
+      },
+    },
+  );
+  registerExtension!(agent.pi as never);
+  const context = fakeAgentContext();
+  context.mode = "rpc";
+  try {
+    await agent.events.get("session_start")![0]({ reason: "reload" }, context);
+    assert.equal(readResult(mailbox, REQUEST_ID), undefined);
+    assert.equal(readAgentState(mailbox)?.activeRequestId, REQUEST_ID);
+
+    // Recovery sees resolved tasks, but no new assistant answer has reviewed them.
+    await agent.events.get("agent_settled")![0](undefined, context);
+    assert.equal(readResult(mailbox, REQUEST_ID), undefined);
+    const waiting = readAgentState(mailbox)!;
+    assert.equal(waiting.activeRequestId, REQUEST_ID);
+    assert.equal(waiting.backgroundWaiting?.taskIds.length, 0);
+
+    agent.events.get("message_end")![0](
+      { message: { role: "assistant", content: "The recovered result is reviewed." } },
+      context,
+    );
+    await agent.events.get("agent_settled")![0](undefined, context);
+    assert.equal(readResult(mailbox, REQUEST_ID)?.text, "The recovered result is reviewed.");
+  } finally {
+    fireShutdown(agent);
+    providerRegistration.dispose();
+    removeRequest(mailbox, REQUEST_ID);
+    removeResult(mailbox, REQUEST_ID);
+    resetAgentMailbox(mailbox);
+  }
 });
 
 test("agent reload preserves a completed request awaiting delivery", async () => {
@@ -2573,7 +3745,7 @@ test("agent reload preserves a completed request awaiting delivery", async () =>
   const reloaded = readAgentState(mailbox)!;
   assert.equal(reloaded.completedRequestId, REQUEST_ID);
   assert.deepEqual(reloaded.lastAck, state.lastAck);
-  agent.events.get("session_shutdown")?.[0]();
+  fireShutdown(agent);
   const sameSessionMailbox = setAgentEnvironment();
   const sameSessionState = managedState("registered-agent");
   sameSessionState.completedRequestId = REQUEST_ID;
@@ -2589,14 +3761,14 @@ test("agent reload preserves a completed request awaiting delivery", async () =>
     readAgentState(sameSessionMailbox)?.completedRequestId,
     REQUEST_ID,
   );
-  sameSessionAgent.events.get("session_shutdown")?.[0]();
+  fireShutdown(sameSessionAgent);
 });
 
 test("active state plus matching durable result repairs to completed", async () => {
   const mailbox = setAgentEnvironment();
   writeAgentState(mailbox, managedState("registered-agent", REQUEST_ID));
   writeResult(mailbox, {
-    version: 4,
+    version: 5,
     runId: AGENT_ID,
     requestId: REQUEST_ID,
     ownerSessionId: LEAD_SESSION_ID,
@@ -2618,7 +3790,7 @@ test("active state plus matching durable result repairs to completed", async () 
   assert.equal(repaired.activeRequestId, undefined);
   assert.equal(repaired.completedRequestId, REQUEST_ID);
   assert.equal(repaired.lastActivityAt, undefined);
-  agent.events.get("session_shutdown")?.[0]();
+  fireShutdown(agent);
 });
 
 test("agent registers native activity events and coalesces activity writes", async () => {
@@ -2656,7 +3828,7 @@ test("agent registers native activity events and coalesces activity writes", asy
   agent.events.get("tool_execution_end")![0]({}, context);
   assert.equal(readAgentState(mailbox)!.lastActivityAt, 1_012_000);
   Date.now = realNow;
-  agent.events.get("session_shutdown")?.[0]();
+  fireShutdown(agent);
 });
 
 test("managed agents cap direct built-in shell calls without explicit timeouts", async () => {
@@ -2744,14 +3916,14 @@ test("agent restart forces an active activity touch within the coalescing window
     fakeAgentContext(),
   );
   assert.ok(readAgentState(mailbox)!.lastActivityAt! > state.lastActivityAt);
-  agent.events.get("session_shutdown")?.[0]();
+  fireShutdown(agent);
 });
 
 test("mismatched result never repairs agent state", async () => {
   const mailbox = setAgentEnvironment();
   writeAgentState(mailbox, managedState("registered-agent", REQUEST_ID));
   writeResult(mailbox, {
-    version: 4,
+    version: 5,
     runId: AGENT_ID,
     requestId: REQUEST_ID,
     ownerSessionId: LEAD_SESSION_ID,
@@ -2771,7 +3943,7 @@ test("mismatched result never repairs agent state", async () => {
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(readAgentState(mailbox)?.activeRequestId, REQUEST_ID);
   assert.equal(readAgentState(mailbox)?.completedRequestId, undefined);
-  agent.events.get("session_shutdown")?.[0]();
+  fireShutdown(agent);
   const malformedMailbox = setAgentEnvironment();
   const state = managedState("registered-agent", REQUEST_ID);
   writeAgentState(malformedMailbox, state);
@@ -2790,7 +3962,7 @@ test("mismatched result never repairs agent state", async () => {
   const recovered = readAgentState(malformedMailbox)!;
   assert.equal(recovered.activeRequestId, state.activeRequestId);
   assert.equal(recovered.completedRequestId, undefined);
-  malformedAgent.events.get("session_shutdown")?.[0]();
+  fireShutdown(malformedAgent);
 });
 
 test("agent reload rejects a different Pi session identity", () => {
@@ -2806,7 +3978,7 @@ test("agent reload rejects a different Pi session identity", () => {
   };
   agent.events.get("session_start")![0]({ reason: "reload" }, context);
   assert.deepEqual(readAgentState(mailbox), state);
-  agent.events.get("session_shutdown")?.[0]();
+  fireShutdown(agent);
 });
 
 test("metadata initialization serializes repeats and rejects stale generations", async () => {
@@ -2845,7 +4017,7 @@ test("metadata initialization serializes repeats and rejects stale generations",
   pending.shift()!();
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(agent.calls.length, 2);
-  agent.events.get("session_shutdown")?.[0]();
+  fireShutdown(agent);
   {
     const mailbox = setAgentEnvironment();
     const gates: (() => void)[] = [];
@@ -2882,7 +4054,7 @@ test("metadata initialization serializes repeats and rejects stale generations",
     gates.shift()!();
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(agent.calls.length, 3);
-    agent.events.get("session_shutdown")?.[0]();
+    fireShutdown(agent);
   }
 });
 
@@ -2942,7 +4114,7 @@ test("metadata outage retains one latest desired snapshot", async () => {
       false,
     );
   assert.equal(agent.calls.length, 3);
-  agent.events.get("session_shutdown")?.[0]();
+  fireShutdown(agent);
 });
 
 test("agent shutdown invalidates in-flight metadata", async () => {
@@ -2970,7 +4142,7 @@ test("agent shutdown invalidates in-flight metadata", async () => {
   agent.events.get("session_start")![0](undefined, context);
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(agent.calls.length, 1);
-  agent.events.get("session_shutdown")?.[0]();
+  for (const shutdown of agent.events.get("session_shutdown") ?? []) shutdown();
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(aborted, true);
   assert.equal(agent.execOptions[0].signal?.aborted, true);
@@ -2988,7 +4160,7 @@ test("agent shutdown invalidates in-flight metadata", async () => {
   assert.ok(successor.includes("thinking"));
   assert.equal(readAgentState(successorMailbox)?.activeRequestId, undefined);
   assert.equal(firstMailbox, successorMailbox);
-  agent.events.get("session_shutdown")?.[0]();
+  for (const shutdown of agent.events.get("session_shutdown") ?? []) shutdown();
 });
 
 test("agent shutdown resolves only after its metadata clear completes", async () => {
@@ -3005,8 +4177,8 @@ test("agent shutdown resolves only after its metadata clear completes", async ()
   await agent.events.get("session_start")![0](undefined, fakeContext());
   await new Promise((resolve) => setImmediate(resolve));
   let settled = false;
-  const shutdown = Promise.resolve(
-    agent.events.get("session_shutdown")![0](),
+  const shutdown = Promise.all(
+    (agent.events.get("session_shutdown") ?? []).map((listener) => listener()),
   ).then(() => (settled = true));
   await new Promise((resolve) => setImmediate(resolve));
   assert.ok(agent.calls.some((args) => args.includes("--clear-title")));
@@ -3024,7 +4196,7 @@ test("task state-write failure retains the request for an exact retry", async ()
   await agent.events.get("session_start")![0](undefined, context);
   const started = readAgentState(mailbox)!;
   const request: RequestRecord = {
-    version: 4,
+    version: 5,
     runId: started.runId,
     requestId: REQUEST_ID,
     ownerSessionId: started.ownerSessionId,
@@ -3050,7 +4222,7 @@ test("task state-write failure retains the request for an exact retry", async ()
   );
   assert.deepEqual(retried, { action: "transform", text: request.text });
   assert.equal(readAgentState(mailbox)?.activeRequestId, REQUEST_ID);
-  agent.events.get("session_shutdown")?.[0]();
+  fireShutdown(agent);
 });
 
 test("acknowledgement state-write failure retains an identity-rejected request", async () => {
@@ -3061,7 +4233,7 @@ test("acknowledgement state-write failure retains an identity-rejected request",
   await agent.events.get("session_start")![0](undefined, context);
   const started = readAgentState(mailbox)!;
   const request: RequestRecord = {
-    version: 4,
+    version: 5,
     runId: started.runId,
     requestId: REQUEST_ID,
     ownerSessionId: started.ownerSessionId,
@@ -3093,7 +4265,7 @@ test("acknowledgement state-write failure retains an identity-rejected request",
     acknowledgedAt: readAgentState(mailbox)!.lastAck!.acknowledgedAt,
   });
   assert.equal(readRequest(mailbox, REQUEST_ID), undefined);
-  agent.events.get("session_shutdown")?.[0]();
+  fireShutdown(agent);
 });
 
 test("a stray agent variable does not suppress the active Lead tool surface", async () => {
@@ -3117,7 +4289,7 @@ test("a stray agent variable does not suppress the active Lead tool surface", as
     "peer_message",
   ]);
   assert.deepEqual(lead.commands, ["agents", "herdsman"]);
-  lead.events.get("session_shutdown")?.[0]();
+  fireShutdown(lead);
 });
 
 test("session agent identity reads the session-wide entry array", () => {
@@ -3253,7 +4425,7 @@ test("retired active sessions suppress threshold compaction until completion", a
   await agent.events.get("session_start")![0](undefined, context);
   const state = readAgentState(mailbox)!;
   const request: RequestRecord = {
-    version: 4,
+    version: 5,
     runId: state.runId,
     requestId: REQUEST_ID,
     ownerSessionId: state.ownerSessionId,
@@ -3316,7 +4488,7 @@ test("retired active sessions suppress threshold compaction until completion", a
     contextResult.messages.at(-1).content,
     /self-contained handoff/i,
   );
-  agent.events.get("session_shutdown")?.[0]();
+  fireShutdown(agent);
   resetAgentMailbox(mailbox);
 });
 
@@ -3330,7 +4502,7 @@ test("context retirement bypasses compaction behavior when disabled", async () =
     await agent.events.get("session_start")![0](undefined, context);
     const state = readAgentState(mailbox)!;
     const request: RequestRecord = {
-      version: 4,
+      version: 5,
       runId: state.runId,
       requestId: REQUEST_ID,
       ownerSessionId: state.ownerSessionId,
@@ -3364,7 +4536,7 @@ test("context retirement bypasses compaction behavior when disabled", async () =
       ),
       true,
     );
-    agent.events.get("session_shutdown")?.[0]();
+    fireShutdown(agent);
     resetAgentMailbox(mailbox);
   } finally {
     updateConfig("contextRetirement", undefined);
@@ -3382,7 +4554,7 @@ test("overflow retires without cancellation and inactive sessions stay untouched
     await agent.events.get("session_start")![0](undefined, context);
     const state = readAgentState(mailbox)!;
     const request: RequestRecord = {
-      version: 4,
+      version: 5,
       runId: state.runId,
       requestId: REQUEST_ID,
       ownerSessionId: state.ownerSessionId,
@@ -3408,7 +4580,7 @@ test("overflow retires without cancellation and inactive sessions stay untouched
       true,
     );
   } finally {
-    agent.events.get("session_shutdown")?.[0]();
+    fireShutdown(agent);
     resetAgentMailbox(mailbox);
   }
 
@@ -3439,7 +4611,7 @@ test("overflow retires without cancellation and inactive sessions stay untouched
       undefined,
     );
   } finally {
-    inactiveAgent.events.get("session_shutdown")?.[0]();
+    fireShutdown(inactiveAgent);
     resetAgentMailbox(inactiveMailbox);
   }
 });
@@ -3464,7 +4636,7 @@ test("agent persists one identity entry before mailbox initialization", async ()
     },
   ]);
   assert.ok(readAgentState(mailbox));
-  agent.events.get("session_shutdown")?.[0]();
+  fireShutdown(agent);
 });
 
 test("agent rejects a conflicting persisted session identity", async () => {
@@ -3491,7 +4663,7 @@ test("agent rejects a conflicting persisted session identity", async () => {
       message.includes("session identity does not match environment"),
     ),
   );
-  agent.events.get("session_shutdown")?.[0]();
+  fireShutdown(agent);
   resetAgentMailbox(mailbox);
 });
 
@@ -3530,7 +4702,7 @@ test("a forked session establishes identity for its own Pi session", async () =>
       },
     ]);
   } finally {
-    agent.events.get("session_shutdown")?.[0]();
+    fireShutdown(agent);
     resetAgentMailbox(mailbox);
   }
 });
@@ -3548,7 +4720,7 @@ test("owner ask delivery is branch-local and recovers on tree navigation", async
   };
   writeAgentState(mailbox, waiting);
   const ask: AskRecord = {
-    version: 4,
+    version: 5,
     askId: waiting.pendingAskId!,
     requestId,
     runId: waiting.runId,
@@ -3595,7 +4767,7 @@ test("owner ask delivery is branch-local and recovers on tree navigation", async
   assert.deepEqual(pi.sentMessageCalls[0]?.options, {
     triggerTurn: true,
   });
-  pi.events.get("session_shutdown")?.[0]();
+  fireShutdown(pi);
   resetAgentMailbox(mailbox);
 });
 
@@ -3612,7 +4784,7 @@ test("owner ask resolved while busy is not delivered after settlement", async ()
   };
   writeAgentState(mailbox, waiting);
   writeAsk(mailbox, {
-    version: 4,
+    version: 5,
     askId: waiting.pendingAskId!,
     requestId,
     runId: waiting.runId,
@@ -3647,7 +4819,7 @@ test("owner ask resolved while busy is not delivered after settlement", async ()
       await handler(undefined, context);
     assert.equal(pi.sent.length, 0);
   } finally {
-    pi.events.get("session_shutdown")?.[0]();
+    fireShutdown(pi);
     resetAgentMailbox(mailbox);
   }
 });
@@ -3665,7 +4837,7 @@ test("owner ask waits while busy and delivers once after settlement", async () =
   };
   writeAgentState(mailbox, waiting);
   writeAsk(mailbox, {
-    version: 4,
+    version: 5,
     askId: waiting.pendingAskId!,
     requestId,
     runId: waiting.runId,
@@ -3714,7 +4886,7 @@ test("owner ask waits while busy and delivers once after settlement", async () =
     );
     assert.deepEqual(pi.sentMessageCalls[0]?.options, { triggerTurn: true });
   } finally {
-    pi.events.get("session_shutdown")?.[0]();
+    fireShutdown(pi);
     resetAgentMailbox(mailbox);
   }
 });

@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { test, type TestContext } from "node:test";
 import { Value } from "typebox/value";
+import { DELEGATION_BRIEF_EXAMPLES, parseDelegationBrief } from "./briefs.ts";
 import type {
   AskRecord,
   RequestRecord,
@@ -105,8 +106,42 @@ function fakeChiefPi(options: Parameters<typeof fakePi>[0] = {}) {
   return fixture;
 }
 const { updateConfig } = await import("./config.ts");
-const agentTool = (pi: ReturnType<typeof fakePi>, name: string) =>
-  pi.tools.find((candidate) => candidate.name === `agent_${name}`)!;
+function testBrief(task: string, profile: keyof typeof DELEGATION_BRIEF_EXAMPLES): string {
+  return `${DELEGATION_BRIEF_EXAMPLES[profile].trimEnd()}\n\nAssignment-specific detail:\n${task}`;
+}
+const agentTool = (pi: ReturnType<typeof fakePi>, name: string) => {
+  const tool = pi.tools.find((candidate) => candidate.name === `agent_${name}`)!;
+  if (name !== "delegate" && name !== "continue" && name !== "interrupt")
+    return tool;
+  return {
+    ...tool,
+    execute: async (...args: Parameters<typeof tool.execute>) => {
+      const params = args[1] as Record<string, unknown> | undefined;
+      const field = name === "interrupt" ? "message" : "task";
+      const task = params?.[field];
+      if (typeof task !== "string" || task.trimStart().startsWith("---"))
+        return tool.execute(...args);
+      const label = typeof params.agent === "string" ? params.agent : "";
+      const storedProfile =
+        name === "interrupt" && label
+          ? readAgentState(agentMailboxPath(WORKSPACE, label))?.briefProfile
+          : undefined;
+      const definition = typeof params.definition === "string" ? params.definition : "";
+      const profile = storedProfile ?? (definition.includes("review")
+        ? "review"
+        : definition.includes("research")
+          ? "research"
+          : definition.includes("investig")
+            ? "investigation"
+            : definition.includes("implement") || definition.includes("execut")
+              ? "execution"
+              : "common");
+      const next = [...args] as Parameters<typeof tool.execute>;
+      next[1] = { ...params, [field]: testBrief(task, profile) } as never;
+      return tool.execute(...next);
+    },
+  };
+};
 const ownershipResult = (
   child: string,
   owner = LEAD_SESSION_ID,
@@ -4555,7 +4590,11 @@ test("session continuation inherits the saved label without an override", async 
 
 const idleRetainedWorkerFixture = async (
   definition: string,
-  options: { launchedModel?: string; storedFingerprint?: "missing" } = {},
+  options: {
+    launchedModel?: string;
+    storedFingerprint?: "missing";
+    onRequest?: (text: string, request?: RequestRecord) => void | Promise<void>;
+  } = {},
 ) => {
   const label = `${definition}-agent`;
   const definitionPath = join(PI_AGENTS_DIR, `${definition}.md`);
@@ -4628,7 +4667,7 @@ const idleRetainedWorkerFixture = async (
     label,
     () => sourceId,
     undefined,
-    undefined,
+    options.onRequest,
     false,
     undefined,
     "/tmp",
@@ -4642,7 +4681,7 @@ const idleRetainedWorkerFixture = async (
       label,
       () => sourceId,
       undefined,
-      undefined,
+      options.onRequest,
       false,
       undefined,
       "/tmp",
@@ -4726,6 +4765,110 @@ test("definition drift relaunches a retained worker on the same session", async 
     resetAgentMailbox(fixture.mailbox);
     realFs.rmSync(fixture.definitionPath, { force: true });
     realFs.rmSync(fixture.sourcePath, { force: true });
+  }
+});
+
+test("assignment response overrides do not relaunch a healthy retained worker", async () => {
+  setLeadEnvironment();
+  nativeSessions.clear();
+  const name = `response-override-${randomUUID().slice(0, 8)}`;
+  const fixture = await idleRetainedWorkerFixture(name);
+  const callsBeforeAssignment = fixture.pi.calls.length;
+  try {
+    const task = testBrief("Return a report without changing the worker role.", "common").replace(
+      "response: role-defaults",
+      "response: { schema: response-contract/v1, target: inline, format: markdown, requiredSections: [Outcome] }",
+    );
+    const result = await agentTool(fixture.pi, "continue").execute(
+      "id",
+      { session: fixture.sourcePath, task },
+      undefined,
+      undefined,
+      fixture.context,
+    );
+    assert.equal(result.details.ok, true, JSON.stringify(result.details));
+    assert.equal(result.details.relaunched, undefined);
+    const after = readAgentState(fixture.mailbox)!;
+    assert.equal(after.runId, fixture.state.runId);
+    assert.equal(after.piSessionId, fixture.state.piSessionId);
+    const newCalls = fixture.pi.calls.slice(callsBeforeAssignment);
+    assert.equal(
+      newCalls.some((args) => args[0] === "agent" && args[1] === "start"),
+      false,
+      "an assignment-level response override is not a launch change",
+    );
+  } finally {
+    fixture.pi.events.get("session_shutdown")?.[0]();
+    nativeSessions.clear();
+    resetAgentMailbox(fixture.mailbox);
+    realFs.rmSync(fixture.definitionPath, { force: true });
+    realFs.rmSync(fixture.sourcePath, { force: true });
+  }
+});
+
+test("validated role-specific brief context reaches worker requests", async () => {
+  for (const profile of ["investigation", "research", "execution", "review"] as const) {
+    setLeadEnvironment();
+    nativeSessions.clear();
+    const name = `brief-${profile}-${randomUUID().slice(0, 4)}`;
+    const received: RequestRecord[] = [];
+    const fixture = await idleRetainedWorkerFixture(name, {
+      onRequest: (_text, request) => {
+        if (request) received.push(request);
+      },
+    });
+    try {
+      const task = testBrief("Use the profile-specific context.", profile);
+      const brief = parseDelegationBrief(task);
+      const result = await agentTool(fixture.pi, "continue").execute(
+        "id",
+        { session: fixture.sourcePath, task },
+        undefined,
+        undefined,
+        fixture.context,
+      );
+      assert.equal(result.details.ok, true, JSON.stringify(result.details));
+      const request = received.at(-1);
+      assert.ok(request, "the retained worker receives the accepted assignment");
+      assert.equal(request.acceptedAssignment?.brief.profile, profile);
+
+      let roleValues: readonly string[];
+      switch (profile) {
+        case "investigation":
+          assert.ok(brief.investigation);
+          roleValues = [
+            ...brief.investigation.questions,
+            ...brief.investigation.targetLocations,
+          ];
+          break;
+        case "research":
+          assert.ok(brief.research);
+          roleValues = [
+            ...brief.research.questions,
+            ...brief.research.sourceConstraints,
+          ];
+          break;
+        case "execution":
+          assert.ok(brief.execution);
+          roleValues = [
+            brief.execution.affectedArea,
+            ...brief.execution.validationExpectations,
+          ];
+          break;
+        case "review":
+          assert.ok(brief.review);
+          roleValues = [brief.review.baseline, ...brief.review.criteria];
+          break;
+      }
+      for (const value of roleValues)
+        assert.ok(request.text.includes(value), `${profile} context missing: ${value}`);
+    } finally {
+      fixture.pi.events.get("session_shutdown")?.[0]();
+      nativeSessions.clear();
+      resetAgentMailbox(fixture.mailbox);
+      realFs.rmSync(fixture.definitionPath, { force: true });
+      realFs.rmSync(fixture.sourcePath, { force: true });
+    }
   }
 });
 
@@ -4955,7 +5098,7 @@ test("session continuation rejects label overrides and occupied inherited labels
   }
 });
 
-test("delegate schema rejects an empty task", () => {
+test("delegate schema accepts a brief string and rejects an empty task", () => {
   setLeadEnvironment();
   const pi = fakePi();
   registerExtension!(pi.pi as never);
@@ -4963,7 +5106,10 @@ test("delegate schema rejects an empty task", () => {
     (candidate) => candidate.name === "agent_delegate",
   )!.parameters;
   assert.equal(
-    Value.Check(schema, { definition: "agent", task: "work" }),
+    Value.Check(schema, {
+      definition: "agent",
+      task: DELEGATION_BRIEF_EXAMPLES.common,
+    }),
     true,
   );
   assert.equal(Value.Check(schema, { definition: "agent", task: "" }), false);
@@ -5583,7 +5729,7 @@ test("registered agent validates duplicate agents and selectors before lifecycle
     {
       definition: "agent",
       label,
-      task: "duplicate task",
+      task: testBrief("duplicate task", "common"),
     },
     undefined,
     undefined,
@@ -5609,7 +5755,7 @@ test("registered agent validates duplicate agents and selectors before lifecycle
     "id",
     {
       session: "/tmp/missing-session.jsonl",
-      task: "continue",
+      task: testBrief("continue", "common"),
     },
     undefined,
     undefined,
@@ -5629,30 +5775,24 @@ test("registered delegate protects a live mailbox owned by another owner", async
     ownerSessionId: "owner-a",
   };
   writeAgentState(mailbox, state);
-  writeRequest(mailbox, {
-    version: 4,
-    runId: state.runId,
-    requestId: REQUEST_ID,
-    ownerSessionId: state.ownerSessionId,
-    workspaceId: WORKSPACE,
-    agentLabel: label,
-    paneId: state.paneId,
-    kind: "task",
-    text: "preserve me",
-    createdAt: Date.now(),
-  });
-  writeResult(mailbox, {
-    version: 4,
-    runId: state.runId,
-    requestId: REQUEST_ID,
-    ownerSessionId: state.ownerSessionId,
-    workspaceId: WORKSPACE,
-    agentLabel: label,
-    paneId: state.paneId,
-    status: "completed",
-    text: "preserve this result",
-    completedAt: Date.now(),
-  });
+  writeRequest(mailbox, { version: 5, runId: state.runId,
+  requestId: REQUEST_ID,
+  ownerSessionId: state.ownerSessionId,
+  workspaceId: WORKSPACE,
+  agentLabel: label,
+  paneId: state.paneId,
+  kind: "task",
+  text: "preserve me",
+  createdAt: Date.now(), });
+  writeResult(mailbox, { version: 5, runId: state.runId,
+  requestId: REQUEST_ID,
+  ownerSessionId: state.ownerSessionId,
+  workspaceId: WORKSPACE,
+  agentLabel: label,
+  paneId: state.paneId,
+  status: "completed",
+  text: "preserve this result",
+  completedAt: Date.now(), });
   const before = readFileSync(`${mailbox}/state.json`, "utf8");
   const requestBefore = readFileSync(
     `${mailbox}/request-${REQUEST_ID}.json`,
@@ -5698,18 +5838,15 @@ test("fresh assignments do not reset an unacknowledged stale mailbox", async () 
   const automaticState = managedState(automaticLabel);
   const automaticRequestId = randomUUID();
   writeAgentState(automaticMailbox, automaticState);
-  writeRequest(automaticMailbox, {
-    version: 4,
-    runId: automaticState.runId,
-    requestId: automaticRequestId,
-    ownerSessionId: automaticState.ownerSessionId,
-    workspaceId: automaticState.workspaceId,
-    agentLabel: automaticState.agentLabel,
-    paneId: automaticState.paneId,
-    kind: "task",
-    text: "preserve automatic handoff",
-    createdAt: Date.now(),
-  });
+  writeRequest(automaticMailbox, { version: 5, runId: automaticState.runId,
+  requestId: automaticRequestId,
+  ownerSessionId: automaticState.ownerSessionId,
+  workspaceId: automaticState.workspaceId,
+  agentLabel: automaticState.agentLabel,
+  paneId: automaticState.paneId,
+  kind: "task",
+  text: "preserve automatic handoff",
+  createdAt: Date.now(), });
   const automaticStartup = startupExecutor(
     automaticLabel + "-2",
     () => DEFAULT_PI_SESSION_ID,
@@ -5738,36 +5875,30 @@ test("request-only mailbox remnants reserve their labels", async () => {
   const explicitLabel = "request-only-explicit";
   const explicitMailbox = agentMailboxPath(WORKSPACE, explicitLabel);
   const explicitRequestId = randomUUID();
-  writeRequest(explicitMailbox, {
-    version: 4,
-    runId: AGENT_ID,
-    requestId: explicitRequestId,
-    ownerSessionId: LEAD_SESSION_ID,
-    workspaceId: WORKSPACE,
-    agentLabel: explicitLabel,
-    paneId: "request-only-pane",
-    kind: "task",
-    text: "retain this request-only remnant",
-    createdAt: Date.now(),
-  });
+  writeRequest(explicitMailbox, { version: 5, runId: AGENT_ID,
+  requestId: explicitRequestId,
+  ownerSessionId: LEAD_SESSION_ID,
+  workspaceId: WORKSPACE,
+  agentLabel: explicitLabel,
+  paneId: "request-only-pane",
+  kind: "task",
+  text: "retain this request-only remnant",
+  createdAt: Date.now(), });
   resetAgentMailbox(explicitMailbox);
 
   setLeadEnvironment();
   const automaticLabel = "agent";
   const automaticMailbox = agentMailboxPath(WORKSPACE, automaticLabel);
   const automaticRequestId = randomUUID();
-  writeRequest(automaticMailbox, {
-    version: 4,
-    runId: AGENT_ID,
-    requestId: automaticRequestId,
-    ownerSessionId: LEAD_SESSION_ID,
-    workspaceId: WORKSPACE,
-    agentLabel: automaticLabel,
-    paneId: "request-only-pane",
-    kind: "task",
-    text: "retain this request-only remnant",
-    createdAt: Date.now(),
-  });
+  writeRequest(automaticMailbox, { version: 5, runId: AGENT_ID,
+  requestId: automaticRequestId,
+  ownerSessionId: LEAD_SESSION_ID,
+  workspaceId: WORKSPACE,
+  agentLabel: automaticLabel,
+  paneId: "request-only-pane",
+  kind: "task",
+  text: "retain this request-only remnant",
+  createdAt: Date.now(), });
   const automaticStartup = startupExecutor(
     `${automaticLabel}-2`,
     () => DEFAULT_PI_SESSION_ID,
@@ -5832,7 +5963,10 @@ test("registered lead exposes only explicit live controls", async () => {
   const identity = recoveryIdentity(label);
   const mailbox = agentMailboxPath(WORKSPACE, label);
   resetAgentMailbox(mailbox);
-  writeAgentState(mailbox, managedState(label, REQUEST_ID, identity));
+  writeAgentState(mailbox, {
+    ...managedState(label, REQUEST_ID, identity),
+    agentDefinition: "generalist",
+  });
   const steerFile = join(testTmpRoot, `${label}-update.md`);
   realFs.writeFileSync(steerFile, "steer evidence");
   let steerSubmitted: RequestRecord | undefined;
@@ -5844,7 +5978,7 @@ test("registered lead exposes only explicit live controls", async () => {
       "working",
       identity.piSessionId,
       (requestMailbox, marker) => {
-        const requestId = marker.slice("__PI_HERDSMAN_AGENT_V4__:".length);
+        const requestId = marker.slice("__PI_HERDSMAN_AGENT_V5__:".length);
         steerSubmitted = readRequest(requestMailbox, requestId);
         const current = readAgentState(requestMailbox)!;
         writeAgentState(requestMailbox, {
@@ -5906,7 +6040,7 @@ test("registered lead exposes only explicit live controls", async () => {
   assert.equal(steer.details.agent, label);
   assert.equal(steer.details.session_id, identity.piSessionId);
   assert.equal(steer.details.assignment_request_id, REQUEST_ID);
-  assert.equal(steer.details.presentation_agent_definition, "agent");
+  assert.equal(steer.details.presentation_agent_definition, "generalist");
   assert.equal(steer.details.truncated, false);
   assert.equal(steerSubmitted?.kind, "steer");
   assert.match(steerSubmitted?.text ?? "", /steer evidence/);
@@ -5936,7 +6070,7 @@ test("registered lead exposes only explicit live controls", async () => {
       "working",
       identity.piSessionId,
       (requestMailbox, marker) => {
-        const requestId = marker.slice("__PI_HERDSMAN_AGENT_V4__:".length);
+        const requestId = marker.slice("__PI_HERDSMAN_AGENT_V5__:".length);
         interruptSubmitted = readRequest(requestMailbox, requestId);
         const current = readAgentState(requestMailbox)!;
         writeAgentState(requestMailbox, {
@@ -5959,7 +6093,7 @@ test("registered lead exposes only explicit live controls", async () => {
     "interrupt",
     {
       agent: label,
-      message: "Stop and use the fallback.",
+      message: testBrief("Stop and use the fallback.", "common"),
     },
     undefined,
     undefined,
@@ -5969,7 +6103,9 @@ test("registered lead exposes only explicit live controls", async () => {
   assert.equal(interrupt.details.action, "interrupt");
   assert.equal(interrupt.details.assignment_request_id, REQUEST_ID);
   assert.equal(interruptSubmitted?.kind, "interrupt");
-  assert.equal(interruptSubmitted?.text, "Stop and use the fallback.");
+  assert.match(interruptSubmitted?.text ?? "", /Stop and use the fallback\./);
+  assert.equal(interruptSubmitted?.acceptedAssignment?.requestId, REQUEST_ID);
+  assert.equal(interruptSubmitted?.acceptedAssignment?.brief.profile, "common");
   interruptPi.events.get("session_shutdown")?.[0]();
   accepting.events.get("session_shutdown")?.[0]();
   realFs.rmSync(steerFile, { force: true });
@@ -5995,19 +6131,16 @@ test("successful controls persist their definition before runtime teardown", asy
     const askId = randomUUID();
     if (action === "reply") {
       writeAgentState(mailbox, { ...state, pendingAskId: askId });
-      writeAsk(mailbox, {
-        version: 4,
-        askId,
-        requestId,
-        runId: state.runId,
-        ownerSessionId: state.ownerSessionId,
-        workspaceId: state.workspaceId,
-        agentLabel: state.agentLabel,
-        paneId: state.paneId,
-        piSessionId: state.piSessionId,
-        question: "Which provider should I use?",
-        createdAt: Date.now(),
-      });
+      writeAsk(mailbox, { version: 5, askId,
+      requestId,
+      runId: state.runId,
+      ownerSessionId: state.ownerSessionId,
+      workspaceId: state.workspaceId,
+      agentLabel: state.agentLabel,
+      paneId: state.paneId,
+      piSessionId: state.piSessionId,
+      question: "Which provider should I use?",
+      createdAt: Date.now(), });
     }
     let pi: ReturnType<typeof fakePi>;
     let context = fakeContext();
@@ -6020,7 +6153,7 @@ test("successful controls persist their definition before runtime teardown", asy
     };
     const acknowledgeAndTearDown = (requestMailbox: string, marker: string) => {
       const observedRequestId = marker.slice(
-        "__PI_HERDSMAN_AGENT_V4__:".length,
+        "__PI_HERDSMAN_AGENT_V5__:".length,
       );
       const current = readAgentState(requestMailbox)!;
       writeAgentState(requestMailbox, {
@@ -6225,7 +6358,50 @@ test("lead steers a blocked parent waiting for direct-child work", async () => {
       false,
     );
 
-    parentStatus = "idle";
+    const provider = { id: "controller-api-waiting-provider", version: 1 };
+writeAgentState(parentMailbox, {
+  ...parent,
+  backgroundWorkProvider: provider,
+  backgroundWaiting: {
+    sessionId: parent.piSessionId,
+    requestId: parent.activeRequestId!,
+    provider,
+    revision: 1,
+    taskIds: ["still-running"],
+  },
+});
+const waitingParent = await agentTool(pi, "list").execute(
+  "list",
+  {},
+  undefined,
+  undefined,
+  context,
+);
+assert.equal(waitingParent.details.agents[0].state, "working");
+assert.ok(
+  waitingParent.details.agents[0].available_tools.includes("agent_steer"),
+);
+assert.ok(
+  !waitingParent.details.agents[0].available_tools.includes("agent_interrupt"),
+);
+const rejectedInterrupt = await agentTool(pi, "interrupt").execute(
+  "interrupt",
+  {
+    agent: parent.agentLabel,
+    message: "interrupt while background work waits",
+  },
+  undefined,
+  undefined,
+  context,
+);
+assert.equal(rejectedInterrupt.details.ok, false);
+assert.equal(rejectedInterrupt.details.error.category, "agent_busy");
+assert.match(
+  rejectedInterrupt.details.error.message,
+  /waiting on background work/,
+);
+writeAgentState(parentMailbox, parent);
+parentStatus = "idle";
     writeAgentState(childMailbox, {
       ...child,
       activeRequestId: undefined,
@@ -6301,18 +6477,15 @@ test("lead steers a blocked parent waiting for direct-child work", async () => {
     writeAgentState(parentMailbox, parent);
 
     const handoffRequestId = randomUUID();
-    writeRequest(parentMailbox, {
-      version: 4,
-      runId: parent.runId,
-      requestId: handoffRequestId,
-      ownerSessionId: parent.ownerSessionId,
-      workspaceId: parent.workspaceId,
-      agentLabel: parent.agentLabel,
-      paneId: parent.paneId,
-      kind: "task",
-      text: "pending handoff",
-      createdAt: Date.now(),
-    });
+    writeRequest(parentMailbox, { version: 5, runId: parent.runId,
+    requestId: handoffRequestId,
+    ownerSessionId: parent.ownerSessionId,
+    workspaceId: parent.workspaceId,
+    agentLabel: parent.agentLabel,
+    paneId: parent.paneId,
+    kind: "task",
+    text: "pending handoff",
+    createdAt: Date.now(), });
     const handoffPending = await agentTool(pi, "list").execute(
       "list",
       {},
@@ -6342,18 +6515,15 @@ test("lead steers a blocked parent waiting for direct-child work", async () => {
       activeRequestId: undefined,
       completedRequestId: child.activeRequestId,
     });
-    writeResult(childMailbox, {
-      version: 4,
-      runId: child.runId,
-      requestId: child.activeRequestId!,
-      ownerSessionId: child.ownerSessionId,
-      workspaceId: child.workspaceId,
-      agentLabel: child.agentLabel,
-      paneId: child.paneId,
-      status: "completed",
-      text: "child result",
-      completedAt: Date.now(),
-    });
+    writeResult(childMailbox, { version: 5, runId: child.runId,
+    requestId: child.activeRequestId!,
+    ownerSessionId: child.ownerSessionId,
+    workspaceId: child.workspaceId,
+    agentLabel: child.agentLabel,
+    paneId: child.paneId,
+    status: "completed",
+    text: "child result",
+    completedAt: Date.now(), });
     assert.ok(readResult(childMailbox, child.activeRequestId!));
     const completedChild = await agentTool(pi, "list").execute(
       "list",
@@ -6372,19 +6542,16 @@ test("lead steers a blocked parent waiting for direct-child work", async () => {
     );
 
     const ownerAskId = randomUUID();
-    writeAsk(parentMailbox, {
-      version: 4,
-      askId: ownerAskId,
-      requestId: REQUEST_ID,
-      runId: parent.runId,
-      ownerSessionId: parent.ownerSessionId,
-      workspaceId: parent.workspaceId,
-      agentLabel: parent.agentLabel,
-      paneId: parent.paneId,
-      piSessionId: parent.piSessionId,
-      question: "owner clarification",
-      createdAt: Date.now(),
-    });
+    writeAsk(parentMailbox, { version: 5, askId: ownerAskId,
+    requestId: REQUEST_ID,
+    runId: parent.runId,
+    ownerSessionId: parent.ownerSessionId,
+    workspaceId: parent.workspaceId,
+    agentLabel: parent.agentLabel,
+    paneId: parent.paneId,
+    piSessionId: parent.piSessionId,
+    question: "owner clarification",
+    createdAt: Date.now(), });
     writeAgentState(parentMailbox, {
       ...parent,
       pendingAskId: ownerAskId,
@@ -6409,18 +6576,15 @@ test("lead steers a blocked parent waiting for direct-child work", async () => {
       activeRequestId: undefined,
       completedRequestId: REQUEST_ID,
     });
-    writeResult(parentMailbox, {
-      version: 4,
-      runId: parent.runId,
-      requestId: REQUEST_ID,
-      ownerSessionId: parent.ownerSessionId,
-      workspaceId: parent.workspaceId,
-      agentLabel: parent.agentLabel,
-      paneId: parent.paneId,
-      status: "completed",
-      text: "parent result while child result is pending",
-      completedAt: Date.now(),
-    });
+    writeResult(parentMailbox, { version: 5, runId: parent.runId,
+    requestId: REQUEST_ID,
+    ownerSessionId: parent.ownerSessionId,
+    workspaceId: parent.workspaceId,
+    agentLabel: parent.agentLabel,
+    paneId: parent.paneId,
+    status: "completed",
+    text: "parent result while child result is pending",
+    completedAt: Date.now(), });
     const completionWithChild = await agentTool(pi, "list").execute(
       "list",
       {},
@@ -6460,18 +6624,15 @@ test("lead steers a blocked parent waiting for direct-child work", async () => {
       activeRequestId: undefined,
       completedRequestId: REQUEST_ID,
     });
-    writeResult(parentMailbox, {
-      version: 4,
-      runId: parent.runId,
-      requestId: REQUEST_ID,
-      ownerSessionId: parent.ownerSessionId,
-      workspaceId: parent.workspaceId,
-      agentLabel: parent.agentLabel,
-      paneId: parent.paneId,
-      status: "completed",
-      text: "parent result",
-      completedAt: Date.now(),
-    });
+    writeResult(parentMailbox, { version: 5, runId: parent.runId,
+    requestId: REQUEST_ID,
+    ownerSessionId: parent.ownerSessionId,
+    workspaceId: parent.workspaceId,
+    agentLabel: parent.agentLabel,
+    paneId: parent.paneId,
+    status: "completed",
+    text: "parent result",
+    completedAt: Date.now(), });
     const ownCompletion = await agentTool(pi, "list").execute(
       "list",
       {},
@@ -6613,18 +6774,15 @@ test("acknowledgement state-write failures retain requests for durable retry", (
       };
 
     const started = readAgentState(mailbox)!;
-    const request: RequestRecord = {
-      version: 4,
-      runId: started.runId,
-      requestId: randomUUID(),
-      ownerSessionId: started.ownerSessionId,
-      workspaceId: started.workspaceId,
-      agentLabel: started.agentLabel,
-      paneId: started.paneId,
-      kind: scenario.kind,
-      text: scenario.name,
-      createdAt: Date.now(),
-    };
+    const request: RequestRecord = { version: 5, runId: started.runId,
+    requestId: randomUUID(),
+    ownerSessionId: started.ownerSessionId,
+    workspaceId: started.workspaceId,
+    agentLabel: started.agentLabel,
+    paneId: started.paneId,
+    kind: scenario.kind,
+    text: scenario.name,
+    createdAt: Date.now(), };
     writeRequest(mailbox, request);
     support.failNextMailboxWrite = true;
     const input = agent.events.get("input")![0];
@@ -6702,18 +6860,15 @@ test("assignment status normalization fails closed safely", async () => {
     if (scenario.result) {
       state.completedRequestId = REQUEST_ID;
       writeAgentState(mailbox, state);
-      writeResult(mailbox, {
-        version: 4,
-        runId: AGENT_ID,
-        requestId: REQUEST_ID,
-        ownerSessionId: LEAD_SESSION_ID,
-        workspaceId: WORKSPACE,
-        agentLabel: label,
-        paneId: identity.paneId,
-        status: "completed",
-        text: "pending",
-        completedAt: Date.now(),
-      });
+      writeResult(mailbox, { version: 5, runId: AGENT_ID,
+      requestId: REQUEST_ID,
+      ownerSessionId: LEAD_SESSION_ID,
+      workspaceId: WORKSPACE,
+      agentLabel: label,
+      paneId: identity.paneId,
+      status: "completed",
+      text: "pending",
+      completedAt: Date.now(), });
     }
     const pi = fakePi({
       exec: leadExec(
@@ -6721,7 +6876,7 @@ test("assignment status normalization fails closed safely", async () => {
         scenario.status,
         identity.piSessionId,
         (requestMailbox, marker) => {
-          const requestId = marker.slice("__PI_HERDSMAN_AGENT_V4__:".length);
+          const requestId = marker.slice("__PI_HERDSMAN_AGENT_V5__:".length);
           const current = readAgentState(requestMailbox)!;
           writeAgentState(requestMailbox, {
             ...current,
@@ -6766,7 +6921,7 @@ test("assignment status normalization fails closed safely", async () => {
         "idle",
         identity.piSessionId,
         (requestMailbox, marker) => {
-          const requestId = marker.slice("__PI_HERDSMAN_AGENT_V4__:".length);
+          const requestId = marker.slice("__PI_HERDSMAN_AGENT_V5__:".length);
           const current = readAgentState(requestMailbox)!;
           writeAgentState(requestMailbox, {
             ...current,
@@ -6784,18 +6939,15 @@ test("assignment status normalization fails closed safely", async () => {
     const context = fakeContext();
     try {
       const handoffRequestId = randomUUID();
-      writeRequest(mailbox, {
-        version: 4,
-        runId: state.runId,
-        requestId: handoffRequestId,
-        ownerSessionId: state.ownerSessionId,
-        workspaceId: state.workspaceId,
-        agentLabel: state.agentLabel,
-        paneId: state.paneId,
-        kind: "task",
-        text: "recover this handoff",
-        createdAt: Date.now(),
-      });
+      writeRequest(mailbox, { version: 5, runId: state.runId,
+      requestId: handoffRequestId,
+      ownerSessionId: state.ownerSessionId,
+      workspaceId: state.workspaceId,
+      agentLabel: state.agentLabel,
+      paneId: state.paneId,
+      kind: "task",
+      text: "recover this handoff",
+      createdAt: Date.now(), });
       await pi.events.get("session_start")![0](undefined, context);
       const handoffList = await agentTool(pi, "list").execute(
         "id",
@@ -6836,18 +6988,15 @@ test("assignment status normalization fails closed safely", async () => {
         ...state,
         completedRequestId: requestA,
       });
-      writeResult(mailbox, {
-        version: 4,
-        runId: state.runId,
-        requestId: requestA,
-        ownerSessionId: state.ownerSessionId,
-        workspaceId: state.workspaceId,
-        agentLabel: state.agentLabel,
-        paneId: state.paneId,
-        status: "completed",
-        text: "done",
-        completedAt: Date.now(),
-      });
+      writeResult(mailbox, { version: 5, runId: state.runId,
+      requestId: requestA,
+      ownerSessionId: state.ownerSessionId,
+      workspaceId: state.workspaceId,
+      agentLabel: state.agentLabel,
+      paneId: state.paneId,
+      status: "completed",
+      text: "done",
+      completedAt: Date.now(), });
       const completedList = await agentTool(pi, "list").execute(
         "id",
         {},

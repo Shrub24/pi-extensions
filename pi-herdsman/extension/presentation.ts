@@ -42,6 +42,7 @@ import { herdsmanTempRoot, resultPath, resultRef } from "./storage.ts";
 export type AgentLifecycleState =
   | "idle"
   | "working"
+  | "waiting"
   | "blocked"
   | "settling"
   | "starting"
@@ -256,6 +257,7 @@ type LifecyclePresentationState = AgentLifecycleState | "idle" | "done";
 const LIFECYCLE = {
   idle: ["○", "idle"],
   working: ["●", "working"],
+  waiting: ["◷", "waiting"],
   blocked: ["◐", "blocked"],
   settling: ["◌", "settling"],
   starting: ["◌", "starting"],
@@ -275,6 +277,7 @@ function lifecycleMarker(state: LifecyclePresentationState): string {
 
 const STATE_COLOR: Record<string, string> = {
   [lifecycleLabel("working")]: "success",
+  [lifecycleLabel("waiting")]: "accent",
   [lifecycleLabel("blocked")]: "warning",
   [lifecycleLabel("settling")]: "accent",
   [lifecycleLabel("starting")]: "accent",
@@ -524,6 +527,7 @@ function formatDuration(milliseconds: number): string {
 export function formatStatusCounts(agents: readonly StatusAgent[]): string {
   const counts = {
     working: agents.filter((agent) => agent.state === "working").length,
+    waiting: agents.filter((agent) => agent.state === "waiting").length,
     blocked: agents.filter((agent) => agent.state === "blocked").length,
     settling: agents.filter((agent) => agent.state === "settling").length,
     starting: agents.filter((agent) => agent.state === "starting").length,
@@ -2226,12 +2230,14 @@ function errorLines(
 function agentListSummary(details: Record<string, unknown>): string {
   const agents = Array.isArray(details.agents) ? details.agents : [];
   let working = 0;
+  let waiting = 0;
   let blocked = 0;
   let needsReply = 0;
   for (const item of agents) {
     if (!item || typeof item !== "object") continue;
     const agent = item as Record<string, unknown>;
     if (agent.state === "working") working++;
+    if (agent.state === "waiting") waiting++;
     if (agent.state === "blocked") blocked++;
     if (
       Array.isArray(agent.available_tools) &&
@@ -2242,6 +2248,7 @@ function agentListSummary(details: Record<string, unknown>): string {
   return [
     `agents ${agents.length}`,
     working ? `${working} working` : "",
+    waiting ? `${waiting} waiting` : "",
     blocked ? `${blocked} blocked` : "",
     needsReply ? `${needsReply} needs reply` : "",
   ]

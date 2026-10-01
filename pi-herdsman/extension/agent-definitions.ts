@@ -19,6 +19,12 @@ import {
   parseFrontmatter as parsePiFrontmatter,
 } from "@earendil-works/pi-coding-agent";
 import { snapshotTextFiles } from "./core.ts";
+import { BRIEF_PROFILES, type BriefProfile } from "./briefs.ts";
+import {
+  DEFAULT_RESPONSE_CONTRACT,
+  normalizeResponseContract,
+  type ResponseContract,
+} from "./response-contracts.ts";
 import { herdsmanTempRoot } from "./storage.ts";
 
 export const VALID_THINKING_LEVELS = [
@@ -63,6 +69,8 @@ const SUPPORTED_FIELDS = new Set([
   "name",
   "description",
   "permission",
+  "briefProfile",
+  "responseContract",
   ...STRING_FIELDS,
   ...BOOLEAN_CAPABILITY_FIELDS,
   ...ARRAY_FIELDS,
@@ -81,6 +89,8 @@ export type Frontmatter = {
   enabled?: boolean;
   model?: string;
   thinking?: string | false;
+  briefProfile?: BriefProfile;
+  responseContract?: { [key: string]: unknown };
   bodyMode?: BodyMode;
   permission?: { [key: string]: unknown };
   noTools?: boolean;
@@ -269,6 +279,19 @@ function validateDefinition(
     invalid("bodyMode", "must be append or replace");
   if (frontmatter.bodyMode !== undefined && !options.allowBodyMode)
     invalid("bodyMode", "only valid when overlaying an existing agent");
+    if (
+      frontmatter.briefProfile !== undefined &&
+      (typeof frontmatter.briefProfile !== "string" ||
+        !(BRIEF_PROFILES as readonly string[]).includes(frontmatter.briefProfile))
+    )
+      invalid("briefProfile", "must be a supported briefing profile");
+    if (frontmatter.responseContract !== undefined) {
+      try {
+        normalizeResponseContract(frontmatter.responseContract);
+      } catch {
+        invalid("responseContract", "must be a complete response-contract/v1 object");
+      }
+    }
 }
 
 function mergeDefinitionBody(
@@ -729,7 +752,9 @@ export type AgentLaunchInputs = {
   systemPromptMode: string;
   model?: string;
   thinking?: string;
-  noTools: boolean;
+  briefProfile: BriefProfile;
+    responseContract: ResponseContract;
+    noTools: boolean;
   tools: string[];
   noBuiltinTools: boolean;
   excludeTools: string[];
@@ -827,6 +852,10 @@ export function resolveAgentLaunchInputs(
   return {
     body: agent.body,
     bodyFiles: bodyFileDigests(agent.body, cwd),
+      briefProfile: frontmatter.briefProfile ?? "common",
+      responseContract: normalizeResponseContract(
+        frontmatter.responseContract ?? DEFAULT_RESPONSE_CONTRACT,
+      ),
     systemPromptMode:
       frontmatter.systemPromptMode ??
       (agent.name === "delegate" ? "append" : "replace"),

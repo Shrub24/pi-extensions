@@ -11,6 +11,7 @@ durable assignment/convergence evidence. It is not a raw herdr lifecycle string.
 | ---------- | -------------------------------------------------------------------------------------------------------- |
 | `idle`     | A retained worker: its terminal result was delivered and its verified live process is available for one new assignment. |
 | `working`  | An assignment is active; `stale` remains an advisory field on this state.                                |
+| `waiting`  | The model turn has yielded, but provider-backed work or its required post-review response remains unresolved. |
 | `blocked`  | Active assignment waits for an owner answer or another condition.                                        |
 | `settling` | Assignment handoff, completion/result delivery, launch, direct-agent gate, or cleanup is converging.     |
 | `unknown`  | Exact safe control state cannot be proved.                                                               |
@@ -34,8 +35,12 @@ mutation.
 
 A delegating agent may be blocked while direct agent work is pending and still accept
 steering when `agent_steer` is listed, but it cannot expose `agent_interrupt` without a
-currently working Pi operation. Stale or inactive fields are advisory and do
-not automatically authorize or recommend interrupt. Descendant visibility does not imply authority;
+currently working Pi operation. A `waiting` worker remains on its active assignment:
+`agent_interrupt`, continuation, replacement assignment, and Clear idle are unavailable.
+Inspection, transcript, steering, and an armed `agent_extend` remain available; an
+explicit `agent_close` may still abandon the assignment when its close preflight permits.
+Stale or inactive fields are advisory and do not automatically authorize or recommend
+interrupt. Descendant visibility does not imply authority;
 records outside the controller's direct ownership can have an empty action list.
 Directly owned live records may expose the applicable live controls; directly
 owned live or proven `lost` records may expose `agent_close` when the applicable close
@@ -56,8 +61,10 @@ worker's acknowledgement. Once it elapses, the owning controller receives one
 the health cadence, so delivery can lag expiry by up to one 30-second scan and
 happens only while the owner is idle. Each entry lists the worker's current
 controls from the same eligibility as `available_tools`, so a record waiting on
-an owner question lists `agent_reply` and not `agent_interrupt`. After a
-delivered digest the window re-arms for another `softTimeoutMs`, so a long
+an owner question lists `agent_reply` and not `agent_interrupt`. A background-work
+waiter remains eligible for the digest and `agent_extend`, but never becomes
+interruptible merely because its task is unresolved. After a delivered digest the
+window re-arms for another `softTimeoutMs`, so a long
 assignment is checkpointed periodically; delivery, `agent_close`, and proven
 loss end the windows, and a resolved assignment is never listed again.
 `agent_extend` lengthens one worker's next window without changing its
@@ -128,7 +135,8 @@ failed inventory never proves `lost`; relocated or conflicting evidence is
 | Record    | Direct-owner actions                                                                                                                                           |
 | --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `idle`    | `agent_inspect`, eligible `agent_transcript`, and `agent_close` when the applicable close preflight succeeds.                                                   |
-| `live`    | `agent_inspect`, eligible `agent_transcript`, `agent_steer`, `agent_interrupt`, `agent_reply`, and `agent_close` when the applicable close preflight succeeds. |
+| `waiting` | `agent_inspect`, eligible `agent_transcript`, `agent_steer`, eligible `agent_extend`, and `agent_close` when the applicable close preflight succeeds; never `agent_interrupt` or Clear idle. |
+| `live`    | `agent_inspect`, eligible `agent_transcript`, `agent_steer`, `agent_interrupt` only for a working operation, `agent_reply` only for a valid pending ask, eligible `agent_extend`, and `agent_close` when the applicable close preflight succeeds. |
 | `lost`    | eligible `agent_transcript` and `agent_close` when the applicable close preflight succeeds.                                                                    |
 | `unknown` | None.                                                                                                                                                          |
 

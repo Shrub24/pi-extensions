@@ -87,6 +87,29 @@ name.
 The exact field semantics live in the
 [agent-definition schema](../reference/agent-definition-schema.md).
 
+## Typed assignment briefs
+
+Every `agent_delegate` and `agent_continue` assignment, and every eligible
+`agent_interrupt` replacement, carries a complete `delegation-brief/v1` Markdown
+document in `task` or `message`. Plain task sentences are rejected before pane,
+request, or advisory-window creation. The common profile requires an objective,
+context or an explicit no-context declaration, allowed and excluded scope,
+constraints, acceptance criteria, and a response requirement. Built-in
+investigation, research, execution, and review definitions add role-specific
+fields; custom definitions use the common profile unless configured stricter.
+
+Required `context.inputs` are validated and snapshotted privately at admission,
+then bound to the request identity so recovery cannot silently replace their
+contents. `agent_steer` and `agent_reply` remain free-form and do not create new
+assignments.
+
+The brief describes incoming work. Its separate `response` requirement resolves
+to a role-default or explicit `response-contract/v1`, which governs inline text
+and/or an artifact without weakening the incoming brief. Herdsman validates the
+actual requested output before success and records framework-observed artifact
+hashes and identity separately from model-authored claims. See the
+[agent tool reference](../reference/agent.md) for schemas and examples.
+
 ## Parallelism
 
 Delegate genuinely independent or context-heavy work. Prefer agents for broad
@@ -159,3 +182,5 @@ closed, the delegating agent is preserved rather than destructively guessing.
 - [`ask_owner` API](../reference/ask-owner.md)
 - [Lifecycle](lifecycle.md)
 - [Handoffs and files](../guides/handoffs.md)
+- [Versioned assignment briefs](../adr/0015-require-versioned-assignment-briefs.md)
+- [Response contracts](../adr/0016-validate-results-against-response-contracts.md)

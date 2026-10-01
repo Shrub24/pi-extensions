@@ -12,6 +12,12 @@ import type {
   ResultRecord,
   ManagedAgentState,
 } from "./mailbox.ts";
+import {
+  DELEGATION_BRIEF_EXAMPLES,
+  parseDelegationBrief,
+  type BriefProfile,
+} from "./briefs.ts";
+import { DEFAULT_RESPONSE_CONTRACT } from "./response-contracts.ts";
 import { claimProcessLock } from "./lock.ts";
 import { OperationError } from "./errors.ts";
 import { herdsmanTempRoot } from "./storage.ts";
@@ -112,6 +118,7 @@ mock.module("node:fs", {
     },
     fstatSync: realFs.fstatSync,
     fsyncSync: realFs.fsyncSync,
+    lstatSync: realFs.lstatSync,
     mkdirSync: realFs.mkdirSync,
     openSync: (...args: any[]) => {
       return realFs.openSync(...args);
@@ -186,10 +193,86 @@ export const {
   resetAgentMailbox,
   agentMailboxPath,
   writeAsk,
-  writeRequest,
+  writeRequest: writeMailboxRequest,
   writeResult,
-  writeAgentState,
+  writeAgentState: writeMailboxAgentState,
 } = await import("./mailbox.ts");
+const { createAcceptedAssignmentContract } = await import(
+  "./response-validation.ts"
+);
+
+export const writeRequestRaw = writeMailboxRequest;
+export const writeAgentStateRaw = writeMailboxAgentState;
+
+function fixtureAcceptedAssignment(
+  requestId: string,
+  profile: BriefProfile = "common",
+) {
+  return createAcceptedAssignmentContract(
+    requestId,
+    parseDelegationBrief(DELEGATION_BRIEF_EXAMPLES[profile]),
+    DEFAULT_RESPONSE_CONTRACT,
+    "/tmp",
+    1024 * 1024,
+  );
+}
+
+export function writeAgentState(
+  mailbox: string,
+  state: ManagedAgentState,
+): void {
+  if (
+    state.version === 5 &&
+    !state.activeRequestId &&
+    state.acceptedAssignment
+  ) {
+    const inactive = { ...state };
+    delete inactive.acceptedAssignment;
+    state = inactive;
+  }
+  if (
+    state.version === 5 &&
+    state.activeRequestId &&
+    !state.legacyAcceptedRequestIds?.includes(state.activeRequestId) &&
+    (!state.briefProfile ||
+      !state.acceptedAssignment ||
+      state.acceptedAssignment.requestId !== state.activeRequestId)
+  ) {
+    const profile =
+      state.briefProfile ?? state.acceptedAssignment?.brief.profile ?? "common";
+    state = {
+      ...state,
+      briefProfile: profile,
+      acceptedAssignment:
+        state.acceptedAssignment?.requestId === state.activeRequestId
+          ? state.acceptedAssignment
+          : fixtureAcceptedAssignment(state.activeRequestId, profile),
+    };
+  }
+  writeMailboxAgentState(mailbox, state);
+}
+
+export function writeRequest(mailbox: string, request: RequestRecord): void {
+  if (
+    request.version === 5 &&
+    (request.kind === "task" || request.kind === "interrupt") &&
+    !request.acceptedAssignment
+  ) {
+    const state = readAgentState(mailbox);
+    request = {
+      ...request,
+      acceptedAssignment: fixtureAcceptedAssignment(
+        request.kind === "task"
+          ? request.requestId
+          : (state?.activeRequestId ??
+            state?.completedRequestId ??
+            request.requestId),
+        state?.briefProfile ?? "common",
+      ),
+    };
+  }
+  writeMailboxRequest(mailbox, request);
+}
 
 mock.module("@earendil-works/pi-coding-agent", {
   namedExports: {
@@ -877,6 +960,7 @@ export function setLeadEnvironment(): void {
     "PI_HERDSMAN_LABEL",
     "PI_HERDSMAN_WORKSPACE_ID",
     "PI_HERDSMAN_AGENT_DEFINITION",
+    "PI_HERDSMAN_BRIEF_PROFILE",
     "PI_HERDSMAN_ALLOWED_AGENT_DEFINITIONS",
     "HERDR_PANE_ID",
     "HERDR_SOCKET_PATH",
@@ -910,6 +994,7 @@ export function setAgentEnvironment(
   process.env.PI_HERDSMAN_LABEL = label;
   process.env.PI_HERDSMAN_WORKSPACE_ID = workspace;
   process.env.PI_HERDSMAN_AGENT_DEFINITION = "agent";
+  process.env.PI_HERDSMAN_BRIEF_PROFILE = "common";
   process.env.HERDR_PANE_ID = "registered-pane";
   if (allowedAgentDefinitions === undefined)
     delete process.env.PI_HERDSMAN_ALLOWED_AGENT_DEFINITIONS;
@@ -933,7 +1018,7 @@ export function managedState(
   identity: FixtureIdentity = defaultFixtureIdentity,
 ): ManagedAgentState {
   return {
-    version: 4,
+    version: 5,
     runId: AGENT_ID,
     ownerSessionId: LEAD_SESSION_ID,
     workspaceId: WORKSPACE,
@@ -942,7 +1027,13 @@ export function managedState(
     piSessionId: identity.piSessionId,
     piSessionFile: identity.piSessionFile,
     cwd: "/tmp",
-    ...(activeRequestId ? { activeRequestId } : {}),
+    ...(activeRequestId
+      ? {
+          briefProfile: "common" as const,
+          activeRequestId,
+          acceptedAssignment: fixtureAcceptedAssignment(activeRequestId),
+        }
+      : {}),
     updatedAt: Date.now(),
   };
 }
@@ -1013,18 +1104,15 @@ export function requestRecordBytes(
   text: string,
 ): number {
   return Buffer.byteLength(
-    JSON.stringify({
-      version: 4,
-      runId: AGENT_ID,
-      requestId: REQUEST_ID,
-      ownerSessionId: LEAD_SESSION_ID,
-      workspaceId: WORKSPACE,
-      agentLabel,
-      paneId,
-      kind: "task",
-      text,
-      createdAt: 1_700_000_000_000,
-    }),
+    JSON.stringify({ version: 5, runId: AGENT_ID,
+    requestId: REQUEST_ID,
+    ownerSessionId: LEAD_SESSION_ID,
+    workspaceId: WORKSPACE,
+    agentLabel,
+    paneId,
+    kind: "task",
+    text,
+    createdAt: 1_700_000_000_000, }),
     "utf8",
   );
 }
@@ -1614,18 +1702,15 @@ export function delegatedLifecycleExecutor(
         const workspaceId = paneEnvironment.PI_HERDSMAN_WORKSPACE_ID;
         const paneId = args[args.indexOf("--pane") + 1];
         const tabForPane = tabByPane.get(paneId) ?? "delegated-tab";
-        const state: ManagedAgentState = {
-          version: 4,
-          runId,
-          ownerSessionId,
-          workspaceId,
-          agentLabel: label,
-          paneId,
-          piSessionId: childSessionIds[createdChildren++],
-          piSessionFile: `/tmp/${label}.jsonl`,
-          cwd: testCwd,
-          updatedAt: Date.now(),
-        };
+        const state: ManagedAgentState = { version: 5, runId,
+        ownerSessionId,
+        workspaceId,
+        agentLabel: label,
+        paneId,
+        piSessionId: childSessionIds[createdChildren++],
+        piSessionFile: `/tmp/${label}.jsonl`,
+        cwd: testCwd,
+        updatedAt: Date.now(), };
         live.set(label, state);
         tabByPane.set(paneId, tabForPane);
         writeAgentState(agentMailboxPath(workspaceId, label), state);
@@ -2313,18 +2398,15 @@ export function createStagedAssignmentFixture(
         completedRequestId: requestId,
         updatedAt: Date.now(),
       });
-      writeResult(startup.mailbox, {
-        version: 4,
-        runId: state.runId,
-        requestId,
-        ownerSessionId: state.ownerSessionId,
-        workspaceId: state.workspaceId,
-        agentLabel: state.agentLabel,
-        paneId: state.paneId,
-        status: "completed",
-        text: "completed before working was observed",
-        completedAt: Date.now(),
-      });
+      writeResult(startup.mailbox, { version: 5, runId: state.runId,
+      requestId,
+      ownerSessionId: state.ownerSessionId,
+      workspaceId: state.workspaceId,
+      agentLabel: state.agentLabel,
+      paneId: state.paneId,
+      status: "completed",
+      text: "completed before working was observed",
+      completedAt: Date.now(), });
       watchedResultPaths.get(`${startup.mailbox}/result-${requestId}.json`)?.(
         {},
         {},
@@ -2343,8 +2425,16 @@ export function writeMetadataTask(
   requestId = REQUEST_ID,
 ): RequestRecord {
   const state = readAgentState(mailbox)!;
+  const profile = state.briefProfile ?? "common";
+  const acceptedAssignment = fixtureAcceptedAssignment(requestId, profile);
+  writeAgentState(mailbox, {
+    ...state,
+    briefProfile: profile,
+    activeRequestId: requestId,
+    acceptedAssignment,
+  });
   const request: RequestRecord = {
-    version: 4,
+    version: 5,
     runId: state.runId,
     requestId,
     ownerSessionId: state.ownerSessionId,
@@ -2352,6 +2442,7 @@ export function writeMetadataTask(
     agentLabel: state.agentLabel,
     paneId: state.paneId,
     kind: "task",
+    acceptedAssignment,
     text,
     createdAt: Date.now(),
   };
@@ -2780,19 +2871,16 @@ export function startupExecutor(
           value: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
         },
       };
-      writeAgentState(mailbox, {
-        version: 4,
-        runId,
-        ownerSessionId,
-        workspaceId: WORKSPACE,
-        agentLabel: label,
-        paneId: activePaneId,
-        piSessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-        piSessionFile: sessionFile,
-        agentDefinition: "agent",
-        cwd: testCwd,
-        updatedAt: Date.now(),
-      });
+      writeAgentState(mailbox, { version: 5, runId,
+      ownerSessionId,
+      workspaceId: WORKSPACE,
+      agentLabel: label,
+      paneId: activePaneId,
+      piSessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      piSessionFile: sessionFile,
+      agentDefinition: "agent",
+      cwd: testCwd,
+      updatedAt: Date.now(), });
       return {
         stdout: JSON.stringify({
           id: AGENT_ID,

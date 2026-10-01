@@ -15,10 +15,18 @@ import {
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { claimProcessLock, ProcessLockOccupiedError } from "./lock.ts";
+import { decodeWaitingEvidence, type WaitingEvidence } from "./background-waiting.ts";
+import { BRIEF_PROFILES, type BriefProfile } from "./briefs.ts";
+import {
+  validateAcceptedAssignmentContract,
+  type AcceptedAssignmentContract,
+  type ArtifactDescriptor,
+  type ResponseDiagnostic,
+} from "./response-validation.ts";
 import { herdsmanDataRoot } from "./storage.ts";
 
 export interface ManagedAgentState {
-  version: 4;
+  version: 5;
   runId: string;
   ownerSessionId: string;
   workspaceId: string;
@@ -28,7 +36,12 @@ export interface ManagedAgentState {
   piSessionFile?: string;
   agentDefinition?: string;
   cwd: string;
+  briefProfile?: BriefProfile;
   activeRequestId?: string;
+  acceptedAssignment?: AcceptedAssignmentContract;
+  legacyAcceptedRequestIds?: readonly string[];
+  backgroundWorkProvider?: { id: string; version: number };
+  backgroundWaiting?: WaitingEvidence;
   pendingAskId?: string;
   lastActivityAt?: number;
   completedRequestId?: string;
@@ -59,7 +72,7 @@ export interface ResultPersistenceError {
   nextAction: string;
 }
 export interface RequestRecord {
-  version: 4;
+  version: 4 | 5;
   runId: string;
   requestId: string;
   ownerSessionId: string;
@@ -68,11 +81,12 @@ export interface RequestRecord {
   paneId: string;
   kind: "task" | "steer" | "interrupt" | "reply";
   askId?: string;
+  acceptedAssignment?: AcceptedAssignmentContract;
   text: string;
   createdAt: number;
 }
 export interface AskRecord {
-  version: 4;
+  version: 4 | 5;
   askId: string;
   requestId: string;
   runId: string;
@@ -85,7 +99,7 @@ export interface AskRecord {
   createdAt: number;
 }
 export interface ResultRecord {
-  version: 4;
+  version: 4 | 5;
   runId: string;
   requestId: string;
   ownerSessionId: string;
@@ -95,8 +109,22 @@ export interface ResultRecord {
   status: "completed" | "failed";
   text?: string;
   error?: {
-    code: "empty_result" | "result_too_large" | "write_failure";
+    code:
+      | "empty_result"
+      | "result_too_large"
+      | "write_failure"
+      | "invalid_response"
+      | "artifact_error";
     message: string;
+  };
+  responseValidation?: {
+    contractHash: string;
+    briefHash: string;
+    workerSessionId: string;
+    target: "inline" | "artifact" | "both";
+    textSource: "worker" | "framework";
+    artifacts: readonly ArtifactDescriptor[];
+    diagnostics?: readonly ResponseDiagnostic[];
   };
   contextUsage?: {
     tokens: number | null;
@@ -108,7 +136,10 @@ export interface ResultRecord {
 
 const UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const PREFIX = "__PI_HERDSMAN_AGENT_V4__:";
+export const MAILBOX_PROTOCOL_VERSION = 5 as const;
+export const MAILBOX_CONTROL_PREFIX = "__PI_HERDSMAN_AGENT_V5__:";
+export const LEGACY_MAILBOX_CONTROL_PREFIX = "__PI_HERDSMAN_AGENT_V4__:";
+const LEGACY_MAILBOX_PROTOCOL_VERSION = 4 as const;
 /** Fixed protocol safety ceiling; configuration only limits new submissions. */
 export const MAILBOX_PROTOCOL_LIMIT_BYTES = 1024 * 1024;
 export function mailboxRecordBytes(record: RequestRecord | AskRecord): number {
@@ -123,6 +154,8 @@ const LIMITS = {
   ask: MAILBOX_PROTOCOL_LIMIT_BYTES,
   result: 4 * 1024 * 1024,
 };
+// Keep the storage path stable: record envelopes migrate V4 state and its exact
+// accepted assignment artifacts in place, rather than abandoning live mailboxes.
 const root = join(herdsmanDataRoot(), "runtime", "mailboxes-v4");
 
 export function agentMailboxPath(
@@ -227,16 +260,29 @@ function validate(
   value: unknown,
   kind: keyof typeof LIMITS,
 ): asserts value is Record<string, unknown> {
-  if (
-    !value ||
-    typeof value !== "object" ||
-    (value as { version?: unknown }).version !== 4
-  )
+  if (!value || typeof value !== "object")
+    throw new Error("Invalid mailbox protocol version or record");
+  const version = (value as { version?: unknown }).version;
+  if (version !== LEGACY_MAILBOX_PROTOCOL_VERSION && version !== MAILBOX_PROTOCOL_VERSION)
     throw new Error("Invalid mailbox protocol version or record");
   const text = JSON.stringify(value);
   if (Buffer.byteLength(text, "utf8") > LIMITS[kind])
     throw new Error("Mailbox record is too large");
   const v = value as Record<string, any>;
+  if (
+    version === LEGACY_MAILBOX_PROTOCOL_VERSION &&
+    kind === "state" &&
+    ["briefProfile", "acceptedAssignment", "legacyAcceptedRequestIds", "backgroundWorkProvider", "backgroundWaiting"].some((field) =>
+      Object.hasOwn(v, field),
+    )
+  )
+    throw new Error("V4 state cannot contain V5 assignment metadata");
+  if (
+    version === LEGACY_MAILBOX_PROTOCOL_VERSION &&
+    kind === "request" &&
+    Object.hasOwn(v, "acceptedAssignment")
+  )
+    throw new Error("V4 requests cannot contain accepted assignment metadata");
   const allowed =
     kind === "state"
       ? [
@@ -250,7 +296,12 @@ function validate(
           "piSessionFile",
           "agentDefinition",
           "cwd",
-          "activeRequestId",
+          "briefProfile",
+      "activeRequestId",
+      "acceptedAssignment",
+          "legacyAcceptedRequestIds",
+          "backgroundWorkProvider",
+          "backgroundWaiting",
           "pendingAskId",
           "lastActivityAt",
           "completedRequestId",
@@ -268,6 +319,7 @@ function validate(
             "agentLabel",
             "paneId",
             "kind",
+      "acceptedAssignment",
             "askId",
             "text",
             "createdAt",
@@ -297,6 +349,7 @@ function validate(
               "status",
               "text",
               "error",
+              "responseValidation",
               "contextUsage",
               "completedAt",
             ];
@@ -365,6 +418,50 @@ function validate(
         (!UUID.test(v[field]) || typeof v[field] !== "string")
       )
         throw new Error(`Invalid ${field}`);
+    if (v.legacyAcceptedRequestIds !== undefined) {
+      const legacyIds = v.legacyAcceptedRequestIds;
+      const eligibleIds = [
+        v.activeRequestId,
+        v.completedRequestId,
+        v.resultError?.requestId,
+      ];
+      if (
+        version !== MAILBOX_PROTOCOL_VERSION ||
+        !Array.isArray(legacyIds) ||
+        legacyIds.length > 2 ||
+        new Set(legacyIds).size !== legacyIds.length ||
+        legacyIds.some(
+          (id: unknown) =>
+            typeof id !== "string" ||
+            !UUID.test(id) ||
+            !eligibleIds.includes(id),
+        )
+      )
+        throw new Error("Invalid legacy assignment identities");
+    }
+    if (
+      v.briefProfile !== undefined &&
+      !BRIEF_PROFILES.includes(v.briefProfile as BriefProfile)
+    )
+      throw new Error("Invalid briefing profile");
+    const legacyActive =
+      typeof v.activeRequestId === "string" &&
+      Array.isArray(v.legacyAcceptedRequestIds) &&
+      v.legacyAcceptedRequestIds.includes(v.activeRequestId);
+    if (v.acceptedAssignment !== undefined) {
+      if (typeof v.activeRequestId !== "string" || !v.briefProfile || legacyActive)
+        throw new Error("Accepted assignment has no active V5 identity");
+      validateAcceptedAssignmentContract(v.acceptedAssignment, {
+        requestId: v.activeRequestId,
+        minimumProfile: v.briefProfile as BriefProfile,
+      });
+    } else if (
+      version === MAILBOX_PROTOCOL_VERSION &&
+      v.activeRequestId &&
+      !legacyActive
+    ) {
+      throw new Error("Active V5 assignment is missing its accepted contract");
+    }
     if (v.pendingAskId !== undefined && !UUID.test(v.pendingAskId as string))
       throw new Error("Invalid pendingAskId");
     if (v.pendingAskId !== undefined && !v.activeRequestId)
@@ -377,6 +474,38 @@ function validate(
       v.activeRequestId === v.completedRequestId
     )
       throw new Error("Active and completed request IDs must differ");
+    if (v.backgroundWorkProvider !== undefined) {
+      const provider = v.backgroundWorkProvider;
+      if (
+        !v.activeRequestId ||
+        typeof provider !== "object" ||
+        provider === null ||
+        Array.isArray(provider) ||
+        Object.keys(provider).length !== 2 ||
+        !("id" in provider) ||
+        !("version" in provider) ||
+        typeof provider.id !== "string" ||
+        !provider.id.trim() ||
+        provider.id.length > 256 ||
+        !Number.isSafeInteger(provider.version) ||
+        (provider.version as number) < 0
+      )
+        throw new Error("Invalid background work provider identity");
+    }
+    if (v.backgroundWaiting !== undefined) {
+      if (!v.activeRequestId || !v.backgroundWorkProvider)
+        throw new Error("Background waiting evidence requires an active provider-backed request");
+      const evidence = decodeWaitingEvidence(v.backgroundWaiting, {
+        sessionId: v.piSessionId as string,
+        requestId: v.activeRequestId as string,
+      });
+      if (
+        v.backgroundWorkProvider &&
+        (evidence.provider.id !== v.backgroundWorkProvider.id ||
+          evidence.provider.version !== v.backgroundWorkProvider.version)
+      )
+        throw new Error("Background waiting provider does not match assignment");
+    }
     if (v.resultError !== undefined) {
       if (v.activeRequestId !== undefined || v.completedRequestId !== undefined)
         throw new Error(
@@ -483,6 +612,24 @@ function validate(
       throw new Error("Invalid reply ask ID");
     if (typeof v.text !== "string" || !v.text.trim())
       throw new Error("Invalid request text");
+    if (version === MAILBOX_PROTOCOL_VERSION) {
+      const needsAssignment = v.kind === "task" || v.kind === "interrupt";
+      if (needsAssignment !== (v.acceptedAssignment !== undefined))
+        throw new Error("V5 task and interrupt requests require an accepted assignment");
+      if (needsAssignment) {
+        const assignmentRequestId = v.acceptedAssignment?.requestId;
+        if (
+          typeof assignmentRequestId !== "string" ||
+          !UUID.test(assignmentRequestId) ||
+          (v.kind === "task" && assignmentRequestId !== v.requestId)
+        )
+          throw new Error("Accepted assignment request identity does not match");
+        validateAcceptedAssignmentContract(v.acceptedAssignment, {
+          requestId: assignmentRequestId,
+          minimumProfile: "common",
+        });
+      }
+    }
     finite("createdAt");
   } else if (kind === "ask") {
     if (typeof v.question !== "string" || !v.question.trim())
@@ -499,7 +646,13 @@ function validate(
       throw new Error("Invalid completed result");
     if (v.status === "failed") {
       const error = v.error as Record<string, unknown> | undefined;
-      const codes = ["empty_result", "result_too_large", "write_failure"];
+      const codes = [
+        "empty_result",
+        "result_too_large",
+        "write_failure",
+        "invalid_response",
+        "artifact_error",
+      ];
       if (
         !error ||
         Object.keys(error).some((key) => !["code", "message"].includes(key)) ||
@@ -510,6 +663,117 @@ function validate(
         throw new Error("Invalid failed result");
       if (v.text !== undefined)
         throw new Error("Failed result cannot contain text");
+    }
+    if (v.responseValidation !== undefined) {
+      const response = v.responseValidation as Record<string, unknown>;
+      if (
+        !response ||
+        typeof response !== "object" ||
+        Object.keys(response).some(
+          (key) =>
+            ![
+              "contractHash",
+              "briefHash",
+              "workerSessionId",
+              "target",
+              "textSource",
+              "artifacts",
+              "diagnostics",
+            ].includes(key),
+        ) ||
+        typeof response.contractHash !== "string" ||
+        !/^[0-9a-f]{64}$/u.test(response.contractHash) ||
+        typeof response.briefHash !== "string" ||
+        !/^[0-9a-f]{64}$/u.test(response.briefHash) ||
+        typeof response.workerSessionId !== "string" ||
+        !response.workerSessionId.trim() ||
+        response.workerSessionId.length > 512 ||
+        !["inline", "artifact", "both"].includes(response.target as string) ||
+        !["worker", "framework"].includes(response.textSource as string) ||
+        !Array.isArray(response.artifacts) ||
+        response.artifacts.length > 1
+      )
+        throw new Error("Invalid response validation provenance");
+      const artifacts = response.artifacts as unknown[];
+      for (const artifactValue of artifacts) {
+        if (!artifactValue || typeof artifactValue !== "object")
+          throw new Error("Invalid response artifact observation");
+        const artifact = artifactValue as Record<string, unknown>;
+        if (
+          Object.keys(artifact).some(
+            (key) =>
+              !["path", "canonicalPath", "sha256", "bytes", "disposition"].includes(key),
+          ) ||
+          typeof artifact.path !== "string" ||
+          !artifact.path.trim() ||
+          artifact.path.length > 4096 ||
+          typeof artifact.canonicalPath !== "string" ||
+          !artifact.canonicalPath.trim() ||
+          artifact.canonicalPath.length > 4096 ||
+          typeof artifact.sha256 !== "string" ||
+          !/^[0-9a-f]{64}$/u.test(artifact.sha256) ||
+          typeof artifact.bytes !== "number" ||
+          !Number.isSafeInteger(artifact.bytes) ||
+          artifact.bytes < 0 ||
+          !["created", "reused"].includes(artifact.disposition as string)
+        )
+          throw new Error("Invalid response artifact observation");
+      }
+      const failedValidation =
+        v.status === "failed" &&
+        Array.isArray(response.diagnostics) &&
+        response.diagnostics.length > 0;
+      if (
+        !failedValidation &&
+        ((response.target === "inline" && artifacts.length !== 0) ||
+          (response.target !== "inline" && artifacts.length !== 1))
+      )
+        throw new Error("Response artifacts do not match the accepted target");
+      if (response.diagnostics !== undefined) {
+        if (
+          !Array.isArray(response.diagnostics) ||
+          response.diagnostics.length === 0 ||
+          response.diagnostics.length > 8
+        )
+          throw new Error("Invalid response diagnostics");
+        for (const diagnosticValue of response.diagnostics) {
+          if (!diagnosticValue || typeof diagnosticValue !== "object")
+            throw new Error("Invalid response diagnostic");
+          const diagnostic = diagnosticValue as Record<string, unknown>;
+          if (
+            Object.keys(diagnostic).some(
+              (key) => !["field", "message", "path"].includes(key),
+            ) ||
+            typeof diagnostic.field !== "string" ||
+            !diagnostic.field.trim() ||
+            diagnostic.field.length > 256 ||
+            typeof diagnostic.message !== "string" ||
+            !diagnostic.message.trim() ||
+            diagnostic.message.length > 512 ||
+            (diagnostic.path !== undefined &&
+              (typeof diagnostic.path !== "string" ||
+                !diagnostic.path.trim() ||
+                diagnostic.path.length > 4096))
+          )
+            throw new Error("Invalid response diagnostic");
+        }
+        if (v.status !== "failed")
+          throw new Error("Completed result cannot contain response diagnostics");
+      }
+      if (
+        response.diagnostics !== undefined &&
+        !["invalid_response", "artifact_error"].includes(
+          (v.error as Record<string, unknown> | undefined)?.code as string,
+        )
+      )
+        throw new Error("Response diagnostics require a validation failure");
+    } else if (
+      v.error &&
+      ["invalid_response", "artifact_error"].includes(
+        (v.error as Record<string, unknown>).code as string,
+      )
+    ) {
+      throw new Error("Validation failure requires response diagnostics");
     }
     if (v.contextUsage !== undefined) {
       const usage = v.contextUsage as Record<string, unknown>;
@@ -536,6 +800,12 @@ function validate(
   }
 }
 function atomic(path: string, value: unknown, kind: keyof typeof LIMITS): void {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    (value as { version?: unknown }).version !== MAILBOX_PROTOCOL_VERSION
+  )
+    throw new Error("Legacy mailbox records are read-only");
   validate(value, kind);
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   chmodSync(dirname(path), 0o700);
@@ -646,9 +916,22 @@ export function agentStatePath(path: string): string {
   return file(path, "state.json");
 }
 export function readAgentState(path: string): ManagedAgentState | undefined {
-  const v = read<ManagedAgentState>(file(path, "state.json"), "state");
-  if (v) validate(v, "state");
-  return v;
+  const value = read<Record<string, unknown>>(file(path, "state.json"), "state");
+  if (!value) return undefined;
+  validate(value, "state");
+  if (value.version === LEGACY_MAILBOX_PROTOCOL_VERSION) {
+    const legacyAcceptedRequestIds = [value.activeRequestId, value.completedRequestId].filter(
+      (requestId): requestId is string => typeof requestId === "string",
+    );
+    const migrated = {
+      ...value,
+      version: MAILBOX_PROTOCOL_VERSION,
+      ...(legacyAcceptedRequestIds.length > 0 ? { legacyAcceptedRequestIds } : {}),
+    };
+    validate(migrated, "state");
+    return migrated as unknown as ManagedAgentState;
+  }
+  return value as unknown as ManagedAgentState;
 }
 export function writeRequest(path: string, request: RequestRecord): void {
   assertFileId(request.requestId);
@@ -666,6 +949,15 @@ export function readRequest(
   if (v) validate(v, "request");
   if (v && v.requestId !== requestId)
     throw new Error("Request filename identity mismatch");
+  if (v?.version === LEGACY_MAILBOX_PROTOCOL_VERSION) {
+    const state = readAgentState(path);
+    const legacyIds = state?.legacyAcceptedRequestIds ?? [];
+    const allowed =
+      v.kind === "task"
+        ? state?.activeRequestId === requestId && legacyIds.includes(requestId)
+        : !!state?.activeRequestId && legacyIds.includes(state.activeRequestId);
+    if (!allowed) throw new Error("V4 request is outside the migrated active assignment");
+  }
   return v;
 }
 export function readUnacknowledgedRequest(
@@ -741,6 +1033,11 @@ export function writeAsk(path: string, ask: AskRecord): void {
 export function readAsk(path: string): AskRecord | undefined {
   const v = read<AskRecord>(file(path, "ask.json"), "ask");
   if (v) validate(v, "ask");
+  if (v?.version === LEGACY_MAILBOX_PROTOCOL_VERSION) {
+    const state = readAgentState(path);
+    if (!state?.activeRequestId || !state.legacyAcceptedRequestIds?.includes(v.requestId))
+      throw new Error("V4 ask is outside the migrated active assignment");
+  }
   return v;
 }
 export function readPendingAsk(
@@ -787,6 +1084,11 @@ export function readResult(
   if (v) validate(v, "result");
   if (v && v.requestId !== requestId)
     throw new Error("Result filename identity mismatch");
+  if (v?.version === LEGACY_MAILBOX_PROTOCOL_VERSION) {
+    const state = readAgentState(path);
+    if (!state?.legacyAcceptedRequestIds?.includes(requestId))
+      throw new Error("V4 result is outside the migrated assignment");
+  }
   return v;
 }
 export function removeResult(path: string, requestId: string): void {
@@ -797,14 +1099,35 @@ export function removeResult(path: string, requestId: string): void {
     if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
   }
 }
-export function controlMarker(requestId: string): string {
+export function controlMarker(
+  requestId: string,
+  version: 4 | 5 = MAILBOX_PROTOCOL_VERSION,
+): string {
   if (!UUID.test(requestId)) throw new Error("Invalid request ID");
-  return `${PREFIX}${requestId}`;
+  const prefix = version === LEGACY_MAILBOX_PROTOCOL_VERSION
+    ? LEGACY_MAILBOX_CONTROL_PREFIX
+    : MAILBOX_CONTROL_PREFIX;
+  return `${prefix}${requestId}`;
+}
+export function parseControlMarkerVersion(
+  text: string,
+): { requestId: string; version: 4 | 5 } | undefined {
+  const version = text.startsWith(MAILBOX_CONTROL_PREFIX)
+    ? MAILBOX_PROTOCOL_VERSION
+    : text.startsWith(LEGACY_MAILBOX_CONTROL_PREFIX)
+      ? LEGACY_MAILBOX_PROTOCOL_VERSION
+      : undefined;
+  if (version === undefined) return undefined;
+  const prefix = version === MAILBOX_PROTOCOL_VERSION
+    ? MAILBOX_CONTROL_PREFIX
+    : LEGACY_MAILBOX_CONTROL_PREFIX;
+  const requestId = text.slice(prefix.length);
+  return UUID.test(requestId) && requestId.length === 36
+    ? { requestId, version }
+    : undefined;
 }
 export function parseControlMarker(text: string): string | undefined {
-  if (!text.startsWith(PREFIX)) return undefined;
-  const id = text.slice(PREFIX.length);
-  return UUID.test(id) && id.length === 36 ? id : undefined;
+  return parseControlMarkerVersion(text)?.requestId;
 }
 export function waitForState(
   path: string,
