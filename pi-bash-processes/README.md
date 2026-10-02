@@ -147,4 +147,9 @@ equivalent — each is fork-only source plus its tests):
   executor, with normal timeout, cancellation, and structured results, rather
   than starting managed tasks. `bg_task` spawn is blocked inside codemode,
   including through nested wrappers. This does not restrict shell syntax such
-  as `cmd &`. Scripts must supply `intent` when `intentMode: "required"` is set.
+  as `cmd &`. A script's own tool calls need no `intent`, even when
+  `intentMode: "required"` is set: `intent` is an optional schema property for
+  every caller, and the required policy is enforced per call by Pi's `tool_call`
+  guard, which exempts a call another tool made. A root `codemode` call still
+  states its purpose as one leading `// intent: ...` comment in the script,
+  after a native `// @options:` line when one is present.

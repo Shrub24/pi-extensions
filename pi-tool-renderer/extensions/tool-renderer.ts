@@ -20,6 +20,7 @@ import { installLiveSettingsRefresh } from "./tool-renderer/live-settings.js";
 import { installSettingsCacheRefresh, recordProjectTrust } from "./tool-renderer/package-config.js";
 import { settingBoolean } from "./tool-renderer/settings.js";
 import { registerStackEvents } from "./tool-renderer/stack.js";
+import { installIntentGuard } from "./tool-renderer/intent.js";
 import { registerBashOnSessionStart, registerEdit, registerRead, registerReadOnly, registerWrite } from "./tool-renderer/tools.js";
 import { installFffRenderers } from "./tool-renderer/fff-patch.js";
 import { installCbmRenderers } from "./tool-renderer/cbm-patch.js";
@@ -55,14 +56,21 @@ export default async function toolRenderer(pi: ExtensionAPI): Promise<void> {
 	installCustomMessageSpacingPatch(pi, (agent as any).CustomMessageComponent);
 	installSkillInvocationRenderer(pi, (agent as any).SkillInvocationMessageComponent);
 	const cwd = process.cwd();
-	registerRead(pi, agent, cwd);
+	// Every tool this package wraps carries the intent argument; the guard refuses
+	// a model-issued call that omits a required one, and (as the package that
+	// presents the root codemode row) a root codemode script without its purpose.
+	// Together with `bash`/`bg_task` in pi-background-tasks, every intent-aware
+	// tool is read from the same settings and refused in the same place.
+	const intentTools: string[] = [];
+	if (registerRead(pi, agent, cwd)) intentTools.push("read");
 	registerBashOnSessionStart(pi, agent, cwd);
 	if (settingBoolean("renderMutationTools", false, cwd)) {
-		registerEdit(pi, agent, cwd);
-		registerWrite(pi, agent, cwd);
+		if (registerEdit(pi, agent, cwd)) intentTools.push("edit");
+		if (registerWrite(pi, agent, cwd)) intentTools.push("write");
 	}
-	registerReadOnly(pi, agent, cwd, "grep");
-	registerReadOnly(pi, agent, cwd, "find");
-	registerReadOnly(pi, agent, cwd, "ls");
-	if (settingBoolean("registerBatchTool", true, cwd)) registerToolBatch(pi, cwd);
+	if (registerReadOnly(pi, agent, cwd, "grep")) intentTools.push("grep");
+	if (registerReadOnly(pi, agent, cwd, "find")) intentTools.push("find");
+	if (registerReadOnly(pi, agent, cwd, "ls")) intentTools.push("ls");
+	if (settingBoolean("registerBatchTool", true, cwd) && registerToolBatch(pi, cwd)) intentTools.push("tool_batch");
+	installIntentGuard(pi, { tools: intentTools, codemodePurpose: true });
 }

@@ -641,7 +641,7 @@
         {
           "key": "intentMode",
           "label": "Intent mode",
-          "description": "Per-call intent argument. off adds nothing to tool schemas; optional lets the model include a one-sentence intent; required adds it to each tool's required list.",
+          "description": "Per-call intent argument. off adds nothing to tool schemas and installs no guard; optional lets the caller include a one-sentence intent; required refuses a model-issued call that omits it through Pi's tool_call guard, with guidance naming the argument. A call another tool makes, such as a codemode script's nested call, is exempt.",
           "type": "enum",
           "default": "optional",
           "category": "Intent",
@@ -664,7 +664,7 @@
         {
           "key": "intentHardRequired",
           "label": "Hard-required intent",
-          "description": "When required and true, missing intent fails provider-side schema validation. When false, a missing intent is backfilled from the deterministic call text instead of blocking the call.",
+          "description": "Retained for configuration compatibility and no longer selects a refusal mechanism: required mode always refuses through Pi's tool_call guard, because one shared schema cannot mark the field required provider-side without failing a codemode script's own nested call.",
           "type": "boolean",
           "default": false,
           "category": "Intent",

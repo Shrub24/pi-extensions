@@ -26,6 +26,8 @@ import {
 	componentDefinesRenderer,
 } from "./generic.js";
 import { settingBoolean, settingEnum, toolChromeMode, type ToolChromeMode } from "./settings.js";
+import { withCodemodePurpose } from "./codemode.js";
+import { CODEMODE_TOOL_NAME } from "./intent.js";
 import { RESERVED_IMAGE_ROW_MARKER, TOOL_RENDER_OVERLAY_CHECK_SYMBOL } from "./overlay.js";
 import { trackToolExecutionComponent } from "./live-settings.js";
 import { glyphs } from "./glyphs.js";
@@ -111,6 +113,12 @@ export function installToolExecutionRendererPatch(pi: ExtensionAPI): void {
 		}
 		if (settingBoolean("genericToolRenderers", true) && shouldUseGenericRenderer(toolName) && !componentDefinesRenderer(this, "renderCall")) {
 			return withCallTheme(this, (args: any, theme: any, context: any) => renderGenericToolCall(toolName, args, theme, context));
+		}
+		if (toolName === CODEMODE_TOOL_NAME) {
+			// Pi's own codemode renderer keeps the row; the wrapper only adds the
+			// script's leading purpose to the title it already draws.
+			const renderer = originalGetCallRenderer.call(this);
+			return typeof renderer === "function" ? withCallTheme(this, withCodemodePurpose(renderer)) : renderer;
 		}
 		const renderer = originalGetCallRenderer.call(this);
 		return typeof renderer === "function" ? withCallTheme(this, renderer) : renderer;

@@ -113,9 +113,9 @@ export function contextCwd(context: any, fallback: string): string {
 	return context?.cwd ?? fallback;
 }
 
-export function registerRead(pi: ExtensionAPI, agent: any, cwd: string): void {
+export function registerRead(pi: ExtensionAPI, agent: any, cwd: string): boolean {
 	const original = getBuiltInTool(agent, cwd, "read");
-	if (!original) return;
+	if (!original) return false;
 	pi.registerTool({
 		renderShell: "self",
 		name: "read",
@@ -154,6 +154,7 @@ export function registerRead(pi: ExtensionAPI, agent: any, cwd: string): void {
 			return renderReadImages(makeTruncatedLines(text), result, expanded, theme, context, cwd);
 		},
 	});
+	return true;
 }
 
 export function registerBash(pi: ExtensionAPI, agent: any, cwd: string): void {
@@ -186,9 +187,9 @@ export function registerBashOnSessionStart(pi: ExtensionAPI, agent: any, cwd: st
 	});
 }
 
-export function registerEdit(pi: ExtensionAPI, agent: any, cwd: string): void {
+export function registerEdit(pi: ExtensionAPI, agent: any, cwd: string): boolean {
 	const original = getBuiltInTool(agent, cwd, "edit");
-	if (!original) return;
+	if (!original) return false;
 	pi.registerTool({
 		renderShell: "self",
 		name: "edit",
@@ -198,7 +199,8 @@ export function registerEdit(pi: ExtensionAPI, agent: any, cwd: string): void {
 		// Pi's agent loop prepares arguments before schema validation; the
 		// replacement definition has to carry the hook or the shapes Pi's own
 		// tool accepts fail validation before execute() can delegate. The
-		// intent arg is stripped and backfilled before the original shim runs.
+		// intent arg is stripped before the original shim runs; no intent is
+		// fabricated into the args.
 		prepareArguments(args: Record<string, unknown>) {
 			const prepared = intentPrepare("edit", "Editing the file", cwd)(args);
 			return original.prepareArguments ? original.prepareArguments(prepared) : prepared;
@@ -241,11 +243,12 @@ export function registerEdit(pi: ExtensionAPI, agent: any, cwd: string): void {
 			return makeTruncatedLines(text);
 		},
 	});
+	return true;
 }
 
-export function registerWrite(pi: ExtensionAPI, agent: any, cwd: string): void {
+export function registerWrite(pi: ExtensionAPI, agent: any, cwd: string): boolean {
 	const original = getBuiltInTool(agent, cwd, "write");
-	if (!original) return;
+	if (!original) return false;
 	pi.registerTool({
 		renderShell: "self",
 		name: "write",
@@ -296,11 +299,12 @@ export function registerWrite(pi: ExtensionAPI, agent: any, cwd: string): void {
 			return makeTruncatedLines(text);
 		},
 	});
+	return true;
 }
 
-export function registerReadOnly(pi: ExtensionAPI, agent: any, cwd: string, toolName: "grep" | "find" | "ls"): void {
+export function registerReadOnly(pi: ExtensionAPI, agent: any, cwd: string, toolName: "grep" | "find" | "ls"): boolean {
 	const original = getBuiltInTool(agent, cwd, toolName);
-	if (!original) return;
+	if (!original) return false;
 	pi.registerTool({
 		rrenderKendexOwned: true,
 		renderShell: "self",
@@ -350,5 +354,5 @@ export function registerReadOnly(pi: ExtensionAPI, agent: any, cwd: string, tool
 			return makeTruncatedLines(text);
 		},
 	});
+	return true;
 }
-

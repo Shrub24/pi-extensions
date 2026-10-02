@@ -91,7 +91,7 @@ import { taskLogs } from "./log-writer.js";
 import { BASH_OUTPUT_SCHEMA, buildManagedBashEnv, createForegroundWaiter, formatManagedBashCompletionText, formatManagedBashRunningText, isCodemodeCall, normalizeManagedBashTimeoutSeconds, settleForegroundWaiter, STRUCTURED_OUTPUT_MAX_BYTES, structuredOutputFor, structuredOutputOmittedMarker } from "./managed-bash.js";
 import { emulateTruncation, stripTerminalTruncation } from "./pipe-strip.js";
 import type * as ManagedBashPresentation from "@vanillagreen/pi-tool-renderer/managed-bash";
-import { getIntent, intentModeFor, intentParameters, intentPrepare, intentSuffix, stripIntent, withIntentParameter } from "@vanillagreen/pi-tool-renderer/intent";
+import { getIntent, intentModeFor, intentParameters, intentPrepare, intentSuffix, stripIntent, withIntentParameter, installIntentGuard } from "@vanillagreen/pi-tool-renderer/intent";
 let managedBashPresentation: typeof ManagedBashPresentation | undefined;
 async function loadManagedBashPresentation(): Promise<void> {
 	if (managedBashPresentation) return;
@@ -2823,4 +2823,9 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 	registerBashTool("compat");
 
 	registerAll(pi, registrationDeps);
+	// `bash` and `bg_task` carry the intent argument (the declaration above and
+	// `registerBgTaskTool`). A model-issued call that omits a required intent is
+	// refused here, before the spawn or the foreground run; a script's own bash
+	// call is left alone by provenance (see `installIntentGuard`).
+	installIntentGuard(pi, { tools: ["bash", "bg_task"] });
 }

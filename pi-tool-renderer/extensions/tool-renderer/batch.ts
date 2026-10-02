@@ -253,7 +253,7 @@ function renderToolBatchCallText(args: any, theme: any, cwd?: string): string {
 	return lines.join("\n");
 }
 
-export function registerToolBatch(pi: ExtensionAPI, cwd: string): void {
+export function registerToolBatch(pi: ExtensionAPI, cwd: string): boolean {
 	pi.registerTool({
 		renderShell: "self",
 		name: "tool_batch",
@@ -355,4 +355,5 @@ export function registerToolBatch(pi: ExtensionAPI, cwd: string): void {
 			return makeTruncatedLines(renderToolBatchText(details.items, theme, expanded, context?.cwd ?? cwd));
 		},
 	});
+	return true;
 }
