@@ -2218,6 +2218,7 @@ export function createStagedAssignmentFixture(
   context.hasUI = true;
   let widget: StatusWidget | undefined;
   context.ui = {
+    notify: () => undefined,
     setWidget: (_key: string, content: unknown) => {
       assertWidgetContent(content);
       if (typeof content === "function")

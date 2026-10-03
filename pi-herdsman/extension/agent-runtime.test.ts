@@ -1951,7 +1951,9 @@ test("startup and completion metadata omit unavailable model and thinking values
   agent.events.get("session_start")![0](undefined, context);
   await new Promise((resolve) => setImmediate(resolve));
 
-  const startup = agent.calls.find((args) => args.includes("managed=1"));
+  const startup = agent.calls.find((args) =>
+    args.some((arg) => arg.startsWith("pi_herdsman_run=")),
+  );
   assert.ok(startup);
   assert.equal(
     startup.some((arg) => /^(model|thinking)=(undefined|null)$/.test(arg)),
@@ -1992,7 +1994,10 @@ test("startup and completion metadata omit unavailable model and thinking values
 
   const completion = agent.calls
     .slice(callsBeforeSettlement)
-    .find((args) => args.includes("--clear-token") && args.includes("task"));
+    .find(
+      (args) =>
+        args.includes("--clear-token") && args.includes("pi_herdsman_task"),
+    );
   assert.ok(completion);
   assert.equal(
     completion.some((arg) => /^(model|thinking)=(undefined|null)$/.test(arg)),
@@ -2011,8 +2016,46 @@ test("startup and completion metadata preserve available model and thinking valu
   agent.events.get("session_start")![0](undefined, context);
   await new Promise((resolve) => setImmediate(resolve));
 
-  const startup = agent.calls.find((args) => args.includes("managed=1"));
+  const startup = agent.calls.find((args) =>
+    args.some((arg) => arg.startsWith("pi_herdsman_run=")),
+  );
   assert.ok(startup);
+  const keys = (args: string[]) =>
+    args
+      .flatMap((arg, index) =>
+        arg === "--token"
+          ? [args[index + 1].split("=")[0]]
+          : arg === "--clear-token"
+            ? [args[index + 1]]
+            : [],
+      )
+      .sort();
+  const expectedKeys = [
+    "model",
+    "provider",
+    "thinking",
+    "session",
+    "context_usage",
+    "pi_herdsman_session",
+    "pi_herdsman_role",
+    "pi_herdsman_run",
+    "pi_herdsman_parent_session",
+    "pi_herdsman_request",
+    "pi_herdsman_task",
+    "pi_herdsman_started",
+  ].sort();
+  assert.deepEqual(keys(startup), expectedKeys);
+  assert.ok(
+    startup.includes(
+      `pi_herdsman_session=${context.sessionManager.getSessionId()}`,
+    ),
+  );
+  assert.ok(
+    startup.includes(
+      `pi_herdsman_parent_session=${readAgentState(mailbox)!.ownerSessionId}`,
+    ),
+  );
+
   assert.ok(startup.includes("model=openai/gpt-5"));
   assert.ok(startup.includes("thinking=high"));
   assert.equal(
@@ -2060,6 +2103,11 @@ test("startup and completion metadata preserve available model and thinking valu
     context,
   );
   const callsBeforeSettlement = agent.calls.length;
+  const active = agent.calls.find((args) =>
+    args.some((arg) => arg.startsWith("pi_herdsman_task=")),
+  );
+  assert.ok(active);
+  assert.deepEqual(keys(active), expectedKeys);
   await agent.events.get("agent_settled")![0](undefined, context);
   const laterCalls = agent.calls.slice(callsBeforeSettlement);
   assert.equal(
@@ -2074,14 +2122,16 @@ test("startup and completion metadata preserve available model and thinking valu
   agent.events.get("session_shutdown")?.[0]();
 });
 
-test("successful presentation clears are not repeated by unrelated metadata updates", async () => {
+test("full snapshots clear unavailable presentation values during task updates", async () => {
   const mailbox = setAgentEnvironment();
   const agent = fakePi();
   registerExtension!(agent.pi as never);
   const context = fakeContext();
   agent.events.get("session_start")![0](undefined, context);
   await new Promise((resolve) => setImmediate(resolve));
-  const startup = agent.calls.find((args) => args.includes("managed=1"));
+  const startup = agent.calls.find((args) =>
+    args.some((arg) => arg.startsWith("pi_herdsman_run=")),
+  );
   assert.ok(startup);
   const hasClear = (args: string[], name: string) =>
     args.some(
@@ -2098,10 +2148,12 @@ test("successful presentation clears are not repeated by unrelated metadata upda
   await new Promise((resolve) => setImmediate(resolve));
   const taskPublication = agent.calls
     .slice(beforeTask)
-    .find((args) => args.some((arg) => arg === `task=${request.text}`));
+    .find((args) =>
+      args.some((arg) => arg === `pi_herdsman_task=${request.text}`),
+    );
   assert.ok(taskPublication);
-  assert.equal(hasClear(taskPublication, "model"), false);
-  assert.equal(hasClear(taskPublication, "thinking"), false);
+  assert.equal(hasClear(taskPublication, "model"), true);
+  assert.equal(hasClear(taskPublication, "thinking"), true);
   (context as any).thinkingLevel = "high";
   (context as any).model = { provider: "openai", id: "gpt-5.1" };
   agent.events.get("model_select")![0](
@@ -2137,8 +2189,14 @@ test("metadata failure retries the latest desired state", async (t) => {
     context,
   );
   await t.waitFor(() => assert.equal(metadataAttempts, 2));
-  assert.ok(agent.calls.some((args) => args.includes("managed=1")));
-  assert.ok(agent.calls.some((args) => args.includes("role=agent")));
+  assert.ok(
+    agent.calls.some((args) =>
+      args.some((arg) => arg.startsWith("pi_herdsman_run=")),
+    ),
+  );
+  assert.ok(
+    agent.calls.some((args) => args.includes("pi_herdsman_role=agent")),
+  );
   assert.ok(agent.calls.some((args) => args.includes("model=openai/gpt-5")));
   assert.equal(readAgentState(mailbox)?.agentLabel, "registered-agent");
   agent.events.get("session_shutdown")?.[0]();
@@ -2190,7 +2248,7 @@ test("failed completion metadata cannot be bypassed by presentation updates", as
       if (command === "herdr" && args[0] === "pane") {
         if (
           !completionMetadataStarted &&
-          args.includes(`task=${taskText}`) &&
+          args.includes(`pi_herdsman_task=${taskText}`) &&
           taskMetadataFailures < 2
         ) {
           taskMetadataFailures++;
@@ -2260,7 +2318,7 @@ test("failed completion metadata cannot be bypassed by presentation updates", as
       assert.equal(
         agent.callResults.filter(
           ({ args, succeeded }) =>
-            !succeeded && args.includes(`task=${taskText}`),
+            !succeeded && args.includes(`pi_herdsman_task=${taskText}`),
         ).length,
         2,
         "task metadata failures were not observed",
@@ -2276,8 +2334,16 @@ test("failed completion metadata cannot be bypassed by presentation updates", as
       ),
     { timeout: 2_000 },
   );
-  assert.ok(agent.calls.some((args) => args.includes(`task=${request.text}`)));
-  assert.ok(agent.calls.some((args) => args.includes(`task=${request.text}`)));
+  assert.ok(
+    agent.calls.some((args) =>
+      args.includes(`pi_herdsman_task=${request.text}`),
+    ),
+  );
+  assert.ok(
+    agent.calls.some((args) =>
+      args.includes(`pi_herdsman_task=${request.text}`),
+    ),
+  );
 
   agent.events.get("turn_end")![0](undefined, context);
 
@@ -2306,7 +2372,7 @@ test("failed completion metadata cannot be bypassed by presentation updates", as
           .some(
             ({ args, succeeded }) =>
               args.includes("--clear-token") &&
-              args.includes("task") &&
+              args.includes("pi_herdsman_task") &&
               !succeeded,
           ),
         "first completion metadata clear did not fail",
@@ -2316,14 +2382,18 @@ test("failed completion metadata cannot be bypassed by presentation updates", as
   assert.ok(
     agent.calls
       .slice(callsBeforeSettlement)
-      .some((args) => args.includes("--clear-token") && args.includes("task")),
+      .some(
+        (args) =>
+          args.includes("--clear-token") && args.includes("pi_herdsman_task"),
+      ),
   );
   const completionFailure =
     callsBeforeSettlement +
     agent.calls
       .slice(callsBeforeSettlement)
       .findIndex(
-        (args) => args.includes("--clear-token") && args.includes("task"),
+        (args) =>
+          args.includes("--clear-token") && args.includes("pi_herdsman_task"),
       );
   assert.ok(completionFailure >= 0);
   agent.events.get("model_select")![0](
@@ -2336,7 +2406,7 @@ test("failed completion metadata cannot be bypassed by presentation updates", as
         agent.callResults.filter(
           ({ args, succeeded }) =>
             args.includes("--clear-token") &&
-            args.includes("task") &&
+            args.includes("pi_herdsman_task") &&
             !succeeded,
         ).length,
         2,
@@ -2350,11 +2420,12 @@ test("failed completion metadata cannot be bypassed by presentation updates", as
       .some(
         (args) =>
           args.some((arg) => arg.startsWith("model=")) &&
-          args.some((arg) => arg.startsWith("task=")),
+          args.some((arg) => arg.startsWith("pi_herdsman_task=")),
       ),
     false,
     "a later model event must not resurrect cleared task metadata",
   );
+  (context as any).model = { provider: "openai", id: "gpt-5.1" };
   agent.events.get("model_select")![0](
     { model: { provider: "openai", id: "gpt-5.1" } },
     context,
@@ -2366,7 +2437,7 @@ test("failed completion metadata cannot be bypassed by presentation updates", as
           ({ args, succeeded }) =>
             succeeded &&
             args.includes("--clear-token") &&
-            args.includes("task") &&
+            args.includes("pi_herdsman_task") &&
             args.includes("model=openai/gpt-5.1"),
         ),
         "completion metadata clear did not recover",
@@ -2378,9 +2449,9 @@ test("failed completion metadata cannot be bypassed by presentation updates", as
     ({ args }, index) =>
       index >= callsBeforeSettlement &&
       args.includes("--clear-token") &&
-      args.includes("request") &&
-      args.includes("task") &&
-      args.includes("started"),
+      args.includes("pi_herdsman_request") &&
+      args.includes("pi_herdsman_task") &&
+      args.includes("pi_herdsman_started"),
   );
   assert.equal(
     completionClears.filter(({ succeeded }) => !succeeded).length,
@@ -2398,8 +2469,8 @@ test("failed completion metadata cannot be bypassed by presentation updates", as
     assert.ok(args.includes(label));
     assert.ok(args.includes("--display-agent"));
     assert.ok(args.includes("agent"));
-    assert.ok(args.includes("managed=1"));
-    assert.ok(args.includes("role=agent"));
+    assert.ok(args.some((arg) => arg.startsWith("pi_herdsman_run=")));
+    assert.ok(args.includes("pi_herdsman_role=agent"));
   }
   const successfulClearRecord = completionClears.find(
     ({ succeeded }, index) => index >= 2 && succeeded,
@@ -2410,27 +2481,27 @@ test("failed completion metadata cannot be bypassed by presentation updates", as
   const successfulClear = agent.callResults.indexOf(successfulClearRecord);
   assert.ok(firstFailedClear < secondFailedClear);
   assert.ok(secondFailedClear < successfulClear);
+  const activityFields = [
+    "pi_herdsman_request",
+    "pi_herdsman_task",
+    "pi_herdsman_started",
+  ];
   assert.deepEqual(
-    completionClears[2].args.filter(
-      (arg) =>
-        arg.startsWith("--clear-token") ||
-        ["request", "task", "started"].includes(arg),
-    ),
-    [
-      "--clear-token",
-      "request",
-      "--clear-token",
-      "task",
-      "--clear-token",
-      "started",
-    ],
+    completionClears[2].args
+      .flatMap((arg, index, args) =>
+        arg === "--clear-token" ? [args[index + 1]] : [],
+      )
+      .filter((name) => activityFields.includes(name)),
+    activityFields,
   );
   assert.equal(
     agent.callResults
       .slice(secondFailedClear + 1, successfulClear)
       .some(({ args }) =>
         args.some((arg) =>
-          /^(model|thinking|ctx|request|task|started)=/.test(arg),
+          /^(model|thinking|context_usage|pi_herdsman_(request|task|started))=/.test(
+            arg,
+          ),
         ),
       ),
     false,
@@ -2439,7 +2510,7 @@ test("failed completion metadata cannot be bypassed by presentation updates", as
   assert.ok(successfulClearRecord.args.includes("model=openai/gpt-5.1"));
   assert.equal(
     successfulClearRecord.args.some((arg) =>
-      /^(task|request|started|ctx)=/.test(arg),
+      /^(pi_herdsman_(task|request|started))=/.test(arg),
     ),
     false,
     "the recovered completion report must not resurrect completed activity",
@@ -2803,7 +2874,7 @@ test("metadata initialization serializes repeats and rejects stale generations",
     assert.ok(startup.includes("registered-agent"));
     assert.ok(startup.includes("--clear-token"));
     assert.equal(
-      startup.some((arg) => arg === `task=${request.text}`),
+      startup.some((arg) => arg === `pi_herdsman_task=${request.text}`),
       false,
     );
     gates.shift()!();
@@ -2841,6 +2912,8 @@ test("metadata outage retains one latest desired snapshot", async () => {
   for (let i = 0; i < 100; i++) {
     const model = `model-${i}`;
     const thinking = `thinking-${i}`;
+    (context as any).model = { provider: "test", id: model };
+    (context as any).thinkingLevel = thinking;
     agent.events.get("model_select")![0](
       { model: { provider: "test", id: model } },
       context,
@@ -2860,7 +2933,7 @@ test("metadata outage retains one latest desired snapshot", async () => {
   assert.equal(attempts, 3);
   assert.ok(recovered.includes(`model=${finalModel}`));
   assert.ok(recovered.includes(`thinking=${finalThinking}`));
-  assert.ok(recovered.includes("ctx=100"));
+  assert.ok(recovered.includes("context_usage=100%"));
   for (const value of intermediateModels)
     assert.equal(
       recovered.some((arg) => arg.includes(value)),
@@ -2875,6 +2948,8 @@ test("agent shutdown invalidates in-flight metadata", async () => {
   let aborted = false;
   const agent = fakePi({
     exec: async (_command, _args, options) => {
+      if (_args.includes("--clear-title"))
+        return { stdout: "", stderr: "", code: 0 };
       await new Promise<void>((resolve, reject) => {
         options?.signal?.addEventListener(
           "abort",
@@ -2898,12 +2973,13 @@ test("agent shutdown invalidates in-flight metadata", async () => {
   assert.equal(aborted, true);
   assert.equal(agent.execOptions[0].signal?.aborted, true);
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(agent.calls.length, 1);
+  assert.equal(agent.calls.length, 2);
+  assert.ok(agent.calls[1].includes("--clear-title"));
   const successorMailbox = setAgentEnvironment();
   agent.events.get("session_start")![0](undefined, context);
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(agent.calls.length, 2);
-  const successor = agent.calls[1];
+  assert.equal(agent.calls.length, 3);
+  const successor = agent.calls[2];
   assert.ok(successor.includes("registered-agent"));
   assert.ok(successor.includes("--clear-token"));
   assert.ok(successor.includes("model"));
@@ -2911,6 +2987,31 @@ test("agent shutdown invalidates in-flight metadata", async () => {
   assert.equal(readAgentState(successorMailbox)?.activeRequestId, undefined);
   assert.equal(firstMailbox, successorMailbox);
   agent.events.get("session_shutdown")?.[0]();
+});
+
+test("agent shutdown resolves only after its metadata clear completes", async () => {
+  setAgentEnvironment();
+  let releaseClear!: () => void;
+  const clearGate = new Promise<void>((resolve) => (releaseClear = resolve));
+  const agent = fakePi({
+    exec: async (_command, args) => {
+      if (args.includes("--clear-title")) await clearGate;
+      return { stdout: "", stderr: "", code: 0 };
+    },
+  });
+  registerExtension!(agent.pi as never);
+  await agent.events.get("session_start")![0](undefined, fakeContext());
+  await new Promise((resolve) => setImmediate(resolve));
+  let settled = false;
+  const shutdown = Promise.resolve(
+    agent.events.get("session_shutdown")![0](),
+  ).then(() => (settled = true));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(agent.calls.some((args) => args.includes("--clear-title")));
+  assert.equal(settled, false);
+  releaseClear();
+  await shutdown;
+  assert.equal(settled, true);
 });
 
 test("task state-write failure retains the request for an exact retry", async () => {

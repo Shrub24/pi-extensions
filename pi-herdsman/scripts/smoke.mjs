@@ -1441,11 +1441,7 @@ async function startCandidate(ctx) {
     const info = resultOf(
       await nestedCommand(ctx, ["pane", "process-info", "--pane", paneId]),
     );
-    if (
-      candidateProcess(info, ctx.candidateExtension, ctx.herdrStateExtension)
-        .length
-    )
-      return paneId;
+    if (candidateProcess(info, ctx.candidateExtension).length) return paneId;
     await sleep(200);
   }
   throw new Error("candidate Pi did not start with both explicit extensions");
@@ -1577,14 +1573,12 @@ export async function runScenario(ctx, scenario) {
   }
 }
 
-function candidateProcess(processInfo, extension, integration) {
+function candidateProcess(processInfo, extension) {
   return (processInfo?.process_info?.foreground_processes ?? []).filter(
     (proc) => {
       const argv = Array.isArray(proc.argv) ? proc.argv.join("\0") : "";
       const cmdline = typeof proc.cmdline === "string" ? proc.cmdline : "";
-      return [argv, cmdline].some(
-        (line) => line.includes(extension) && line.includes(integration),
-      );
+      return [argv, cmdline].some((line) => line.includes(extension));
     },
   );
 }
@@ -1605,7 +1599,6 @@ export async function inspectPaneProcesses(
   rootPaneId,
   inspect,
   extension,
-  integration,
 ) {
   const paneIds = [
     ...new Set(
@@ -1644,7 +1637,6 @@ export async function inspectPaneProcesses(
         candidateProcess(
           { process_info: { foreground_processes: [proc] } },
           extension,
-          integration,
         ).length > 0,
       error: null,
     }));
@@ -1664,7 +1656,6 @@ async function inspectCandidateProcesses(ctx) {
     ctx.rootPaneId,
     (paneId) => nestedCommand(ctx, ["pane", "process-info", "--pane", paneId]),
     ctx.candidateExtension,
-    ctx.herdrStateExtension,
   );
 }
 
@@ -1885,11 +1876,7 @@ async function runContinuationSmoke(ctx) {
             agent.pane_id,
           ]),
         );
-        for (const proc of candidateProcess(
-          info,
-          ctx.candidateExtension,
-          ctx.herdrStateExtension,
-        ))
+        for (const proc of candidateProcess(info, ctx.candidateExtension))
           if (proc.pid != null) firstPids.add(proc.pid);
         break;
       }
@@ -1987,11 +1974,7 @@ async function runContinuationSmoke(ctx) {
           agent.pane_id,
         ]),
       );
-      const matches = candidateProcess(
-        info,
-        ctx.candidateExtension,
-        ctx.herdrStateExtension,
-      );
+      const matches = candidateProcess(info, ctx.candidateExtension);
       for (const proc of matches) {
         if (
           proc.pid != null &&
@@ -2131,11 +2114,7 @@ async function runManagerRecoverySmoke(ctx) {
     );
   const candidatePids = async (paneId) => {
     const info = resultOf(await paneInfo(paneId));
-    return candidateProcess(
-      info,
-      ctx.candidateExtension,
-      ctx.herdrStateExtension,
-    )
+    return candidateProcess(info, ctx.candidateExtension)
       .map((proc) => proc.pid)
       .filter((pid) => pid != null);
   };
@@ -2386,11 +2365,7 @@ async function runManagerRecoverySmoke(ctx) {
   const panes = listedPanes(await nestedCommand(ctx, ["pane", "list"]));
   assert.ok(panes.some((pane) => pane.paneId === paneId));
   const placement = resultOf(await paneInfo(paneId));
-  const initialProcesses = candidateProcess(
-    placement,
-    ctx.candidateExtension,
-    ctx.herdrStateExtension,
-  );
+  const initialProcesses = candidateProcess(placement, ctx.candidateExtension);
   assert.equal(
     initialProcesses.length,
     1,
@@ -2583,7 +2558,6 @@ async function runManagerRecoverySmoke(ctx) {
       const processes = candidateProcess(
         resultOf(await paneInfo(paneId)),
         ctx.candidateExtension,
-        ctx.herdrStateExtension,
       );
       return processes.length === 1 && processes[0].pid !== initialPid
         ? processes
@@ -2651,11 +2625,7 @@ async function runManagerRecoverySmoke(ctx) {
   assert.equal(beforeKillAgent.pane_id, paneId);
   assert.equal(beforeKillAgent.workspace_id, workspaceId);
   const beforeKillInfo = resultOf(await paneInfo(paneId));
-  const proven = candidateProcess(
-    beforeKillInfo,
-    ctx.candidateExtension,
-    ctx.herdrStateExtension,
-  );
+  const proven = candidateProcess(beforeKillInfo, ctx.candidateExtension);
   assert.equal(proven.length, 1);
   assert.equal(proven[0].pid, resumedPid);
   assert.ok(
@@ -2753,7 +2723,6 @@ async function runManagerRecoverySmoke(ctx) {
     const processes = candidateProcess(
       resultOf(await paneInfo(recoveredPaneId)),
       ctx.candidateExtension,
-      ctx.herdrStateExtension,
     );
     return processes.length === 1 && processes[0].pid !== resumedPid
       ? processes
@@ -3138,7 +3107,6 @@ async function collectDiagnostics(ctx, owned) {
       return result.value;
     },
     ctx.candidateExtension,
-    ctx.herdrStateExtension,
   );
   diagnostics.processes = processDiagnostics.records.slice(0, 40);
   try {

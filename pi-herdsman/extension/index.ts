@@ -1,3 +1,8 @@
+import {
+  createMetadataPublisher,
+  sessionMetadata,
+  OWNER_METADATA_TTL_MS,
+} from "./pane-metadata.ts";
 import type {
   BuildSystemPromptOptions,
   ContextEvent,
@@ -27,6 +32,7 @@ import {
 import { createHash, randomUUID } from "node:crypto";
 import {
   realpathSync,
+  existsSync,
   readFileSync,
   statSync,
   unlinkSync,
@@ -122,6 +128,7 @@ import {
   captureStartupDiagnostic,
   closeHerdrPane,
   herdrAgentAlias,
+  herdrReporterExtensionPath,
   herdrSessionSnapshot,
   watchHerdrLifecycle,
   listHerdrAgents,
@@ -144,7 +151,6 @@ import {
   type HerdrStartPlacement,
   type HerdrSessionSnapshot,
 } from "./herdr.ts";
-import { reportLeadMetadata } from "./herdr.ts";
 import {
   acquireProcessLock,
   claimProcessLock,
@@ -771,43 +777,24 @@ type MetadataRuntime = {
   agentDefinition: string;
   cwd: string;
 };
-type MetadataDesiredState = {
-  generation: number;
-  revision: number;
-  runtime: MetadataRuntime;
-  activity?: MetadataActivity;
-  context?: number;
-  model?: string;
-  thinking?: string;
-};
-type MetadataPublishedState = {
-  generation: number;
-  activityKnown: boolean;
-  activity?: MetadataActivity;
-  contextKnown: boolean;
-  context?: number;
-  modelKnown: boolean;
-  model?: string;
-  thinkingKnown: boolean;
-  thinking?: string;
-};
 type MetadataPatch = {
   activity?: MetadataActivity | null;
   context?: number | null;
   model?: string | null;
   thinking?: string | null;
 };
-let metadataGeneration = 0;
-let metadataDesired: MetadataDesiredState | undefined;
-let metadataPublished: MetadataPublishedState = {
-  generation: 0,
-  activityKnown: false,
-  contextKnown: false,
-  modelKnown: false,
-  thinkingKnown: false,
-};
-let metadataDirty = false;
-let metadataFlushActive = false;
+let workerMetadata: ReturnType<typeof createMetadataPublisher> | undefined;
+let workerMetadataActivity: MetadataActivity | undefined;
+let workerMetadataOwner: ExtensionAPI | undefined;
+let publishOwnerView:
+  | ((
+      pi: ExtensionAPI,
+      ctx: ExtensionContext,
+      view: ManagedAgentSnapshotView,
+    ) => void)
+  | undefined;
+let workerMetadataRun: string | undefined;
+let integrationNoticeShown = false;
 let metadataAbortController: AbortController | undefined;
 const REQUEST_CLEANUP_ERROR_PREFIX =
   "Acknowledged request could not be removed:";
@@ -2329,16 +2316,16 @@ function parsePresentationTokens(tokens: unknown): {
       (typeof raw === "string" && !raw.trim())
     )
       return undefined;
-    const value = Number(raw);
+    const value = Number(typeof raw === "string" ? raw.replace(/%$/, "") : raw);
     return Number.isFinite(value) && valid(value) ? value : undefined;
   };
   return {
-    task: text("task"),
-    startedAt: number("started", (value) => value >= 0),
+    task: text("pi_herdsman_task"),
+    startedAt: number("pi_herdsman_started", (value) => value >= 0),
     model: text("model"),
     thinking: text("thinking"),
     contextPercent: number(
-      "ctx",
+      "context_usage",
       (value) => Number.isInteger(value) && value >= 0 && value <= 100,
     ),
   };
@@ -2422,266 +2409,27 @@ function validateIdentity(
       "identity",
     );
 }
-function sameActivity(
-  left: MetadataActivity | undefined,
-  right: MetadataActivity | undefined,
-): boolean {
-  return (
-    left?.requestId === right?.requestId &&
-    left?.task === right?.task &&
-    left?.startedAt === right?.startedAt
-  );
-}
-function normalizeMetadataContext(value: number): number {
-  return Math.max(0, Math.min(100, Math.round(value)));
-}
-function resetMetadataSession(
-  runtime: MetadataRuntime,
-  patch: MetadataPatch,
-): void {
-  metadataGeneration += 1;
-  metadataDesired = {
-    generation: metadataGeneration,
-    revision: 1,
-    runtime,
-    ...(patch.activity && { activity: patch.activity }),
-    ...(patch.context !== undefined && patch.context !== null
-      ? { context: normalizeMetadataContext(patch.context) }
-      : {}),
-    ...(patch.model ? { model: patch.model } : {}),
-    ...(patch.thinking ? { thinking: patch.thinking } : {}),
-  };
-  metadataPublished = {
-    generation: metadataGeneration,
-    activityKnown: false,
-    contextKnown: false,
-    modelKnown: false,
-    thinkingKnown: false,
-  };
-  metadataDirty = true;
-}
-function invalidateMetadataSession(): void {
-  metadataGeneration += 1;
-  metadataDesired = undefined;
-  metadataPublished = {
-    generation: metadataGeneration,
-    activityKnown: false,
-    contextKnown: false,
-    modelKnown: false,
-    thinkingKnown: false,
-  };
-  metadataDirty = false;
-}
-function updateMetadataDesired(
-  runtime: MetadataRuntime,
-  patch: MetadataPatch,
-): boolean {
-  const desired = metadataDesired;
-  if (!desired) return false;
-  let changed = false;
-  if (JSON.stringify(desired.runtime) !== JSON.stringify(runtime)) {
-    desired.runtime = runtime;
-    changed = true;
-  }
-  if (patch.activity !== undefined) {
-    const next = patch.activity ?? undefined;
-    if (!sameActivity(desired.activity, next)) {
-      desired.activity = next;
-      changed = true;
-    }
-  }
-  if (patch.context !== undefined) {
-    const next =
-      patch.context === null
-        ? undefined
-        : normalizeMetadataContext(patch.context);
-    if (desired.context !== next) {
-      desired.context = next;
-      changed = true;
-    }
-  }
-  if (patch.model !== undefined) {
-    const next = patch.model ?? undefined;
-    if (desired.model !== next) {
-      desired.model = next;
-      changed = true;
-    }
-  }
-  if (patch.thinking !== undefined) {
-    const next = patch.thinking ?? undefined;
-    if (desired.thinking !== next) {
-      desired.thinking = next;
-      changed = true;
-    }
-  }
-  if (changed) {
-    desired.revision += 1;
-    metadataDirty = true;
-  }
-  return changed;
-}
-function snapshotMetadataDesired(
-  desired: MetadataDesiredState,
-): MetadataDesiredState {
-  return {
-    ...desired,
-    runtime: { ...desired.runtime },
-    ...(desired.activity
-      ? { activity: { ...desired.activity } }
-      : { activity: undefined }),
-  };
-}
-function buildMetadataArgs(
-  desired: MetadataDesiredState,
-  published: MetadataPublishedState,
-): string[] {
-  const { runtime, activity } = desired;
-  const title =
-    collapseDisplayText(
-      activity ? `${runtime.label} · ${activity.task}` : runtime.label,
-      80,
-    ) ?? runtime.label.slice(0, 80);
-  const args = [
-    "--source",
-    `pi-herdsman:${runtime.runId}`,
-    "--title",
-    title,
-    "--display-agent",
-    runtime.agentDefinition,
-    "--token",
-    "managed=1",
-    "--token",
-    `role=${runtime.agentDefinition}`,
-  ];
-  const generationChanged = published.generation !== desired.generation;
-  if (
-    generationChanged ||
-    !published.activityKnown ||
-    !sameActivity(published.activity, activity)
-  ) {
-    if (activity)
-      args.push(
-        "--token",
-        `request=${activity.requestId}`,
-        "--token",
-        `task=${collapseDisplayText(activity.task) ?? ""}`,
-        "--token",
-        `started=${activity.startedAt}`,
-      );
-    else
-      args.push(
-        "--clear-token",
-        "request",
-        "--clear-token",
-        "task",
-        "--clear-token",
-        "started",
-      );
-  }
-  if (
-    generationChanged ||
-    !published.contextKnown ||
-    published.context !== desired.context
-  ) {
-    if (activity && desired.context !== undefined)
-      args.push("--token", `ctx=${desired.context}`);
-    else args.push("--clear-token", "ctx");
-  }
-  if (
-    generationChanged ||
-    !published.modelKnown ||
-    desired.model !== published.model
-  )
-    args.push(
-      desired.model !== undefined ? "--token" : "--clear-token",
-      desired.model !== undefined ? `model=${desired.model}` : "model",
-    );
-  if (
-    generationChanged ||
-    !published.thinkingKnown ||
-    desired.thinking !== published.thinking
-  )
-    args.push(
-      desired.thinking !== undefined ? "--token" : "--clear-token",
-      desired.thinking !== undefined
-        ? `thinking=${desired.thinking}`
-        : "thinking",
-    );
-  return args;
-}
-async function flushMetadata(
+function ownSessionMetadata(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
-): Promise<void> {
-  if (metadataFlushActive) return;
-  metadataFlushActive = true;
-  try {
-    while (metadataDirty && metadataDesired) {
-      metadataDirty = false;
-      const attempted = snapshotMetadataDesired(metadataDesired);
-      const attemptedGeneration = attempted.generation,
-        attemptedRevision = attempted.revision;
-      let succeeded = false;
-      try {
-        await runHerdr(
-          pi,
-          ctx,
-          [
-            "pane",
-            "report-metadata",
-            attempted.runtime.paneId,
-            ...buildMetadataArgs(attempted, metadataPublished),
-          ],
-          {
-            timeout: 10_000,
-            signal: metadataAbortController?.signal,
-            noResult: true,
-          },
-        );
-        succeeded = true;
-      } catch {
-        succeeded = false;
-      }
-      const current = metadataDesired;
-      if (!current || current.generation !== attemptedGeneration) continue;
-      if (!succeeded) {
-        if (current.revision !== attemptedRevision) {
-          metadataDirty = true;
-          continue;
-        }
-        metadataDirty = true;
-        break;
-      }
-      const generationChanged =
-        metadataPublished.generation !== attempted.generation;
-      const modelChanged =
-        generationChanged ||
-        !metadataPublished.modelKnown ||
-        attempted.model !== metadataPublished.model;
-      const thinkingChanged =
-        generationChanged ||
-        !metadataPublished.thinkingKnown ||
-        attempted.thinking !== metadataPublished.thinking;
-      metadataPublished = {
-        generation: attemptedGeneration,
-        activityKnown: true,
-        activity: attempted.activity ? { ...attempted.activity } : undefined,
-        contextKnown: true,
-        context: attempted.context,
-        modelKnown: true,
-        model:
-          attempted.model ??
-          (modelChanged ? undefined : metadataPublished.model),
-        thinkingKnown: true,
-        thinking:
-          attempted.thinking ??
-          (thinkingChanged ? undefined : metadataPublished.thinking),
-      };
-      if (current.revision !== attemptedRevision) metadataDirty = true;
-    }
-  } finally {
-    metadataFlushActive = false;
-  }
+  patch: MetadataPatch = {},
+) {
+  return sessionMetadata({
+    model:
+      patch.model ??
+      (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined),
+    provider: ctx.model?.provider,
+    thinking: patch.thinking ?? ctx.thinkingLevel,
+    name: pi.getSessionName() ?? ctx.sessionManager.getSessionName(),
+    sessionId: ctx.sessionManager.getSessionId(),
+    contextPercent: ctx.getContextUsage()?.percent ?? undefined,
+  });
+}
+function invalidateMetadataSession(): Promise<void> {
+  const cleared = workerMetadata?.clear() ?? Promise.resolve();
+  workerMetadata = undefined;
+  workerMetadataActivity = undefined;
+  return cleared;
 }
 function reportMetadata(
   pi: ExtensionAPI,
@@ -2690,9 +2438,48 @@ function reportMetadata(
   patch: MetadataPatch,
   reset = false,
 ): void {
-  if (reset) resetMetadataSession(runtime, patch);
-  else updateMetadataDesired(runtime, patch);
-  void flushMetadata(pi, ctx);
+  if (
+    ctx.mode !== "tui" ||
+    !process.env.HERDR_ENV ||
+    !process.env.HERDR_PANE_ID ||
+    !runtime.paneId
+  )
+    return;
+  if (reset) {
+    workerMetadataActivity = undefined;
+    if (workerMetadataOwner !== pi || workerMetadataRun !== runtime.runId) {
+      void workerMetadata?.clear();
+      workerMetadata = undefined;
+      workerMetadataOwner = pi;
+      workerMetadataRun = runtime.runId;
+    }
+  }
+  if (patch.activity !== undefined)
+    workerMetadataActivity = patch.activity ?? undefined;
+  workerMetadata ??= createMetadataPublisher((args, signal) =>
+    runHerdr(pi, ctx, args, {
+      signal,
+      timeout: 10_000,
+      noResult: true,
+    }),
+  );
+  const activity = workerMetadataActivity;
+  workerMetadata.update({
+    paneId: runtime.paneId,
+    source: `pi-herdsman:${runtime.runId}`,
+    title: activity ? `${runtime.label} · ${activity.task}` : runtime.label,
+    displayAgent: runtime.agentDefinition,
+    tokens: {
+      ...ownSessionMetadata(pi, ctx, patch),
+      pi_herdsman_role: runtime.agentDefinition,
+      pi_herdsman_run: runtime.runId,
+      pi_herdsman_parent_session:
+        process.env.PI_HERDSMAN_OWNER_SESSION_ID ?? null,
+      pi_herdsman_request: activity?.requestId ?? null,
+      pi_herdsman_task: activity?.task ?? null,
+      pi_herdsman_started: activity ? String(activity.startedAt) : null,
+    },
+  });
 }
 function agentMetadataRuntime(
   state: ManagedAgentState,
@@ -3502,7 +3289,7 @@ async function agentSnapshotView(
   proveLead = false,
 ): Promise<ManagedAgentSnapshotView> {
   const snapshot = await managedAgentSnapshots(pi, ctx, signal, proveLead);
-  return {
+  const view = {
     ...snapshot,
     visible: visibleAgentSnapshots(
       snapshot,
@@ -3510,6 +3297,8 @@ async function agentSnapshotView(
       ctx.sessionManager.getSessionId(),
     ),
   };
+  publishOwnerView?.(pi, ctx, view);
+  return view;
 }
 
 function statusBreadcrumb(
@@ -6887,9 +6676,10 @@ async function actionUnsafe(
     // Only an armed window can be replaced. A disabled configuration, a
     // resolved assignment, or an idle worker has no window and no effect.
     const requestId = runtime.activeRequestId;
-    const armed = softWindowsEnabled() && requestId
-      ? softWindows.get(requestId)
-      : undefined;
+    const armed =
+      softWindowsEnabled() && requestId
+        ? softWindows.get(requestId)
+        : undefined;
     if (!requestId || !armed || armed.runId !== runtime.runId)
       fail("agent_busy", "Agent has no armed soft window", "extend", {
         nextAction:
@@ -7143,25 +6933,151 @@ async function action(
 }
 
 export default function (pi: ExtensionAPI): void {
-  let leadMetadataQueue = Promise.resolve();
+  let leadMetadata: ReturnType<typeof createMetadataPublisher> | undefined;
+  let leadMetadataClosed = false;
+  let leadMetadataName: string | undefined;
+  let leadMetadataAsk: string | undefined;
+  if (role() === "lead") {
+    for (const event of [
+      "turn_end",
+      "model_select",
+      "thinking_level_select",
+    ] as const)
+      pi.on(event, (_event, ctx) => {
+        void publishLeadRole(
+          ctx,
+          roleSuspended ? "suspended" : chiefMode,
+          chiefModeGeneration,
+        );
+      });
+  }
   const queueLeadMetadata = (
     ctx: ExtensionContext,
-    metadata: Parameters<typeof reportLeadMetadata>[2],
+    metadata: { paneId: string; name?: string; pendingAskId?: string },
   ): void => {
-    if (controllerRole === "manager") {
-      void publishLeadRole(
-        ctx,
-        roleSuspended ? "suspended" : "inactive",
-        chiefModeGeneration,
-      );
-      return;
+    leadMetadataName = metadata.name;
+    leadMetadataAsk = metadata.pendingAskId;
+    void publishLeadRole(
+      ctx,
+      roleSuspended ? "suspended" : chiefMode,
+      chiefModeGeneration,
+    );
+  };
+  const ownerMetadata = new Map<
+    string,
+    {
+      publisher: ReturnType<typeof createMetadataPublisher>;
+      closing?: Promise<void>;
     }
-    leadMetadataQueue = leadMetadataQueue
-      .catch(() => {})
-      .then(() => reportLeadMetadata(pi, ctx, metadata))
-      .catch(() => {
-        // Lead metadata is display-only and best effort.
-      });
+  >();
+  let ownerMetadataClosed = false;
+  const clearOwnerMetadata = async (): Promise<void> => {
+    ownerMetadataClosed = true;
+    await Promise.all(
+      [...ownerMetadata.values()].map(({ publisher }) => publisher.clear()),
+    );
+    ownerMetadata.clear();
+  };
+
+  const publishOwnerStates = (
+    ctx: ExtensionContext,
+    entries: {
+      state: ManagedAgentState;
+      projection: unknown;
+      agentSession?: unknown;
+    }[],
+  ): void => {
+    if (
+      ownerMetadataClosed ||
+      ctx.mode !== "tui" ||
+      !process.env.HERDR_ENV ||
+      !process.env.HERDR_PANE_ID
+    )
+      return;
+    const owner = ctx.sessionManager.getSessionId();
+    const visible = new Set<string>();
+    for (const { state, projection, agentSession } of entries) {
+      if (state.ownerSessionId !== owner || !state.paneId) continue;
+      if (
+        agentSession !== undefined &&
+        !matchesExpectedSession(agentSession, {
+          id: state.piSessionId,
+          path: state.piSessionFile,
+        })
+      )
+        continue;
+      visible.add(state.runId);
+      let entry = ownerMetadata.get(state.runId);
+      if (!entry) {
+        entry = {
+          publisher: createMetadataPublisher(
+            (args, signal) =>
+              runHerdr(pi, ctx, args, {
+                signal,
+                timeout: 10_000,
+                noResult: true,
+              }),
+            OWNER_METADATA_TTL_MS,
+          ),
+        };
+        ownerMetadata.set(state.runId, entry);
+      }
+      if (!entry.closing)
+        void entry.publisher.update({
+          paneId: state.paneId,
+          source: `pi-herdsman:owner:${state.runId}`,
+          tokens: {
+            pi_herdsman_state:
+              typeof projection === "string" ? projection : null,
+          },
+        });
+    }
+    for (const [runId, entry] of ownerMetadata) {
+      if (!visible.has(runId) && !entry.closing) {
+        entry.closing = entry.publisher.clear().then(() => {
+          ownerMetadata.delete(runId);
+        });
+      }
+    }
+  };
+
+  publishOwnerView = (currentPi, ctx, view) => {
+    if (currentPi !== pi) return;
+    publishOwnerStates(
+      ctx,
+      view.visible.map((snapshot) => ({
+        state: snapshot.state,
+        projection: snapshot.listed.state,
+        agentSession: view.liveAgents.find(
+          (agent: any) => agent.pane_id === snapshot.state.paneId,
+        )?.agent_session,
+      })),
+    );
+  };
+  let metadataSession: string | undefined;
+  const preparePaneMetadata = (ctx: ExtensionContext): void => {
+    leadMetadataClosed = false;
+    ownerMetadataClosed = false;
+    const session = ctx.sessionManager.getSessionId();
+    if (metadataSession !== session) {
+      leadMetadataName = undefined;
+      leadMetadataAsk = undefined;
+      metadataSession = session;
+    }
+    if (
+      integrationNoticeShown ||
+      role() === "unmanaged" ||
+      ctx.mode !== "tui" ||
+      !ctx.hasUI
+    )
+      return;
+    if (!herdrReporterExtensionPath()) {
+      integrationNoticeShown = true;
+      ctx.ui.notify(
+        "Install the official Herdr Pi reporter: herdr integration install pi. Remove pi-herdr; Herdsman now owns pane metadata.",
+        "warning",
+      );
+    }
   };
   const agentEnvError =
     process.env.PI_HERDSMAN_MAILBOX !== undefined
@@ -7237,10 +7153,8 @@ export default function (pi: ExtensionAPI): void {
     (message, options, theme) =>
       renderAgentAttentionMessage(message, options, theme),
   );
-  pi.registerMessageRenderer(
-    SOFT_DEADLINE_MESSAGE,
-    (message, options, theme) =>
-      renderAgentSoftDeadlineMessage(message, options, theme),
+  pi.registerMessageRenderer(SOFT_DEADLINE_MESSAGE, (message, options, theme) =>
+    renderAgentSoftDeadlineMessage(message, options, theme),
   );
   const processRole = role();
   if (processRole === "unmanaged") {
@@ -7695,35 +7609,35 @@ export default function (pi: ExtensionAPI): void {
     generation: number,
   ): Promise<void> => {
     const paneId = process.env.HERDR_PANE_ID;
-    if (!paneId) return Promise.resolve();
-    const args = [
-      "pane",
-      "report-metadata",
+    if (
+      leadMetadataClosed ||
+      !paneId ||
+      ctx.mode !== "tui" ||
+      generation !== chiefModeGeneration
+    )
+      return Promise.resolve();
+    leadMetadata ??= createMetadataPublisher((args, signal) =>
+      runHerdr(pi, ctx, args, {
+        noResult: true,
+        timeout: 10_000,
+        signal,
+      }),
+    );
+    const role = mode === "active" ? "chief" : activeRole();
+    return leadMetadata.update({
       paneId,
-      "--source",
-      "pi-herdsman:lead",
-      "--title",
-      mode === "active"
-        ? "chief"
-        : activeRole() === "manager"
-          ? "Pi Herdsman manager"
-          : "Pi Herdsman lead",
-      ...(mode === "active"
-        ? ["--token", "pi_herdsman_role=chief"]
-        : mode === "inactive"
-          ? ["--token", `pi_herdsman_role=${activeRole()}`]
-          : ["--clear-token", "pi_herdsman_role"]),
-    ];
-    leadMetadataQueue = leadMetadataQueue
-      .catch(() => {})
-      .then(async () => {
-        if (generation !== chiefModeGeneration) return;
-        await runHerdr(pi, ctx, args, { noResult: true, timeout: 10_000 });
-      })
-      .catch(() => {
-        // Metadata is display-only and best effort.
-      });
-    return leadMetadataQueue;
+      source: "pi-herdsman:lead",
+      title:
+        mode === "active"
+          ? "chief"
+          : leadMetadataName?.trim() || `Pi Herdsman ${role}`,
+      tokens: {
+        ...ownSessionMetadata(pi, ctx),
+        pi_herdsman_role: mode === "suspended" ? null : role,
+        pi_herdsman_name: leadMetadataName ?? null,
+        pi_herdsman_ask: leadMetadataAsk ?? null,
+      },
+    });
   };
   const persistRole = (role: SessionRole): void => {
     if (!leadTools) throw new Error("Lead tool baseline is unavailable");
@@ -11365,6 +11279,7 @@ export default function (pi: ExtensionAPI): void {
           unresolvedMailboxState,
         ),
       );
+
       const agents = listed.map((agent) => {
         const runtime = runtimes.get(agent.agent as string);
         const tokens = agent.tokens ?? {};
@@ -11376,13 +11291,16 @@ export default function (pi: ExtensionAPI): void {
             typeof agent.agent_definition === "string" &&
               agent.agent_definition.trim()
               ? agent.agent_definition
-              : typeof tokens.role === "string"
-                ? tokens.role
+              : typeof tokens.pi_herdsman_role === "string"
+                ? tokens.pi_herdsman_role
                 : undefined,
           ),
           paneId: agent.pane_id,
           sessionId: agent.pi_session_id,
-          task: typeof tokens.task === "string" ? tokens.task : runtime?.task,
+          task:
+            typeof tokens.pi_herdsman_task === "string"
+              ? tokens.pi_herdsman_task
+              : runtime?.task,
           startedAt: presentation.startedAt ?? runtime?.startedAt,
           model:
             presentation.model !== undefined
@@ -13415,7 +13333,8 @@ export default function (pi: ExtensionAPI): void {
                 entries,
                 runtime.activeRequestId,
               );
-              const armedAt = recorded?.armedAt ?? state.lastAck?.acknowledgedAt;
+              const armedAt =
+                recorded?.armedAt ?? state.lastAck?.acknowledgedAt;
               if (armedAt !== undefined)
                 softWindows.set(runtime.activeRequestId, {
                   requestId: runtime.activeRequestId,
@@ -14401,6 +14320,7 @@ export default function (pi: ExtensionAPI): void {
       void refreshStatus(ctx, generation);
     };
     pi.on("session_start", async (_event: unknown, ctx: ExtensionContext) => {
+      preparePaneMetadata(ctx);
       managerDiagnostic("session_start_reached");
       startupDefinitionRoster = undefined;
       clearChiefStartPreflight();
@@ -14642,6 +14562,11 @@ export default function (pi: ExtensionAPI): void {
       if (wasChief) watchActiveAsks();
     });
     pi.on("session_shutdown", async () => {
+      leadMetadataClosed = true;
+      const metadataClear = Promise.all([
+        leadMetadata?.clear(),
+        clearOwnerMetadata(),
+      ]);
       ++sessionGeneration;
       ++peerPresenceGeneration;
       clearChiefStartPreflight();
@@ -14754,6 +14679,9 @@ export default function (pi: ExtensionAPI): void {
       askDeliveryInFlight.clear();
       runtimes.clear();
       softWindows.clear();
+
+      await metadataClear;
+      leadMetadata = undefined;
     });
     const agentTool = {
       name: "agent_list",
@@ -15634,6 +15562,7 @@ export default function (pi: ExtensionAPI): void {
   pi.on("session_before_switch", () => ({ cancel: true }));
   pi.on("session_before_fork", () => ({ cancel: true }));
   pi.on("session_start", async (_e: unknown, ctx: ExtensionContext) => {
+    preparePaneMetadata(ctx);
     resetRequestPump();
     resetLeafStatus();
     ownTools = undefined;
@@ -15960,7 +15889,10 @@ export default function (pi: ExtensionAPI): void {
     const deliveredRequestId = state.completedRequestId;
     const deliveredAssignment =
       deliveredRequestId !== undefined &&
-      !pendingResultExists(process.env.PI_HERDSMAN_MAILBOX!, deliveredRequestId);
+      !pendingResultExists(
+        process.env.PI_HERDSMAN_MAILBOX!,
+        deliveredRequestId,
+      );
     if (
       request.kind === "task" &&
       ((state.completedRequestId !== undefined && !deliveredAssignment) ||
@@ -16102,7 +16034,7 @@ export default function (pi: ExtensionAPI): void {
   });
   pi.on("turn_end", (_event: unknown, ctx: ExtensionContext) => {
     touchActivity();
-    if (!state?.activeRequestId) return;
+    if (!state) return;
     const usage = ctx.getContextUsage();
     const percent =
       usage?.percent == null ? undefined : Math.round(usage.percent);
@@ -16115,6 +16047,9 @@ export default function (pi: ExtensionAPI): void {
       ...(model ? { model } : {}),
       ...(thinking ? { thinking } : {}),
     });
+  });
+  pi.on("session_info_changed", (_event, ctx) => {
+    if (state) reportMetadata(pi, ctx, agentMetadataRuntime(state, ctx), {});
   });
   pi.on("turn_start", () => {
     touchActivity();
@@ -16380,7 +16315,7 @@ export default function (pi: ExtensionAPI): void {
     resetLeafStatus();
     metadataAbortController?.abort();
     metadataAbortController = undefined;
-    invalidateMetadataSession();
+    const workerMetadataCleared = invalidateMetadataSession();
     initialized = false;
     resetRequestPump();
     agentControllerReady = false;
@@ -16390,5 +16325,9 @@ export default function (pi: ExtensionAPI): void {
     retryTimer = undefined;
     if (stateRetryTimer) clearInterval(stateRetryTimer);
     stateRetryTimer = undefined;
+
+    return Promise.all([workerMetadataCleared, clearOwnerMetadata()]).then(
+      () => undefined,
+    );
   });
 }

@@ -7,6 +7,7 @@ import {
 import { createHash, randomUUID } from "node:crypto";
 import {
   closeSync,
+  existsSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -109,11 +110,22 @@ const LIFECYCLE_SUBSCRIPTIONS = [
 const LIFECYCLE_SUBSCRIPTION_ID = "pi-herdsman:lifecycle";
 const LIFECYCLE_RECONNECT_MS = 1_000;
 const MAX_EVENT_BUFFER_BYTES = 1024 * 1024;
-const HERDR_AGENT_STATE_EXTENSION = join(
-  getAgentDir(),
-  "extensions",
-  "herdr-agent-state.ts",
-);
+
+/**
+ * The official Herdr Pi reporter, when installed. Workers launched with
+ * `--no-extensions` load only explicit paths, so the path is passed whenever it
+ * exists; Pi dedupes it against discovery, which keeps it to a single load.
+ */
+export function herdrReporterExtensionPath(): string | undefined {
+  const path = join(getAgentDir(), "extensions", "herdr-agent-state.ts");
+  return existsSync(path) ? path : undefined;
+}
+
+function herdrReporterArgs(): string[] {
+  const path = herdrReporterExtensionPath();
+  return path ? ["--extension", path] : [];
+}
+
 function error(operation: string, message: string, details?: unknown): never {
   throw new OperationError({
     category: "internal_failure",
@@ -718,44 +730,6 @@ export function watchHerdrLifecycle(
   connect();
 }
 
-export type LeadMetadata = {
-  paneId: string;
-  name?: string;
-  pendingAskId?: string;
-};
-
-export function leadMetadataArgs(metadata: LeadMetadata): string[] {
-  const args = [
-    "pane",
-    "report-metadata",
-    metadata.paneId,
-    "--source",
-    "pi-herdsman:lead",
-    "--title",
-    metadata.name?.trim() || "Pi Herdsman lead",
-    "--token",
-    "pi_herdsman_role=lead",
-  ];
-  if (metadata.pendingAskId)
-    args.push("--token", `pi_herdsman_ask=${metadata.pendingAskId}`);
-  else args.push("--clear-token", "pi_herdsman_ask");
-  if (metadata.name?.trim())
-    args.push("--token", `pi_herdsman_name=${metadata.name.trim()}`);
-  else args.push("--clear-token", "pi_herdsman_name");
-  return args;
-}
-
-export async function reportLeadMetadata(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-  metadata: LeadMetadata,
-): Promise<void> {
-  await runHerdr(pi, ctx, leadMetadataArgs(metadata), {
-    timeout: 10_000,
-    noResult: true,
-  });
-}
-
 export type StartHerdrOptions = {
   label: string;
   runId: string;
@@ -1311,8 +1285,7 @@ export async function startHerdrAgent(
             ...(options.extensionPath
               ? ["--extension", options.extensionPath]
               : []),
-            "--extension",
-            HERDR_AGENT_STATE_EXTENSION,
+            ...herdrReporterArgs(),
             ...(options.agentArgs ?? []),
           ],
           {
@@ -1528,8 +1501,7 @@ export async function startHerdrAgentInPane(
             ...(options.extensionPath
               ? ["--extension", options.extensionPath]
               : []),
-            "--extension",
-            HERDR_AGENT_STATE_EXTENSION,
+            ...herdrReporterArgs(),
             ...(options.agentArgs ?? []),
           ],
           {

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import fs, {
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   realpathSync,
@@ -21,11 +22,10 @@ import {
   herdrAgentAlias,
   listHerdrAgents,
   listAllHerdrAgents,
+  herdrReporterExtensionPath,
   herdrSessionSnapshot,
   worktreeGroupScope,
   watchHerdrLifecycle,
-  leadMetadataArgs,
-  reportLeadMetadata,
   inspectHerdrAgent,
   runHerdr,
   sameShellProcessOwner,
@@ -267,58 +267,6 @@ test("lifecycle watcher subscribes, reconciles, reconnects, and aborts", async (
     if (globalThis.process.platform !== "win32")
       rmSync(socketPath, { force: true });
   }
-});
-
-test("lead metadata is display-only and carries current name and ask", () => {
-  assert.deepEqual(
-    leadMetadataArgs({
-      paneId: "root-pane",
-      name: " API root ",
-      pendingAskId: "ask-1",
-    }),
-    [
-      "pane",
-      "report-metadata",
-      "root-pane",
-      "--source",
-      "pi-herdsman:lead",
-      "--title",
-      "API root",
-      "--token",
-      "pi_herdsman_role=lead",
-      "--token",
-      "pi_herdsman_ask=ask-1",
-      "--token",
-      "pi_herdsman_name=API root",
-    ],
-  );
-  assert.deepEqual(leadMetadataArgs({ paneId: "root-pane" }).slice(-4), [
-    "--clear-token",
-    "pi_herdsman_ask",
-    "--clear-token",
-    "pi_herdsman_name",
-  ]);
-});
-
-test("lead metadata accepts successful empty Herdr output", async () => {
-  let call: { args: string[]; options: Record<string, unknown> } | undefined;
-  const pi = {
-    exec: async (
-      _command: string,
-      args: string[],
-      options: Record<string, unknown>,
-    ) => {
-      call = { args, options };
-      return { code: 0, stdout: "", stderr: "" };
-    },
-  } as any;
-
-  await reportLeadMetadata(pi, { cwd: "/tmp" } as any, {
-    paneId: "root-pane",
-  });
-
-  assert.deepEqual(call?.args, leadMetadataArgs({ paneId: "root-pane" }));
-  assert.equal(call?.options.timeout, 10_000);
 });
 
 test("inspection reads raw bounded text and tolerates unavailable process evidence", async () => {
@@ -1105,6 +1053,19 @@ test("serializes lifecycle mutations across managed and concrete tab identities"
   }
 });
 
+test("the Herdr reporter path exists only when the integration is installed", () => {
+  const path = join(getAgentDir(), "extensions", "herdr-agent-state.ts");
+  rmSync(path, { force: true });
+  assert.equal(herdrReporterExtensionPath(), undefined);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, "");
+  try {
+    assert.equal(herdrReporterExtensionPath(), path);
+  } finally {
+    rmSync(path, { force: true });
+  }
+});
+
 test("start injects mandatory extensions before definition args and configures the environment", async () => {
   const environment = globalThis.process.env;
   const previousWorkspace = environment.HERDR_WORKSPACE_ID;
@@ -1112,6 +1073,9 @@ test("start injects mandatory extensions before definition args and configures t
   const cwd = mkdtempSync(join(tmpdir(), "pi-herdsman-agent-space-"));
   const mailbox = join(cwd, "mailbox with $dollar 'quote' `backtick`");
   const definitionExtension = join(cwd, "definition-extension.ts");
+  const reporter = join(getAgentDir(), "extensions", "herdr-agent-state.ts");
+  mkdirSync(dirname(reporter), { recursive: true });
+  writeFileSync(reporter, "");
   const processInfo = {
     pane_id: "pane-1",
     shell_pid: 12,
@@ -1227,6 +1191,7 @@ test("start injects mandatory extensions before definition args and configures t
       extensionPath: join(dirname(fileURLToPath(import.meta.url)), "index.ts"),
       env: contract,
       agentArgs: [
+        "--no-extensions",
         "--extension",
         definitionExtension,
         "--name",
@@ -1236,6 +1201,7 @@ test("start injects mandatory extensions before definition args and configures t
       ],
     });
   } finally {
+    rmSync(reporter, { force: true });
     Date.now = originalDateNow;
     if (previousWorkspace === undefined) delete environment.HERDR_WORKSPACE_ID;
     else environment.HERDR_WORKSPACE_ID = previousWorkspace;
@@ -1272,7 +1238,8 @@ test("start injects mandatory extensions before definition args and configures t
     "--extension",
     join(dirname(fileURLToPath(import.meta.url)), "index.ts"),
     "--extension",
-    join(getAgentDir(), "extensions", "herdr-agent-state.ts"),
+    reporter,
+    "--no-extensions",
     "--extension",
     definitionExtension,
     "--name",

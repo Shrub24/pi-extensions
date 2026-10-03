@@ -1870,7 +1870,7 @@ test("continuation accepts a prefixed marker only in the stopped response descen
   assert.equal(assistantResultForSession({ contents }, prompt, marker), null);
 });
 
-test("core counts distinct non-root pane/PID processes with both extension paths, without role labels", async () => {
+test("core counts distinct non-root candidate processes without role labels", async () => {
   assert.equal(
     distinctPaneCount([
       { paneId: "same", pid: 1 },
@@ -1901,13 +1901,7 @@ test("core counts distinct non-root pane/PID processes with both extension paths
         foreground_processes: [
           {
             pid: 11,
-            argv: [
-              "pi",
-              "--extension",
-              "/candidate/dist/index.js",
-              "--extension",
-              "/isolated/herdr-agent-state.ts",
-            ],
+            argv: ["pi", "--extension", "/candidate/dist/index.js"],
           },
           { pid: 11, cmdline: "duplicate same process" },
         ],
@@ -1927,7 +1921,7 @@ test("core counts distinct non-root pane/PID processes with both extension paths
     "unrelated-pane": {
       process_info: {
         foreground_processes: [
-          { pid: 31, cmdline: "pi --extension /candidate/dist/index.js" },
+          { pid: 31, cmdline: "pi --extension /unrelated/dist/index.js" },
         ],
       },
     },
@@ -1937,7 +1931,6 @@ test("core counts distinct non-root pane/PID processes with both extension paths
     "root",
     async (paneId) => response[paneId],
     "/candidate/dist/index.js",
-    "/isolated/herdr-agent-state.ts",
   );
   assert.deepEqual(
     result.verified.map(({ paneId, pid }) => [paneId, pid]),
@@ -1954,7 +1947,7 @@ test("core counts distinct non-root pane/PID processes with both extension paths
   );
 });
 
-test("process evidence requires both exact extension paths and excludes root pane", async () => {
+test("process evidence requires the candidate extension and excludes root pane", async () => {
   const result = await inspectPaneProcesses(
     ["root", "missing-extension", "missing-pane"],
     "root",
@@ -1963,13 +1956,12 @@ test("process evidence requires both exact extension paths and excludes root pan
       return {
         process_info: {
           foreground_processes: [
-            { pid: 42, cmdline: "pi --extension /candidate/dist/index.js" },
+            { pid: 42, cmdline: "pi --extension /unrelated/dist/index.js" },
           ],
         },
       };
     },
     "/candidate/dist/index.js",
-    "/isolated/herdr-agent-state.ts",
   );
   assert.deepEqual(result.verified, []);
   assert.deepEqual(

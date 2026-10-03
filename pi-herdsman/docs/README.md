@@ -48,6 +48,7 @@ references for exact contracts:
 - [Supervisor tools](reference/supervisor.md)
 - [Peer tools](reference/peer.md)
 - [Agent states](reference/agent-states.md)
+- [Pane metadata and hierarchy](reference/pane-metadata.md)
 - [Errors](reference/errors.md)
 
 Human-facing surfaces are documented separately:

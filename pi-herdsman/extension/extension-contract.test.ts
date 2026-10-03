@@ -226,7 +226,9 @@ const STAFF_TOOL_CASES = [
 test("the documented agent_extend schema matches the registered tool", () => {
   const pi = fakePi();
   registerExtension!(pi.pi as never);
-  const tool = pi.tools.find((candidate: any) => candidate.name === "agent_extend")!;
+  const tool = pi.tools.find(
+    (candidate: any) => candidate.name === "agent_extend",
+  )!;
   assert.ok(tool, "agent_extend is registered for a control-capable session");
   const doc = readFileSync(
     join(import.meta.dirname, "..", "docs", "reference", "agent.md"),
@@ -2436,6 +2438,23 @@ test("lead metadata omits coordination state and follows session names", async (
   assert.ok(pi.calls.some((args) => args.includes("pi_herdsman_name=renamed")));
   pi.events.get("session_shutdown")?.[0]();
   delete process.env.HERDR_PANE_ID;
+  const selfReports = pi.calls.filter(
+    (args) =>
+      args.includes("pi-herdsman:lead") && !args.includes("--clear-title"),
+  );
+  assert.ok(
+    selfReports.some((args) =>
+      args.includes(
+        `pi_herdsman_session=${context.sessionManager.getSessionId()}`,
+      ),
+    ),
+  );
+  assert.equal(
+    selfReports.some((args) =>
+      args.some((arg) => arg.startsWith("pi_herdsman_parent_session=")),
+    ),
+    false,
+  );
 });
 
 test("malformed persisted role fails closed without authoritative lead state", async () => {
@@ -3077,6 +3096,10 @@ test("managed non-TUI agents do not receive the widget", async () => {
   registerExtension!(pi.pi as never);
   await pi.events.get("session_start")![0](undefined, context);
   assert.equal(registrations, 0);
+  assert.equal(
+    pi.calls.some((args) => args[1] === "report-metadata"),
+    false,
+  );
   pi.events.get("session_shutdown")?.[0]();
   resetAgentMailbox(mailbox);
   setLeadEnvironment();

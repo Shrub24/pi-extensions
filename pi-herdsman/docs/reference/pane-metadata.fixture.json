@@ -1,0 +1,281 @@
+{
+  "panes": [
+    {
+      "pane_id": "fixture:p1",
+      "workspace_id": "fixture",
+      "tab_id": "fixture:t1",
+      "agent_session": {
+        "source": "herdr:pi",
+        "agent": "pi",
+        "kind": "id",
+        "value": "11111111-1111-4111-8111-111111111111"
+      },
+      "agent_status": "working",
+      "metadata": [
+        {
+          "source": "pi-herdsman:lead",
+          "ttl_ms": 3600000,
+          "tokens": {
+            "model": "example/model",
+            "provider": "example",
+            "thinking": "high",
+            "session": null,
+            "context_usage": "43%",
+            "pi_herdsman_session": "11111111-1111-4111-8111-111111111111",
+            "pi_herdsman_role": "lead",
+            "pi_herdsman_name": null,
+            "pi_herdsman_ask": null
+          }
+        },
+        {
+          "source": "radar:fixture",
+          "ttl_ms": 3600000,
+          "tokens": {
+            "anchor": "1",
+            "sort_key": "0001"
+          }
+        }
+      ]
+    },
+    {
+      "pane_id": "fixture:p2",
+      "workspace_id": "fixture",
+      "tab_id": "fixture:t1",
+      "agent_session": {
+        "source": "herdr:pi",
+        "agent": "pi",
+        "kind": "id",
+        "value": "22222222-2222-4222-8222-222222222222"
+      },
+      "agent_status": "working",
+      "metadata": [
+        {
+          "source": "pi-herdsman:22222222-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "ttl_ms": 3600000,
+          "tokens": {
+            "model": "example/model",
+            "provider": "example",
+            "thinking": "high",
+            "session": null,
+            "context_usage": "43%",
+            "pi_herdsman_session": "22222222-2222-4222-8222-222222222222",
+            "pi_herdsman_role": "researcher",
+            "pi_herdsman_run": "22222222-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "pi_herdsman_parent_session": "11111111-1111-4111-8111-111111111111",
+            "pi_herdsman_request": null,
+            "pi_herdsman_task": null,
+            "pi_herdsman_started": null
+          }
+        },
+        {
+          "source": "pi-herdsman:owner:22222222-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "ttl_ms": 30000,
+          "tokens": {
+            "pi_herdsman_state": "blocked"
+          }
+        }
+      ]
+    },
+    {
+      "pane_id": "fixture:p3",
+      "workspace_id": "fixture",
+      "tab_id": "fixture:t2",
+      "agent_session": {
+        "source": "herdr:pi",
+        "agent": "pi",
+        "kind": "id",
+        "value": "33333333-3333-4333-8333-333333333333"
+      },
+      "agent_status": "unknown",
+      "metadata": [
+        {
+          "source": "pi-herdsman:33333333-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "ttl_ms": 3600000,
+          "tokens": {
+            "model": "example/model",
+            "provider": "example",
+            "thinking": "high",
+            "session": null,
+            "context_usage": "43%",
+            "pi_herdsman_session": "33333333-3333-4333-8333-333333333333",
+            "pi_herdsman_role": "worker",
+            "pi_herdsman_run": "33333333-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "pi_herdsman_parent_session": "22222222-2222-4222-8222-222222222222",
+            "pi_herdsman_request": null,
+            "pi_herdsman_task": null,
+            "pi_herdsman_started": null
+          }
+        },
+        {
+          "source": "pi-herdsman:owner:33333333-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "ttl_ms": 30000,
+          "tokens": {
+            "pi_herdsman_state": "lost"
+          }
+        }
+      ]
+    }
+  ],
+  "expected": {
+    "preorder": [
+      "fixture:p1",
+      "fixture:p2",
+      "fixture:p3"
+    ],
+    "parents": {
+      "fixture:p2": "fixture:p1",
+      "fixture:p3": "fixture:p2"
+    },
+    "owner_states": {
+      "fixture:p2": "blocked",
+      "fixture:p3": "lost"
+    },
+    "agent_list": {
+      "agents": [
+        {
+          "pane_id": "fixture:p1",
+          "workspace_id": "fixture",
+          "tab_id": "fixture:t1",
+          "agent_session": {
+            "source": "herdr:pi",
+            "agent": "pi",
+            "kind": "id",
+            "value": "11111111-1111-4111-8111-111111111111"
+          },
+          "agent_status": "working",
+          "tokens": {
+            "model": "example/model",
+            "provider": "example",
+            "thinking": "high",
+            "context_usage": "43%",
+            "pi_herdsman_session": "11111111-1111-4111-8111-111111111111",
+            "pi_herdsman_role": "lead",
+            "anchor": "1",
+            "sort_key": "0001"
+          }
+        },
+        {
+          "pane_id": "fixture:p2",
+          "workspace_id": "fixture",
+          "tab_id": "fixture:t1",
+          "agent_session": {
+            "source": "herdr:pi",
+            "agent": "pi",
+            "kind": "id",
+            "value": "22222222-2222-4222-8222-222222222222"
+          },
+          "agent_status": "working",
+          "tokens": {
+            "model": "example/model",
+            "provider": "example",
+            "thinking": "high",
+            "context_usage": "43%",
+            "pi_herdsman_session": "22222222-2222-4222-8222-222222222222",
+            "pi_herdsman_role": "researcher",
+            "pi_herdsman_run": "22222222-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "pi_herdsman_parent_session": "11111111-1111-4111-8111-111111111111",
+            "pi_herdsman_state": "blocked"
+          }
+        },
+        {
+          "pane_id": "fixture:p3",
+          "workspace_id": "fixture",
+          "tab_id": "fixture:t2",
+          "agent_session": {
+            "source": "herdr:pi",
+            "agent": "pi",
+            "kind": "id",
+            "value": "33333333-3333-4333-8333-333333333333"
+          },
+          "agent_status": "unknown",
+          "tokens": {
+            "model": "example/model",
+            "provider": "example",
+            "thinking": "high",
+            "context_usage": "43%",
+            "pi_herdsman_session": "33333333-3333-4333-8333-333333333333",
+            "pi_herdsman_role": "worker",
+            "pi_herdsman_run": "33333333-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "pi_herdsman_parent_session": "22222222-2222-4222-8222-222222222222",
+            "pi_herdsman_state": "lost"
+          }
+        }
+      ]
+    },
+    "owner_source_expired": {
+      "agents": [
+        {
+          "pane_id": "fixture:p1",
+          "workspace_id": "fixture",
+          "tab_id": "fixture:t1",
+          "agent_session": {
+            "source": "herdr:pi",
+            "agent": "pi",
+            "kind": "id",
+            "value": "11111111-1111-4111-8111-111111111111"
+          },
+          "agent_status": "working",
+          "tokens": {
+            "model": "example/model",
+            "provider": "example",
+            "thinking": "high",
+            "context_usage": "43%",
+            "pi_herdsman_session": "11111111-1111-4111-8111-111111111111",
+            "pi_herdsman_role": "lead",
+            "anchor": "1",
+            "sort_key": "0001"
+          }
+        },
+        {
+          "pane_id": "fixture:p2",
+          "workspace_id": "fixture",
+          "tab_id": "fixture:t1",
+          "agent_session": {
+            "source": "herdr:pi",
+            "agent": "pi",
+            "kind": "id",
+            "value": "22222222-2222-4222-8222-222222222222"
+          },
+          "agent_status": "working",
+          "tokens": {
+            "model": "example/model",
+            "provider": "example",
+            "thinking": "high",
+            "context_usage": "43%",
+            "pi_herdsman_session": "22222222-2222-4222-8222-222222222222",
+            "pi_herdsman_role": "researcher",
+            "pi_herdsman_run": "22222222-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "pi_herdsman_parent_session": "11111111-1111-4111-8111-111111111111"
+          }
+        },
+        {
+          "pane_id": "fixture:p3",
+          "workspace_id": "fixture",
+          "tab_id": "fixture:t2",
+          "agent_session": {
+            "source": "herdr:pi",
+            "agent": "pi",
+            "kind": "id",
+            "value": "33333333-3333-4333-8333-333333333333"
+          },
+          "agent_status": "unknown",
+          "tokens": {
+            "model": "example/model",
+            "provider": "example",
+            "thinking": "high",
+            "context_usage": "43%",
+            "pi_herdsman_session": "33333333-3333-4333-8333-333333333333",
+            "pi_herdsman_role": "worker",
+            "pi_herdsman_run": "33333333-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "pi_herdsman_parent_session": "22222222-2222-4222-8222-222222222222"
+          }
+        }
+      ],
+      "consumer_fallback": {
+        "fixture:p2": "working",
+        "fixture:p3": "unknown"
+      }
+    }
+  },
+  "kind": "publication input with expected flattened Herdr agent-list projection"
+}

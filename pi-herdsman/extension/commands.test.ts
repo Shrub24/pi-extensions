@@ -1,3 +1,7 @@
+import {
+  OWNER_METADATA_TTL_MS,
+  METADATA_TTL_MS,
+} from "./pane-metadata.ts";
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import {
@@ -3464,7 +3468,12 @@ test("Chief overview redraws after a background refresh", async () => {
   const activeTimers = new Set<object>();
   let intervalCalls = 0;
   let refresh: (() => void) | undefined;
-  globalThis.setInterval = ((callback: TimerHandler) => {
+  globalThis.setInterval = ((callback: TimerHandler, delay?: number) => {
+    if (
+      delay === METADATA_TTL_MS / 2 ||
+      delay === OWNER_METADATA_TTL_MS / 2
+    )
+      return originalSetInterval(callback as () => void, delay);
     refresh = callback as () => void;
     intervalCalls++;
     const timer = { unref: () => undefined };
@@ -3472,7 +3481,7 @@ test("Chief overview redraws after a background refresh", async () => {
     return timer as any;
   }) as typeof setInterval;
   globalThis.clearInterval = ((timer: any) => {
-    activeTimers.delete(timer);
+    if (!activeTimers.delete(timer)) originalClearInterval(timer);
   }) as typeof clearInterval;
   try {
     const harness = await openChiefOverview(true);

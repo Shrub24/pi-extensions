@@ -1,5 +1,7 @@
 # Agent states
 
+[Herdr pane metadata](pane-metadata.md) publishes this projection separately from Herdr's semantic state; Radar owns its presentation.
+
 [Documentation index](../README.md)
 
 The public state is a safe-control projection built from live lifecycle and

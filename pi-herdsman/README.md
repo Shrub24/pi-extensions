@@ -45,6 +45,8 @@ pi install npm:pi-herdsman
 herdr integration install pi
 ```
 
+Remove pi-herdr if installed. Herdsman now owns [pane metadata](docs/reference/pane-metadata.md); the official Herdr integration remains the sole state reporter.
+
 Start herdr in your project, then start Pi inside its pane:
 
 ```sh
