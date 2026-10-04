@@ -8,11 +8,12 @@
     "pi-jev",
     "pi-otel",
     "pi-output-policy",
+    "pi-reqcap",
     "pi-subagents",
     "pi-tool-renderer"
   ],
   "scripts": {
-    "test": "for p in pi-bash-processes pi-tool-renderer pi-otel pi-jev pi-cbmem pi-output-policy; do echo \"== $p\"; (cd $p && bun test) || exit 1; done"
+    "test": "for p in pi-bash-processes pi-tool-renderer pi-otel pi-jev pi-cbmem pi-output-policy pi-reqcap; do echo \"== $p\"; (cd $p && bun test) || exit 1; done"
   },
   "devDependencies": {
     "@gotgenes/pi-permission-system": "^33.0.5",

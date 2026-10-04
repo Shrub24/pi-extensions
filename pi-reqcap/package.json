@@ -1,0 +1,27 @@
+{
+  "name": "pi-reqcap",
+  "version": "0.1.0",
+  "description": "Records and diffs every provider payload Pi sends, and reports which part of the prompt a cache re-bill charged for. Names the changed system section, tools array or message; flags compaction, model and thinking-level changes as causes.",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "diagnostics",
+    "prompt-cache",
+    "cache",
+    "observability"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "bun test ./tests"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
