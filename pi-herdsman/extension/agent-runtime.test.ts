@@ -2108,6 +2108,8 @@ test("startup and completion metadata preserve available model and thinking valu
   );
   assert.ok(active);
   assert.deepEqual(keys(active), expectedKeys);
+  // Herdr rejects a whole report above 16 token keys.
+  assert.ok(keys(active).length <= 16);
   await agent.events.get("agent_settled")![0](undefined, context);
   const laterCalls = agent.calls.slice(callsBeforeSettlement);
   assert.equal(

@@ -44,15 +44,19 @@ Herdsman SHALL NOT publish the same token name from two sources on one pane. The
 
 ### Requirement: Bounded refresh and clearing
 
-Publications SHALL carry a TTL and be refreshed before it elapses while the process lives. Shutdown and session replacement SHALL clear the process's tokens, and a Lead leaving its role SHALL clear its role token. Shutdown SHALL complete only after the clear request has finished or failed. A clear MUST NOT remove tokens owned by another source.
+Publications SHALL carry a TTL and be refreshed before it elapses while the process lives. Shutdown and session replacement SHALL clear the process's tokens, and a Lead leaving its role SHALL clear its role token. Shutdown SHALL complete only after the clear request has finished or failed. Herdr keeps one flat token map per pane in which the latest write to a key wins and a clear removes the key regardless of source, so each token name SHALL have exactly one publisher and Herdsman SHALL clear only names it publishes. A report SHALL carry at most 16 token keys, and Herdsman's names on one pane SHALL leave room within Herdr's 32 retained keys per pane.
 
 #### Scenario: Refresh before expiry
 - **WHEN** a session stays open past half of the TTL without any value change
 - **THEN** its current tokens are republished
 
-#### Scenario: Other source survives
+#### Scenario: Other publishers' names survive
 - **WHEN** a process clears its own tokens at shutdown
-- **THEN** tokens published by other sources on that pane are unaffected
+- **THEN** the request names only token keys that process publishes, so keys published by Radar or others are untouched
+
+#### Scenario: Report size
+- **WHEN** any Herdsman report is built
+- **THEN** it carries at most 16 token keys
 
 ### Requirement: Gating and best-effort delivery
 

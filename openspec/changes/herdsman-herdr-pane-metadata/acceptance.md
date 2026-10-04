@@ -29,7 +29,8 @@ Paths below are relative to `pi-herdsman/extension/`. These checks establish pub
 | Oversized or control text | Same test: Unicode bounds and control-text sanitization. |
 | Worker token set | `agent-runtime.test.ts`: exact idle/active token keys and absence of legacy bare orchestration keys. |
 | Refresh before expiry | `pane-metadata.test.ts`: unchanged metadata refreshes before expiry. |
-| Other source survives | Source-local clear request test; fixture preserves self/native/Radar facts in its expired-owner projection. Live merge: user smoke. |
+| Other publishers' names survive | Clear requests name only the publisher's own keys; fixture preserves self/native/Radar facts in its expired-owner projection. Herdr stores one flat map, so this holds only through disjoint names (design risks). |
+| Report size | `agent-runtime.test.ts` asserts the worker report is at most 16 keys (12 today); the lead report has 9. |
 | Not in Herdr | `extension-contract.test.ts`: managed non-TUI session makes no metadata calls; Herdr/pane gates are explicit in each wiring seam. |
 | Publication failure | Publisher coalescing/outage test and existing worker completion-clear failure/retry tests. |
 | Contract matches behaviour | Fixture consistency test, exact worker token checks, and Radar's accepted mechanical projection check. |
@@ -41,7 +42,7 @@ Paths below are relative to `pi-herdsman/extension/`. These checks establish pub
 | Delegating worker | `controller-lifecycle.test.ts`: parent delegates two same-definition children with exact ownership, including the nested launch environment. Same-workspace placement is enforced in the launch path, as recorded in `implementation.md`. |
 | State change | Existing shared list/status projection supplies the owner token; sibling recovery integration compares published token with listed state. |
 | Worker is lost | Sibling recovery integration removes live worker evidence and verifies `lost`, 30-second TTL and record-removal clear. |
-| Owner crashes | Publisher expiry/refresh constants and source-local shutdown tests; fixture expires the owner slot without removing other sources. Actual crash/expiry: user smoke. |
+| Owner crashes | Publisher expiry/refresh constants and source-local shutdown tests; fixture expires the owner key without removing other publishers' keys. Actual crash/expiry: user smoke. |
 | Semantic state untouched | Owner integration and request-builder test forbid semantic-state reporting; only `pi_herdsman_state` is emitted by the owner. |
 | Non-owned descendant | Owner publication filters exact `ownerSessionId`; nested ownership test establishes the direct owner. No descendant ownership is inferred from visibility. |
 
@@ -50,7 +51,7 @@ Waiting is additive: owner publication forwards the projection string without a 
 ## Remaining user boundaries
 
 - Official integration loaded exactly once in live panes.
-- Two sources writing one pane, source-local clears, and cross-pane writes against actual Herdr.
+- Herdsman, Radar and other publishers writing one pane against actual Herdr. The Radar owner's probe on Herdr 0.9.3 already established the flat-map behaviour, that cross-pane writes by explicit pane id work, and the key limits.
 - Lead, worker, nested worker, loss and owner-expiry presentation in Radar. Sibling/orphan/cycle ordering belongs to Radar consumer tests, not this publisher.
 
 ## Independent review and fixes

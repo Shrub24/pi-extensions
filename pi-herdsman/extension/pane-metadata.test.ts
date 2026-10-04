@@ -135,8 +135,13 @@ test("Radar fixture preserves exact lineage and flattens only live source fields
       const self = pane.metadata.find(
         (slot) => !slot.source.startsWith("pi-herdsman:owner:"),
       );
-      assert.equal(self.tokens.pi_herdsman_session, pane.agent_session.value);
-      assert.equal(pane.agent_session.kind, "id");
+      // The official reporter prefers the session file path, so identity joins on Herdsman's tokens only.
+      assert.equal(pane.agent_session.kind, "path");
+      assert.ok(
+        pane.agent_session.value.endsWith(
+          `${self.tokens.pi_herdsman_session}.jsonl`,
+        ),
+      );
       return [self.tokens.pi_herdsman_session, pane.pane_id];
     }),
   );
