@@ -4,13 +4,15 @@
  *
  * Two facts have to agree, and this module is the one place either is spelled:
  *
- * 1. `tui` declares `bg_task` with exactly `spawn/get/stop/list` and no
+ * 1. `tui` declares `bg_task` with exactly `spawn/get/stop/list/extend` and no
  *    `bg_status`; every other mode — `print`, `json`, `rpc`, and any value this
  *    build does not know — keeps the compatibility surface with the retained
- *    bounded `wait` and the `bg_status` status tool.
+ *    bounded `wait` and the `bg_status` status tool. `extend` is the one action
+ *    the narrowed surface shares with the compatibility one: re-arming a task's
+ *    soft reminder is neither a bounded wait nor a raw-log read.
  * 2. Every text surface that tells the agent or the operator how to inspect a
  *    task may only name operations that surface actually declares. A TUI wake
- *    that says `bg_task log` or `bg_task action:"extend"` names an operation the
+ *    that says `bg_task log` or `bg_task action:"wait"` names an operation the
  *    model cannot call, and a live-log path is not a retrieval route in any mode:
  *    the declared `get` operation is.
  *
@@ -23,7 +25,7 @@
 export type TaskToolSurface = "tui" | "compat";
 
 /** The complete `bg_task` action surface of each mode. */
-export const TUI_BG_TASK_ACTIONS = ["spawn", "get", "stop", "list"] as const;
+export const TUI_BG_TASK_ACTIONS = ["spawn", "get", "stop", "list", "extend"] as const;
 export const COMPAT_BG_TASK_ACTIONS = ["spawn", "list", "log", "get", "stop", "clear", "wait", "extend"] as const;
 
 /**
@@ -62,7 +64,7 @@ export interface TaskSurfaceGuidance {
 	similarRunning: string;
 	/** Wording for a same-command task that finished recently. */
 	recentRerun: (id: string) => string;
-	/** What a soft reminder offers, after inspection and stopping. */
+	/** What a soft reminder offers: continue (optionally re-arming the interval), inspect, or stop. */
 	softReminderChoices: string;
 }
 
@@ -77,7 +79,7 @@ const TUI_GUIDANCE: TaskSurfaceGuidance = {
 	similarRunning: "If this was meant to poll or retry it, bg_task action:\"get\" on the existing task is cheaper.",
 	recentRerun: (id) => `Rerun only what changed (bg_task action:"get" id: "${id}" shows the captured result) unless the code changed since.`,
 	softReminderChoices:
-		'Choose one: let it continue, inspect it with bg_task action:"get", or stop the task with bg_task action:"stop". Nothing was stopped; the exit wake is still armed.',
+		'Choose one: let it continue (it will ask again in the same interval, or re-arm it now with bg_task action:"extend" id:... softTimeoutMs:...), inspect it with bg_task action:"get", or stop the task with bg_task action:"stop". Nothing was stopped; the exit wake is still armed.',
 };
 
 const COMPAT_GUIDANCE: TaskSurfaceGuidance = {
@@ -91,7 +93,7 @@ const COMPAT_GUIDANCE: TaskSurfaceGuidance = {
 	similarRunning: "If this was meant to poll or retry it, bg_task wait on the existing task is cheaper.",
 	recentRerun: (id) => `Rerun only what changed (bg_task log ${id} shows the previous tail) unless the code changed since.`,
 	softReminderChoices:
-		'Choose one: continue (optionally extend with bg_task action:"extend"), inspect it with bg_task action:"get", or stop the task with bg_task action:"stop". Nothing was stopped; the exit wake is still armed.',
+		'Choose one: continue (it will ask again in the same interval, or extend it now with bg_task action:"extend" id:... softTimeoutMs:...), inspect it with bg_task action:"get", or stop the task with bg_task action:"stop". Nothing was stopped; the exit wake is still armed.',
 };
 
 export function taskSurfaceGuidance(surface: TaskToolSurface): TaskSurfaceGuidance {

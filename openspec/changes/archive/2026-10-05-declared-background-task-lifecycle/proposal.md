@@ -12,7 +12,7 @@ Background-task completion is currently acknowledged partly by inferring shell r
 - Make `stop` report confirmed termination or the actual competing outcome, and deliver the result without requiring a subsequent `get`. Keep the same ID and retained output readable.
 - Keep `list` observational: no acknowledgment and no timer reset. Soft reminders measure time since review; hard deadlines remain absolute.
 - Persist completion acknowledgment and reconcile it with deferred wakes and restored snapshots. Cancel extension-held stale notifications; document Pi 0.99.2's lack of selective cancellation for custom messages already queued in Pi.
-- **BREAKING:** stop advertising live log paths, remove inferred-read acknowledgment/PATH read shims, and replace the ordinary interactive log/wait/extend workflow with get/stop/list. Preserve only the explicit legacy child/headless wait compatibility required while the subagent bridge remains deferred.
+- **BREAKING:** stop advertising live log paths, remove inferred-read acknowledgment/PATH read shims, and replace the ordinary interactive log/wait workflow with get/stop/list/extend, where `extend` only re-arms or disables a running task's soft-reminder interval. Preserve only the explicit legacy child/headless wait compatibility required while the subagent bridge remains deferred.
 
 ## Capabilities
 

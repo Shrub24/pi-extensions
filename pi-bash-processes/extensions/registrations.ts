@@ -94,7 +94,8 @@ function bgTaskGuidelines(surface: TaskToolSurface): string[] {
 	if (surface === "tui") {
 		return [
 			shared[0]!,
-			"Use bg_task list/get/stop to inspect or terminate tasks started by bg_task or /bg. get is the task's result, including its readiness and outcome; there is no separate status tool in this mode.",
+			"Use bg_task list/get/stop/extend to inspect, re-arm, or terminate tasks started by bg_task or /bg. get is the task's result, including its readiness and outcome; there is no separate status tool in this mode.",
+			"For a long-running watcher or monitor, set softTimeoutMs generously at spawn (or 0 to disable it); the periodic soft reminder can be re-armed later with bg_task action:\"extend\" id:... softTimeoutMs:....",
 			shared[1]!,
 			"Running is not success. Do not poll: no sleep/tail loops and no repeated list/get calls. Do independent work; if nothing independent remains, finish the turn with a brief waiting status and go idle, and the task's completion wakes the agent in a new turn.",
 			"Use bg_task for pi-bridge, session, tmux, agent/delegate, or log monitoring instead of raw foreground bash polling loops.",
@@ -128,8 +129,8 @@ function bgTaskPromptSnippet(surface: TaskToolSurface): string {
 
 function bgTaskActionDescription(surface: TaskToolSurface): string {
 	return surface === "tui"
-		? "spawn=start a task, get=the task's result (state, outcome, output preview or full immutable output), stop=terminate and return the result, list=show tasks"
-		: "spawn=start a task, list=show tasks, log=raw tail of the captured log, get=the task's result (state, outcome, output preview or full immutable output), stop=terminate and return the result, clear=remove finished tasks, wait=block up to waitSeconds for a task to finish, extend=reset the soft timeout";
+		? "spawn=start a task, get=the task's result (state, outcome, output preview or full immutable output), stop=terminate and return the result, list=show tasks, extend=reset the soft reminder, optionally at a new interval"
+		: "spawn=start a task, list=show tasks, log=raw tail of the captured log, get=the task's result (state, outcome, output preview or full immutable output), stop=terminate and return the result, clear=remove finished tasks, wait=block up to waitSeconds for a task to finish, extend=reset the soft reminder, optionally at a new interval";
 }
 
 /**
@@ -153,7 +154,7 @@ export function bashPromptGuidelines(surface: TaskToolSurface): string[] {
  * serve an action this surface does not declare is not declared either, and no
  * description names an action the caller cannot use. A compatibility caller's
  * schema is therefore unchanged, and the TUI never reads prose about a bounded
- * wait, a raw log action, or a soft-window extension.
+ * wait or a raw log action.
  */
 function bgTaskSchema(surface: TaskToolSurface) {
 	const tui = surface === "tui";
@@ -165,7 +166,7 @@ function bgTaskSchema(surface: TaskToolSurface) {
 		cwd: Type.Optional(Type.String({ description: "Working directory for action=spawn" })),
 		id: Type.Optional(Type.String({
 			description: tui
-				? "Task id for action=get or action=stop."
+				? "Task id for action=get, action=stop, or action=extend."
 				: "Task id for action=log, action=get, action=stop, action=wait, or action=extend. action=wait without an id waits on the oldest running task.",
 		})),
 		notifyOnExit: Type.Optional(Type.Boolean({ description: "Wake the agent when the task exits. Defaults to true." })),
@@ -183,9 +184,7 @@ function bgTaskSchema(surface: TaskToolSurface) {
 		})),
 		timeoutSeconds: Type.Optional(Type.Number({ description: "Hard timeout for spawned tasks. Defaults to 0 (disabled)." })),
 		softTimeoutMs: Type.Optional(Type.Number({
-			description: tui
-				? "Soft progress reminder in milliseconds for action=spawn. Defaults to 600000 (10 minutes); 0 disables it. Soft expiry never stops the process: it asks the agent to continue, inspect, or stop."
-				: "Soft progress reminder in milliseconds for action=spawn or action=extend. Defaults to 600000 (10 minutes); 0 disables it. Soft expiry never stops the process: it asks the agent to continue, inspect, or stop.",
+			description: "Soft progress reminder in milliseconds for action=spawn, or for action=extend to re-arm it later. Set it generously for a long-running task such as a watcher or log monitor, or 0 to disable it. Defaults to 600000 (10 minutes). Soft expiry never stops the process: it asks the agent to continue, inspect, or stop.",
 		})),
 		...(tui
 			? {}

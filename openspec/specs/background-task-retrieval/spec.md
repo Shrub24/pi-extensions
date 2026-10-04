@@ -1,10 +1,9 @@
-# Background task retrieval
+# background-task-retrieval Specification
 
 ## Purpose
-
 Make background shell work observable through session-scoped task handles, declared result retrieval, review reminders, and explicit cancellation, without inferring reads of live log files.
 
-## ADDED Requirements
+## Requirements
 
 ### Requirement: Dispatch returns a task handle without exposing a live log
 
@@ -149,6 +148,11 @@ A configured soft interval SHALL schedule a progress-review wake based on the mo
 - **THEN** the next configured review interval SHALL be armed
 - **AND** a task that has become terminal SHALL receive completion handling instead of a stale running reminder
 
+#### Scenario: The caller re-arms a running review interval
+- **WHEN** a running task's progress review is delivered and the caller re-arms it with a different soft interval
+- **THEN** the next reminder SHALL be measured from that re-arm using the new interval, without stopping the process
+- **AND** the absolute hard deadline SHALL be unchanged, and `0` SHALL disable further reminders for that task
+
 ### Requirement: Hard deadlines remain absolute
 
 The existing `defaultTimeoutSeconds` process timeout and per-task `timeoutSeconds` override SHALL define the absolute hard process-lifetime ceiling; `defaultSoftTimeoutMs` SHALL remain the separate progress-review interval, not a process ceiling. A configured hard timeout SHALL remain an absolute process-lifetime ceiling. Foreground yield, retrieval, listing, output activity, progress reminders, or any legacy soft-reset compatibility path SHALL NOT extend it. A task without a configured hard limit SHALL NOT acquire an invented deadline through retrieval.
@@ -185,7 +189,7 @@ On Pi 0.99.2, the system SHALL NOT clear/reconstruct whole steering or follow-up
 
 ### Requirement: Interactive waiting changes do not break deferred integrations
 
-Ordinary interactive guidance and schema SHALL prefer spawn/get/stop/list and ending the response for native wakes. Existing child/headless/internal wait compatibility SHALL remain usable until the separate pending-work lifecycle bridge is verified. This change SHALL NOT modify pi-subagents lifetime management or remove codemode's existing foreground-only background-task safeguards.
+Ordinary interactive guidance and schema SHALL prefer spawn/get/stop/list/extend and ending the response for native wakes. `extend` SHALL only re-arm or disable a running task's soft progress-reminder interval; it SHALL NOT move a hard deadline. Existing child/headless/internal wait compatibility SHALL remain usable until the separate pending-work lifecycle bridge is verified. This change SHALL NOT modify pi-subagents lifetime management or remove codemode's existing foreground-only background-task safeguards.
 
 #### Scenario: A legacy child needs a shell result before its session closes
 - **WHEN** a current child/headless caller uses the retained bounded wait compatibility path
@@ -200,8 +204,9 @@ Ordinary interactive guidance and schema SHALL prefer spawn/get/stop/list and en
 
 #### Scenario: TUI guidance and tool schema are assembled
 - **WHEN** the session mode is tui
-- **THEN** the effective prompt SHALL recommend independent work followed by end-response waiting for native wakes and bg_task's schema SHALL expose only spawn/get/stop/list
+- **THEN** the effective prompt SHALL recommend independent work followed by end-response waiting for native wakes and bg_task's schema SHALL expose only spawn/get/stop/list/extend
 - **AND** bg_status SHALL NOT be registered in TUI, and neither bg_status nor bg_task action:"wait" SHALL be recommended by the TUI prompt
+- **AND** the TUI `extend` action SHALL re-arm or disable the task's soft progress-reminder interval without changing the absolute hard deadline
 - **AND** the installed shared block SHALL be mode-neutral, with mode-specific waiting instructions supplied through a supported per-session prompt contribution instead of rewriting a shared user instruction file
 
 ### Requirement: Retention protects active work and handed-off output

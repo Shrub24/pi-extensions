@@ -144,7 +144,7 @@ drives genuine root tool calls through the real SDK/sandbox/pipeline with `--no-
 and an explicit `builtin:codemode`.
 
 Surface switch: the factory registers `bg_task` only, and `session_start` declares
-the mode's own surface — `tui` gets exactly `spawn/get/stop/list` and no
+the mode's own surface — `tui` gets exactly `spawn/get/stop/list/extend` and no
 `bg_status`; `print`/`json`/`rpc`/runtime-unknown keep the compatibility set with the
 bounded `wait` and `bg_status`. Re-verified on a fresh Pi 0.99.2 with an isolated
 `PI_CODING_AGENT_DIR`: TUI `getActiveTools()` = `['read','bash','edit','write','codemode','bg_task']`
@@ -157,6 +157,12 @@ stating "There is no bounded wait in this mode"; `json` mode keeps the eight-act
 `extensions/tool-surface.ts` and consumed by the wake, acknowledgement, managed-bash
 running and schema-description producers, so no mode is handed prose for an operation
 it cannot call.
+
+Revision (2026-10-05): `extend` was added back to the TUI surface — the enum is now
+`['spawn','get','stop','list','extend']` — so a TUI caller can re-arm or disable a
+running task's soft-reminder interval instead of only choosing it at spawn. The
+declared surface and the reminder prose are asserted by `tests/tool-surface.test.ts`
+and `tests/tool-surface-tui.test.ts`; `extend` still never moves a hard deadline.
 
 Codemode live gate (previously unevidenced): with `--no-extensions` and an explicit
 `-e builtin:codemode`, a root model call ran `tools.bash` inside the real sandbox and
@@ -175,7 +181,7 @@ are another owner's `pi-tool-renderer/**`.
 
 ## 4. Switch the ordinary interactive surface and remove read inference
 
-- [x] 4.1 Register only bg_task spawn/get/stop/list in TUI and do not register bg_status there; retain noninteractive/child bg_status and bounded wait, routing compatibility list/stop/log through shared list/stop/get. Verify all modes and unknown-mode fallback, required compatibility names/actions, no live-path bypass, and no absent-tool/polling/wait recommendation in the assembled TUI prompt.
+- [x] 4.1 Register only bg_task spawn/get/stop/list/extend in TUI and do not register bg_status there; retain noninteractive/child bg_status and bounded wait, routing compatibility list/stop/log through shared list/stop/get. Verify all modes and unknown-mode fallback, required compatibility names/actions, no live-path bypass, and no absent-tool/polling/wait recommendation in the assembled TUI prompt.
 - [x] 4.2 Remove live-log advertisements from spawn/yield/get/stop/wake text, render/details/activity/dashboard paths, and consumption-related bash environment exports; verify an exact-literal surface audit and fixtures show only task IDs and explicitly handed-off immutable artifacts.
 - [x] 4.3 Remove inferred-read PATH interception and per-process consume-log bookkeeping only after declared CLI acknowledgments pass; verify raw reads of retained snapshot artifacts do not mutate notification state, no legacy inferred-consumption channel is accidentally authoritative, and unrelated PATH/process safety behavior remains intact.
 - [x] 4.4 Retire read-shim replacement/live-path CLI bypasses and the interactive sleep-as-wait path, preserving only named legacy compatibility proven necessary; verify CLI help and old caller compatibility tests route to explicit operations or give actionable migration errors rather than silently bypassing acknowledgment.

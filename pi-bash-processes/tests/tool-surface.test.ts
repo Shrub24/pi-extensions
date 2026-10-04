@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 
 import { applyTaskToolSurface, registerAll, type RegistrationDeps } from "../extensions/registrations.js";
+import { taskSurfaceGuidance } from "../extensions/tool-surface.js";
 import { createToolRegistry, declaredActionEnum, declaredSchemaText } from "./fixtures/tool-surface-harness.js";
 
 // Task 4.1: the declared surface for each session mode.
@@ -102,9 +103,9 @@ test("bg_status is never registered at load, and only the compatibility modes re
 	expect(compat.registry.getAllTools().map((tool) => tool.name).sort()).toStrictEqual(["bg_status", "bg_task"]);
 });
 
-test("the declared action enum is exactly the four TUI actions, and the full set everywhere else", () => {
+test("the declared action enum is exactly the five TUI actions, and the full set everywhere else", () => {
 	const tui = surfaceFor("tui");
-	expect(declaredActionEnum(toolNamed(tui.registry, "bg_task")!)).toStrictEqual(["spawn", "get", "stop", "list"]);
+	expect(declaredActionEnum(toolNamed(tui.registry, "bg_task")!)).toStrictEqual(["spawn", "get", "stop", "list", "extend"]);
 
 	const compat = surfaceFor("print");
 	expect(declaredActionEnum(toolNamed(compat.registry, "bg_task")!)).toStrictEqual([
@@ -156,9 +157,11 @@ test("the TUI prompt never recommends bg_status or the bounded wait, and no mode
 test("the declared parameter schema never names an action the same schema does not declare", () => {
 	const tui = surfaceFor("tui");
 	const tuiSchema = declaredSchemaText(toolNamed(tui.registry, "bg_task")!);
-	for (const absent of ['action=log', 'action=wait', 'action=extend', "action=\"log\"", 'waitSeconds', 'action="wait"', 'action="extend"']) {
+	for (const absent of ['action=log', 'action=wait', "action=\"log\"", 'waitSeconds', 'action="wait"']) {
 		expect(tuiSchema, `the TUI schema must not name ${absent}`).not.toContain(absent);
 	}
+	// `extend` is declared in the TUI now, so its action and its parameter are named.
+	expect(tuiSchema, "the TUI schema names the extend action it declares").toContain("action=extend");
 	// The properties that exist only for those actions are not declared either.
 	expect(tuiSchema, "the TUI schema declares no bounded wait window").not.toContain("taskWaitDefaultSeconds");
 	expect(tuiSchema, "the TUI schema names the actions it does declare").toContain("action=get");
@@ -195,6 +198,18 @@ test("a pre-existing active selection survives the mode surface being applied", 
 	// `setActiveTools` allows; applying the surface must not widen it back.
 	registry.setActiveTools(["bg_task"]);
 	expect(registry.getActiveTools()).toStrictEqual(["bg_task"]);
+});
+
+/**
+ * The soft reminder the TUI now receives names the `extend` lever the surface
+ * declares, so the agent can re-arm the interval instead of only choosing it at
+ * spawn. `wake-events.ts` renders this field, so the wake text and the schema
+ * cannot disagree about the operation that exists.
+ */
+test("the TUI soft reminder offers the extend lever its surface declares", () => {
+	const choices = taskSurfaceGuidance("tui").softReminderChoices;
+	expect(choices).toContain('bg_task action:"extend"');
+	expect(choices, "the reminder states that continuing repeats the same interval").toContain("same interval");
 });
 
 /**
@@ -288,7 +303,7 @@ test("the shipped documents describe the mode surface and the retired mechanisms
 	const changelog = readFileSync(new URL("../CHANGELOG.md", import.meta.url), "utf8");
 
 	// The mode split is stated in the consumer docs and the maintainer notes.
-	expect(readme, "the README states the TUI action set").toContain("`spawn/get/stop/list`");
+	expect(readme, "the README states the TUI action set").toContain("`spawn/get/stop/list/extend`");
 	expect(readme, "the README states the compatibility surface").toContain("`bg_status`");
 	expect(development, "the maintainer notes name the single surface module").toContain("extensions/tool-surface.ts");
 	expect(development, "and say why it is declared at session_start").toContain("never at factory load");

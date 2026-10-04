@@ -21,7 +21,7 @@ Restart Pi after installation. Use `kendex update-pi --check` to preview the ins
 ## Features
 
 - Start, inspect and stop background commands.
-- In the interactive TUI, exactly `bg_task spawn/get/stop/list`: completion arrives as a pushed wake, so no bounded wait and no status tool are declared. Noninteractive and child sessions keep the compatibility surface — the bounded `bg_task wait` (configurable 30s default, 120s maximum) and the `bg_status` status tool — without turning the turn into a polling loop.
+- In the interactive TUI, exactly `bg_task spawn/get/stop/list/extend`: completion arrives as a pushed wake, so no bounded wait and no status tool are declared, and `extend` only re-arms a task's soft reminder. Noninteractive and child sessions keep the compatibility surface — the bounded `bg_task wait` (configurable 30s default, 120s maximum) and the `bg_status` status tool — without turning the turn into a polling loop.
 - Yield unexpectedly slow model-facing Bash commands into managed background tasks after a configurable foreground wait.
 - Notify the agent when a task exits or produces selected output.
 - Read full logs and task history in the dashboard.
@@ -33,7 +33,7 @@ Every model-facing Bash command starts under the task manager. If it finishes wi
 
 ### Soft timeouts: decide at the reminder, not the kill
 
-Every background task has a soft timeout (10 minutes by default; per-spawn `softTimeoutMs`, 0 disables). When it expires the process is **not** stopped: the agent receives exactly one progress wake with elapsed time and the current output tail, and must choose — let it continue (in the compatibility surface, optionally extend with `bg_task action: "extend" id:... softTimeoutMs:...`, which starts a fresh window from now), inspect it with `bg_task get`, or stop the task. The reminder is one-shot and survives restarts; a restored live task re-arms it, a fired one stays fired. The hard `timeoutSeconds` is only a backstop that should rarely fire (default disabled); when both are set, the soft wake also names the remaining hard time so the decision happens long before any kill. Extending never changes the hard timeout.
+Every background task has a soft timeout (10 minutes by default; per-spawn `softTimeoutMs`, 0 disables). When it expires the process is **not** stopped: the agent receives one progress wake per interval with elapsed time and the current output tail, and must choose — let it continue (the next reminder arrives after the same interval), re-arm the interval with `bg_task action: "extend" id:... softTimeoutMs:...` (an omitted `softTimeoutMs` keeps the current interval, `0` disables it), inspect it with `bg_task get`, or stop the task. A delivered reminder is itself a review, so the next interval is measured from it and the reminder repeats while the task runs; the deadline survives restarts, where a restored live task re-arms it and an already-fired one does not replay. The hard `timeoutSeconds` is only a backstop that should rarely fire (default disabled); when both are set, the soft wake also names the remaining hard time so the decision happens long before any kill. Re-arming never changes the hard timeout. Set `softTimeoutMs` generously at spawn for a long-running watcher so the reminder does not interrupt it.
 
 ### The declared CLI: asking a session about its own tasks
 
@@ -104,7 +104,7 @@ The settings editor writes project values to `.pi/settings.json`. The default us
 Open `/extensions:settings`; settings appear under the **Background Tasks** tab. Project settings in `.pi/settings.json` apply only after Pi marks the workspace trusted.
 
 - `enabled`: package toggle; `glyphStyle` picks Unicode or ASCII symbols, and `pi-tool-renderer`'s global override wins when set.
-- Tool surface: the interactive TUI declares `bg_task` (`spawn`, `get`, `stop`, `list`) and no `bg_status`; `print`, `json`, `rpc` and any unrecognized mode keep the compatibility surface (bounded `wait`, `bg_status`). There is nothing to configure — the mode Pi reports decides it.
+- Tool surface: the interactive TUI declares `bg_task` (`spawn`, `get`, `stop`, `list`, `extend`) and no `bg_status`; `print`, `json`, `rpc` and any unrecognized mode keep the compatibility surface (bounded `wait`, `bg_status`). There is nothing to configure — the mode Pi reports decides it.
 - Auto-backgrounding for user `!` Bash: `autoBackgroundBash`, `autoBackgroundPatterns`, `forcedBackgroundWindowSeconds`, `forcedBackgroundNotifyOnOutput`.
 - Execution: `foregroundYieldMs` is the model-facing Bash soft wait; `taskWaitDefaultSeconds` and `taskWaitMaxSeconds` bound one compatibility `bg_task wait` (a TUI session declares no wait at all); `defaultSoftTimeoutMs` is the default soft reminder (10 minutes, 0 disables); `defaultTimeoutSeconds` (hard backstop, default disabled), `forceKillGraceMs`, and the `resourceControl*` group control explicit and auto-background task runtime and resources. Soft waits and soft reminders never kill a process, and resource controls do not wrap ordinary managed Bash commands.
 - Wakes and output: `outputSettleMs`, `outputAlertMaxChars`, `outputWakeBudgetMaxWakes`, `outputWakeBudgetMaxBytes`, `outputBufferMaxChars`, `logTailMaxChars`.
@@ -130,12 +130,12 @@ equivalent — each is fork-only source plus its tests):
   (`sleep-intercept.ts`), and the per-process consume logs are all retired.
 - **Declared tool surface per session mode** (`extensions/tool-surface.ts`) — the
   mode from `session_start` decides the tools and the guidance. The TUI declares
-  `bg_task` with exactly `spawn/get/stop/list` and no `bg_status`; every other
+  `bg_task` with exactly `spawn/get/stop/list/extend` and no `bg_status`; every other
   mode keeps the compatibility surface. Wake, acknowledgement and wake-budget text
   is generated per mode so it never names an operation the model cannot call, and
   the installed append-system block stays mode-neutral.
 - **Soft timeouts** — an advisory per-task reminder that surfaces a decision
-  (extend, stop, let it run) before the hard kill; the "Soft timeouts" section
+  (re-arm its interval, stop, let it run) before the hard kill; the "Soft timeouts" section
   above documents the behaviour.
 - **Configurable task policy** — task retention and auto-background behaviour
   exposed through settings.

@@ -24,11 +24,11 @@ const exitWakesFor = (id: string) =>
 	});
 const taskById = async (id: string) => (await host.listTasks()).find((task) => task.id === id);
 
-test("a TUI session declares bg_task with exactly four actions and never declares bg_status", () => {
+test("a TUI session declares bg_task with exactly five actions and never declares bg_status", () => {
 	const tools = host.allTools();
 	expect(tools.map((tool) => tool.name), "bg_status is absent from the TUI registry, not inactive").not.toContain("bg_status");
 	const bgTask = tools.find((tool) => tool.name === "bg_task");
-	expect(bgTask?.actionEnum, "the declared action enum is the four-action surface").toStrictEqual(["spawn", "get", "stop", "list"]);
+	expect(bgTask?.actionEnum, "the declared action enum is the five-action surface").toStrictEqual(["spawn", "get", "stop", "list", "extend"]);
 	expect(host.activeTools(), "the declared surface is what the model is given").toContain("bg_task");
 	expect(host.activeTools(), "no status tool is declared to the model either").not.toContain("bg_status");
 });
