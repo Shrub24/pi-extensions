@@ -14,6 +14,7 @@ import type {
 } from "./mailbox.ts";
 import { claimProcessLock } from "./lock.ts";
 import { resultPath, resultRef } from "./storage.ts";
+import { IDLE_WAKE_PROMPT } from "./idle-wake.ts";
 import support, {
   CHILD_SESSION_ID,
   DEFAULT_PI_SESSION_ID,
@@ -1373,7 +1374,7 @@ test("recovery requires the official session and retries one failed delivery", a
   assert.equal(successful, 1);
   for (let index = 0; index < 5; index++)
     await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.equal(recovering.sentUsers.length, 0);
+  assert.deepEqual(recovering.sentUsers, [IDLE_WAKE_PROMPT]);
   assert.match(
     delivered,
     new RegExp(

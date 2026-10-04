@@ -2837,10 +2837,7 @@ test("parent settlement waits for agent delivery and ignores result cleanup lag"
       (pi.sentMessageCalls[0].message as any).customType,
       "pi-herdsman-agent-result",
     );
-    assert.deepEqual(pi.sentMessageCalls[0].options, {
-      triggerTurn: true,
-      deliverAs: "steer",
-    });
+    assert.deepEqual(pi.sentMessageCalls[0].options, {});
     assert.match(
       String((pi.sentMessageCalls[0].message as any).content),
       /Delegation status:/,
@@ -2889,7 +2886,7 @@ test("parent settlement waits for agent delivery and ignores result cleanup lag"
       [
         {
           customType: "pi-herdsman-agent-result",
-          options: { triggerTurn: true, deliverAs: "steer" },
+          options: {},
         },
       ],
     );
@@ -4764,9 +4761,7 @@ test("owner ask delivery is branch-local and recovers on tree navigation", async
   branch.length = 0;
   pi.events.get("session_tree")![0](undefined, context);
   assert.equal(pi.sent.length, 2);
-  assert.deepEqual(pi.sentMessageCalls[0]?.options, {
-    triggerTurn: true,
-  });
+  assert.deepEqual(pi.sentMessageCalls[0]?.options, {});
   fireShutdown(pi);
   resetAgentMailbox(mailbox);
 });
@@ -4884,7 +4879,7 @@ test("owner ask waits while busy and delivers once after settlement", async () =
       ).length,
       1,
     );
-    assert.deepEqual(pi.sentMessageCalls[0]?.options, { triggerTurn: true });
+    assert.deepEqual(pi.sentMessageCalls[0]?.options, {});
   } finally {
     fireShutdown(pi);
     resetAgentMailbox(mailbox);

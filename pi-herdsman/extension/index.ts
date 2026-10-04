@@ -256,6 +256,7 @@ import {
   validByteLimit,
   validSoftTimeout,
 } from "./config.ts";
+import { sendWakeMessage } from "./idle-wake.ts";
 
 import {
   collapseDisplayText,
@@ -3767,7 +3768,9 @@ async function deliverResultUnsafe(
       `session=${runtime.piSessionId ?? "?"}`,
       `status=${result.status}`,
     ].join(" · ");
-    pi.sendMessage(
+    sendWakeMessage(
+      pi,
+      ctx,
       {
         customType: "pi-herdsman-agent-result",
         content: [
@@ -4311,7 +4314,9 @@ function deliverAskUnsafe(
   if (hasDeliveredAsk(entries, ask)) return true;
   // Delivery completion is observed from the session branch; synchronous
   // Message failures are retryable, and ask.json remains the durable anchor.
-  pi.sendMessage(
+  sendWakeMessage(
+    pi,
+    ctx,
     {
       customType: "pi-herdsman-agent-ask",
       content: `Agent ${ask.agentLabel} needs your input:\n\n${ask.question}\n\nUse agent_reply with agent="${ask.agentLabel}" to answer this question.`,
@@ -8442,7 +8447,9 @@ export default function (pi: ExtensionAPI): void {
           stillAssigned.id !== assignment.id
         )
           return 0;
-        await pi.sendMessage(
+        await sendWakeMessage(
+          pi,
+          ctx,
           {
             customType: "pi-herdsman-project_message",
             content: `Project ${record.branch} from lead ${record.fromSessionId}:\n\n${record.text}`,
@@ -9113,13 +9120,17 @@ export default function (pi: ExtensionAPI): void {
               throw new Error(
                 "Coordination delivery deferred while recipient is active",
               );
-            const result = await pi.sendMessage(message, options);
+            await sendWakeMessage(
+              pi,
+              ctx,
+              message as Parameters<ExtensionAPI["sendMessage"]>[0],
+              options,
+            );
             if (projectAssignment)
               managerDiagnostic("project_assignment_send", {
                 outcome: "resolved",
                 triggerTurn: options?.triggerTurn === true,
               });
-            return result;
           } catch (error) {
             managerDiagnostic("inbox_catch", { category: "send" });
             if (projectAssignment)
@@ -13848,7 +13859,9 @@ export default function (pi: ExtensionAPI): void {
       try {
         if (signal.aborted || !ctx.isIdle()) return false;
         const closeAvailable = availableActions.includes("close");
-        pi.sendMessage(
+        sendWakeMessage(
+          pi,
+          ctx,
           {
             customType: "pi-herdsman-agent-lost",
             content: [
@@ -13946,7 +13959,9 @@ export default function (pi: ExtensionAPI): void {
             continue;
           try {
             if (!ctx.isIdle()) continue;
-            pi.sendMessage(
+            sendWakeMessage(
+              pi,
+              ctx,
               {
                 customType: "pi-herdsman-agent-attention",
                 content: [
@@ -14002,7 +14017,9 @@ export default function (pi: ExtensionAPI): void {
           if (!current || !ctx.isIdle()) continue;
           try {
             if (!ctx.isIdle()) continue;
-            pi.sendMessage(
+            sendWakeMessage(
+              pi,
+              ctx,
               {
                 customType: "pi-herdsman-agent-attention",
                 content: [
@@ -14071,7 +14088,9 @@ export default function (pi: ExtensionAPI): void {
               )
                 continue;
               if (!ctx.isIdle()) continue;
-              pi.sendMessage(
+              sendWakeMessage(
+                pi,
+                ctx,
                 {
                   customType: "pi-herdsman-agent-ask",
                   content: [
@@ -14126,7 +14145,9 @@ export default function (pi: ExtensionAPI): void {
             continue;
           try {
             if (!ctx.isIdle()) continue;
-            pi.sendMessage(
+            sendWakeMessage(
+              pi,
+              ctx,
               {
                 customType: "pi-herdsman-agent-attention",
                 content: [
@@ -14191,7 +14212,9 @@ export default function (pi: ExtensionAPI): void {
               !ctx.isIdle()
             )
               continue;
-            pi.sendMessage(
+            sendWakeMessage(
+              pi,
+              ctx,
               {
                 customType: "pi-herdsman-agent-attention",
                 content: [
@@ -14374,7 +14397,9 @@ export default function (pi: ExtensionAPI): void {
             !ctx.isIdle()
           )
             return;
-          pi.sendMessage(
+          sendWakeMessage(
+            pi,
+            ctx,
             {
               customType: "pi-herdsman-agent-stale",
               content: [
@@ -14506,7 +14531,9 @@ export default function (pi: ExtensionAPI): void {
           ? actions.map((action) => `agent_${String(action)}`).join(", ")
           : "none";
       try {
-        pi.sendMessage(
+        sendWakeMessage(
+          pi,
+          ctx,
           {
             customType: SOFT_DEADLINE_MESSAGE,
             content: [
@@ -15081,7 +15108,9 @@ export default function (pi: ExtensionAPI): void {
             !assignGuidanceSent
           ) {
             try {
-              pi.sendMessage(
+              sendWakeMessage(
+                pi,
+                ctx,
                 {
                   customType: "pi-herdsman-delegation-guidance",
                   content: `${AGENT_EXECUTION_OWNERSHIP_GUIDANCE} ${AGENT_UNRESOLVED_GUIDANCE}`,
