@@ -62,10 +62,14 @@ export interface ExtensionHost {
 	tools: Map<string, HostTool>;
 	/** Every `pi.sendMessage` call, wakes included. */
 	messages: unknown[][];
+	/** Every `pi.sendUserMessage` call: an idle wake started through the prompt lifecycle. */
+	userMessages: unknown[][];
 	/** Every `pi.appendEntry` call: the extension's persisted state. */
 	entries: unknown[];
 	/** The handler results of one `agent_settled` boundary. */
 	settle(): Promise<unknown[]>;
+	/** What `ctx.isIdle()` answers from now on, for idle-versus-busy delivery controls. */
+	setIdle(isIdle: () => boolean): void;
 	dispatch(event: string, payload?: unknown): Promise<unknown[]>;
 	/** `bg_task list` tasks, as the model would see them. */
 	listTasks(): Promise<Record<string, any>[]>;
@@ -112,6 +116,8 @@ export interface ExtensionHostOptions {
 	activeTools?: string[];
 	/** An explicit tool exclusion, as a configured `disabledTools` entry supplies. */
 	excludedTools?: string[];
+	/** What `ctx.isIdle()` answers. Default: true, so a wake takes the idle path. */
+	isIdle?: () => boolean;
 	/**
 	 * Extra `kendex.extensionManager.config` entries, by package id. The intent
 	 * argument's mode is read by `pi-tool-renderer` from its own package config,
@@ -175,6 +181,8 @@ export async function startExtensionHost(options: ExtensionHostOptions = {}): Pr
 	const handlers = new Map<string, ((event: unknown, ctx: ExtensionContext) => unknown)[]>();
 	const tools = new Map<string, HostTool>();
 	const messages: unknown[][] = [];
+	const userMessages: unknown[][] = [];
+	let idleFn: () => boolean = options.isIdle ?? (() => true);
 	const entries: unknown[] = [];
 	const notifications: unknown[][] = [];
 	const entriesForBranch: unknown[] = [];
@@ -182,7 +190,7 @@ export async function startExtensionHost(options: ExtensionHostOptions = {}): Pr
 		cwd,
 		hasUI: false,
 		mode: options.mode ?? "print",
-		isIdle: () => true,
+		isIdle: () => idleFn(),
 		isProjectTrusted: () => true,
 		hasPendingMessages: () => false,
 		signal: undefined,
@@ -230,6 +238,7 @@ export async function startExtensionHost(options: ExtensionHostOptions = {}): Pr
 			entriesForBranch.push(entry);
 		},
 		sendMessage: (...args: unknown[]) => messages.push(args),
+		sendUserMessage: (...args: unknown[]) => userMessages.push(args),
 		events: { on: () => () => {} },
 	} as unknown as ExtensionAPI;
 
@@ -264,8 +273,12 @@ export async function startExtensionHost(options: ExtensionHostOptions = {}): Pr
 		ctx,
 		tools,
 		messages,
+		userMessages,
 		entries,
 		settle: () => dispatch("agent_settled"),
+		setIdle: (isIdle: () => boolean) => {
+			idleFn = isIdle;
+		},
 		dispatch,
 		listTasks: readTasks,
 		activeTools: () => registry.getActiveTools(),

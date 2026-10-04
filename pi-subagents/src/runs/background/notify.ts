@@ -8,7 +8,7 @@
 
 import { statSync } from "node:fs";
 import { debuglog } from "node:util";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { buildCompletionKey, markSeenWithTtl } from "./completion-dedupe.ts";
 import {
 	type CompletionBatchConfig,
@@ -20,6 +20,7 @@ import { SUBAGENT_ASYNC_COMPLETE_EVENT, SUBAGENT_FOREGROUND_COMPLETE_EVENT, type
 import { safeTerminalText } from "../../shared/display-text.ts";
 import { resolveSubagentResultStatus } from "../../intercom/result-intercom.ts";
 import { isUnexplainedProcessSignal } from "../shared/process-signal.ts";
+import { sendIdleWake } from "../shared/idle-wake.ts";
 import type { ResultDeliveryOwnership } from "./result-delivery-ownership.ts";
 
 export interface SubagentNotifyChildOutput {
@@ -594,20 +595,23 @@ const processGlobal = globalThis as typeof globalThis & { [completionSendRegistr
 const processCompletionSendRegistry = processGlobal[completionSendRegistrySymbol]
 	?? (processGlobal[completionSendRegistrySymbol] = createCompletionSendRegistry());
 
-function sendCompletion(pi: Pick<ExtensionAPI, "sendMessage">, items: PendingCompletion[]): boolean {
+function sendCompletion(
+	pi: Pick<ExtensionAPI, "sendMessage">,
+	context: ExtensionContext | null | undefined,
+	items: PendingCompletion[],
+): boolean {
 	if (items.length === 0) return true;
 	const details = items.map((item) => item.details);
 	const content = details.length === 1 ? formatSingleCompletion(details[0]!) : formatGroupedCompletion(details);
 	const display = details.some((detail) => detail.source === "foreground" || detail.status !== "completed" || detail.scheduleOrigin !== undefined);
+	const message = {
+		customType: "subagent-notify",
+		content,
+		display,
+	};
 	try {
-		pi.sendMessage(
-			{
-				customType: "subagent-notify",
-				content,
-				display,
-			},
-			{ triggerTurn: items.some((item) => item.triggerTurn) },
-		);
+		if (items.some((item) => item.triggerTurn)) sendIdleWake(pi, context, message, { triggerTurn: true });
+		else pi.sendMessage(message, { triggerTurn: false });
 		return true;
 	} catch {
 		return false;
@@ -759,7 +763,7 @@ export function buildCompletionDetails(result: CompletionNotification): Subagent
 
 export default function registerSubagentNotify(
 	pi: ExtensionAPI,
-	state: Pick<SubagentState, "currentSessionId" | "completionOwnerId">,
+	state: Pick<SubagentState, "currentSessionId" | "completionOwnerId" | "lastUiContext">,
 	options: RegisterSubagentNotifyOptions = {},
 ): CompletionNotifier {
 	const seen = new Map<string, number>();
@@ -805,7 +809,7 @@ export default function registerSubagentNotify(
 			void claim.outcome.then((outcome) => settle([item], outcome, outcome ? undefined : "send_failed"));
 		}
 		const claimedItems = claimed.map(({ item }) => item);
-		const sent = sendCompletion(pi, claimedItems);
+		const sent = sendCompletion(pi, state.lastUiContext, claimedItems);
 		for (const { claim } of claimed) claim.settle?.(sent);
 		settle(claimedItems, sent, sent ? "send_accepted" : "send_failed");
 	};

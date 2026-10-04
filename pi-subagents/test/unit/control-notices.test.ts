@@ -114,3 +114,55 @@ describe("subagent control notice delivery", () => {
 		assert.deepEqual(visible, []);
 	});
 });
+
+describe("subagent control notice idle wake", () => {
+	function makeWakeRecorder() {
+		const sent: Array<{ message: unknown; options: unknown }> = [];
+		const userMessages: string[] = [];
+		return {
+			sent,
+			userMessages,
+			pi: {
+				sendMessage(message: unknown, options: unknown) {
+					sent.push({ message, options });
+				},
+				sendUserMessage(content: string) {
+					userMessages.push(content);
+				},
+			},
+		};
+	}
+
+	it("starts an idle session's control wake through the prompt lifecycle", () => {
+		const state = makeState();
+		(state as { lastUiContext: unknown }).lastUiContext = { isIdle: () => true };
+		const rec = makeWakeRecorder();
+
+		handleSubagentControlNotice({
+			pi: rec.pi,
+			state,
+			visibleControlNotices: new Set(),
+			details: { source: "async", event: needsAttentionEvent() },
+		});
+
+		assert.equal(rec.sent.length, 1);
+		assert.deepEqual(rec.sent[0]?.options, {});
+		assert.deepEqual(rec.userMessages, ["New subagent notification above."]);
+	});
+
+	it("keeps the busy trigger delivery for a streaming session", () => {
+		const state = makeState();
+		(state as { lastUiContext: unknown }).lastUiContext = { isIdle: () => false };
+		const rec = makeWakeRecorder();
+
+		handleSubagentControlNotice({
+			pi: rec.pi,
+			state,
+			visibleControlNotices: new Set(),
+			details: { source: "async", event: needsAttentionEvent() },
+		});
+
+		assert.deepEqual(rec.sent[0]?.options, { triggerTurn: true });
+		assert.deepEqual(rec.userMessages, []);
+	});
+});

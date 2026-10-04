@@ -356,12 +356,52 @@ test("a long-running notice is checked in on, and the finding wakes the orchestr
 	expect(state.child_work?.role?.name).toBe("reviewer");
 
 	// The finding is delivered as a wake, not a steer: an idle orchestrator has
-	// no tool batch for a steer to land after.
+	// no tool batch for a steer to land after. The nudge is appended without a
+	// trigger and a short user prompt starts the run, so the wake goes through
+	// the prompt lifecycle (`before_agent_start`) instead of `triggerTurn`,
+	// which would start an unprepared run (pi#5581, #10267).
 	expect(host.sent).toHaveLength(1);
 	const sent = host.sent[0] as { message?: { content?: string }; options?: { deliverAs?: string; triggerTurn?: boolean } };
+	expect(sent.options).toBeUndefined();
+	expect(host.userSent).toHaveLength(1);
+	expect((host.userSent[0] as { message?: unknown }).message).toContain("nudge above");
+	expect(sent.message?.content).toContain("orchestrator.intent_alignment");
+});
+
+test("a busy orchestrator is steered, not woken through a user prompt", async () => {
+	// The mirror of the wake above: the same finding while a turn runs must keep
+	// its steer, since a `sendUserMessage` there would queue a second turn and
+	// the running run already carries prepared system-prompt options.
+	const host = fakeHost({ branch: branchWith({ instruction: "fix the parser" }), isIdle: () => false });
+	const jev = fakeJevClient({
+		"orchestrator.intent_alignment": noul(0.05),
+		"agent.role_adherence": noul(0.05),
+	});
+	wireIntentConsumer(host.pi, {
+		config: testConfig({ mode: "shadow", deliverSubagentNudges: true, orchestratorCheckInMs: 3_600_000 }),
+		log: fakeLog(),
+		jev: jev as never,
+		now: () => new Date("2026-09-19T00:00:00.000Z"),
+		policy: { preferences: [], margin: 0.2 },
+	});
+	await host.sessionStart("s1");
+	host.setBranch([
+		...branchWith({ instruction: "fix the parser" }),
+		{
+			type: "custom_message",
+			customType: "subagent_control_notice",
+			id: "n1",
+			content: "Subagent active but long-running: reviewer\nRun: bg-1 step 1\nSignal: reviewer is still active but long-running",
+		},
+	]);
+	await host.fire("agent_settled");
+	await new Promise((resolve) => setTimeout(resolve, 0));
+
+	expect(host.sent).toHaveLength(1);
+	const sent = host.sent[0] as { options?: { deliverAs?: string; triggerTurn?: boolean } };
 	expect(sent.options?.deliverAs).toBe("followUp");
 	expect(sent.options?.triggerTurn).toBe(true);
-	expect(sent.message?.content).toContain("orchestrator.intent_alignment");
+	expect(host.userSent).toHaveLength(0);
 });
 
 test("a notice is checked in on once, and a clean reading wakes nobody", async () => {

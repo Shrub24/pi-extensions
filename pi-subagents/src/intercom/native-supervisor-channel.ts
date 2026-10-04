@@ -5,6 +5,7 @@ import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { ChildSupervisorMetadata } from "../runs/shared/child-runtime-config.ts";
+import { sendIdleWake } from "../runs/shared/idle-wake.ts";
 import { INTERCOM_DETACH_REQUEST_EVENT, POLL_INTERVAL_MS, TEMP_ROOT_DIR, type ControlEvent, type IntercomEventBus, type SubagentState } from "../shared/types.ts";
 import { writeAtomicJson } from "../shared/atomic-json.ts";
 import { shouldUseNativeFsWatch } from "../shared/watch-strategy.ts";
@@ -755,7 +756,7 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 			// The ask is already queued above. A sendMessage failure (no UI, stale context) must not
 			// lose it, and must not abort the loop before the remaining asks register.
 			try {
-				pi.sendMessage({
+				sendIdleWake(pi, state.lastUiContext, {
 					customType: SUPERVISOR_REQUEST_MESSAGE_TYPE,
 					content: requestVisibleText(request),
 					display: true,

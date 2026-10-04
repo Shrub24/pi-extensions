@@ -16,6 +16,8 @@ export interface HostOptions {
 	branch?: readonly unknown[];
 	/** Tools `getAllTools()` reports, for the toolbox line. */
 	tools?: readonly { name: string; description?: string }[];
+	/** What `ctx.isIdle()` answers. Default: idle, the orchestrator's usual state. */
+	isIdle?: () => boolean;
 }
 
 export function fakeHost(options: HostOptions = {}) {
@@ -68,6 +70,7 @@ export function fakeHost(options: HostOptions = {}) {
 				getBranch: () => branch,
 			},
 			ui: { notify: (message: string, level?: string) => notices.push({ message, level }) },
+			isIdle: options.isIdle ?? (() => true),
 		}) as unknown as ExtensionContext;
 
 	return {

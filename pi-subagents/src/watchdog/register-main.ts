@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { resolveEffectiveThinking, splitKnownThinkingSuffix, THINKING_LEVELS, type ThinkingLevel } from "../shared/model-info.ts";
+import { sendIdleWake } from "../runs/shared/idle-wake.ts";
 import { SLASH_TEXT_RESULT_TYPE } from "../shared/types.ts";
 import { startWatchdogDiffBaselineCapture, type WatchdogDiffBaseline } from "./diff-tool.ts";
 import { formatWatchdogRecommendation, recommendWatchdogModel, resolveWatchdogModelInput, parseWatchdogThinkingInput } from "./model-selection.ts";
@@ -382,7 +383,7 @@ export function registerMainWatchdog(pi: ExtensionAPI, options: RegisterMainWatc
 		reviewChangesOnly: true,
 		displayWarning: (details, options) => pi.sendMessage(createWatchdogWarningMessage(details, { display: true, details }), options),
 		displayUserWarning: (details) => pi.appendEntry(SUBAGENT_WATCHDOG_WARNING_TYPE, details),
-		displayClarification: (content) => pi.sendMessage({ customType: "subagent_watchdog_clarification", content, display: true }, { deliverAs: "steer", triggerTurn: true }),
+		displayClarification: (content) => sendIdleWake(pi, currentContext, { customType: "subagent_watchdog_clarification", content, display: true }, { deliverAs: "steer", triggerTurn: true }),
 	});
 
 	pi.registerMessageRenderer<WatchdogWarningDetails>(SUBAGENT_WATCHDOG_WARNING_TYPE, (message, renderOptions, theme) => {

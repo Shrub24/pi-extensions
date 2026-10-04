@@ -386,7 +386,7 @@ export function wireIntentConsumer(pi: ExtensionAPI, deps: IntentDeps = {}): voi
 		if (wake && config.deliverSubagentNudges) {
 			// One wake for the whole scan: every message here is a turn the
 			// orchestrator spends, and its findings read as one paragraph anyway.
-			deliverNudges(pi, [wake], { mode: "followUp", triggerTurn: true });
+			deliverNudges(pi, [wake], { mode: "followUp", triggerTurn: true, isIdle: () => ctx?.isIdle() === true });
 		}
 	};
 

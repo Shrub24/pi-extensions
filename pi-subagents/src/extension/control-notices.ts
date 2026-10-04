@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { sendIdleWake } from "../runs/shared/idle-wake.ts";
 import { controlNotificationKey, formatControlNoticeMessage } from "../runs/shared/subagent-control.ts";
 import type { ControlEvent, SubagentState } from "../shared/types.ts";
 
@@ -23,7 +24,8 @@ export function formatSubagentControlNotice(details: SubagentControlMessageDetai
 }
 
 function deliverControlNotice(input: {
-	pi: Pick<ExtensionAPI, "sendMessage">;
+	pi: Pick<ExtensionAPI, "sendMessage" | "sendUserMessage">;
+	state: Pick<SubagentState, "lastUiContext">;
 	visibleControlNotices: Set<string>;
 	details: SubagentControlMessageDetails;
 }): void {
@@ -32,19 +34,18 @@ function deliverControlNotice(input: {
 	if (input.visibleControlNotices.has(key)) return;
 	input.visibleControlNotices.add(key);
 	const noticeText = input.details.noticeText ?? formatControlNoticeMessage(input.details.event, childIntercomTarget);
-	input.pi.sendMessage(
-		{
-			customType: SUBAGENT_CONTROL_MESSAGE_TYPE,
-			content: noticeText,
-			display: true,
-			details: { ...input.details, childIntercomTarget, noticeText },
-		},
-		{ triggerTurn: input.details.source === "async" },
-	);
+	const message = {
+		customType: SUBAGENT_CONTROL_MESSAGE_TYPE,
+		content: noticeText,
+		display: true,
+		details: { ...input.details, childIntercomTarget, noticeText },
+	};
+	if (input.details.source === "async") sendIdleWake(input.pi, input.state.lastUiContext, message, { triggerTurn: true });
+	else input.pi.sendMessage(message, { triggerTurn: false });
 }
 
 export function handleSubagentControlNotice(input: {
-	pi: Pick<ExtensionAPI, "sendMessage">;
+	pi: Pick<ExtensionAPI, "sendMessage" | "sendUserMessage">;
 	state: SubagentState;
 	visibleControlNotices: Set<string>;
 	details: SubagentControlMessageDetails;

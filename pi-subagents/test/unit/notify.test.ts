@@ -1223,3 +1223,52 @@ describe("watchdog blockers in completion notices", () => {
 
 	});
 });
+
+describe("completion notify idle wake", () => {
+	function createWakeRecorder() {
+		const sent: Array<{ message: unknown; options: unknown }> = [];
+		const userMessages: string[] = [];
+		return {
+			sent,
+			userMessages,
+			pi: {
+				events: createEventBus(),
+				sendMessage(message: unknown, options: unknown) {
+					sent.push({ message, options });
+				},
+				sendUserMessage(content: string) {
+					userMessages.push(content);
+				},
+			},
+		};
+	}
+
+	function wakeState(isIdle: boolean) {
+		return { currentSessionId: "session-a", completionOwnerId: COMPLETION_OWNER_ID, lastUiContext: { isIdle: () => isIdle } } as never;
+	}
+
+	it("starts an idle session's completion run through the prompt lifecycle", async () => {
+		const rec = createWakeRecorder();
+		const notifier = registerSubagentNotify(rec.pi as never, wakeState(true), { batchConfig: { enabled: false }, sendRegistry: createCompletionSendRegistry() });
+		try {
+			assert.equal(await notifier.deliver(completionResult({ id: "idle-wake", sessionId: "session-a" })), true);
+			assert.equal(rec.sent.length, 1);
+			assert.deepEqual(rec.sent[0]?.options, {});
+			assert.deepEqual(rec.userMessages, ["New subagent notification above."]);
+		} finally {
+			notifier.dispose();
+		}
+	});
+
+	it("keeps the busy trigger delivery for a streaming session", async () => {
+		const rec = createWakeRecorder();
+		const notifier = registerSubagentNotify(rec.pi as never, wakeState(false), { batchConfig: { enabled: false }, sendRegistry: createCompletionSendRegistry() });
+		try {
+			assert.equal(await notifier.deliver(completionResult({ id: "busy-wake", sessionId: "session-a" })), true);
+			assert.deepEqual(rec.sent[0]?.options, { triggerTurn: true });
+			assert.deepEqual(rec.userMessages, []);
+		} finally {
+			notifier.dispose();
+		}
+	});
+});

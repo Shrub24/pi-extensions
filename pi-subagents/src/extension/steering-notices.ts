@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { sendIdleWake } from "../runs/shared/idle-wake.ts";
 import type { SteeringNotice, SubagentState } from "../shared/types.ts";
 
 export const SUBAGENT_STEERING_MESSAGE_TYPE = "subagent_steering_notice";
@@ -19,14 +20,14 @@ export function formatSteeringNotice(details: Pick<SubagentSteeringMessageDetail
 }
 
 export function handleSubagentSteeringNotice(input: {
-	pi: Pick<ExtensionAPI, "sendMessage">;
+	pi: Pick<ExtensionAPI, "sendMessage" | "sendUserMessage">;
 	state: SubagentState;
 	details: SubagentSteeringMessageDetails;
 }): void {
 	if (!input.details || (input.details.state !== "failed" && input.details.state !== "partial" && input.details.state !== "recovered")) return;
 	if (!input.state.currentSessionId || input.details.currentSessionId !== input.state.currentSessionId) return;
 	const noticeText = input.details.noticeText ?? formatSteeringNotice(input.details);
-	input.pi.sendMessage({
+	sendIdleWake(input.pi, input.state.lastUiContext, {
 		customType: SUBAGENT_STEERING_MESSAGE_TYPE,
 		content: noticeText,
 		display: true,

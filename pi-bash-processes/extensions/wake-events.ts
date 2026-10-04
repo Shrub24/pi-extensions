@@ -326,6 +326,47 @@ export function noteOutputWakeSent(task: ManagedTask): void {
 	}
 }
 
+/**
+ * The delivery a wake uses, so one place decides how an idle run starts.
+ *
+ * A run started by `triggerTurn` skips `before_agent_start` (pi#5581, #10267):
+ * the run is never prepared with the system-prompt options every extension
+ * contributed, so its second request rebuilds the prompt from base options,
+ * drops those sections mid-run and re-bills the whole prompt. An idle session is
+ * therefore woken by a short user prompt, which runs the normal prompt
+ * lifecycle; a busy session keeps its steer, and that run already carries
+ * prepared options.
+ */
+export interface WakeSend {
+	sendMessage: (message: Record<string, unknown>, options: Record<string, unknown>) => void;
+	/** Whether the session is idle right now. Absent means unknown. */
+	isIdle?: () => boolean;
+	/** Starts an idle run through the prompt lifecycle. Absent keeps `triggerTurn`. */
+	sendUserMessage?: (content: string) => void;
+}
+
+/**
+ * The short prompt that starts an idle session's run. It carries no content —
+ * the wake is the custom message above it — it only routes the wake through
+ * `prompt()` so the run is prepared like a user turn.
+ */
+const IDLE_WAKE_PROMPT = "New background task notification above.";
+
+/** Send one wake, through the prompt lifecycle when the session is idle. */
+export function deliverWakeMessage(
+	deps: WakeSend,
+	message: Record<string, unknown>,
+	busyOptions: Record<string, unknown>,
+): void {
+	if (deps.isIdle?.() === true && typeof deps.sendUserMessage === "function") {
+		// Append without a trigger; the user prompt below starts the run.
+		deps.sendMessage(message, {});
+		deps.sendUserMessage(IDLE_WAKE_PROMPT);
+		return;
+	}
+	deps.sendMessage(message, busyOptions);
+}
+
 export interface SendTaskWakeDeps {
 	isShuttingDown: () => boolean;
 	logDiagnostic: (diagnostic: WakeDiagnostic) => void;
@@ -344,6 +385,10 @@ export interface SendTaskWakeDeps {
 	outputTail: (task: ManagedTask) => string;
 	rememberSnapshot: (task: ManagedTask) => BackgroundTaskSnapshot;
 	sendMessage: (message: Record<string, unknown>, options: Record<string, unknown>) => void;
+	/** Whether the session is idle right now. Absent means unknown. */
+	isIdle?: () => boolean;
+	/** Starts an idle run through the prompt lifecycle. Absent keeps `triggerTurn`. */
+	sendUserMessage?: (content: string) => void;
 	/** Optional one-line inventory of other still-running tasks, appended to the wake text. */
 	runningInventory?: () => string;
 }
@@ -516,7 +561,7 @@ export function sendTaskWake(
 			...(hardRemaining != null ? [`Hard timeout backstop: about ${formatElapsed(hardRemaining)} remaining; it will kill the task if you let it lapse.`] : []),
 			guidance.softReminderChoices,
 		].join("\n");
-		deps.sendMessage({
+		deliverWakeMessage(deps, {
 			content,
 			customType: deps.messageType,
 			details,
@@ -599,7 +644,8 @@ export function sendTaskWake(
 	const inventory = deps.runningInventory?.();
 	const commandPreview = truncateField(task.command, WAKE_CONTENT_COMMAND_MAX_CHARS) ?? "";
 
-	deps.sendMessage(
+	deliverWakeMessage(
+		deps,
 		{
 			content: `${headline}\nCommand: ${commandPreview}${exitGuidance}${inventory ? `\n${inventory}` : ""}`,
 			customType: deps.messageType,
@@ -623,6 +669,10 @@ export interface SendBudgetExhaustedNoticeDeps {
 	now?: () => number;
 	rememberSnapshot: (task: ManagedTask) => BackgroundTaskSnapshot;
 	sendMessage: (message: Record<string, unknown>, options: Record<string, unknown>) => void;
+	/** Whether the session is idle right now. Absent means unknown. */
+	isIdle?: () => boolean;
+	/** Starts an idle run through the prompt lifecycle. Absent keeps `triggerTurn`. */
+	sendUserMessage?: (content: string) => void;
 	/**
 	 * The mode's declared surface, read lazily so the notice names the operation
 	 * the session actually has. Absent means the conservative compatibility
@@ -648,7 +698,8 @@ export function sendOutputWakeBudgetExhaustedNotice(
 		`Budget caps: ${Math.max(0, Math.floor(limits.maxWakes))} wakes / ${Math.max(0, Math.floor(limits.maxBytes))} inline bytes.`,
 	].join("\n");
 	const compactTask = compactBackgroundTaskSnapshot(deps.rememberSnapshot(task));
-	deps.sendMessage(
+	deliverWakeMessage(
+		deps,
 		{
 			content,
 			customType: deps.messageType,

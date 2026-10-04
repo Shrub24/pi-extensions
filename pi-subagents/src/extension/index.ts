@@ -71,6 +71,7 @@ import { drainOutstandingWork } from "../runs/background/auto-drain.ts";
 import registerSubagentNotify, { parseSubagentNotifyContent, type SubagentNotifyDetails } from "../runs/background/notify.ts";
 import { formatSteeringNotice, handleSubagentSteeringNotice, SUBAGENT_STEERING_MESSAGE_TYPE, type SubagentSteeringMessageDetails } from "./steering-notices.ts";
 import { SUBAGENT_CHILD_ENV, SUBAGENT_PARENT_SESSION_ENV } from "../runs/shared/child-runtime-config.ts";
+import { sendIdleWake } from "../runs/shared/idle-wake.ts";
 import { disposeChildSessions } from "../runs/shared/child-session.ts";
 import { resolveCurrentSubagentCapabilityCeiling } from "../runs/shared/capability-ceiling.ts";
 import { formatDuration, shortenPath } from "../shared/formatters.ts";
@@ -1087,14 +1088,11 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		if (event.reason !== "manual") return;
 		const hasActiveAsyncWork = [...state.asyncJobs.values()].some((job) => job.status === "queued" || job.status === "running");
 		if (!hasActiveAsyncWork || !withLastUiContext(() => true)) return;
-		pi.sendMessage(
-			{
-				customType: "subagent-compaction-resume",
-				content: "Compaction is complete. Resume the parent task now; background subagent results will arrive separately when ready.",
-				display: false,
-			},
-			{ triggerTurn: true },
-		);
+		sendIdleWake(pi, state.lastUiContext, {
+			customType: "subagent-compaction-resume",
+			content: "Compaction is complete. Resume the parent task now; background subagent results will arrive separately when ready.",
+			display: false,
+		}, { triggerTurn: true });
 	});
 
 	pi.on("session_start", (event, ctx) => {

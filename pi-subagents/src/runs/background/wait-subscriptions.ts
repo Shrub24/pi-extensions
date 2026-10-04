@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { listAsyncRuns, type AsyncRunSummary } from "./async-status.ts";
+import { sendIdleWake } from "../shared/idle-wake.ts";
 import { formatResumeFirstFailedRunDetail } from "./resume-guidance.ts";
 import { readCompletionReplay } from "./completion-replay.ts";
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
@@ -98,7 +99,7 @@ export function formatWaitSubscriptions(state: Pick<SubagentState, "waitSubscrip
 }
 
 export function createWaitSubscriptionManager(
-	pi: Pick<ExtensionAPI, "events" | "sendMessage">,
+	pi: Pick<ExtensionAPI, "events" | "sendMessage" | "sendUserMessage">,
 	state: SubagentState,
 	options: WaitSubscriptionManagerOptions = {},
 ): WaitSubscriptionManager {
@@ -188,7 +189,7 @@ export function createWaitSubscriptionManager(
 			return;
 		}
 		try {
-			pi.sendMessage({
+			sendIdleWake(pi, state.lastUiContext, {
 				customType: "subagent-wait-subscription",
 				content: `Wait subscription ${record.token} fired for run ${record.runId}: ${outcome}. ${detail}`,
 				display: true,

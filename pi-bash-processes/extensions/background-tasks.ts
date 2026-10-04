@@ -160,6 +160,7 @@ import {
 	emptyOutputWakeBudget,
 	ensureOutputWakeBudget,
 	ensureWakeState,
+	deliverWakeMessage,
 	resolveNotifyMode,
 	recordScheduledOutputDrop,
 	scheduleTaskWake,
@@ -1264,14 +1265,33 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		maxWakes: Math.max(0, Math.floor(settingNumber("outputWakeBudgetMaxWakes", DEFAULT_OUTPUT_WAKE_BUDGET_MAX_WAKES, cwd))),
 	});
 
+	/**
+	 * How a wake reads whether the session is idle and wakes it through the
+	 * prompt lifecycle. Pi skips `before_agent_start` for a `triggerTurn` run
+	 * (pi#5581, #10267), so an idle wake is started by a short user prompt.
+	 */
+	const wakeSend = {
+		isIdle: (): boolean => {
+			try {
+				return activeCtx?.isIdle() === true;
+			} catch {
+				return false;
+			}
+		},
+		sendMessage: (message: Record<string, unknown>, options: Record<string, unknown>): void => pi.sendMessage(message as never, options as never),
+		// Absent when the host has no `sendUserMessage`; the wake helper then keeps
+		// the `triggerTurn` delivery rather than waking through a prompt it cannot.
+		...(typeof pi.sendUserMessage === "function" ? { sendUserMessage: (content: string): void => pi.sendUserMessage(content) } : {}),
+	};
+
 	const announceWakeBudgetExhausted = (task: ManagedTask) => {
 		const limits = wakeBudgetLimits(activeCtx?.cwd);
 		const announced = sendOutputWakeBudgetExhaustedNotice({
+			...wakeSend,
 			logDiagnostic: logWakeDiagnostic,
 			messageType: BG_MESSAGE_TYPE,
 			surface: () => taskToolSurface,
 			rememberSnapshot,
-			sendMessage: (message, messageOptions) => pi.sendMessage(message as any, messageOptions as any),
 		}, task, limits);
 		if (announced) {
 			rememberSnapshot(task);
@@ -1328,13 +1348,13 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			return false;
 		}
 		const sent = sendTaskWake({
+			...wakeSend,
 			isShuttingDown: () => shuttingDown,
 			logDiagnostic: logWakeDiagnostic,
 			messageType: BG_MESSAGE_TYPE,
 			surface: () => taskToolSurface,
 			outputTail: (target) => tailText(getTaskOutput(target), settingNumber("outputAlertMaxChars", DEFAULT_OUTPUT_ALERT_MAX_CHARS, activeCtx?.cwd)),
 			rememberSnapshot,
-			sendMessage: (message, messageOptions) => pi.sendMessage(message as any, messageOptions as any),
 			runningInventory,
 		}, eventType, task, options);
 		publishBackgroundTaskActivity(eventType, task, { ...options, sequence: options.sequence ?? task.wakeSequence ?? 0 });
@@ -2159,13 +2179,13 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			// sequence the wake payload carries.
 			const options = pending.find(([id]) => id === task.id)?.[1] ?? {};
 			const sent = sendTaskWake({
+				...wakeSend,
 				isShuttingDown: () => shuttingDown,
 				logDiagnostic: logWakeDiagnostic,
 				messageType: BG_MESSAGE_TYPE,
 				surface: () => taskToolSurface,
 				outputTail: (target) => tailText(getTaskOutput(target), settingNumber("outputAlertMaxChars", DEFAULT_OUTPUT_ALERT_MAX_CHARS, activeCtx?.cwd)),
 				rememberSnapshot,
-				sendMessage: (message, messageOptions) => pi.sendMessage(message as any, messageOptions as any),
 				runningInventory,
 			}, "exit", task, options);
 			// The send is the delivery: acknowledge through the shared entry point so
@@ -2188,7 +2208,8 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 				: "If these results are already consumed, nothing more to do; stop lingering tasks with bg_task stop.",
 			runningInventory(),
 		].join("\n");
-		pi.sendMessage(
+		deliverWakeMessage(
+			wakeSend,
 			{ customType: BG_MESSAGE_TYPE, content, display: true, details: { grouped: true, tasks: finished.map((t) => compactBackgroundTaskSnapshot(t)) } },
 			{ deliverAs: "followUp", triggerTurn: true },
 		);

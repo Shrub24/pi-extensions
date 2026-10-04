@@ -125,6 +125,7 @@ import { getInspectorPlugins } from "../../inspectors/plugins.ts";
 import { handleHerdrProjectPaneAction, HERDR_PROJECT_PANE_ACTIONS } from "../../inspectors/herdr/project-panes.ts";
 import { previewSimpleWorkflowRun, runWorkflowScript, validateWorkflowScript, WorkflowScriptError, type WorkflowChildSettledNotification, type WorkflowLanePlan, type WorkflowReceiptResumeReference, type WorkflowScriptChildResult, type WorkflowScriptTraceEntry, type WorkflowSteerOptions, type WorkflowSteerResult } from "../../workflows/scripted-workflow.ts";
 import { formatIncrementalChildCompletion, incrementalChildCompletionTriggersTurn } from "../background/notify.ts";
+import { sendIdleWake } from "../shared/idle-wake.ts";
 import { appendWorkflowChildJournal, findWorkflowReuseSource, matchWorkflowReuse, workflowChildFingerprint, workflowScriptDigest, workflowStopCause, WORKFLOW_RUNTIME_REPLACED_RELAUNCH_NOTICE } from "../../workflows/workflow-reuse.ts";
 import { executeWorkflowHostCommand, resolveWorkflowHostOutputClaimPath, type WorkflowHostCommandParams, type WorkflowHostCommandResult } from "../../workflows/host-command.ts";
 import { buildWorkflowReceipt, readWorkflowReceipt, workflowReceiptPath, resolveWorkflowReceiptResumeEntry, writeWorkflowReceipt, type WorkflowReceipt, type WorkflowReceiptState } from "../../workflows/workflow-receipt.ts";
@@ -5602,14 +5603,11 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 					if (resultWriteFailureWakeDelivered) return false;
 					if (deps.state.currentSessionId !== currentSessionId || deps.state.completionOwnerId !== completionOwnerId) return false;
 					try {
-						deps.pi.sendMessage(
-							{
-								customType: "subagent-workflow-result-write-failed",
-								content: message,
-								display: true,
-							},
-							{ triggerTurn: true },
-						);
+						sendIdleWake(deps.pi, deps.state.lastUiContext, {
+							customType: "subagent-workflow-result-write-failed",
+							content: message,
+							display: true,
+						}, { triggerTurn: true });
 						resultWriteFailureWakeDelivered = true;
 					} catch (sendError) {
 						console.error(`Failed to send workflow result write failure notification for '${workflowRunId}':`, sendError);
@@ -6103,14 +6101,16 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 									workflowRunning: notification.workflowRunning,
 								});
 								try {
-									deps.pi.sendMessage(
-										{
-											customType: "subagent-incremental-child-notify",
-											content: formatIncrementalChildCompletion(notification),
-											display: notification.outcome !== "completed",
-										},
-										{ triggerTurn: incrementalChildCompletionTriggersTurn(notification, requestParams.scheduleOrigin) },
-									);
+									const message = {
+										customType: "subagent-incremental-child-notify",
+										content: formatIncrementalChildCompletion(notification),
+										display: notification.outcome !== "completed",
+									};
+									if (incrementalChildCompletionTriggersTurn(notification, requestParams.scheduleOrigin)) {
+										sendIdleWake(deps.pi, deps.state.lastUiContext, message, { triggerTurn: true });
+									} else {
+										deps.pi.sendMessage(message, { triggerTurn: false });
+									}
 								} catch (sendError) {
 									console.error(`Failed to send incremental child completion notification for '${notification.childKey}':`, sendError);
 								}
