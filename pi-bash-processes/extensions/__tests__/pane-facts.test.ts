@@ -132,3 +132,12 @@ test("closing aborts an in-flight write before it clears", async () => {
 	await publisher.close();
 	expect(events, "a stale write can never land after the shutdown clear").toEqual(["write-start", "write-aborted", "clear"]);
 });
+
+test("an announced, unassociated result is history, not outstanding work", () => {
+	const done = { ...task("bg-1", 1_000, "completed"), resultReady: true, exitNotified: true };
+	expect(paneFacts([done])).toEqual(emptyPaneFacts());
+	// Still owed: the exit was not announced yet, or an assignment settles on it.
+	expect(paneFacts([{ ...done, exitNotified: false }]).pi_bg_tasks).toBe("bg-1:review");
+	expect(paneFacts([{ ...done, assignmentRequestId: "req-1" }]).pi_bg_tasks).toBe("bg-1:review");
+	expect(paneFacts([{ ...done, assignmentRequestId: "req-1", resultResolution: "delivered" }])).toEqual(emptyPaneFacts());
+});

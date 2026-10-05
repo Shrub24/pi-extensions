@@ -37,7 +37,7 @@ test("a TUI session without a Herdr pane id publishes nothing", async () => {
 	await host.tools.get("bg_task")!.execute("no-pane-get", { action: "get", id });
 });
 
-test("running tasks are advertised while the session is still working, and cleared once their results are read", async () => {
+test("running tasks are advertised while the session is still working, and cleared once they have ended and been announced", async () => {
 	process.env.HERDR_PANE_ID = "pane-facts-test";
 	// The session is mid-turn: publication must not wait for it to stop.
 	await host.dispatch("agent_start");
@@ -69,16 +69,8 @@ test("running tasks are advertised while the session is still working, and clear
 	expect(both.args).toContain(`pi_bg_tasks=${first}:running,${second}:running`);
 
 	await host.tools.get("bg_task")!.execute("pane-facts-stop", { action: "stop", id: "all" });
-	// An exited task whose result has not been read is still outstanding: it
-	// keeps its id as `flushing` and then `review`, and only the running count
-	// drops. Clearing is the result being read, not the process ending.
-	const bothReview = ({ args }: { args: string[] }) =>
-		args.includes("pi_bg_running=0") && args.some((arg) => arg.includes(`${first}:review`)) && args.some((arg) => arg.includes(`${second}:review`));
-	await until(() => herdrWrites().some(bothReview));
-	expect(clearedKeys(herdrWrites().find(bothReview)!), "an unread result is advertised, never cleared").toHaveLength(0);
-
-	await host.tools.get("bg_task")!.execute("pane-facts-get-first", { action: "get", id: first });
-	await host.tools.get("bg_task")!.execute("pane-facts-get-second", { action: "get", id: second });
+	// The stop result told the agent each task ended, so nothing is owed on them:
+	// an announced, unassociated result is history, and the facts clear without a `get`.
 	await until(() => herdrWrites().some(({ args }) => clearedKeys({ args }).length === 3));
 	const cleared = herdrWrites().filter(({ args }) => clearedKeys({ args }).length === 3).pop()!;
 	expect(clearedKeys(cleared), "exactly the three owned keys are cleared, and nothing is left published").toStrictEqual([

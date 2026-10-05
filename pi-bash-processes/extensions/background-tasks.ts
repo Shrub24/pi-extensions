@@ -572,7 +572,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			task,
 			{
 				cancelHeldWake: cancelHeldCompletionWake,
-				persist: (target) => { rememberSnapshot(target); persistSnapshots(); },
+				persist: (target) => { rememberSnapshot(target); persistSnapshots(); publishPaneFacts(); },
 			},
 			options,
 		);

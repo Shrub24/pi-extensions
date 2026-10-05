@@ -382,9 +382,13 @@ export async function restoredTaskFromSnapshot(snapshot: BackgroundTaskSnapshot,
 		assignmentRequestId: typeof snapshot.assignmentRequestId === "string" && snapshot.assignmentRequestId.length > 0
 			? snapshot.assignmentRequestId
 			: undefined,
+		// A foreign-session task is another session's history (a fork replays its
+		// parent's branch). This session can never retrieve its result, so nothing
+		// here waits on it: a terminal one is closed as `delivered` instead of
+		// being advertised as awaiting review for the life of the fork.
 		resultResolution: snapshot.resultResolution === "delivered" || snapshot.resultResolution === "error"
 			? snapshot.resultResolution
-			: undefined,
+			: foreignSession ? "delivered" : undefined,
 		pendingWakes: [],
 		status: pidStillAlive ? "running" : (wasRunning ? "stopped" : snapshot.status),
 		stopReason: pidStillAlive ? null : (coercedFromRunning ? "shutdown" : null),

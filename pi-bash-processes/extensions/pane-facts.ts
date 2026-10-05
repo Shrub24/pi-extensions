@@ -25,6 +25,8 @@ export type PaneFactTask = {
 	resultResolution?: "delivered" | "error";
 	resultReady?: boolean;
 	restored?: boolean;
+	exitNotified?: boolean;
+	assignmentRequestId?: string;
 };
 
 export type PaneFacts = {
@@ -57,9 +59,19 @@ export function factValue(value: string | null | undefined): string | null {
 
 export type TaskPhase = "running" | "flushing" | "review";
 
-/** The unresolved tasks: the one set both the pane tokens and the Radar bus describe. */
+/**
+ * The tasks something is still waiting on: the one set both the pane tokens and
+ * the Radar bus describe. A finished task counts only while its result is owed
+ * to someone: an assignment's settlement needs it, or its exit has not yet been
+ * announced to the agent. Once the agent has been told, an unassociated result
+ * is retrievable history, not outstanding work; advertising it as awaiting
+ * review for as long as nobody calls `get` made idle panes read as busy.
+ */
 export function unresolvedTasks<T extends PaneFactTask>(tasks: readonly T[]): T[] {
-	return tasks.filter((task) => !resultIsResolved(task));
+	return tasks.filter((task) =>
+		!resultIsResolved(task)
+		&& (task.status === "running" || task.assignmentRequestId !== undefined || task.exitNotified !== true),
+	);
 }
 
 /** The three-word vocabulary shared by `pi_bg_tasks` and the Radar bus. */

@@ -383,3 +383,16 @@ test("a cleanly finished command survives the persist/restore round trip as comp
 		"and a restore of it is a ready, complete terminal result",
 	).toStrictEqual({ readiness: "terminal", resultReady: true, outputComplete: true });
 });
+
+test("a foreign-session terminal snapshot is closed, not left awaiting review", async () => {
+	const foreign = await restoredTaskFromSnapshot(
+		fakeSnapshot({ id: "bg-fork", status: "completed", exitCode: 0, exitNotified: true, sessionId: "sess-OTHER" }),
+		{ identityProbe: async () => reading(null), sessionId: "sess-1", now: 1_700_000_100_000 },
+	);
+	expect(foreign.resultResolution).toBe("delivered");
+	const own = await restoredTaskFromSnapshot(
+		fakeSnapshot({ id: "bg-own", status: "completed", exitCode: 0, exitNotified: true, sessionId: "sess-1" }),
+		{ identityProbe: async () => reading(null), sessionId: "sess-1", now: 1_700_000_100_000 },
+	);
+	expect(own.resultResolution).toBeUndefined();
+});
