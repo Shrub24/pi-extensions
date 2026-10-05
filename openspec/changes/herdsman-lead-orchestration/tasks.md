@@ -55,7 +55,9 @@ All paths are under `pi-herdsman/`. Tests run with `npm test` (node test runner)
 ## 9. Integration
 
 - [x] 9.1 Run the full `npm test` and `npm run check` in `pi-herdsman/`. Verify 0 failures and that the pass count is at least the baseline plus the new tests.
-- [ ] 9.2 Obtain fresh-context read-only logic review against this change's proposal/design/specs, covering soft-window persistence, digest/extend eligibility, retained reuse/fingerprints, recovery and idle cleanup guards. Resolve actionable findings and reverify affected checks. Compile/tests and sound logic are the agent acceptance gate; an agent-run runtime smoke is no longer required.
+- [x] 9.2 Obtain fresh-context read-only logic review against this change's proposal/design/specs, covering soft-window persistence, digest/extend eligibility, retained reuse/fingerprints, recovery and idle cleanup guards. Resolve actionable findings and reverify affected checks. Compile/tests and sound logic are the agent acceptance gate; an agent-run runtime smoke is no longer required.
+
+  Review ran 2026-10-05 against `main` `54dd4748` (`omniroute/coder-high`, read-only, three-invariant scope); the report and parent triage are in `logic-review.md`. Verdict: merge, no P0/P1. Two P2s are recorded rather than resolved: F1 (`agent_extend` has no liveness guard, so a `lost` worker's recovered window stays extendable until the health scan drops it) and F2 (a failed durable re-arm write can make the digest fire twice after a restart). Invariant 2 had no finding.
 
 ## User-owned runtime smoke
 
