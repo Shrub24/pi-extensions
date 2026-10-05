@@ -72,6 +72,9 @@ implementation, including the upstream behavior a fork decision supersedes.
 
 - [0013 Retain workers across assignments](adr/0013-retain-workers-across-assignments.md)
 - [0014 Advisory soft-deadline checkpoints](adr/0014-advisory-soft-deadline-checkpoints.md)
+- [0015 Require versioned assignment briefs](adr/0015-require-versioned-assignment-briefs.md)
+- [0016 Validate results against response contracts](adr/0016-validate-results-against-response-contracts.md)
+- [0017 Publish pane facts without owning sidebar presentation](adr/0017-publish-pane-facts-without-owning-sidebar-presentation.md)
 
 The repository directories are organized by content type. The index is
 task-first so readers do not need to understand that structure before finding
