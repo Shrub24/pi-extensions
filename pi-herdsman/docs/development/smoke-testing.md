@@ -41,7 +41,7 @@ npm run smoke -- manager-recovery
 `npm run smoke` runs the default `core` scenario. The harness creates a
 disposable named Herdr session with isolated Herdr configuration/state, Pi
 configuration, and Pi session storage. It launches the current worktree's
-`dist/index.js` explicitly alongside Herdr's Pi integration. The invoking
+`extension/index.ts` explicitly alongside Herdr's Pi integration. The invoking
 development Agent remains outside that candidate session and owns observation
 and cleanup. The harness removes only resources it created.
 

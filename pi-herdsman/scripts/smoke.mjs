@@ -58,6 +58,8 @@ export function parseSmokeArgs(args) {
     allowPositionals: true,
     options: {
       model: { type: "string" },
+      agents: { type: "string" },
+      settings: { type: "string" },
       "manager-ready-timeout-ms": { type: "string" },
       "manager-recovery-diagnostics": { type: "boolean" },
     },
@@ -86,6 +88,8 @@ export function parseSmokeArgs(args) {
   return {
     scenario,
     model: values.model,
+    ...(values.agents === undefined ? {} : { agents: values.agents }),
+    ...(values.settings === undefined ? {} : { settings: values.settings }),
     managerReadyTimeoutMs,
     managerRecoveryDiagnostics,
   };
@@ -1380,7 +1384,6 @@ async function waitForNestedHerdr(ctx) {
 }
 
 async function startCandidate(ctx) {
-  assert.equal(ctx.candidateExtension, join(ctx.repoRoot, "dist", "index.js"));
   assert.equal(
     ctx.herdrStateExtension,
     join(ctx.paths.piAgent, "extensions", "herdr-agent-state.ts"),
@@ -3265,15 +3268,34 @@ async function main() {
   preflight();
   const model = await resolveSmokeModel(args.model);
   const scenario = args.scenario;
-  await run("npm", ["run", "build"], { cwd: repoRoot });
   const paths = await createIsolation();
+  // The package resolves to its source entry, so there is nothing to build. The
+  // isolated agent dir is empty apart from auth, so an operator definition set is
+  // opt-in: without it the run exercises the bundled roster only.
+  if (args.agents !== undefined) {
+    const agents = resolve(args.agents);
+    await access(agents);
+    await symlink(agents, join(paths.piAgent, "agents"));
+  }
+  // Provider configuration is separate from definitions: an operator provider
+  // registered by an extension only resolves when its settings are present too.
+  if (args.settings !== undefined) {
+    const settings = resolve(args.settings);
+    await access(settings);
+    await symlink(settings, join(paths.piAgent, "settings.json"));
+  }
   const owned = {};
   const pkg = JSON.parse(
     await readFile(join(repoRoot, "package.json"), "utf8"),
   );
+  // The package resolves to its source entry, so the candidate extension is
+  // whatever the manifest declares rather than a build output.
+  const candidateExtension = pkg.pi?.extensions?.[0];
+  if (typeof candidateExtension !== "string")
+    throw new Error("package.json declares no pi.extensions entry");
   const ctx = {
     repoRoot,
-    candidateExtension: join(repoRoot, "dist", "index.js"),
+    candidateExtension: join(repoRoot, candidateExtension),
     herdrStateExtension: paths.herdrStateExtension,
     ...(scenario === "chief-tree"
       ? {
