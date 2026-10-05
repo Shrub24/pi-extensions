@@ -94,3 +94,33 @@ export function writeBody(name: string, body: unknown): void {
     /* ignore */
   }
 }
+
+/** Tail of requests.jsonl, oldest first, so a long session's log stays cheap to read. */
+export function readRecords(maxLines = 4000): any[] {
+  try {
+    const lines = readFileSync(`${DIR}/requests.jsonl`, "utf8").split("\n").filter(Boolean);
+    const out: any[] = [];
+    for (const line of lines.slice(Math.max(0, lines.length - maxLines))) {
+      try {
+        out.push(JSON.parse(line));
+      } catch {
+        /* a torn last line */
+      }
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+export function writeTrace(name: string, lines: string[]): string {
+  try {
+    mkdirSync(`${DIR}/traces`, { recursive: true });
+    const path = `${DIR}/traces/${name}.txt`;
+    writeFileSync(path, `${lines.join("\n")}\n`);
+    return path;
+  } catch {
+    return "";
+  }
+}
+

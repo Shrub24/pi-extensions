@@ -107,3 +107,26 @@ test("cold and re-billed are read from usage", () => {
 
   expect(usageFlags(undefined, 0).seen).toBe(false);
 });
+
+test("an OpenAI-shaped prompt is not double counted", () => {
+  // The gateway reports prompt_tokens inclusive of the cached part.
+  const u = usageFlags({ prompt_tokens: 30288, cached_tokens: 6144, prompt_tokens_details: { cached_tokens: 6144 }, completion_tokens: 99 }, 0);
+  expect(u.read).toBe(6144);
+  expect(u.input).toBe(24144);
+  expect(u.promptTokens).toBe(30288);
+});
+
+test("a provider that never caches the whole prefix is not a re-bill", () => {
+  const u = usageFlags({ prompt_tokens: 60799, prompt_tokens_details: { cached_tokens: 30336 } }, 60596, 30208);
+  expect(u.promptTokens).toBe(60799);
+  expect(u.reBilled).toBe(false);
+});
+
+test("a collapsed cached prefix is a re-bill even without a write charge", () => {
+  const grew = usageFlags({ prompt_tokens: 227944, prompt_tokens_details: { cached_tokens: 7040 } }, 225732, 66432);
+  expect(grew.reBilled).toBe(true);
+  const shrank = usageFlags({ prompt_tokens: 223532, prompt_tokens_details: { cached_tokens: 56704 } }, 232294, 232064);
+  expect(shrank.reBilled).toBe(true);
+  const warm = usageFlags({ prompt_tokens: 232066, prompt_tokens_details: { cached_tokens: 230656 } }, 230784, 230272);
+  expect(warm.reBilled).toBe(false);
+});

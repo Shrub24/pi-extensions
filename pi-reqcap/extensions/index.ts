@@ -10,12 +10,18 @@
 //   bodies/*.json   the wire body of a request that paid, and the one it diverged from
 //   state/*.json    the last fingerprint and body per session and model, so a resume
 //                   continues the chain instead of restarting it
+//   traces/*.txt    the prefix comparison for every re-bill worth warning about
+//
+// A re-bill worth warning about raises a toast and updates the footer status; the
+// report surface is `/reqcap` (overview), `/reqcap trace [n]` (one line per request),
+// `/reqcap diff [seq]` (full prefix comparison) and `/reqcap where` (paths, knobs).
 //
 // No extra model calls and no extra tokens. Every handler is wrapped: a diagnostics
 // failure must never break a request.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { diff, fingerprint, usageFlags, type Divergence, type Fingerprint } from "./diff.js";
+import { diff, fingerprint, prefixTrace, usageFlags, type Divergence, type Fingerprint } from "./diff.js";
+import { bustLine, diffReport, overview, short, traceLines } from "./report.js";
 import {
   CAPTURE_BODIES,
   DIR,
@@ -24,18 +30,25 @@ import {
   keyFor,
   loadState,
   log,
+  readRecords,
   record,
   saveState,
   writeBody,
+  writeTrace,
 } from "./store.js";
 
 const CAUSE_EVENTS = ["session_compact", "mcp_servers_change", "model_select", "thinking_level_select", "cache_warming_decision"] as const;
+// A re-bill below this is not worth interrupting a session for. Zero warns on every one.
+const NOTICE_MIN_TOKENS = Number(process.env.PI_REQCAP_NOTICE_MIN_TOKENS ?? 20_000);
+const STATUS_KEY = "reqcap";
+const MAX_SCAN_LINES = 4000;
 
 type Inflight = {
   seq: number;
   key: string;
   fp: Fingerprint;
   divergence: Divergence;
+  prevFp: Fingerprint | null;
   body: unknown;
   status?: number;
   headers?: Record<string, string>;
@@ -55,8 +68,22 @@ export default function piReqcap(pi: ExtensionAPI): void {
   const lastBody = new Map<string, unknown>();
   const predecessorBody = new Map<string, unknown>();
   const lastPromptTokens = new Map<string, number>();
+  const lastReadTokens = new Map<string, number>();
   let seq = 0;
   let inflight: Inflight | null = null;
+  // The last event context is enough for a toast and the footer: both are
+  // fire-and-forget, and a session without UI simply ignores them.
+  let lastCtx: any = null;
+  const totals = { busts: 0, tokens: 0 };
+
+  const setStatus = (): void => {
+    try {
+      const text = totals.busts ? `reqcap: ${totals.busts} busts · ${short(totals.tokens)} tok` : "reqcap: watching";
+      lastCtx?.ui?.setStatus(STATUS_KEY, text);
+    } catch {
+      /* ignore */
+    }
+  };
 
   /** Write the response side of a request and, when it paid, its payload. */
   const flush = (): void => {
@@ -64,8 +91,10 @@ export default function piReqcap(pi: ExtensionAPI): void {
     inflight = null;
     if (!req) return;
     const prevPrompt = lastPromptTokens.get(req.key) ?? 0;
-    const u = usageFlags(req.usage, prevPrompt);
+    const prevRead = lastReadTokens.get(req.key) ?? 0;
+    const u = usageFlags(req.usage, prevPrompt, prevRead);
     lastPromptTokens.set(req.key, u.promptTokens);
+    lastReadTokens.set(req.key, u.read);
     record({
       kind: "response",
       session: SESSION,
@@ -98,10 +127,41 @@ export default function piReqcap(pi: ExtensionAPI): void {
       d.was ? `    was: ${d.was}` : "",
       d.now ? `    now: ${d.now}` : "",
     ]);
+
+    const lost = Math.max(0, u.promptTokens - u.read);
+    totals.busts += 1;
+    totals.tokens += lost;
+    setStatus();
+    if (lost < NOTICE_MIN_TOKENS) return;
+    const lines = prefixTrace(req.prevFp, req.fp);
+    const path = writeTrace(`bust-${stamp}`, [
+      ...lines,
+      "",
+      bustLine(
+        {
+          kind: "response",
+          seq: req.seq,
+          at: new Date().toISOString(),
+          usage: { input: u.input, read: u.read, write: u.write, write1h: u.write1h, output: u.output, promptTokens: u.promptTokens },
+          cold: u.cold,
+          reBilled: u.reBilled,
+          divergence: d,
+        },
+        undefined,
+      ),
+    ]);
+    try {
+      const what = `${d.kind}${d.at ? ` ${d.at}` : ""}${d.detail ? ` — ${d.detail}` : ""}`;
+      lastCtx?.ui?.notify(`reqcap: ${u.cold ? "cold cache" : "cache re-bill"} ${short(lost)} tok · ${what}  (/reqcap diff ${req.seq})`, "warning");
+    } catch {
+      /* ignore */
+    }
+    log([path ? `    prefix trace: ${path}` : ""]);
   };
 
-  pi.on("before_provider_request", (event: any) => {
+  pi.on("before_provider_request", (event: any, ctx: any) => {
     try {
+      lastCtx = ctx ?? lastCtx;
       flush();
       const payload = event?.payload;
       const body = payload as any;
@@ -114,8 +174,9 @@ export default function piReqcap(pi: ExtensionAPI): void {
         return;
       }
       loadState(key, chain, predecessorBody);
-      const divergence = diff(chain.get(key) ?? null, fp);
-      inflight = { seq, key, fp, divergence, body };
+      const prevFp = chain.get(key) ?? null;
+      const divergence = diff(prevFp, fp);
+      inflight = { seq, key, fp, divergence, prevFp, body };
       record({
         kind: "request",
         session: SESSION,
@@ -143,8 +204,9 @@ export default function piReqcap(pi: ExtensionAPI): void {
     }
   });
 
-  pi.on("before_provider_headers", (event: any) => {
+  pi.on("before_provider_headers", (event: any, ctx: any) => {
     try {
+      lastCtx = ctx ?? lastCtx;
       if (!inflight) return;
       const headers = event?.headers;
       if (!headers || typeof headers !== "object") return;
@@ -158,8 +220,9 @@ export default function piReqcap(pi: ExtensionAPI): void {
     }
   });
 
-  pi.on("after_provider_response", (event: any) => {
+  pi.on("after_provider_response", (event: any, ctx: any) => {
     try {
+      lastCtx = ctx ?? lastCtx;
       if (!inflight) return;
       inflight.status = Number(event?.status ?? 0) || undefined;
       const headers = event?.headers;
@@ -175,8 +238,9 @@ export default function piReqcap(pi: ExtensionAPI): void {
     }
   });
 
-  pi.on("provider_stream_event", (event: any) => {
+  pi.on("provider_stream_event", (event: any, ctx: any) => {
     try {
+      lastCtx = ctx ?? lastCtx;
       if (!inflight) return;
       inflight.provider = typeof event?.provider === "string" ? event.provider : inflight.provider;
       inflight.api = typeof event?.api === "string" ? event.api : inflight.api;
@@ -193,8 +257,9 @@ export default function piReqcap(pi: ExtensionAPI): void {
   // A cause is what a divergence is attributed to. Pi raises these when the session
   // itself changed the prompt's inputs, so recording them removes the archaeology.
   for (const name of CAUSE_EVENTS) {
-    pi.on(name as any, (event: any) => {
+    pi.on(name as any, (event: any, ctx: any) => {
       try {
+        lastCtx = ctx ?? lastCtx;
         const detail = event?.reason ?? event?.name ?? event?.model ?? event?.level ?? event?.value ?? null;
         record({ kind: "cause", event: name, session: SESSION, pid: process.pid, seq, at: new Date().toISOString(), detail });
         log([`[${new Date().toISOString()}] cause session=${SESSION} event=${name}${detail ? ` detail=${JSON.stringify(detail)}` : ""}`]);
@@ -205,12 +270,75 @@ export default function piReqcap(pi: ExtensionAPI): void {
   }
 
   for (const name of ["agent_settled", "agent_end", "session_shutdown"] as const) {
-    pi.on(name as any, () => {
+    pi.on(name as any, (_event: any, ctx: any) => {
       try {
+        lastCtx = ctx ?? lastCtx;
         flush();
+        setStatus();
       } catch {
         /* ignore */
       }
     });
   }
+
+  const recordsFor = (all: boolean): any[] => {
+    const records = readRecords(MAX_SCAN_LINES);
+    return all ? records : records.filter((r) => r.session === SESSION);
+  };
+
+  const emit = (ctx: any, lines: string[], type: "info" | "warning" = "info"): void => {
+    try {
+      ctx?.ui?.notify(lines.filter(Boolean).join("\n"), type);
+    } catch {
+      /* ignore */
+    }
+  };
+
+  pi.registerCommand("reqcap", {
+    description: "Cache diagnostics: overview, trace, diff, where",
+    handler: async (args: string, ctx: any) => {
+      const [sub, rest] = String(args ?? "").trim().split(/\s+/);
+      try {
+        if (sub === "trace") {
+          const n = Math.min(200, Math.max(1, Number(rest) || 20));
+          emit(ctx, [`reqcap trace — last ${n} requests (${SESSION})`, ...traceLines(recordsFor(false), n)]);
+          return;
+        }
+        if (sub === "diff") {
+          const seq = Number(rest) || undefined;
+          const lines = diffReport(recordsFor(false), seq);
+          const path = writeTrace(`diff-${seq ?? "last"}-${Date.now()}`, lines);
+          const head = lines.slice(0, 18);
+          emit(ctx, [...head, lines.length > head.length ? `… ${lines.length - head.length} more lines` : "", path ? `full trace: ${path}` : ""]);
+          return;
+        }
+        if (sub === "where") {
+          emit(ctx, [
+            `dir       ${DIR}`,
+            `records   ${DIR}/requests.jsonl`,
+            `log       ${DIR}/rewrites.log`,
+            `bodies    ${DIR}/bodies (${CAPTURE_BODIES ? "on" : "off"})`,
+            `traces    ${DIR}/traces`,
+            "knobs     PI_REQCAP_DIR, PI_REQCAP_BODIES=0, PI_REQCAP_MAX_BODIES, PI_REQCAP_MAX_LOG_BYTES, PI_REQCAP_NOTICE_MIN_TOKENS",
+          ]);
+          return;
+        }
+        if (sub === "help") {
+          emit(ctx, [
+            "/reqcap               session overview: totals, busts, causes, breakpoints",
+            "/reqcap all           the same over every session in records.jsonl",
+            "/reqcap trace [n]     one line per request: prompt movement and what it cost",
+            "/reqcap diff [seq]    full prefix comparison, request vs its predecessor",
+            "/reqcap where         output paths and environment knobs",
+            `busts warn above ${NOTICE_MIN_TOKENS.toLocaleString("en-US")} re-billed tokens (PI_REQCAP_NOTICE_MIN_TOKENS) — ${totals.busts} this process, ${short(totals.tokens)} tok`,
+          ]);
+          return;
+        }
+        const all = sub === "all";
+        emit(ctx, overview(recordsFor(all), { scope: all ? `all sessions in ${DIR}` : `session ${SESSION}` }));
+      } catch (error) {
+        emit(ctx, [`reqcap: ${error instanceof Error ? error.message : String(error)}`], "warning");
+      }
+    },
+  });
 }

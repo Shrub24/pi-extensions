@@ -270,14 +270,24 @@ export function diff(prevFp: Fingerprint | null, cur: Fingerprint): Divergence {
  * `cold` is read=0 on a prompt worth caching; `reBilled` is a prompt much larger
  * than what the provider could read back, at a write volume no append produces.
  */
-export function usageFlags(usage: Record<string, any> | undefined, prevPromptTokens: number): Usage {
+export function usageFlags(usage: Record<string, any> | undefined, prevPromptTokens: number, prevRead = 0): Usage {
   const seen = usage != null;
-  const read = Number(usage?.cache_read_input_tokens ?? usage?.prompt_tokens_details?.cached_tokens ?? 0);
+  const read = Number(usage?.cache_read_input_tokens ?? usage?.cached_tokens ?? usage?.prompt_tokens_details?.cached_tokens ?? 0);
   const write = Number(usage?.cache_creation_input_tokens ?? 0);
   const write1h = Number(usage?.cache_creation?.ephemeral_1h_input_tokens ?? 0);
-  const input = Number(usage?.input_tokens ?? usage?.prompt_tokens ?? 0);
+  // Anthropic reports input_tokens and cache_read_input_tokens as disjoint parts.
+  // The OpenAI-shaped providers report prompt_tokens *including* the cached part,
+  // so adding them would double count the whole cached prefix.
+  const rawInput = Number(usage?.input_tokens ?? usage?.prompt_tokens ?? 0);
+  const input = usage?.input_tokens !== undefined ? rawInput : Math.max(0, rawInput - read - write);
   const output = Number(usage?.output_tokens ?? usage?.completion_tokens ?? 0);
   const promptTokens = input + read + write;
+  // Two ways a request can pay again. Anthropic charges the re-billed part as a
+  // cache write, so a write is the tell. Auto-caching providers have no write to
+  // show, so the tell is the cached prefix collapsing under a prompt that did not
+  // shrink — without that second test a provider which simply never caches the
+  // whole prefix reads as a re-bill on every turn.
+  const collapsed = prevRead > 20_000 && read <= 0.5 * prevRead && (promptTokens >= prevPromptTokens - 1_000 || prevRead - read > 50_000);
   return {
     input,
     read,
@@ -286,7 +296,103 @@ export function usageFlags(usage: Record<string, any> | undefined, prevPromptTok
     output,
     promptTokens,
     cold: read === 0 && promptTokens > 5_000,
-    reBilled: write > 60_000 || (promptTokens > 10_000 && read < 0.8 * prevPromptTokens),
+    reBilled: write > 60_000 || (write > 10_000 && promptTokens > 10_000 && read < 0.8 * prevPromptTokens) || collapsed,
     seen,
   };
 }
+
+export interface TraceSubject {
+  seq?: number;
+  at?: string;
+  model?: string;
+  bodyChars?: number;
+  params?: Record<string, unknown>;
+  tools?: { n: number; hash: string };
+  system?: { i: number; chars: number; hash: string; sections?: Section[] }[];
+  messages?: { i: number; role: string; hash: string; chars: number }[];
+  breakpoints?: { at: string; ttl: unknown }[];
+}
+
+const MARK = "!!";
+
+function breakpointList(s: TraceSubject): string {
+  const list = (s.breakpoints ?? []).map((b) => `${b.at}${b.ttl ? `(${b.ttl})` : ""}`);
+  return list.length ? list.join(", ") : "none";
+}
+
+/**
+ * A prefix comparison between two requests: every part of the prompt a cache has
+ * to match, in wire order, with the first divergence marked. This is "why did
+ * this request re-bill" as a readable trace rather than a classification.
+ */
+export function prefixTrace(prev: TraceSubject | null, cur: TraceSubject): string[] {
+  const out: string[] = [];
+  out.push(`prefix trace   ${prev ? `#${prev.seq ?? "?"}` : "(no previous request)"} ${prev?.model ?? ""} → #${cur.seq ?? "?"} ${cur.model ?? ""}`);
+  if (!prev) {
+    out.push("  nothing to compare against: first request of this session and model");
+    return out;
+  }
+
+  const row = (label: string, a: string, b: string) => {
+    const same = a === b;
+    out.push(`  ${label.padEnd(12)} ${same ? "same" : MARK + " changed"}  ${same ? a : `${a} → ${b}`}`);
+  };
+
+  row("breakpoints", breakpointList(prev), breakpointList(cur));
+  row("tools", `${prev.tools?.n ?? 0} tools ${prev.tools?.hash ?? "-"}`, `${cur.tools?.n ?? 0} tools ${cur.tools?.hash ?? "-"}`);
+  row("params", JSON.stringify(prev.params ?? {}), JSON.stringify(cur.params ?? {}));
+
+  const n = Math.max(prev.system?.length ?? 0, cur.system?.length ?? 0);
+  for (let i = 0; i < n; i += 1) {
+    const a = prev.system?.[i];
+    const b = cur.system?.[i];
+    // The block's own index, not its slot: a record can hold a partial array.
+    const label = `system[${(b ?? a)?.i ?? i}]`;
+    if (!a || !b) {
+      out.push(`  ${label.padEnd(12)} ${MARK} ${a ? "removed" : "added"}`);
+      continue;
+    }
+    if (a.hash === b.hash) {
+      out.push(`  ${label.padEnd(12)} same      ${b.chars}ch`);
+      continue;
+    }
+    const delta = b.chars - a.chars;
+    out.push(`  ${label.padEnd(12)} ${MARK} changed ${a.chars}ch → ${b.chars}ch (${delta >= 0 ? "+" : ""}${delta})  ${a.hash} → ${b.hash}`);
+    const secA = new Map((a.sections ?? []).map((s) => [s.name, s]));
+    const secB = new Map((b.sections ?? []).map((s) => [s.name, s]));
+    for (const [name, now] of secB) {
+      const was = secA.get(name);
+      if (!was) out.push(`      ${name.padEnd(22)} absent → ${now.chars}ch`);
+      else if (was.hash !== now.hash) {
+        const d2 = now.chars - was.chars;
+        out.push(`      ${name.padEnd(22)} ${was.chars}ch → ${now.chars}ch (${d2 >= 0 ? "+" : ""}${d2})`);
+      }
+    }
+    for (const [name, was] of secA) if (!secB.has(name)) out.push(`      ${name.padEnd(22)} ${was.chars}ch → absent`);
+  }
+
+  const pm = prev.messages ?? [];
+  const cm = cur.messages ?? [];
+  let firstDiff = -1;
+  for (let i = 0; i < Math.min(pm.length, cm.length); i += 1) {
+    if (pm[i].hash !== cm[i].hash) {
+      firstDiff = i;
+      break;
+    }
+  }
+  if (firstDiff >= 0) {
+    const a = pm[firstDiff];
+    const b = cm[firstDiff];
+    out.push(`  messages     ${MARK} first divergence at messages[${firstDiff}] of ${Math.max(pm.length, cm.length)}`);
+    out.push(`      ${firstDiff} ${a.role} ${a.chars}ch ${a.hash} → ${b.role} ${b.chars}ch ${b.hash}`);
+    out.push(`      matched ${firstDiff} messages, array ${pm.length} → ${cm.length}`);
+  } else if (cm.length < pm.length) {
+    out.push(`  messages     ${MARK} truncated ${pm.length} → ${cm.length}`);
+  } else if (cm.length > pm.length) {
+    out.push(`  messages     same      ${pm.length} matched, +${cm.length - pm.length} appended`);
+  } else {
+    out.push(`  messages     same      ${pm.length} matched, none added`);
+  }
+  return out;
+}
+
