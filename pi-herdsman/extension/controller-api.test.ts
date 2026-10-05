@@ -3208,6 +3208,67 @@ test("semantic result refs attach persisted output and preserve canonical file r
   }
 });
 
+test("advertised result refs resolve as accepted context inputs", async () => {
+  setLeadEnvironment();
+  const requestId = randomUUID();
+  const canonical = resultRef(requestId);
+  const resultFile = resultPath(requestId);
+  const resultText = "persisted context input evidence";
+  realFs.mkdirSync(resolve(resultFile, ".."), { recursive: true });
+  realFs.writeFileSync(resultFile, resultText, "utf8");
+  const entries: unknown[] = [
+    {
+      customType: "pi-herdsman-agent-result",
+      details: {
+        agentLabel: "implementation",
+        resultIndex: 1,
+        requestId,
+        resultRef: canonical,
+        status: "completed",
+      },
+    },
+  ];
+  const label = "agent";
+  const startup = startupExecutor(label, () => DEFAULT_PI_SESSION_ID);
+  const pi = fakePi({ entries, exec: startup.exec });
+  registerExtension!(pi.pi as never);
+  const brief = DELEGATION_BRIEF_EXAMPLES.common.replace(
+    "  inputs: []",
+    "  inputs:\n    - reference: result:implementation#1\n      purpose: required context",
+  );
+  try {
+    const malformed = await agentTool(pi, "delegate").execute(
+      "malformed",
+      {
+        definition: "agent",
+        task: brief.replace("result:implementation#1", "result:implementation#01"),
+      },
+      undefined,
+      undefined,
+      fakeContext(entries),
+    );
+    assert.equal(malformed.details.error.category, "invalid_request");
+    assert.equal(
+      malformed.details.error.message,
+      "Invalid result ref: result:implementation#01. Copy the exact result ref shown by the agent completion.",
+    );
+
+    const result = await agentTool(pi, "delegate").execute(
+      "id",
+      { definition: "agent", task: brief },
+      undefined,
+      undefined,
+      fakeContext(entries),
+    );
+    assert.equal(result.details.ok, true, JSON.stringify(result.details));
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    startup.stopMailboxConsumer();
+    resetAgentMailbox(startup.mailbox);
+    realFs.rmSync(resultFile, { force: true });
+  }
+});
+
 test("semantic result refs resolve only on the active branch", async () => {
   setLeadEnvironment();
   const requestId = randomUUID();
@@ -4594,6 +4655,7 @@ const idleRetainedWorkerFixture = async (
     launchedModel?: string;
     storedFingerprint?: "missing";
     onRequest?: (text: string, request?: RequestRecord) => void | Promise<void>;
+    beforeClose?: () => void | Promise<void>;
   } = {},
 ) => {
   const label = `${definition}-agent`;
@@ -4692,7 +4754,14 @@ const idleRetainedWorkerFixture = async (
   let executor: ReturnType<typeof startupExecutor> = retainedExecutor;
   let closed = false;
   const pi = fakePi({
-    exec: (command, args) => {
+    exec: async (command, args) => {
+      if (
+        command === "herdr" &&
+        args[0] === "pane" &&
+        args[1] === "close" &&
+        options.beforeClose
+      )
+        await options.beforeClose();
       const placing =
         (args[0] === "tab" && args[1] === "create") ||
         (args[0] === "pane" && args[1] === "split") ||
@@ -4760,6 +4829,64 @@ test("definition drift relaunches a retained worker on the same session", async 
     assert.equal(restarted.agentLabel, fixture.label);
     assert.equal(restarted.piSessionId, fixture.sourceId);
   } finally {
+    fixture.pi.events.get("session_shutdown")?.[0]();
+    nativeSessions.clear();
+    resetAgentMailbox(fixture.mailbox);
+    realFs.rmSync(fixture.definitionPath, { force: true });
+    realFs.rmSync(fixture.sourcePath, { force: true });
+  }
+});
+
+test("the relaunch close holds the session reservation against a concurrent continue", async () => {
+  setLeadEnvironment();
+  nativeSessions.clear();
+  const name = `drift-concurrent-${randomUUID().slice(0, 8)}`;
+  let closedEntered!: () => void;
+  const entered = new Promise<void>((resolve) => (closedEntered = resolve));
+  let releaseClose!: () => void;
+  const closeGate = new Promise<void>((resolve) => (releaseClose = resolve));
+  const fixture = await idleRetainedWorkerFixture(name, {
+    launchedModel: "explicit/old",
+    beforeClose: async () => {
+      closedEntered();
+      await closeGate;
+    },
+  });
+  try {
+    const first = agentTool(fixture.pi, "continue").execute(
+      "first",
+      { session: fixture.sourcePath, task: "continue after drift" },
+      undefined,
+      undefined,
+      fixture.context,
+    );
+    await entered;
+    const second = await agentTool(fixture.pi, "continue").execute(
+      "second",
+      { session: fixture.sourcePath, task: "must wait for the close" },
+      undefined,
+      undefined,
+      fixture.context,
+    );
+    // The close owns the reservation, so the second continue must be refused by
+    // the session activation claim rather than by the assignment lock the close
+    // happens to hold.
+    assert.equal(
+      second.details.error.category,
+      "agent_busy",
+      JSON.stringify(second.details),
+    );
+    assert.match(second.details.error.message, /already being activated/);
+    releaseClose();
+    const firstResult = await first;
+    assert.equal(
+      firstResult.details.ok,
+      true,
+      JSON.stringify(firstResult.details),
+    );
+    assert.equal(firstResult.details.relaunched, "definition_changed");
+  } finally {
+    releaseClose();
     fixture.pi.events.get("session_shutdown")?.[0]();
     nativeSessions.clear();
     resetAgentMailbox(fixture.mailbox);

@@ -12,7 +12,131 @@ import {
 } from "node:fs";
 import { resolve } from "node:path";
 import { TextDecoder } from "node:util";
-import { resolveResultRef } from "./storage.ts";
+import { resultRef, resolveResultRef } from "./storage.ts";
+
+const RESULT_PREFIX = "result:";
+export const AGENT_LABEL_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
+
+export function validAgentLabel(value: unknown): value is string {
+  return typeof value === "string" && AGENT_LABEL_PATTERN.test(value);
+}
+
+export function agentResultDetails(
+  entry: unknown,
+): Record<string, unknown> | undefined {
+  if (!entry || typeof entry !== "object") return undefined;
+
+  const record = entry as Record<string, unknown>;
+  const message =
+    record.message && typeof record.message === "object"
+      ? (record.message as Record<string, unknown>)
+      : record;
+
+  if (message.customType !== "pi-herdsman-agent-result") return undefined;
+
+  const details =
+    message.details && typeof message.details === "object"
+      ? message.details
+      : record.details;
+
+  return details && typeof details === "object" && !Array.isArray(details)
+    ? (details as Record<string, unknown>)
+    : undefined;
+}
+
+function canonicalResultRef(
+  details: Record<string, unknown>,
+  operation: string,
+): string {
+  if (
+    details.status !== "completed" ||
+    typeof details.requestId !== "string" ||
+    typeof details.resultRef !== "string"
+  )
+    fail("internal_failure", "Result metadata is incomplete", operation);
+
+  let expected: string;
+  try {
+    expected = resultRef(details.requestId);
+  } catch {
+    fail(
+      "internal_failure",
+      "Result metadata contains an invalid request identity",
+      operation,
+    );
+  }
+
+  if (details.resultRef !== expected)
+    fail(
+      "internal_failure",
+      "Result metadata contains an inconsistent canonical reference",
+      operation,
+    );
+
+  return expected;
+}
+
+// One resolver for advertised `result:<label>#<index>` references, shared by
+// every file-evidence reader. It returns the canonical `result:<requestId>`
+// form, or undefined for canonical references and ordinary paths, so the
+// advertised grammar never reaches the canonical-UUID validator in storage.ts.
+// Missing and ambiguous references stay distinguishable for the callers that
+// map them onto file errors.
+export function resolveResultReference(
+  input: string,
+  branch: readonly unknown[] | undefined,
+  operation: string,
+): string | undefined {
+  if (!input.startsWith(RESULT_PREFIX) || !input.includes("#"))
+    return undefined;
+
+  const value = input.slice(RESULT_PREFIX.length);
+  const separator = value.lastIndexOf("#");
+  const agent = value.slice(0, separator);
+  const rawIndex = value.slice(separator + 1);
+  const index = Number(rawIndex);
+
+  if (
+    !validAgentLabel(agent) ||
+    !Number.isSafeInteger(index) ||
+    index < 1 ||
+    String(index) !== rawIndex
+  )
+    fail(
+      "invalid_request",
+      `Invalid result ref: ${input}. Copy the exact result ref shown by the agent completion.`,
+      operation,
+    );
+
+  const matches = (branch ?? [])
+    .map(agentResultDetails)
+    .filter(
+      (details): details is Record<string, unknown> =>
+        !!details &&
+        details.agentLabel === agent &&
+        details.resultIndex === index,
+    );
+
+  if (!matches.length)
+    fail(
+      "target_not_found",
+      `Result ref ${input} is not available on the current branch`,
+      operation,
+    );
+
+  const refs = new Set(
+    matches.map((details) => canonicalResultRef(details, operation)),
+  );
+
+  if (refs.size !== 1)
+    fail(
+      "target_ambiguous",
+      `Result ref ${input} resolves to conflicting canonical results`,
+      operation,
+    );
+
+  return refs.values().next().value!;
+}
 
 export type TextFileSnapshot = {
   input: string;
@@ -25,6 +149,9 @@ export type TextFileSnapshot = {
 export interface SnapshotTextFilesOptions {
   maxBytes?: number;
   skipCanonicalPaths?: Iterable<string>;
+  // Active session branch used to resolve advertised `result:<label>#<index>`
+  // references. Undefined leaves those references unresolvable.
+  resultBranch?: readonly unknown[];
 }
 
 type RegularFile = {
@@ -49,16 +176,21 @@ function resolveRegularFiles(
   cwd: string,
   operation: string,
   skipCanonicalPaths: Iterable<string> = [],
+  resultBranch?: readonly unknown[],
 ): RegularFile[] {
   const skipped = new Set(skipCanonicalPaths);
   const seen = new Set<string>();
   return inputs.flatMap((input) => {
+    // Resolve the advertised grammar before the try so a missing or ambiguous
+    // reference keeps its own category instead of being wrapped as a read
+    // failure.
+    const reference = resolveResultReference(input, resultBranch, operation);
     let path: string;
     let resolvedResultPath: string | undefined;
     let canonicalPath: string;
     try {
-      resolvedResultPath = resolveResultRef(input);
-      path = resolvedResultPath ?? resolve(cwd, input);
+      resolvedResultPath = resolveResultRef(reference ?? input);
+      path = resolvedResultPath ?? resolve(cwd, reference ?? input);
       canonicalPath = realpathSync(path);
       if (skipped.has(canonicalPath) || seen.has(canonicalPath)) return [];
       const beforeOpen = statSync(canonicalPath);
@@ -113,6 +245,7 @@ export function snapshotTextFiles(
     cwd,
     operation,
     options.skipCanonicalPaths,
+    options.resultBranch,
   );
   const snapshots: TextFileSnapshot[] = [];
   let totalBytes = 0;
@@ -171,6 +304,7 @@ export type MessagePreparationOptions = {
   inlineLimitBytes?: number;
   mailboxLimitBytes?: number;
   serializedBytes?: (text: string) => number;
+  resultBranch?: readonly unknown[];
 };
 
 function escapeMessageFileName(path: string): string {
@@ -224,7 +358,13 @@ export function prepareMessageInput(
       );
     return { text, canonicalPaths: [] };
   }
-  const regular = resolveRegularFiles(files, cwd, operation);
+  const regular = resolveRegularFiles(
+    files,
+    cwd,
+    operation,
+    [],
+    options.resultBranch,
+  );
   const sections = regular.map((file) => renderMessageFile(file));
   const rendered = () => [...sections, `${heading}:\n${text}`].join("\n\n");
   const fits =
@@ -253,7 +393,9 @@ export function prepareMessageInput(
     let resolvedResultPath: string | undefined;
     let bytes: Buffer;
     try {
-      resolvedResultPath = resolveResultRef(file.input);
+      resolvedResultPath = file.input.startsWith(RESULT_PREFIX)
+        ? file.path
+        : undefined;
       // O_NONBLOCK prevents a path replaced by a FIFO from blocking this
       // preparation step. The descriptor is also the one that gets read.
       fd = openSync(

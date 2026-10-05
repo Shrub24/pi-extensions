@@ -3242,6 +3242,220 @@ test("concurrent session activation permits one generation", async () => {
   }
 });
 
+test("a failed continue releases the session activation reservation", async () => {
+  setLeadEnvironment();
+  const name = `released-session-${randomUUID().slice(0, 8)}`;
+  const definitionPath = join(PI_AGENTS_DIR, `${name}.md`);
+  const session = {
+    id: DEFAULT_PI_SESSION_ID,
+    path: join(PI_AGENT_ROOT, `${name}-session.jsonl`),
+    cwd: "/tmp",
+    entries: [
+      {
+        type: "custom",
+        customType: "pi-herdsman-agent-definition",
+        data: {
+          sessionId: DEFAULT_PI_SESSION_ID,
+          definition: name,
+          label: name,
+        },
+      },
+    ],
+  };
+  realFs.writeFileSync(
+    definitionPath,
+    `---\nname: ${name}\n---\nactivation release test\n`,
+  );
+  realFs.writeFileSync(session.path, "{}", "utf8");
+  nativeSessions.set(session.id, session);
+  const startup = startupExecutor(name, () => session.id);
+  const pi = fakePi({ exec: startup.exec });
+  registerExtension!(pi.pi as never);
+  try {
+    const failed = await registeredAgentTool(pi, "continue").execute(
+      "first",
+      {
+        session: session.path,
+        task: "must not start",
+        files: [join(testTmpRoot, "missing-activation-preflight.md")],
+      },
+      undefined,
+      undefined,
+      ownedSessionContext(session.id, name),
+    );
+    assert.equal(failed.details.error.category, "invalid_request");
+    assert.equal(
+      failed.details.error.rollbackOccurred,
+      false,
+      "preflight rejection must precede launch",
+    );
+    assert.equal(startup.getCount(), 0, "preflight must reject before launch");
+
+    const retried = await registeredAgentTool(pi, "continue").execute(
+      "second",
+      {
+        session: session.path,
+        task: "start now",
+      },
+      undefined,
+      undefined,
+      ownedSessionContext(session.id, name),
+    );
+    assert.equal(
+      retried.details.ok,
+      true,
+      `a released reservation must not refuse the retry: ${JSON.stringify(retried.details)}`,
+    );
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    nativeSessions.delete(session.id);
+    resetAgentMailbox(startup.mailbox);
+    realFs.rmSync(definitionPath, { force: true });
+    realFs.rmSync(session.path, { force: true });
+  }
+});
+
+test("concurrent continues of an idle retained worker serialize on the reservation", async () => {
+  setLeadEnvironment();
+  updateConfig("retainWorkers", true);
+  const name = `warm-concurrent-${randomUUID().slice(0, 8)}`;
+  const label = `${name}-agent`;
+  const definitionPath = join(PI_AGENTS_DIR, `${name}.md`);
+  const sessionPath = join(PI_AGENT_ROOT, `${name}-session.jsonl`);
+  realFs.writeFileSync(definitionPath, `---\nname: ${name}\n---\nwarm body\n`);
+  realFs.writeFileSync(sessionPath, "{}", "utf8");
+  const session = {
+    id: DEFAULT_PI_SESSION_ID,
+    path: sessionPath,
+    cwd: "/tmp",
+    entries: [
+      {
+        type: "custom",
+        customType: "pi-herdsman-agent-definition",
+        data: { sessionId: DEFAULT_PI_SESSION_ID, definition: name, label },
+      },
+    ],
+  };
+  nativeSessions.set(session.id, session);
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  const startup = startupExecutor(label, () => session.id);
+  let snapshotCalls = 0;
+  let gating = false;
+  let snapshotEntered!: () => void;
+  const entered = new Promise<void>((resolve) => (snapshotEntered = resolve));
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  const pi = fakePi({
+    exec: async (command, args, options) => {
+      if (command === "herdr" && args[0] === "api" && args[1] === "snapshot") {
+        snapshotCalls += 1;
+        // The first call is the pre-claim inventory; the second is the
+        // identity snapshot inside the reservation.
+        if (gating && snapshotCalls === 2) {
+          gating = false;
+          snapshotEntered();
+          await gate;
+        }
+      }
+      return startup.exec(command, args, options);
+    },
+  });
+  const entries: unknown[] = [];
+  registerExtension!(pi.pi as never);
+  const context = fakeContext(entries);
+  const state = {
+    ...managedState(label, undefined, {
+      paneId: "startup-pane",
+      tabId: "startup-tab",
+      piSessionId: session.id,
+      piSessionFile: sessionPath,
+    }),
+    completedRequestId: randomUUID(),
+  };
+  try {
+    for (const handler of pi.events.get("session_start") ?? [])
+      await handler(undefined, context);
+    resetAgentMailbox(mailbox);
+    writeAgentState(mailbox, state);
+    entries.push(
+      {
+        type: "custom_message",
+        message: {
+          customType: "pi-herdsman-agent-result",
+          details: {
+            piSessionId: session.id,
+            piSessionFile: sessionPath,
+            ownerSessionId: LEAD_SESSION_ID,
+            runId: state.runId,
+            requestId: state.completedRequestId,
+            agentLabel: label,
+            agentDefinition: name,
+            status: "completed",
+          },
+        },
+      },
+      {
+        type: "custom",
+        customType: "pi-herdsman-worker-launch",
+        data: {
+          runId: state.runId,
+          label,
+          fingerprint: agentLaunchFingerprint(
+            resolveAgentLaunchInputs(
+              {
+                name,
+                path: definitionPath,
+                frontmatter: { name },
+                body: "warm body",
+              },
+              { cwd: "/tmp" },
+            ),
+          ),
+        },
+      },
+    );
+    // Arm the gate only for this continue: its pre-claim inventory is the
+    // first snapshot call, its identity snapshot is the second.
+    snapshotCalls = 0;
+    gating = true;
+    const first = registeredAgentTool(pi, "continue").execute(
+      "first",
+      { session: sessionPath, task: "first assignment" },
+      undefined,
+      undefined,
+      context,
+    );
+    await entered;
+    const second = await registeredAgentTool(pi, "continue").execute(
+      "second",
+      { session: session.id, task: "second assignment" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(
+      second.details.error.category,
+      "agent_busy",
+      JSON.stringify(second.details),
+    );
+    release();
+    const firstResult = await first;
+    assert.equal(
+      firstResult.details.ok,
+      true,
+      JSON.stringify(firstResult.details),
+    );
+    assert.equal(firstResult.details.reused, true);
+  } finally {
+    release();
+    pi.events.get("session_shutdown")?.[0]();
+    nativeSessions.delete(session.id);
+    resetAgentMailbox(startup.mailbox);
+    realFs.rmSync(definitionPath, { force: true });
+    realFs.rmSync(sessionPath, { force: true });
+  }
+});
+
 test("session assignment reports a pane mismatch from the agent state producer", async () => {
   const label = "agent";
   const producerMismatchPath = join(testTmpRoot, "producer-mismatch.jsonl");

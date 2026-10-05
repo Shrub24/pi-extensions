@@ -113,6 +113,10 @@ import {
   agentControlState,
   snapshotTextFiles,
   isSpawnPlacement,
+  agentResultDetails,
+  resolveResultReference,
+  validAgentLabel,
+  AGENT_LABEL_PATTERN,
   type SpawnPlacement,
 } from "./core.ts";
 import {
@@ -1003,12 +1007,6 @@ function allowedAgentDefinitionsFromEnv(): string[] {
     process.env.PI_HERDSMAN_ALLOWED_AGENT_DEFINITIONS,
   );
 }
-const AGENT_LABEL_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
-
-function validAgentLabel(value: unknown): value is string {
-  return typeof value === "string" && AGENT_LABEL_PATTERN.test(value);
-}
-
 function managedAgentEnvironmentError(): string | undefined {
   const e = process.env;
   if (!e.PI_HERDSMAN_MAILBOX) return "PI_HERDSMAN_MAILBOX missing";
@@ -3542,28 +3540,6 @@ function resultDeliveryExpectation(
     piSessionFile: source.piSessionFile,
   };
 }
-function agentResultDetails(
-  entry: unknown,
-): Record<string, unknown> | undefined {
-  if (!entry || typeof entry !== "object") return undefined;
-
-  const record = entry as Record<string, unknown>;
-  const message =
-    record.message && typeof record.message === "object"
-      ? (record.message as Record<string, unknown>)
-      : record;
-
-  if (message.customType !== "pi-herdsman-agent-result") return undefined;
-
-  const details =
-    message.details && typeof message.details === "object"
-      ? message.details
-      : record.details;
-
-  return details && typeof details === "object" && !Array.isArray(details)
-    ? (details as Record<string, unknown>)
-    : undefined;
-}
 function nextAgentResultIndex(
   entries: readonly unknown[],
   agentLabel: string,
@@ -3590,37 +3566,8 @@ function hasDeliveredResult(
     return !!details && deliveryIdentityMatches(details, expected);
   });
 }
-function canonicalResultRef(
-  details: Record<string, unknown>,
-  operation: string,
-): string {
-  if (
-    details.status !== "completed" ||
-    typeof details.requestId !== "string" ||
-    typeof details.resultRef !== "string"
-  )
-    fail("internal_failure", "Result metadata is incomplete", operation);
-
-  let expected: string;
-  try {
-    expected = resultRef(details.requestId);
-  } catch {
-    fail(
-      "internal_failure",
-      "Result metadata contains an invalid request identity",
-      operation,
-    );
-  }
-
-  if (details.resultRef !== expected)
-    fail(
-      "internal_failure",
-      "Result metadata contains an inconsistent canonical reference",
-      operation,
-    );
-
-  return expected;
-}
+// Thin wrapper over the shared resolver so the `files` entry point and the
+// core file readers resolve advertised result references identically.
 function resolveMessageFiles(
   ctx: ExtensionContext,
   files: readonly string[] | undefined,
@@ -3631,56 +3578,9 @@ function resolveMessageFiles(
     return [...files];
 
   const branch = ctx.sessionManager.getBranch();
-  return files.map((file) => {
-    if (!file.startsWith("result:") || !file.includes("#")) return file;
-
-    const value = file.slice("result:".length);
-    const separator = value.lastIndexOf("#");
-    const agent = value.slice(0, separator);
-    const rawIndex = value.slice(separator + 1);
-    const index = Number(rawIndex);
-
-    if (
-      !validAgentLabel(agent) ||
-      !Number.isSafeInteger(index) ||
-      index < 1 ||
-      String(index) !== rawIndex
-    )
-      fail(
-        "invalid_request",
-        `Invalid result ref: ${file}. Copy the exact result ref shown by the agent completion.`,
-        operation,
-      );
-
-    const matches = branch
-      .map(agentResultDetails)
-      .filter(
-        (details): details is Record<string, unknown> =>
-          !!details &&
-          details.agentLabel === agent &&
-          details.resultIndex === index,
-      );
-
-    if (!matches.length)
-      fail(
-        "target_not_found",
-        `Result ref ${file} is not available on the current branch`,
-        operation,
-      );
-
-    const refs = new Set(
-      matches.map((details) => canonicalResultRef(details, operation)),
-    );
-
-    if (refs.size !== 1)
-      fail(
-        "target_ambiguous",
-        `Result ref ${file} resolves to conflicting canonical results`,
-        operation,
-      );
-
-    return refs.values().next().value!;
-  });
+  return files.map(
+    (file) => resolveResultReference(file, branch, operation) ?? file,
+  );
 }
 async function deliverResultUnsafe(
   pi: ExtensionAPI,
@@ -6108,7 +6008,10 @@ async function actionUnsafe(
       brief.context.inputs.map((input) => input.reference),
       ctx.cwd,
       operation,
-      { maxBytes: limits.mailbox.bytes },
+      {
+        maxBytes: limits.mailbox.bytes,
+        resultBranch: ctx.sessionManager.getBranch(),
+      },
     );
     const descriptors: AcceptedContextSnapshot[] = files.map((file, index) => ({
       reference: brief.context.inputs[index]!.reference,
@@ -6269,9 +6172,10 @@ async function actionUnsafe(
     // A retained worker takes its next assignment in the process that already
     // holds its session, so continuation reuses it instead of launching.
     let idleReuseRuntime: Runtime | undefined;
-    if (resumed) {
+    if (resumed)
       releaseSessionActivation = claimSessionActivationLock(resumed.path);
-      try {
+    try {
+      if (resumed) {
         const snapshot = await managedAgentSnapshots(pi, ctx, signal);
         const states = listAgentStates().filter(
           ({ state }) =>
@@ -6349,703 +6253,707 @@ async function actionUnsafe(
               },
             );
         }
-      } catch (error) {
-        releaseSessionActivation();
-        releaseSessionActivation = undefined;
-        throw error;
       }
-    }
-    // Reuse keeps the worker's own label, so an existing live label is expected
-    // there; only a fresh generation must not collide with a live label.
-    if (requestedLabel && labels.has(requestedLabel) && !idleReuseRuntime)
-      fail(
-        "agent_label_exists",
-        `Agent label already exists: ${requestedLabel}`,
-        p.action,
-      );
-    const workspaceId = assignment!.workspaceId;
-    const explicitMessageFiles = resolveMessageFiles(ctx, p.files, p.action);
-    assignmentFileCount = explicitMessageFiles.length;
-    let label = requestedLabel ?? chooseLabel(agentDefinition, labels);
-    if (!validAgentLabel(label))
-      fail(
-        "invalid_request",
-        'Agent label must start with a lowercase letter, contain only lowercase letters, digits, "_" or "-", and be at most 32 characters',
-        p.action,
-      );
-    const acceptedBrief = acceptBrief(
-      brief,
-      assignment!.requestId,
-      roleLaunchInputs,
-      agentCwd,
-      p.action,
-    );
-    acceptedAssignment = acceptedBrief.accepted;
-    const contextPaths = acceptedBrief.contextPaths;
-    p.files = [...explicitMessageFiles, ...contextPaths];
-    const prepareAssignmentInput = (assignmentLabel: string) =>
-      prepareMessageInput(
-        formatAcceptedAssignmentPrompt(acceptedAssignment!),
-        resolveMessageFiles(ctx, p.files, p.action),
-        ctx.cwd,
-        p.action,
-        "Task",
-        {
-          inlineLimitBytes: limits.inline.bytes,
-          fits: (text) =>
-            prospectiveAssignmentFits(
-              assignment!.runId,
-              assignment!.ownerSessionId,
-              assignment!.workspaceId,
-              assignmentLabel,
-              text,
-              "",
-              assignment!.createdAt,
-              assignment!.requestId,
-              acceptedAssignment!,
-              limits.mailbox.bytes,
-              roleLaunchInputs.briefProfile,
-            ),
-        },
-      );
-    // The label is knowable until a mailbox collision changes it; only Herdr's
-    // pane identity remains unknown until startup returns.
-    assignmentInput = prepareAssignmentInput(label);
-    if (idleReuseRuntime) {
-      // The retained worker keeps its process, label, pane, and Pi session; the
-      // new assignment is submitted into the runtime that is already live.
-      const reused = idleReuseRuntime;
-      releaseSessionActivation?.();
-      releaseSessionActivation = undefined;
-      runtimes.set(reused.label, reused);
-      requestStatusRefresh?.();
-      const requestId = await submit(
-        pi,
-        reused,
-        "task",
-        assignmentInput.text,
-        ctx,
-        signal,
-        undefined,
-        assignment!.createdAt,
+      // Reuse keeps the worker's own label, so an existing live label is expected
+      // there; only a fresh generation must not collide with a live label.
+      if (requestedLabel && labels.has(requestedLabel) && !idleReuseRuntime)
+        fail(
+          "agent_label_exists",
+          `Agent label already exists: ${requestedLabel}`,
+          p.action,
+        );
+      const workspaceId = assignment!.workspaceId;
+      const explicitMessageFiles = resolveMessageFiles(ctx, p.files, p.action);
+      assignmentFileCount = explicitMessageFiles.length;
+      let label = requestedLabel ?? chooseLabel(agentDefinition, labels);
+      if (!validAgentLabel(label))
+        fail(
+          "invalid_request",
+          'Agent label must start with a lowercase letter, contain only lowercase letters, digits, "_" or "-", and be at most 32 characters',
+          p.action,
+        );
+      const acceptedBrief = acceptBrief(
+        brief,
         assignment!.requestId,
+        roleLaunchInputs,
+        agentCwd,
         p.action,
-        acceptedAssignment,
-        roleLaunchInputs.briefProfile,
       );
-      requestStatusRefresh?.();
-      return {
-        ok: true,
-        action: p.action,
-        agent: reused.label,
-        definition: agentDefinition,
-        owner_session_id: reused.ownerSessionId,
-        pane_id: reused.paneId,
-        session_id: reused.piSessionId,
-        session_path: reused.piSessionFile,
-        request_id: requestId,
-        reused: true,
-      };
-    }
-    const preparedBody = expandAgentBodyFiles(
-      definition.body,
-      assignmentInput.canonicalPaths.slice(0, assignmentFileCount),
-      p.action,
-    );
-    const preparedDefinition =
-      preparedBody === definition.body
-        ? definition
-        : { ...definition, body: preparedBody };
-    const effectiveDefinition = projectAgentDefinition(
-      preparedDefinition,
-      definitionScope,
-    );
-    const delegationEnabled =
-      agentDefinitionDelegationEnabled(effectiveDefinition);
-    const runId = assignment!.runId;
-    const owner = assignment!.ownerSessionId;
-    const forwardingSession =
-      scope.kind === "managed-agent"
-        ? (process.env.PI_SUBAGENT_PARENT_SESSION ?? owner)
-        : owner;
-    const configuredPlacement = (await placementSettings(ctx)).effective;
-    const placement = await physicalPlacement(
-      pi,
-      ctx,
-      label,
-      scope,
-      configuredPlacement,
-      signal,
-    );
-    const placementRevalidator =
-      scope?.kind !== "managed-agent" && configuredPlacement === "tab"
-        ? async (
-            current: HerdrStartPlacement,
-          ): Promise<HerdrStartPlacement> => {
-            if (current.kind !== "tab") return current;
-            const candidate = await reusableLeadTab(pi, ctx, signal);
-            return {
-              kind: "tab",
-              label: current.label,
-              ...(candidate ? { tabId: candidate } : {}),
-            };
+      acceptedAssignment = acceptedBrief.accepted;
+      const contextPaths = acceptedBrief.contextPaths;
+      p.files = [...explicitMessageFiles, ...contextPaths];
+      const prepareAssignmentInput = (assignmentLabel: string) =>
+        prepareMessageInput(
+          formatAcceptedAssignmentPrompt(acceptedAssignment!),
+          resolveMessageFiles(ctx, p.files, p.action),
+          ctx.cwd,
+          p.action,
+          "Task",
+          {
+            inlineLimitBytes: limits.inline.bytes,
+            resultBranch: ctx.sessionManager.getBranch(),
+            fits: (text) =>
+              prospectiveAssignmentFits(
+                assignment!.runId,
+                assignment!.ownerSessionId,
+                assignment!.workspaceId,
+                assignmentLabel,
+                text,
+                "",
+                assignment!.createdAt,
+                assignment!.requestId,
+                acceptedAssignment!,
+                limits.mailbox.bytes,
+                roleLaunchInputs.briefProfile,
+              ),
+          },
+        );
+      // The label is knowable until a mailbox collision changes it; only Herdr's
+      // pane identity remains unknown until startup returns.
+      assignmentInput = prepareAssignmentInput(label);
+      if (idleReuseRuntime) {
+        // The retained worker keeps its process, label, pane, and Pi session; the
+        // new assignment is submitted into the runtime that is already live.
+        const reused = idleReuseRuntime;
+        releaseSessionActivation?.();
+        releaseSessionActivation = undefined;
+        runtimes.set(reused.label, reused);
+        requestStatusRefresh?.();
+        const requestId = await submit(
+          pi,
+          reused,
+          "task",
+          assignmentInput.text,
+          ctx,
+          signal,
+          undefined,
+          assignment!.createdAt,
+          assignment!.requestId,
+          p.action,
+          acceptedAssignment,
+          roleLaunchInputs.briefProfile,
+        );
+        requestStatusRefresh?.();
+        return {
+          ok: true,
+          action: p.action,
+          agent: reused.label,
+          definition: agentDefinition,
+          owner_session_id: reused.ownerSessionId,
+          pane_id: reused.paneId,
+          session_id: reused.piSessionId,
+          session_path: reused.piSessionFile,
+          request_id: requestId,
+          reused: true,
+        };
+      }
+      const preparedBody = expandAgentBodyFiles(
+        definition.body,
+        assignmentInput.canonicalPaths.slice(0, assignmentFileCount),
+        p.action,
+      );
+      const preparedDefinition =
+        preparedBody === definition.body
+          ? definition
+          : { ...definition, body: preparedBody };
+      const effectiveDefinition = projectAgentDefinition(
+        preparedDefinition,
+        definitionScope,
+      );
+      const delegationEnabled =
+        agentDefinitionDelegationEnabled(effectiveDefinition);
+      const runId = assignment!.runId;
+      const owner = assignment!.ownerSessionId;
+      const forwardingSession =
+        scope.kind === "managed-agent"
+          ? (process.env.PI_SUBAGENT_PARENT_SESSION ?? owner)
+          : owner;
+      const configuredPlacement = (await placementSettings(ctx)).effective;
+      const placement = await physicalPlacement(
+        pi,
+        ctx,
+        label,
+        scope,
+        configuredPlacement,
+        signal,
+      );
+      const placementRevalidator =
+        scope?.kind !== "managed-agent" && configuredPlacement === "tab"
+          ? async (
+              current: HerdrStartPlacement,
+            ): Promise<HerdrStartPlacement> => {
+              if (current.kind !== "tab") return current;
+              const candidate = await reusableLeadTab(pi, ctx, signal);
+              return {
+                kind: "tab",
+                label: current.label,
+                ...(candidate ? { tabId: candidate } : {}),
+              };
+            }
+          : undefined;
+      let mailbox = agentMailboxPath(workspaceId, label);
+      let releaseClaim: (() => void) | undefined;
+      while (true) {
+        try {
+          releaseClaim = claimAgentMailbox(mailbox);
+        } catch (error) {
+          if (!(error instanceof MailboxClaimOccupiedError)) {
+            releaseSessionActivation?.();
+            releaseSessionActivation = undefined;
+            throw error;
           }
-        : undefined;
-    let mailbox = agentMailboxPath(workspaceId, label);
-    let releaseClaim: (() => void) | undefined;
-    while (true) {
-      try {
-        releaseClaim = claimAgentMailbox(mailbox);
-      } catch (error) {
-        if (!(error instanceof MailboxClaimOccupiedError)) {
+          if (requestedLabel) {
+            releaseSessionActivation?.();
+            releaseSessionActivation = undefined;
+            fail(
+              "agent_label_exists",
+              `Agent label already exists: ${label}`,
+              p.action,
+            );
+          }
+          try {
+            labels.add(label);
+            label = chooseLabel(agentDefinition, labels);
+            if (!validAgentLabel(label))
+              fail(
+                "invalid_request",
+                'Agent label must start with a lowercase letter, contain only lowercase letters, digits, "_" or "-", and be at most 32 characters',
+                p.action,
+              );
+            assignmentInput = prepareAssignmentInput(label);
+            mailbox = agentMailboxPath(workspaceId, label);
+            continue;
+          } catch (retryError) {
+            releaseSessionActivation?.();
+            releaseSessionActivation = undefined;
+            throw retryError;
+          }
+        }
+        try {
+          if (
+            !requestedLabel &&
+            guardMailboxOccupancy(mailbox, label, p.action, false)
+          ) {
+            releaseClaim();
+            releaseClaim = undefined;
+            labels.add(label);
+            label = chooseLabel(agentDefinition, labels);
+            if (!validAgentLabel(label))
+              fail(
+                "invalid_request",
+                'Agent label must start with a lowercase letter, contain only lowercase letters, digits, "_" or "-", and be at most 32 characters',
+                p.action,
+              );
+            assignmentInput = prepareAssignmentInput(label);
+            mailbox = agentMailboxPath(workspaceId, label);
+            continue;
+          }
+          if (requestedLabel)
+            guardMailboxOccupancy(mailbox, label, p.action, true);
+          break;
+        } catch (error) {
+          if (releaseClaim) releaseClaim();
+          releaseClaim = undefined;
           releaseSessionActivation?.();
           releaseSessionActivation = undefined;
           throw error;
         }
-        if (requestedLabel) {
-          releaseSessionActivation?.();
-          releaseSessionActivation = undefined;
-          fail(
-            "agent_label_exists",
-            `Agent label already exists: ${label}`,
-            p.action,
-          );
-        }
-        try {
-          labels.add(label);
-          label = chooseLabel(agentDefinition, labels);
-          if (!validAgentLabel(label))
-            fail(
-              "invalid_request",
-              'Agent label must start with a lowercase letter, contain only lowercase letters, digits, "_" or "-", and be at most 32 characters',
-              p.action,
-            );
-          assignmentInput = prepareAssignmentInput(label);
-          mailbox = agentMailboxPath(workspaceId, label);
-          continue;
-        } catch (retryError) {
-          releaseSessionActivation?.();
-          releaseSessionActivation = undefined;
-          throw retryError;
-        }
       }
-      try {
-        if (
-          !requestedLabel &&
-          guardMailboxOccupancy(mailbox, label, p.action, false)
-        ) {
-          releaseClaim();
-          releaseClaim = undefined;
-          labels.add(label);
-          label = chooseLabel(agentDefinition, labels);
-          if (!validAgentLabel(label))
-            fail(
-              "invalid_request",
-              'Agent label must start with a lowercase letter, contain only lowercase letters, digits, "_" or "-", and be at most 32 characters',
-              p.action,
-            );
-          assignmentInput = prepareAssignmentInput(label);
-          mailbox = agentMailboxPath(workspaceId, label);
-          continue;
-        }
-        if (requestedLabel)
-          guardMailboxOccupancy(mailbox, label, p.action, true);
-        break;
-      } catch (error) {
-        if (releaseClaim) releaseClaim();
-        releaseClaim = undefined;
-        releaseSessionActivation?.();
-        releaseSessionActivation = undefined;
-        throw error;
-      }
-    }
-    const pendingStart: PendingStart = {
-      label,
-      definition: agentDefinition,
-      ...(acceptedTaskText !== undefined ? { task: acceptedTaskText } : {}),
-      startedAt: Date.now(),
-      ...(scope.kind === "managed-agent" && process.env.PI_HERDSMAN_LABEL
-        ? { parentLabel: process.env.PI_HERDSMAN_LABEL }
-        : {}),
-    };
-    pendingStarts?.set(label, pendingStart);
-    requestStatusRefresh?.();
-    let promptPaths: string[] = [];
-    let promptWriteFailed = false;
-    let started: StartedHerdrAgent | undefined;
-    let accepted = false;
-    try {
-      const skillResolution = resolveDefinitionSkills({
-        agent: effectiveDefinition.name,
-        ...(effectiveDefinition.frontmatter.skills !== undefined
-          ? { skills: effectiveDefinition.frontmatter.skills }
+      const pendingStart: PendingStart = {
+        label,
+        definition: agentDefinition,
+        ...(acceptedTaskText !== undefined ? { task: acceptedTaskText } : {}),
+        startedAt: Date.now(),
+        ...(scope.kind === "managed-agent" && process.env.PI_HERDSMAN_LABEL
+          ? { parentLabel: process.env.PI_HERDSMAN_LABEL }
           : {}),
-        ...(effectiveDefinition.frontmatter.preloadedSkills !== undefined
-          ? { preloadedSkills: effectiveDefinition.frontmatter.preloadedSkills }
-          : {}),
-        cwd: agentCwd,
-      });
-      if (!skillResolution.ok)
-        fail("invalid_request", skillResolution.reason, p.action);
+      };
+      pendingStarts?.set(label, pendingStart);
+      requestStatusRefresh?.();
+      let promptPaths: string[] = [];
+      let promptWriteFailed = false;
+      let started: StartedHerdrAgent | undefined;
+      let accepted = false;
       try {
-        promptPaths = writePrivatePromptSnapshots([
-          ...(preparedDefinition.body ? [preparedDefinition.body] : []),
-          ...skillResolution.preloaded.map((skill) => skill.body),
-          SHARED_AGENT_INSTRUCTIONS,
-        ]);
-      } catch (error) {
-        promptWriteFailed = true;
-        throw error;
-      }
-      const bodyPromptPath = preparedDefinition.body
-        ? promptPaths[0]
-        : undefined;
-      const preloadedSkillPromptPaths = skillResolution.preloaded.map(
-        (_skill, index) =>
-          promptPaths[(preparedDefinition.body ? 1 : 0) + index]!,
-      );
-      const sharedPromptPath = promptPaths[promptPaths.length - 1]!;
-      invalidateCachedRuntime(label);
-      const resetRelease = claimAssignmentLock(mailbox, p.action, { label });
-      try {
-        resetAgentMailbox(mailbox);
-      } finally {
-        resetRelease();
-      }
-      const env = [
-        `PI_HERDSMAN_MAILBOX=${mailbox}`,
-        `PI_HERDSMAN_RUN_ID=${runId}`,
-        `PI_HERDSMAN_OWNER_SESSION_ID=${owner}`,
-        `PI_SUBAGENT_PARENT_SESSION=${forwardingSession}`,
-        `PI_HERDSMAN_LABEL=${label}`,
-        `PI_HERDSMAN_WORKSPACE_ID=${workspaceId}`,
-        `PI_HERDSMAN_AGENT_DEFINITION=${agentDefinition}`,
-        `PI_HERDSMAN_BRIEF_PROFILE=${roleLaunchInputs.briefProfile}`,
-        `PI_HERDSMAN_ALLOWED_AGENT_DEFINITIONS=${JSON.stringify(
-          delegationEnabled ? effectiveDefinition.frontmatter.agents : [],
-        )}`,
-        ...(process.env.PI_CODING_AGENT_DIR
-          ? [`PI_CODING_AGENT_DIR=${process.env.PI_CODING_AGENT_DIR}`]
-          : []),
-        "PI_OFFLINE=1",
-      ];
-      // Pi reports the providers that extensions registered; a model from one
-      // of them cannot resolve in a child denied extension discovery.
-      // Older registries and test doubles may not expose the list, in which
-      // case nothing counts as extension-provided and the model is inherited
-      // exactly as before this change.
-      const registeredProviderIds = new Set(
-        ctx.modelRegistry?.getRegisteredProviderIds?.() ?? [],
-      );
-      const childModel = resolveChildModel({
-        configured: configuredModel(effectiveDefinition.frontmatter),
-        inherited:
-          !resumed && ctx.model
-            ? { provider: ctx.model.provider, token: modelToken(ctx.model) }
-            : undefined,
-        isForeignProvider: (providerId) =>
-          registeredProviderIds.has(providerId),
-      });
-      // The operator's model policy, then the one contradiction the policy
-      // exists to surface: a pinned model whose provider only an extension
-      // supplies, in a child the definition denies extensions to.
-      if (childModel.kind === "use") {
-        const pinnedValue = configuredModel(effectiveDefinition.frontmatter);
-        const pinned =
-          pinnedValue !== undefined && pinnedValue.trim() !== ""
-            ? pinnedValue
-            : undefined;
-        const origin = pinned === undefined ? "inherited" : "pinned";
-        const scopes = readConfig().modelScopes;
-        const agentAllow = scopes.agents?.[effectiveDefinition.name]?.allow;
-        const violation = modelPolicyError({
+        const skillResolution = resolveDefinitionSkills({
           agent: effectiveDefinition.name,
-          model: childModel.model,
-          origin,
-          ...(scopes.allow === undefined
-            ? {}
-            : { globalAllow: scopes.allow }),
-          ...(agentAllow === undefined ? {} : { agentAllow }),
+          ...(effectiveDefinition.frontmatter.skills !== undefined
+            ? { skills: effectiveDefinition.frontmatter.skills }
+            : {}),
+          ...(effectiveDefinition.frontmatter.preloadedSkills !== undefined
+            ? { preloadedSkills: effectiveDefinition.frontmatter.preloadedSkills }
+            : {}),
+          cwd: agentCwd,
         });
-        if (violation !== undefined) throw new Error(violation);
-        if (origin === "pinned") {
-          const denied = deniedDiscoveryModelError({
+        if (!skillResolution.ok)
+          fail("invalid_request", skillResolution.reason, p.action);
+        try {
+          promptPaths = writePrivatePromptSnapshots([
+            ...(preparedDefinition.body ? [preparedDefinition.body] : []),
+            ...skillResolution.preloaded.map((skill) => skill.body),
+            SHARED_AGENT_INSTRUCTIONS,
+          ]);
+        } catch (error) {
+          promptWriteFailed = true;
+          throw error;
+        }
+        const bodyPromptPath = preparedDefinition.body
+          ? promptPaths[0]
+          : undefined;
+        const preloadedSkillPromptPaths = skillResolution.preloaded.map(
+          (_skill, index) =>
+            promptPaths[(preparedDefinition.body ? 1 : 0) + index]!,
+        );
+        const sharedPromptPath = promptPaths[promptPaths.length - 1]!;
+        invalidateCachedRuntime(label);
+        const resetRelease = claimAssignmentLock(mailbox, p.action, { label });
+        try {
+          resetAgentMailbox(mailbox);
+        } finally {
+          resetRelease();
+        }
+        const env = [
+          `PI_HERDSMAN_MAILBOX=${mailbox}`,
+          `PI_HERDSMAN_RUN_ID=${runId}`,
+          `PI_HERDSMAN_OWNER_SESSION_ID=${owner}`,
+          `PI_SUBAGENT_PARENT_SESSION=${forwardingSession}`,
+          `PI_HERDSMAN_LABEL=${label}`,
+          `PI_HERDSMAN_WORKSPACE_ID=${workspaceId}`,
+          `PI_HERDSMAN_AGENT_DEFINITION=${agentDefinition}`,
+          `PI_HERDSMAN_BRIEF_PROFILE=${roleLaunchInputs.briefProfile}`,
+          `PI_HERDSMAN_ALLOWED_AGENT_DEFINITIONS=${JSON.stringify(
+            delegationEnabled ? effectiveDefinition.frontmatter.agents : [],
+          )}`,
+          ...(process.env.PI_CODING_AGENT_DIR
+            ? [`PI_CODING_AGENT_DIR=${process.env.PI_CODING_AGENT_DIR}`]
+            : []),
+          "PI_OFFLINE=1",
+        ];
+        // Pi reports the providers that extensions registered; a model from one
+        // of them cannot resolve in a child denied extension discovery.
+        // Older registries and test doubles may not expose the list, in which
+        // case nothing counts as extension-provided and the model is inherited
+        // exactly as before this change.
+        const registeredProviderIds = new Set(
+          ctx.modelRegistry?.getRegisteredProviderIds?.() ?? [],
+        );
+        const childModel = resolveChildModel({
+          configured: configuredModel(effectiveDefinition.frontmatter),
+          inherited:
+            !resumed && ctx.model
+              ? { provider: ctx.model.provider, token: modelToken(ctx.model) }
+              : undefined,
+          isForeignProvider: (providerId) =>
+            registeredProviderIds.has(providerId),
+        });
+        // The operator's model policy, then the one contradiction the policy
+        // exists to surface: a pinned model whose provider only an extension
+        // supplies, in a child the definition denies extensions to.
+        if (childModel.kind === "use") {
+          const pinnedValue = configuredModel(effectiveDefinition.frontmatter);
+          const pinned =
+            pinnedValue !== undefined && pinnedValue.trim() !== ""
+              ? pinnedValue
+              : undefined;
+          const origin = pinned === undefined ? "inherited" : "pinned";
+          const scopes = readConfig().modelScopes;
+          const agentAllow = scopes.agents?.[effectiveDefinition.name]?.allow;
+          const violation = modelPolicyError({
             agent: effectiveDefinition.name,
             model: childModel.model,
-            noExtensions:
-              effectiveDefinition.frontmatter.noExtensions === true,
-            extensions: effectiveDefinition.frontmatter.extensions,
-            isForeignProvider: (providerId) =>
-              registeredProviderIds.has(providerId),
+            origin,
+            ...(scopes.allow === undefined
+              ? {}
+              : { globalAllow: scopes.allow }),
+            ...(agentAllow === undefined ? {} : { agentAllow }),
           });
-          if (denied !== undefined) throw new Error(denied);
-        }
-      }
-      const launchArgs = agentLaunchArgs(effectiveDefinition, {
-        ...(bodyPromptPath !== undefined ? { bodyPromptPath } : {}),
-        ...(preloadedSkillPromptPaths.length
-          ? { preloadedSkillPromptPaths }
-          : {}),
-        sharedPromptPath,
-        cwd: agentCwd,
-        managedAgent: true,
-        approveProject:
-          agentContext.projectTrusted && sameCwd(agentCwd, ctx.cwd),
-        ...(!resumed ? { inheritedThinking: pi.getThinkingLevel() } : {}),
-        modelDecision: childModel,
-        resolvedSkills: skillResolution.advertised,
-      });
-      // A retained process keeps the launch configuration it started with, so
-      // reuse compares this fingerprint with the then-current definition.
-      const launchFingerprint = agentLaunchFingerprint(
-        resolveAgentLaunchInputs(fingerprintDefinition, { cwd: agentCwd }),
-      );
-      started = await startHerdrAgent(pi, ctx, {
-        label,
-        runId,
-        cwd: agentCwd,
-        extensionPath: HERDSMAN_EXTENSION_PATH,
-        placement,
-        ...(placementRevalidator ? { placementRevalidator } : {}),
-        agentArgs: [...launchArgs, ...sessionArgs],
-        env,
-        signal,
-      });
-      const state = await waitForState(
-        mailbox,
-        (s) => s.runId === runId && s.ownerSessionId === owner,
-        { timeoutMs: 30_000, signal },
-      ).catch(() => undefined);
-      if (!state) {
-        let startupDiagnostic: string | undefined;
-        let startupProcess: Record<string, unknown> | undefined;
-        try {
-          const result = await pi.exec(
-            "herdr",
-            [
-              "pane",
-              "read",
-              started.paneId,
-              "--source",
-              "recent-unwrapped",
-              "--lines",
-              "40",
-            ],
-            { cwd: ctx.cwd, signal, timeout: 5_000 },
-          );
-          if (result.code === 0 && !result.killed) {
-            const bytes = Buffer.from(
-              `${result.stdout ?? ""}\n${result.stderr ?? ""}`.trim(),
-              "utf8",
-            );
-            if (bytes.length) {
-              let start = Math.max(0, bytes.length - 4096);
-              while (start < bytes.length && (bytes[start]! & 0xc0) === 0x80)
-                start++;
-              startupDiagnostic = bytes.subarray(start).toString("utf8");
-            }
+          if (violation !== undefined) throw new Error(violation);
+          if (origin === "pinned") {
+            const denied = deniedDiscoveryModelError({
+              agent: effectiveDefinition.name,
+              model: childModel.model,
+              noExtensions:
+                effectiveDefinition.frontmatter.noExtensions === true,
+              extensions: effectiveDefinition.frontmatter.extensions,
+              isForeignProvider: (providerId) =>
+                registeredProviderIds.has(providerId),
+            });
+            if (denied !== undefined) throw new Error(denied);
           }
-        } catch {
-          // Startup evidence is advisory; preserve the original failure.
         }
-        try {
-          const process = await paneProcess(
-            pi,
-            ctx,
-            started.paneId,
-            undefined,
-            undefined,
-            true,
-            2_000,
-          );
-          if (process?.pane_id === started.paneId)
-            startupProcess = {
-              pane_id: process.pane_id,
-              shell_pid: process.shell_pid,
-              foreground_processes: (process.foreground_processes ?? []).map(
-                ({ argv0, state }) => ({
-                  ...(argv0 ? { argv0 } : {}),
-                  ...(state ? { state } : {}),
-                }),
-              ),
-            };
-        } catch {
-          // Process evidence is optional; preserve the original failure.
-        }
-        fail(
-          "pane_not_ready",
-          "Agent did not initialize its mailbox",
-          p.action,
-          startupDiagnostic || startupProcess
-            ? {
-                details: {
-                  ...(startupDiagnostic ? { startupDiagnostic } : {}),
-                  ...(startupProcess ? { startupProcess } : {}),
-                },
-              }
-            : {},
-        );
-      }
-      const expectedHerdrAgent = herdrAgentAlias(
-        workspaceId,
-        label,
-        state.runId,
-      );
-      if (started.herdrAgent !== expectedHerdrAgent)
-        fail(
-          "target_not_found",
-          "Agent launch returned an unexpected Herdr agent alias",
-          p.action,
-          { ids: { label, paneId: started.paneId } },
-        );
-      if (
-        started.agent &&
-        !herdrAliasMatchesIfReported(started.agent, expectedHerdrAgent)
-      )
-        fail(
-          "target_not_found",
-          "Agent launch returned conflicting Herdr agent aliases",
-          p.action,
-          { ids: { label, paneId: started.paneId } },
-        );
-      const runtime: Runtime = {
-        label,
-        herdrAgent: expectedHerdrAgent,
-        workspaceId,
-        paneId: started.paneId,
-        cwd: started.cwd,
-        runId: state.runId,
-        ownerSessionId: owner,
-        mailboxPath: mailbox,
-        piSessionId: state.piSessionId,
-        piSessionFile: state.piSessionFile,
-        agentDefinition,
-        model: started.agent?.model ?? null,
-        thinking: started.agent?.thinking ?? null,
-      };
-      validateIdentity(runtime, state, {
-        workspace_id: workspaceId,
-        label,
-        pane_id: started.paneId,
-        cwd: started.cwd,
-        pi_session_id: state.piSessionId,
-        pi_session_path: state.piSessionFile,
-      });
-      try {
-        pi.appendEntry(WORKER_LAUNCH_ENTRY, {
-          runId: state.runId,
-          label,
-          fingerprint: launchFingerprint,
-        } satisfies WorkerLaunchEntry);
-      } catch (error) {
-        appendDurableError(pi, ctx, "pi_herdsman_state_error", error);
-      }
-      // Herdr chooses the pane only while starting. Re-render now that the
-      // authoritative final envelope identity is known.
-      assignmentInput = prepareMessageInput(
-        formatAcceptedAssignmentPrompt(acceptedAssignment!),
-        resolveMessageFiles(ctx, p.files, p.action),
-        ctx.cwd,
-        p.action,
-        "Task",
-        {
-          inlineLimitBytes: limits.inline.bytes,
-          mailboxLimitBytes: limits.mailbox.bytes,
-          serializedBytes: (text) =>
-            requestRecordBytesFor(
-              runtime,
-              "task",
-              text,
-              undefined,
-              assignment!.createdAt,
-              assignment!.requestId,
-              acceptedAssignment,
-              roleLaunchInputs.briefProfile,
-            ),
-        },
-      );
-      await validateIntegration(pi, runtime, ctx, {
-        signal,
-        waitForSession: true,
-      });
-      runtimes.set(label, runtime);
-      requestStatusRefresh?.();
-      const requestId = await submit(
-        pi,
-        runtime,
-        "task",
-        assignmentInput!.text,
-        ctx,
-        signal,
-        undefined,
-        assignment!.createdAt,
-        assignment!.requestId,
-        p.action,
-        acceptedAssignment,
-        roleLaunchInputs.briefProfile,
-      );
-      pendingStart.requestId = requestId;
-      accepted = true;
-      requestStatusRefresh?.();
-      return {
-        ok: true,
-        action: p.action,
-        agent: label,
-        definition: agentDefinition,
-        owner_session_id: runtime.ownerSessionId,
-        pane_id: runtime.paneId,
-        session_id: runtime.piSessionId,
-        session_path: runtime.piSessionFile,
-        request_id: runtime.activeRequestId,
-        ...(relaunchReason ? { relaunched: relaunchReason } : {}),
-      };
-    } catch (caught) {
-      if (promptWriteFailed) throw caught;
-      const startupFailure =
-        caught instanceof HerdrStartFailure ? caught : undefined;
-      const error = startupFailure?.cause ?? caught;
-      if (startupFailure) {
-        started = startupFailure.attempt;
-        if (error instanceof OperationError)
-          error.detail.details = {
-            ...error.detail.details,
-            stage: startupFailure.stage,
-          };
-        if (startupFailure.retryAttempted && error instanceof OperationError)
-          error.detail.retryAttempted = true;
-      }
-      let rollbackError: unknown;
-      const embeddedDetails =
-        error instanceof OperationError && error.detail.details
-          ? error.detail.details
-          : undefined;
-      const embeddedPrimary = embeddedDetails?.primary as
-        | {
-            category?: string;
-            message?: string;
-            operation?: string;
-          }
-        | undefined;
-      const primaryCause =
-        embeddedPrimary?.category && embeddedPrimary.message
-          ? {
-              category: embeddedPrimary.category as any,
-              message: embeddedPrimary.message,
-              operation: embeddedPrimary.operation ?? p.action,
-            }
-          : error instanceof OperationError
-            ? {
-                category: error.detail.category,
-                message: error.detail.message,
-                operation: error.detail.operation,
-              }
-            : {
-                category: "internal_failure" as const,
-                message: String(error),
-                operation: p.action,
-              };
-      const embeddedIds = embeddedDetails?.ids as
-        { label?: string; paneId?: string; tabId?: string } | undefined;
-      const ids = {
-        label,
-        ...(started?.paneId ? { paneId: started.paneId } : {}),
-        ...(started?.tabId ? { tabId: started.tabId } : {}),
-        ...(embeddedIds?.paneId ? { paneId: embeddedIds.paneId } : {}),
-        ...(embeddedIds?.tabId ? { tabId: embeddedIds.tabId } : {}),
-      };
-      runtimes.delete(label);
-      try {
-        if (started) {
-          await rollbackStartedAgent(
-            pi,
-            ctx,
-            started,
-            label,
-            workspaceId,
-            runId,
-            mailbox,
-          );
-        } else {
-          await rollbackUnknownStartedAgent(pi, ctx, label, mailbox);
-        }
-      } catch (rollbackFailure) {
-        rollbackError = rollbackFailure;
-        markRetryAttempted(rollbackFailure);
-        const cleanupCause = {
-          category: "internal_failure" as const,
-          message: String(rollbackFailure),
-          operation: "rollback",
-        };
-        const cleanupDetail = JSON.stringify({
-          primary: primaryCause,
-          cleanup: cleanupCause,
-          ids,
+        const launchArgs = agentLaunchArgs(effectiveDefinition, {
+          ...(bodyPromptPath !== undefined ? { bodyPromptPath } : {}),
+          ...(preloadedSkillPromptPaths.length
+            ? { preloadedSkillPromptPaths }
+            : {}),
+          sharedPromptPath,
+          cwd: agentCwd,
+          managedAgent: true,
+          approveProject:
+            agentContext.projectTrusted && sameCwd(agentCwd, ctx.cwd),
+          ...(!resumed ? { inheritedThinking: pi.getThinkingLevel() } : {}),
+          modelDecision: childModel,
+          resolvedSkills: skillResolution.advertised,
         });
-        appendDurableError(pi, ctx, "pi_herdsman_cleanup_error", cleanupDetail);
-      }
-      if (rollbackError) {
-        requestStatusRefresh?.();
-        fail(
-          "rollback_failure",
-          `Agent launch failed and rollback was incomplete. Primary: ${primaryCause.message}. Cleanup: ${String(rollbackError)}`,
+        // A retained process keeps the launch configuration it started with, so
+        // reuse compares this fingerprint with the then-current definition.
+        const launchFingerprint = agentLaunchFingerprint(
+          resolveAgentLaunchInputs(fingerprintDefinition, { cwd: agentCwd }),
+        );
+        started = await startHerdrAgent(pi, ctx, {
+          label,
+          runId,
+          cwd: agentCwd,
+          extensionPath: HERDSMAN_EXTENSION_PATH,
+          placement,
+          ...(placementRevalidator ? { placementRevalidator } : {}),
+          agentArgs: [...launchArgs, ...sessionArgs],
+          env,
+          signal,
+        });
+        const state = await waitForState(
+          mailbox,
+          (s) => s.runId === runId && s.ownerSessionId === owner,
+          { timeoutMs: 30_000, signal },
+        ).catch(() => undefined);
+        if (!state) {
+          let startupDiagnostic: string | undefined;
+          let startupProcess: Record<string, unknown> | undefined;
+          try {
+            const result = await pi.exec(
+              "herdr",
+              [
+                "pane",
+                "read",
+                started.paneId,
+                "--source",
+                "recent-unwrapped",
+                "--lines",
+                "40",
+              ],
+              { cwd: ctx.cwd, signal, timeout: 5_000 },
+            );
+            if (result.code === 0 && !result.killed) {
+              const bytes = Buffer.from(
+                `${result.stdout ?? ""}\n${result.stderr ?? ""}`.trim(),
+                "utf8",
+              );
+              if (bytes.length) {
+                let start = Math.max(0, bytes.length - 4096);
+                while (start < bytes.length && (bytes[start]! & 0xc0) === 0x80)
+                  start++;
+                startupDiagnostic = bytes.subarray(start).toString("utf8");
+              }
+            }
+          } catch {
+            // Startup evidence is advisory; preserve the original failure.
+          }
+          try {
+            const process = await paneProcess(
+              pi,
+              ctx,
+              started.paneId,
+              undefined,
+              undefined,
+              true,
+              2_000,
+            );
+            if (process?.pane_id === started.paneId)
+              startupProcess = {
+                pane_id: process.pane_id,
+                shell_pid: process.shell_pid,
+                foreground_processes: (process.foreground_processes ?? []).map(
+                  ({ argv0, state }) => ({
+                    ...(argv0 ? { argv0 } : {}),
+                    ...(state ? { state } : {}),
+                  }),
+                ),
+              };
+          } catch {
+            // Process evidence is optional; preserve the original failure.
+          }
+          fail(
+            "pane_not_ready",
+            "Agent did not initialize its mailbox",
+            p.action,
+            startupDiagnostic || startupProcess
+              ? {
+                  details: {
+                    ...(startupDiagnostic ? { startupDiagnostic } : {}),
+                    ...(startupProcess ? { startupProcess } : {}),
+                  },
+                }
+              : {},
+          );
+        }
+        const expectedHerdrAgent = herdrAgentAlias(
+          workspaceId,
+          label,
+          state.runId,
+        );
+        if (started.herdrAgent !== expectedHerdrAgent)
+          fail(
+            "target_not_found",
+            "Agent launch returned an unexpected Herdr agent alias",
+            p.action,
+            { ids: { label, paneId: started.paneId } },
+          );
+        if (
+          started.agent &&
+          !herdrAliasMatchesIfReported(started.agent, expectedHerdrAgent)
+        )
+          fail(
+            "target_not_found",
+            "Agent launch returned conflicting Herdr agent aliases",
+            p.action,
+            { ids: { label, paneId: started.paneId } },
+          );
+        const runtime: Runtime = {
+          label,
+          herdrAgent: expectedHerdrAgent,
+          workspaceId,
+          paneId: started.paneId,
+          cwd: started.cwd,
+          runId: state.runId,
+          ownerSessionId: owner,
+          mailboxPath: mailbox,
+          piSessionId: state.piSessionId,
+          piSessionFile: state.piSessionFile,
+          agentDefinition,
+          model: started.agent?.model ?? null,
+          thinking: started.agent?.thinking ?? null,
+        };
+        validateIdentity(runtime, state, {
+          workspace_id: workspaceId,
+          label,
+          pane_id: started.paneId,
+          cwd: started.cwd,
+          pi_session_id: state.piSessionId,
+          pi_session_path: state.piSessionFile,
+        });
+        try {
+          pi.appendEntry(WORKER_LAUNCH_ENTRY, {
+            runId: state.runId,
+            label,
+            fingerprint: launchFingerprint,
+          } satisfies WorkerLaunchEntry);
+        } catch (error) {
+          appendDurableError(pi, ctx, "pi_herdsman_state_error", error);
+        }
+        // Herdr chooses the pane only while starting. Re-render now that the
+        // authoritative final envelope identity is known.
+        assignmentInput = prepareMessageInput(
+          formatAcceptedAssignmentPrompt(acceptedAssignment!),
+          resolveMessageFiles(ctx, p.files, p.action),
+          ctx.cwd,
           p.action,
+          "Task",
           {
-            rollbackOccurred: true,
-            retryAttempted: true,
-            ids,
-            primary: primaryCause,
-            cleanup: {
-              category: "internal_failure",
-              message: String(rollbackError),
-              operation: "rollback",
-            },
-            ...(error instanceof OperationError && error.detail.details
-              ? { details: error.detail.details }
-              : startupFailure
-                ? { details: { stage: startupFailure.stage } }
-                : {}),
-            nextAction: "Resolve the reported cleanup failure before retrying.",
+            inlineLimitBytes: limits.inline.bytes,
+            mailboxLimitBytes: limits.mailbox.bytes,
+            resultBranch: ctx.sessionManager.getBranch(),
+            serializedBytes: (text) =>
+              requestRecordBytesFor(
+                runtime,
+                "task",
+                text,
+                undefined,
+                assignment!.createdAt,
+                assignment!.requestId,
+                acceptedAssignment,
+                roleLaunchInputs.briefProfile,
+              ),
           },
         );
-      }
-      requestStatusRefresh?.();
-      if (embeddedDetails && !rollbackError) {
-        const durableDetail = JSON.stringify({
-          primary: primaryCause,
-          cleanup: embeddedDetails.cleanup,
-          ids,
+        await validateIntegration(pi, runtime, ctx, {
+          signal,
+          waitForSession: true,
         });
-        appendDurableError(pi, ctx, "pi_herdsman_cleanup_error", durableDetail);
-      }
-      if (error instanceof OperationError) {
-        error.detail.rollbackOccurred = true;
-        if (startupFailure?.retryAttempted) error.detail.retryAttempted = true;
-        error.detail.ids = ids;
-        throw error;
-      }
-      fail("internal_failure", String(error), p.action, {
-        rollbackOccurred: true,
-        retryAttempted: startupFailure?.retryAttempted ?? false,
-        ids: {
+        runtimes.set(label, runtime);
+        requestStatusRefresh?.();
+        const requestId = await submit(
+          pi,
+          runtime,
+          "task",
+          assignmentInput!.text,
+          ctx,
+          signal,
+          undefined,
+          assignment!.createdAt,
+          assignment!.requestId,
+          p.action,
+          acceptedAssignment,
+          roleLaunchInputs.briefProfile,
+        );
+        pendingStart.requestId = requestId;
+        accepted = true;
+        requestStatusRefresh?.();
+        return {
+          ok: true,
+          action: p.action,
+          agent: label,
+          definition: agentDefinition,
+          owner_session_id: runtime.ownerSessionId,
+          pane_id: runtime.paneId,
+          session_id: runtime.piSessionId,
+          session_path: runtime.piSessionFile,
+          request_id: runtime.activeRequestId,
+          ...(relaunchReason ? { relaunched: relaunchReason } : {}),
+        };
+      } catch (caught) {
+        if (promptWriteFailed) throw caught;
+        const startupFailure =
+          caught instanceof HerdrStartFailure ? caught : undefined;
+        const error = startupFailure?.cause ?? caught;
+        if (startupFailure) {
+          started = startupFailure.attempt;
+          if (error instanceof OperationError)
+            error.detail.details = {
+              ...error.detail.details,
+              stage: startupFailure.stage,
+            };
+          if (startupFailure.retryAttempted && error instanceof OperationError)
+            error.detail.retryAttempted = true;
+        }
+        let rollbackError: unknown;
+        const embeddedDetails =
+          error instanceof OperationError && error.detail.details
+            ? error.detail.details
+            : undefined;
+        const embeddedPrimary = embeddedDetails?.primary as
+          | {
+              category?: string;
+              message?: string;
+              operation?: string;
+            }
+          | undefined;
+        const primaryCause =
+          embeddedPrimary?.category && embeddedPrimary.message
+            ? {
+                category: embeddedPrimary.category as any,
+                message: embeddedPrimary.message,
+                operation: embeddedPrimary.operation ?? p.action,
+              }
+            : error instanceof OperationError
+              ? {
+                  category: error.detail.category,
+                  message: error.detail.message,
+                  operation: error.detail.operation,
+                }
+              : {
+                  category: "internal_failure" as const,
+                  message: String(error),
+                  operation: p.action,
+                };
+        const embeddedIds = embeddedDetails?.ids as
+          { label?: string; paneId?: string; tabId?: string } | undefined;
+        const ids = {
           label,
           ...(started?.paneId ? { paneId: started.paneId } : {}),
           ...(started?.tabId ? { tabId: started.tabId } : {}),
-        },
-        ...(startupFailure ? { details: { stage: startupFailure.stage } } : {}),
-      });
-    } finally {
-      if (!accepted && pendingStarts?.get(label) === pendingStart) {
-        pendingStarts.delete(label);
+          ...(embeddedIds?.paneId ? { paneId: embeddedIds.paneId } : {}),
+          ...(embeddedIds?.tabId ? { tabId: embeddedIds.tabId } : {}),
+        };
+        runtimes.delete(label);
+        try {
+          if (started) {
+            await rollbackStartedAgent(
+              pi,
+              ctx,
+              started,
+              label,
+              workspaceId,
+              runId,
+              mailbox,
+            );
+          } else {
+            await rollbackUnknownStartedAgent(pi, ctx, label, mailbox);
+          }
+        } catch (rollbackFailure) {
+          rollbackError = rollbackFailure;
+          markRetryAttempted(rollbackFailure);
+          const cleanupCause = {
+            category: "internal_failure" as const,
+            message: String(rollbackFailure),
+            operation: "rollback",
+          };
+          const cleanupDetail = JSON.stringify({
+            primary: primaryCause,
+            cleanup: cleanupCause,
+            ids,
+          });
+          appendDurableError(pi, ctx, "pi_herdsman_cleanup_error", cleanupDetail);
+        }
+        if (rollbackError) {
+          requestStatusRefresh?.();
+          fail(
+            "rollback_failure",
+            `Agent launch failed and rollback was incomplete. Primary: ${primaryCause.message}. Cleanup: ${String(rollbackError)}`,
+            p.action,
+            {
+              rollbackOccurred: true,
+              retryAttempted: true,
+              ids,
+              primary: primaryCause,
+              cleanup: {
+                category: "internal_failure",
+                message: String(rollbackError),
+                operation: "rollback",
+              },
+              ...(error instanceof OperationError && error.detail.details
+                ? { details: error.detail.details }
+                : startupFailure
+                  ? { details: { stage: startupFailure.stage } }
+                  : {}),
+              nextAction: "Resolve the reported cleanup failure before retrying.",
+            },
+          );
+        }
         requestStatusRefresh?.();
-      }
-      for (const promptPath of promptPaths)
-        if (statSync(promptPath, { throwIfNoEntry: false }))
-          unlinkSync(promptPath);
-      try {
-        if (releaseClaim) releaseClaim();
+        if (embeddedDetails && !rollbackError) {
+          const durableDetail = JSON.stringify({
+            primary: primaryCause,
+            cleanup: embeddedDetails.cleanup,
+            ids,
+          });
+          appendDurableError(pi, ctx, "pi_herdsman_cleanup_error", durableDetail);
+        }
+        if (error instanceof OperationError) {
+          error.detail.rollbackOccurred = true;
+          if (startupFailure?.retryAttempted) error.detail.retryAttempted = true;
+          error.detail.ids = ids;
+          throw error;
+        }
+        fail("internal_failure", String(error), p.action, {
+          rollbackOccurred: true,
+          retryAttempted: startupFailure?.retryAttempted ?? false,
+          ids: {
+            label,
+            ...(started?.paneId ? { paneId: started.paneId } : {}),
+            ...(started?.tabId ? { tabId: started.tabId } : {}),
+          },
+          ...(startupFailure ? { details: { stage: startupFailure.stage } } : {}),
+        });
       } finally {
-        if (releaseSessionActivation) releaseSessionActivation();
+        if (!accepted && pendingStarts?.get(label) === pendingStart) {
+          pendingStarts.delete(label);
+          requestStatusRefresh?.();
+        }
+        for (const promptPath of promptPaths)
+          if (statSync(promptPath, { throwIfNoEntry: false }))
+            unlinkSync(promptPath);
+        try {
+          if (releaseClaim) releaseClaim();
+        } finally {
+          if (releaseSessionActivation) releaseSessionActivation();
+        }
       }
+    } catch (error) {
+      if (releaseSessionActivation) {
+        releaseSessionActivation();
+        releaseSessionActivation = undefined;
+      }
+      throw error;
     }
   }
   const agentLabel = p.agent;
@@ -7231,6 +7139,7 @@ async function actionUnsafe(
       {
         inlineLimitBytes: limits.inline.bytes,
         mailboxLimitBytes: limits.mailbox.bytes,
+        resultBranch: ctx.sessionManager.getBranch(),
         serializedBytes: (text) =>
           requestRecordBytesFor(
             runtime,
@@ -7317,6 +7226,7 @@ async function actionUnsafe(
     {
       inlineLimitBytes: limits.inline.bytes,
       mailboxLimitBytes: limits.mailbox.bytes,
+      resultBranch: ctx.sessionManager.getBranch(),
       serializedBytes: (text) =>
         requestRecordBytesFor(
           runtime,
@@ -16043,6 +15953,7 @@ export default function (pi: ExtensionAPI): void {
           {
             inlineLimitBytes: limits.inline.bytes,
             mailboxLimitBytes: limits.mailbox.bytes,
+            resultBranch: ctx.sessionManager.getBranch(),
             serializedBytes: (text) =>
               askRecordBytesFor(state!, askId, text, askCreatedAt),
           },
