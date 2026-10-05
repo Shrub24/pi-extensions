@@ -149,25 +149,53 @@ CLI behavior is unchanged today.
 `extensions/pane-facts.ts` publishes this session's outstanding background work
 on its own Herdr pane, so a sidebar can show what the session is waiting on
 without reading the task store. Each TUI session inside Herdr writes three
-tokens under the `pi-bash-processes` source. A headless session, a session with
-no Herdr pane id, and a session with no running task publishes nothing; the keys
-are cleared when the last task ends and on shutdown.
+tokens under the `pi-bash-processes` source. A headless session and a session
+with no Herdr pane id publish nothing; a session with nothing outstanding
+publishes nothing; the keys are cleared once the last outstanding result has
+been read, and on shutdown.
 
 | Token | Value | When present |
 | --- | --- | --- |
-| `pi_bg_running` | Count of running tasks | At least one running |
-| `pi_bg_tasks` | Running task ids, comma-separated, at most 6 | At least one running |
-| `pi_bg_started` | ISO 8601 start of the oldest running task | At least one running |
+| `pi_bg_running` | Count of running tasks | At least one task is outstanding |
+| `pi_bg_tasks` | Outstanding task ids with their phase (`bg-1:running`, `bg-2:flushing`, `bg-3:review`), comma-separated, at most 6 | At least one task is outstanding |
+| `pi_bg_started` | ISO 8601 start of the oldest outstanding task | At least one task is outstanding |
 
 The facts describe what is outstanding, not what the session is doing, so a
-task spawned mid-turn is advertised while the session is still working. No
-`state`-like token is published: the pane's semantic state stays the official
-Herdr integration's, and a managed worker's assignment projection stays
-pi-herdsman's. Values are terminal-safe and bounded to 80 characters, expire
-after 30 seconds and refresh every 15 seconds while a task runs, so a session
-that dies without clearing leaves at most 30 seconds of stale tokens. These
-tokens are the consumer contract for presentation; nothing reads the task
-store on the consumer's behalf.
+task spawned mid-turn is advertised while the session is still working. A task
+that has exited but whose result has not been read is still outstanding: it
+keeps its id in `pi_bg_tasks`, as `flushing` and then `review`, and only
+`pi_bg_running` drops. No `state`-like token is published: the pane's semantic
+state stays the official Herdr integration's, and a managed worker's assignment
+projection stays pi-herdsman's. Values are terminal-safe and bounded to 80
+characters, expire after 30 seconds and refresh every 15 seconds while a task
+is outstanding, so a session that dies without clearing leaves at most 30
+seconds of stale tokens. These tokens are the consumer contract for
+presentation; nothing reads the task store on the consumer's behalf.
+
+### Radar bus
+
+`extensions/radar-bus.ts` pushes the per-task detail the tokens cannot carry —
+run time, output activity, exit code — to Agent Radar's local socket, the
+contract in `agent-radar/docs/radar-bus.md` (v1). The publisher dials Radar,
+which only listens: it sends `hello` with this session's UUID (and the pane id
+when there is one), then one `tasks` message carrying every outstanding task
+after each change to that set, and an explicit empty list once the last result
+has been read. A session with nothing outstanding opens no connection, and the
+connection closes on shutdown. Each task carries its `command` and `cwd`
+bounded to 256 characters; a log path is never sent, and nothing Radar sends is
+read or acted on.
+
+Publishing is best-effort and off the turn path: the socket directory must be
+owned by this user, mode `0700` and not a symlink (an explicit `RADAR_SOCKET`
+is taken as given), and a missing, refusing or slow Radar is invisible to the
+session — nothing the bus does can fail, delay or retrieve a task. The single
+writer keeps only the newest complete list, so a stalled peer costs nothing but
+memory bounded by one list, and a refused, dropped or closed connection is
+retried with capped backoff (1 s to 30 s) while tasks are outstanding. A socket
+that is absent or fails the trust check is never dialled and holds no timer:
+the path is re-resolved on the next change. State changes go out at once;
+messages that only move `output_bytes` or `last_output_at` are coalesced to
+about one per second.
 
 ## Memory and disk use
 

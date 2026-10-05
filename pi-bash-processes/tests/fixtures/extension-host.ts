@@ -169,6 +169,7 @@ export async function startExtensionHost(options: ExtensionHostOptions = {}): Pr
 		PI_BG_LOG_DIR: process.env.PI_BG_LOG_DIR,
 		PI_BG_LOG_GLOB: process.env.PI_BG_LOG_GLOB,
 		PI_BG_REAL_PATH: process.env.PI_BG_REAL_PATH,
+		RADAR_SOCKET: process.env.RADAR_SOCKET,
 	};
 	// The extension resolves its settings and task directory from the
 	// environment, so these must be in place before the module is imported. A
@@ -180,6 +181,11 @@ export async function startExtensionHost(options: ExtensionHostOptions = {}): Pr
 	process.env.PI_CODING_AGENT_DIR = join(root, "agent");
 	process.env.PI_BG_TASK_DIR = join(root, "logs");
 	for (const key of ["PI_BG_CONSUME_LOG", "PI_BG_LOG_DIR", "PI_BG_LOG_GLOB", "PI_BG_REAL_PATH"] as const) delete process.env[key];
+	// A host that spawns a task publishes on the Radar bus, so point it at a path
+	// inside this host's scratch root: without that, a developer's live Radar
+	// socket would receive every test session's phantom tasks. A test that wants
+	// the bus overwrites this with its own listening socket before its first spawn.
+	process.env.RADAR_SOCKET = join(root, "radar-bus.sock");
 	process.env.PATH = (previousEnv.PATH ?? "").split(":").filter((entry) => !entry.endsWith("/shims")).join(":");
 
 	const restoreEnv = () => {

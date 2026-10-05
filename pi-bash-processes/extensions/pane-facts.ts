@@ -55,26 +55,36 @@ export function factValue(value: string | null | undefined): string | null {
 	return clean ? [...clean].slice(0, MAX_FACT_CHARS).join("") : null;
 }
 
-/** Outstanding task identities and phases, with the exact running count. */
-export function paneFacts(tasks: readonly PaneFactTask[]): PaneFacts {
-  const outstanding = tasks.filter((task) => !resultIsResolved(task));
-  if (outstanding.length === 0) return emptyPaneFacts();
-  const oldest = outstanding.reduce((earliest, task) => task.startedAt < earliest.startedAt ? task : earliest);
-  const entries: string[] = [];
-  for (const task of outstanding.slice(0, MAX_LISTED_TASKS)) {
-    const readiness = taskReadiness(task);
-    const phase = readiness === "running" ? "running" : readiness === "finalizing" ? "flushing" : "review";
-    const entry = `${task.id}:${phase}`;
-    if ([...entries.concat(entry).join(",")].length > MAX_FACT_CHARS) break;
-    entries.push(entry);
-  }
-  return {
-    pi_bg_running: String(outstanding.filter((task) => task.status === "running").length),
-    pi_bg_tasks: factValue(entries.join(",")),
-    pi_bg_started: new Date(oldest.startedAt).toISOString(),
-  };
+export type TaskPhase = "running" | "flushing" | "review";
+
+/** The unresolved tasks: the one set both the pane tokens and the Radar bus describe. */
+export function unresolvedTasks<T extends PaneFactTask>(tasks: readonly T[]): T[] {
+	return tasks.filter((task) => !resultIsResolved(task));
 }
 
+/** The three-word vocabulary shared by `pi_bg_tasks` and the Radar bus. */
+export function taskPhase(task: PaneFactTask): TaskPhase {
+	const readiness = taskReadiness(task);
+	return readiness === "running" ? "running" : readiness === "finalizing" ? "flushing" : "review";
+}
+
+/** Outstanding task identities and phases, with the exact running count. */
+export function paneFacts(tasks: readonly PaneFactTask[]): PaneFacts {
+	const outstanding = unresolvedTasks(tasks);
+	if (outstanding.length === 0) return emptyPaneFacts();
+	const oldest = outstanding.reduce((earliest, task) => (task.startedAt < earliest.startedAt ? task : earliest));
+	const entries: string[] = [];
+	for (const task of outstanding.slice(0, MAX_LISTED_TASKS)) {
+		const entry = `${task.id}:${taskPhase(task)}`;
+		if ([...entries.concat(entry).join(",")].length > MAX_FACT_CHARS) break;
+		entries.push(entry);
+	}
+	return {
+		pi_bg_running: String(outstanding.filter((task) => task.status === "running").length),
+		pi_bg_tasks: factValue(entries.join(",")),
+		pi_bg_started: new Date(oldest.startedAt).toISOString(),
+	};
+}
 
 export function factsArgs(
 	paneId: string,

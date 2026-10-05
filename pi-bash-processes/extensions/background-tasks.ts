@@ -111,6 +111,7 @@ async function loadManagedBashPresentation(): Promise<void> {
 void loadManagedBashPresentation();
 import { createOrphanWatcher, type OrphanWatcher } from "./orphan-watcher.js";
 import { createPaneFactsPublisher, paneFacts } from "./pane-facts.js";
+import { busTasks, createRadarBusPublisher } from "./radar-bus.js";
 import { applyCustomEntryWithBarrier, createPersistence, sessionIdForContext, sidecarStatePath } from "./persistence.js";
 import { mapWithConcurrency, PROBE_CONCURRENCY } from "./probes.js";
 import { defaultSystemdUnitActive, planResourceControlledSpawn, stopResourceControlledTask } from "./resource-control.js";
@@ -1548,6 +1549,9 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		for (const task of tasks.values()) rememberSnapshot(task);
 		if (activeCtx) syncWidget(activeCtx);
 		requestWidgetRender?.();
+		// The only coalesced reaction a running task has: the bus rides it for
+		// counter movement, which the pane tokens never carry.
+		publishRadarBus();
 	};
 	const outputUiRefresh = createCoalescedCall(refreshUi, OUTPUT_UI_REFRESH_MS);
 
@@ -1562,7 +1566,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 	// pane's state stays the official integration's and a worker's assignment
 	// projection stays pi-herdsman's.
 	let paneFactsPublisher: ReturnType<typeof createPaneFactsPublisher> | undefined;
-	const publishPaneFacts = (): void => {
+	const publishPaneTokens = (): void => {
 		const paneId = process.env.HERDR_PANE_ID?.trim();
 		if (!activeCtx || activeCtx.mode !== "tui" || !paneId) return;
 		const facts = paneFacts([...tasks.values()]);
@@ -1579,8 +1583,32 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		// call and the next update or the TTL refresh retries it.
 		void paneFactsPublisher.update(facts);
 	};
+	// The same unresolved set, with per-task detail, goes to Agent Radar's local
+	// socket (openspec `bash-processes-radar-bus`). The bus follows the Pi
+	// session rather than the pane: `hello` carries the session UUID, and the
+	// pane only where there is one. Passive and best-effort.
+	let radarBus: ReturnType<typeof createRadarBusPublisher> | undefined;
+	const publishRadarBus = (): void => {
+		if (activeSessionId === null) return;
+		const list = busTasks([...tasks.values()]);
+		if (!radarBus) {
+			// A session that has never had a task opens no connection.
+			if (list.length === 0) return;
+			radarBus = createRadarBusPublisher();
+		}
+		radarBus.update(activeSessionId, process.env.HERDR_PANE_ID?.trim() || undefined, list);
+	};
+	const publishPaneFacts = (): void => {
+		// Nothing publishes after the shutdown clear: a killed task's close event
+		// lands after it, and would reopen the publisher it just closed.
+		if (shuttingDown) return;
+		publishPaneTokens();
+		publishRadarBus();
+	};
 	/** Clear this pane's keys on shutdown; the publisher aborts any in-flight write first. */
 	const clearPaneFacts = async (): Promise<void> => {
+		radarBus?.close();
+		radarBus = undefined;
 		const publisher = paneFactsPublisher;
 		paneFactsPublisher = undefined;
 		await publisher?.close();
