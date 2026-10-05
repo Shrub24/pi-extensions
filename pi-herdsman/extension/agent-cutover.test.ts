@@ -300,10 +300,11 @@ test("each Agent operation has its own strict schema without projection", () => 
       `${name} rejects cross-operation fields`,
     );
     assert.doesNotThrow(() => makeStrictJsonSchema(schema), name);
-    assert.deepEqual(tool.constrainedSampling, {
-      type: "json_schema",
-      strict: "prefer",
-    });
+    // Constrained sampling is deliberately not requested: when a model supports
+    // strict tools, Anthropic compiles one grammar per request over every strict
+    // tool in the session, and that budget is global and invisible to a package.
+    // See docs/adr/0018-do-not-request-constrained-tool-sampling.md.
+    assert.equal(tool.constrainedSampling, undefined, name);
     assert.equal(
       tool.prepareArguments,
       undefined,

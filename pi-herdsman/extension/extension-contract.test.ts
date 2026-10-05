@@ -99,10 +99,11 @@ function assertPortableToolSchema(tool: any): void {
   assert.doesNotThrow(() => makeStrictJsonSchema(tool.parameters));
   assert.equal(tool.parameters.required?.includes("files") ?? false, false);
   assert.equal(tool.parameters.properties.action, undefined, tool.name);
-  assert.deepEqual(tool.constrainedSampling, {
-    type: "json_schema",
-    strict: "prefer",
-  });
+  // Constrained sampling is deliberately not requested: when a model supports
+  // strict tools, Anthropic compiles one grammar per request over every strict
+  // tool in the session, and that budget is global and invisible to a package.
+  // See docs/adr/0018-do-not-request-constrained-tool-sampling.md.
+  assert.equal(tool.constrainedSampling, undefined, tool.name);
 }
 
 const REGISTERED_ROLE_TOOLS = [

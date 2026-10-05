@@ -12731,7 +12731,6 @@ export default function (pi: ExtensionAPI): void {
           "Send material coordination to the direct supervisor when a decision, action, warning, or review handoff is needed.",
         executionMode: "sequential",
         parameters: supervisorMessageParameters,
-        constrainedSampling: { type: "json_schema", strict: "prefer" },
         execute: async (
           _id: string,
           raw: unknown,
@@ -12939,7 +12938,6 @@ export default function (pi: ExtensionAPI): void {
           "Send a message to another live same-role Lead or Manager session by exact session ID.",
         executionMode: "sequential",
         parameters: peerMessageParameters,
-        constrainedSampling: { type: "json_schema", strict: "prefer" },
         execute: async (
           _id: string,
           raw: unknown,
@@ -13063,7 +13061,6 @@ export default function (pi: ExtensionAPI): void {
           "Supervise direct reports; Managers may delegate new linked-worktree Leads",
         executionMode: "sequential",
         parameters: staffMessageParameters,
-        constrainedSampling: { type: "json_schema", strict: "prefer" },
         execute: async (
           _id: string,
           raw: unknown,
@@ -13394,7 +13391,6 @@ export default function (pi: ExtensionAPI): void {
           description: "List direct-report supervision state.",
           parameters: emptyParameters,
           promptSnippet: undefined,
-          constrainedSampling: { type: "json_schema", strict: "prefer" },
           execute: (
             id: string,
             _p: unknown,
@@ -13415,7 +13411,6 @@ export default function (pi: ExtensionAPI): void {
             "Read bounded live terminal/process evidence for a direct report.",
           parameters: staffTargetParameters,
           promptSnippet: undefined,
-          constrainedSampling: { type: "json_schema", strict: "prefer" },
           execute: (
             id: string,
             p: any,
@@ -13443,7 +13438,6 @@ export default function (pi: ExtensionAPI): void {
             "Read bounded persisted Pi conversation/tool evidence for a direct report.",
           parameters: staffTargetParameters,
           promptSnippet: undefined,
-          constrainedSampling: { type: "json_schema", strict: "prefer" },
           execute: (
             id: string,
             p: any,
@@ -13470,7 +13464,6 @@ export default function (pi: ExtensionAPI): void {
           description: "Send a durable follow-up message to a direct report.",
           parameters: staffMessageParameters,
           promptSnippet: undefined,
-          constrainedSampling: { type: "json_schema", strict: "prefer" },
           execute: (
             id: string,
             p: any,
@@ -13498,7 +13491,6 @@ export default function (pi: ExtensionAPI): void {
             "Start new project work or resume existing work by Git branch. Reuses an unoccupied Herdr worktree when available.",
           parameters: staffDelegateParameters,
           promptSnippet: undefined,
-          constrainedSampling: { type: "json_schema", strict: "prefer" },
           execute: (
             id: string,
             p: any,
@@ -13526,7 +13518,6 @@ export default function (pi: ExtensionAPI): void {
             "Stop an exact direct Lead and its owned execution tree while preserving project work, Pi session, branch, and worktree.",
           parameters: staffTargetParameters,
           promptSnippet: undefined,
-          constrainedSampling: { type: "json_schema", strict: "prefer" },
           execute: (
             id: string,
             p: any,
@@ -13554,7 +13545,6 @@ export default function (pi: ExtensionAPI): void {
             "Complete fulfilled project work while preserving its branch and worktree.",
           parameters: staffDiscardParameters,
           promptSnippet: undefined,
-          constrainedSampling: { type: "json_schema", strict: "prefer" },
           execute: (
             id: string,
             p: any,
@@ -13582,7 +13572,6 @@ export default function (pi: ExtensionAPI): void {
             "Abandon project work by branch, stopping its executor and removing the assignment while preserving Git branch and worktree.",
           parameters: staffDiscardParameters,
           promptSnippet: undefined,
-          constrainedSampling: { type: "json_schema", strict: "prefer" },
           execute: (
             id: string,
             p: any,
@@ -15137,7 +15126,6 @@ export default function (pi: ExtensionAPI): void {
         "List current owned Agent state and refresh the Agent-definition roster. Do not use for progress polling.",
       executionMode: "sequential",
       parameters: agentListParameters,
-      constrainedSampling: { type: "json_schema", strict: "prefer" },
       execute: async (
         _id: string,
         raw: unknown,
@@ -15526,7 +15514,6 @@ export default function (pi: ExtensionAPI): void {
         name: "supervisor_message",
         parameters: supervisorMessageParameters,
         promptSnippet: undefined,
-        constrainedSampling: { type: "json_schema", strict: "prefer" },
         execute: (
           id: string,
           p: any,
@@ -15547,7 +15534,6 @@ export default function (pi: ExtensionAPI): void {
           "List other live ordinary Lead sessions. Do not use for progress polling.",
         parameters: emptyParameters,
         promptSnippet: undefined,
-        constrainedSampling: { type: "json_schema", strict: "prefer" },
         execute: (
           id: string,
           _p: unknown,
@@ -15565,7 +15551,6 @@ export default function (pi: ExtensionAPI): void {
         name: "peer_message",
         parameters: peerMessageParameters,
         promptSnippet: undefined,
-        constrainedSampling: { type: "json_schema", strict: "prefer" },
         execute: (
           id: string,
           p: any,
@@ -15859,7 +15844,6 @@ export default function (pi: ExtensionAPI): void {
     description:
       "Ask your direct owner for a decision that is required to continue. Call this alone as the final tool call of the turn, then stop and wait for the reply. Only one question may be outstanding.",
     executionMode: "sequential",
-    constrainedSampling: { type: "json_schema", strict: "prefer" },
     parameters: Type.Object(
       {
         question: Type.String({
