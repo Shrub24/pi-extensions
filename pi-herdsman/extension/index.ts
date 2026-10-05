@@ -15704,6 +15704,10 @@ export default function (pi: ExtensionAPI): void {
   // been validated yet, so the worker is asked to continue (bounded) before the
   // result is judged; this is not a repair of an invalid answer (ADR 0016).
   let turnCutOff = false;
+  // That turn also produced no text and essentially no output tokens, which
+  // means the provider returned an empty stream rather than the model
+  // overrunning its budget. There is nothing to shorten, so it is judged.
+  let turnEmptyGeneration = false;
   let awaitingContinuation = false;
   let cutOffContinuations: { requestId: string; count: number } | undefined;
   let pendingResult: ResultRecord | undefined;
@@ -15885,10 +15889,26 @@ export default function (pi: ExtensionAPI): void {
     code?: "busy" | "idle" | "invalid" | "identity" | "delivery",
     message?: string,
   ): void => {
-    if (!state) return;
+    if (!state) {
+      reportAcknowledgementFailure(
+        ctx,
+        new Error(
+          `Rejected request ${requestId} could not be acknowledged: worker state is not initialized`,
+        ),
+      );
+      return;
+    }
     const mailbox = process.env.PI_HERDSMAN_MAILBOX!;
     const release = tryClaimAssignmentLock(mailbox);
-    if (!release) return;
+    if (!release) {
+      reportAcknowledgementFailure(
+        ctx,
+        new Error(
+          `Rejected request ${requestId} could not be acknowledged: mailbox assignment lock is occupied`,
+        ),
+      );
+      return;
+    }
     try {
       const current = readAgentState(mailbox);
       if (!current || !sameManagedAgentIdentity(current, state)) return;
@@ -16318,14 +16338,22 @@ export default function (pi: ExtensionAPI): void {
     const id = marker.requestId;
     let request: RequestRecord | undefined;
     try {
-      request = readRequest(process.env.PI_HERDSMAN_MAILBOX!, id);
-    } catch {
+      request = readRequest(process.env.PI_HERDSMAN_MAILBOX!, id, {
+        // A request from an owner running an older build carries no profile;
+        // this worker's own launch profile is the floor in that case.
+        legacyProfileFallback: process.env
+          .PI_HERDSMAN_BRIEF_PROFILE as BriefProfile | undefined,
+      });
+    } catch (error) {
       acknowledgeAndDiscard(
         id,
         false,
         ctx,
         "invalid",
-        "Malformed or oversized request",
+        // The reason reaches the owner as the rejection message; a fixed text
+        // would hide what actually failed (an oversized record reads very
+        // differently from an invalid one).
+        `Invalid request: ${String(error).slice(0, 240)}`,
       );
       return { action: "handled" };
     }
@@ -16760,6 +16788,15 @@ export default function (pi: ExtensionAPI): void {
     freshResponse = true;
     // A reply cut off by the output limit is an incomplete turn, not an answer.
     turnCutOff = message?.stopReason === "length";
+    // A length stop that produced no text and essentially no output tokens is
+    // not a reply cut short: the provider returned an empty stream (observed as
+    // a one-token keepalive), so asking for brevity cannot help.
+    const outputTokens =
+      typeof message?.usage?.output === "number"
+        ? message.usage.output
+        : undefined;
+    turnEmptyGeneration =
+      turnCutOff && !latest && outputTokens !== undefined && outputTokens <= 1;
     awaitingContinuation = false;
   });
   pi.on("turn_end", (_event: unknown, ctx: ExtensionContext) => {
@@ -17180,6 +17217,7 @@ export default function (pi: ExtensionAPI): void {
       if (used >= MAX_RESPONSE_CORRECTIONS) return false;
       cutOffContinuations = { requestId, count: used + 1 };
       turnCutOff = false;
+      turnEmptyGeneration = false;
       awaitingContinuation = true;
       latest = "";
       freshResponse = false;
@@ -17188,6 +17226,7 @@ export default function (pi: ExtensionAPI): void {
     };
     if (
       turnCutOff &&
+      !turnEmptyGeneration &&
       requestCorrection(
         "Your previous reply was cut off by the output limit before it finished. " +
           "Continue the assignment: keep reasoning brief, write artifacts to disk as you go, " +
@@ -17195,7 +17234,15 @@ export default function (pi: ExtensionAPI): void {
       )
     )
       return;
+    if (turnEmptyGeneration)
+      appendDurableError(
+        pi,
+        ctx,
+        "pi_herdsman_state_error",
+        "empty generation: the turn ended on the output limit with no response text and no generated tokens",
+      );
     turnCutOff = false;
+    turnEmptyGeneration = false;
     let resultStatus: ResultRecord["status"] = "failed";
     let resultText: string | undefined;
     let resultError: ResultRecord["error"];

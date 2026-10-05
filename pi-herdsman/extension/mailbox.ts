@@ -260,6 +260,15 @@ function ensure(path: string): void {
 function validate(
   value: unknown,
   kind: keyof typeof LIMITS,
+  options: {
+    /**
+     * Profile to enforce when a V5 assignment request carries none. Only the
+     * receiving boundary sets this: a request written by an owner running an
+     * older build has no profile field, and the worker's own launch profile is
+     * then the floor rather than a reason to discard the request.
+     */
+    legacyProfileFallback?: BriefProfile;
+  } = {},
 ): asserts value is Record<string, unknown> {
   if (!value || typeof value !== "object")
     throw new Error("Invalid mailbox protocol version or record");
@@ -623,8 +632,26 @@ function validate(
       if (needsAssignment) {
         // The request carries the definition's brief profile so this boundary
         // can enforce the same profile floor as the persisted-state boundary
-        // (mailbox state `briefProfile`) instead of accepting any claim.
-        if (!BRIEF_PROFILES.includes(v.briefProfile as BriefProfile))
+        // (mailbox state `briefProfile`) instead of accepting any claim. A
+        // request from an owner running an older build carries none; it is then
+        // validated against the worker's own launch profile, so the absence of
+        // the field can never lower the floor. A profile that is present but not
+        // a known one is always rejected.
+        const declaredProfile = v.briefProfile as BriefProfile | undefined;
+        if (
+          declaredProfile !== undefined &&
+          !BRIEF_PROFILES.includes(declaredProfile)
+        )
+          throw new Error(
+            "V5 task and interrupt requests require a valid brief profile",
+          );
+        const fallback = options.legacyProfileFallback;
+        const briefProfile =
+          declaredProfile ??
+          (fallback !== undefined && BRIEF_PROFILES.includes(fallback)
+            ? fallback
+            : undefined);
+        if (briefProfile === undefined)
           throw new Error(
             "V5 task and interrupt requests require a valid brief profile",
           );
@@ -637,7 +664,7 @@ function validate(
           throw new Error("Accepted assignment request identity does not match");
         validateAcceptedAssignmentContract(v.acceptedAssignment, {
           requestId: assignmentRequestId,
-          minimumProfile: v.briefProfile as BriefProfile,
+          minimumProfile: briefProfile,
         });
       } else if (v.briefProfile !== undefined) {
         throw new Error(
@@ -955,13 +982,14 @@ export function writeRequest(path: string, request: RequestRecord): void {
 export function readRequest(
   path: string,
   requestId: string,
+  options: { legacyProfileFallback?: BriefProfile } = {},
 ): RequestRecord | undefined {
   assertFileId(requestId);
   const v = read<RequestRecord>(
     file(path, `request-${requestId}.json`),
     "request",
   );
-  if (v) validate(v, "request");
+  if (v) validate(v, "request", options);
   if (v && v.requestId !== requestId)
     throw new Error("Request filename identity mismatch");
   if (v?.version === LEGACY_MAILBOX_PROTOCOL_VERSION) {

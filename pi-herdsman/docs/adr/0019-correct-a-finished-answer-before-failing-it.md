@@ -9,6 +9,12 @@ When a worker's final answer cannot be accepted, Herdsman asks that worker to fi
 
 The correction is an ordinary visible follow-up message in the worker's transcript. It names the deficiency (the typed code and up to four field diagnostics) and tells the worker to fix exactly that without redoing finished work. Validation runs again, unchanged, on whatever the worker then produces. When the budget is spent the result is the same one-shot typed failure as before, carrying the last attempt's diagnostics. Only an answer the worker actually gave is corrected; a wait that resolved with no new answer is not.
 
+A length stop that produced no text and no generated tokens is neither case: the
+provider returned an empty stream (observed as a one-token keepalive), so there
+is nothing to shorten. It is judged by the response contract instead of being
+continued for brevity, and it draws on the same budget only when that diagnostic
+itself needs correcting.
+
 This supersedes the part of [ADR 0016](0016-validate-results-against-response-contracts.md) that rejected reprompting after a validation failure. Everything else in 0016 stands: the contract is immutable, validation is framework-observed, and success proves structure and artifact identity, not the truth of claims.
 
 ## Rationale
@@ -26,6 +32,7 @@ ADR 0016 objected that repair would be silent, unbounded and would not make a cl
 ## Consequences
 
 - A worker may take up to two extra turns before a failure is published; assignments that fail do so later.
+- An empty generation does not spend a correction on brevity, so a contract that targets artifacts can publish its validated artifacts from a turn that produced no text at all. A durable record names the empty generation, so such a failure is not misread as a defect in the worker's answer format.
 - The correction prompts live in the worker's session log; the published result is unchanged.
 - Corrections are not recorded on the result itself; add that if an owner needs to see that one occurred.
 

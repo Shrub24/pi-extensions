@@ -1815,6 +1815,74 @@ test("a turn cut off by the output limit is continued instead of settled as a fa
   }
 });
 
+test("an empty generation is judged by the contract instead of continued for brevity", async () => {
+  // A provider that returns a one-token keepalive reports a length stop with no
+  // text at all. Nothing was generated to shorten, so the continuation must not
+  // ask for brevity; the response-contract diagnostic is the accurate one.
+  const mailbox = setAgentEnvironment("empty-generation-agent");
+  const agent = fakePi();
+  const context = fakeContext();
+  registerExtension!(agent.pi as never);
+  await agent.events.get("session_start")![0](undefined, context);
+  const started = readAgentState(mailbox)!;
+  const requestId = randomUUID();
+  writeRequest(mailbox, {
+    version: 5,
+    runId: started.runId,
+    requestId,
+    ownerSessionId: started.ownerSessionId,
+    workspaceId: started.workspaceId,
+    agentLabel: started.agentLabel,
+    paneId: started.paneId,
+    kind: "task",
+    text: "Do the work",
+    createdAt: Date.now(),
+  });
+  agent.events.get("input")![0]({ text: controlMarker(requestId) }, context);
+  try {
+    agent.events.get("message_end")![0](
+      {
+        message: {
+          role: "assistant",
+          content: [],
+          stopReason: "length",
+          usage: { output: 1 },
+        },
+      },
+      context,
+    );
+    await agent.events.get("agent_settled")![0](undefined, context);
+    await agent.events.get("agent_settled")![0](undefined, context);
+    assert.equal(readResult(mailbox, requestId), undefined);
+    assert.equal(agent.sentUsers.length, 1, "one correction is requested");
+    assert.doesNotMatch(
+      JSON.stringify(agent.sentUsers[0]),
+      /cut off by the output limit/u,
+    );
+    assert.match(
+      JSON.stringify(agent.sentUsers[0]),
+      /did not satisfy the assignment's response contract/u,
+    );
+    agent.events.get("message_end")![0](
+      {
+        message: { role: "assistant", content: "Finished.", stopReason: "stop" },
+      },
+      context,
+    );
+    await agent.events.get("agent_settled")![0](undefined, context);
+    await agent.events.get("agent_settled")![0](undefined, context);
+    assert.equal(readResult(mailbox, requestId)?.status, "completed");
+    assert.equal(
+      agent.sentUsers.length,
+      1,
+      "a complete answer asks for nothing more",
+    );
+  } finally {
+    fireShutdown(agent);
+    resetAgentMailbox(mailbox);
+  }
+});
+
 test("a worker that keeps being cut off fails after two continuations, not forever", async () => {
   const mailbox = setAgentEnvironment("truncated-forever-agent");
   const agent = fakePi();

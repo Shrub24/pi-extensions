@@ -282,6 +282,65 @@ test("V5 task and interrupt requests carry and enforce the definition's brief pr
   });
   assert.equal(readRequest(path, interruptId)?.briefProfile, "common");
 });
+test("a V5 request written without a profile is read against the worker's own profile", () => {
+  // An owner running an older build sends no `briefProfile` at all. The
+  // receiving boundary must not discard that request outright: it validates the
+  // assignment against the worker's own launch profile, so the absent field can
+  // never lower the floor. Without a fallback it still refuses.
+  const path = mkdtempSync(join(tmpdir(), "pi-herdsman-mailbox-test-"));
+  const requestId = randomUUID();
+  const assignment = (profile: "common" | "execution") =>
+    createAcceptedAssignmentContract(
+      requestId,
+      parseDelegationBrief(DELEGATION_BRIEF_EXAMPLES[profile]),
+      DEFAULT_RESPONSE_CONTRACT,
+      process.cwd(),
+      1024 * 1024,
+    );
+  const writeLegacy = (acceptedAssignment: unknown, briefProfile?: string) => {
+    writeFileSync(
+      join(path, `request-${requestId}.json`),
+      JSON.stringify({
+        version: 5,
+        runId: state.runId,
+        requestId,
+        ownerSessionId: state.ownerSessionId,
+        workspaceId: state.workspaceId,
+        agentLabel: state.agentLabel,
+        paneId: state.paneId,
+        kind: "task",
+        text: "work",
+        createdAt: Date.now(),
+        acceptedAssignment,
+        ...(briefProfile === undefined ? {} : { briefProfile }),
+      }),
+      "utf8",
+    );
+  };
+  writeLegacy(assignment("execution"));
+  assert.throws(
+    () => readRequest(path, requestId),
+    /require a valid brief profile/u,
+  );
+  assert.equal(
+    readRequest(path, requestId, { legacyProfileFallback: "execution" })
+      ?.requestId,
+    requestId,
+  );
+  // The fallback is a floor, not a bypass: a legacy brief claiming less than the
+  // worker's own profile is still rejected at this boundary.
+  writeLegacy(assignment("common"));
+  assert.throws(
+    () => readRequest(path, requestId, { legacyProfileFallback: "execution" }),
+    /requires execution/u,
+  );
+  // A profile that is present but unknown stays invalid, fallback or not.
+  writeLegacy(assignment("execution"), "nonsense");
+  assert.throws(
+    () => readRequest(path, requestId, { legacyProfileFallback: "execution" }),
+    /require a valid brief profile/u,
+  );
+});
 test("Pi UUIDv7 session and run identities are valid mailbox fields", () => {
   const path = mkdtempSync(join(tmpdir(), "pi-herdsman-mailbox-test-"));
   const v7State: ManagedAgentState = {
