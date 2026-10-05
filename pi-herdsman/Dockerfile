@@ -12,8 +12,7 @@ RUN npm ci
 
 COPY . .
 
-RUN npm run build \
- && npm run package:audit \
+RUN npm run package:audit \
  && node -e '\
 const runtime = require("./package.json").piHerdsman?.runtime; \
 if (!runtime?.pi || !runtime.herdr?.version || !runtime.herdr?.sha256) \

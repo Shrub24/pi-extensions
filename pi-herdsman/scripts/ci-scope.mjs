@@ -58,12 +58,6 @@ function classify(paths) {
       continue;
     }
 
-    if (path === "scripts/build.mjs") {
-      packageCheck = true;
-      smoke();
-      continue;
-    }
-
     if (path === "scripts/package-audit.mjs") {
       packageCheck = true;
       continue;

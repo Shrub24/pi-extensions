@@ -77,7 +77,6 @@ jobs:
           node-version: 22.19.0
           package-manager-cache: false
       - run: npm ci
-      - run: npm run build
       - run: npm run package:audit
 
   container:

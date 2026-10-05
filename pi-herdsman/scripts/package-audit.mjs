@@ -20,7 +20,7 @@ const packed = JSON.parse(
 );
 const files = packed[0]?.files ?? [];
 const allowed =
-  /^(?:package\.json|README\.md|SKILL\.md|LICENSE|docs\/|dist\/)/u;
+  /^(?:package\.json|README\.md|SKILL\.md|LICENSE|docs\/|extension\/)/u;
 const expectedRoot = new Set([
   "package.json",
   "README.md",
@@ -30,10 +30,9 @@ const expectedRoot = new Set([
 const expectedDefinitions = readdirSync(
   resolve(root, "extension/agent-definitions"),
 ).filter((name) => name.endsWith(".md"));
-const expectedDist = new Set([
-  "dist/index.js",
-  "dist/index.js.map",
-  ...expectedDefinitions.map((name) => `dist/agent-definitions/${name}`),
+const expectedSource = new Set([
+  "extension/index.ts",
+  ...expectedDefinitions.map((name) => `extension/agent-definitions/${name}`),
 ]);
 for (const path of expectedRoot)
   if (!files.some((entry) => normalize(entry.path) === path)) {
@@ -41,11 +40,11 @@ for (const path of expectedRoot)
     process.exitCode = 1;
   }
 for (const path of files.map((entry) => normalize(entry.path)))
-  if (path.startsWith("dist/") && !expectedDist.has(path)) {
+  if (path.startsWith("dist/")) {
     console.error(`unexpected package path: ${path}`);
     process.exitCode = 1;
   }
-for (const path of expectedDist)
+for (const path of expectedSource)
   if (!files.some((entry) => normalize(entry.path) === path)) {
     console.error(`missing package path: ${path}`);
     process.exitCode = 1;
@@ -100,12 +99,12 @@ try {
   if (errors.length)
     throw new Error(
       [
-        "Pi failed to load built package extension:",
+        "Pi failed to load package extension:",
         ...errors.map(({ path, error }) => `${path}: ${error}`),
       ].join("\n"),
     );
 
-  const expectedEntry = resolve(root, "dist/index.js");
+  const expectedEntry = resolve(root, "extension/index.ts");
   const loadedEntries = extensions.map(({ resolvedPath }) => resolvedPath);
 
   if (loadedEntries.length !== 1 || loadedEntries[0] !== expectedEntry)

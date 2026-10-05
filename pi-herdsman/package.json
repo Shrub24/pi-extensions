@@ -39,7 +39,7 @@
   ],
   "pi": {
     "extensions": [
-      "./dist/index.js"
+      "./extension/index.ts"
     ],
     "skills": [
       "."
@@ -64,11 +64,9 @@
     "test": "node --experimental-test-module-mocks --import=./scripts/test-env.mjs --test --test-timeout=10000",
     "smoke": "node scripts/smoke.mjs",
     "check": "node scripts/check.mjs",
-    "build": "node scripts/build.mjs",
     "package:audit": "node scripts/package-audit.mjs",
-    "validate": "npm run check && npm run build && npm run package:audit",
-    "release:check": "npm run validate && npm publish --dry-run --ignore-scripts",
-    "prepack": "npm run build"
+    "validate": "npm run check && npm run package:audit",
+    "release:check": "npm run validate && npm publish --dry-run --ignore-scripts"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
@@ -91,7 +89,7 @@
     "SKILL.md",
     "LICENSE",
     "docs",
-    "dist"
+    "extension"
   ],
   "publishConfig": {
     "registry": "https://registry.npmjs.org/"
