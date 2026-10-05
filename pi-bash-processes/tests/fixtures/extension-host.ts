@@ -18,9 +18,15 @@ import { sidecarStatePath } from "../../extensions/persistence.js";
  *
  * One host per test file: the host environment (HOME, the agent directory, the
  * task directory) is process-wide and Pi's settings reads are memoized over it,
- * so a second host started after the first serves its own settings to both.
- * Bun runs one file at a time, so a host created at a file's top level owns the
- * environment until its `dispose()`.
+ * so a second host started after the first serves its own settings to both. That
+ * memo outlives `dispose()`, so a file that reads different settings —
+ * `codemode-bash-intent.test.ts` and its required intent mode — silently keeps
+ * an earlier file's answers unless each file runs in its own worker. The package
+ * runs `bun test --parallel=4`, which isolates them; a bare `bun test` runs the
+ * files in one process and fails that file.
+ *
+ * Bun runs one file at a time within a worker, so a host created at a file's top
+ * level owns the environment until its `dispose()`.
  */
 export interface HostTool {
 	name: string;
