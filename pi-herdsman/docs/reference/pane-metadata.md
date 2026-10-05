@@ -38,7 +38,7 @@ The set describes outstanding work, not the agent: it is published while the pan
 
 ## Background task facts
 
-`pi-bash-processes` owns three more keys on the same pane for the background tasks it manages: `pi_bg_running` (exact count of running tasks), `pi_bg_tasks` (their ids, comma-separated, capped at six) and `pi_bg_started` (the oldest running task's ISO 8601 start). They carry presence and identity only and are cleared on the last exit.
+`pi-bash-processes` owns three more keys on the same pane for the background tasks it manages: `pi_bg_running` (exact count of *running* tasks), `pi_bg_tasks` (their `<id>:<phase>` entries, comma-separated, capped at six) and `pi_bg_started` (the oldest outstanding task's ISO 8601 start). They carry presence and identity only and are cleared when the last task resolves. The phase is one of `running`, `flushing` and `review`, the same three words the Radar bus uses.
 
 ## Deriving a pane's activity state
 
@@ -47,10 +47,13 @@ A consumer derives one activity state from the facts on the pane. No publisher e
 1. A live `pi_herdsman_state=lost` from the owner wins: the pane is lost; an expired owner value is not used.
 2. Otherwise a working native Herdr state stays working, awaited items included.
 3. A native state that is unknown or missing stays unknown.
-4. Otherwise a non-empty union of awaited facts is waiting.
+4. Otherwise a non-empty union of awaited facts is waiting: any entry in
+   `pi_bg_tasks` or any item in `pi_herdsman_awaited`.
 5. Otherwise the native state stands: idle, blocked or done.
 
 The union spans publishers, because `pi_herdsman_awaited` and the `pi_bg_*` background facts have different owners and the contract forbids one key with two publishers. The owner's assignment projection is never a second authority for this state.
+
+Step 4 reads the `pi_bg_tasks` entries, not `pi_bg_running`. The count covers only tasks whose process is alive, so a pane whose tasks have all exited and are awaiting retrieval publishes `pi_bg_running=0` beside a non-empty `pi_bg_tasks` (`bg-7:review,bg-8:review`) and is still waiting. Deriving from the count reports that pane as idle.
 
 ## Herdr storage model and limits
 
