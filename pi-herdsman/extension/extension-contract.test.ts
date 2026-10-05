@@ -226,6 +226,10 @@ const STAFF_TOOL_CASES = [
 ] as const;
 
 test("the documented agent_extend schema matches the registered tool", () => {
+  // The registered tool set follows the session's role, so a managed-worker
+  // environment inherited from the invoking shell (PI_HERDSMAN_MAILBOX and
+  // friends) registers worker tools and the lead schema is absent.
+  setLeadEnvironment();
   const pi = fakePi();
   registerExtension!(pi.pi as never);
   const tool = pi.tools.find(
