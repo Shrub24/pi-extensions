@@ -90,7 +90,9 @@ live agent execution (or, for `agent_extend`, only its advisory checkpoint) and
 are available only when listed. Read-only `agent_inspect` captures bounded live terminal/process evidence.
 `agent_transcript` captures bounded persisted Pi conversation and tool evidence
 when listed. Neither changes agent
-state. A completed agent does not remain available for another assignment.
+state. A delivered worker with a retained pane stays available for another
+assignment through `agent_continue`; with `retainWorkers: false` it is cleaned up
+at delivery and is not reused.
 
 Use `agent_steer` only to change active work non-preemptively. Steering does not cancel
 an in-flight model or tool operation; Pi may queue it until the current
