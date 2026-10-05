@@ -100,7 +100,10 @@ fields; custom definitions use the common profile unless configured stricter.
 
 Required `context.inputs` are validated and snapshotted privately at admission,
 then bound to the request identity so recovery cannot silently replace their
-contents. `agent_steer` and `agent_reply` remain free-form and do not create new
+contents. A task or interrupt request also carries the definition's briefing
+profile, so the mailbox request boundary enforces the same profile floor as the
+persisted worker state and a weaker claimed profile is rejected before it is
+admitted. `agent_steer` and `agent_reply` remain free-form and do not create new
 assignments.
 
 The brief describes incoming work. Its separate `response` requirement resolves

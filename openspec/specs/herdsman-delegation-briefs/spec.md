@@ -39,7 +39,7 @@ The effective worker definition SHALL select a briefing profile. Every profile S
 
 ### Requirement: Context snapshots and admission consistency
 
-Validated context references SHALL use the existing supported attachment/result-reference mechanisms and their snapshot, permission and size rules. The brief and its resolved response contract SHALL be bound to the accepted request. Owner-side and worker-side admission SHALL agree on the validated contract. Warm continuation with a new task and interrupt replacement when otherwise eligible SHALL require a fresh valid brief; recovery of an existing assignment SHALL use its already accepted contract.
+Validated context references SHALL use the existing supported attachment/result-reference mechanisms and their snapshot, permission and size rules. The brief and its resolved response contract SHALL be bound to the accepted request. Owner-side and worker-side admission SHALL agree on the validated contract. A V5 task or interrupt request SHALL carry the definition's briefing profile, and the request boundary SHALL enforce that profile as the assignment's floor rather than accepting a weaker claimed profile; a request without a valid profile SHALL be rejected. Warm continuation with a new task and interrupt replacement when otherwise eligible SHALL require a fresh valid brief; recovery of an existing assignment SHALL use its already accepted contract.
 
 #### Scenario: Warm continuation
 - **WHEN** an idle retained worker receives a new task
@@ -52,6 +52,10 @@ Validated context references SHALL use the existing supported attachment/result-
 #### Scenario: Existing assignment recovery
 - **WHEN** an accepted assignment recovers after restart
 - **THEN** it retains the accepted brief and response requirements rather than resolving mutable current defaults again
+
+#### Scenario: Weaker profile at the request boundary
+- **WHEN** a task or interrupt request carries a definition brief profile that is stronger than the profile its accepted assignment claims
+- **THEN** the request is rejected at the mailbox boundary instead of admitting the weaker claim
 
 ### Requirement: Canonical examples and useful errors
 

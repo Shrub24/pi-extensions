@@ -46,9 +46,11 @@ Directly owned live records may expose the applicable live controls; directly
 owned live or proven `lost` records may expose `agent_close` when the applicable close
 preflight currently succeeds. They may also expose the read-only `agent_transcript`
 action when a materialized persisted Pi session file exists. `agent_extend`
-appears only for a directly owned record with an armed soft window, so it is
-absent when `softTimeoutMs` is `0`, when the assignment has resolved, and for
-every record that is not directly owned. Unknown records and
+appears only for a directly owned, currently live record with an armed soft
+window, so it is absent when `softTimeoutMs` is `0`, when the assignment has
+resolved, for every record that is not directly owned, and for a recovered
+`unknown` or proven `lost` record. A direct call for such a record fails with
+`agent_busy` and changes no window. Unknown records and
 non-direct descendants remain fail-closed with no actions.
 
 ## Soft-deadline windows

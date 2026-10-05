@@ -86,18 +86,19 @@ function writeRequest(path: string, request: RequestRecord): void {
   if (
     request.version === 5 &&
     (request.kind === "task" || request.kind === "interrupt") &&
-    !request.acceptedAssignment &&
     validRequestId.test(request.requestId)
   ) {
-    Object.assign(request, {
-      acceptedAssignment: createAcceptedAssignmentContract(
+    if (!request.acceptedAssignment) {
+      request.acceptedAssignment = createAcceptedAssignmentContract(
         request.requestId,
         parseDelegationBrief(DELEGATION_BRIEF_EXAMPLES.common),
         DEFAULT_RESPONSE_CONTRACT,
         process.cwd(),
         1024 * 1024,
-      ),
-    });
+      );
+    }
+    request.briefProfile =
+      request.briefProfile ?? request.acceptedAssignment.brief.profile;
   }
   writeMailboxRequest(path, request);
 }
@@ -214,6 +215,72 @@ test("V5 task and interrupt requests require an accepted assignment contract", (
   const steer = { ...base, requestId: randomUUID(), kind: "steer" as const };
   writeMailboxRequest(path, steer);
   assert.deepEqual(readRequest(path, steer.requestId), steer);
+});
+test("V5 task and interrupt requests carry and enforce the definition's brief profile", () => {
+  const path = mkdtempSync(join(tmpdir(), "pi-herdsman-mailbox-test-"));
+  const requestId = randomUUID();
+  const commonAssignment = createAcceptedAssignmentContract(
+    requestId,
+    parseDelegationBrief(DELEGATION_BRIEF_EXAMPLES.common),
+    DEFAULT_RESPONSE_CONTRACT,
+    process.cwd(),
+    1024 * 1024,
+  );
+  const base: RequestRecord = {
+    version: 5,
+    runId: state.runId,
+    requestId,
+    ownerSessionId: state.ownerSessionId,
+    workspaceId: state.workspaceId,
+    agentLabel: state.agentLabel,
+    paneId: state.paneId,
+    kind: "task",
+    text: "work",
+    createdAt: Date.now(),
+  };
+  // The request must carry the definition's profile; a V5 assignment request
+  // without it is rejected rather than silently treated as profile-free.
+  assert.throws(
+    () =>
+      writeMailboxRequest(path, {
+        ...base,
+        acceptedAssignment: commonAssignment,
+      }),
+    /require a valid brief profile/,
+  );
+  // A brief that claims a weaker profile than the request's own is rejected at
+  // this boundary, matching the persisted-state validator.
+  assert.throws(
+    () =>
+      writeMailboxRequest(path, {
+        ...base,
+        briefProfile: "review",
+        acceptedAssignment: commonAssignment,
+      }),
+    /requires review/u,
+  );
+  // Matching profiles are accepted, and the interrupt request form agrees.
+  writeMailboxRequest(path, {
+    ...base,
+    briefProfile: "common",
+    acceptedAssignment: commonAssignment,
+  });
+  assert.equal(readRequest(path, requestId)?.briefProfile, "common");
+  const interruptId = randomUUID();
+  writeMailboxRequest(path, {
+    ...base,
+    requestId: interruptId,
+    kind: "interrupt",
+    briefProfile: "common",
+    acceptedAssignment: createAcceptedAssignmentContract(
+      interruptId,
+      parseDelegationBrief(DELEGATION_BRIEF_EXAMPLES.common),
+      DEFAULT_RESPONSE_CONTRACT,
+      process.cwd(),
+      1024 * 1024,
+    ),
+  });
+  assert.equal(readRequest(path, interruptId)?.briefProfile, "common");
 });
 test("Pi UUIDv7 session and run identities are valid mailbox fields", () => {
   const path = mkdtempSync(join(tmpdir(), "pi-herdsman-mailbox-test-"));

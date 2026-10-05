@@ -255,20 +255,24 @@ export function writeAgentState(
 export function writeRequest(mailbox: string, request: RequestRecord): void {
   if (
     request.version === 5 &&
-    (request.kind === "task" || request.kind === "interrupt") &&
-    !request.acceptedAssignment
+    (request.kind === "task" || request.kind === "interrupt")
   ) {
     const state = readAgentState(mailbox);
-    request = {
-      ...request,
-      acceptedAssignment: fixtureAcceptedAssignment(
+    const acceptedAssignment =
+      request.acceptedAssignment ??
+      fixtureAcceptedAssignment(
         request.kind === "task"
           ? request.requestId
           : (state?.activeRequestId ??
             state?.completedRequestId ??
             request.requestId),
         state?.briefProfile ?? "common",
-      ),
+      );
+    request = {
+      ...request,
+      acceptedAssignment,
+      briefProfile:
+        request.briefProfile ?? acceptedAssignment.brief.profile,
     };
   }
   writeMailboxRequest(mailbox, request);

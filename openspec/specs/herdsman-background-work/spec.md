@@ -35,7 +35,7 @@ At turn settlement, a worker with outstanding owned background work SHALL enter 
 
 ### Requirement: Wake, review and resume
 
-Completion/readiness and progress reminders SHALL resume waiting workers through the existing background-work wake delivery. Waiting SHALL NOT require a blocking wait tool or repeated model polling. Terminal work SHALL be resolved by a successful result handoff or a confirmed cancellation with its result; an explicitly delivered unrecoverable capture error SHALL resolve the work as a failure, never as success.
+Completion/readiness and progress reminders SHALL resume waiting workers through the existing background-work wake delivery. Waiting SHALL NOT require a blocking wait tool or repeated model polling. Terminal work SHALL be resolved by a successful result handoff or a confirmed cancellation with its result; an explicitly delivered unrecoverable capture error SHALL resolve the work as a failure, never as success. A withheld settlement SHALL NOT depend on the provider's wake arriving: while an assignment is held the worker SHALL re-query the provider on a bounded cadence, and a provider change notification SHALL let settlement re-run once a fresh answer is pending. Publication SHALL remain exactly once per assignment, the re-query SHALL stop when the assignment settles or the worker is reused or closed, and the durable withhold record SHALL still be written while the hold persists.
 
 #### Scenario: Exit notifications disabled
 - **WHEN** a waiting worker's task reaches terminal-ready state with ordinary exit notifications disabled
@@ -52,6 +52,10 @@ Completion/readiness and progress reminders SHALL resume waiting workers through
 #### Scenario: Irrecoverable capture
 - **WHEN** the worker explicitly receives an unrecoverable result-capture error
 - **THEN** the work can resolve as a recorded failure without certifying complete output
+
+#### Scenario: Resolution without a wake
+- **WHEN** a held worker's provider reports the outstanding work resolved without delivering a wake
+- **THEN** the worker still produces and publishes exactly one post-review result through the bounded provider re-query
 
 ### Requirement: Safe controls and deadlines while waiting
 

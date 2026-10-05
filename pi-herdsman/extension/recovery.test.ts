@@ -7032,6 +7032,130 @@ test("a proven lost assignment drops agent_extend from available_tools", async (
     fakeContext(),
   );
   assert.equal(attempted.details.ok, false);
+  assert.equal(
+    pi.entries.filter(
+      (entry: any) =>
+        entry.customType === "pi-herdsman-soft-window" &&
+        entry.data.extended === true,
+    ).length,
+    0,
+    "a refused lost-worker extension records no window",
+  );
+  pi.events.get("session_shutdown")?.[0]();
+  resetAgentMailbox(mailbox);
+});
+
+test("agent_extend refuses a non-live worker's recovered window", async (t) => {
+  setLeadEnvironment();
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const label = "soft-extend-nonlive";
+  const identity = recoveryIdentity(label);
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  resetAgentMailbox(mailbox);
+  writeAgentState(mailbox, {
+    ...managedState(label, REQUEST_ID, identity),
+    lastActivityAt: now,
+    lastAck: {
+      requestId: REQUEST_ID,
+      accepted: true,
+      acknowledgedAt: now - 10_000,
+    },
+  });
+  const entries = [softWindowEntry(label, REQUEST_ID, now - 10_000, 300_000)];
+  const liveExec = leadExec(
+    label,
+    "working",
+    identity.piSessionId,
+    undefined,
+    identity.piSessionId,
+    identity,
+  );
+  // The session inventory no longer proves this worker's physical identity
+  // (presence `unknown`), yet the official integration still reports its exact
+  // session, so runtime resolution succeeds and the extend branch is reached.
+  const otherSession = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+  const inventoryExec = (command: string, args: readonly string[]) => {
+    if (command === "herdr" && isApiSnapshot(args)) {
+      const snapshot = JSON.parse(
+        listResponse(label, "working", otherSession, identity),
+      );
+      return {
+        stdout: JSON.stringify({
+          id: AGENT_ID,
+          result: {
+            snapshot: {
+              agents: snapshot.agents,
+              panes: [
+                {
+                  pane_id: identity.paneId,
+                  workspace_id: WORKSPACE,
+                  cwd: "/tmp",
+                  agent: label,
+                  agent_status: "working",
+                  agent_session: {
+                    source: "herdr:pi",
+                    agent: "pi",
+                    kind: "id",
+                    value: otherSession,
+                  },
+                },
+              ],
+            },
+          },
+        }),
+        stderr: "",
+        code: 0,
+      };
+    }
+    return liveExec(command, args);
+  };
+  const pi = fakePi({ entries, exec: inventoryExec });
+  registerExtension!(pi.pi as never);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  await pi.events.get("session_start")![0](undefined, fakeContext(entries));
+  for (let index = 0; index < 4; index++)
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+  const listed = await agentTool(pi, "list").execute(
+    "id",
+    {},
+    undefined,
+    undefined,
+    fakeContext(),
+  );
+  const agent = listed.details.agents.find(
+    (candidate: any) => candidate.agent === label,
+  );
+  assert.equal(agent.state, "unknown");
+  assert.equal(
+    (agent.available_tools as string[]).includes("agent_extend"),
+    false,
+    "a non-live record advertises no extension",
+  );
+
+  const attempted = await agentTool(pi, "extend").execute(
+    "id",
+    { agent: label, windowMs: 900_000 },
+    undefined,
+    undefined,
+    fakeContext(),
+  );
+  assert.equal(attempted.details.ok, false);
+  assert.equal(
+    attempted.details.error.category,
+    "agent_busy",
+    `extend refuses a non-live worker through its own guard: ${JSON.stringify(attempted.details)}`,
+  );
+  assert.equal(
+    pi.entries.filter(
+      (entry: any) =>
+        entry.customType === "pi-herdsman-soft-window" &&
+        entry.data.extended === true,
+    ).length,
+    0,
+    "a refused non-live extension records no window",
+  );
   pi.events.get("session_shutdown")?.[0]();
   resetAgentMailbox(mailbox);
 });

@@ -391,6 +391,7 @@ const ATTENTION_REPEAT_MIN_MS = 60_000;
 const ATTENTION_FIRST_REPEAT_MS = STALE_AFTER_MS / 2;
 const ACTIVITY_WRITE_MIN_MS = 5_000;
 const RESULT_WRITE_MAX_ATTEMPTS = 8;
+const SETTLEMENT_BACKSTOP_MS = 5_000;
 const MAX_RESPONSE_INLINE_BYTES = 1024 * 1024;
 const MAX_RESPONSE_ARTIFACT_BYTES = 1024 * 1024;
 const TOKEN_ESTIMATE_BYTES = 4;
@@ -2634,11 +2635,18 @@ async function submit(
   requestId = randomUUID(),
   operation = kind === "task" ? "delegate" : kind,
   acceptedAssignment?: AcceptedAssignmentContract,
+  briefProfile?: BriefProfile,
 ): Promise<string> {
   if (!text.trim())
     fail("invalid_request", "Message must not be empty", operation);
   if (kind === "reply" && !askId)
     fail("invalid_request", "Reply request is missing its ask ID", operation);
+  if ((kind === "task" || kind === "interrupt") && !briefProfile)
+    fail(
+      "invalid_request",
+      "Task and interrupt requests require the definition's brief profile",
+      operation,
+    );
   const request: RequestRecord = {
     version: 5,
     runId: runtime.runId,
@@ -2650,6 +2658,9 @@ async function submit(
     kind,
     ...(kind === "reply" ? { askId } : {}),
     ...(acceptedAssignment ? { acceptedAssignment } : {}),
+    ...(briefProfile && kind !== "reply" && kind !== "steer"
+      ? { briefProfile }
+      : {}),
     text,
     createdAt,
   };
@@ -4621,6 +4632,7 @@ async function resolveRuntime(
   agent: any;
   state: ManagedAgentState;
   controlState: import("./core.ts").AgentControlState;
+  presence: ManagedAgentPresence;
 }> {
   const snapshot = await managedAgentSnapshots(pi, ctx, signal);
   const matches = snapshot.agents.filter(
@@ -4704,7 +4716,7 @@ async function resolveRuntime(
   runtimes.set(runtime.label, runtime);
   validateIdentity(runtime, state, agent);
   await validateIntegration(pi, runtime, ctx, { signal });
-  return { runtime, agent, state, controlState: agent.state };
+  return { runtime, agent, state, controlState: agent.state, presence: matches[0].presence };
 }
 function runtimeForListedAgent(
   agent: any,
@@ -5807,6 +5819,7 @@ function requestRecordBytesFor(
   createdAt: number,
   requestId: string,
   acceptedAssignment?: AcceptedAssignmentContract,
+  briefProfile?: BriefProfile,
 ): number {
   return mailboxRecordBytes({
     version: 5,
@@ -5819,6 +5832,9 @@ function requestRecordBytesFor(
     kind,
     ...(kind === "reply" ? { askId } : {}),
     ...(acceptedAssignment ? { acceptedAssignment } : {}),
+    ...(briefProfile && kind !== "reply" && kind !== "steer"
+      ? { briefProfile }
+      : {}),
     text,
     createdAt,
   });
@@ -5835,6 +5851,7 @@ function prospectiveAssignmentFits(
   requestId: string,
   acceptedAssignment: AcceptedAssignmentContract,
   mailboxLimitBytes: number,
+  briefProfile?: BriefProfile,
 ): boolean {
   return (
     mailboxRecordBytes({
@@ -5847,6 +5864,7 @@ function prospectiveAssignmentFits(
       paneId,
       kind: "task",
       acceptedAssignment,
+      ...(briefProfile ? { briefProfile } : {}),
       text,
       createdAt,
     }) <= mailboxLimitBytes
@@ -6386,6 +6404,7 @@ async function actionUnsafe(
               assignment!.requestId,
               acceptedAssignment!,
               limits.mailbox.bytes,
+              roleLaunchInputs.briefProfile,
             ),
         },
       );
@@ -6412,6 +6431,7 @@ async function actionUnsafe(
         assignment!.requestId,
         p.action,
         acceptedAssignment,
+        roleLaunchInputs.briefProfile,
       );
       requestStatusRefresh?.();
       return {
@@ -6840,6 +6860,7 @@ async function actionUnsafe(
               assignment!.createdAt,
               assignment!.requestId,
               acceptedAssignment,
+              roleLaunchInputs.briefProfile,
             ),
         },
       );
@@ -6861,6 +6882,7 @@ async function actionUnsafe(
         assignment!.requestId,
         p.action,
         acceptedAssignment,
+        roleLaunchInputs.briefProfile,
       );
       pendingStart.requestId = requestId;
       accepted = true;
@@ -7048,6 +7070,21 @@ async function actionUnsafe(
     };
   }
   if (p.action === "extend") {
+    // Only an armed window on a live assignment can be replaced. The window is
+    // recovered for any directly-owned unresolved request, including one whose
+    // physical identity is no longer proved live, so presence is checked here
+    // rather than inferred from the window. This mirrors the digest pass, which
+    // only acts on live assignments, and the advertised-controls gate.
+    if (resolved.presence.kind !== "live")
+      fail(
+        "agent_busy",
+        `Agent is not currently live: ${resolved.controlState}`,
+        "extend",
+        {
+          nextAction:
+            "Use agent_extend only while the Agent is live and available_tools includes it.",
+        },
+      );
     // Only an armed window can be replaced. A disabled configuration, a
     // resolved assignment, or an idle worker has no window and no effect.
     const requestId = runtime.activeRequestId;
@@ -7231,6 +7268,7 @@ async function actionUnsafe(
   const requestCreatedAt = Date.now();
   const controlRequestId = randomUUID();
   const controlAction = p.action;
+  let controlBriefProfile: BriefProfile | undefined;
   let controlFiles = resolveMessageFiles(ctx, p.files, controlAction);
   if (controlAction === "interrupt") {
     let roleLaunchInputs: ReturnType<typeof resolveAgentLaunchInputs>;
@@ -7266,6 +7304,7 @@ async function actionUnsafe(
       controlAction,
     );
     acceptedAssignment = acceptedBrief.accepted;
+    controlBriefProfile = roleLaunchInputs.briefProfile;
     p.message = formatAcceptedAssignmentPrompt(acceptedAssignment!);
     controlFiles = [...controlFiles, ...acceptedBrief.contextPaths];
   }
@@ -7287,6 +7326,7 @@ async function actionUnsafe(
           requestCreatedAt,
           controlRequestId,
           acceptedAssignment,
+          controlBriefProfile,
         ),
     },
   );
@@ -7302,6 +7342,7 @@ async function actionUnsafe(
     controlRequestId,
     controlAction,
     acceptedAssignment,
+    controlBriefProfile,
   );
   return {
     ok: true,
@@ -15672,6 +15713,7 @@ export default function (pi: ExtensionAPI): void {
   let stateRetryTimer: ReturnType<typeof setInterval> | undefined;
   let requestPumpTimer: ReturnType<typeof setInterval> | undefined;
   let backgroundWorkChangeUnsubscribe: (() => void) | undefined;
+  let settlementBackstopTimer: ReturnType<typeof setInterval> | undefined;
   let requestPumpErrorReported = false;
   let acknowledgementErrorReported = false;
   let pendingStateTransition = false;
@@ -16823,6 +16865,7 @@ export default function (pi: ExtensionAPI): void {
       stateRetryTimer = undefined;
       latest = "";
       freshResponse = false;
+      stopSettlementBackstop();
       reportMetadata(pi, ctx, agentMetadataRuntime(state, ctx), {
         activity: null,
         context: null,
@@ -16908,9 +16951,17 @@ export default function (pi: ExtensionAPI): void {
     backgroundWorkChangeUnsubscribe = subscribeBackgroundWorkChanges(
       pi.events,
       scope,
-      () => refreshBackgroundWaitingEvidence(scope),
+      () => {
+        refreshBackgroundWaitingEvidence(scope);
+        // A notification never resolves a result. It only lets settlement
+        // re-run when the worker already produced a fresh answer; settlement
+        // owns publication.
+        if (freshResponse) settleCurrentAgent(ctx);
+      },
     );
     queueMicrotask(() => refreshBackgroundWaitingEvidence(scope));
+    // A recovered hold has no pending agent_settled to restart settlement.
+    if (current.backgroundWaiting) ensureSettlementBackstop(ctx);
   };
   let backgroundFinalResponseRequested: string | undefined;
   const settleCurrentAgent = (ctx: ExtensionContext): void => {
@@ -17110,6 +17161,8 @@ export default function (pi: ExtensionAPI): void {
       }
       latest = "";
       freshResponse = false;
+      // Recovery no longer depends on the provider's wake arriving.
+      ensureSettlementBackstop(ctx);
       return;
     }
     settlementHoldReported = false;
@@ -17309,6 +17362,9 @@ export default function (pi: ExtensionAPI): void {
             retryTimer = undefined;
             latest = "";
             freshResponse = false;
+            // The provider turned outstanding between the settlement query and
+            // the result write; recover without depending on a wake.
+            ensureSettlementBackstop(ctx);
             if (currentWork.state !== "ready" && !settlementHoldReported) {
               settlementHoldReported = true;
               const detail =
@@ -17423,6 +17479,7 @@ export default function (pi: ExtensionAPI): void {
             retryTimer = undefined;
             agentStartedAt = undefined;
             latest = "";
+            stopSettlementBackstop();
             reportMetadata(pi, ctx, agentMetadataRuntime(state, ctx), {
               activity: null,
               context: null,
@@ -17452,6 +17509,32 @@ export default function (pi: ExtensionAPI): void {
     };
     flush();
     if (pendingResult && !retryTimer) retryTimer = setInterval(flush, 250);
+  };
+  // A held assignment must not depend on the provider's wake arriving. This
+  // bounded backstop re-queries the provider while the assignment is held, so a
+  // provider that never notifies still recovers. The background-work change
+  // subscription re-runs settlement earlier when a fresh answer is already
+  // pending; here settlement itself decides whether to publish or to ask for a
+  // fresh answer, so a result is still published exactly once and only through
+  // settlement. The timer clears itself once the assignment is no longer held
+  // and is stopped explicitly when the assignment settles or its worker closes.
+  const stopSettlementBackstop = (): void => {
+    if (settlementBackstopTimer) clearInterval(settlementBackstopTimer);
+    settlementBackstopTimer = undefined;
+  };
+  const ensureSettlementBackstop = (ctx: ExtensionContext): void => {
+    if (settlementBackstopTimer) return;
+    settlementBackstopTimer = setInterval(() => {
+      if (!state?.activeRequestId || !state.backgroundWaiting) {
+        stopSettlementBackstop();
+        return;
+      }
+      // A fresh answer is already waiting for the agent_settled settlement;
+      // re-running here would discard it before that settlement runs.
+      if (freshResponse) return;
+      settleCurrentAgent(ctx);
+    }, SETTLEMENT_BACKSTOP_MS);
+    settlementBackstopTimer.unref?.();
   };
   pi.on("agent_settled", async (_event: unknown, ctx: ExtensionContext) => {
     if (pendingInterruptReplacement) {
@@ -17483,6 +17566,7 @@ export default function (pi: ExtensionAPI): void {
     if (delegationEnabled) clearAgentRuntimes();
     if (retryTimer) clearInterval(retryTimer);
     retryTimer = undefined;
+    stopSettlementBackstop();
     if (stateRetryTimer) clearInterval(stateRetryTimer);
     stateRetryTimer = undefined;
 

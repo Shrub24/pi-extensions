@@ -82,6 +82,7 @@ export interface RequestRecord {
   kind: "task" | "steer" | "interrupt" | "reply";
   askId?: string;
   acceptedAssignment?: AcceptedAssignmentContract;
+  briefProfile?: BriefProfile;
   text: string;
   createdAt: number;
 }
@@ -280,7 +281,9 @@ function validate(
   if (
     version === LEGACY_MAILBOX_PROTOCOL_VERSION &&
     kind === "request" &&
-    Object.hasOwn(v, "acceptedAssignment")
+    ["acceptedAssignment", "briefProfile"].some((field) =>
+      Object.hasOwn(v, field),
+    )
   )
     throw new Error("V4 requests cannot contain accepted assignment metadata");
   const allowed =
@@ -320,6 +323,7 @@ function validate(
             "paneId",
             "kind",
       "acceptedAssignment",
+            "briefProfile",
             "askId",
             "text",
             "createdAt",
@@ -617,6 +621,13 @@ function validate(
       if (needsAssignment !== (v.acceptedAssignment !== undefined))
         throw new Error("V5 task and interrupt requests require an accepted assignment");
       if (needsAssignment) {
+        // The request carries the definition's brief profile so this boundary
+        // can enforce the same profile floor as the persisted-state boundary
+        // (mailbox state `briefProfile`) instead of accepting any claim.
+        if (!BRIEF_PROFILES.includes(v.briefProfile as BriefProfile))
+          throw new Error(
+            "V5 task and interrupt requests require a valid brief profile",
+          );
         const assignmentRequestId = v.acceptedAssignment?.requestId;
         if (
           typeof assignmentRequestId !== "string" ||
@@ -626,8 +637,12 @@ function validate(
           throw new Error("Accepted assignment request identity does not match");
         validateAcceptedAssignmentContract(v.acceptedAssignment, {
           requestId: assignmentRequestId,
-          minimumProfile: "common",
+          minimumProfile: v.briefProfile as BriefProfile,
         });
+      } else if (v.briefProfile !== undefined) {
+        throw new Error(
+          "Only V5 task and interrupt requests carry a brief profile",
+        );
       }
     }
     finite("createdAt");

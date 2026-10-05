@@ -154,7 +154,13 @@ Herdsman persists the provider, revision, and outstanding task IDs, then
 revalidates them during recovery and immediately before result
 persistence. A missing, failing, or identity-changed provider for a bound
 request fails closed. After the work resolves, the worker reviews it and emits
-a post-review response before the assignment settles. Assignments accepted
+a post-review response before the assignment settles. A waiting assignment does
+not depend on the provider's wake arriving: while an assignment is held, the
+worker re-queries the provider on a bounded cadence and re-runs settlement when
+a change notification arrives while a fresh answer is pending, so a provider
+that reports resolution without delivering a wake still produces exactly one
+result. The bounded re-query stops once the assignment settles, the worker is
+reused, or it is closed. Assignments accepted
 without a provider keep the ordinary lifecycle; `retainWorkers` affects only
 post-delivery cleanup and does not abandon an unresolved request.
 
@@ -470,9 +476,11 @@ so the worker is not checkpointed again until that window elapses. It changes
 no assignment, does not steer or interrupt the worker, and creates no result.
 Windows armed after that one use the configured `softTimeoutMs` again.
 
-It is unavailable for any worker that is not directly owned, for a resolved
-assignment, for a closed or proven `lost` record, and whenever `softTimeoutMs`
-is `0`; such a call fails without changing any window. See
+It is unavailable for any worker that is not directly owned, for a worker whose
+live presence is not currently proved (including a closed or proven `lost`
+record and a recovered `unknown` record), for a resolved assignment, and
+whenever `softTimeoutMs` is `0`; such a call fails without changing any window.
+See
 [Soft deadlines](#soft-deadlines).
 
 ## `agent_reply`

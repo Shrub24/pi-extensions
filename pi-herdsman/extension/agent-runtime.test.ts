@@ -72,23 +72,29 @@ beforeEach(() => updateConfig("retainWorkers", false));
 function writeRequest(mailbox: string, request: RequestRecord): void {
   if (
     request.version === 5 &&
-    (request.kind === "task" || request.kind === "interrupt") &&
-    !request.acceptedAssignment
+    (request.kind === "task" || request.kind === "interrupt")
   ) {
-    const state = readAgentState(mailbox);
+    if (!request.acceptedAssignment) {
+      const state = readAgentState(mailbox);
+      request = {
+        ...request,
+        acceptedAssignment: createAcceptedAssignmentContract(
+          request.kind === "task"
+            ? request.requestId
+            : (state?.activeRequestId ??
+              state?.completedRequestId ??
+              request.requestId),
+          parseDelegationBrief(DELEGATION_BRIEF_EXAMPLES.common),
+          DEFAULT_RESPONSE_CONTRACT,
+          process.cwd(),
+          1024 * 1024,
+        ),
+      };
+    }
     request = {
       ...request,
-      acceptedAssignment: createAcceptedAssignmentContract(
-        request.kind === "task"
-          ? request.requestId
-          : (state?.activeRequestId ??
-            state?.completedRequestId ??
-            request.requestId),
-        parseDelegationBrief(DELEGATION_BRIEF_EXAMPLES.common),
-        DEFAULT_RESPONSE_CONTRACT,
-        process.cwd(),
-        1024 * 1024,
-      ),
+      briefProfile:
+        request.briefProfile ?? request.acceptedAssignment!.brief.profile,
     };
   }
   writeMailboxRequest(mailbox, request);
@@ -591,6 +597,141 @@ test("post-review settlement requires a fresh response in either listener order"
       providerRegistration.dispose();
       resetAgentMailbox(mailbox);
     }
+  }
+});
+
+test("a withheld settlement retries without a provider wake", async (t) => {
+  const mailbox = setAgentEnvironment("settlement-retry-agent");
+  const providerId = "settlement-retry-provider";
+  const state = managedState("settlement-retry-agent", REQUEST_ID);
+  const provider = { id: providerId, version: 1 };
+  state.backgroundWorkProvider = provider;
+  state.lastAck = {
+    requestId: REQUEST_ID,
+    accepted: true,
+    acknowledgedAt: Date.now(),
+  };
+  writeAgentState(mailbox, state);
+  writeRequest(mailbox, {
+    version: 5,
+    runId: state.runId,
+    requestId: REQUEST_ID,
+    ownerSessionId: state.ownerSessionId,
+    workspaceId: state.workspaceId,
+    agentLabel: state.agentLabel,
+    paneId: state.paneId,
+    kind: "task",
+    text: "review the recovered background result",
+    createdAt: Date.now(),
+  });
+
+  let revision = 1;
+  let reconciliation:
+    | { state: "ready" }
+    | { state: "reconciling"; reason: string } = {
+    state: "reconciling",
+    reason: "the provider is still recovering terminal tasks",
+  };
+  let outstanding: { taskId: string; state: string; reason: string }[] = [
+    { taskId: "pending-task", state: "running", reason: "still working" },
+  ];
+  const agent = fakePi();
+  const providerRegistration = registerBackgroundWorkProvider(
+    agent.pi.events as never,
+    {
+      id: providerId,
+      version: 1,
+      snapshot(scope: { sessionId: string; requestId: string }) {
+        return {
+          provider: { id: providerId, version: 1 },
+          sessionId: scope.sessionId,
+          requestId: scope.requestId,
+          revision,
+          reconciliation,
+          outstanding,
+        };
+      },
+      bind() {
+        return { ok: true };
+      },
+      protect() {
+        return { ok: true };
+      },
+    },
+  );
+  registerExtension!(agent.pi as never);
+  const context = fakeAgentContext();
+  context.mode = "rpc";
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  try {
+    await agent.events.get("session_start")![0]({ reason: "reload" }, context);
+    // The first settlement is withheld while the provider reconciles, and the
+    // durable withhold record is written.
+    await agent.events.get("agent_settled")![0](undefined, context);
+    assert.equal(readResult(mailbox, REQUEST_ID), undefined);
+    assert.deepEqual(readAgentState(mailbox)?.backgroundWaiting?.taskIds, [
+      "pending-task",
+    ]);
+    assert.ok(
+      agent.entries.some(
+        (entry: any) =>
+          entry.customType === "pi_herdsman_state_error" &&
+          String(entry.data?.error).includes(
+            "background settlement withheld completion",
+          ),
+      ),
+      "the durable withhold record is written",
+    );
+
+    // The provider becomes authoritative but still reports the task. The
+    // backstop only re-queries: the worker stays held, no wake is manufactured.
+    reconciliation = { state: "ready" };
+    revision++;
+    t.mock.timers.tick(5_000);
+    assert.equal(readResult(mailbox, REQUEST_ID), undefined);
+    assert.deepEqual(readAgentState(mailbox)?.backgroundWaiting?.taskIds, [
+      "pending-task",
+    ]);
+    assert.equal(agent.sentUsers.length, 0);
+
+    // The provider resolves atomically, with no change notification and no
+    // provider wake, exactly the lost-wake case.
+    outstanding = [];
+    revision++;
+    t.mock.timers.tick(5_000);
+    assert.equal(
+      agent.sentUsers.length,
+      1,
+      "the backstop requests a fresh final response",
+    );
+
+    agent.events.get("message_end")![0](
+      {
+        message: {
+          role: "assistant",
+          content: "The recovered background result is reviewed.",
+        },
+      },
+      context,
+    );
+    await agent.events.get("agent_settled")![0](undefined, context);
+    assert.equal(
+      readResult(mailbox, REQUEST_ID)?.text,
+      "The recovered background result is reviewed.",
+    );
+    // Publication is exactly once: later retries find no active assignment.
+    t.mock.timers.tick(30_000);
+    assert.equal(
+      readResult(mailbox, REQUEST_ID)?.text,
+      "The recovered background result is reviewed.",
+    );
+    assert.equal(agent.sentUsers.length, 1);
+  } finally {
+    fireShutdown(agent);
+    providerRegistration.dispose();
+    removeRequest(mailbox, REQUEST_ID);
+    removeResult(mailbox, REQUEST_ID);
+    resetAgentMailbox(mailbox);
   }
 });
 

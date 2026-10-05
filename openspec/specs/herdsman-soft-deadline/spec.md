@@ -64,7 +64,7 @@ After a window has been included in a delivered digest, the owning controller SH
 
 ### Requirement: `agent_extend` lengthens one worker's next window
 
-The controller SHALL expose an `agent_extend` tool. It SHALL take the exact live agent identity and a window length in milliseconds (an integer from `1` through `2147483647`). It SHALL accept no other fields. On success it SHALL replace that worker's current window with a fresh window of the given length, measured from the call. Windows armed after that one SHALL use `softTimeoutMs` again. `agent_extend` SHALL appear in a worker's `available_tools` only while that worker is directly owned by the caller and has an armed soft window. Calling it for any other worker SHALL fail without changing any window. `agent_extend` SHALL NOT change the assignment, steer the worker, or create a result.
+The controller SHALL expose an `agent_extend` tool. It SHALL take the exact live agent identity and a window length in milliseconds (an integer from `1` through `2147483647`). It SHALL accept no other fields. On success it SHALL replace that worker's current window with a fresh window of the given length, measured from the call. Windows armed after that one SHALL use `softTimeoutMs` again. `agent_extend` SHALL appear in a worker's `available_tools` only while that worker is directly owned by the caller, is currently live, and has an armed soft window. Calling it for any other worker SHALL fail without changing any window, and the call SHALL revalidate live presence rather than infer it from the recovered window. `agent_extend` SHALL NOT change the assignment, steer the worker, or create a result.
 
 #### Scenario: Extend a long-running worker
 
@@ -75,6 +75,11 @@ The controller SHALL expose an `agent_extend` tool. It SHALL take the exact live
 
 - **WHEN** `softTimeoutMs` is `0`, or the worker's assignment has resolved
 - **THEN** `agent_extend` is absent from that worker's `available_tools`, and calling it fails with no effect
+
+#### Scenario: Non-live target
+
+- **WHEN** the lead calls `agent_extend` for a worker whose live presence is no longer proved, even though the recovered window is still armed
+- **THEN** the call fails with `agent_busy` and records no extension window
 
 #### Scenario: Strict schema
 
