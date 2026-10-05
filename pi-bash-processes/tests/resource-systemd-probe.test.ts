@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { fixtureChildEnv } from "./fixtures/child-env.js";
 import type { ResourceControlSpawnPlan } from "../extensions/resource-control.js";
 import { command } from "./fixtures/resource-control.js";
 
@@ -29,7 +30,7 @@ test.skipIf(process.platform !== "linux")("default systemd availability probe ex
 			const child = spawnSync(process.execPath, [fileURLToPath(new URL("./fixtures/resource-probe-child.ts", import.meta.url))], {
 				cwd: root, encoding: "utf8", timeout: 15_000,
 				env: {
-					...process.env, PATH: bin, PI_CODING_AGENT_DIR: join(root, "pi"), PI_BG_TASK_DIR: join(root, "background"),
+					...fixtureChildEnv(), PATH: bin, PI_CODING_AGENT_DIR: join(root, "pi"), PI_BG_TASK_DIR: join(root, "background"),
 					RESOURCE_PROBE_LOG: log, RESOURCE_SYSTEMCTL_STATUS: String(row.systemctlStatus), RESOURCE_SYSTEMD_RUN_STATUS: String(row.systemdRunStatus),
 				},
 			});

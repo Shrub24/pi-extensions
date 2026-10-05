@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fixtureChildEnv } from "./fixtures/child-env.js";
 
 const SESSION_ID = "sidecar-root";
 
@@ -15,7 +16,7 @@ const SESSION_ID = "sidecar-root";
  * that and reports `sidecar: false`, so the state simply stops persisting. */
 function sidecarPath(home: string, override: string | undefined): string {
 	const module = JSON.stringify(join(import.meta.dir, "..", "extensions", "persistence.ts"));
-	const env: Record<string, string> = { ...process.env as Record<string, string>, HOME: home };
+	const env: Record<string, string | undefined> = { ...fixtureChildEnv(), HOME: home };
 	if (override === undefined) delete env.PI_CODING_AGENT_DIR;
 	else env.PI_CODING_AGENT_DIR = override;
 	const child = spawnSync(process.execPath, ["-e", `

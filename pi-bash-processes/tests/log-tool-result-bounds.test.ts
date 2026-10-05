@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { DEFAULT_LOG_TAIL_MAX_CHARS as cap } from "../extensions/constants.js";
 import type { BackgroundTaskSnapshot, BackgroundLogTruncation } from "../extensions/types.js";
 import { WAKE_MANIFEST_FIELD_MAX_CHARS as fieldCap } from "../extensions/wake-events.js";
+import { fixtureChildEnv } from "./fixtures/child-env.js";
 import { privateLogRoot } from "./fixtures/log-settings.js";
 import { SPAWN_FIXTURE_TIMEOUT_MS } from "./fixtures/spawn-child-runner.js";
 
@@ -47,7 +48,7 @@ test("registered log tool result rows", () => {
 			},
 		}));
 		const child = spawnSync(process.execPath, [join(import.meta.dir, "fixtures", "registered-log.ts")], {
-			cwd: root, env: { ...process.env, PI_CODING_AGENT_DIR: join(root, "agent"), PI_BG_TASK_DIR: join(root, "logs") },
+			cwd: root, env: fixtureChildEnv({ PI_CODING_AGENT_DIR: join(root, "agent"), PI_BG_TASK_DIR: join(root, "logs") }),
 			input: JSON.stringify(inputs), encoding: "utf8", timeout: SPAWN_FIXTURE_TIMEOUT_MS, killSignal: "SIGKILL", maxBuffer: 2_000_000,
 		});
 		if (child.error) throw new Error(`registered log child spawn failed: ${child.error.message}`);

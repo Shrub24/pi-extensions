@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
+import { fixtureChildEnv } from "./fixtures/child-env.js";
 
 const lifecycleCases = [
 	["expiry-above", 15],
@@ -28,7 +29,7 @@ test("widget lifecycle scenarios", () => {
 		try {
 			const result = spawnSync(process.execPath, [resolve(import.meta.dir, "fixtures/widget-lifecycle.ts"), scenario, String(seconds)], {
 				cwd: dir,
-				env: { ...process.env, PI_CODING_AGENT_DIR: dir, PI_BG_TASK_DIR: dir },
+				env: fixtureChildEnv({ PI_CODING_AGENT_DIR: dir, PI_BG_TASK_DIR: dir }),
 				encoding: "utf8",
 				timeout: 10_000,
 			});

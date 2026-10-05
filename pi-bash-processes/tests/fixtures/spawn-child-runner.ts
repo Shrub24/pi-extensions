@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { fixtureChildEnv } from "./child-env.js";
 
 // Table deadlines include every child window plus a window for parent setup and cleanup.
 // A `spawn-extension.ts` child costs a measured mean of 4322 ms on an ubuntu-latest CI runner, where
@@ -22,7 +23,7 @@ export function runSpawnFixture(fixture: string, input: Record<string, unknown>)
 		} } } } }));
 		const child = spawnSync(process.execPath, [join(import.meta.dir, fixture)], {
 			cwd: root,
-			env: { ...process.env, HOME: join(root, "home"), USERPROFILE: join(root, "home"), PI_CODING_AGENT_DIR: join(root, "agent"), PI_BG_TASK_DIR: join(root, "logs"), PI_BG_TASK_DIAGNOSTIC_LOG: join(root, "diagnostics.log") },
+			env: fixtureChildEnv({ HOME: join(root, "home"), USERPROFILE: join(root, "home"), PI_CODING_AGENT_DIR: join(root, "agent"), PI_BG_TASK_DIR: join(root, "logs"), PI_BG_TASK_DIAGNOSTIC_LOG: join(root, "diagnostics.log") }),
 			input: JSON.stringify(input), encoding: "utf8", timeout: SPAWN_FIXTURE_TIMEOUT_MS, killSignal: "SIGKILL", maxBuffer: 2_000_000,
 		});
 		if (child.error) throw new Error(`spawn_fixture.spawn_error=${child.error.code ?? child.error.name}\n${child.error.message}`);
