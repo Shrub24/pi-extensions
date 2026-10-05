@@ -30,7 +30,9 @@ schema is:
   "retainWorkers": false,
   "softTimeoutMs": 300000,
   "inlineAttachmentLimitBytes": 131072,
-  "mailboxPayloadLimitBytes": 131072
+  "mailboxPayloadLimitBytes": 131072,
+  "disabledDefinitions": [],
+  "modelScopes": {}
 }
 ```
 
@@ -44,6 +46,8 @@ An absent file means these defaults:
 | `softTimeoutMs`              |          `300000`  | integer from 0 (disabled) through 2147483647      |
 | `inlineAttachmentLimitBytes` | `131072` (128 KiB) | integer from 1024 (1 KiB) through 1048576 (1 MiB) |
 | `mailboxPayloadLimitBytes`   | `131072` (128 KiB) | integer from 1024 (1 KiB) through 1048576 (1 MiB) |
+| `disabledDefinitions`        |                `[]` | unique definition names, at most 64              |
+| `modelScopes`                |                `{}` | `allow` and `agents` lists of model patterns     |
 
 Malformed JSON, a non-object root, unknown fields, and invalid known values
 are errors. Reads do not create the directory or file. Configuration changes
@@ -83,6 +87,39 @@ Set to `true`, a delivered worker stays running in the public `idle` state under
 its agent label, and a later `agent_continue` for its session delivers the next
 assignment into the same live process. Release an `idle` worker with
 `agent_close` or the `/agents` → `Clear idle` action.
+
+`disabledDefinitions` takes definition names out of the offered roster. A
+named definition disappears from the lead roster, the `/agents` menu, and every
+owner-visible definition list, and delegation to it is rejected as disabled. It
+still resolves, so another definition's `agents` reference to it keeps loading.
+A name that matches no definition is an error, because a typo would otherwise
+disable nothing while appearing to work.
+
+This differs from `enabled: false` in a definition file, which also rejects
+delegation and hides the definition from owner-visible lists but leaves it listed
+in the lead roster. The configuration list is how an operator removes a bundled
+role such as `generalist` or `implementer` from delegation entirely.
+
+`modelScopes` constrains which models a delegated agent may run on. `allow` is
+the global list, and `agents.<name>.allow` restricts one definition. A resolved
+model must satisfy every scope that exists, so a per-definition list restricts
+without exempting. A pattern is an exact `provider/model`, a trailing-wildcard
+`provider/*`, or the reserved `$inherited`, which matches a model the launch
+inherited rather than pinned — so `["$inherited"]` reads as "an unpinned agent
+may follow the controller, a pinned model must be listed". A violation fails the
+launch, naming the definition, the model, whether it was pinned or inherited,
+and the scope that rejected it; no model is substituted. An absent
+`modelScopes` leaves resolution exactly as it was.
+
+A definition that pins a model whose provider an extension registers while also
+setting `noExtensions: true` fails immediately: the child cannot resolve a model
+it is denied the extension for. Remove the denial, or pin a model a built-in
+provider serves. Without this check the failure surfaces about two seconds later
+as `Model "<id>" not found`, which reads as a missing model rather than as a
+conflicting definition.
+
+A nested agent inherits its managed parent's model, so a scope on the parent's
+definition governs the model a grandchild inherits.
 
 Placement affects future starts, not existing agents. `tab` uses one lead-owned
 agents tab, `subtree` gives each lead-direct agent its own tab, and `split`

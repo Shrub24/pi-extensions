@@ -19,6 +19,22 @@ export const MIN_BYTE_LIMIT = 1024;
 export const MAX_BYTE_LIMIT = 1024 * 1024;
 export const DEFAULT_SOFT_TIMEOUT_MS = 5 * 60_000;
 export const MAX_SOFT_TIMEOUT_MS = 2_147_483_647;
+export const MAX_DISABLED_DEFINITIONS = 64;
+export const MAX_MODEL_PATTERNS = 64;
+export const MAX_MODEL_PATTERN_LENGTH = 128;
+
+/** One definition's model allow list. */
+export type ModelScope = { allow: string[] };
+
+/**
+ * Operator policy for which models a delegated agent may run on. A candidate
+ * must satisfy every scope that exists: the global list and the definition's own
+ * list are restrictions, never exemptions.
+ */
+export type ModelScopes = {
+  allow?: string[];
+  agents?: Record<string, ModelScope>;
+};
 
 export type HerdsmanConfig = {
   spawnPlacement: SpawnPlacement;
@@ -27,6 +43,8 @@ export type HerdsmanConfig = {
   softTimeoutMs: number;
   inlineAttachmentLimitBytes: number;
   mailboxPayloadLimitBytes: number;
+  disabledDefinitions: string[];
+  modelScopes: ModelScopes;
 };
 
 export const DEFAULT_CONFIG: HerdsmanConfig = {
@@ -36,6 +54,8 @@ export const DEFAULT_CONFIG: HerdsmanConfig = {
   softTimeoutMs: DEFAULT_SOFT_TIMEOUT_MS,
   inlineAttachmentLimitBytes: DEFAULT_BYTE_LIMIT,
   mailboxPayloadLimitBytes: DEFAULT_BYTE_LIMIT,
+  disabledDefinitions: [],
+  modelScopes: {},
 };
 
 export function validByteLimit(value: unknown): value is number {
@@ -45,6 +65,71 @@ export function validByteLimit(value: unknown): value is number {
     value >= MIN_BYTE_LIMIT &&
     value <= MAX_BYTE_LIMIT
   );
+}
+
+// A disable list is a bounded set of unique, non-empty definition names. Whether a
+// name matches a definition is checked during discovery, the only place the roster
+// is known.
+export function validDisabledDefinitions(value: unknown): value is string[] {
+  if (!Array.isArray(value) || value.length > MAX_DISABLED_DEFINITIONS)
+    return false;
+  const seen = new Set<string>();
+  for (const entry of value) {
+    if (typeof entry !== "string" || entry.trim().length === 0) return false;
+    if (seen.has(entry)) return false;
+    seen.add(entry);
+  }
+  return true;
+}
+
+function isConfigObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * A model pattern is an exact `provider/model`, a trailing-wildcard `provider/*`,
+ * or the reserved `$inherited`, which matches a model the launch inherited rather
+ * than pinned.
+ */
+export function validModelPattern(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.trim().length > 0 &&
+    value.length <= MAX_MODEL_PATTERN_LENGTH &&
+    !/\s/u.test(value)
+  );
+}
+
+function validModelPatternList(value: unknown): value is string[] {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.length <= MAX_MODEL_PATTERNS &&
+    value.every(validModelPattern)
+  );
+}
+
+/** A model scope is an allow list, and nothing else. */
+export function validModelScope(value: unknown): value is ModelScope {
+  if (!isConfigObject(value)) return false;
+  if (Object.keys(value).some((key) => key !== "allow")) return false;
+  return validModelPatternList(value.allow);
+}
+
+export function validModelScopes(value: unknown): value is ModelScopes {
+  if (!isConfigObject(value)) return false;
+  if (Object.keys(value).some((key) => key !== "allow" && key !== "agents"))
+    return false;
+  if ("allow" in value && !validModelPatternList(value.allow)) return false;
+  if (!("agents" in value)) return true;
+  const agents = value.agents;
+  if (!isConfigObject(agents)) return false;
+  // An empty `agents` map is the same as omitting it, so a generated config may
+  // emit it; an empty allow list is a scope that permits nothing, which is a
+  // misconfiguration rather than a policy.
+  const names = Object.keys(agents);
+  if (names.length > MAX_MODEL_PATTERNS) return false;
+  return names.every((name) => validModelScope(agents[name]));
 }
 
 // Advisory soft-deadline windows accept any non-negative integer; 0 disables
@@ -66,6 +151,8 @@ const CONFIG_KEYS = new Set<ConfigKey>([
   "softTimeoutMs",
   "inlineAttachmentLimitBytes",
   "mailboxPayloadLimitBytes",
+  "disabledDefinitions",
+  "modelScopes",
 ]);
 
 function parseRawConfig(content: string): Partial<HerdsmanConfig> {
@@ -99,6 +186,16 @@ function parseRawConfig(content: string): Partial<HerdsmanConfig> {
     if (!validSoftTimeout(record.softTimeoutMs))
       throw new Error("Invalid Pi Herdsman config field softTimeoutMs");
     result.softTimeoutMs = record.softTimeoutMs;
+  }
+  if ("modelScopes" in record) {
+    if (!validModelScopes(record.modelScopes))
+      throw new Error("Invalid Pi Herdsman config field modelScopes");
+    result.modelScopes = record.modelScopes;
+  }
+  if ("disabledDefinitions" in record) {
+    if (!validDisabledDefinitions(record.disabledDefinitions))
+      throw new Error("Invalid Pi Herdsman config field disabledDefinitions");
+    result.disabledDefinitions = [...record.disabledDefinitions];
   }
   for (const key of [
     "inlineAttachmentLimitBytes",

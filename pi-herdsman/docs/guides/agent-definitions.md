@@ -14,7 +14,7 @@ see the [agent-definition schema](../reference/agent-definition-schema.md).
 Bundled definitions live in:
 
 ```text
-dist/agent-definitions/
+extension/agent-definitions/
 ```
 
 Global definitions live by default in:
@@ -176,6 +176,45 @@ does not need extension-provided capabilities.
 
 The `name` is authoritative; the filename itself is not the public definition
 name.
+
+## Advertise and preload skills
+
+`skills` tells Pi a skill exists; the worker reads it only if it decides to.
+`preloadedSkills` inlines the skill's body into the worker's system prompt, so
+the method is in context from the first request and costs its tokens on every
+one.
+
+```markdown
+---
+name: builder
+description: Focused implementation agent for a resolved change
+systemPromptMode: replace
+inheritSkills: true
+skills: ["codebase-explore"]
+preloadedSkills: ["lean-implementation"]
+tools: ["read", "bash", "edit", "write"]
+---
+
+Edit, test, and report.
+```
+
+Both fields accept a path or a bare skill name. A name resolves against the
+project's `.pi/skills` and `.agents/skills`, then the user's
+`~/.pi/agent/skills` and `~/.agents/skills`, then the skills declared by
+installed packages (`pi.skills` in a package manifest) and by `settings.json`; a
+project match outranks a user match. A path is used as written, and a relative path resolves against the
+worker's working directory rather than against the definition file, so a
+definition that depends on the layout of its own directory needs an absolute
+path. A value that resolves to nothing fails the launch instead of reaching Pi
+as a path that does not exist.
+
+A skill named in both fields is preloaded and not advertised, because
+advertising a skill whose text is already in the prompt only spends tokens.
+`preloadedSkills` is independent of `noSkills` and `inheritSkills`, which govern
+Pi's own skill discovery: `noSkills: true` alongside a preloaded skill is
+coherent, and gives the worker the method without a registry entry. Preloaded
+content is capped at 64 KiB per launch, and exceeding it fails the launch rather
+than truncating.
 
 ## Allow direct agents
 

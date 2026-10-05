@@ -3518,6 +3518,58 @@ test("fresh assignment transports automatic prompt snapshots and cleans them up"
   }
 });
 
+test("fresh assignment transports preloaded skill bodies and cleans them up", async () => {
+  setLeadEnvironment();
+  const name = `preload-${randomUUID().slice(0, 8)}`;
+  const label = name;
+  const definitionPath = join(PI_AGENTS_DIR, `${name}.md`);
+  const skillPath = join(PI_AGENT_ROOT, `${name}-skill.md`);
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  realFs.writeFileSync(
+    skillPath,
+    "---\nname: preload-probe\ndescription: probe skill\n---\n\nPreloaded method text.\n",
+  );
+  realFs.writeFileSync(
+    definitionPath,
+    `---\nname: ${name}\npreloadedSkills: ["${skillPath}"]\n---\ndefinition body\n`,
+  );
+  const launched: { args: string[]; contents: string[] }[] = [];
+  const startup = startupExecutor(
+    label,
+    () => DEFAULT_PI_SESSION_ID,
+    undefined,
+    undefined,
+    false,
+    (args) => {
+      launched.push({ args: [...args], contents: promptLaunchContents(args) });
+    },
+  );
+  const pi = fakePi({ exec: startup.exec });
+  registerExtension!(pi.pi as never);
+  try {
+    const result = await registeredAgentTool(pi, "delegate").execute(
+      "id",
+      { definition: name, label, task: "fresh task" },
+      undefined,
+      undefined,
+      fakeContext(),
+    );
+    assert.equal(result.details.ok, true, JSON.stringify(result.details));
+    assert.equal(launched.length, 1);
+    assert.equal(launched[0]!.contents.length, 4);
+    assert.match(launched[0]!.contents[1]!, /Preloaded method text\./);
+    assert.doesNotMatch(launched[0]!.contents[1]!, /description: probe skill/);
+    assert.doesNotMatch(launched[0]!.contents[0]!, /Preloaded method text\./);
+    for (const path of promptLaunchPaths(launched[0]!.args))
+      assert.equal(realFs.existsSync(path), false, `prompt leaked: ${path}`);
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(mailbox);
+    realFs.rmSync(definitionPath, { force: true });
+    realFs.rmSync(skillPath, { force: true });
+  }
+});
+
 test("startup failure cleans private prompt snapshots", async () => {
   setLeadEnvironment();
   const name = `failure-${randomUUID().slice(0, 8)}`;

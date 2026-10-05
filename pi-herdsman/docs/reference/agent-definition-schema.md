@@ -45,7 +45,7 @@ definition and return a partial roster.
 Bundled definitions:
 
 ```text
-dist/agent-definitions/
+extension/agent-definitions/
 ```
 
 Global definitions by default:
@@ -54,7 +54,19 @@ Global definitions by default:
 ~/.pi/agent/agents/
 ```
 
-A matching project or global name overlays the lower-precedence definition.
+A matching project or global name overlays the lower-precedence definition. An
+overlay merges **field by field**: a field the overriding file sets replaces the
+inherited value, and a field it omits keeps the value from the definition it
+overlays. Arrays replace wholesale, so an explicit `[]` clears an inherited list.
+
+Overriding a bundled role therefore means reading that role's file first. The
+bundled `scout`, `reviewer` and `researcher` set `noSkills: true`,
+`noExtensions: true` and `inheritGlobalContext: false`, and the bundled
+`reviewer` also sets an `agents` list. A local definition that omits those fields
+inherits them, and nothing in the local file shows it. Set a field explicitly
+whenever the answer matters, and confirm the outcome with `/agents definitions`,
+which resolves the effective roster rather than the file and reports each field
+it inherited, with the definition that supplied it.
 
 An unmatched project or global definition is standalone. Project definitions
 are loaded from `<cwd>/.pi/agents/` when Pi considers the project trusted.
@@ -98,14 +110,17 @@ available actions; disabling a definition does not mutate that assignment.
 | `thinking`              | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `false` | spawning controller for fresh `delegate`; saved session for `continue` | Explicit value wins; `false` launches as `off`.                                                                                           |
 | `systemPromptMode`      | `append` or `replace`                                                 | `append` only for definition name `delegate`; otherwise `replace`      | Controls effective body versus Pi base system prompt.                                                                                     |
 | `bodyMode`              | `append` or `replace`                                                 | `replace` for non-empty matching overlay body                          | Valid only when overlaying an existing lower-precedence definition; consumed during body composition.                                     |
+| `briefProfile`          | `common`, `investigation`, `research`, `execution`, or `review`        | `common`                                                               | The brief profile this definition's agents require. A brief whose `profile` differs is rejected at acceptance; `common` accepts any profile. |
+| `responseContract`      | mapping                                                               | `{ schema, target: "inline", format: "text", requiredSections: [] }`   | Validated at acceptance and frozen for the assignment. An assignment override wins over the definition's value; the result is checked against the effective contract. |
 | `noTools`               | boolean                                                               | Pi normal tool policy                                                  | `true` emits `--no-tools`; managed `ask_owner` remains infrastructure.                                                                    |
 | `noBuiltinTools`        | boolean                                                               | Pi normal built-in tool policy                                         | `true` emits `--no-builtin-tools`.                                                                                                        |
 | `tools`                 | array of non-empty strings                                            | no explicit allowlist                                                  | Passed to Pi as a source-agnostic tool-name allowlist; matching overlay replaces whole array.                                             |
 | `excludeTools`          | array of non-empty strings                                            | no explicit exclusions                                                 | Passed to Pi as source-agnostic tool-name exclusions; matching override replaces whole array.                                             |
 | `permission`            | mapping                                                               | absent                                                                 | Opaque interoperability policy for permission-aware extensions; Pi Herdsman does not evaluate it.                                         |
-| `noSkills`              | boolean                                                               | skills disabled unless `inheritSkills: true`                           | Controls Pi native skill discovery; explicit `skills` values are still passed separately.                                                 |
-| `inheritSkills`         | boolean                                                               | does not enable by itself unless `true`                                | `true` changes omitted `noSkills` default so native skills remain available. Explicit `noSkills` wins.                                    |
-| `skills`                | array of non-empty strings                                            | no explicit skill arguments                                            | Each value is passed unchanged as a Pi skill path/resource.                                                                               |
+| `noSkills`              | boolean                                                               | skills disabled unless `inheritSkills: true`                           | Controls Pi native skill discovery; explicit `skills` values are still passed separately. An explicit `noSkills` in the same file wins over `inheritSkills`. |
+| `inheritSkills`         | boolean                                                               | does not enable by itself unless `true`                                | `true` changes the omitted `noSkills` default so native skills remain available. An `inheritSkills` this file sets also beats a `noSkills` inherited from the definition it overlays, so an overlay that opts in is not defeated by a bundled default. |
+| `skills`                | array of non-empty strings                                            | no explicit skill arguments                                            | Each value is a Pi skill path or a bare skill name: a name is resolved against the project, user, package and settings skill roots, a path is used as written, and a value that resolves to nothing fails the launch. |
+| `preloadedSkills`       | array of non-empty strings                                            | no preloaded skills                                                    | Each value resolves like a `skills` value, then the skill's body is inlined into the child's system prompt after the definition body. A skill named in both fields is inlined and not advertised. Costs its tokens on every request. |
 | `noExtensions`          | boolean                                                               | Pi normal extension policy                                             | `true` emits `--no-extensions`, except when the launched model needs extension discovery. Launcher-injected herdr infrastructure remains. |
 | `extensions`            | array of non-empty strings                                            | no extra extension arguments                                           | Each value is passed unchanged to Pi.                                                                                                     |
 | `agents`                | array of unique non-empty definition names                            | no direct agents                                                       | Names direct definitions this agent may delegate to; every name must exist.                                                               |
@@ -125,8 +140,11 @@ discoverable, but is rejected during assignment or fresh agent startup with an e
 disabled-agent error rather than being silently removed from the delegating agent
 definition.
 
-Skill and extension paths are passed to Pi unchanged. herdr does not resolve
-them relative to the definition file.
+Skill values are resolved before the launch: a bare name is looked up in the
+project, user, package and settings skill roots, and a path is used as written.
+A relative path resolves against the child's working directory, not against the
+definition file, so a definition that depends on the layout of its own directory
+must use an absolute path. Extension paths are passed to Pi unchanged.
 
 Tool names are governed by Pi's native name-based policy, regardless of
 whether a tool is built in, registered by an extension, or supplied as a
@@ -266,6 +284,8 @@ For a newly constructed managed agent, the effective launch composition is:
 ```text
 Pi base system prompt
     ↓ effective body via systemPromptMode
+preloaded skill bodies
+    ↓
 selected project/global context-file additions
     ↓
 shared herdr agent guidance

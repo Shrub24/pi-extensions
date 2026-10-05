@@ -570,6 +570,7 @@ export const {
   sessionAgentIdentity,
   sessionContextRetired,
   resolveAssignmentSession,
+  visibleAgentDefinitionMetadata,
 } = extension;
 export const { herdrAgentAlias: runScopedHerdrAlias } =
   await import("./herdr.ts");

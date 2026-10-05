@@ -72,6 +72,9 @@ const {
   readConfig,
   updateConfig,
   validByteLimit,
+  validDisabledDefinitions,
+  validModelPattern,
+  validModelScopes,
   validSoftTimeout,
 } = await import("./config.ts");
 const { herdsmanConfigPath, herdsmanDataRoot } = await import("./storage.ts");
@@ -146,6 +149,8 @@ test("partial and complete valid configs overlay defaults", () => {
     softTimeoutMs: DEFAULT_SOFT_TIMEOUT_MS,
     inlineAttachmentLimitBytes: MIN_BYTE_LIMIT,
     mailboxPayloadLimitBytes: MAX_BYTE_LIMIT,
+    disabledDefinitions: [],
+    modelScopes: {},
   });
 });
 
@@ -174,6 +179,18 @@ test("invalid values, malformed JSON, non-object roots, and unknown keys fail cl
     ["{", "Invalid Pi Herdsman config JSON"],
     ["[]", "root must be an object"],
     ['{"typo":true}', "unknown field typo"],
+    ['{"disabledDefinitions":"scout"}', "disabledDefinitions"],
+    ['{"disabledDefinitions":["scout","scout"]}', "disabledDefinitions"],
+    ['{"disabledDefinitions":[""]}', "disabledDefinitions"],
+    ['{"disabledDefinitions":["   "]}', "disabledDefinitions"],
+    ['{"disabledDefinitions":[1]}', "disabledDefinitions"],
+    ['{"modelScopes":[]}', "modelScopes"],
+    ['{"modelScopes":{"allow":[]}}', "modelScopes"],
+    ['{"modelScopes":{"allow":[""]}}', "modelScopes"],
+    ['{"modelScopes":{"allow":["a b"]}}', "modelScopes"],
+    ['{"modelScopes":{"typo":["a"]}}', "modelScopes"],
+    ['{"modelScopes":{"agents":{"scout":{}}}}', "modelScopes"],
+    ['{"modelScopes":{"agents":{"scout":{"allow":["a"],"extra":1}}}}', "modelScopes"],
   ] as const) {
     realFs.writeFileSync(herdsmanConfigPath(), content);
     assert.throws(() => readConfig(), new RegExp(message));
@@ -183,6 +200,23 @@ test("invalid values, malformed JSON, non-object roots, and unknown keys fail cl
   assert.equal(validByteLimit(MIN_BYTE_LIMIT + 0.5), false);
   assert.equal(validSoftTimeout(-1), false);
   assert.equal(validSoftTimeout(1.5), false);
+  assert.equal(validDisabledDefinitions(["scout"]), true);
+  assert.equal(validDisabledDefinitions([]), true);
+  assert.equal(validDisabledDefinitions(["scout", "scout"]), false);
+  assert.equal(validDisabledDefinitions(Array.from({ length: 64 }, (_, i) => `a${i}`)), true);
+  assert.equal(validDisabledDefinitions(Array.from({ length: 65 }, (_, i) => `a${i}`)), false);
+  assert.equal(validModelScopes({}), true);
+  assert.equal(validModelScopes({ allow: ["openai-codex/*"] }), true);
+  assert.equal(validModelScopes({ agents: {} }), true);
+  assert.equal(validModelScopes({ agents: { scout: { allow: ["$inherited"] } } }), true);
+  assert.equal(validModelScopes({ allow: [] }), false);
+  assert.equal(validModelScopes({ agents: { scout: {} } }), false);
+  assert.equal(validModelScopes({ agents: { scout: { allow: ["a"], extra: 1 } } }), false);
+  assert.equal(validModelPattern("omniroute/explorer"), true);
+  assert.equal(validModelPattern("$inherited"), true);
+  assert.equal(validModelPattern(""), false);
+  assert.equal(validModelPattern("a b"), false);
+  assert.equal(validModelPattern(1), false);
 });
 
 test("updates preserve configured keys, reset one key, and delete the final config", () => {

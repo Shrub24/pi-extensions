@@ -122,11 +122,13 @@ import {
   agentDefinitionDelegationEnabled,
   agentDefinitionMetadata,
   configuredModel,
+  deniedDiscoveryModelError,
   discoverAgent,
   discoverAgentDefinitions,
   expandAgentBodyFiles,
   projectAgentDefinition,
   resolveAgentLaunchInputs,
+  modelPolicyError,
   resolveChildModel,
   updateAgentOverride,
   validateAgentDefinitionReferences,
@@ -134,6 +136,7 @@ import {
   writePrivatePromptSnapshots,
   type AgentDefinition,
 } from "./agent-definitions.ts";
+import { resolveDefinitionSkills } from "./agent-skills.ts";
 import {
   BRIEF_PROFILES,
   parseDelegationBrief,
@@ -563,17 +566,18 @@ type ControllerScope =
       kind: "managed-agent";
       allowedAgentDefinitions: ReadonlySet<string>;
     };
-async function visibleAgentDefinitionMetadata(
+export async function visibleAgentDefinitionMetadata(
   ctx: ExtensionContext,
   scope: ControllerScope,
 ): Promise<Record<string, unknown>[]> {
-  const definitions = (await contextAgentDefinitions(ctx)).definitions.map(
-    (definition) =>
+  const definitions = (await contextAgentDefinitions(ctx)).definitions
+    .filter((definition) => definition.disabledByConfig !== true)
+    .map((definition) =>
       agentDefinitionMetadata(
         definition,
         scope.kind === "managed-agent" ? "leaf" : "delegating",
       ),
-  );
+    );
   return scope.kind === "managed-agent"
     ? definitions.filter(
         (definition) =>
@@ -1257,9 +1261,10 @@ async function contextAgentDefinitions(ctx: ExtensionContext) {
   const projectTrusted = ctx.isProjectTrusted();
   return {
     projectTrusted,
-    definitions: discoverAgentDefinitions(
-      projectTrusted ? { projectRoot: ctx.cwd } : {},
-    ),
+    definitions: discoverAgentDefinitions({
+      ...(projectTrusted ? { projectRoot: ctx.cwd } : {}),
+      disabledDefinitions: readConfig().disabledDefinitions,
+    }),
   };
 }
 const AGENT_DEFINITION_ENTRY = "pi-herdsman-agent-definition";
@@ -6526,15 +6531,36 @@ async function actionUnsafe(
     let started: StartedHerdrAgent | undefined;
     let accepted = false;
     try {
+      const skillResolution = resolveDefinitionSkills({
+        agent: effectiveDefinition.name,
+        ...(effectiveDefinition.frontmatter.skills !== undefined
+          ? { skills: effectiveDefinition.frontmatter.skills }
+          : {}),
+        ...(effectiveDefinition.frontmatter.preloadedSkills !== undefined
+          ? { preloadedSkills: effectiveDefinition.frontmatter.preloadedSkills }
+          : {}),
+        cwd: agentCwd,
+      });
+      if (!skillResolution.ok)
+        fail("invalid_request", skillResolution.reason, p.action);
       try {
         promptPaths = writePrivatePromptSnapshots([
           ...(preparedDefinition.body ? [preparedDefinition.body] : []),
+          ...skillResolution.preloaded.map((skill) => skill.body),
           SHARED_AGENT_INSTRUCTIONS,
         ]);
       } catch (error) {
         promptWriteFailed = true;
         throw error;
       }
+      const bodyPromptPath = preparedDefinition.body
+        ? promptPaths[0]
+        : undefined;
+      const preloadedSkillPromptPaths = skillResolution.preloaded.map(
+        (_skill, index) =>
+          promptPaths[(preparedDefinition.body ? 1 : 0) + index]!,
+      );
+      const sharedPromptPath = promptPaths[promptPaths.length - 1]!;
       invalidateCachedRuntime(label);
       const resetRelease = claimAssignmentLock(mailbox, p.action, { label });
       try {
@@ -6576,15 +6602,53 @@ async function actionUnsafe(
         isForeignProvider: (providerId) =>
           registeredProviderIds.has(providerId),
       });
+      // The operator's model policy, then the one contradiction the policy
+      // exists to surface: a pinned model whose provider only an extension
+      // supplies, in a child the definition denies extensions to.
+      if (childModel.kind === "use") {
+        const pinnedValue = configuredModel(effectiveDefinition.frontmatter);
+        const pinned =
+          pinnedValue !== undefined && pinnedValue.trim() !== ""
+            ? pinnedValue
+            : undefined;
+        const origin = pinned === undefined ? "inherited" : "pinned";
+        const scopes = readConfig().modelScopes;
+        const agentAllow = scopes.agents?.[effectiveDefinition.name]?.allow;
+        const violation = modelPolicyError({
+          agent: effectiveDefinition.name,
+          model: childModel.model,
+          origin,
+          ...(scopes.allow === undefined
+            ? {}
+            : { globalAllow: scopes.allow }),
+          ...(agentAllow === undefined ? {} : { agentAllow }),
+        });
+        if (violation !== undefined) throw new Error(violation);
+        if (origin === "pinned") {
+          const denied = deniedDiscoveryModelError({
+            agent: effectiveDefinition.name,
+            model: childModel.model,
+            noExtensions:
+              effectiveDefinition.frontmatter.noExtensions === true,
+            isForeignProvider: (providerId) =>
+              registeredProviderIds.has(providerId),
+          });
+          if (denied !== undefined) throw new Error(denied);
+        }
+      }
       const launchArgs = agentLaunchArgs(effectiveDefinition, {
-        ...(effectiveDefinition.body ? { bodyPromptPath: promptPaths[0] } : {}),
-        sharedPromptPath: promptPaths[effectiveDefinition.body ? 1 : 0],
+        ...(bodyPromptPath !== undefined ? { bodyPromptPath } : {}),
+        ...(preloadedSkillPromptPaths.length
+          ? { preloadedSkillPromptPaths }
+          : {}),
+        sharedPromptPath,
         cwd: agentCwd,
         managedAgent: true,
         approveProject:
           agentContext.projectTrusted && sameCwd(agentCwd, ctx.cwd),
         ...(!resumed ? { inheritedThinking: pi.getThinkingLevel() } : {}),
         modelDecision: childModel,
+        resolvedSkills: skillResolution.advertised,
       });
       // A retained process keeps the launch configuration it started with, so
       // reuse compares this fingerprint with the then-current definition.
@@ -12071,7 +12135,11 @@ export default function (pi: ExtensionAPI): void {
     ): Promise<void> => {
       let selectedDefinition: string | undefined;
       while (true) {
-        const definitions = (await contextAgentDefinitions(ctx)).definitions;
+        const definitions = (
+          await contextAgentDefinitions(ctx)
+        ).definitions.filter(
+          (definition) => definition.disabledByConfig !== true,
+        );
         const bundled = definitions.filter(
           (definition) => definition.extensionSource,
         );

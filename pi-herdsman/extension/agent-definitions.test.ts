@@ -10,12 +10,14 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
   agentDefinitionDelegationEnabled,
   agentDefinitionMetadata,
   agentDefinitionEnabled,
   agentLaunchArgs,
+  agentLaunchFingerprint,
   AGENT_COORDINATION_TOOLS,
   discoverAgent,
   discoverAgentDefinitions,
@@ -23,7 +25,12 @@ import {
   mergeFrontmatter,
   projectAgentDefinition,
   resolveAgentLaunchInputs,
+  deniedDiscoveryModelError,
+  modelPatternMatches,
+  modelPolicyError,
   resolveChildModel,
+  skillDiscoveryDisabled,
+  SUPPORTED_FIELDS,
   updateAgentOverride,
   validateAgentDefinitionReferences,
   writePrivatePromptSnapshots,
@@ -323,6 +330,9 @@ test("rejects malformed capability fields", () => {
   for (const [field, value, message] of [
     ["tools", '"read"', /must be an array/],
     ["skills", '["ok", 1]', /must be an array/],
+    ["preloadedSkills", '"lean-implementation"', /must be an array/],
+    ["preloadedSkills", '["ok", 1]', /must be an array/],
+    ["preloadedSkills", '["   "]', /must be an array/],
     ["extensions", '[""]', /must be an array/],
     [
       "systemPromptFiles",
@@ -1196,6 +1206,230 @@ test("builds exact Pi capability launch arguments", () => {
     "--extension",
     "/extensions/shared.ts",
   ]);
+});
+
+test("appends preloaded skill prompt files after the body and before context files", () => {
+  const definition = {
+    name: "worker",
+    path: "/agents/worker.md",
+    frontmatter: { name: "worker", noSkills: true, skills: ["raw-skill"] },
+    body: "Prompt",
+  };
+  assert.deepEqual(
+    agentLaunchArgs(definition, {
+      bodyPromptPath: "/prompt",
+      preloadedSkillPromptPaths: ["/preloaded-1", "/preloaded-2"],
+    }),
+    [
+      "--system-prompt",
+      "/prompt",
+      "--append-system-prompt",
+      "/preloaded-1",
+      "--append-system-prompt",
+      "/preloaded-2",
+      "--no-context-files",
+      "--no-skills",
+      "--skill",
+      "raw-skill",
+    ],
+  );
+});
+
+test("resolved skills replace the definition's raw values", () => {
+  const definition = {
+    name: "worker",
+    path: "/agents/worker.md",
+    frontmatter: {
+      name: "worker",
+      noSkills: false,
+      skills: ["codebase-explore"],
+    },
+    body: "",
+  };
+  assert.deepEqual(
+    agentLaunchArgs(definition, {
+      resolvedSkills: ["/abs/codebase-explore/SKILL.md"],
+    }),
+    ["--no-context-files", "--skill", "/abs/codebase-explore/SKILL.md"],
+  );
+});
+
+test("a field the overriding file omits is reported as inherited from the bundled definition", () => {
+  const definition = discoverAgentDefinitionsWithContents(
+    "---\nname: scout\ninheritSkills: true\n---\n\nLocal body\n",
+  ).find(({ name }) => name === "scout")!;
+  assert.deepEqual(
+    agentDefinitionMetadata(definition).inheritedFields?.filter(
+      ({ field }) => field === "noSkills" || field === "noExtensions",
+    ),
+    [
+      { field: "noSkills", source: "bundled" },
+      { field: "noExtensions", source: "bundled" },
+    ],
+  );
+  assert.equal(skillDiscoveryDisabled(definition), false);
+});
+
+test("an inherited noSkills still disables discovery when the file does not opt in", () => {
+  const definition = discoverAgentDefinitionsWithContents(
+    "---\nname: scout\n---\n\nLocal body\n",
+  ).find(({ name }) => name === "scout")!;
+  assert.equal(skillDiscoveryDisabled(definition), true);
+});
+
+test("an explicit noSkills in the same file wins over inheritSkills", () => {
+  const definition = {
+    name: "worker",
+    path: "/agents/worker.md",
+    frontmatter: { name: "worker", noSkills: true, inheritSkills: true },
+    body: "",
+  };
+  assert.equal(skillDiscoveryDisabled(definition), true);
+});
+
+test("model patterns match exact ids, provider wildcards and inherited models", () => {
+  assert.equal(modelPatternMatches("a/b", "pinned", "a/b"), true);
+  assert.equal(modelPatternMatches("a/b", "pinned", "a/c"), false);
+  assert.equal(modelPatternMatches("a/b", "pinned", "a/*"), true);
+  assert.equal(modelPatternMatches("ab/c", "pinned", "a/*"), false);
+  assert.equal(modelPatternMatches("a/b", "inherited", "$inherited"), true);
+  assert.equal(modelPatternMatches("a/b", "pinned", "$inherited"), false);
+});
+
+test("every applicable model scope must permit the resolved model", () => {
+  assert.equal(modelPolicyError({ agent: "scout", model: "a/b", origin: "pinned" }), undefined);
+  assert.match(
+    modelPolicyError({
+      agent: "scout",
+      model: "a/b",
+      origin: "pinned",
+      globalAllow: ["c/*"],
+    })!,
+    /scout cannot run on pinned model a\/b: the modelScopes allow list does not permit it/,
+  );
+  assert.match(
+    modelPolicyError({
+      agent: "scout",
+      model: "a/b",
+      origin: "pinned",
+      globalAllow: ["a/*"],
+      agentAllow: ["a/c"],
+    })!,
+    /modelScopes\.agents\.scout does not permit it/,
+  );
+  assert.equal(
+    modelPolicyError({
+      agent: "scout",
+      model: "a/b",
+      origin: "pinned",
+      globalAllow: ["a/*"],
+      agentAllow: ["a/b"],
+    }),
+    undefined,
+  );
+  assert.equal(
+    modelPolicyError({
+      agent: "scout",
+      model: "a/b",
+      origin: "inherited",
+      agentAllow: ["$inherited"],
+    }),
+    undefined,
+  );
+});
+
+test("a pinned extension-provided model in a denied child fails before the launch", () => {
+  const foreign = (providerId: string) => providerId === "omniroute";
+  assert.match(
+    deniedDiscoveryModelError({
+      agent: "scout",
+      model: "omniroute/explorer",
+      noExtensions: true,
+      isForeignProvider: foreign,
+    })!,
+    /scout pins model omniroute\/explorer, whose provider omniroute an extension registers/,
+  );
+  assert.equal(
+    deniedDiscoveryModelError({
+      agent: "scout",
+      model: "omniroute/explorer",
+      noExtensions: false,
+      isForeignProvider: foreign,
+    }),
+    undefined,
+  );
+  assert.equal(
+    deniedDiscoveryModelError({
+      agent: "scout",
+      model: "openai-codex/gpt-6.1-sol",
+      noExtensions: true,
+      isForeignProvider: foreign,
+    }),
+    undefined,
+  );
+});
+
+test("a configured disable list keeps a definition resolvable but unoffered", () => {
+  const effective = discoverAgentDefinitions({
+    disabledDefinitions: ["scout"],
+  });
+  const scout = effective.find(({ name }) => name === "scout")!;
+  assert.equal(scout.disabledByConfig, true);
+  assert.equal(agentDefinitionEnabled(scout), false);
+  // A definition that names scout still loads.
+  assert.equal(
+    effective.some(({ name }) => name === "generalist"),
+    true,
+  );
+  const researcher = effective.find(({ name }) => name === "researcher")!;
+  assert.equal(researcher.disabledByConfig, undefined);
+  assert.equal(agentDefinitionEnabled(researcher), true);
+});
+
+test("a disable-list name that matches no definition fails discovery", () => {
+  assert.throws(
+    () => discoverAgentDefinitions({ disabledDefinitions: ["no-such-agent"] }),
+    /disabled definition name matches no definition: no-such-agent/,
+  );
+});
+
+test("a standalone definition reports no inherited fields", () => {
+  const definition = discoverAgentDefinitionsWithContents(
+    "---\nname: standalone-probe\n---\n\nBody\n",
+  ).find(({ name }) => name === "standalone-probe")!;
+  assert.equal(agentDefinitionMetadata(definition).inheritedFields, undefined);
+});
+
+test("the schema reference documents every supported field", () => {
+  const doc = readFileSync(
+    fileURLToPath(
+      new URL("../docs/reference/agent-definition-schema.md", import.meta.url),
+    ),
+    "utf8",
+  );
+  const missing = [...SUPPORTED_FIELDS].filter(
+    (field) => !doc.includes(`\`${field}\``),
+  );
+  assert.deepEqual(missing, []);
+});
+
+test("a preloaded skill changes the launch fingerprint", () => {
+  const base = {
+    name: "worker",
+    path: "/agents/worker.md",
+    frontmatter: { name: "worker" },
+    body: "Prompt",
+  };
+  const withPreload = {
+    ...base,
+    frontmatter: { name: "worker", preloadedSkills: ["lean-implementation"] },
+  };
+  assert.notEqual(
+    agentLaunchFingerprint(resolveAgentLaunchInputs(base, { cwd: "/tmp" })),
+    agentLaunchFingerprint(
+      resolveAgentLaunchInputs(withPreload, { cwd: "/tmp" }),
+    ),
+  );
 });
 
 test("drops --no-extensions when the child's model comes from an extension", () => {

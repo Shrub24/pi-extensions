@@ -62,10 +62,11 @@ const ARRAY_FIELDS = new Set([
   "tools",
   "excludeTools",
   "skills",
+  "preloadedSkills",
   "extensions",
   "agents",
 ]);
-const SUPPORTED_FIELDS = new Set([
+export const SUPPORTED_FIELDS = new Set([
   "name",
   "description",
   "permission",
@@ -99,6 +100,7 @@ export type Frontmatter = {
   excludeTools?: string[];
   noSkills?: boolean;
   skills?: string[];
+  preloadedSkills?: string[];
   noExtensions?: boolean;
   extensions?: string[];
   agents?: string[];
@@ -114,7 +116,22 @@ export type AgentDefinition = {
   extensionSource?: string;
   projectSource?: string;
   overrideSource?: string;
+  /**
+   * Which layer supplied each effective field's value. Present once a definition
+   * has been merged, so a field the definition's own file omits is visible as
+   * inherited rather than looking like something the operator wrote.
+   */
+  fieldSources?: Record<string, DefinitionSource>;
+  /**
+   * Named in the configuration's disable list. The definition still resolves so an
+   * `agents` reference to it loads and delegation reports a disabled definition,
+   * but no offered surface lists it.
+   */
+  disabledByConfig?: boolean;
 };
+
+/** The layer a definition's own file came from. */
+export type DefinitionSource = "bundled" | "project" | "global";
 
 export const AGENT_COORDINATION_TOOLS = [
   "agent_list",
@@ -198,6 +215,53 @@ export function mergeFrontmatter(
   override: Frontmatter,
 ): Frontmatter {
   return { ...base, ...override };
+}
+
+/** The layer a definition's own file came from. */
+export function definitionLayerSource(
+  definition: AgentDefinition,
+): DefinitionSource {
+  if (definition.overrideSource !== undefined) return "global";
+  if (definition.projectSource !== undefined) return "project";
+  return "bundled";
+}
+
+/**
+ * The effective fields whose value came from a lower-precedence definition,
+ * because the definition's own file omits them. This is what an operator cannot
+ * see by reading their own file: overriding a bundled role inherits every field
+ * it does not set, including behaviour-changing ones like `noSkills`,
+ * `noExtensions`, `inheritGlobalContext` and `agents`.
+ */
+export function inheritedFrontmatterFields(
+  definition: AgentDefinition,
+): { field: string; source: DefinitionSource }[] {
+  const own = definitionLayerSource(definition);
+  return Object.entries(definition.fieldSources ?? {})
+    .filter(
+      ([field, source]) => source !== own && field in definition.frontmatter,
+    )
+    .map(([field, source]) => ({ field, source }));
+}
+
+/**
+ * Whether native skill discovery is off for this definition.
+ *
+ * An explicit `noSkills` wins over `inheritSkills`, but an `inheritSkills` the
+ * definition itself sets wins over a `noSkills` inherited from the definition it
+ * overlays: the operator wrote the opt-in, so an inherited default must not
+ * defeat it.
+ */
+export function skillDiscoveryDisabled(agent: AgentDefinition): boolean {
+  const { frontmatter } = agent;
+  const own = definitionLayerSource(agent);
+  const sourceOf = (field: "noSkills" | "inheritSkills") =>
+    agent.fieldSources?.[field] ??
+    (frontmatter[field] === undefined ? undefined : own);
+  if (sourceOf("noSkills") === own) return frontmatter.noSkills === true;
+  if (sourceOf("inheritSkills") === own && frontmatter.inheritSkills === true)
+    return false;
+  return frontmatter.noSkills ?? frontmatter.inheritSkills !== true;
 }
 
 function validateDefinition(
@@ -332,8 +396,18 @@ function applyDefinitionLayer(
 ): void {
   for (const definition of layer) {
     const base = definitions.get(definition.name);
+    // The layer label comes from which layer is being applied, not from the
+    // definition's own source fields: those are only set once it is merged in.
+    const layerSource: DefinitionSource =
+      sourceField === "overrideSource" ? "global" : "project";
     if (!base) {
       definition[sourceField] = definition.path;
+      definition.fieldSources = Object.fromEntries(
+        Object.keys(definition.frontmatter).map((field) => [
+          field,
+          layerSource,
+        ]),
+      );
       validateDefinition(definition);
       definitions.set(definition.name, definition);
       continue;
@@ -341,11 +415,26 @@ function applyDefinitionLayer(
     const mode = overrideBodyMode(definition);
     const { bodyMode: _bodyMode, ...overrideFrontmatter } =
       definition.frontmatter;
+    const baseSource = definitionLayerSource(base);
     const effective: AgentDefinition = {
       name: base.name,
       path: definition.path,
       frontmatter: mergeFrontmatter(base.frontmatter, overrideFrontmatter),
       body: mergeDefinitionBody(base.body, definition.body, mode),
+      fieldSources: {
+        ...Object.fromEntries(
+          Object.keys(base.frontmatter).map((field) => [
+            field,
+            base.fieldSources?.[field] ?? baseSource,
+          ]),
+        ),
+        ...Object.fromEntries(
+          Object.keys(overrideFrontmatter).map((field) => [
+            field,
+            layerSource,
+          ]),
+        ),
+      },
       extensionSource: base.extensionSource,
       projectSource: base.projectSource,
       overrideSource: base.overrideSource,
@@ -356,7 +445,15 @@ function applyDefinitionLayer(
   }
 }
 
-export type DiscoverAgentDefinitionsOptions = { projectRoot?: string };
+export type DiscoverAgentDefinitionsOptions = {
+  projectRoot?: string;
+  /**
+   * Names the operator has taken out of the offered roster. A name that matches no
+   * definition is an error, because a typo would otherwise disable nothing while
+   * appearing to work.
+   */
+  disabledDefinitions?: readonly string[];
+};
 
 export function discoverAgentDefinitions(
   options: DiscoverAgentDefinitionsOptions = {},
@@ -383,6 +480,12 @@ export function discoverAgentDefinitions(
     left.name.localeCompare(right.name),
   );
   const names = new Set(effective.map((definition) => definition.name));
+  const disabled = new Set(options.disabledDefinitions ?? []);
+  for (const name of disabled)
+    if (!names.has(name))
+      throw new Error(
+        `disabled definition name matches no definition: ${name}`,
+      );
   for (const definition of effective)
     for (const reference of definition.frontmatter.agents ?? [])
       if (!names.has(reference))
@@ -391,9 +494,12 @@ export function discoverAgentDefinitions(
         );
   return effective.map((definition) => ({
     ...definition,
+    ...(disabled.has(definition.name) ? { disabledByConfig: true } : {}),
     frontmatter: {
       ...definition.frontmatter,
-      enabled: definition.frontmatter.enabled ?? true,
+      enabled: disabled.has(definition.name)
+        ? false
+        : (definition.frontmatter.enabled ?? true),
     },
   }));
 }
@@ -460,7 +566,9 @@ export function agentDefinitionMetadata(
   agent: AgentDefinition,
   scope: AgentDefinitionScope = "delegating",
 ) {
-  const { frontmatter } = projectAgentDefinition(agent, scope);
+  const projected = projectAgentDefinition(agent, scope);
+  const { frontmatter } = projected;
+  const inheritedFields = inheritedFrontmatterFields(projected);
   const description = frontmatter.description;
   const model = configuredModel(frontmatter);
   const thinking = configuredThinking(agent);
@@ -476,6 +584,7 @@ export function agentDefinitionMetadata(
     ...(agent.overrideSource === undefined
       ? {}
       : { overrideSource: agent.overrideSource }),
+    ...(inheritedFields.length === 0 ? {} : { inheritedFields }),
     ...(typeof description === "string" ? { description } : {}),
     ...(model === undefined ? {} : { model }),
     ...(thinking === undefined ? {} : { thinking }),
@@ -645,6 +754,79 @@ export function resolveChildModel(input: {
   };
 }
 
+export type ModelOrigin = "pinned" | "inherited";
+
+/**
+ * A pattern is an exact `provider/model`, a trailing-wildcard `provider/*`, or the
+ * reserved `$inherited`, which matches only a model the launch inherited.
+ */
+export function modelPatternMatches(
+  model: string,
+  origin: ModelOrigin,
+  pattern: string,
+): boolean {
+  if (pattern === "$inherited") return origin === "inherited";
+  if (pattern.endsWith("*")) return model.startsWith(pattern.slice(0, -1));
+  return model === pattern;
+}
+
+export function modelPermitted(
+  model: string,
+  origin: ModelOrigin,
+  allow: readonly string[],
+): boolean {
+  return allow.some((pattern) => modelPatternMatches(model, origin, pattern));
+}
+
+/**
+ * The policy error for a resolved model, or undefined when every applicable scope
+ * permits it. A scope that exists is a restriction, never an exemption: the
+ * global list and the definition's own list must both permit the model.
+ */
+export function modelPolicyError(input: {
+  agent: string;
+  model: string;
+  origin: ModelOrigin;
+  globalAllow?: readonly string[];
+  agentAllow?: readonly string[];
+}): string | undefined {
+  const describe = `${input.origin} model ${input.model}`;
+  if (
+    input.globalAllow !== undefined &&
+    !modelPermitted(input.model, input.origin, input.globalAllow)
+  )
+    return `agent ${input.agent} cannot run on ${describe}: the modelScopes allow list does not permit it`;
+  if (
+    input.agentAllow !== undefined &&
+    !modelPermitted(input.model, input.origin, input.agentAllow)
+  )
+    return `agent ${input.agent} cannot run on ${describe}: modelScopes.agents.${input.agent} does not permit it`;
+  return undefined;
+}
+
+/**
+ * A definition that pins a model from an extension-registered provider and also
+ * denies extension discovery cannot resolve it: Pi starts, finds no such model
+ * and exits about two seconds later with a message that reads as a missing model
+ * rather than as a conflicting definition. Catch it before the launch.
+ */
+export function deniedDiscoveryModelError(input: {
+  agent: string;
+  model: string;
+  noExtensions: boolean;
+  isForeignProvider: (providerId: string) => boolean;
+}): string | undefined {
+  if (!input.noExtensions) return undefined;
+  const provider = input.model.split("/")[0] ?? "";
+  if (provider.length === 0 || !input.isForeignProvider(provider))
+    return undefined;
+  return (
+    `agent ${input.agent} pins model ${input.model}, whose provider ${provider} an extension registers, ` +
+    `but the definition sets noExtensions: true so the child cannot resolve it. ` +
+    "Remove noExtensions: true, or pin a model a built-in provider serves."
+  );
+}
+
 function configuredThinking(agent: AgentDefinition): string | undefined {
   const configured = agent.frontmatter.thinking;
   if (configured === false) return "off";
@@ -736,6 +918,17 @@ export type AgentLaunchOptions = {
    * model (configured, else inherited) is passed through unchanged.
    */
   modelDecision?: ChildModelDecision;
+  /**
+   * Skill arguments already resolved by the caller, replacing the definition's
+   * raw values. The launch path resolves and validates them; callers that omit
+   * this keep the definition's values verbatim.
+   */
+  resolvedSkills?: readonly string[];
+  /**
+   * Prompt files holding preloaded skill bodies, appended after the definition
+   * body and before inherited context files.
+   */
+  preloadedSkillPromptPaths?: readonly string[];
 };
 
 /**
@@ -760,6 +953,7 @@ export type AgentLaunchInputs = {
   excludeTools: string[];
   noSkills: boolean;
   skills: string[];
+  preloadedSkills: string[];
   noExtensions: boolean;
   extensions: string[];
   inheritProjectContext: boolean;
@@ -862,8 +1056,9 @@ export function resolveAgentLaunchInputs(
     ...(model === undefined ? {} : { model }),
     ...(thinking === undefined ? {} : { thinking }),
     ...managedToolSelection(agent),
-    noSkills: frontmatter.noSkills ?? frontmatter.inheritSkills !== true,
+    noSkills: skillDiscoveryDisabled(agent),
     skills: [...(frontmatter.skills ?? [])],
+    preloadedSkills: [...(frontmatter.preloadedSkills ?? [])],
     noExtensions: frontmatter.noExtensions === true,
     extensions: [...(frontmatter.extensions ?? [])],
     inheritProjectContext,
@@ -882,6 +1077,7 @@ export function agentLaunchFingerprint(inputs: AgentLaunchInputs): string {
     tools: [...inputs.tools].sort(),
     excludeTools: [...inputs.excludeTools].sort(),
     skills: [...inputs.skills].sort(),
+    preloadedSkills: [...inputs.preloadedSkills].sort(),
     extensions: [...inputs.extensions].sort(),
   });
   return createHash("sha256").update(canonical).digest("hex");
@@ -945,6 +1141,8 @@ export function agentLaunchArgs(
       mode === "append" ? "--append-system-prompt" : "--system-prompt",
       bodyPromptPathForLaunch,
     );
+  for (const path of options.preloadedSkillPromptPaths ?? [])
+    args.push("--append-system-prompt", path);
   const inheritProjectContext =
     frontmatter.inheritProjectContext ?? agent.name === "delegate";
   const inheritGlobalContext =
@@ -983,9 +1181,10 @@ export function agentLaunchArgs(
       args.push("--exclude-tools", frontmatter.excludeTools.join(","));
   }
 
-  const noSkills = frontmatter.noSkills ?? frontmatter.inheritSkills !== true;
+  const noSkills = skillDiscoveryDisabled(agent);
   if (noSkills) args.push("--no-skills");
-  for (const skill of frontmatter.skills ?? []) args.push("--skill", skill);
+  for (const skill of options.resolvedSkills ?? frontmatter.skills ?? [])
+    args.push("--skill", skill);
 
   // A model whose provider comes from an extension cannot resolve inside a
   // child denied extension discovery, so the model's needs outrank the

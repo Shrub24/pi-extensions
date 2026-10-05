@@ -67,6 +67,7 @@ import support, {
   defaultFixtureIdentity,
   discoverAgent,
   fakeContext,
+  visibleAgentDefinitionMetadata,
   fakePi,
   fakeAgentContext,
   herdrAlias,
@@ -2925,6 +2926,32 @@ test("lead agents command uses native completion and exact human grammar", async
     "Usage: /agents stats | definitions | placement [tab|subtree|split] | stop",
     "Usage: /agents placement [tab|subtree|split]",
   ]);
+});
+
+test("a configured disable list removes a definition from the offered roster", async () => {
+  setLeadEnvironment();
+  const configDir = join(PI_AGENT_ROOT, "pi-herdsman");
+  realFs.mkdirSync(configDir, { recursive: true });
+  realFs.writeFileSync(
+    join(configDir, "config.json"),
+    JSON.stringify({ disabledDefinitions: ["scout"] }),
+  );
+  try {
+    const roster = await visibleAgentDefinitionMetadata(
+      fakeContext() as any,
+      { kind: "lead" },
+    );
+    assert.equal(
+      roster.some((definition) => definition.name === "scout"),
+      false,
+    );
+    assert.equal(
+      roster.some((definition) => definition.name === "researcher"),
+      true,
+    );
+  } finally {
+    realFs.rmSync(configDir, { recursive: true, force: true });
+  }
 });
 
 test("/agents placement subtree writes flat config outside project settings", async () => {
