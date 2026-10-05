@@ -2521,7 +2521,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			...summaries.map((line) => `• ${line}`),
 			failures.length > 0
 				? `${failures.length} failed: ${taskSurfaceGuidance(taskToolSurface).reviewFailures}.`
-				: "If these results are already consumed, nothing more to do; stop lingering tasks with bg_task stop.",
+				: "If these results are already consumed, nothing more to do.",
 			runningInventory(),
 		].join("\n");
 		deliverWakeMessage(
@@ -3028,6 +3028,13 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		ensureOrphanWatcher();
 		syncWidget(ctx);
 	});
+	// A run Pi starts without `before_agent_start` (a queued follow-up, a peer
+	// extension's trigger-turn wake: earendil-works/pi#5581) is still a run in
+	// flight. If only `before_agent_start` marked it, an exit during that run
+	// took the idle path and was sent as a follow-up the agent had already
+	// consumed through get/stop.
+	pi.on("agent_start", () => { turnActive = true; });
+	pi.on("turn_start", () => { turnActive = true; });
 	pi.on("before_agent_start", (_event, ctx) => {
 		turnActive = true;
 		recordProjectTrust(ctx);

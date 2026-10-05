@@ -402,7 +402,12 @@ export function renderBgToolResult(result: any, options: any, theme: Theme, cont
 
 	if (action === "stop") {
 		const task = latestSnapshot(details.task as BackgroundTaskSnapshot | undefined);
-		const label = task ? `${theme.fg("accent", task.id)} ${bgStatusText(task, theme)}` : theme.fg("muted", compactText(raw, 80));
+		// A stop of a task that had already ended is a no-op that reports its real
+		// outcome; "stop bg-1 failed (exit 1)" reads as the stop having failed.
+		const alreadyEnded = typeof details.stopMessage === "string" && details.stopMessage.includes(" is already ");
+		const label = task
+			? `${theme.fg("accent", task.id)} ${alreadyEnded ? theme.fg("dim", "already ") : ""}${bgStatusText(task, theme)}`
+			: theme.fg("muted", compactText(raw, 80));
 		let text = `${theme.fg("warning", "● ")}${bgToolLabel(theme, "Background task stop ")}${label}`;
 		if (expanded && task) text += `\n${renderTaskDetails(task, theme, cwd).join("\n")}`;
 		return renderLines(text);

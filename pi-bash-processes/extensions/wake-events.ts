@@ -649,8 +649,8 @@ export function sendTaskWake(
 		: cancelled
 			? "\nNo result will arrive; rerun the work if it is still needed."
 			: (task.exitCode ?? 0) === 0
-				? "\nIf you already consumed this result, nothing more to do; stop lingering tasks you no longer need with bg_task stop."
-				: `\n${guidance.reviewFailures} (the failed task is ${task.id}); stop lingering tasks you no longer need with bg_task stop.`;
+				? "\nIf you already consumed this result, nothing more to do."
+				: `\n${guidance.reviewFailures} (the failed task is ${task.id}).`;
 	const inventory = deps.runningInventory?.();
 	const commandPreview = truncateField(task.command, WAKE_CONTENT_COMMAND_MAX_CHARS) ?? "";
 
