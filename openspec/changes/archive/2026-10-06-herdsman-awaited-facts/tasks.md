@@ -29,4 +29,4 @@
   `PI_HERDSMAN_*`/`PI_SUBAGENT_*` env removed: with them inherited, role-sensitive
   tests fail on a managed-worker session (pre-existing at HEAD).
 - [x] 2.3 Strict OpenSpec validation for this change.
-- [ ] 2.4 Tell the Radar session the key, the item shape and the derivation rule.
+- [x] 2.4 Tell the Radar session the key, the item shape and the derivation rule.

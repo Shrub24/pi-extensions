@@ -1,6 +1,12 @@
-# Background pane facts
+# background-pane-facts Specification
 
-## ADDED Requirements
+## Purpose
+Presence and shape of this session's outstanding background work, published as `pi_bg_*` pane
+tokens so a sidebar can show what a session is waiting on without reading the task store. The
+tokens carry only count, identities and phases — no command text, output or paths — and no
+semantic-state key, because waiting is derived by the consumer rather than published.
+
+## Requirements
 
 ### Requirement: A session with running tasks advertises them on its own pane
 
@@ -44,11 +50,13 @@ session is doing.
 - **WHEN** a session spawns a background task and keeps working
 - **THEN** the facts are published while the session is working
 
-### Requirement: Only presence and state are published
+### Requirement: Only presence and state are published on the pane
 
-Published values SHALL contain the running count, task identifiers and a start
-timestamp, and SHALL NOT contain command text, output, prompts, working
-directories or any other task content.
+Every `pi_bg_*` pane value SHALL contain the running count, task identifiers and
+a start timestamp, and SHALL NOT contain command text, output, prompts, working
+directories or any other task content. This bounds the pane tokens, which a
+sidebar and the terminal both display; per-task detail travels on Agent Radar's
+local socket instead, where the operator-only surface already shows it.
 
 #### Scenario: Task content stays in the session
 

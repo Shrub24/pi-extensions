@@ -37,5 +37,5 @@
   and record the counts and the source checkpoint. 345 pass / 0 fail across 98
   files at git `5b778a04`, jj change `wtkylqrrmmqknqzvyysrlrqypnuslyru`.
 - [x] 4.3 Strict OpenSpec validation for this change.
-- [ ] 4.4 Tell the Radar session the token set so it can render the waiting
+- [x] 4.4 Tell the Radar session the token set so it can render the waiting
   presentation. (Owner-level: cross-session message.)
