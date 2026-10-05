@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 
-import { applyTaskToolSurface, registerAll, type RegistrationDeps } from "../extensions/registrations.js";
+import { applyTaskToolSurface, bashPromptGuidelines, registerAll, type RegistrationDeps } from "../extensions/registrations.js";
 import { taskSurfaceGuidance } from "../extensions/tool-surface.js";
 import { createToolRegistry, declaredActionEnum, declaredSchemaText } from "./fixtures/tool-surface-harness.js";
 
@@ -151,6 +151,15 @@ test("the TUI prompt never recommends bg_status or the bounded wait, and no mode
 			expect(text, "compatibility guidance names the retained bounded wait").toContain('action:"wait"');
 			expect(text, "compatibility guidance names what the wait is for").toContain("noninteractive or child caller");
 		}
+	}
+});
+
+test("bash guidance tells every surface not to trim output and that shells run pipefail", () => {
+	for (const surface of ["tui", "compat"] as const) {
+		const text = bashPromptGuidelines(surface).join("\n");
+		expect(text, `${surface}: names the trim anti-pattern`).toContain("Do not trim output with");
+		expect(text, `${surface}: says oversized output is saved in full`).toContain("saved in full");
+		expect(text, `${surface}: says pipefail applies`).toContain("pipefail");
 	}
 });
 

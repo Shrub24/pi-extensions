@@ -114,12 +114,12 @@ test("managed bash v1: a hand-written sleep+read poll runs as written, with no s
 }, SPAWN_FIXTURE_TIMEOUT_MS);
 
 /**
- * A terminal `| tail -N` runs to completion (real exit code, live log) and the
- * truncation is applied afterwards, with a disclosure footer.
+ * A terminal `| tail` is the author's choice and the extension no longer
+ * rewrites it: the command reaches the shell as written.
  */
-test("managed bash v1: terminal tail is stripped, emulated and disclosed", () => {
-	const result = runScenario({ mode: "spawn", scenario: "fast", command: "echo batch | tail -1" });
-	expect(result.resultText).toContain("two\n");
-	expect(result.resultText).toContain("kendex: `tail -n 1` was applied to the completed output");
-	expect(result.resultText).not.toContain("one\n");
+test("managed bash v1: a terminal tail reaches the shell unmodified", () => {
+	const command = "echo batch | tail -1";
+	const result = runScenario({ mode: "spawn", scenario: "fast", command });
+	expect(result.composedCommand).toBe(command);
+	expect(result.resultText).not.toContain("was applied to the completed output");
 }, SPAWN_FIXTURE_TIMEOUT_MS);

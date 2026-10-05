@@ -97,7 +97,6 @@ import { applyTaskToolSurface, bashPromptGuidelines, registerAll, type Registrat
 import { closeTaskLifecycle, replayMissedExitsLifecycle, sendExitWakeLifecycle, type LifecycleHooks } from "./lifecycle.js";
 import { taskLogs } from "./log-writer.js";
 import { BASH_OUTPUT_SCHEMA, buildManagedBashEnv, createForegroundWaiter, formatManagedBashCompletionText, formatManagedBashRunningText, isCodemodeCall, normalizeManagedBashTimeoutSeconds, settleForegroundWaiter, STRUCTURED_OUTPUT_MAX_BYTES, structuredOutputFor, structuredOutputOmittedMarker } from "./managed-bash.js";
-import { emulateTruncation, stripTerminalTruncation } from "./pipe-strip.js";
 import type * as ManagedBashPresentation from "@vanillagreen/pi-tool-renderer/managed-bash";
 import { getIntent, intentModeFor, intentParameters, intentPrepare, intentSuffix, stripIntent, withIntentParameter, installIntentGuard } from "@vanillagreen/pi-tool-renderer/intent";
 let managedBashPresentation: typeof ManagedBashPresentation | undefined;
@@ -115,7 +114,7 @@ import { applyCustomEntryWithBarrier, createPersistence, sessionIdForContext, si
 import { mapWithConcurrency, PROBE_CONCURRENCY } from "./probes.js";
 import { defaultSystemdUnitActive, planResourceControlledSpawn, stopResourceControlledTask } from "./resource-control.js";
 import { installSettingsCacheRefresh, recordProjectTrust } from "./package-config.js";
-import { bridgeSocketPath, logFilePath, settingBoolean, settingEnum, settingNumber, settingString, taskEnv, taskLaneDir, taskLanesRoot } from "./settings.js";
+import { bridgeSocketPath, logFilePath, pipefailShellArgs, settingBoolean, settingEnum, settingNumber, settingString, taskEnv, taskLaneDir, taskLanesRoot } from "./settings.js";
 import { prepareSnapshot } from "./snapshot-artifact.js";
 import { clampTaskWaitSeconds, createTaskWaitWaiter, DEFAULT_TASK_WAIT_SECONDS, formatTaskWaitRunningText, MAX_TASK_WAIT_SECONDS, settleTaskWaitWaiter, TASK_WAIT_PENDING_POLL_MS } from "./task-wait.js";
 import {
@@ -2285,13 +2284,8 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 
 		const timeoutSeconds = normalizeManagedBashTimeoutSeconds(params.timeout);
 		const yieldMs = managedBashYieldMs(ctx.cwd);
-		// A terminal `| head/tail [-n] N` becomes run-to-completion + post-hoc
-		// emulation: the filter used to eat the exit code (pipefail off) and keep
-		// the log empty until exit. The truncation itself still applies below.
-		const stripped = stripTerminalTruncation(command);
-		const effectiveCommand = stripped?.command ?? command;
 		const task = spawnTask({
-			command: effectiveCommand,
+			command,
 			cwd: ctx.cwd,
 			env: managedBashEnv(ctx),
 			foregroundYieldMs: yieldMs,
@@ -2357,16 +2351,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 				if (exitCode !== 0) {
 					throw new Error(`${rawText}\n\nCommand exited with code ${exitCode}`);
 				}
-				// Emulate the stripped filter on the completed output and disclose
-				// the substitution; the command ran to completion, so this exit code
-				// is the real one.
-				let text = rawText;
-				if (stripped) {
-					const emulated = emulateTruncation(rawText, stripped.tool, stripped.lines);
-					text = emulated.text
-						+ `\n(kendex: \`${stripped.tool} -n ${stripped.lines}\` was applied to the completed output; the command ran without the filter)`;
-				}
-				return makeToolResult(text, details, managedBashStructuredContent(task, exitCode, elapsedMs, rawText));
+				return makeToolResult(rawText, details, managedBashStructuredContent(task, exitCode, elapsedMs, rawText));
 			}
 			return makeToolResult(formatManagedBashRunning(task, elapsedMs, ctx.cwd), details);
 		} finally {
@@ -2649,7 +2634,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			command,
 			cwd,
 			shell,
-			shellArgs: args,
+			shellArgs: pipefailShellArgs(shell, args, cwd),
 			taskId: id,
 			now,
 			origin: options.origin ?? "bg_task",

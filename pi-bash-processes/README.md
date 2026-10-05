@@ -177,8 +177,10 @@ current through upstream `#3289`. The fork's own features (upstream has no
 equivalent — each is fork-only source plus its tests):
 
 - **Managed bash** (`extensions/managed-bash.ts`) — the extension's own bash
-  tool wrapping pi-bash-processes semantics, with pipe stripping
-  (`pipe-strip.ts`) and a bounded task wait (`task-wait.ts`). Awaiting a result is
+  tool wrapping pi-bash-processes semantics, with a bounded task wait
+  (`task-wait.ts`) and `pipefail` on bash and zsh shells (`managedShellPipefail:
+  false` opts out). Commands run exactly as written: a trailing `| head`/`| tail`
+  is no longer rewritten. Awaiting a result is
   a declared operation now: the read shim (`read-shim.ts`) that made a raw log
   read consume the exit wake, the sleep-as-wait interception
   (`sleep-intercept.ts`), and the per-process consume logs are all retired.

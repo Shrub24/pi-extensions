@@ -142,6 +142,7 @@ function bgTaskActionDescription(surface: TaskToolSurface): string {
 export function bashPromptGuidelines(surface: TaskToolSurface): string[] {
 	return [
 		"You can inspect PI_* environment variables for current model and session details.",
+		"Do not trim output with `| tail`/`| head` or discard it with `2>/dev/null`: oversized results are bounded and saved in full to a file the result names, and a trim hides failures and forces re-runs. Shells run with pipefail, so a failing pipeline stage fails the command.",
 		surface === "tui"
 			? 'If a bash result says Running, it is not success: do not use its output or artifacts yet. Do independent work; if nothing independent remains, finish the turn with a brief waiting status and go idle, and completion will wake the agent in a new turn. There is no bounded wait in this mode, and repeatedly calling list/get is not a substitute for it.'
 			: 'If a bash result says Running, it is not success: do not use its output or artifacts yet. If the result is a dependency barrier, call bg_task action:"wait" once with a bounded waitSeconds; otherwise continue only independent work. If nothing independent remains, finish the turn with a brief waiting status and go idle; completion will wake the agent in a new turn. Do not repeatedly call list/log/wait in a polling loop.',

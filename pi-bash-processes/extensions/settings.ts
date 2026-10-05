@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, join, resolve } from "node:path";
+import { basename, delimiter, join, resolve } from "node:path";
 
 import { CONFIG_ID } from "./constants.js";
 import { expandHome, piUserDir, readPackageConfig } from "./package-config.js";
@@ -21,6 +21,17 @@ export function settingNumber(key: string, fallback: number, cwd?: string): numb
 export function settingBoolean(key: string, fallback: boolean, cwd?: string): boolean {
 	const value = readkendexConfig(cwd)[key];
 	return typeof value === "boolean" ? value : fallback;
+}
+
+/**
+ * Managed shells run with `pipefail`, so a failing stage fails the pipeline
+ * instead of hiding behind the last stage's exit code. Only shells known to
+ * accept `-o pipefail` are touched; `managedShellPipefail: false` opts out.
+ */
+export function pipefailShellArgs(shell: string, args: string[], cwd?: string): string[] {
+	if (!settingBoolean("managedShellPipefail", true, cwd)) return args;
+	const name = basename(shell);
+	return name === "bash" || name === "zsh" ? ["-o", "pipefail", ...args] : args;
 }
 
 export function settingString(key: string, fallback: string, cwd?: string): string {
