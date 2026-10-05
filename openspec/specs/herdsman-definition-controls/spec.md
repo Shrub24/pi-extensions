@@ -1,7 +1,7 @@
 # herdsman-definition-controls Specification
 
 ## Purpose
-TBD - created by archiving change herdsman-definition-controls. Update Purpose after archive.
+Remove chosen definitions from every offered surface while keeping them resolvable, and report the fields each overlay inherited.
 
 ## Requirements
 

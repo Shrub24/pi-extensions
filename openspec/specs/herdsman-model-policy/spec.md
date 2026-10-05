@@ -1,7 +1,7 @@
 # herdsman-model-policy Specification
 
 ## Purpose
-TBD - created by archiving change herdsman-model-policy. Update Purpose after archive.
+Constrain which models a delegated agent may run on, and fail a launch whose model cannot resolve before a child starts.
 
 ## Requirements
 

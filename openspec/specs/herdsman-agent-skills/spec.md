@@ -1,7 +1,7 @@
 # herdsman-agent-skills Specification
 
 ## Purpose
-TBD - created by archiving change herdsman-agent-skills. Update Purpose after archive.
+Resolve a definition's skill names to real paths, and let a definition force-load chosen skill bodies into its agent prompt.
 
 ## Requirements
 
