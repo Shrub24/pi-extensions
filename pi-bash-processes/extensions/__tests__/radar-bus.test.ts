@@ -122,15 +122,30 @@ test("every emitted line has the shape of Radar's published fixture", () => {
 	expect(JSON.parse(helloLine(SESSION, undefined))).toEqual(fixture[1]);
 	expect(JSON.parse(tasksLine([]))).toEqual(fixture.find((m: any) => m.type === "tasks" && m.tasks.length === 0));
 	const full = fixture.find((m: any) => m.type === "tasks" && m.tasks.length === 3);
+	// The fixture's review task carries the decided command/cwd, so both come from
+	// Radar's published example rather than from a second copy of the strings here.
+	const example = full.tasks.find((task: any) => task.state === "review");
 	const built = JSON.parse(
 		tasksLine(
 			busTasks([
 				task("bg-1", { startedAt: 1759218000123, lastOutputAt: 1759218074567, outputBytes: 18244, pid: 48213 }),
 				task("bg-2", { status: "completed", resultReady: false, startedAt: 1759218010000, lastOutputAt: 1759218060000, outputBytes: 9917 }),
-				task("bg-3", { status: "completed", resultReady: true, startedAt: 1759217900000, lastOutputAt: 1759218000000, outputBytes: 65536, exitCode: 0 }),
+				task("bg-3", {
+					status: "completed",
+					resultReady: true,
+					startedAt: 1759217900000,
+					lastOutputAt: 1759218000000,
+					outputBytes: 65536,
+					exitCode: 0,
+					command: example.command,
+					cwd: example.cwd,
+				}),
 			]),
 		),
 	);
+	expect(example.command, "the fixture carries the decided command/cwd").toBeDefined();
+	expect(built.tasks[2]!.command).toBe(example.command);
+	expect(built.tasks[2]!.cwd).toBe(example.cwd);
 	// Same keys and types as the fixture; the fixture's pids on exited tasks are illustrative.
 	for (const [index, expected] of full.tasks.entries()) {
 		for (const key of Object.keys(built.tasks[index])) expect(typeof built.tasks[index][key]).toBe(typeof expected[key]);
