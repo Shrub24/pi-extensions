@@ -590,6 +590,125 @@ test("post-review settlement requires a fresh response in either listener order"
   }
 });
 
+test("a held worker that resumes with an artifact-only response publishes", async () => {
+  const mailbox = setAgentEnvironment("artifact-waiting-agent");
+  const providerId = "artifact-waiting-provider";
+  const agent = fakePi();
+  let revision = 1;
+  let outstanding: { taskId: string; state: string; reason: string }[] = [
+    {
+      taskId: "artifact-task",
+      state: "running",
+      reason: "the artifact is not written yet",
+    },
+  ];
+  const providerRegistration = registerBackgroundWorkProvider(
+    agent.pi.events as never,
+    {
+      id: providerId,
+      version: 1,
+      snapshot(scope: { sessionId: string; requestId: string }) {
+        return {
+          provider: { id: providerId, version: 1 },
+          sessionId: scope.sessionId,
+          requestId: scope.requestId,
+          revision,
+          reconciliation: { state: "ready" },
+          outstanding,
+        };
+      },
+      bind() {
+        return { ok: true };
+      },
+      protect() {
+        return { ok: true };
+      },
+    },
+  );
+  registerExtension!(agent.pi as never);
+  const context = fakeAgentContext();
+  context.mode = "rpc";
+  const artifactPath = `held-artifact-${randomUUID()}.md`;
+  let canonicalPath: string | undefined;
+  try {
+    await agent.events.get("session_start")![0](undefined, context);
+    const initial = readAgentState(mailbox)!;
+    canonicalPath = join(initial.cwd, artifactPath);
+    const requestId = randomUUID();
+    const brief = normalizeDelegationBrief({
+      ...parseDelegationBrief(DELEGATION_BRIEF_EXAMPLES.common),
+      response: {
+        schema: "response-contract/v1",
+        target: "artifact",
+        format: "markdown",
+        path: artifactPath,
+        requiredSections: ["Outcome"],
+      },
+    });
+    writeRequest(mailbox, {
+      version: 5,
+      runId: initial.runId,
+      requestId,
+      ownerSessionId: initial.ownerSessionId,
+      workspaceId: initial.workspaceId,
+      agentLabel: initial.agentLabel,
+      paneId: initial.paneId,
+      kind: "task",
+      acceptedAssignment: createAcceptedAssignmentContract(
+        requestId,
+        brief,
+        DEFAULT_RESPONSE_CONTRACT,
+        initial.cwd,
+        1024 * 1024,
+      ),
+      text: "Write the report artifact and report back",
+      createdAt: Date.now(),
+    });
+    agent.events.get("input")![0]({ text: controlMarker(requestId) }, context);
+    agent.events.get("message_end")![0](
+      {
+        message: {
+          role: "assistant",
+          content: "waiting for the background task to finish",
+        },
+      },
+      context,
+    );
+    await agent.events.get("agent_settled")![0](undefined, context);
+    assert.equal(readResult(mailbox, requestId), undefined);
+    assert.ok(
+      readAgentState(mailbox)?.backgroundWaiting,
+      "the worker is held while its background task runs",
+    );
+
+    // The task resolves and the wake resumes the worker. An artifact-target
+    // contract does not require inline text, so this turn ends with an empty
+    // assistant message and only the artifact as its answer.
+    outstanding = [];
+    revision++;
+    writeFileSync(canonicalPath!, "## Outcome\nArtifact-backed response", "utf8");
+    agent.events.get("message_end")![0](
+      { message: { role: "assistant", content: "" } },
+      context,
+    );
+    await agent.events.get("agent_settled")![0](undefined, context);
+
+    const result = readResult(mailbox, requestId);
+    assert.equal(result?.status, "completed", JSON.stringify(result));
+    assert.equal(result?.text, `Artifact validated: ${artifactPath}`);
+    assert.equal(
+      readAgentState(mailbox)?.backgroundWaiting,
+      undefined,
+      "the held marker clears once the artifact response is published",
+    );
+  } finally {
+    fireShutdown(agent);
+    providerRegistration.dispose();
+    if (canonicalPath) realFs.rmSync(canonicalPath, { force: true });
+    resetAgentMailbox(mailbox);
+  }
+});
+
 test("registered provider reconciliation errors fail closed at settlement", async () => {
   const mailbox = setAgentEnvironment("background-error-agent");
   const providerId = "test-background-provider-error";

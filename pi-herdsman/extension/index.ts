@@ -15524,6 +15524,10 @@ export default function (pi: ExtensionAPI): void {
   let state: ManagedAgentState | undefined;
   let initialized = false;
   let latest = "";
+  // A settlement that resolved background work may only publish an answer the
+  // worker produced after the wait. An artifact-target contract can answer with
+  // no inline text, so freshness is tracked separately from the text itself.
+  let freshResponse = false;
   let pendingResult: ResultRecord | undefined;
   let pendingInterruptReplacement: string | undefined;
   let resultWriteAttempts = 0;
@@ -15880,6 +15884,7 @@ export default function (pi: ExtensionAPI): void {
         release();
       }
       latest = "";
+      freshResponse = false;
       return {
         content: [
           {
@@ -16299,6 +16304,7 @@ export default function (pi: ExtensionAPI): void {
       state = candidate;
       acknowledgementErrorReported = false;
       latest = "";
+      freshResponse = false;
       return {
         action: "transform",
         text: `Owner reply:\n\n${request.text}\n\nContinue the original assignment using this answer.`,
@@ -16544,6 +16550,7 @@ export default function (pi: ExtensionAPI): void {
       )
         return { action: "handled" };
       latest = "";
+      freshResponse = false;
       if (request.kind === "interrupt") {
         const editorText =
           ctx.mode === "tui" ? ctx.ui.getEditorText() : undefined;
@@ -16558,6 +16565,7 @@ export default function (pi: ExtensionAPI): void {
       return { action: "transform", text: request.text };
     }
     latest = "";
+    freshResponse = false;
     return { action: "transform", text: request.text };
   });
   pi.on("message_end", (event: any, ctx: ExtensionContext) => {
@@ -16571,6 +16579,7 @@ export default function (pi: ExtensionAPI): void {
     )
       return;
     latest = contentText(message.content, "").trim();
+    freshResponse = true;
   });
   pi.on("turn_end", (_event: unknown, ctx: ExtensionContext) => {
     touchActivity();
@@ -16674,6 +16683,7 @@ export default function (pi: ExtensionAPI): void {
       if (stateRetryTimer) clearInterval(stateRetryTimer);
       stateRetryTimer = undefined;
       latest = "";
+      freshResponse = false;
       reportMetadata(pi, ctx, agentMetadataRuntime(state, ctx), {
         activity: null,
         context: null,
@@ -16927,7 +16937,7 @@ export default function (pi: ExtensionAPI): void {
       (settlement.state === "ready" &&
         settlement.snapshot.outstanding.length === 0);
     // Keep the marker until a fresh post-review answer is available.
-    if (settled && state.backgroundWaiting && latest.trim()) {
+    if (settled && state.backgroundWaiting && freshResponse) {
       const cleared = mutateAgentState((current) => ({
         ...current,
         backgroundWaiting: undefined,
@@ -16959,6 +16969,7 @@ export default function (pi: ExtensionAPI): void {
         );
       }
       latest = "";
+      freshResponse = false;
       return;
     }
     settlementHoldReported = false;
@@ -17111,6 +17122,7 @@ export default function (pi: ExtensionAPI): void {
             if (retryTimer) clearInterval(retryTimer);
             retryTimer = undefined;
             latest = "";
+            freshResponse = false;
             if (currentWork.state !== "ready" && !settlementHoldReported) {
               settlementHoldReported = true;
               const detail =
@@ -17126,7 +17138,7 @@ export default function (pi: ExtensionAPI): void {
             }
             return;
           }
-          if (currentState.backgroundWaiting && !latest.trim()) {
+          if (currentState.backgroundWaiting && !freshResponse) {
             const waitingState: ManagedAgentState = {
               ...currentState,
               backgroundWaiting: {
