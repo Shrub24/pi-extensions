@@ -11,7 +11,7 @@ under its own source.
 #### Scenario: A task starts
 
 - **WHEN** a TUI session in Herdr spawns a background task
-- **THEN** its pane carries `pi_bg_running` as 1, a `pi_bg_tasks` entry naming that task, and `pi_bg_started`
+- **THEN** its pane carries `pi_bg_running` as 1, `pi_bg_tasks` naming that task, and `pi_bg_started`
 
 #### Scenario: A second task starts
 
@@ -46,7 +46,7 @@ session is doing.
 
 ### Requirement: Only presence and state are published
 
-Published values SHALL contain task identifiers, their states and a start
+Published values SHALL contain the running count, task identifiers and a start
 timestamp, and SHALL NOT contain command text, output, prompts, working
 directories or any other task content.
 

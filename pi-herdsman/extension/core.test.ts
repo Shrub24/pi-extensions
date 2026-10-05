@@ -225,12 +225,17 @@ test("projects lifecycle and assignment state into control states", () => {
     "unknown",
   );
   assert.equal(
-    agentControlState("idle", "request", false, false, false, false, false, true),
+    agentControlState("idle", "request", false, false, false, false, false, ["background-task"]),
     "waiting",
     "background waiting is not surfaced as idle",
   );
   assert.equal(
-    agentControlState("unknown", "request", false, false, false, false, false, true),
+    agentControlState("idle", "request", false, false, false, false, false, []),
+    "settling",
+    "an empty background marker cannot advertise waiting without a dependency",
+  );
+  assert.equal(
+    agentControlState("unknown", "request", false, false, false, false, false, ["background-task"]),
     "unknown",
     "unavailable lifecycle evidence remains unknown",
   );
@@ -268,16 +273,16 @@ test("projects lifecycle and assignment state into control states", () => {
     "an unacknowledged handoff outranks a delivered assignment",
   );
   assert.equal(
-    agentControlState("idle", "request", false, false, false, false, false, true),
+    agentControlState("idle", "request", false, false, false, false, false, ["background-task"]),
     "waiting",
   );
   assert.equal(
-    agentControlState("working", "request", false, false, false, false, false, true),
+    agentControlState("working", "request", false, false, false, false, false, ["background-task"]),
     "working",
     "an active review turn stays working",
   );
   assert.equal(
-    agentControlState("idle", "request", false, false, true, false, false, true),
+    agentControlState("idle", "request", false, false, true, false, false, ["background-task"]),
     "blocked",
     "pending owner questions retain their reply state",
   );

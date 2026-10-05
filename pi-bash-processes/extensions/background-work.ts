@@ -4,10 +4,10 @@
 //
 // Constraints this module keeps (openspec/changes/herdsman-background-handoffs/
 // design.md D1/D2):
-// - One registration slot per supplied session-local bus. No global provider
-//   singleton, task map, process handle, timer or persisted registry lives
-//   here; the bus-attached symbol slot below is only the duplicate/stale-
-//   registration guard, shared by every helper module instance on that bus.
+// - One registration per underlying session-local bus. Pi supplies a separate
+//   events facade to each extension, so registration is discovered through a
+//   synchronous bus channel, not facade object identity. No global provider
+//   singleton, task map, process handle, timer or persisted registry lives here.
 // - Queries resolve inside the bus `emit` call. Pi's EventBus invokes
 //   listeners synchronously through a rejecting-safe async trampoline
 //   (pi-coding-agent dist/core/event-bus.js), so a provider answers
@@ -201,13 +201,7 @@ export interface BackgroundWorkChange {
 	revision: number;
 }
 
-/**
- * Duplicate, stale and disposal guard: one registration slot per bus. The
- * slot lives ON the bus under a process-wide symbol, so every helper module
- * instance sharing that bus — provider side, consumer side, independently
- * loaded copies — sees the same registration. No module-private WeakMap can
- * do that: separately imported copies of this file would each see absence.
- */
+/** Provider-owned duplicate/stale guard, discoverable across Pi's event facades. */
 interface RegistrationSlot {
 	registrationId: string;
 	providerId: string;
@@ -217,6 +211,7 @@ interface RegistrationSlot {
 }
 
 const REGISTRATION_SLOT = Symbol.for("pi-background-work:v1.registration");
+const REGISTRATION_QUERY_CHANNEL = "pi-background-work:v1:registration-query";
 
 function slotCarrier(bus: BackgroundWorkEventBus): { [key: symbol]: unknown } {
 	return bus as unknown as { [key: symbol]: unknown };
@@ -232,8 +227,12 @@ function isRegistrationSlot(value: unknown): value is RegistrationSlot {
  * then fail closed (missing/stale), never as an empty successful snapshot.
  */
 function readSlot(bus: BackgroundWorkEventBus): RegistrationSlot | null {
-	const value = slotCarrier(bus)[REGISTRATION_SLOT];
-	if (value === undefined) return null;
+	const registrations: unknown[] = [];
+	bus.emit(REGISTRATION_QUERY_CHANNEL, { registrations });
+	if (registrations.length > 1) return null;
+	// Keep the provider's local slot as evidence of a missing reply if its
+	// subscriptions disappear; consumers with a known provider use expectedProviderId.
+	const value = registrations.length === 1 ? registrations[0] : slotCarrier(bus)[REGISTRATION_SLOT];
 	if (!isRegistrationSlot(value)) return null;
 	return value.disposed ? null : value;
 }
@@ -523,7 +522,7 @@ export function registerBackgroundWorkProvider(bus: BackgroundWorkEventBus, prov
 	requireBus(bus);
 	requireProvider(provider);
 	const carrier = slotCarrier(bus);
-	const existingRaw = carrier[REGISTRATION_SLOT];
+	const existingRaw = carrier[REGISTRATION_SLOT] ?? readSlot(bus) ?? undefined;
 	if (existingRaw !== undefined) {
 		if (!isRegistrationSlot(existingRaw)) throw new TypeError("background-work: event bus carries invalid registration metadata");
 		if (!existingRaw.disposed) throw new Error(`background-work: a provider is already registered on this event bus (provider "${existingRaw.providerId}")`);
@@ -626,9 +625,14 @@ export function registerBackgroundWorkProvider(bus: BackgroundWorkEventBus, prov
 		throw error;
 	}
 	const slot: RegistrationSlot = { registrationId, providerId, providerVersion };
+	let offRegistration: (() => void) | undefined;
 	try {
+		offRegistration = bus.on(REGISTRATION_QUERY_CHANNEL, (raw) => {
+			if (!slot.disposed && isRecord(raw) && Array.isArray(raw.registrations)) raw.registrations.push(slot);
+		});
 		carrier[REGISTRATION_SLOT] = slot;
 	} catch (error) {
+		offRegistration?.();
 		offQuery();
 		offBind();
 		offProtect();
@@ -673,6 +677,7 @@ export function registerBackgroundWorkProvider(bus: BackgroundWorkEventBus, prov
 		dispose(): void {
 			if (disposed) return;
 			disposed = true;
+			offRegistration?.();
 			offQuery();
 			offBind();
 			offProtect();

@@ -75,6 +75,8 @@ export interface ExtensionHost {
 	entries: unknown[];
 	/** The shared `pi.events` bus the extension registers its settlement provider on. */
 	events: EventBus;
+	/** Every `pi.exec` call the extension made — the Herdr pane writes, for tests. */
+	execCalls: { command: string; args: string[] }[];
 	/** The handler results of one `agent_settled` boundary. */
 	settle(): Promise<unknown[]>;
 	/** What `ctx.isIdle()` answers from now on, for idle-versus-busy delivery controls. */
@@ -194,6 +196,7 @@ export async function startExtensionHost(options: ExtensionHostOptions = {}): Pr
 	let idleFn: () => boolean = options.isIdle ?? (() => true);
 	const entries: unknown[] = [];
 	const notifications: unknown[][] = [];
+	const execCalls: { command: string; args: string[] }[] = [];
 	const entriesForBranch: unknown[] = [];
 	const ctx = {
 		cwd,
@@ -249,6 +252,10 @@ export async function startExtensionHost(options: ExtensionHostOptions = {}): Pr
 		},
 		sendMessage: (...args: unknown[]) => messages.push(args),
 		sendUserMessage: (...args: unknown[]) => userMessages.push(args),
+		exec: async (command: string, args: string[]) => {
+			execCalls.push({ command, args });
+			return { stdout: "", stderr: "", code: 0, killed: false };
+		},
 		// Pi's real shared event bus: the background settlement provider
 		// registers on it through the same public `pi.events` surface production
 		// uses, so tests query the actual registration lifecycle.
@@ -299,6 +306,7 @@ export async function startExtensionHost(options: ExtensionHostOptions = {}): Pr
 		userMessages,
 		entries,
 		events,
+		execCalls,
 		settle: () => dispatch("agent_settled"),
 		setIdle: (isIdle: () => boolean) => {
 			idleFn = isIdle;

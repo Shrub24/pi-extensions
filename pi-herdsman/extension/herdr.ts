@@ -985,8 +985,7 @@ async function selectSplitPlacement(
     rectangles.set(paneId, { width, height });
   }
 
-  let anchor:
-    { pane: any; rect: { width: number; height: number } } | undefined;
+  let anchor: { pane: any } | undefined;
   let anchorArea = -1;
   for (const pane of agentPanes) {
     const paneId = pane.pane_id;
@@ -1003,7 +1002,7 @@ async function selectSplitPlacement(
         `cannot safely select an agent split anchor in tab ${tabId}`,
       );
     if (area > anchorArea) {
-      anchor = { pane, rect };
+      anchor = { pane };
       anchorArea = area;
     }
   }
@@ -1015,7 +1014,7 @@ async function selectSplitPlacement(
   return {
     paneId: anchor.pane.pane_id,
     ratio: AGENT_SPLIT_RATIO,
-    direction: anchor.rect.width >= anchor.rect.height ? "right" : "down",
+    direction: "down",
   };
 }
 

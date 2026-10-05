@@ -377,7 +377,7 @@ export function agentControlState(
   waitingForOwner = false,
   recoveryPending = false,
   delivered = false,
-  waitingForBackgroundWork = false,
+  backgroundWorkTaskIds: readonly string[] = [],
 ): ManagedAgentControlState {
   if (completionPending || handoffPending || recoveryPending) return "settling";
   if (activeRequestId) {
@@ -386,7 +386,7 @@ export function agentControlState(
       if (lifecycle === "unknown") return "unknown";
       return "blocked";
     }
-    if (waitingForBackgroundWork) {
+    if (backgroundWorkTaskIds.length > 0) {
       if (lifecycle === "unknown") return "unknown";
       return "waiting";
     }

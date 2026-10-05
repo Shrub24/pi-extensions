@@ -110,6 +110,7 @@ async function loadManagedBashPresentation(): Promise<void> {
 }
 void loadManagedBashPresentation();
 import { createOrphanWatcher, type OrphanWatcher } from "./orphan-watcher.js";
+import { createPaneFactsPublisher, paneFacts } from "./pane-facts.js";
 import { applyCustomEntryWithBarrier, createPersistence, sessionIdForContext, sidecarStatePath } from "./persistence.js";
 import { mapWithConcurrency, PROBE_CONCURRENCY } from "./probes.js";
 import { defaultSystemdUnitActive, planResourceControlledSpawn, stopResourceControlledTask } from "./resource-control.js";
@@ -298,6 +299,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 	/** Monotonic snapshot revision: bumps on every transition that can change the answer. */
 	const bumpSettlementRevision = (): void => {
 		settlementRevision += 1;
+		publishPaneFacts();
 		if (activeSessionId !== null && boundAssignment !== null) {
 			settlementRegistration?.notifyChange({
 				sessionId: activeSessionId,
@@ -322,9 +324,11 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		if (task.status === "running") return false;
 		if (task.resultResolution !== undefined) return false;
 		task.resultResolution = kind;
+		remindedResultReviews.delete(task.id);
 		rememberSnapshot(task);
 		persistSnapshots();
 		bumpSettlementRevision();
+		publishPaneFacts();
 		return true;
 	};
 
@@ -1547,6 +1551,41 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 	};
 	const outputUiRefresh = createCoalescedCall(refreshUi, OUTPUT_UI_REFRESH_MS);
 
+	// --- Background pane facts ---------------------------------------------
+	//
+	// This extension owns its tasks, so it publishes the facts about them on its
+	// own pane (openspec `bash-processes-pane-facts`): a sidebar can show what
+	// the session is waiting on without reading the task store. The facts
+	// describe outstanding work, not the session's state — a task spawned
+	// mid-turn is advertised while the session is still working, and the same
+	// facts remain once the turn ends. No semantic-state key is published: the
+	// pane's state stays the official integration's and a worker's assignment
+	// projection stays pi-herdsman's.
+	let paneFactsPublisher: ReturnType<typeof createPaneFactsPublisher> | undefined;
+	const publishPaneFacts = (): void => {
+		const paneId = process.env.HERDR_PANE_ID?.trim();
+		if (!activeCtx || activeCtx.mode !== "tui" || !paneId) return;
+		const facts = paneFacts([...tasks.values()]);
+		// Nothing published in this process and nothing outstanding: no pane write.
+		if (!paneFactsPublisher && facts.pi_bg_running === null) return;
+		paneFactsPublisher ??= createPaneFactsPublisher({
+			paneId,
+			send: async (args, signal) => {
+				const result = await pi.exec("herdr", args, { cwd: activeCtx?.cwd ?? process.cwd(), signal, timeout: 10_000 });
+				if (result.code !== 0 || result.killed) throw new Error(`herdr pane report-metadata exited ${result.code}`);
+			},
+		});
+		// Publication never fails the session: the publisher swallows a failed
+		// call and the next update or the TTL refresh retries it.
+		void paneFactsPublisher.update(facts);
+	};
+	/** Clear this pane's keys on shutdown; the publisher aborts any in-flight write first. */
+	const clearPaneFacts = async (): Promise<void> => {
+		const publisher = paneFactsPublisher;
+		paneFactsPublisher = undefined;
+		await publisher?.close();
+	};
+
 	const logWakeDiagnostic = (diagnostic: WakeDiagnostic) => {
 		logBackgroundDiagnostic("wake diagnostic", diagnostic);
 	};
@@ -1946,6 +1985,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		clearRunningMarker(task);
 		task.child = null;
 		refreshUi();
+		publishPaneFacts();
 		exitWakeDue.add(task);
 		const settle = () => {
 			exitWakeDue.delete(task);
@@ -1955,6 +1995,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 				// re-derive a complete capture from a fresh, empty queue.
 				const logSettled = taskLogs.settled(task.logFile);
 				completeResultFinalization(task, logSettled);
+				bumpSettlementRevision();
 				notifyTerminal(task);
 				// The exit-wake decision runs while an attached waiter is still
 				// unsettled: that is how a foreground bash wait or a bounded task
@@ -2749,6 +2790,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		rememberSnapshot(task);
 		persistSnapshots();
 		publishBackgroundTaskStarted(task);
+		publishPaneFacts();
 		// The identity lets a later restore tell this process from a reused
 		// pid; it rides the next windowed persist, and every lifecycle persist
 		// and session_shutdown flush it. A task cleared or replaced before the
@@ -2966,13 +3008,31 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 	// turnActive=false would push every later exit down the idle path, where the
 	// wake is sent (after the 250ms debounce) before any later read can consume
 	// it — the "wake arrived already consumed" failure.
+	const remindedResultReviews = new Set<string>();
 	pi.on("agent_settled", () => {
 		turnActive = false;
+		// Only results notified before this boundary qualify: don't duplicate
+		// the exit wake we are about to deliver for the first time.
+		const unread = protectedAssignment === null ? [] : [...tasks.values()].filter((task) =>
+			task.assignmentRequestId === protectedAssignment && task.exitNotified &&
+			!deferredExitWakes.has(task.id) && !idleExitBatch.has(task.id) &&
+			!resultIsResolved(task) && taskReadiness(task) !== "running" &&
+			taskReadiness(task) !== "finalizing" && !remindedResultReviews.has(task.id));
 		flushDeferredExitWakes();
 		announceRunningTasks();
+		if (unread.length) {
+			pi.sendUserMessage(
+				`Assignment completion is held on unread background results: ${unread.map((task) => task.id).join(", ")}. ` +
+				"These processes have exited; do not rerun or poll them. Retrieve each finished handle through bg_task get (output: full) " +
+				"to certify and acknowledge its result, then submit a fresh final response. Reading log files does not settle a handle.",
+				{ deliverAs: "followUp", triggerTurn: true },
+			);
+			for (const task of unread) remindedResultReviews.add(task.id);
+		}
 	});
 	pi.on("session_start", async (_event, ctx) => {
 		shuttingDown = false;
+		remindedResultReviews.clear();
 		recordProjectTrust(ctx);
 		activeCtx = ctx;
 		// The settlement provider is session-scoped: reset its restore state and
@@ -3027,6 +3087,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		// pass waits one poll interval.
 		ensureOrphanWatcher();
 		syncWidget(ctx);
+		publishPaneFacts();
 	});
 	// A run Pi starts without `before_agent_start` (a queued follow-up, a peer
 	// extension's trigger-turn wake: earendil-works/pi#5581) is still a run in
@@ -3097,6 +3158,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			clearTaskTimers(task);
 		}
 		persistSnapshots();
+		await clearPaneFacts();
 		// The persisted snapshots carry the tasks to the next session_start.
 		tasks.clear();
 		clearWidget();

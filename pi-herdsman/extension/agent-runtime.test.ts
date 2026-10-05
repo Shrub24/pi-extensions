@@ -567,7 +567,8 @@ test("post-review settlement requires a fresh response in either listener order"
       assert.equal(readResult(mailbox, request.requestId), undefined);
       assert.equal(awaitingFinal.activeRequestId, request.requestId);
       assert.equal(awaitingFinal.backgroundWaiting?.taskIds.length, 0);
-      assert.deepEqual(agent.sentUsers, []);
+      assert.equal(agent.sentUsers.length, 1);
+      assert.match(JSON.stringify(agent.sentUsers[0]), /All background dependencies.*resolved/);
 
       agent.events.get("message_end")![0](
         { message: { role: "assistant", content: "Here is the reviewed result." } },
@@ -580,7 +581,7 @@ test("post-review settlement requires a fresh response in either listener order"
       await settleListeners();
       assert.deepEqual(readResult(mailbox, request.requestId), published);
       assert.equal(readAgentState(mailbox)?.activeRequestId, undefined);
-      assert.deepEqual(agent.sentUsers, []);
+      assert.equal(agent.sentUsers.length, 1, "no repeated resumption prompt");
       removeResult(mailbox, request.requestId);
     } finally {
       fireShutdown(agent);
@@ -3240,6 +3241,7 @@ test("startup and completion metadata preserve available model and thinking valu
     "context_usage",
     "pi_herdsman_session",
     "pi_herdsman_role",
+    "pi_herdsman_label",
     "pi_herdsman_run",
     "pi_herdsman_parent_session",
     "pi_herdsman_request",
@@ -3400,6 +3402,11 @@ test("metadata failure retries the latest desired state", async (t) => {
   );
   assert.ok(
     agent.calls.some((args) => args.includes("pi_herdsman_role=agent")),
+  );
+  assert.ok(
+    agent.calls.some((args) =>
+      args.includes("pi_herdsman_label=registered-agent"),
+    ),
   );
   assert.ok(agent.calls.some((args) => args.includes("model=openai/gpt-5")));
   assert.equal(readAgentState(mailbox)?.agentLabel, "registered-agent");
@@ -3827,6 +3834,7 @@ test("worker recovery keeps resolved background work waiting for a post-review r
     const waiting = readAgentState(mailbox)!;
     assert.equal(waiting.activeRequestId, REQUEST_ID);
     assert.equal(waiting.backgroundWaiting?.taskIds.length, 0);
+    assert.equal(agent.sentUsers.length, 1, "recovery requests a fresh final response instead of idling");
 
     agent.events.get("message_end")![0](
       { message: { role: "assistant", content: "The recovered result is reviewed." } },

@@ -5,19 +5,26 @@
 ### Requirement: Every pane advertises what it is awaiting
 
 A pane herdsman publishes for SHALL carry `pi_herdsman_awaited` while anything is
-outstanding, listing `agent:<label>` entries for the agents it awaits and
-`owner` when it has asked its owner. The key SHALL be cleared when nothing is
-awaited.
+outstanding, listing `agent:<label>` entries for each outstanding direct child
+and `owner` when it has asked its owner. A direct child is outstanding while its
+assignment has an active request, an undelivered result or a durable result
+error; a delivered, resolved or retained idle child is not awaited. The key SHALL
+be cleared when nothing is awaited.
 
 #### Scenario: A Lead awaits its workers
 
-- **WHEN** a Lead has two live workers
+- **WHEN** a Lead has two workers with outstanding work
 - **THEN** its pane carries `pi_herdsman_awaited` naming both labels
 
 #### Scenario: A worker awaits a nested agent
 
-- **WHEN** a worker has a live nested child
+- **WHEN** a worker has a nested child with outstanding work
 - **THEN** its pane carries `pi_herdsman_awaited` naming that child
+
+#### Scenario: A direct child has no outstanding work
+
+- **WHEN** a direct child's result has been delivered
+- **THEN** that child is not named in `pi_herdsman_awaited`
 
 #### Scenario: A pane awaits an owner reply
 
@@ -69,14 +76,36 @@ expires, and a pane awaiting nothing SHALL publish nothing and run no timer.
 
 ### Requirement: The consumer rule is documented
 
-The pane metadata reference SHALL state that `waiting` is derived rather than
-published: a pane that is not working with a non-empty union of awaited items is
-waiting, and the union spans publishers.
+The pane metadata reference SHALL state that the pane's activity state is
+derived rather than published: a live owner `lost` wins; else a working native
+state stays working; else a native unknown or missing state stays unknown; else
+a non-empty union of awaited items is waiting; else the native state stands. The
+union spans publishers, and the owner's assignment projection is not a second
+authority for that state.
 
 #### Scenario: A consumer derives the state
 
 - **WHEN** a pane is not working and carries awaited items from any publisher
-- **THEN** the documented rule yields waiting, and yields idle when the union is empty
+- **THEN** the documented rule yields waiting, and yields the native state when the union is empty
+
+### Requirement: Managed worker panes advertise their runtime label
+
+A managed worker pane SHALL publish `pi_herdsman_label` with its runtime label
+under its existing metadata source, alongside `pi_herdsman_role`, so a consumer
+names the pane by the same label its owner's `agent:<label>` awaited entry uses.
+The key SHALL be part of that source's own report, so the pane clears it with the
+other names it owns, and the report SHALL stay within the 16-key limit. Root
+panes need not publish the key.
+
+#### Scenario: A worker publishes its label
+
+- **WHEN** a managed worker publishes its pane metadata
+- **THEN** its report carries `pi_herdsman_label` with the runtime label
+
+#### Scenario: A root pane publishes no worker label
+
+- **WHEN** a Lead pane publishes its metadata
+- **THEN** its report carries no `pi_herdsman_label`
 
 ### Requirement: The control projection is unchanged
 

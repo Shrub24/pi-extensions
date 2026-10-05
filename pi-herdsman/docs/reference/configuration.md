@@ -53,6 +53,10 @@ Malformed JSON, a non-object root, unknown fields, and invalid known values
 are errors. Reads do not create the directory or file. Configuration changes
 through `/agents` update this single file atomically.
 
+`spawnPlacement: "split"` keeps children in the caller's tab. The first child
+splits to the right by default; later children split the largest existing agent
+pane vertically, keeping the lead wide instead of adding narrow columns.
+
 `inlineAttachmentLimitBytes` applies per file. Eligible complete strict UTF-8
 files are embedded only when the exact serialized mailbox record fits; other
 files remain canonical references. `mailboxPayloadLimitBytes` limits the exact

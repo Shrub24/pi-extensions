@@ -106,6 +106,28 @@ function rogueEchoOn(queryChannel: string): (bus: BackgroundWorkEventBus) => () 
 		});
 }
 
+test("separate Pi extension facades share provider registration and lifetime", async () => {
+	const { createEventBus, createExtensionRuntime } = await import("@earendil-works/pi-coding-agent");
+	const { loadExtensionFromFactory } = await import(new URL("./core/extensions/loader.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href);
+	const bus = createEventBus();
+	const runtime = createExtensionRuntime();
+	let providerBus!: BackgroundWorkEventBus;
+	let consumerBus!: BackgroundWorkEventBus;
+	await loadExtensionFromFactory((pi: { events: BackgroundWorkEventBus }) => { providerBus = pi.events; }, process.cwd(), bus, runtime);
+	await loadExtensionFromFactory((pi: { events: BackgroundWorkEventBus }) => { consumerBus = pi.events; }, process.cwd(), bus, runtime);
+	expect(providerBus).not.toBe(consumerBus);
+	const registration = registerBackgroundWorkProvider(providerBus, fakeProvider({ protect: () => ({ ok: true }) }));
+	try {
+		expect(bindBackgroundWorkAssignment(consumerBus, SCOPE)).toEqual({ state: "bound" });
+		expect(protectBackgroundWorkAssignment(consumerBus, SCOPE, true)).toEqual({ state: "bound" });
+		expect(queryBackgroundWorkSnapshot(consumerBus, SCOPE)).toEqual({ state: "ready", snapshot: readySnapshot() });
+		expect(() => registerBackgroundWorkProvider(consumerBus, fakeProvider())).toThrow("already registered");
+	} finally {
+		registration.dispose();
+	}
+	expect(queryBackgroundWorkSnapshot(consumerBus, SCOPE)).toEqual({ state: "absent" });
+});
+
 test("no registration: snapshot and bind report absent, not an empty snapshot", () => {
 	const bus = fakeEventBus();
 	expect(queryBackgroundWorkSnapshot(bus, SCOPE)).toEqual({ state: "absent" });

@@ -805,8 +805,8 @@ export function modelPolicyError(input: {
 }
 
 /**
- * A definition that pins a model from an extension-registered provider and also
- * denies extension discovery cannot resolve it: Pi starts, finds no such model
+ * A definition that pins an extension-provided model, disables discovery, and
+ * names no explicit extensions cannot resolve it: Pi starts, finds no such model
  * and exits about two seconds later with a message that reads as a missing model
  * rather than as a conflicting definition. Catch it before the launch.
  */
@@ -814,16 +814,17 @@ export function deniedDiscoveryModelError(input: {
   agent: string;
   model: string;
   noExtensions: boolean;
+  extensions?: readonly string[];
   isForeignProvider: (providerId: string) => boolean;
 }): string | undefined {
-  if (!input.noExtensions) return undefined;
+  if (!input.noExtensions || input.extensions?.length) return undefined;
   const provider = input.model.split("/")[0] ?? "";
   if (provider.length === 0 || !input.isForeignProvider(provider))
     return undefined;
   return (
     `agent ${input.agent} pins model ${input.model}, whose provider ${provider} an extension registers, ` +
     `but the definition sets noExtensions: true so the child cannot resolve it. ` +
-    "Remove noExtensions: true, or pin a model a built-in provider serves."
+    "List the provider extension in extensions, remove noExtensions: true, or pin a model a built-in provider serves."
   );
 }
 

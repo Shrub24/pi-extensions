@@ -3,6 +3,7 @@ import {
   sessionMetadata,
   OWNER_METADATA_TTL_MS,
 } from "./pane-metadata.ts";
+import { createAwaitedFacts } from "./awaited-facts.ts";
 import type {
   BuildSystemPromptOptions,
   ContextEvent,
@@ -834,6 +835,7 @@ let publishOwnerView:
       view: ManagedAgentSnapshotView,
     ) => void)
   | undefined;
+let refreshAwaitedFacts: ((ctx: ExtensionContext) => void) | undefined;
 let workerMetadataRun: string | undefined;
 let integrationNoticeShown = false;
 let metadataAbortController: AbortController | undefined;
@@ -2492,6 +2494,7 @@ function reportMetadata(
     !runtime.paneId
   )
     return;
+  refreshAwaitedFacts?.(ctx);
   if (reset) {
     workerMetadataActivity = undefined;
     if (workerMetadataOwner !== pi || workerMetadataRun !== runtime.runId) {
@@ -2519,6 +2522,7 @@ function reportMetadata(
     tokens: {
       ...ownSessionMetadata(pi, ctx, patch),
       pi_herdsman_role: runtime.agentDefinition,
+      pi_herdsman_label: runtime.label,
       pi_herdsman_run: runtime.runId,
       pi_herdsman_parent_session:
         process.env.PI_HERDSMAN_OWNER_SESSION_ID ?? null,
@@ -2907,7 +2911,7 @@ async function managedAgentSnapshots(
           !!state.pendingAskId,
           !!state.resultError,
           delivered,
-          !!state.backgroundWaiting,
+          state.backgroundWaiting?.taskIds ?? [],
         )
       : "unknown";
     const pendingDirectChildWork = hasPendingDirectChildWork(state, mailboxes);
@@ -5088,7 +5092,7 @@ function assertManagedAgentCascadeSafe(
   }
 }
 function directChildStates(
-  parent: ManagedAgentState,
+  parent: Pick<ManagedAgentState, "workspaceId" | "piSessionId">,
   states = listAgentStates(),
 ): Array<{
   path: string;
@@ -5100,16 +5104,23 @@ function directChildStates(
       state.ownerSessionId === parent.piSessionId,
   );
 }
+/** A direct child whose assignment has not produced a delivered result yet. */
+function directChildWorkPending(
+  path: string,
+  agent: ManagedAgentState,
+): boolean {
+  if (agent.resultError) return true;
+  if (agent.activeRequestId) return true;
+  if (!agent.completedRequestId) return false;
+  return pendingResultExists(path, agent.completedRequestId);
+}
 function hasPendingDirectChildWork(
   parent: ManagedAgentState,
   states = listAgentStates(),
 ): boolean {
-  return directChildStates(parent, states).some(({ path, state: agent }) => {
-    if (agent.resultError) return true;
-    if (agent.activeRequestId) return true;
-    if (!agent.completedRequestId) return false;
-    return pendingResultExists(path, agent.completedRequestId);
-  });
+  return directChildStates(parent, states).some(({ path, state: agent }) =>
+    directChildWorkPending(path, agent),
+  );
 }
 function allDirectChildrenAskBlocked(
   parent: ManagedAgentState,
@@ -6630,6 +6641,7 @@ async function actionUnsafe(
             model: childModel.model,
             noExtensions:
               effectiveDefinition.frontmatter.noExtensions === true,
+            extensions: effectiveDefinition.frontmatter.extensions,
             isForeignProvider: (providerId) =>
               registeredProviderIds.has(providerId),
           });
@@ -7363,6 +7375,56 @@ export default function (pi: ExtensionAPI): void {
       chiefModeGeneration,
     );
   };
+  let awaitedFacts: ReturnType<typeof createAwaitedFacts> | undefined;
+  let awaitedFactsClosed = false;
+  const paneAwaitedEntries = (ctx: ExtensionContext): string[] => {
+    const states = listAgentStates();
+    // A managed pane's own durable state is the parent identity its other
+    // projections use; the Lead pane has none and resolves by its session.
+    const mailbox = process.env.PI_HERDSMAN_MAILBOX;
+    const own = mailbox
+      ? states.find(({ path }) => path === mailbox)?.state
+      : undefined;
+    const entries = directChildStates(
+      {
+        workspaceId:
+          own?.workspaceId ?? process.env.HERDR_WORKSPACE_ID ?? ctx.cwd,
+        piSessionId: own?.piSessionId ?? ctx.sessionManager.getSessionId(),
+      },
+      states,
+    )
+      .filter(
+        ({ path, state: child }) =>
+          // A pane's owner is a different session, so it is never its own
+          // child; this keeps a durable state that says otherwise local.
+          path !== mailbox && directChildWorkPending(path, child),
+      )
+      .map(({ state: child }) => `agent:${child.agentLabel}`)
+      .sort();
+    if (own ? !!own.pendingAskId : !!leadMetadataAsk) entries.push("owner");
+    return entries;
+  };
+  const clearAwaitedFacts = (): Promise<void> => {
+    awaitedFactsClosed = true;
+    const clearing = awaitedFacts?.clear() ?? Promise.resolve();
+    awaitedFacts = undefined;
+    return clearing;
+  };
+  refreshAwaitedFacts = (ctx) => {
+    if (
+      awaitedFactsClosed ||
+      ctx.mode !== "tui" ||
+      !process.env.HERDR_ENV ||
+      !process.env.HERDR_PANE_ID
+    )
+      return;
+    awaitedFacts ??= createAwaitedFacts({
+      paneId: process.env.HERDR_PANE_ID,
+      send: (args, signal) =>
+        runHerdr(pi, ctx, args, { signal, timeout: 10_000, noResult: true }),
+    });
+    awaitedFacts.refresh(paneAwaitedEntries(ctx));
+  };
   const ownerMetadata = new Map<
     string,
     {
@@ -7458,6 +7520,7 @@ export default function (pi: ExtensionAPI): void {
   const preparePaneMetadata = (ctx: ExtensionContext): void => {
     leadMetadataClosed = false;
     ownerMetadataClosed = false;
+    awaitedFactsClosed = false;
     const session = ctx.sessionManager.getSessionId();
     if (metadataSession !== session) {
       leadMetadataName = undefined;
@@ -8028,6 +8091,7 @@ export default function (pi: ExtensionAPI): void {
       }),
     );
     const role = mode === "active" ? "chief" : activeRole();
+    refreshAwaitedFacts?.(ctx);
     return leadMetadata.update({
       paneId,
       source: "pi-herdsman:lead",
@@ -14989,6 +15053,7 @@ export default function (pi: ExtensionAPI): void {
       leadMetadataClosed = true;
       const metadataClear = Promise.all([
         leadMetadata?.clear(),
+        clearAwaitedFacts(),
         clearOwnerMetadata(),
       ]);
       ++sessionGeneration;
@@ -16825,6 +16890,7 @@ export default function (pi: ExtensionAPI): void {
     );
     queueMicrotask(() => refreshBackgroundWaitingEvidence(scope));
   };
+  let backgroundFinalResponseRequested: string | undefined;
   const settleCurrentAgent = (ctx: ExtensionContext): void => {
     if (
       !state?.activeRequestId ||
@@ -17207,6 +17273,14 @@ export default function (pi: ExtensionAPI): void {
             pendingResult = undefined;
             if (retryTimer) clearInterval(retryTimer);
             retryTimer = undefined;
+            if (backgroundFinalResponseRequested !== current.requestId) {
+              pi.sendUserMessage(
+                "All background dependencies for this assignment are resolved. " +
+                "Produce a fresh final response using the retrieved results and existing artifacts; do not rerun the work.",
+                { deliverAs: "followUp", triggerTurn: true },
+              );
+              backgroundFinalResponseRequested = current.requestId;
+            }
             return;
           }
           if (currentState.backgroundWaiting) {
@@ -17333,6 +17407,7 @@ export default function (pi: ExtensionAPI): void {
     metadataAbortController?.abort();
     metadataAbortController = undefined;
     const workerMetadataCleared = invalidateMetadataSession();
+    const awaitedFactsCleared = clearAwaitedFacts();
     initialized = false;
     resetRequestPump();
     agentControllerReady = false;
@@ -17343,8 +17418,10 @@ export default function (pi: ExtensionAPI): void {
     if (stateRetryTimer) clearInterval(stateRetryTimer);
     stateRetryTimer = undefined;
 
-    return Promise.all([workerMetadataCleared, clearOwnerMetadata()]).then(
-      () => undefined,
-    );
+    return Promise.all([
+      workerMetadataCleared,
+      awaitedFactsCleared,
+      clearOwnerMetadata(),
+    ]).then(() => undefined);
   });
 }

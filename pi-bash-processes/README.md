@@ -144,6 +144,31 @@ at the run boundary), and never again once its result is retrieved. Herdsman-sid
 settlement consumption arrives with Group 3; ordinary unprotected task and
 CLI behavior is unchanged today.
 
+### Background pane facts
+
+`extensions/pane-facts.ts` publishes this session's outstanding background work
+on its own Herdr pane, so a sidebar can show what the session is waiting on
+without reading the task store. Each TUI session inside Herdr writes three
+tokens under the `pi-bash-processes` source. A headless session, a session with
+no Herdr pane id, and a session with no running task publishes nothing; the keys
+are cleared when the last task ends and on shutdown.
+
+| Token | Value | When present |
+| --- | --- | --- |
+| `pi_bg_running` | Count of running tasks | At least one running |
+| `pi_bg_tasks` | Running task ids, comma-separated, at most 6 | At least one running |
+| `pi_bg_started` | ISO 8601 start of the oldest running task | At least one running |
+
+The facts describe what is outstanding, not what the session is doing, so a
+task spawned mid-turn is advertised while the session is still working. No
+`state`-like token is published: the pane's semantic state stays the official
+Herdr integration's, and a managed worker's assignment projection stays
+pi-herdsman's. Values are terminal-safe and bounded to 80 characters, expire
+after 30 seconds and refresh every 15 seconds while a task runs, so a session
+that dies without clearing leaves at most 30 seconds of stale tokens. These
+tokens are the consumer contract for presentation; nothing reads the task
+store on the consumer's behalf.
+
 ## Memory and disk use
 
 - A finished task's output is read from its log file; the process handle and the in-memory output are released once the task has exited and its last log write has finished. A task whose last log write failed or stalled keeps its in-memory output instead.

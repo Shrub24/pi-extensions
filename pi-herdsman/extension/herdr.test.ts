@@ -2672,7 +2672,7 @@ async function placementCalls(config: {
   return { calls, cwd };
 }
 
-test("placement validates a non-lead caller and selects the largest agent axis", async () => {
+test("placement validates a non-lead caller and stacks later agents vertically", async () => {
   const caller = await placementCalls({
     placement: "split",
     callerPaneId: "caller",
@@ -2711,7 +2711,7 @@ test("placement validates a non-lead caller and selects the largest agent axis",
         ],
       },
       anchor: "large",
-      direction: "right",
+      direction: "down",
     },
     {
       layout: {

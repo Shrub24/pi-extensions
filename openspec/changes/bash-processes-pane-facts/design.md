@@ -38,16 +38,18 @@ which is exactly the division of labour the contract already assigns it.
 | Key | Value | Purpose |
 | --- | --- | --- |
 | `pi_bg_running` | count of running tasks | the primary fact |
-| `pi_bg_tasks` | `id:state` entries, comma-separated, capped | which tasks, and whether one is flushing or awaiting result review |
+| `pi_bg_tasks` | task ids, comma-separated, capped | which tasks, for a sidebar that shows them by name |
 | `pi_bg_started` | ISO 8601 start of the oldest running task | lets Radar show an age without a refresh loop |
 
 `pi_bg_started` is a timestamp rather than an elapsed duration so that a task
-running for an hour needs no re-publish to stay accurate.
+running for an hour needs no re-publish to stay accurate. The list carries ids
+only: the tasks it lists are by definition running, so a per-entry state would
+repeat the same word on every entry.
 
 ### D4 — Cadence, expiry and clearing
 
 Facts are published on every task state change, refreshed on a timer while any
-task is running (TTL 60 s, refresh every 20 s), cleared when the last task ends,
+task is running (TTL 30 s, refresh every 15 s), cleared when the last task ends,
 and cleared on shutdown with the clear awaited before the process exits. The TTL
 is what bounds a crashed session: nothing else removes a token for a pane that
 still exists.

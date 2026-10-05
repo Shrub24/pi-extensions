@@ -32,16 +32,24 @@ characters replaced by spaces, cleared when empty. Labels are used rather than
 session ids because the sidebar shows labels, and the ids are already published
 by the hierarchy keys.
 
-- A Lead lists its live workers.
-- A worker lists its live nested children.
+- A Lead lists its outstanding workers.
+- A worker lists its outstanding nested children.
+- A child is outstanding while its assignment has an active request, an
+  undelivered result or a durable result error; delivered, resolved and retained
+  idle children are not awaited.
 - A pane that has asked its owner lists `owner`.
 
 ### D4 — Cadence
 
-While the set is non-empty: publish on every membership change and refresh every
-15 s with a 30 s TTL, matching the owner-state path. When the set becomes empty,
-clear the key and stop the timer. A pane awaiting nothing publishes nothing and
-runs no timer, so an idle session costs nothing.
+Herdr applies `--ttl-ms` per report, so the set is published in its own source
+slot (`pi-herdsman:awaited`, one key, 30 s TTL) rather than folded into the
+pane's one-hour report, which would expire long before its next refresh.
+
+While the set is non-empty: publish on every membership change, driven by the
+pane's own metadata publication, and refresh every 15 s with a 30 s TTL, matching
+the owner-state path. When the set becomes empty, clear the key and stop the
+timer. A pane awaiting nothing publishes nothing and runs no timer, so an idle
+session costs nothing.
 
 ### D5 — `pi_herdsman_state` keeps its meaning
 
@@ -53,10 +61,13 @@ for what it cannot derive.
 ### D6 — The consumer rule is documented, not implied
 
 The pane-metadata reference states the rule so every consumer derives the same
-state: working panes are `working`; a pane that is not working with a non-empty
-union of awaited items is `waiting`; otherwise it is idle. The union spans
+state: a live owner `lost` wins; otherwise a working native state stays working;
+a native unknown or missing state stays unknown; otherwise a non-empty union of
+awaited items is waiting; otherwise the native state stands. The union spans
 publishers, because `pi_bg_running` and `pi_herdsman_awaited` have different
-owners and the contract forbids one key with two publishers.
+owners and the contract forbids one key with two publishers. The owner's
+assignment projection is assignment detail, not a second authority for the
+activity state.
 
 ## Non-Goals
 

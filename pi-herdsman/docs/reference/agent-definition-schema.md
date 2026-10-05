@@ -193,8 +193,14 @@ provider is registered by an extension, discovery stays available for that
 launch even when `noExtensions` is `true`, because a child denied discovery
 cannot resolve a model whose provider only an extension supplies. A model
 pinned in the definition is passed to Pi as written and keeps the definition's
-own extension policy, so a definition that pins such a model must set
-`noExtensions: false` itself.
+own extension policy. With `noExtensions: true`, an extension-provided pin
+requires a non-empty explicit `extensions` list. Include the provider entry in
+that list; Herdsman does not infer which providers arbitrary extensions register,
+so an incorrect list can still fail with Pi's `Model not found` error. An empty
+list is rejected before launch. Alternatively, set `noExtensions: false`.
+
+For a thin worker, list required built-ins explicitly too: for example,
+`builtin:mcp` supplies MCP tools when discovery is disabled.
 
 ## Managed-agent coordination tools
 

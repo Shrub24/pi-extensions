@@ -1369,6 +1369,38 @@ test("a pinned extension-provided model in a denied child fails before the launc
   );
 });
 
+test("explicit provider extensions permit a pinned model without extension discovery", () => {
+  const extensions = ["builtin:mcp", "/provider/index.ts"];
+  assert.equal(
+    deniedDiscoveryModelError({
+      agent: "worker",
+      model: "omniroute/coder-high",
+      noExtensions: true,
+      extensions,
+      isForeignProvider: () => true,
+    }),
+    undefined,
+  );
+  assert.match(
+    deniedDiscoveryModelError({
+      agent: "worker",
+      model: "omniroute/coder-high",
+      noExtensions: true,
+      extensions: [],
+      isForeignProvider: () => true,
+    })!,
+    /cannot resolve/,
+  );
+  const args = agentLaunchArgs({
+    name: "worker",
+    body: "",
+    frontmatter: { model: "omniroute/coder-high", noExtensions: true, extensions },
+  } as AgentDefinition, {});
+  assert.ok(args.includes("--no-extensions"));
+  for (const extension of extensions)
+    assert.ok(args.some((arg, i) => arg === "--extension" && args[i + 1] === extension));
+});
+
 test("a configured disable list keeps a definition resolvable but unoffered", () => {
   const effective = discoverAgentDefinitions({
     disabledDefinitions: ["scout"],

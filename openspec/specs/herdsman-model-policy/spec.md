@@ -68,16 +68,24 @@ the definition pinned.
 
 ### Requirement: A pinned extension-provided model fails fast when discovery is denied
 
-When a definition pins a model whose provider is registered by an extension and also denies
-extension discovery, the launch SHALL fail immediately with a diagnostic naming the definition,
-the model, the registering provider and both remedies, rather than launching a child that Pi
-then rejects.
+When a definition pins an extension-provided model, denies extension discovery and lists no
+explicit extensions, the launch SHALL fail immediately with a diagnostic naming the definition,
+the model, the registering provider and available remedies. A non-empty explicit `extensions`
+list SHALL be allowed without enabling discovery; the operator is responsible for including the
+provider entry, and Pi remains responsible for resolving the model from those loaded extensions.
 
 #### Scenario: The contradiction is reported before the launch
 
 - **WHEN** a definition pins a model from an extension-registered provider and sets
-  `noExtensions: true`
+  `noExtensions: true` with no explicit extensions
 - **THEN** the launch fails with that diagnostic and no child process is started
+
+#### Scenario: An explicit provider extension keeps the child thin
+
+- **WHEN** a definition pins an extension-provided model, sets `noExtensions: true` and
+  explicitly lists the provider entry and required built-ins
+- **THEN** the launch preserves `--no-extensions` and passes each explicit entry unchanged
+- **AND** the pre-launch guard does not reject the model merely because discovery is disabled
 
 ### Requirement: A pinned model is part of the launch record
 
