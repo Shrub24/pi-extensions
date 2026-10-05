@@ -184,7 +184,8 @@ test("parent delegates two same-definition children with exact ownership", async
       .promptGuidelines!.join(" ");
     for (const phrase of [
       "Use agent_delegate to start a fresh bounded assignment from a definition; use agent_continue to resume an exact historical managed-Agent Pi session with a new bounded assignment.",
-      "Each live Agent generation exists for one assignment; after its terminal result is delivered, Herdsman cleans it up.",
+      "Each live Agent generation exists for one assignment. A delivered worker is retained by default: its pane, process and Pi session stay alive as idle, and a fresh agent is created only for work no live worker holds.",
+      "Prefer agent_continue for a follow-on, a revision, or the same kind of work against a scope a retained worker already holds: the worker keeps its Pi session, its in-memory context, its artifacts and its pane, and a fresh agent would reconstruct all of that from the brief.",
       "Agent labels identify the current live generation; exact Pi sessions identify historical context and continuation.",
       "`files` carries relevant assignment evidence, not runtime capability.",
       "Do not attach or mention agent instruction files such as AGENTS.md, CLAUDE.md, GEMINI.md, or equivalents merely because they exist.",

@@ -318,8 +318,14 @@ worker projects as `idle`, so its pane stays available for the next assignment
 and the logical label is not released.
 
 Continue such a worker with `agent_continue` and the exact session ID or session
-path from the result. The outcome depends on the retained process's launch
-configuration:
+path from the result. Prefer continuation whenever a retained worker already
+holds the relevant context — a follow-on, a revision, or the same kind of work
+against the same scope. The worker keeps its Pi session, its in-memory context,
+its artifacts and its pane, and a fresh `agent_delegate` would reconstruct all of
+that from the brief and start a new pane. Delegate a fresh agent when no live
+worker holds the relevant context, or when the assignment is genuinely
+independent of every live worker. The outcome depends on the retained process's
+launch configuration:
 
 - **reused** (`reused: true`): the launch configuration still matches the current
 definition, so the task is submitted into the existing process. No new process or

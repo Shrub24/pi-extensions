@@ -59,11 +59,19 @@ Use `agent_delegate` to start one bounded fresh assignment from an agent definit
 Use `agent_continue` to start one bounded assignment from an exact historical
 managed-agent Pi session.
 
-A managed agent executes one assignment at a time. After its terminal result is
-delivered, Pi Herdsman cleans that agent up automatically; when `retainWorkers`
-is enabled the delivered worker instead stays `idle` until a later assignment
-reuses it or you close it. To continue completed work with its existing context,
-use the exact session returned with the result.
+A managed agent executes one assignment at a time. A delivered worker is
+retained by default (`retainWorkers: true`): the verified live process, pane,
+label and mailbox survive delivery and the worker projects as `idle` until a
+later assignment reuses it or you close it. With `retainWorkers: false` it is
+cleaned up after delivery instead. To continue completed work with its existing
+context, use the exact session returned with the result.
+
+Continue a retained worker when it already holds the relevant context — a
+follow-on, a revision, or the same kind of work against the same scope. It keeps
+its Pi session, in-memory context, artifacts and pane; a fresh `agent_delegate`
+would reconstruct that from the brief and start a new pane. Delegate fresh when
+no live worker holds the relevant context, or when the work is genuinely
+independent.
 Agent labels control the currently live generation; they are not continuation
 selectors.
 Session continuation inherits the saved definition, cwd, and logical label;

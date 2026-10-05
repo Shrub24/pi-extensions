@@ -2780,7 +2780,14 @@ test("delegating agents receive only their allowed definition roster", async () 
   );
   assert.match(
     sharedGuidance,
-    /Each live Agent generation exists for one assignment/,
+    /A delivered worker is retained by default/,
+  );
+  // The selection rule is the point of the retention default: a lead that never
+  // sees it keeps spawning fresh agents for follow-on work.
+  assert.match(sharedGuidance, /Prefer agent_continue for a follow-on, a revision/);
+  assert.match(
+    sharedGuidance,
+    /When a retained worker already holds the relevant context, continue it instead of starting a fresh agent/,
   );
   assert.match(
     sharedGuidance,

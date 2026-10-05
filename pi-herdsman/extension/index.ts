@@ -414,13 +414,20 @@ function formatMessageLimit(bytes: number): string {
 }
 const MAX_RESPONSE_CORRECTIONS = 2;
 const AGENT_DELEGATION_GUIDANCE =
-  "Use agent_delegate for genuinely independent or context-heavy work; keep small, tightly coupled work local.";
+  "Use agent_delegate for genuinely independent or context-heavy work; keep small, tightly coupled work local. " +
+  "When a retained worker already holds the relevant context, continue it instead of starting a fresh agent.";
 const AGENT_EXECUTION_OWNERSHIP_GUIDANCE =
   "Each unresolved unit of work has one executor. Using agent_delegate transfers that assignment's execution ownership to the Agent until it resolves. After delegation succeeds, stop executing, inspecting, or analyzing that delegated scope locally; do not assign overlapping work. Continue only concrete, necessary work clearly outside the delegated scope that you still own.";
 const AGENT_HANDOFF_GUIDANCE =
   "Use agent_delegate to start a fresh bounded assignment from a definition; " +
   "use agent_continue to resume an exact historical managed-Agent Pi session " +
-  "with a new bounded assignment. Every task and eligible interrupt replacement " +
+  "with a new bounded assignment. " +
+  "Prefer agent_continue for a follow-on, a revision, or the same kind of work " +
+  "against a scope a retained worker already holds: the worker keeps its Pi " +
+  "session, its in-memory context, its artifacts and its pane, and a fresh agent " +
+  "would reconstruct all of that from the brief. Delegate a fresh agent when no " +
+  "live worker holds the relevant context. " +
+  "Every task and eligible interrupt replacement " +
   "requires a complete versioned Markdown delegation brief in `task` or `message`; " +
   `${DELEGATION_BRIEF_GUIDE} ` +
   "Plain task sentences are rejected before assignment side effects. Include the " +
@@ -428,8 +435,10 @@ const AGENT_HANDOFF_GUIDANCE =
   "and either required context inputs or an explicit no-context declaration. " +
   "Brief context inputs are privately snapshotted at acceptance; the response " +
   "contract is separate and may use the role default or an explicit brief override. " +
-  "Each live Agent generation exists for one assignment; after its terminal result " +
-  "is delivered, Herdsman cleans it up. Agent labels identify the current live " +
+  "Each live Agent generation exists for one assignment. A delivered worker is " +
+  "retained by default: its pane, process and Pi session stay alive as idle, and " +
+  "a fresh agent is created only for work no live worker holds. Agent labels " +
+  "identify the current live " +
   "generation; exact Pi sessions identify historical context and continuation. " +
   "For new or updated assignments, `files` carries additional assignment evidence. Pass " +
   "every user-supplied or already-available artifact relevant to the target's " +
@@ -15348,7 +15357,7 @@ export default function (pi: ExtensionAPI): void {
       name: "agent_delegate",
       label: "agent delegate",
       description:
-        "Start one fresh bounded assignment from an Agent definition. `task` must be a complete delegation-brief/v1 Markdown document; plain task sentences are rejected.",
+        "Start one fresh bounded assignment from an Agent definition. `task` must be a complete delegation-brief/v1 Markdown document; plain task sentences are rejected. Prefer `agent_continue` when a retained worker already holds the relevant context.",
       parameters: agentDelegateParameters,
       promptSnippet: undefined,
       promptGuidelines: undefined,
@@ -15376,7 +15385,7 @@ export default function (pi: ExtensionAPI): void {
       name: "agent_continue",
       label: "agent continue",
       description:
-        "Start one bounded assignment from an exact historical managed-Agent Pi session. `task` must be a fresh, role-valid delegation-brief/v1 Markdown document.",
+        "Start one bounded assignment from an exact historical managed-Agent Pi session. `task` must be a fresh, role-valid delegation-brief/v1 Markdown document. Prefer this over a fresh `agent_delegate` when a retained worker already holds the relevant context.",
       parameters: agentContinueParameters,
       promptSnippet: undefined,
       promptGuidelines: undefined,
