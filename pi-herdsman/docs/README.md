@@ -77,6 +77,8 @@ implementation, including the upstream behavior a fork decision supersedes.
 - [0017 Publish pane facts without owning sidebar presentation](adr/0017-publish-pane-facts-without-owning-sidebar-presentation.md)
 - [0018 Do not request constrained tool sampling](adr/0018-do-not-request-constrained-tool-sampling.md)
 - [0019 Correct a finished answer before failing it](adr/0019-correct-a-finished-answer-before-failing-it.md)
+- [0020 Gate an armed window on live presence](adr/0020-gate-an-armed-window-on-live-presence.md)
+- [0021 Recover a held settlement without a wake](adr/0021-recover-a-held-settlement-without-a-wake.md)
 
 The repository directories are organized by content type. The index is
 task-first so readers do not need to understand that structure before finding
