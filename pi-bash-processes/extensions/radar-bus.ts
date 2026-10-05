@@ -11,8 +11,9 @@ import type { BackgroundTaskSnapshot } from "./types.js";
  *
  * Passive and best-effort: it reads task state and never changes it, it never
  * reads what Radar sends, and nothing here can fail or delay a turn, a task, a
- * wake or a result. `command` and `cwd` are sent (bounded), which is why the
- * socket directory check is load-bearing: a log path is never sent.
+ * wake or a result. `command` and `cwd` are sent bounded, for an operator-only
+ * surface that already shows the same thing in the task dashboard; a log path
+ * is never sent.
  */
 export const BUS_VERSION = 1;
 export const THROTTLE_MS = 1_000;
