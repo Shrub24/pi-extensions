@@ -132,7 +132,7 @@ imported at `156b1c66` (v0.18.0). The fork's own changes:
   persistent sessions that compact through their own Pi context stack and stay
   continuable, instead of retiring at the compaction threshold.
 
-- **Retained workers across assignments** — with `retainWorkers` enabled, a
+- **Retained workers across assignments** — by default (`retainWorkers: true`), a
   delivered worker keeps its verified live process, pane, label, and mailbox and
   stays `idle` until `agent_continue` reuses it; a drifted or missing launch
   fingerprint closes it and continues the same session in a new process

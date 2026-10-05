@@ -27,7 +27,7 @@ schema is:
 {
   "spawnPlacement": "subtree",
   "contextRetirement": false,
-  "retainWorkers": false,
+  "retainWorkers": true,
   "softTimeoutMs": 300000,
   "inlineAttachmentLimitBytes": 131072,
   "mailboxPayloadLimitBytes": 131072,
@@ -42,7 +42,7 @@ An absent file means these defaults:
 | ---------------------------- | -----------------: | ------------------------------------------------- |
 | `spawnPlacement`             |          `subtree` | `tab`, `subtree`, `split`                         |
 | `contextRetirement`          |              false | boolean                                           |
-| `retainWorkers`              |              false | boolean                                           |
+| `retainWorkers`              |               true | boolean                                           |
 | `softTimeoutMs`              |          `300000`  | integer from 0 (disabled) through 2147483647      |
 | `inlineAttachmentLimitBytes` | `131072` (128 KiB) | integer from 1024 (1 KiB) through 1048576 (1 MiB) |
 | `mailboxPayloadLimitBytes`   | `131072` (128 KiB) | integer from 1024 (1 KiB) through 1048576 (1 MiB) |
@@ -85,12 +85,14 @@ and `0` disables soft windows entirely. Set the value from the
 `/agents` → `Soft timeout` item or the config file.
 
 `retainWorkers` controls whether a worker's process and pane survive after its
-result is delivered. Left `false`, each managed worker receives exactly one
-assignment and is cleaned up after delivery, which is the default lifecycle.
-Set to `true`, a delivered worker stays running in the public `idle` state under
-its agent label, and a later `agent_continue` for its session delivers the next
-assignment into the same live process. Release an `idle` worker with
-`agent_close` or the `/agents` → `Clear idle` action.
+result is delivered. It defaults to `true`: a worker is a persistent session, so
+a delivered worker, whether it succeeded or failed, stays running in the public
+`idle` state under its agent label, and a later `agent_continue` for its session
+delivers the next assignment into the same live process. A failure, including a
+rejected answer or a model error, therefore never costs the pane or its context;
+the owner can steer, continue or retry it. Release an `idle` worker with
+`agent_close` or the `/agents` → `Clear idle` action. Set `false` for one-shot
+workers that are cleaned up after delivery.
 
 `disabledDefinitions` takes definition names out of the offered roster. A
 named definition disappears from the lead roster, the `/agents` menu, and every

@@ -99,26 +99,26 @@ test("documented soft-deadline and retention defaults match the configuration", 
   // docs/reference/configuration.md documents exactly these values.
   assert.equal(DEFAULT_SOFT_TIMEOUT_MS, 300_000);
   assert.equal(readConfig().softTimeoutMs, 300_000);
-  assert.equal(readConfig().retainWorkers, false);
+  assert.equal(readConfig().retainWorkers, true);
 });
 
 test("soft-timeout and retain-workers overlays accept only valid values", () => {
   realFs.mkdirSync(herdsmanDataRoot(), { recursive: true });
   realFs.writeFileSync(
     herdsmanConfigPath(),
-    JSON.stringify({ softTimeoutMs: 0, retainWorkers: true }),
+    JSON.stringify({ softTimeoutMs: 0, retainWorkers: false }),
   );
   assert.deepEqual(readConfig(), {
     ...DEFAULT_CONFIG,
     softTimeoutMs: 0,
-    retainWorkers: true,
+    retainWorkers: false,
   });
   realFs.writeFileSync(
     herdsmanConfigPath(),
-    JSON.stringify({ softTimeoutMs: MAX_SOFT_TIMEOUT_MS, retainWorkers: false }),
+    JSON.stringify({ softTimeoutMs: MAX_SOFT_TIMEOUT_MS, retainWorkers: true }),
   );
   assert.equal(readConfig().softTimeoutMs, MAX_SOFT_TIMEOUT_MS);
-  assert.equal(readConfig().retainWorkers, false);
+  assert.equal(readConfig().retainWorkers, true);
   assert.equal(validSoftTimeout(0), true);
   assert.equal(validSoftTimeout(MAX_SOFT_TIMEOUT_MS), true);
 });
@@ -145,7 +145,7 @@ test("partial and complete valid configs overlay defaults", () => {
   assert.deepEqual(readConfig(), {
     spawnPlacement: "tab",
     contextRetirement: false,
-    retainWorkers: false,
+    retainWorkers: true,
     softTimeoutMs: DEFAULT_SOFT_TIMEOUT_MS,
     inlineAttachmentLimitBytes: MIN_BYTE_LIMIT,
     mailboxPayloadLimitBytes: MAX_BYTE_LIMIT,
@@ -222,7 +222,7 @@ test("invalid values, malformed JSON, non-object roots, and unknown keys fail cl
 test("updates preserve configured keys, reset one key, and delete the final config", () => {
   updateConfig("spawnPlacement", "tab");
   updateConfig("contextRetirement", false);
-  updateConfig("retainWorkers", true);
+  updateConfig("retainWorkers", false);
   updateConfig("softTimeoutMs", 0);
   updateConfig("mailboxPayloadLimitBytes", 64 * 1024);
   assert.deepEqual(
@@ -230,27 +230,27 @@ test("updates preserve configured keys, reset one key, and delete the final conf
     {
       spawnPlacement: "tab",
       contextRetirement: false,
-      retainWorkers: true,
+      retainWorkers: false,
       softTimeoutMs: 0,
       mailboxPayloadLimitBytes: 64 * 1024,
     },
   );
   assert.equal(readConfig().spawnPlacement, "tab");
   assert.equal(readConfig().contextRetirement, false);
-  assert.equal(readConfig().retainWorkers, true);
+  assert.equal(readConfig().retainWorkers, false);
   assert.equal(readConfig().softTimeoutMs, 0);
   updateConfig("spawnPlacement", undefined);
   assert.deepEqual(
     JSON.parse(realFs.readFileSync(herdsmanConfigPath(), "utf8")),
     {
       contextRetirement: false,
-      retainWorkers: true,
+      retainWorkers: false,
       softTimeoutMs: 0,
       mailboxPayloadLimitBytes: 64 * 1024,
     },
   );
   updateConfig("retainWorkers", undefined);
-  assert.equal(readConfig().retainWorkers, false);
+  assert.equal(readConfig().retainWorkers, true);
   updateConfig("softTimeoutMs", undefined);
   assert.equal(readConfig().softTimeoutMs, DEFAULT_SOFT_TIMEOUT_MS);
   updateConfig("mailboxPayloadLimitBytes", undefined);

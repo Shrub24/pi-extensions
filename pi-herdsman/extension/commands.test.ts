@@ -4144,7 +4144,8 @@ test("main agents menu toggles context retirement", async () => {
 
 test("main agents menu toggles retain workers", async () => {
   setLeadEnvironment();
-  updateConfig("retainWorkers", undefined);
+  // Retention is on by default; start from the opt-out to see the toggle turn it on.
+  updateConfig("retainWorkers", false);
   const pi = fakePi();
   registerExtension!(pi.pi as never);
   const context = fakeContext() as any;

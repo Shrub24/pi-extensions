@@ -76,6 +76,7 @@ implementation, including the upstream behavior a fork decision supersedes.
 - [0016 Validate results against response contracts](adr/0016-validate-results-against-response-contracts.md)
 - [0017 Publish pane facts without owning sidebar presentation](adr/0017-publish-pane-facts-without-owning-sidebar-presentation.md)
 - [0018 Do not request constrained tool sampling](adr/0018-do-not-request-constrained-tool-sampling.md)
+- [0019 Correct a finished answer before failing it](adr/0019-correct-a-finished-answer-before-failing-it.md)
 
 The repository directories are organized by content type. The index is
 task-first so readers do not need to understand that structure before finding

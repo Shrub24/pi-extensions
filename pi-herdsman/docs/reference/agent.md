@@ -130,9 +130,10 @@ identity, symlinks, baseline freshness, bounded bytes, Markdown structure and
 metadata. Success details include framework-owned contract and brief hashes,
 worker session identity, text origin, and observed artifact path, hash, byte count,
 and created/reused disposition. Model-authored claims about checks are not
-execution evidence. Invalid output produces a one-shot failed result with a typed
-`invalid_response` or `artifact_error` code and bounded field diagnostics; Herdsman
-does not ask the worker to repair output automatically.
+execution evidence. A rejected answer, or a reply cut off by the model's output limit, is first
+corrected in the worker's own session, at most twice per assignment (ADR 0019).
+If it is still unacceptable, the result is a one-shot failure with a typed
+`invalid_response` or `artifact_error` code and bounded field diagnostics.
 
 ## Background-work waiting
 
@@ -513,9 +514,10 @@ An accepted delegated task remains the internal mailbox `kind: "task"` request
 and has one correlated final result. Delivery goes to the exact owning Pi
 session and occurs exactly once. Success is published only after the accepted
 response contract validates the requested inline and/or artifact output. Invalid
-responses produce one terminal `invalid_response` or `artifact_error` result with
-bounded field diagnostics; Herdsman does not automatically repair or re-prompt.
-Correction requires a new valid assignment or an eligible interrupt replacement.
+responses are corrected in the worker's session up to twice (ADR 0019), then
+produce one terminal `invalid_response` or `artifact_error` result with bounded
+field diagnostics. After that, correction requires a new valid assignment or an
+eligible interrupt replacement.
 A persisted reusable completion's model-visible wording is:
 
 ```text

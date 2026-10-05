@@ -205,14 +205,15 @@ active assignment.
 ## Exactly-once assignment result
 
 Each accepted task request maps to one final assignment result. Each managed
-agent generation executes one assignment at a time; while `retainWorkers` is
-`false` (the default) a completed agent is not available for another task.
-With `retainWorkers` enabled, delivering the terminal result leaves the verified
-live worker in place as `idle`, and a later controller assignment starts a new
-assignment on that same process.
+agent generation executes one assignment at a time; by default
+(`retainWorkers: true`) delivering the terminal result, completed or failed,
+leaves the verified live worker in place as `idle`, and a later controller
+assignment starts a new assignment on that same process. With `retainWorkers`
+set to `false` a delivered agent is cleaned up and is not available for another
+task.
 
 Result publication and cleanup are separate convergence steps. An agent may
-therefore appear `settling` after its model has finished. Cleanup follows
+therefore appear `settling` after its model has finished. Any cleanup follows
 exactly-once delivery for both completed and failed terminal results.
 
 ## Session continuation

@@ -16,6 +16,14 @@ For the `files` channel, strict UTF-8 text is embedded when it fits; non-text an
 non-fitting files remain canonical local references and are not copied or
 snapshotted. This is separate from the brief's required context snapshots.
 
+## Brief format
+
+The delegation tools' guidance shows the model the brief shape: YAML frontmatter,
+explicit lists, the profile block, and a worked example built from the same
+canonical examples the parser is tested against. A rejected brief returns the
+field-specific diagnostic followed by the example for the profile the role
+requires, so a caller can correct it in one attempt.
+
 ## Message `files`
 
 Agent-session context crosses boundaries explicitly.
@@ -304,7 +312,7 @@ remains bounded in both cases.
 
 ## Retained workers and continuation
 
-With `retainWorkers` enabled, delivering a terminal result keeps the worker's
+By default (`retainWorkers: true`), delivering a terminal result keeps the worker's
 verified live process, pane, label, and mailbox instead of cleaning them up. The
 worker projects as `idle`, so its pane stays available for the next assignment
 and the logical label is not released.

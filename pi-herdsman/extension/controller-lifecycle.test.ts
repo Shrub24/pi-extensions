@@ -3,7 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir, tmpdir } from "node:os";
-import { mock, test } from "node:test";
+import { beforeEach, mock, test } from "node:test";
 import { Value } from "typebox/value";
 import type {
   AskRecord,
@@ -13,7 +13,7 @@ import type {
 } from "./mailbox.ts";
 import { claimProcessLock } from "./lock.ts";
 import support from "./support.ts";
-import { DELEGATION_BRIEF_EXAMPLES } from "./briefs.ts";
+import { DELEGATION_BRIEF_EXAMPLES, briefFormatHint } from "./briefs.ts";
 import {
   CHILD_SESSION_ID,
   DEFAULT_PI_SESSION_ID,
@@ -319,6 +319,9 @@ const registeredAgentTool = (
   };
 };
 const { updateConfig } = await import("./config.ts");
+// These suites cover the one-shot lifecycle; retained workers are the default,
+// and the tests that exercise retention opt in or out explicitly.
+beforeEach(() => updateConfig("retainWorkers", false));
 const { agentLaunchFingerprint, resolveAgentLaunchInputs } =
   await import("./agent-definitions.ts");
 
@@ -4727,7 +4730,14 @@ test("rejects invalid assignment prerequisites before lifecycle mutation", async
     );
 
     assert.equal(result.details.error.category, "invalid_request");
-    assert.equal(result.details.error.message, message);
+    if (message.startsWith("brief.")) {
+      // A rejected brief carries the shape the role expects, so the caller can
+      // correct it in one attempt instead of discovering fields one error at a time.
+      assert.equal(
+        result.details.error.message,
+        `${message}\n${briefFormatHint("common")}`,
+      );
+    } else assert.equal(result.details.error.message, message);
     assert.ok(
       pi.calls.every(
         (args) =>

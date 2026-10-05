@@ -4,6 +4,8 @@ import test from "node:test";
 import {
   BRIEF_PROFILES,
   DELEGATION_BRIEF_EXAMPLES,
+  DELEGATION_BRIEF_GUIDE,
+  briefFormatHint,
   delegationBriefHash,
   normalizeDelegationBrief,
   parseDelegationBrief,
@@ -142,4 +144,15 @@ test("canonical metadata is independently revalidated at worker admission", () =
     () => normalizeDelegationBrief({ ...brief, profile: "review" }),
     /brief\.review/u,
   );
+});
+
+test("the rejection hint and the model guide are built from the canonical examples", () => {
+  for (const profile of BRIEF_PROFILES) {
+    const hint = briefFormatHint(profile);
+    assert.ok(hint.includes(DELEGATION_BRIEF_EXAMPLES[profile]), profile);
+    parseDelegationBrief(hint.slice(hint.indexOf("---")), { minimumProfile: profile });
+  }
+  assert.ok(DELEGATION_BRIEF_GUIDE.includes(DELEGATION_BRIEF_EXAMPLES.execution));
+  for (const block of ["investigation", "research", "execution", "review"])
+    assert.ok(DELEGATION_BRIEF_GUIDE.includes(`${block}:`), block);
 });

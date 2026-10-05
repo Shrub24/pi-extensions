@@ -140,6 +140,8 @@ import {
 import { resolveDefinitionSkills } from "./agent-skills.ts";
 import {
   BRIEF_PROFILES,
+  DELEGATION_BRIEF_GUIDE,
+  briefFormatHint,
   parseDelegationBrief,
   type BriefProfile,
   type DelegationBrief,
@@ -410,6 +412,7 @@ function formatMessageLimit(bytes: number): string {
   const tokens = Math.ceil(bytes / TOKEN_ESTIMATE_BYTES);
   return `${bytes / 1024} KiB · ≈${tokens.toLocaleString("en-US")} tokens`;
 }
+const MAX_RESPONSE_CORRECTIONS = 2;
 const AGENT_DELEGATION_GUIDANCE =
   "Use agent_delegate for genuinely independent or context-heavy work; keep small, tightly coupled work local.";
 const AGENT_EXECUTION_OWNERSHIP_GUIDANCE =
@@ -419,7 +422,8 @@ const AGENT_HANDOFF_GUIDANCE =
   "use agent_continue to resume an exact historical managed-Agent Pi session " +
   "with a new bounded assignment. Every task and eligible interrupt replacement " +
   "requires a complete versioned Markdown delegation brief in `task` or `message`; " +
-  "plain task sentences are rejected before assignment side effects. Include the " +
+  `${DELEGATION_BRIEF_GUIDE} ` +
+  "Plain task sentences are rejected before assignment side effects. Include the " +
   "definition's required role profile, explicit empty lists, scope, acceptance, " +
   "and either required context inputs or an explicit no-context declaration. " +
   "Brief context inputs are privately snapshotted at acceptance; the response " +
@@ -6167,7 +6171,7 @@ async function actionUnsafe(
     } catch (error) {
       fail(
         "invalid_request",
-        error instanceof Error ? error.message : String(error),
+        `${error instanceof Error ? error.message : String(error)}\n${briefFormatHint(roleLaunchInputs.briefProfile)}`,
         p.action,
       );
     }
@@ -7241,7 +7245,7 @@ async function actionUnsafe(
     } catch (error) {
       fail(
         "invalid_request",
-        error instanceof Error ? error.message : String(error),
+        `${error instanceof Error ? error.message : String(error)}\n${briefFormatHint(roleLaunchInputs.briefProfile)}`,
         controlAction,
       );
     }
@@ -15646,6 +15650,12 @@ export default function (pi: ExtensionAPI): void {
   // worker produced after the wait. An artifact-target contract can answer with
   // no inline text, so freshness is tracked separately from the text itself.
   let freshResponse = false;
+  // The last assistant reply ended on the model's output limit. Nothing has
+  // been validated yet, so the worker is asked to continue (bounded) before the
+  // result is judged; this is not a repair of an invalid answer (ADR 0016).
+  let turnCutOff = false;
+  let awaitingContinuation = false;
+  let cutOffContinuations: { requestId: string; count: number } | undefined;
   let pendingResult: ResultRecord | undefined;
   let pendingInterruptReplacement: string | undefined;
   let resultWriteAttempts = 0;
@@ -16697,6 +16707,9 @@ export default function (pi: ExtensionAPI): void {
       return;
     latest = contentText(message.content, "").trim();
     freshResponse = true;
+    // A reply cut off by the output limit is an incomplete turn, not an answer.
+    turnCutOff = message?.stopReason === "length";
+    awaitingContinuation = false;
   });
   pi.on("turn_end", (_event: unknown, ctx: ExtensionContext) => {
     touchActivity();
@@ -17091,6 +17104,36 @@ export default function (pi: ExtensionAPI): void {
       return;
     }
     settlementHoldReported = false;
+    // A correction is in flight: nothing new has been answered yet.
+    if (awaitingContinuation) return;
+    // One budget covers both a reply cut off by the output limit and a finished
+    // answer that fails its contract (ADR 0019); the worker keeps its context.
+    const requestCorrection = (message: string): boolean => {
+      const requestId = state?.activeRequestId;
+      if (!requestId) return false;
+      const used =
+        cutOffContinuations?.requestId === requestId
+          ? cutOffContinuations.count
+          : 0;
+      if (used >= MAX_RESPONSE_CORRECTIONS) return false;
+      cutOffContinuations = { requestId, count: used + 1 };
+      turnCutOff = false;
+      awaitingContinuation = true;
+      latest = "";
+      freshResponse = false;
+      pi.sendUserMessage(message, { deliverAs: "followUp", triggerTurn: true });
+      return true;
+    };
+    if (
+      turnCutOff &&
+      requestCorrection(
+        "Your previous reply was cut off by the output limit before it finished. " +
+          "Continue the assignment: keep reasoning brief, write artifacts to disk as you go, " +
+          "and end with your complete final response.",
+      )
+    )
+      return;
+    turnCutOff = false;
     let resultStatus: ResultRecord["status"] = "failed";
     let resultText: string | undefined;
     let resultError: ResultRecord["error"];
@@ -17144,6 +17187,22 @@ export default function (pi: ExtensionAPI): void {
         code: "empty_result",
         message: "Agent produced no assistant text",
       };
+    }
+    // Only an answer the worker actually gave can be corrected; a wait that
+    // resolved with no new answer is handled by the background-work path below.
+    if (resultError && freshResponse) {
+      const detail = (responseValidation?.diagnostics ?? [])
+        .slice(0, 4)
+        .map((item) => `- ${item.field}: ${item.message}`)
+        .join("\n");
+      if (
+        requestCorrection(
+          "Your final response did not satisfy the assignment's response contract " +
+            `(${resultError.code}: ${resultError.message}).\n${detail ? `${detail}\n` : ""}` +
+            "Fix exactly this and answer again; do not redo work that is already complete.",
+        )
+      )
+        return;
     }
     const result: ResultRecord = {
       version: 5,

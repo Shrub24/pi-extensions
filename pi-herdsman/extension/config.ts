@@ -50,7 +50,7 @@ export type HerdsmanConfig = {
 export const DEFAULT_CONFIG: HerdsmanConfig = {
   spawnPlacement: "subtree",
   contextRetirement: false,
-  retainWorkers: false,
+  retainWorkers: true,
   softTimeoutMs: DEFAULT_SOFT_TIMEOUT_MS,
   inlineAttachmentLimitBytes: DEFAULT_BYTE_LIMIT,
   mailboxPayloadLimitBytes: DEFAULT_BYTE_LIMIT,

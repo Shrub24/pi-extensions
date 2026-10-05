@@ -423,6 +423,25 @@ review:
 Review the diff against the stated baseline and criteria.`,
 });
 
+/** What a rejected brief should have looked like, for the profile the role requires. */
+export function briefFormatHint(profile: BriefProfile): string {
+  return (
+    `Expected format (${profile} profile): YAML frontmatter, then a nonempty Markdown body.\n` +
+    DELEGATION_BRIEF_EXAMPLES[profile]
+  );
+}
+
+/**
+ * Shown to the model beside the delegation tools. Built from the validated
+ * examples so the documented shape cannot drift from the parser.
+ */
+export const DELEGATION_BRIEF_GUIDE =
+  "A brief is YAML frontmatter followed by a nonempty Markdown body, with every list explicit (`[]` when empty) and no unknown fields. " +
+  "`profile` is `common` or the role's required profile; `execution`, `investigation`, `research` and `review` each add one block: " +
+  "investigation: {questions, targetLocations}; research: {questions, sourceConstraints}; execution: {affectedArea, validationExpectations}; review: {baseline, criteria}. " +
+  "`context.inputs` entries are {reference, purpose}; `response` is `role-defaults` unless an explicit response contract is needed. Example:\n" +
+  DELEGATION_BRIEF_EXAMPLES.execution;
+
 export function validateBriefExamples(): void {
   for (const [profile, source] of Object.entries(DELEGATION_BRIEF_EXAMPLES) as [BriefProfile, string][]) {
     parseDelegationBrief(source, { minimumProfile: profile });

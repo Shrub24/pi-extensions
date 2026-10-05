@@ -3,7 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
-import { mock, test } from "node:test";
+import { beforeEach, mock, test } from "node:test";
 import { Value } from "typebox/value";
 import { DELEGATION_BRIEF_EXAMPLES } from "./briefs.ts";
 import type {
@@ -71,6 +71,9 @@ import support, {
   writeAgentState,
 } from "./support.ts";
 const { updateConfig } = await import("./config.ts");
+// These suites cover the one-shot lifecycle; retained workers are the default,
+// and the tests that exercise retention opt in or out explicitly.
+beforeEach(() => updateConfig("retainWorkers", false));
 const agentTool = (pi: ReturnType<typeof fakePi>, name: string) => {
   const tool = pi.tools.find((candidate) => candidate.name === `agent_${name}`)!;
   if (name !== "delegate" && name !== "continue") return tool;

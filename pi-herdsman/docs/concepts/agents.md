@@ -108,11 +108,12 @@ evidence fails closed rather than guessing.
 A managed agent generation is one process lifetime of a managed agent. It
 executes one delegated assignment at a time. Its terminal result is delivered
 once, then the agent's pane, process, mailbox, and runtime state are cleaned up.
-Failed assignments follow the same terminal cleanup path. With `retainWorkers`
-enabled, delivering the result keeps the verified live process, pane, label, and
-mailbox instead of cleaning them up: the same generation takes the next
-assignment, and the worker projects as `idle` until a later assignment reuses it.
-The cleanup described here happens when that retained worker is closed.
+Failed assignments follow the same path. By default (`retainWorkers: true`),
+delivering the result, completed or failed, keeps the verified live process,
+pane, label, and mailbox instead of cleaning them up: the same generation takes
+the next assignment, and the worker projects as `idle` until a later assignment
+reuses it. The cleanup described here happens when that retained worker is
+closed, or at once after delivery when `retainWorkers` is `false`.
 
 The Pi session outlives its generations. To continue the same
 conversational context, use `agent_continue` with the exact session ID or session path

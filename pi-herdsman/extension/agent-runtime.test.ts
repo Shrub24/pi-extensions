@@ -3,7 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
-import { mock, test } from "node:test";
+import { beforeEach, mock, test } from "node:test";
 import { Value } from "typebox/value";
 import {
   DELEGATION_BRIEF_EXAMPLES,
@@ -66,6 +66,9 @@ const { writePrivatePromptSnapshots } = await import(
   "./agent-definitions.ts"
 );
 const { updateConfig } = await import("./config.ts");
+// These suites cover the one-shot lifecycle; retained workers are the default,
+// and the tests that exercise retention opt in or out explicitly.
+beforeEach(() => updateConfig("retainWorkers", false));
 function writeRequest(mailbox: string, request: RequestRecord): void {
   if (
     request.version === 5 &&
@@ -1597,12 +1600,16 @@ test("recovery validates against the accepted response override", async () => {
       readAgentState(mailbox)?.acceptedAssignment?.responseContractHash,
       acceptedAssignment.responseContractHash,
     );
-    recovered.events.get("message_end")![0](
-      { message: { role: "assistant", content: "Done without the required heading." } },
-      fakeContext(),
-    );
-    await recovered.events.get("agent_settled")![0](undefined, fakeContext());
-    await recovered.events.get("agent_settled")![0](undefined, fakeContext());
+    // The recovered worker is corrected twice, then fails with the typed result.
+    for (let turn = 0; turn < 3; turn++) {
+      recovered.events.get("message_end")![0](
+        { message: { role: "assistant", content: "Done without the required heading." } },
+        fakeContext(),
+      );
+      await recovered.events.get("agent_settled")![0](undefined, fakeContext());
+      await recovered.events.get("agent_settled")![0](undefined, fakeContext());
+    }
+    assert.equal(recovered.sentUsers.length, 2);
     const result = readResult(mailbox, requestId);
     assert.equal(result?.status, "failed");
     assert.equal(result?.error?.code, "invalid_response");
@@ -1613,6 +1620,96 @@ test("recovery validates against the accepted response override", async () => {
     assert.equal(result?.responseValidation?.diagnostics?.[0]?.field, "requiredSections");
   } finally {
     fireShutdown(first);
+    resetAgentMailbox(mailbox);
+  }
+});
+
+test("a turn cut off by the output limit is continued instead of settled as a failure", async () => {
+  const mailbox = setAgentEnvironment("truncated-turn-agent");
+  const agent = fakePi();
+  const context = fakeContext();
+  registerExtension!(agent.pi as never);
+  await agent.events.get("session_start")![0](undefined, context);
+  const started = readAgentState(mailbox)!;
+  const requestId = randomUUID();
+  writeRequest(mailbox, {
+    version: 5,
+    runId: started.runId,
+    requestId,
+    ownerSessionId: started.ownerSessionId,
+    workspaceId: started.workspaceId,
+    agentLabel: started.agentLabel,
+    paneId: started.paneId,
+    kind: "task",
+    text: "Do the work",
+    createdAt: Date.now(),
+  });
+  agent.events.get("input")![0]({ text: controlMarker(requestId) }, context);
+  const cutOff = () =>
+    agent.events.get("message_end")![0](
+      { message: { role: "assistant", content: [], stopReason: "length" } },
+      context,
+    );
+  try {
+    cutOff();
+    await agent.events.get("agent_settled")![0](undefined, context);
+    await agent.events.get("agent_settled")![0](undefined, context);
+    assert.equal(readResult(mailbox, requestId), undefined, "a truncated turn is not a final answer");
+    assert.equal(readAgentState(mailbox)?.activeRequestId, requestId);
+    assert.equal(agent.sentUsers.length, 1, "one continuation is requested");
+    assert.match(JSON.stringify(agent.sentUsers[0]), /cut off by the output limit/);
+
+    agent.events.get("message_end")![0](
+      { message: { role: "assistant", content: "Finished.", stopReason: "stop" } },
+      context,
+    );
+    await agent.events.get("agent_settled")![0](undefined, context);
+    await agent.events.get("agent_settled")![0](undefined, context);
+    assert.equal(readResult(mailbox, requestId)?.status, "completed");
+    assert.equal(readResult(mailbox, requestId)?.text, "Finished.");
+    assert.equal(agent.sentUsers.length, 1, "a complete answer asks for nothing more");
+  } finally {
+    fireShutdown(agent);
+    resetAgentMailbox(mailbox);
+  }
+});
+
+test("a worker that keeps being cut off fails after two continuations, not forever", async () => {
+  const mailbox = setAgentEnvironment("truncated-forever-agent");
+  const agent = fakePi();
+  const context = fakeContext();
+  registerExtension!(agent.pi as never);
+  await agent.events.get("session_start")![0](undefined, context);
+  const started = readAgentState(mailbox)!;
+  const requestId = randomUUID();
+  writeRequest(mailbox, {
+    version: 5,
+    runId: started.runId,
+    requestId,
+    ownerSessionId: started.ownerSessionId,
+    workspaceId: started.workspaceId,
+    agentLabel: started.agentLabel,
+    paneId: started.paneId,
+    kind: "task",
+    text: "Do the work",
+    createdAt: Date.now(),
+  });
+  agent.events.get("input")![0]({ text: controlMarker(requestId) }, context);
+  try {
+    for (let turn = 0; turn < 3; turn++) {
+      agent.events.get("message_end")![0](
+        { message: { role: "assistant", content: [], stopReason: "length" } },
+        context,
+      );
+      await agent.events.get("agent_settled")![0](undefined, context);
+      await agent.events.get("agent_settled")![0](undefined, context);
+    }
+    assert.equal(agent.sentUsers.length, 2, "continuations are bounded");
+    const result = readResult(mailbox, requestId);
+    assert.equal(result?.status, "failed");
+    assert.equal(result?.error?.code, "invalid_response");
+  } finally {
+    fireShutdown(agent);
     resetAgentMailbox(mailbox);
   }
 });
@@ -1655,19 +1752,56 @@ test("invalid final responses publish one typed failure with diagnostics", async
     createdAt: Date.now(),
   });
   agent.events.get("input")![0]({ text: controlMarker(requestId) }, context);
-  agent.events.get("message_end")![0](
-    { message: { role: "assistant", content: "All done." } },
-    context,
-  );
-  await agent.events.get("agent_settled")![0](undefined, context);
-  await agent.events.get("agent_settled")![0](undefined, context);
-  const result = readResult(mailbox, requestId);
+  const answer = async (text: string) => {
+    agent.events.get("message_end")![0](
+      { message: { role: "assistant", content: text } },
+      context,
+    );
+    await agent.events.get("agent_settled")![0](undefined, context);
+    await agent.events.get("agent_settled")![0](undefined, context);
+  };
+  // A fixable deficiency is corrected in the worker's own session first.
+  await answer("All done.");
+  assert.equal(readResult(mailbox, requestId), undefined, "the first miss is not terminal");
+  assert.equal(agent.sentUsers.length, 1);
+  const correctionPrompt = JSON.stringify(agent.sentUsers[0]);
+  assert.match(correctionPrompt, /Missing Markdown heading: Outcome/, "the correction names the deficiency");
+  // A correction that fixes it publishes success.
+  await answer("## Outcome\nFixed.");
+  assert.equal(readResult(mailbox, requestId)?.status, "completed");
+  removeResult(mailbox, requestId);
+  agent.sentUsers.length = 0;
+
+  // A worker that never satisfies the contract fails once, after two corrections.
+  const stubbornId = randomUUID();
+  writeRequest(mailbox, {
+    version: 5,
+    runId: started.runId,
+    requestId: stubbornId,
+    ownerSessionId: started.ownerSessionId,
+    workspaceId: started.workspaceId,
+    agentLabel: started.agentLabel,
+    paneId: started.paneId,
+    kind: "task",
+    acceptedAssignment: createAcceptedAssignmentContract(
+      stubbornId,
+      brief,
+      DEFAULT_RESPONSE_CONTRACT,
+      process.cwd(),
+      1024 * 1024,
+    ),
+    text: "Return a report with an Outcome section",
+    createdAt: Date.now(),
+  });
+  agent.events.get("input")![0]({ text: controlMarker(stubbornId) }, context);
+  for (let turn = 0; turn < 3; turn++) await answer("Still nothing useful.");
+  assert.equal(agent.sentUsers.length, 2, "corrections are bounded");
+  const result = readResult(mailbox, stubbornId);
   assert.equal(result?.status, "failed");
   assert.equal(result?.error?.code, "invalid_response");
   assert.equal(result?.responseValidation?.diagnostics?.[0]?.field, "requiredSections");
   assert.equal(result?.responseValidation?.diagnostics?.[0]?.message, "Missing Markdown heading: Outcome");
-  assert.equal(readResult(mailbox, requestId)?.status, "failed", "failure is not repaired automatically");
-  assert.deepEqual(agent.sentUsers, [], "no automatic repair turn is queued");
+  removeResult(mailbox, stubbornId);
 
   // The owner repairs through an ordinary new assignment with its own contract.
   removeResult(mailbox, requestId);
