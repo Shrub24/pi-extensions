@@ -5366,3 +5366,96 @@ test("owner ask waits while busy and delivers once after settlement", async () =
     resetAgentMailbox(mailbox);
   }
 });
+
+test("a background change mid-turn does not settle on a tool-call message that carries no answer", async () => {
+  const mailbox = setAgentEnvironment("mid-turn-change-agent");
+  const providerId = "test-mid-turn-provider";
+  const agent = fakePi();
+  let revision = 1;
+  let outstanding: { taskId: string; state: string; reason: string }[] = [];
+  const registration = registerBackgroundWorkProvider(agent.pi.events as never, {
+    id: providerId,
+    version: 1,
+    snapshot(scope: { sessionId: string; requestId: string }) {
+      return {
+        provider: { id: providerId, version: 1 },
+        sessionId: scope.sessionId,
+        requestId: scope.requestId,
+        revision,
+        reconciliation: { state: "ready" },
+        outstanding,
+      };
+    },
+    bind() {
+      return { ok: true };
+    },
+    protect() {
+      return { ok: true };
+    },
+  });
+  registerExtension!(agent.pi as never);
+  const context = fakeAgentContext();
+  context.mode = "rpc";
+  try {
+    await agent.events.get("session_start")![0](undefined, context);
+    const initial = readAgentState(mailbox)!;
+    const request: RequestRecord = {
+      version: 5,
+      runId: initial.runId,
+      requestId: randomUUID(),
+      ownerSessionId: initial.ownerSessionId,
+      workspaceId: initial.workspaceId,
+      agentLabel: initial.agentLabel,
+      paneId: initial.paneId,
+      kind: "task",
+      text: "retrieve the finished task",
+      createdAt: Date.now(),
+    };
+    writeRequest(mailbox, request);
+    agent.events.get("input")![0]({ text: controlMarker(request.requestId) }, context);
+
+    // The worker ends a turn while a finished result is unread, so the hold
+    // watches the provider for the change that resolves it.
+    outstanding = [
+      { taskId: "unread", state: "awaiting-result-review", reason: "finished" },
+    ];
+    revision++;
+    agent.events.get("message_end")![0](
+      { message: { role: "assistant", content: "waiting" } },
+      context,
+    );
+    await agent.events.get("agent_settled")![0](undefined, context);
+    assert.equal(readResult(mailbox, request.requestId), undefined);
+
+    // The worker resumes and issues the retrieval: a tool-call message with no
+    // text, then the retrieval itself resolves the task and notifies a change.
+    agent.events.get("message_end")![0](
+      { message: { role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", name: "bg_task" }] } },
+      context,
+    );
+    outstanding = [];
+    revision++;
+    registration.notifyChange({
+      sessionId: context.sessionManager.getSessionId(),
+      requestId: request.requestId,
+    });
+
+    assert.equal(
+      readResult(mailbox, request.requestId),
+      undefined,
+      "a tool call is not a final answer, so nothing may be published or failed mid-turn",
+    );
+    assert.equal(readAgentState(mailbox)?.activeRequestId, request.requestId);
+    assert.deepEqual(agent.sentUsers, [], "and no correction may be requested for a reply the worker has not given");
+
+    agent.events.get("message_end")![0](
+      { message: { role: "assistant", stopReason: "stop", content: "retrieved and reviewed" } },
+      context,
+    );
+    await agent.events.get("agent_settled")![0](undefined, context);
+    assert.equal(readResult(mailbox, request.requestId)?.text, "retrieved and reviewed");
+  } finally {
+    fireShutdown(agent);
+    resetAgentMailbox(mailbox);
+  }
+});

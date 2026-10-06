@@ -16750,7 +16750,9 @@ export default function (pi: ExtensionAPI): void {
     )
       return;
     latest = contentText(message.content, "").trim();
-    freshResponse = true;
+    // A tool-call message with no text is not an answer; counting it would fail
+    // a worker that is still working.
+    freshResponse = message?.stopReason !== "toolUse";
     // A reply cut off by the output limit is an incomplete turn, not an answer.
     turnCutOff = message?.stopReason === "length";
     // A length stop that produced no text and essentially no output tokens is
