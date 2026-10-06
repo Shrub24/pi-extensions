@@ -6915,3 +6915,102 @@ test("fresh assignment refreshes the widget after validation", async (t) => {
     } else realFs.unlinkSync(definitionPath);
   }
 });
+
+test("active Manager supervision refreshes serialize and coalesce concurrent requests", async (t) => {
+  setLeadEnvironment();
+  process.env.HERDR_PANE_ID = "coalesced-manager-pane";
+  process.env.HERDR_TAB_ID = "coalesced-manager-tab";
+  process.env.HERDR_SOCKET_PATH = join(
+    tmpdir(),
+    `supervision-coalescing-${randomUUID()}.sock`,
+  );
+  const respond = (result: unknown) => ({
+    stdout: JSON.stringify({ id: AGENT_ID, result }),
+    stderr: "",
+    code: 0,
+  });
+  const release = Promise.withResolvers<void>();
+  const gatedSnapshotStarted = Promise.withResolvers<void>();
+  let snapshots = 0;
+  let active = 0;
+  let maxActive = 0;
+  let gateRefresh = false;
+  let refreshSnapshotBase = 0;
+  const pi = fakeChiefPi({
+    activeTools: ["read"],
+    exec: async (_command, args) => {
+      if (args[0] === "workspace" && args[1] === "get")
+        return respond({
+          workspace: {
+            worktree: { repo_key: "repo-key", is_linked_worktree: false },
+          },
+        });
+      if (args[0] === "worktree" && args[1] === "list")
+        return respond({
+          source: {
+            source_workspace_id: WORKSPACE,
+            repo_key: "repo-key",
+            repo_name: "project",
+          },
+          worktrees: [],
+        });
+      if (isAgentList(args))
+        return respond({ agents: [managerAgentIdentity()] });
+      if (args[0] === "agent" && args[1] === "get")
+        return respond({ agent: managerAgentIdentity() });
+      if (isApiSnapshot(args)) {
+        snapshots++;
+        active++;
+        maxActive = Math.max(maxActive, active);
+        if (gateRefresh && snapshots === refreshSnapshotBase + 1) {
+          gatedSnapshotStarted.resolve();
+          await release.promise;
+        }
+        active--;
+        return respond({ snapshot: { agents: [], panes: [] } });
+      }
+      return respond({});
+    },
+  });
+  const context = fakeContext() as any;
+  context.mode = "rpc";
+  registerExtension!(pi.pi as never);
+  t.after(async () => {
+    release.resolve();
+    await pi.events.get("session_shutdown")?.[0]();
+    delete process.env.HERDR_SOCKET_PATH;
+    delete process.env.HERDR_TAB_ID;
+    delete process.env.HERDR_PANE_ID;
+    setLeadEnvironment();
+  });
+
+  await pi.events.get("session_start")![0](undefined, context);
+  await pi.commandOptions.get("manager").handler("", context);
+  assert.equal(
+    readLeadCoordinationState(supervisionRuntime(), LEAD_SESSION_ID)?.role,
+    "manager",
+  );
+  refreshSnapshotBase = snapshots;
+  maxActive = 0;
+  gateRefresh = true;
+  const beforeStart = pi.events.get("before_agent_start")![0];
+  const firstCaller = beforeStart(
+    { systemPrompt: "base", systemPromptOptions: { contextFiles: [] } },
+    context,
+  );
+  await gatedSnapshotStarted.promise;
+  const callers = Array.from({ length: 4 }, () =>
+    beforeStart(
+      { systemPrompt: "base", systemPromptOptions: { contextFiles: [] } },
+      context,
+    ),
+  );
+  release.resolve();
+  const results = await Promise.all([firstCaller, ...callers]);
+  assert.ok(
+    results.every((result) => /Manager role/.test(result?.systemPrompt ?? "")),
+  );
+  assert.equal(maxActive, 1);
+  assert.equal(snapshots - refreshSnapshotBase, 2);
+});
+

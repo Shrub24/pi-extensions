@@ -2279,34 +2279,6 @@ function supervisedSessionFile(
     return undefined;
   }
 }
-function persistedSessionName(agent: any): string | undefined {
-  const session = sessionIdentity(agent?.agent_session);
-  if (session?.kind !== "path") return undefined;
-  try {
-    const manager = SessionManager.open(session.value);
-    const name = manager.getSessionName();
-    return typeof name === "string" && name.trim() ? name.trim() : undefined;
-  } catch {
-    return undefined;
-  }
-}
-function isLeadSessionBoundary(
-  agent: any,
-  pane: any,
-  ownerSessionId: string,
-): boolean {
-  if (!isPiAgent(agent) || pane?.agent !== "pi") return false;
-  const session = sessionIdentity(agent?.agent_session);
-  if (session?.kind !== "path") return false;
-  try {
-    if (SessionManager.open(session.value).getSessionId() !== ownerSessionId)
-      return false;
-    const manager = SessionManager.open(session.value);
-    return !sessionAgentIdentity(manager.getEntries(), manager.getSessionId());
-  } catch {
-    return false;
-  }
-}
 function herdrAliasMatchesIfReported(
   agent: any,
   expectedAlias: string,
@@ -3010,6 +2982,7 @@ async function managedAgentSnapshots(
   proveLead = false,
   allWorkspaces = false,
   suppliedInventory?: HerdrSessionSnapshot,
+  allowTranscriptDefinitionFallback = true,
 ): Promise<{
   agents: ManagedAgentSnapshot[];
   mailboxes: ReturnType<typeof listAgentStates>;
@@ -3035,6 +3008,7 @@ async function managedAgentSnapshots(
         agent,
         state,
         runtimes.get(state.agentLabel),
+        allowTranscriptDefinitionFallback,
       );
     } catch {
       agentDefinition = "unknown";
@@ -3170,10 +3144,23 @@ async function managedAgentSnapshots(
               pane?.pane_id === ownerAgent.pane_id,
           );
           if (
-            ownerPanes.length === 1 &&
-            isLeadSessionBoundary(ownerAgent, ownerPanes[0], ownerSessionId)
+            ownerPanes.length !== 1 ||
+            !isPiAgent(ownerAgent) ||
+            ownerPanes[0]?.agent !== "pi"
           )
-            leadSessionIds.push(ownerSessionId);
+            continue;
+          // Recurring lead authority comes from Herdsman's own coordination
+          // state; missing or malformed evidence stays unknown.
+          try {
+            const state = readLeadCoordinationState(
+              supervisionRuntime(),
+              ownerSessionId,
+            );
+            if (state && (state.role ?? "lead") === "lead")
+              leadSessionIds.push(ownerSessionId);
+          } catch {
+            // Missing or invalid Lead authority stays unknown.
+          }
         }
       }
     } catch {
@@ -3717,8 +3704,17 @@ async function agentSnapshotView(
   scope: ControllerScope | undefined,
   signal?: AbortSignal,
   proveLead = false,
+  allowTranscriptDefinitionFallback = true,
 ): Promise<ManagedAgentSnapshotView> {
-  const snapshot = await managedAgentSnapshots(pi, ctx, signal, proveLead);
+  const snapshot = await managedAgentSnapshots(
+    pi,
+    ctx,
+    signal,
+    proveLead,
+    false,
+    undefined,
+    allowTranscriptDefinitionFallback,
+  );
   const view = {
     ...snapshot,
     visible: visibleAgentSnapshots(
@@ -4790,11 +4786,14 @@ function agentDefinitionForRuntime(
   agent: any,
   state: ManagedAgentState,
   cached?: Runtime,
+  allowTranscriptFallback = true,
 ): string {
   if (state.agentDefinition !== undefined) return stateAgentDefinition(state);
-  return cached && runtimeIdentityMatches(cached, state, agent)
-    ? cached.agentDefinition
-    : stateAgentDefinition(state);
+  if (cached && runtimeIdentityMatches(cached, state, agent))
+    return cached.agentDefinition;
+  // Recurring observation must not open a legacy transcript body; explicit
+  // and continuity callers keep resolving the persisted definition.
+  return allowTranscriptFallback ? stateAgentDefinition(state) : "unknown";
 }
 function guardMailboxOccupancy(
   mailbox: string,
@@ -4974,6 +4973,7 @@ function runtimeForListedAgent(
   agent: any,
   state: ManagedAgentState,
   cached?: Runtime,
+  allowTranscriptFallback = true,
 ): Runtime {
   const useCached =
     cached !== undefined && runtimeIdentityMatches(cached, state, agent);
@@ -4982,7 +4982,9 @@ function runtimeForListedAgent(
       ? stateAgentDefinition(state)
       : useCached
         ? cached!.agentDefinition
-        : stateAgentDefinition(state);
+        : allowTranscriptFallback
+          ? stateAgentDefinition(state)
+          : "unknown";
   const runtime =
     (useCached ? cached : undefined) ??
     ({
@@ -10809,6 +10811,8 @@ export default function (pi: ExtensionAPI): void {
     let healthTimer: ReturnType<typeof setTimeout> | undefined;
     let healthGeneration = 0;
     let supervisionTimer: ReturnType<typeof setInterval> | undefined;
+    let supervisionRefreshInFlight: Promise<void> | undefined;
+    let pendingSupervisionRefresh: ExtensionContext | undefined;
     let supervisionOverviewGeneration = 0;
     let activeSupervisionRender: (() => void) | undefined;
     const loadSupervisionSnapshot = async (
@@ -10907,7 +10911,6 @@ export default function (pi: ExtensionAPI): void {
       const agents = live.flatMap((agent: any) => {
         const sessionId = herdrSessionId(agent);
         if (!isPiAgent(agent) || !sessionId) return [];
-        const sessionName = persistedSessionName(agent);
         const candidateSessionFile = supervisedSessionFile(agent, sessionId);
         const piSessionFile =
           candidateSessionFile &&
@@ -10926,7 +10929,6 @@ export default function (pi: ExtensionAPI): void {
             tabId: agent.tab_id,
             workspaceCwd: agent.cwd,
             herdrName: agent.name,
-            ...(sessionName ? { sessionName } : {}),
             ...(piSessionFile ? { piSessionFile } : {}),
             tokens: agent.tokens,
             runtimeState: normalizeHerdrLifecycleState(agent),
@@ -11953,20 +11955,17 @@ export default function (pi: ExtensionAPI): void {
         throw error;
       }
     };
-    const refreshSupervision = async (
+    const refreshSupervisionOnce = async (
       ctx: ExtensionContext,
-      isCurrent?: () => boolean,
-    ): Promise<boolean> => {
+    ): Promise<void> => {
       if (
         chiefMode !== "active" &&
         !(activeRole() === "manager" && !roleSuspended)
       )
-        return false;
+        return;
       const generation = currentSupervisionGeneration(ctx);
       const refreshIsCurrent = (): boolean =>
-        currentSupervisionGeneration(ctx) === generation &&
-        (isCurrent?.() ?? true);
-      let refreshed = false;
+        currentSupervisionGeneration(ctx) === generation;
       try {
         const inventory = await herdrSessionSnapshot(pi, ctx, ctx.signal);
         const agents = await managedAgentSnapshots(
@@ -11976,14 +11975,14 @@ export default function (pi: ExtensionAPI): void {
           false,
           true,
           inventory,
+          false,
         );
         const snapshot = await loadSupervisionSnapshot(ctx, inventory, agents);
-        if (!refreshIsCurrent()) return false;
+        if (!refreshIsCurrent()) return;
         supervisionSnapshot = snapshot;
         supervisionSnapshotKnown = true;
         supervisionSnapshotGeneration = generation;
         supervisionStale = false;
-        refreshed = true;
         activeSupervisionRender?.();
       } catch {
         if (refreshIsCurrent())
@@ -12000,7 +11999,23 @@ export default function (pi: ExtensionAPI): void {
           // A failed UI redraw must not reject a fire-and-forget refresh.
         }
       }
-      return refreshed;
+    };
+    // At most one supervision refresh runs at a time and at most one rerun is
+    // queued while it runs; a sustained trigger stream may still cause later
+    // runs once the in-flight refresh finishes.
+    const refreshSupervision = (ctx: ExtensionContext): Promise<void> => {
+      pendingSupervisionRefresh = ctx;
+      if (supervisionRefreshInFlight) return supervisionRefreshInFlight;
+      supervisionRefreshInFlight = (async () => {
+        while (pendingSupervisionRefresh) {
+          const next = pendingSupervisionRefresh;
+          pendingSupervisionRefresh = undefined;
+          await refreshSupervisionOnce(next);
+        }
+      })().finally(() => {
+        supervisionRefreshInFlight = undefined;
+      });
+      return supervisionRefreshInFlight;
     };
     prepareSupervisionMessage = async (ctx: ExtensionContext) => {
       if (!isCurrentChief(ctx) && activeRole() !== "manager") return;
@@ -12011,7 +12026,7 @@ export default function (pi: ExtensionAPI): void {
         currentSupervisionGeneration(ctx) === generation;
 
       try {
-        await refreshSupervision(ctx, isCurrent);
+        await refreshSupervision(ctx);
         if (!isCurrent()) return;
 
         const status = supervisionSnapshotStatus(ctx);
@@ -12126,6 +12141,7 @@ export default function (pi: ExtensionAPI): void {
       void refreshSupervision(ctx);
     };
     clearSupervisionUI = (removeWidget = true) => {
+      pendingSupervisionRefresh = undefined;
       activeSupervisionRender = undefined;
       requestSupervisionWidgetRender = undefined;
       if (supervisionTimer) clearInterval(supervisionTimer);
@@ -12583,6 +12599,7 @@ export default function (pi: ExtensionAPI): void {
     const loadStatusSnapshot = async (
       ctx: ExtensionContext,
       signal?: AbortSignal,
+      allowTranscriptDefinitionFallback = true,
     ): Promise<import("./presentation.ts").StatusSnapshot> => {
       const view = await agentSnapshotView(
         pi,
@@ -12590,6 +12607,7 @@ export default function (pi: ExtensionAPI): void {
         controllerScope,
         signal,
         true,
+        allowTranscriptDefinitionFallback,
       );
       const ownerSessionId = ctx.sessionManager.getSessionId();
       const unresolvedMailboxState =
@@ -12727,6 +12745,7 @@ export default function (pi: ExtensionAPI): void {
         lastValidStatus = await loadStatusSnapshot(
           ctx,
           controllerAbortController?.signal,
+          false,
         );
         if (generation !== statusGeneration || ctx !== statusContext) return;
         reconcilePendingStarts(lastValidStatus);
@@ -14780,6 +14799,7 @@ export default function (pi: ExtensionAPI): void {
     const publishAgentLoss = (
       ctx: ExtensionContext,
       state: ManagedAgentState,
+      snapshotAgentDefinition: string,
       availableActions: string[],
       nextReminderMs: number,
       signal: AbortSignal,
@@ -14858,7 +14878,8 @@ export default function (pi: ExtensionAPI): void {
               paneId: current.paneId,
               piSessionId: current.piSessionId,
               piSessionFile: current.piSessionFile,
-              agentDefinition: stateAgentDefinition(current),
+              agentDefinition:
+                current.agentDefinition ?? snapshotAgentDefinition ?? "unknown",
               requestId: latestRequestId,
               availableActions,
               nextReminderMs,
@@ -14880,7 +14901,15 @@ export default function (pi: ExtensionAPI): void {
       if (signal.aborted || generation !== healthGeneration || !ctx.isIdle())
         return;
       const ownerSessionId = ctx.sessionManager.getSessionId();
-      const snapshot = await managedAgentSnapshots(pi, ctx, signal);
+      const snapshot = await managedAgentSnapshots(
+        pi,
+        ctx,
+        signal,
+        false,
+        false,
+        undefined,
+        false,
+      );
       if (signal.aborted || generation !== healthGeneration || !ctx.isIdle())
         return;
       const view: ManagedAgentSnapshotView = {
@@ -14972,7 +15001,14 @@ export default function (pi: ExtensionAPI): void {
           if (published || !attentionDue(state.runId, episode, now)) continue;
           const intervalMs = nextAttentionInterval(state.runId, episode);
           if (
-            publishAgentLoss(ctx, state, availableActions, intervalMs, signal)
+            publishAgentLoss(
+              ctx,
+              state,
+              agent.agentDefinition,
+              availableActions,
+              intervalMs,
+              signal,
+            )
           ) {
             recordAttention(state.runId, episode, intervalMs);
             published = true;
@@ -15260,6 +15296,7 @@ export default function (pi: ExtensionAPI): void {
                 agent.listed,
                 current,
                 runtimes.get(current.agentLabel),
+                false,
               ),
               diagnosticSignal,
             );
@@ -15270,7 +15307,15 @@ export default function (pi: ExtensionAPI): void {
         if (attemptedDiagnostic && !diagnostic) {
           let refreshed: Awaited<ReturnType<typeof managedAgentSnapshots>>;
           try {
-            refreshed = await managedAgentSnapshots(pi, ctx, signal);
+            refreshed = await managedAgentSnapshots(
+              pi,
+              ctx,
+              signal,
+              false,
+              false,
+              undefined,
+              false,
+            );
           } catch {
             continue;
           }
@@ -16627,6 +16672,9 @@ export default function (pi: ExtensionAPI): void {
         ctx,
         metadataAbortController?.signal,
         true,
+        false,
+        undefined,
+        false,
       );
       if (generation !== leafStatusGeneration || ctx !== leafStatusContext)
         return;
