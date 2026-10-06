@@ -439,6 +439,12 @@ function formatMessageLimit(bytes: number): string {
   return `${bytes / 1024} KiB · ≈${tokens.toLocaleString("en-US")} tokens`;
 }
 const MAX_RESPONSE_CORRECTIONS = 2;
+// A managed session is compacted once its context reaches this reserve below the
+// model's window. The route clamps the completion budget as the prompt
+// approaches the window and answers with a single token and a length stop at the
+// top of it (observed at a 270k prompt on a 272k window: `output: 1`, no text),
+// and this reserve is also what leaves room for a long final reply.
+const MANAGED_CONTEXT_RESERVE_TOKENS = 65_536;
 const AGENT_DELEGATION_GUIDANCE =
   "Use agent_delegate for genuinely independent or context-heavy work; keep small, tightly coupled work local. " +
   "When a retained worker already holds the relevant context, continue it instead of starting a fresh agent.";
@@ -16506,6 +16512,9 @@ export default function (pi: ExtensionAPI): void {
   let turnEmptyGeneration = false;
   let awaitingContinuation = false;
   let cutOffContinuations: { requestId: string; count: number } | undefined;
+  // A compaction is in flight; a second request would stack summaries over the
+  // same session.
+  let contextCompactionInFlight = false;
   let pendingResult: ResultRecord | undefined;
   let pendingInterruptReplacement: string | undefined;
   let resultWriteAttempts = 0;
@@ -18402,6 +18411,71 @@ export default function (pi: ExtensionAPI): void {
     }, SETTLEMENT_BACKSTOP_MS);
     settlementBackstopTimer.unref?.();
   };
+  /**
+   * Re-assert this session's identity entries after a compaction. Compaction
+   * replaces the history those entries live in, and both are read back later:
+   * the session metadata classifies the session, and the agent definition entry
+   * is what lets an owner resolve this worker's role.
+   */
+  const reassertManagedIdentity = (ctx: ExtensionContext): void => {
+    recordManagedSessionMetadata(pi, ctx);
+    const definition = process.env.PI_HERDSMAN_AGENT_DEFINITION;
+    const label = process.env.PI_HERDSMAN_LABEL;
+    if (!definition || !label) return;
+    try {
+      ensureAgentIdentity(pi, ctx, definition, label);
+    } catch (error) {
+      appendDurableError(pi, ctx, SESSION_METADATA_DIAGNOSTIC_ENTRY, error);
+    }
+  };
+
+  /**
+   * Ask Pi to compact this managed session. Pi compacts by itself only for an
+   * explicit request, a threshold crossing, or overflow recovery: the
+   * deployment keeps Pi's threshold compaction off because the operator session
+   * belongs to Magic Context, and a generation that came back empty under the
+   * route's clamp is neither an overflow nor a recoverable cut-off. The child
+   * build carries pi-vcc, which owns the summary from the marker without a
+   * model call; without it the summary falls to whichever handler is loaded.
+   */
+  const compactManagedContext = (ctx: ExtensionContext): boolean => {
+    if (contextCompactionInFlight) return false;
+    if (typeof ctx.compact !== "function") return false;
+    contextCompactionInFlight = true;
+    try {
+      ctx.compact({
+        customInstructions: "/pi-vcc",
+        onComplete: () => {
+          contextCompactionInFlight = false;
+          reassertManagedIdentity(ctx);
+        },
+        onError: () => {
+          contextCompactionInFlight = false;
+        },
+      });
+    } catch {
+      contextCompactionInFlight = false;
+      return false;
+    }
+    return true;
+  };
+
+  /**
+   * Compact while the worker is idle and its context has grown into the reserve
+   * below the model's window. Called after a settlement published its result,
+   * so the summary can never race the answer being judged, and never while
+   * context retirement is configured to make the opposite choice.
+   */
+  const compactManagedContextIfFull = (ctx: ExtensionContext): void => {
+    if (readConfig().contextRetirement) return;
+    const usage = ctx.getContextUsage();
+    if (!usage || usage.tokens === null) return;
+    if (!(usage.contextWindow > 0)) return;
+    if (usage.tokens < usage.contextWindow - MANAGED_CONTEXT_RESERVE_TOKENS)
+      return;
+    compactManagedContext(ctx);
+  };
+
   pi.on("agent_settled", async (_event: unknown, ctx: ExtensionContext) => {
     if (pendingInterruptReplacement) {
       const replacement = pendingInterruptReplacement;
@@ -18417,9 +18491,13 @@ export default function (pi: ExtensionAPI): void {
         ctx,
         controllerAbortController?.signal,
       ).catch(() => {});
+    // Last: the result this settlement publishes is judged from the session
+    // history that a compaction would replace.
+    compactManagedContextIfFull(ctx);
   });
   pi.on("session_shutdown", () => {
     pendingInterruptReplacement = undefined;
+    contextCompactionInFlight = false;
     resetLeafStatus();
     metadataAbortController?.abort();
     metadataAbortController = undefined;

@@ -5096,6 +5096,158 @@ test("session agent identity reads the session-wide entry array", () => {
   );
 });
 
+const COMPACTION_WINDOW = 272_000;
+function countCustomEntries(entries: unknown[], customType: string): number {
+  return entries.filter(
+    (entry: any) => entry?.type === "custom" && entry.customType === customType,
+  ).length;
+}
+/** A managed worker whose reported usage and compaction are under test. */
+function compactingAgentContext(
+  entries: unknown[],
+  tokens: number | null,
+  compact: (options: {
+    customInstructions?: string;
+    onComplete?: () => void;
+  }) => void = () => undefined,
+): never {
+  return {
+    ...fakeAgentContext(entries),
+    getContextUsage: () => ({
+      tokens,
+      contextWindow: COMPACTION_WINDOW,
+      percent: null,
+    }),
+    compact,
+  } as never;
+}
+
+test("a settled worker compacts into its reserve and keeps its identity entries", async (t) => {
+  const mailbox = setAgentEnvironment("compaction-agent");
+  t.after(() => resetAgentMailbox(mailbox));
+  const agent = fakePi();
+  registerExtension!(agent.pi as never);
+  const compactions: string[] = [];
+  const context = compactingAgentContext(
+    agent.entries,
+    COMPACTION_WINDOW - 32_768,
+    (options) => {
+      compactions.push(options?.customInstructions ?? "");
+      // A compaction replaces the summarized history with a summary.
+      for (let index = agent.entries.length - 1; index >= 0; index--) {
+        const customType = (agent.entries[index] as any)?.customType;
+        if (
+          customType === "pi-herdsman-session-metadata" ||
+          customType === "pi-herdsman-agent-definition"
+        )
+          agent.entries.splice(index, 1);
+      }
+      options?.onComplete?.();
+    },
+  );
+  await agent.events.get("session_start")![0](undefined, context);
+
+  await agent.events.get("agent_settled")![0](undefined, context);
+
+  assert.deepEqual(compactions, ["/pi-vcc"]);
+  // The entries the summary replaced are read back later: one classifies the
+  // session, the other lets an owner resolve this worker's role.
+  assert.equal(
+    countCustomEntries(agent.entries, "pi-herdsman-session-metadata"),
+    1,
+  );
+  assert.equal(
+    countCustomEntries(agent.entries, "pi-herdsman-agent-definition"),
+    1,
+  );
+  fireShutdown(agent);
+});
+
+test("a settled worker below its reserve does not compact", async (t) => {
+  const mailbox = setAgentEnvironment("compaction-room-agent");
+  t.after(() => resetAgentMailbox(mailbox));
+  const agent = fakePi();
+  registerExtension!(agent.pi as never);
+  const compactions: string[] = [];
+  const context = compactingAgentContext(
+    agent.entries,
+    COMPACTION_WINDOW - 96_000,
+    (options) => {
+      compactions.push(options?.customInstructions ?? "");
+    },
+  );
+  await agent.events.get("session_start")![0](undefined, context);
+
+  await agent.events.get("agent_settled")![0](undefined, context);
+
+  assert.deepEqual(compactions, []);
+  fireShutdown(agent);
+});
+
+test("unknown context usage does not compact", async (t) => {
+  const mailbox = setAgentEnvironment("compaction-unknown-agent");
+  t.after(() => resetAgentMailbox(mailbox));
+  const agent = fakePi();
+  registerExtension!(agent.pi as never);
+  const compactions: string[] = [];
+  // Pi reports no token count right after a compaction, so a missing figure
+  // must not be read as a full window: that would compact forever.
+  const context = compactingAgentContext(agent.entries, null, (options) => {
+    compactions.push(options?.customInstructions ?? "");
+  });
+  await agent.events.get("session_start")![0](undefined, context);
+
+  await agent.events.get("agent_settled")![0](undefined, context);
+
+  assert.deepEqual(compactions, []);
+  fireShutdown(agent);
+});
+
+test("a compaction already in flight is not started again", async (t) => {
+  const mailbox = setAgentEnvironment("compaction-once-agent");
+  t.after(() => resetAgentMailbox(mailbox));
+  const agent = fakePi();
+  registerExtension!(agent.pi as never);
+  const compactions: string[] = [];
+  const context = compactingAgentContext(
+    agent.entries,
+    COMPACTION_WINDOW - 32_768,
+    (options) => {
+      compactions.push(options?.customInstructions ?? "");
+    },
+  );
+  await agent.events.get("session_start")![0](undefined, context);
+
+  await agent.events.get("agent_settled")![0](undefined, context);
+  await agent.events.get("agent_settled")![0](undefined, context);
+
+  assert.deepEqual(compactions, ["/pi-vcc"]);
+  fireShutdown(agent);
+});
+
+test("context retirement replaces compaction on a settled worker", async (t) => {
+  updateConfig("contextRetirement", true);
+  t.after(() => updateConfig("contextRetirement", undefined));
+  const mailbox = setAgentEnvironment("compaction-retired-agent");
+  t.after(() => resetAgentMailbox(mailbox));
+  const agent = fakePi();
+  registerExtension!(agent.pi as never);
+  const compactions: string[] = [];
+  const context = compactingAgentContext(
+    agent.entries,
+    COMPACTION_WINDOW - 32_768,
+    (options) => {
+      compactions.push(options?.customInstructions ?? "");
+    },
+  );
+  await agent.events.get("session_start")![0](undefined, context);
+
+  await agent.events.get("agent_settled")![0](undefined, context);
+
+  assert.deepEqual(compactions, []);
+  fireShutdown(agent);
+});
+
 test("retired active sessions suppress threshold compaction until completion", async (t) => {
   updateConfig("contextRetirement", true);
   t.after(() => updateConfig("contextRetirement", undefined));

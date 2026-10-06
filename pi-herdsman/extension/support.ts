@@ -600,6 +600,11 @@ export type Context = {
   isIdle: () => boolean;
   abort: () => void;
   getContextUsage: () => { tokens: number; contextWindow: number };
+  compact?: (options?: {
+    customInstructions?: string;
+    onComplete?: () => void;
+    onError?: (error: Error) => void;
+  }) => void;
   sessionManager: {
     getSessionId: () => string;
     getSessionFile: () => string;
