@@ -16,13 +16,13 @@
 
 ## 3. Operator deployment (dotfiles owner; outside this repository)
 
-- [ ] 3.1 Have the dotfiles owner finalize native `sessionDir = ".pi/sessions"` in `modules/agents/pi.nix`; verify the rendered setting and run `nix flake check --no-build --no-write-lock-file`. Keep activation held until group 4 is ready.
-- [ ] 3.2 Have the dotfiles owner finalize the narrow global ignore in `modules/dev-tools/cli.nix`; verify root and nested `.pi/sessions/` files are ignored while settings/skills are not, and commit only its two owned configuration hunks when authorized.
+- [x] 3.1 Have the dotfiles owner finalize native `sessionDir = ".pi/sessions"` in `modules/agents/pi.nix`; verify the rendered setting and run `nix flake check --no-build --no-write-lock-file`. Keep activation held until group 4 is ready. (Verified 2026-10-06: `.pi/agent/settings.json` carries `sessionDir: ".pi/sessions"`; the owner reported the canonical no-build flake check at exit 0. Activation ran at 19:44 local.)
+- [x] 3.2 Have the dotfiles owner finalize the narrow global ignore in `modules/dev-tools/cli.nix`; verify root and nested `.pi/sessions/` files are ignored while settings/skills are not, and commit only its two owned configuration hunks when authorized. (Verified 2026-10-06 from this repository: `git check-ignore -v` matches `.pi/sessions/y.jsonl` and `.pi/sessions/children/x.jsonl` against the global rule `**/.pi/sessions/`, and does not match `.pi/skills/`. The commit was handed to that repository's own commit gate.)
 
 ## 4. Integration and deployment verification
 
 - [x] 4.1 On the integrated tree, run parent-focused lifecycle/control/metadata tests, `npm run validate`, and `openspec validate --all --strict`; record actual exits and counts, with no source edits during the full gate.
-- [ ] 4.2 With explicit operator approval, activate the deployment and verify a fresh operator session and managed worker are stored in the two local directories with correct on-disk metadata; verify the native operator picker excludes child files. Record any live-smoke limitation instead of marking it complete.
+- [ ] 4.2 Verify a fresh operator session and managed worker are stored in the two local directories with correct on-disk metadata. Verified 2026-10-06 after activation: an operator session created in a temporary cwd (through the deployed `pi` shell routing) landed in `<cwd>/.pi/sessions/`; a delegated worker landed in `<repo>/.pi/sessions/children/` under the Pi-Bolt child build with `{"kind":"managed","definition":"delegate","label":"session-dir-smoke","parentSessionId":"01a10e6e-…","sessionId":"01a11065-…","role":"delegate","version":1}`; and this session's own file holds exactly one `{kind: operator, role: lead}` record. Not verified: the native picker excluding child files. The directory is one level below a project session directory, and Pi's discovery is known not to recurse, but the live picker was not driven, so this stays open rather than claimed.
 
 ## Coordination notes
 
