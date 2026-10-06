@@ -193,7 +193,7 @@ test("protect does not duplicate a wake that was already delivered before it", a
 	// was already delivered and must not be re-fired, yet the assignment must
 	// not be left waiting with no path to review. The path is durable, not a
 	// second wake — the snapshot still reports the result as awaiting review,
-	// a fresh scope is refused with this task's id, and retrieval retires it.
+	// a fresh scope carries it forward as outstanding, and retrieval retires it.
 	// (Automatic re-prompting of a consumed-but-unretrieved wake is the Group-3
 	// settlement-consumption guard, deliberately not claimed here.)
 	const snapshot = queryBackgroundWorkSnapshot(host.events, scope("req-g"));
@@ -201,9 +201,12 @@ test("protect does not duplicate a wake that was already delivered before it", a
 	expect(snapshot.snapshot.outstanding, "the consumed wake still reports awaiting-result-review").toStrictEqual([
 		{ taskId: id, state: "awaiting-result-review", reason: expect.stringContaining("awaiting an actual result handoff") },
 	]);
-	const refused = bindBackgroundWorkAssignment(host.events, scope("req-i"));
-	expect(refused.state, "a fresh scope is refused while the result is unretrieved").toBe("refused");
-	if (refused.state === "refused") expect(refused.reason, "the refusal names the task blocking review").toContain(id);
+	// A finished result of an earlier request no longer locks out the next bind:
+	// it is carried into the new assignment and stays outstanding there.
+	expect(bindBackgroundWorkAssignment(host.events, scope("req-i")), "a finished unretrieved result is carried, not a blocker").toStrictEqual({ state: "bound" });
+	const carried = queryBackgroundWorkSnapshot(host.events, scope("req-i"));
+	if (carried.state !== "ready") throw new Error(`expected ready, received ${JSON.stringify(carried)}`);
+	expect(carried.snapshot.outstanding.map((entry) => entry.taskId), "the unretrieved result is still outstanding for the new request").toStrictEqual([id]);
 
 	await bgTask().execute("protect-prior-get", { action: "get", id });
 });

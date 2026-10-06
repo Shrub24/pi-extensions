@@ -267,9 +267,12 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 	// - `bind` adopts task→assignment association: spawned tasks inherit the
 	//   bound request id (`task.assignmentRequestId`, written once at spawn),
 	//   and binding refuses while unresolved work exists that is NOT
-	//   attributable to the request — foreign-request tasks and unassociated
-	//   tasks (restored pre-Group-2 work, or spawns from before the first bind)
-	//   are quarantined for explicit reconciliation, never silently adopted.
+	//   attributable to the request — still-running or uncertified foreign-
+	//   request tasks and unassociated tasks (restored pre-Group-2 work, or
+	//   spawns from before the first bind) are quarantined for explicit
+	//   reconciliation, never silently adopted. A foreign task that has finished
+	//   with a certified result is carried instead: it stays outstanding (never
+	//   cleared) for the bound request until it is retrieved.
 	// - Result resolution (`task.resultResolution`) is the only thing that
 	//   retires a task from `outstanding`: a durable observation that a
 	//   certified result reached the worker (`delivered`, tasks 2.2) or that
@@ -355,6 +358,21 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 				continue;
 			}
 			if (task.assignmentRequestId !== requestId) {
+				// A finished, certified result of an earlier request is history
+				// awaiting review, not live foreign work: carrying it keeps it
+				// outstanding for whoever is bound now, so a resumed worker is not
+				// locked out of its next assignment and the result is still never
+				// cleared until it is actually retrieved. The association stays as
+				// recorded. Anything still running or not yet certified keeps
+				// blocking, because that work may yet change.
+				if (task.status !== "running" && task.resultReady === true) {
+					classification.outstanding.push({
+						taskId: task.id,
+						state: "awaiting-result-review",
+						reason: `terminal result of an earlier request ("${task.assignmentRequestId}") is unretrieved; retrieve it before relying on this assignment being settled`,
+					});
+					continue;
+				}
 				classification.unattributable.push(task.id);
 				continue;
 			}
