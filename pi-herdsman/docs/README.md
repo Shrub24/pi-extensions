@@ -83,6 +83,10 @@ implementation, including the upstream behavior a fork decision supersedes.
 - [0021 Recover a held settlement without a wake](adr/0021-recover-a-held-settlement-without-a-wake.md)
 - [0022 Accept an older owner's request shape](adr/0022-accept-an-older-owners-request-shape.md)
 - [0023 Carry finished results into the next assignment](adr/0023-carry-finished-results-into-the-next-assignment.md)
+- [0024 Carry owner control requests as files with an exclusive claim](adr/0024-carry-control-requests-as-files-with-a-claim.md)
+- [0025 Record session classification in its own versioned entry](adr/0025-record-session-classification-in-its-own-entry.md)
+- [0026 Store fresh managed sessions under the target working directory](adr/0026-store-fresh-managed-sessions-under-the-target-cwd.md)
+- [0027 Ignore a foreign session record before validating it](adr/0027-ignore-a-foreign-session-record-before-validating-it.md)
 
 The repository directories are organized by content type. The index is
 task-first so readers do not need to understand that structure before finding
