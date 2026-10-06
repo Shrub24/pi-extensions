@@ -1,6 +1,6 @@
 # pi-herdsman and pi-bash-processes: outstanding work
 
-Updated 2026-10-06. Local `main` is ahead of upstream and not pushed; the push waits for the owner's word.
+Updated 2026-10-06. Local `main` equals upstream and the Nix pin; everything below is pushed.
 Every item names its root cause (known, partly known, unknown) and the path forward.
 
 ## Worker lifecycle (direction)
@@ -70,9 +70,14 @@ refusals, plus carried-background-result settlement contract tests. No live reco
    branch-resident extension entry as session-bound or inheritable, bind session-bound ones to the
    session id that wrote them, ignore foreign ones on restore, and add a fork regression per extension.
    Until then, do not fork a lead that owns workers or running tasks.
-8. `herdsman-child-command` (configurable child launch command, then a probe-gated `pane run` start path)
-   goes next because it changes the Radar contract; the upstream pre-extraction alignment follows it.
-   Both edit `index.ts` and `herdr.ts`, so they run one after the other, not in parallel.
+8. The upstream pre-extraction alignment waits on the owner's approval of
+   `.pi-herdsman/pre-extraction-adoption-plan.md` (every fork divergence classified incidental or
+   deliberate, deliberate ones kept behind a separable seam). It edits `index.ts` and `herdr.ts`, so it
+   takes those two files alone. `herdsman-child-command` is landed (`73dc8bc3`, `37f2ec32`); open under it
+   are the dotfiles-side pane-env verification and the model-driven delegated launch/restart smoke, whose
+   harness needs a model reachable inside its isolated Pi directory.
+9. `#258` exact-path lookup: a separate upstream improvement to the managed-Lead/worktree resolution
+   (replaces another global session scan). Independent of the alignment.
 
 ## Hygiene
 
