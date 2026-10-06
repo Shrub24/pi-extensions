@@ -110,14 +110,18 @@ confirmation that does not match its own target.
 | `completedAt` | ISO 8601 time the owner wrote the result. |
 
 A result names the effects actually applied rather than the operation that was
-asked for. `close` applies `process_ended` and then `pane_closed`. `restart`
-applies `process_ended`, `session_retained` and `process_relaunched`, and keeps
-the pane, so it never reports `pane_closed`. A refusal and an `unknown` outcome
-list no effects.
+asked for. Closing a live target reports `process_ended` and `pane_closed`.
+Closing a proven lost generation removes its mailbox but leaves any surviving
+shell pane untouched; it reports only `process_ended`, indicating that the
+managed process is no longer live, not that this request terminated it.
+`restart` reports `process_ended`, `session_retained` and `process_relaunched`,
+and keeps the pane, so it never reports `pane_closed`. A refusal and an `unknown`
+outcome list no effects. Requesters must read `effects`, not infer a pane close
+from the `closed` outcome.
 
 | Outcome | Meaning |
 | ------------- | --------------------------------------------------------------------------------------- |
-| `closed` | The process ended and its pane was closed. |
+| `closed` | The managed generation was closed. `effects` says whether its pane was also closed; a lost generation's surviving shell pane is left untouched. |
 | `restarted` | The process ended and a new process continues the same Pi session, label and run id. |
 | `refused` | The owner declined and applied no effect; `category` names the reason. |
 | `unknown` | Execution had started and its outcome cannot be established; never retried. |
