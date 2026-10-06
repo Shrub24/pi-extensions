@@ -138,6 +138,36 @@ export interface ResultRecord {
 const UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 export const MAILBOX_PROTOCOL_VERSION = 5 as const;
+
+/**
+ * Pi reports the size of the context it holds, which can exceed the window
+ * just before a compaction (272,212 tokens in a 272,000 window). The result
+ * validator rejects that, and a rejected result is never delivered, so the
+ * producer bounds the figures instead of handing over a record that can only
+ * fail. Anything unusable is omitted: usage is a display fact, not a result.
+ */
+export function boundedContextUsage(
+  usage:
+    | { tokens?: number | null; contextWindow?: number; percent?: number | null }
+    | undefined,
+): ResultRecord["contextUsage"] | undefined {
+  if (!usage) return undefined;
+  const window = usage.contextWindow;
+  if (typeof window !== "number" || !Number.isFinite(window) || window <= 0)
+    return undefined;
+  const tokens =
+    typeof usage.tokens === "number" &&
+    Number.isFinite(usage.tokens) &&
+    usage.tokens >= 0
+      ? usage.tokens
+      : null;
+  const percent =
+    typeof usage.percent === "number" && Number.isFinite(usage.percent)
+      ? Math.min(100, Math.max(0, usage.percent))
+      : null;
+  return { tokens, contextWindow: window, percent };
+}
+
 export const MAILBOX_CONTROL_PREFIX = "__PI_HERDSMAN_AGENT_V5__:";
 export const LEGACY_MAILBOX_CONTROL_PREFIX = "__PI_HERDSMAN_AGENT_V4__:";
 const LEGACY_MAILBOX_PROTOCOL_VERSION = 4 as const;

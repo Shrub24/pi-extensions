@@ -69,6 +69,7 @@ import {
   type SelectItem,
 } from "@earendil-works/pi-tui";
 import {
+  boundedContextUsage,
   controlMarker,
   MAILBOX_CONTROL_PREFIX,
   LEGACY_MAILBOX_CONTROL_PREFIX,
@@ -17292,7 +17293,7 @@ export default function (pi: ExtensionAPI): void {
       ...(resultText ? { text: resultText } : {}),
       ...(resultError ? { error: resultError } : {}),
       ...(responseValidation ? { responseValidation } : {}),
-      contextUsage: ctx.getContextUsage(),
+      contextUsage: boundedContextUsage(ctx.getContextUsage()),
       completedAt: Date.now(),
     };
     pendingResult = result;

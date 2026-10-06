@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
+import { boundedContextUsage } from "./mailbox.ts";
 import { DELEGATION_BRIEF_EXAMPLES, parseDelegationBrief } from "./briefs.ts";
 import { DEFAULT_RESPONSE_CONTRACT } from "./response-contracts.ts";
 import { createAcceptedAssignmentContract } from "./response-validation.ts";
@@ -1227,4 +1228,20 @@ test("state waiter removes its abort listener after resolution", async () => {
   writeAgentState(path, state);
   await waiting;
   assert.equal(listeners.size, 0);
+});
+
+test("a context usage over the window is bounded so the result still persists", () => {
+  // Pi reports the pre-compaction size, which can exceed the window
+  // (272,212 tokens in a 272,000 window): the result must not be refused.
+  assert.deepEqual(
+    boundedContextUsage({ tokens: 272212, contextWindow: 272000, percent: 100.08, extra: 1 } as never),
+    { tokens: 272212, contextWindow: 272000, percent: 100 },
+  );
+  assert.deepEqual(
+    boundedContextUsage({ tokens: null, contextWindow: 10, percent: null }),
+    { tokens: null, contextWindow: 10, percent: null },
+  );
+  assert.equal(boundedContextUsage(undefined), undefined);
+  assert.equal(boundedContextUsage({ tokens: 1, contextWindow: 0, percent: 1 }), undefined);
+  assert.equal(boundedContextUsage({ tokens: -1, contextWindow: 10, percent: Number.NaN }) !== undefined, true);
 });
