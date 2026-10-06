@@ -197,6 +197,8 @@ import {
   matchesExpectedSession,
   startHerdrAgent,
   startHerdrAgentInPane,
+  resolveChildCommand,
+  CHILD_COMMAND_ENV,
   sameCwd,
   inspectHerdrAgent,
   stopHerdrAgentPreservingPane,
@@ -3231,6 +3233,21 @@ type ManagedWorkerLaunchPlan =
     };
 
 /**
+ * The launch-identity form of the configured child command: the executable a
+ * launch would run, or the operator's unusable setting, so a changed setting is
+ * drift even when it cannot be honoured. Absent when unconfigured, which keeps
+ * an unconfigured fingerprint equal to one recorded before this input existed.
+ */
+function childCommandIdentity(): string | undefined {
+  const command = resolveChildCommand();
+  return command.kind === "unset"
+    ? undefined
+    : command.kind === "resolved"
+      ? command.command
+      : command.value;
+}
+
+/**
  * Prepares the prompt snapshots, environment and Pi arguments of one managed
  * worker process. A fresh launch, a definition_changed relaunch and an operator
  * restart all need the same definition-derived launch configuration, so the
@@ -3258,6 +3275,11 @@ function prepareManagedWorkerLaunch(
   },
 ): ManagedWorkerLaunchPlan {
   const { pi, operation, definition } = inputs;
+  // The operator's own environment chooses the child binary. A value that names
+  // no executable refuses the launch here, before a pane or process exists.
+  const childCommand = resolveChildCommand();
+  if (childCommand.kind === "invalid")
+    fail("invalid_request", childCommand.reason, operation);
   const skillResolution = resolveDefinitionSkills({
     agent: definition.name,
     ...(definition.frontmatter.skills !== undefined
@@ -3302,6 +3324,9 @@ function prepareManagedWorkerLaunch(
       ? [`PI_CODING_AGENT_DIR=${process.env.PI_CODING_AGENT_DIR}`]
       : []),
     "PI_OFFLINE=1",
+    ...(childCommand.kind === "resolved"
+      ? [`${CHILD_COMMAND_ENV}=${childCommand.command}`]
+      : []),
   ];
   // Pi reports the providers that extensions registered; a model from one
   // of them cannot resolve in a child denied extension discovery.
@@ -3379,6 +3404,7 @@ function prepareManagedWorkerLaunch(
     const launchFingerprint = agentLaunchFingerprint(
       resolveAgentLaunchInputs(inputs.fingerprintDefinition, {
         cwd: inputs.cwd,
+        launchCommand: childCommandIdentity(),
       }),
     );
     return { ok: true, launchArgs, launchFingerprint, env, promptPaths };
@@ -3419,7 +3445,10 @@ function resolveIdleWorker(
   );
   try {
     const current = agentLaunchFingerprint(
-      resolveAgentLaunchInputs(currentDefinition, { cwd }),
+      resolveAgentLaunchInputs(currentDefinition, {
+        cwd,
+        launchCommand: childCommandIdentity(),
+      }),
     );
     if (fingerprint === undefined || fingerprint !== current)
       return { kind: "relaunch", listed: record.listed, state };

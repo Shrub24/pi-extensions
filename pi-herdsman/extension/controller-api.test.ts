@@ -4669,6 +4669,8 @@ const idleRetainedWorkerFixture = async (
   options: {
     launchedModel?: string;
     storedFingerprint?: "missing";
+    /** The child command the retained process was launched under. */
+    launchCommand?: string;
     onRequest?: (text: string, request?: RequestRecord) => void | Promise<void>;
     beforeClose?: () => void | Promise<void>;
     /** The retained generation's physical state as the inventory reports it. */
@@ -4741,7 +4743,7 @@ const idleRetainedWorkerFixture = async (
               frontmatter: { name: definition, model: launched },
               body: "retained",
             },
-            { cwd: "/tmp" },
+            { cwd: "/tmp", launchCommand: options.launchCommand },
           ),
         ),
       },
@@ -4896,6 +4898,131 @@ test("definition drift relaunches a retained worker on the same session", async 
     resetAgentMailbox(fixture.mailbox);
     realFs.rmSync(fixture.definitionPath, { force: true });
     realFs.rmSync(fixture.sourcePath, { force: true });
+  }
+});
+
+/** A real executable for `PI_HERDSMAN_CHILD_COMMAND`, outside the repository. */
+const tempChildCommand = (suffix: string): string => {
+  const path = join(
+    tmpdir(),
+    `pi-herdsman-child-command-${suffix}-${randomUUID().slice(0, 8)}`,
+  );
+  realFs.writeFileSync(path, "#!/bin/sh\n", { mode: 0o755 });
+  return path;
+};
+
+const continueRetainedWorker = (fixture: {
+  pi: ReturnType<typeof fakePi>;
+  context: any;
+  sourcePath: string;
+}) =>
+  agentTool(fixture.pi, "continue").execute(
+    "id",
+    { session: fixture.sourcePath, task: "continue under the current command" },
+    undefined,
+    undefined,
+    fixture.context,
+  );
+
+test("a changed child command relaunches a retained worker on the same session", async () => {
+  setLeadEnvironment();
+  nativeSessions.clear();
+  const name = `command-drift-${randomUUID().slice(0, 8)}`;
+  const command = tempChildCommand("drift");
+  // The recorded launch carried no command; the current environment does, so
+  // the retained process no longer matches its launch configuration.
+  process.env.PI_HERDSMAN_CHILD_COMMAND = command;
+  const fixture = await idleRetainedWorkerFixture(name);
+  try {
+    const result = await continueRetainedWorker(fixture);
+    assert.equal(result.details.ok, true, JSON.stringify(result.details));
+    assert.equal(result.details.relaunched, "definition_changed");
+    const start = fixture.pi.calls.find(
+      (args) => args[0] === "agent" && args[1] === "start",
+    )!;
+    assert.ok(start, "the changed command starts a new process");
+    assert.equal(
+      start[start.indexOf("--session") + 1],
+      realFs.realpathSync(fixture.sourcePath),
+      "the new process continues the same Pi session",
+    );
+    assert.ok(
+      fixture.pi.calls.some(
+        (args) =>
+          args[0] === "tab" &&
+          args[1] === "create" &&
+          args.includes(`PI_HERDSMAN_CHILD_COMMAND=${command}`),
+      ),
+      "the relaunched pane carries the current child command",
+    );
+    const relaunched = readAgentState(fixture.mailbox)!;
+    assert.equal(relaunched.agentLabel, fixture.label);
+    assert.equal(relaunched.piSessionId, fixture.sourceId);
+  } finally {
+    fixture.pi.events.get("session_shutdown")?.[0]();
+    nativeSessions.clear();
+    resetAgentMailbox(fixture.mailbox);
+    realFs.rmSync(fixture.definitionPath, { force: true });
+    realFs.rmSync(fixture.sourcePath, { force: true });
+    realFs.rmSync(command, { force: true });
+    delete process.env.PI_HERDSMAN_CHILD_COMMAND;
+  }
+});
+
+test("a matching child command reuses the retained worker", async () => {
+  setLeadEnvironment();
+  nativeSessions.clear();
+  const name = `command-match-${randomUUID().slice(0, 8)}`;
+  const command = tempChildCommand("match");
+  process.env.PI_HERDSMAN_CHILD_COMMAND = command;
+  const fixture = await idleRetainedWorkerFixture(name, {
+    launchCommand: command,
+  });
+  const callsBeforeAssignment = fixture.pi.calls.length;
+  try {
+    const result = await continueRetainedWorker(fixture);
+    assert.equal(result.details.ok, true, JSON.stringify(result.details));
+    assert.equal(result.details.relaunched, undefined);
+    const after = readAgentState(fixture.mailbox)!;
+    assert.equal(after.runId, fixture.state.runId);
+    assert.equal(after.piSessionId, fixture.state.piSessionId);
+    assert.equal(
+      fixture.pi.calls
+        .slice(callsBeforeAssignment)
+        .some((args) => args[0] === "agent" && args[1] === "start"),
+      false,
+      "a matching command keeps the existing process",
+    );
+  } finally {
+    fixture.pi.events.get("session_shutdown")?.[0]();
+    nativeSessions.clear();
+    resetAgentMailbox(fixture.mailbox);
+    realFs.rmSync(fixture.definitionPath, { force: true });
+    realFs.rmSync(fixture.sourcePath, { force: true });
+    realFs.rmSync(command, { force: true });
+    delete process.env.PI_HERDSMAN_CHILD_COMMAND;
+  }
+});
+
+test("clearing the child command relaunches a retained worker", async () => {
+  setLeadEnvironment();
+  nativeSessions.clear();
+  const name = `command-cleared-${randomUUID().slice(0, 8)}`;
+  const command = tempChildCommand("cleared");
+  const fixture = await idleRetainedWorkerFixture(name, {
+    launchCommand: command,
+  });
+  try {
+    const result = await continueRetainedWorker(fixture);
+    assert.equal(result.details.ok, true, JSON.stringify(result.details));
+    assert.equal(result.details.relaunched, "definition_changed");
+  } finally {
+    fixture.pi.events.get("session_shutdown")?.[0]();
+    nativeSessions.clear();
+    resetAgentMailbox(fixture.mailbox);
+    realFs.rmSync(fixture.definitionPath, { force: true });
+    realFs.rmSync(fixture.sourcePath, { force: true });
+    realFs.rmSync(command, { force: true });
   }
 });
 

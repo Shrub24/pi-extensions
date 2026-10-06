@@ -3797,6 +3797,203 @@ test("a fresh delegation stores the child session under the operator cwd", async
   }
 });
 
+/** The `--env` assignments Herdsman passed to the pane it created for a launch. */
+const paneEnvironmentAssignments = (
+  pi: ReturnType<typeof fakePi>,
+): string[] => {
+  const assignments: string[] = [];
+  for (const args of pi.calls) {
+    if (args[0] !== "tab" || args[1] !== "create") continue;
+    for (let index = 0; index < args.length - 1; index++)
+      if (args[index] === "--env") assignments.push(args[index + 1]!);
+  }
+  return assignments;
+};
+
+/** A real executable for `PI_HERDSMAN_CHILD_COMMAND`, outside the repository. */
+const tempChildCommand = (suffix: string): string => {
+  const path = join(
+    tmpdir(),
+    `pi-herdsman-child-command-${suffix}-${randomUUID().slice(0, 8)}`,
+  );
+  writeFileSync(path, "#!/bin/sh\n", { mode: 0o755 });
+  return path;
+};
+
+const childCommandAssignments = (pi: ReturnType<typeof fakePi>): string[] =>
+  paneEnvironmentAssignments(pi).filter((assignment) =>
+    assignment.startsWith("PI_HERDSMAN_CHILD_COMMAND="),
+  );
+
+test("a configured child command reaches the child pane environment exactly once", async () => {
+  setLeadEnvironment();
+  const command = tempChildCommand("configured");
+  process.env.PI_HERDSMAN_CHILD_COMMAND = command;
+  const name = `child-command-${randomUUID().slice(0, 8)}`;
+  const label = name;
+  const definitionPath = join(PI_AGENTS_DIR, `${name}.md`);
+  realFs.writeFileSync(
+    definitionPath,
+    `---\nname: ${name}\n---\ndefinition body\n`,
+    "utf8",
+  );
+  const startup = startupExecutor(label, () => DEFAULT_PI_SESSION_ID);
+  const pi = fakePi({ exec: startup.exec });
+  registerExtension!(pi.pi as never);
+  try {
+    const result = await registeredAgentTool(pi, "delegate").execute(
+      "id",
+      { definition: name, label, task: "configured child command" },
+      undefined,
+      undefined,
+      fakeContext(),
+    );
+    assert.equal(result.details.ok, true, JSON.stringify(result.details));
+    assert.deepEqual(childCommandAssignments(pi), [
+      `PI_HERDSMAN_CHILD_COMMAND=${command}`,
+    ]);
+    // The rest of the child contract is untouched by the new assignment.
+    const assignments = paneEnvironmentAssignments(pi);
+    assert.ok(assignments.includes("PI_SUBAGENT_CHILD=1"));
+    assert.equal(
+      assignments.filter((assignment) =>
+        assignment.startsWith("PI_SUBAGENT_PARENT_SESSION="),
+      ).length,
+      1,
+    );
+    assert.ok(assignments.includes("PI_OFFLINE=1"));
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(startup.mailbox);
+    realFs.rmSync(definitionPath, { force: true });
+    realFs.rmSync(command, { force: true });
+    delete process.env.PI_HERDSMAN_CHILD_COMMAND;
+  }
+});
+
+test("an unconfigured child command leaves the pane environment unchanged", async () => {
+  setLeadEnvironment();
+  const name = `child-command-unset-${randomUUID().slice(0, 8)}`;
+  const label = name;
+  const definitionPath = join(PI_AGENTS_DIR, `${name}.md`);
+  realFs.writeFileSync(
+    definitionPath,
+    `---\nname: ${name}\n---\ndefinition body\n`,
+    "utf8",
+  );
+  const startup = startupExecutor(label, () => DEFAULT_PI_SESSION_ID);
+  const pi = fakePi({ exec: startup.exec });
+  registerExtension!(pi.pi as never);
+  try {
+    const result = await registeredAgentTool(pi, "delegate").execute(
+      "id",
+      { definition: name, label, task: "no configured child command" },
+      undefined,
+      undefined,
+      fakeContext(),
+    );
+    assert.equal(result.details.ok, true, JSON.stringify(result.details));
+    assert.deepEqual(childCommandAssignments(pi), []);
+    assert.ok(paneEnvironmentAssignments(pi).includes("PI_SUBAGENT_CHILD=1"));
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(startup.mailbox);
+    realFs.rmSync(definitionPath, { force: true });
+  }
+});
+
+test("a worker's inherited child command serves its own delegation", async () => {
+  setLeadEnvironment();
+  const command = tempChildCommand("inherited");
+  process.env.PI_HERDSMAN_CHILD_COMMAND = command;
+  // The value arrived with the launch, not from a shell export; nothing in the
+  // worker refuses it or falls back to a default.
+  process.env.PI_SUBAGENT_CHILD = "1";
+  const name = `child-command-inherited-${randomUUID().slice(0, 8)}`;
+  const label = name;
+  const definitionPath = join(PI_AGENTS_DIR, `${name}.md`);
+  realFs.writeFileSync(
+    definitionPath,
+    `---\nname: ${name}\n---\ndefinition body\n`,
+    "utf8",
+  );
+  const startup = startupExecutor(label, () => DEFAULT_PI_SESSION_ID);
+  const pi = fakePi({ exec: startup.exec });
+  registerExtension!(pi.pi as never);
+  try {
+    const result = await registeredAgentTool(pi, "delegate").execute(
+      "id",
+      { definition: name, label, task: "nested delegation" },
+      undefined,
+      undefined,
+      fakeContext(),
+    );
+    assert.equal(result.details.ok, true, JSON.stringify(result.details));
+    assert.deepEqual(childCommandAssignments(pi), [
+      `PI_HERDSMAN_CHILD_COMMAND=${command}`,
+    ]);
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(startup.mailbox);
+    realFs.rmSync(definitionPath, { force: true });
+    realFs.rmSync(command, { force: true });
+    delete process.env.PI_SUBAGENT_CHILD;
+    delete process.env.PI_HERDSMAN_CHILD_COMMAND;
+  }
+});
+
+test("an invalid child command fails the launch before any pane is created", async () => {
+  setLeadEnvironment();
+  const nonExecutable = join(
+    tmpdir(),
+    `pi-herdsman-child-command-plain-${randomUUID().slice(0, 8)}`,
+  );
+  writeFileSync(nonExecutable, "", { mode: 0o644 });
+  const name = `child-command-invalid-${randomUUID().slice(0, 8)}`;
+  const label = name;
+  const definitionPath = join(PI_AGENTS_DIR, `${name}.md`);
+  realFs.writeFileSync(
+    definitionPath,
+    `---\nname: ${name}\n---\ndefinition body\n`,
+    "utf8",
+  );
+  const startup = startupExecutor(label, () => DEFAULT_PI_SESSION_ID);
+  const pi = fakePi({ exec: startup.exec });
+  registerExtension!(pi.pi as never);
+  try {
+    for (const value of ["relative/child-command", nonExecutable]) {
+      process.env.PI_HERDSMAN_CHILD_COMMAND = value;
+      const result = await registeredAgentTool(pi, "delegate").execute(
+        "id",
+        { definition: name, label, task: "refused child command" },
+        undefined,
+        undefined,
+        fakeContext(),
+      );
+      assert.equal(result.details.ok, false, value);
+      assert.equal(result.details.error.category, "invalid_request", value);
+      assert.match(result.details.error.message, /PI_HERDSMAN_CHILD_COMMAND/);
+    }
+    assert.equal(
+      pi.calls.some(
+        (args) =>
+          (args[0] === "tab" && args[1] === "create") ||
+          (args[0] === "pane" && args[1] === "split") ||
+          (args[0] === "agent" && args[1] === "start"),
+      ),
+      false,
+      "no pane or process is created for a refused command",
+    );
+    assert.equal(startup.getCount(), 0);
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(startup.mailbox);
+    realFs.rmSync(definitionPath, { force: true });
+    realFs.rmSync(nonExecutable, { force: true });
+    delete process.env.PI_HERDSMAN_CHILD_COMMAND;
+  }
+});
+
 test("a nested worker keeps the same child directory as its owner", async () => {
   const parentLabel = `nested-owner-${randomUUID().slice(0, 8)}`;
   const parent = managedState(parentLabel);

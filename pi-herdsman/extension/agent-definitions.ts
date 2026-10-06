@@ -959,6 +959,12 @@ export type AgentLaunchInputs = {
   extensions: string[];
   inheritProjectContext: boolean;
   inheritGlobalContext: boolean;
+  /**
+   * The operator-selected child executable this launch runs, when one is
+   * configured. Absent for an unconfigured launch, so a fingerprint recorded
+   * before this input existed still matches an unconfigured current launch.
+   */
+  launchCommand?: string;
 };
 
 type ManagedToolSelection = Pick<
@@ -1030,11 +1036,14 @@ function bodyFileDigests(body: string, cwd: string): string[] {
  * Values the caller contributes instead of the definition — an inherited model
  * or thinking level — are deliberately absent: they are not part of the
  * definition's configuration, and folding them in would make the same worker
- * fingerprint differently depending on how its process was started.
+ * fingerprint differently depending on how its process was started. The
+ * operator's `launchCommand` is the deliberate exception: it selects the binary
+ * the launch runs, so it is launch configuration and an idle worker recorded
+ * under a different command must relaunch (ADR 0013).
  */
 export function resolveAgentLaunchInputs(
   agent: AgentDefinition,
-  options: { cwd?: string } = {},
+  options: { cwd?: string; launchCommand?: string } = {},
 ): AgentLaunchInputs {
   const { frontmatter } = agent;
   const cwd = options.cwd ?? process.cwd();
@@ -1064,6 +1073,7 @@ export function resolveAgentLaunchInputs(
     extensions: [...(frontmatter.extensions ?? [])],
     inheritProjectContext,
     inheritGlobalContext,
+    ...(options.launchCommand ? { launchCommand: options.launchCommand } : {}),
   };
 }
 

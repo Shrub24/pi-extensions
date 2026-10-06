@@ -92,7 +92,7 @@ Continuation reports one of four outcomes:
 | Outcome     | Result evidence                      | Behavior                                                                                                                                                                                                                                                                     |
 | ----------- | ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | reused      | `reused: true`                       | With `retainWorkers` enabled, the session's single representation is a directly owned `idle` worker whose recorded launch configuration still matches the current definition: the task is submitted into that existing verified live process, so no new process, pane, or label appears. |
-| relaunched  | `relaunched: "definition_changed"`    | The idle worker's launch configuration drifted (prompt body including `@file` contents, `systemPromptMode`, model, thinking, or the effective tools, skills, extensions, and context inheritance) or its launch record is missing. The worker is closed and a fresh generation continues the same session. |
+| relaunched  | `relaunched: "definition_changed"`    | The idle worker's launch configuration drifted (prompt body including `@file` contents, `systemPromptMode`, model, thinking, the effective tools, skills, extensions, and context inheritance, or the selected child executable) or its launch record is missing. The worker is closed and a fresh generation continues the same session. |
 | recovered   | `relaunched: "process_lost"`         | The session's directly owned worker is a proven `lost` generation: its process is gone, and its pane is either gone too or survives as a shell. A `lost` record is retired through the shared close preflight and a new generation continues the same Pi session in a new process and pane. Nothing is closed or removed by hand first, and a surviving pane is left untouched. Unprovable identity still refuses `agent_busy`, and an unretrieved durable result still refuses rather than being overwritten. |
 | fresh       | neither field                        | The work starts as a new agent generation because no verified live process represents the session.                                                                                                                                                                    |
 
@@ -115,6 +115,33 @@ evidence where available. All return after atomic
 recording for controller restart recovery, not completion. A terminal result
 makes the exact session identity
 prominent for a later `agent_continue` call.
+
+## Child executable
+
+Managed children run the binary selected by `PI_HERDSMAN_CHILD_COMMAND` in the
+lead's own process environment. Herdsman reads it when it builds a launch, so it
+is not a configuration-file setting and has no `/agents` menu entry.
+
+| Value              | Effect                                                                                                                                                                        |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| unset or empty     | No command is configured; the launch is unchanged.                                                                                                                            |
+| an absolute path   | That file is used; it must exist and be executable.                                                                                                                           |
+| a command name     | The name is resolved on the launch `PATH`, and the resolved executable is used.                                                                                                |
+| anything else      | The launch fails before any pane or process is created, with an `invalid_request` naming `PI_HERDSMAN_CHILD_COMMAND`. No default executable is substituted for a mistyped value. |
+
+The selected executable is part of the recorded launch configuration, so a
+retained `idle` worker whose recorded command differs from the current one —
+including set where it was unset, or cleared where it was set — is relaunched
+instead of reused. The value is read once per launch and is therefore fixed for
+a running lead: changing it takes effect on launches after the lead restarts.
+
+One value covers the whole herd. The child environment receives the resolved
+value with its launch, so a worker that delegates a further worker reuses the
+value it inherited and nested workers run the same binary without a shell
+exporting anything. The export itself belongs to the lead process's environment
+(the operator's shell or dotfiles); this repository documents the contract and
+does not manage those files. To roll back, unset the variable and restart the
+lead.
 
 ## Separate response contracts
 

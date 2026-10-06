@@ -28,7 +28,8 @@ launch the controller appends `pi-herdsman-worker-launch {runId, label,
 fingerprint}` to its own session, where the fingerprint hashes the resolved
 definition inputs that shape the process: the expanded body including `@file`
 contents, `systemPromptMode`, model, thinking, the effective tools and exclusion
-lists, skills, extensions, and context inheritance. A matching fingerprint
+lists, skills, extensions, context inheritance, and the child executable the
+launch runs when `PI_HERDSMAN_CHILD_COMMAND` selects one. A matching fingerprint
 reuses the idle worker. A mismatch, or a missing launch entry, closes the worker
 through the existing `closeManagedAgent` path and continues the same session in
 a fresh process, reporting `relaunched: "definition_changed"`.

@@ -1464,6 +1464,50 @@ test("a preloaded skill changes the launch fingerprint", () => {
   );
 });
 
+test("the configured child command changes the launch fingerprint", () => {
+  const base = {
+    name: "worker",
+    path: "/agents/worker.md",
+    frontmatter: { name: "worker" },
+    body: "Prompt",
+  };
+  const unconfigured = agentLaunchFingerprint(
+    resolveAgentLaunchInputs(base, { cwd: "/tmp" }),
+  );
+  assert.equal(
+    unconfigured,
+    agentLaunchFingerprint(resolveAgentLaunchInputs(base, { cwd: "/tmp" })),
+    "an unconfigured command leaves the fingerprint where it was",
+  );
+  const first = agentLaunchFingerprint(
+    resolveAgentLaunchInputs(base, {
+      cwd: "/tmp",
+      launchCommand: "/nix/store/a/bin/pi-bolt-child",
+    }),
+  );
+  assert.notEqual(first, unconfigured, "a configured command is launch identity");
+  assert.equal(
+    first,
+    agentLaunchFingerprint(
+      resolveAgentLaunchInputs(base, {
+        cwd: "/tmp",
+        launchCommand: "/nix/store/a/bin/pi-bolt-child",
+      }),
+    ),
+    "the same command keeps the same fingerprint",
+  );
+  assert.notEqual(
+    first,
+    agentLaunchFingerprint(
+      resolveAgentLaunchInputs(base, {
+        cwd: "/tmp",
+        launchCommand: "/nix/store/b/bin/pi-bolt-child",
+      }),
+    ),
+    "another command is a different launch configuration",
+  );
+});
+
 test("drops --no-extensions when the child's model comes from an extension", () => {
   const definition = {
     name: "scout",

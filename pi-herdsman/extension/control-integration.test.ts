@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { beforeEach, test } from "node:test";
 import {
   AGENT_ID,
@@ -500,6 +501,50 @@ test("a control restart relaunches an idle retained worker and refuses a busy on
     assert.deepEqual(busy.wakeMessages(), []);
   } finally {
     busy.shutdown();
+  }
+});
+
+test("a control restart reuses its pane and applies no changed child command", async (t) => {
+  const worker = controlWorkerFixture("restart-command");
+  try {
+    await worker.open();
+    const command = join(
+      tmpdir(),
+      `pi-herdsman-child-command-restart-${randomUUID().slice(0, 8)}`,
+    );
+    realFs.writeFileSync(command, "#!/bin/sh\n", { mode: 0o755 });
+    process.env.PI_HERDSMAN_CHILD_COMMAND = command;
+    try {
+      const callsBeforeRestart = worker.pi.calls.length;
+      const request = controlRequest("restart", worker.label, AGENT_ID, {
+        paneId: "startup-pane",
+        piSessionId: worker.session.id,
+      });
+      assert.equal(writeControlRequest(request, LEAD_SESSION_ID).ok, true);
+      const result = await answered(t, request.requestId);
+      assert.equal(result.outcome, "restarted", JSON.stringify(result));
+      const started = worker.starts.at(-1)!;
+      assert.ok(started, "the worker was relaunched");
+      assert.equal(
+        started.some((arg) =>
+          arg.startsWith("PI_HERDSMAN_CHILD_COMMAND="),
+        ),
+        false,
+        "stage 1 applies a changed command only where the launch creates the pane",
+      );
+      assert.deepEqual(
+        worker.pi.calls
+          .slice(callsBeforeRestart)
+          .filter((args) => args[0] === "tab" && args[1] === "create"),
+        [],
+        "a restart reuses the pane the command was not applied to",
+      );
+    } finally {
+      delete process.env.PI_HERDSMAN_CHILD_COMMAND;
+      realFs.rmSync(command, { force: true });
+    }
+  } finally {
+    worker.shutdown();
   }
 });
 
