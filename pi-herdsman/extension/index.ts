@@ -5,6 +5,13 @@ import {
   OWNER_METADATA_TTL_MS,
 } from "./pane-metadata.ts";
 import { createAwaitedFacts } from "./awaited-facts.ts";
+import {
+  SESSION_METADATA_ENTRY,
+  readSessionMetadata,
+  updateSessionMetadata,
+  type OperatorRole,
+  type SessionMetadata,
+} from "./session-metadata.ts";
 import type {
   BuildSystemPromptOptions,
   ContextEvent,
@@ -1085,6 +1092,81 @@ function appendDurableError(
   } catch {
     ctx.ui.notify(type, "error");
   }
+}
+const SESSION_METADATA_DIAGNOSTIC_ENTRY =
+  "pi_herdsman_session_metadata_error";
+/**
+ * Records this session's classification and role. Unreadable current metadata
+ * is reported and left unresolved rather than guessed, and never fails the
+ * live session: classification is discovery information, not admission.
+ */
+function persistSessionMetadata(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  metadata: SessionMetadata,
+): void {
+  try {
+    const update = updateSessionMetadata(
+      ctx.sessionManager.getEntries(),
+      metadata,
+      (data) => pi.appendEntry(SESSION_METADATA_ENTRY, data),
+    );
+    if (update.status === "unavailable")
+      appendDurableError(
+        pi,
+        ctx,
+        SESSION_METADATA_DIAGNOSTIC_ENTRY,
+        new Error(update.reason),
+      );
+  } catch (error) {
+    appendDurableError(pi, ctx, SESSION_METADATA_DIAGNOSTIC_ENTRY, error);
+  }
+}
+function recordOperatorSessionMetadata(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  role: OperatorRole,
+): void {
+  const sessionId = ctx.sessionManager.getSessionId();
+  try {
+    // A legacy worker identity with no managed metadata has no known owner, and
+    // opening its file as an operator does not make it one.
+    if (
+      readSessionMetadata(ctx.sessionManager.getEntries(), sessionId).status ===
+        "absent" &&
+      sessionAgentIdentity(ctx.sessionManager.getEntries(), sessionId)
+    )
+      return;
+  } catch (error) {
+    appendDurableError(pi, ctx, SESSION_METADATA_DIAGNOSTIC_ENTRY, error);
+    return;
+  }
+  persistSessionMetadata(pi, ctx, {
+    version: 1,
+    sessionId,
+    kind: "operator",
+    role,
+  });
+}
+function recordManagedSessionMetadata(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+): void {
+  const definition = process.env.PI_HERDSMAN_AGENT_DEFINITION;
+  const label = process.env.PI_HERDSMAN_LABEL;
+  const parentSessionId = process.env.PI_HERDSMAN_OWNER_SESSION_ID;
+  if (!definition || !label || !parentSessionId) return;
+  // The direct owner is the launching controller, so a legitimate continuation
+  // under a new owner appends rather than rewriting history.
+  persistSessionMetadata(pi, ctx, {
+    version: 1,
+    sessionId: ctx.sessionManager.getSessionId(),
+    kind: "managed",
+    role: definition,
+    parentSessionId,
+    definition,
+    label,
+  });
 }
 function settingRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -3281,6 +3363,17 @@ function prepareManagedWorkerLaunch(
       modelDecision: childModel,
       resolvedSkills: skillResolution.advertised,
     });
+    // A fresh managed session is stored in its target cwd's child directory, so
+    // operator JSONL files stay pickable without one subdirectory per worker.
+    // Storage follows the target cwd rather than delegation depth or the parent
+    // session path, so a managed parent adds no `children/children` level. A
+    // resumed session instead keeps its exact saved `--session` path and is
+    // never rehomed.
+    if (!inputs.resumed)
+      launchArgs.push(
+        "--session-dir",
+        resolve(inputs.cwd, ".pi", "sessions", "children"),
+      );
     // A retained process keeps the launch configuration it started with, so
     // reuse compares this fingerprint with the then-current definition.
     const launchFingerprint = agentLaunchFingerprint(
@@ -8851,6 +8944,7 @@ export default function (pi: ExtensionAPI): void {
   const persistRole = (role: SessionRole): void => {
     if (!leadTools) throw new Error("Lead tool baseline is unavailable");
     pi.appendEntry("pi-herdsman-role", { role, leadTools: [...leadTools] });
+    if (leadContext) recordOperatorSessionMetadata(pi, leadContext, role);
   };
   const persistCoordinatorState = (): boolean => {
     try {
@@ -15672,6 +15766,12 @@ export default function (pi: ExtensionAPI): void {
           leadCoordinationHealthy
         )
           await schedulePeerPresence(ctx);
+        if (!malformedRole)
+          recordOperatorSessionMetadata(
+            pi,
+            ctx,
+            roleSuspended ? persistedRole : activeRole(),
+          );
       }
       controllerAbortController?.abort();
       chiefInboxAbortController?.abort();
@@ -16880,6 +16980,7 @@ export default function (pi: ExtensionAPI): void {
         process.env.PI_HERDSMAN_AGENT_DEFINITION!,
         process.env.PI_HERDSMAN_LABEL!,
       );
+      recordManagedSessionMetadata(pi, ctx);
       const existing = readAgentState(process.env.PI_HERDSMAN_MAILBOX!);
       if (existing && !sameManagedAgentIdentity(existing, candidate)) {
         throw new Error("agent session identity changed while state existed");

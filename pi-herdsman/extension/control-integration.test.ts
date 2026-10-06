@@ -472,6 +472,11 @@ test("a control restart relaunches an idle retained worker and refuses a busy on
       worker.sessionPath,
       "the relaunch continues the same Pi session",
     );
+    assert.equal(
+      started.includes("--session-dir"),
+      false,
+      "a restart keeps the saved session file where it is",
+    );
   } finally {
     worker.shutdown();
   }

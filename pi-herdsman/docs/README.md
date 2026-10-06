@@ -49,6 +49,7 @@ references for exact contracts:
 - [Peer tools](reference/peer.md)
 - [Agent states](reference/agent-states.md)
 - [Pane metadata and hierarchy](reference/pane-metadata.md)
+- [Session organization and metadata](reference/session-organization.md)
 - [Herdsman control](reference/herdsman-control.md)
 - [Errors](reference/errors.md)
 

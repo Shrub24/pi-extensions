@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { beforeEach, mock, test } from "node:test";
 import { Value } from "typebox/value";
@@ -901,7 +901,13 @@ test("parent delegation lock makes concurrent close and delegate fail fast", asy
   try {
     for (const handler of parentPi.events.get("session_start") ?? [])
       await handler(undefined, parentContext);
-    assert.equal(parentPi.entries.length, 0, JSON.stringify(parentPi.entries));
+    // Startup records classification only: the existing identity entry is reused
+    // and no state error is reported.
+    assert.deepEqual(
+      parentPi.entries.map((entry: any) => entry.customType),
+      ["pi-herdsman-session-metadata"],
+      JSON.stringify(parentPi.entries),
+    );
 
     const closePromise = registeredAgentTool(leadPi, "close").execute(
       "close",
@@ -3736,6 +3742,133 @@ test("fresh assignment transports automatic prompt snapshots and cleans them up"
   }
 });
 
+test("a fresh delegation stores the child session under the operator cwd", async () => {
+  setLeadEnvironment();
+  const name = `child-dir-${randomUUID().slice(0, 8)}`;
+  const label = name;
+  const definitionPath = join(PI_AGENTS_DIR, `${name}.md`);
+  realFs.writeFileSync(
+    definitionPath,
+    `---\nname: ${name}\n---\ndefinition body\n`,
+    "utf8",
+  );
+  const targetCwd = join(tmpdir(), `pi-herdsman-target-${randomUUID().slice(0, 8)}`);
+  const launched: string[][] = [];
+  const startup = startupExecutor(
+    label,
+    () => DEFAULT_PI_SESSION_ID,
+    undefined,
+    undefined,
+    false,
+    (args) => launched.push([...args]),
+    targetCwd,
+  );
+  const pi = fakePi({ exec: startup.exec });
+  registerExtension!(pi.pi as never);
+  try {
+    const context = fakeContext();
+    (context as any).cwd = targetCwd;
+    const result = await registeredAgentTool(pi, "delegate").execute(
+      "id",
+      { definition: name, label, task: "fresh task" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(result.details.ok, true, JSON.stringify(result.details));
+    assert.equal(launched.length, 1);
+    assert.deepEqual(
+      launched[0]!.slice(launched[0]!.indexOf("--session-dir"), launched[0]!.indexOf("--session-dir") + 2),
+      ["--session-dir", resolve(targetCwd, ".pi", "sessions", "children")],
+    );
+    assert.equal(
+      launched[0]!.filter((arg) => arg === "--session-dir").length,
+      1,
+    );
+    assert.equal(
+      launched[0]!.includes("--session"),
+      false,
+      "a fresh launch has no saved session to continue",
+    );
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(startup.mailbox);
+    realFs.rmSync(definitionPath, { force: true });
+  }
+});
+
+test("a nested worker keeps the same child directory as its owner", async () => {
+  const parentLabel = `nested-owner-${randomUUID().slice(0, 8)}`;
+  const parent = managedState(parentLabel);
+  const parentMailbox = setAgentEnvironment(parentLabel, ["child"]);
+  const parentSessionPath = join(
+    "/tmp",
+    ".pi",
+    "sessions",
+    "children",
+    `${parentLabel}.jsonl`,
+  );
+  const nested = { ...parent, piSessionFile: parentSessionPath };
+  writeAgentState(parentMailbox, nested);
+  const lifecycle = delegatedLifecycleExecutor(nested);
+  const starts: string[][] = [];
+  const pi = fakePi({
+    exec: (command, args) => {
+      if (command === "herdr" && args[0] === "agent" && args[1] === "start")
+        starts.push([...args]);
+      return lifecycle.exec(command, args);
+    },
+  });
+  registerExtension!(pi.pi as never);
+  const context = fakeAgentContext([
+    {
+      type: "custom",
+      customType: "pi-herdsman-agent-definition",
+      data: {
+        sessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        definition: "agent",
+        label: parentLabel,
+      },
+    },
+  ]);
+  (context as any).sessionManager = {
+    ...(context as any).sessionManager,
+    getSessionFile: () => parentSessionPath,
+  };
+  try {
+    for (const handler of pi.events.get("session_start") ?? [])
+      await handler(undefined, context);
+    const started = await registeredAgentTool(pi, "delegate").execute(
+      "start",
+      { definition: "child", task: "nested task" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(started.details.ok, true, JSON.stringify(started.details));
+    assert.equal(starts.length, 1);
+    assert.deepEqual(
+      starts[0]!.slice(
+        starts[0]!.indexOf("--session-dir"),
+        starts[0]!.indexOf("--session-dir") + 2,
+      ),
+      ["--session-dir", "/tmp/.pi/sessions/children"],
+      "the owner's own session directory does not add another children level",
+    );
+    const childMailbox = agentMailboxPath(
+      WORKSPACE,
+      started.details.agent as string,
+    );
+    assert.equal(
+      readAgentState(childMailbox)!.ownerSessionId,
+      context.sessionManager.getSessionId(),
+    );
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(parentMailbox);
+  }
+});
+
 test("fresh assignment transports preloaded skill bodies and cleans them up", async () => {
   setLeadEnvironment();
   const name = `preload-${randomUUID().slice(0, 8)}`;
@@ -4186,6 +4319,11 @@ test("session continuation starts a new agent generation with current prompt con
       launched[0].args[sessionIndex + 1],
       realFs.realpathSync(session.path),
     );
+    assert.equal(
+      launched[0].args.includes("--session-dir"),
+      false,
+      "a saved session is resumed by exact path and never rehomed",
+    );
     for (const path of promptLaunchPaths(launched[0].args))
       assert.equal(realFs.existsSync(path), false, `prompt leaked: ${path}`);
   } finally {
@@ -4196,6 +4334,149 @@ test("session continuation starts a new agent generation with current prompt con
     realFs.rmSync(definitionPath, { force: true });
     realFs.rmSync(promptPath, { force: true });
     realFs.rmSync(session.path, { force: true });
+  }
+});
+
+test("a local child session is continued by its exact path without rehoming", async () => {
+  setLeadEnvironment();
+  const name = `local-resume-${randomUUID().slice(0, 8)}`;
+  const label = name;
+  const definitionPath = join(PI_AGENTS_DIR, `${name}.md`);
+  const localDir = join(PI_AGENT_ROOT, ".pi", "sessions", "children");
+  const sessionPath = join(localDir, `${name}-session.jsonl`);
+  realFs.mkdirSync(localDir, { recursive: true });
+  realFs.writeFileSync(
+    definitionPath,
+    `---\nname: ${name}\n---\ndefined local child\n`,
+    "utf8",
+  );
+  realFs.writeFileSync(sessionPath, "{}", "utf8");
+  const session = {
+    id: DEFAULT_PI_SESSION_ID,
+    path: sessionPath,
+    cwd: "/tmp",
+    entries: [
+      {
+        type: "custom",
+        customType: "pi-herdsman-agent-definition",
+        data: { sessionId: DEFAULT_PI_SESSION_ID, definition: name, label },
+      },
+    ],
+  };
+  nativeSessions.set(session.id, session);
+  const launched: { args: string[]; contents: string[] }[] = [];
+  const startup = startupExecutor(
+    label,
+    () => session.id,
+    undefined,
+    undefined,
+    false,
+    (args) => {
+      launched.push({ args: [...args], contents: promptLaunchContents(args) });
+    },
+  );
+  const pi = fakePi({ exec: startup.exec });
+  registerExtension!(pi.pi as never);
+  try {
+    const result = await registeredAgentTool(pi, "continue").execute(
+      "id",
+      { session: sessionPath, task: "resume the local child" },
+      undefined,
+      undefined,
+      ownedSessionContext(session.id, label),
+    );
+    assert.equal(result.details.ok, true, JSON.stringify(result.details));
+    assert.equal(launched.length, 1);
+    const expected = realFs.realpathSync(sessionPath);
+    assert.match(expected, /\.pi[/\\]sessions[/\\]children[/\\]/);
+    assert.equal(
+      launched[0]!.args[launched[0]!.args.indexOf("--session") + 1],
+      expected,
+      "the saved local file is resumed where it is",
+    );
+    assert.equal(
+      launched[0]!.args.includes("--session-dir"),
+      false,
+      "the new-layout directory never rewrites a saved path",
+    );
+    assert.equal(result.details.session_id, session.id);
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    nativeSessions.delete(session.id);
+    resetAgentMailbox(startup.mailbox);
+    realFs.rmSync(definitionPath, { force: true });
+    realFs.rmSync(sessionPath, { force: true });
+  }
+});
+
+test("fabricated session metadata cannot authorize continuation", async () => {
+  setLeadEnvironment();
+  const name = `fabricated-owner-${randomUUID().slice(0, 8)}`;
+  const definitionPath = join(PI_AGENTS_DIR, `${name}.md`);
+  const localDir = join(PI_AGENT_ROOT, ".pi", "sessions", "children");
+  const sessionPath = join(localDir, `${name}-session.jsonl`);
+  realFs.mkdirSync(localDir, { recursive: true });
+  realFs.writeFileSync(
+    definitionPath,
+    `---\nname: ${name}\n---\nunowned session\n`,
+    "utf8",
+  );
+  realFs.writeFileSync(sessionPath, "{}", "utf8");
+  nativeSessions.set(DEFAULT_PI_SESSION_ID, {
+    id: DEFAULT_PI_SESSION_ID,
+    path: sessionPath,
+    cwd: "/tmp",
+    entries: [
+      {
+        type: "custom",
+        customType: "pi-herdsman-agent-definition",
+        data: { sessionId: DEFAULT_PI_SESSION_ID, definition: name, label: name },
+      },
+      // The file advertises the caller as its direct owner, but ownership is
+      // decided by result provenance, never by this record.
+      {
+        type: "custom",
+        customType: "pi-herdsman-session-metadata",
+        data: {
+          version: 1,
+          sessionId: DEFAULT_PI_SESSION_ID,
+          kind: "managed",
+          role: name,
+          parentSessionId: LEAD_SESSION_ID,
+          definition: name,
+          label: name,
+        },
+      },
+    ],
+  });
+  const startup = startupExecutor(name, () => DEFAULT_PI_SESSION_ID);
+  const pi = fakePi({ exec: startup.exec });
+  registerExtension!(pi.pi as never);
+  try {
+    const result = await registeredAgentTool(pi, "continue").execute(
+      "id",
+      { session: sessionPath, task: "claim an unowned session" },
+      undefined,
+      undefined,
+      fakeContext(),
+    );
+    assert.equal(result.details.ok, false);
+    assert.equal(result.details.error.category, "invalid_request");
+    assert.match(
+      result.details.error.message,
+      /proven session ownership tree/,
+    );
+    assert.equal(
+      pi.calls.some((args) => args[0] === "agent" && args[1] === "start"),
+      false,
+      "no generation is launched for an unowned session",
+    );
+    assert.equal(startup.getCount(), 0);
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    nativeSessions.delete(DEFAULT_PI_SESSION_ID);
+    realFs.rmSync(definitionPath, { force: true });
+    realFs.rmSync(sessionPath, { force: true });
   }
 });
 

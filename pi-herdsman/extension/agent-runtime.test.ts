@@ -5297,7 +5297,7 @@ test("overflow retires without cancellation and inactive sessions stay untouched
   }
 });
 
-test("agent persists one identity entry before mailbox initialization", async () => {
+test("agent persists one identity entry and its classification before mailbox initialization", async () => {
   const mailbox = setAgentEnvironment();
   const agent = fakePi();
   registerExtension!(agent.pi as never);
@@ -5311,6 +5311,19 @@ test("agent persists one identity entry before mailbox initialization", async ()
       customType: "pi-herdsman-agent-definition",
       data: {
         sessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        definition: "agent",
+        label: "registered-agent",
+      },
+    },
+    {
+      type: "custom",
+      customType: "pi-herdsman-session-metadata",
+      data: {
+        version: 1,
+        sessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        kind: "managed",
+        role: "agent",
+        parentSessionId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         definition: "agent",
         label: "registered-agent",
       },
@@ -5377,6 +5390,21 @@ test("a forked session establishes identity for its own Pi session", async () =>
         customType: "pi-herdsman-agent-definition",
         data: {
           sessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+          definition: "agent",
+          label: "forked-agent",
+        },
+      },
+      // Copied source records name another session, so they classify nothing
+      // and the fork records its own managed metadata.
+      {
+        type: "custom",
+        customType: "pi-herdsman-session-metadata",
+        data: {
+          version: 1,
+          sessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+          kind: "managed",
+          role: "agent",
+          parentSessionId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
           definition: "agent",
           label: "forked-agent",
         },

@@ -3363,3 +3363,279 @@ test("registered delegate embeds text and references binary evidence", async () 
     realFs.rmSync(binaryPath, { force: true });
   }
 });
+
+const sessionMetadataRecords = (entries: unknown[]) =>
+  (entries as any[]).filter(
+    (entry) => entry.customType === "pi-herdsman-session-metadata",
+  );
+
+test("operator startup records classification once and appends only on a role change", async () => {
+  setLeadEnvironment();
+  const entries: unknown[] = [];
+  const pi = fakePi({
+    entries,
+    activeTools: REGISTERED_ROLE_TOOLS.map(({ name }) => name),
+    allTools: REGISTERED_ROLE_TOOLS,
+  });
+  registerExtension!(pi.pi as never);
+  const sessionStart = pi.events.get("session_start")![0];
+  const sessionShutdown = pi.events.get("session_shutdown")![0];
+  try {
+    await sessionStart(undefined, fakeContext(entries) as any);
+    assert.deepEqual(
+      sessionMetadataRecords(entries).map((entry) => entry.data),
+      [
+        {
+          version: 1,
+          sessionId: LEAD_SESSION_ID,
+          kind: "operator",
+          role: "lead",
+        },
+      ],
+    );
+    await sessionStart(undefined, fakeContext(entries) as any);
+    assert.equal(
+      sessionMetadataRecords(entries).length,
+      1,
+      "an unchanged restart appends no record",
+    );
+  } finally {
+    await sessionShutdown();
+  }
+});
+
+test("a restored non-Lead role keeps operator classification", async () => {
+  setLeadEnvironment();
+  process.env.HERDR_PANE_ID = "metadata-chief-pane";
+  process.env.HERDR_TAB_ID = "metadata-chief-tab";
+  process.env.HERDR_SOCKET_PATH = join(
+    tmpdir(),
+    `metadata-chief-${randomUUID()}.sock`,
+  );
+  const entries: unknown[] = [
+    {
+      type: "custom",
+      customType: "pi-herdsman-role",
+      data: {
+        role: "chief",
+        leadTools: REGISTERED_ROLE_TOOLS.map(({ name }) => name),
+      },
+    },
+  ];
+  const pi = fakePi({
+    entries,
+    activeTools: REGISTERED_ROLE_TOOLS.map(({ name }) => name),
+    allTools: REGISTERED_ROLE_TOOLS,
+  });
+  registerExtension!(pi.pi as never);
+  try {
+    await pi.events.get("session_start")![0](
+      undefined,
+      fakeContext(entries) as any,
+    );
+    assert.deepEqual(
+      sessionMetadataRecords(entries).map((entry) => entry.data),
+      [
+        {
+          version: 1,
+          sessionId: LEAD_SESSION_ID,
+          kind: "operator",
+          role: "chief",
+        },
+      ],
+    );
+  } finally {
+    await pi.events.get("session_shutdown")![0]();
+    delete process.env.HERDR_PANE_ID;
+    delete process.env.HERDR_TAB_ID;
+    delete process.env.HERDR_SOCKET_PATH;
+    setLeadEnvironment();
+  }
+});
+
+test("a managed file opened as an operator keeps its managed origin", async () => {
+  setLeadEnvironment();
+  const owner = randomUUID();
+  const entries: unknown[] = [
+    {
+      type: "custom",
+      customType: "pi-herdsman-session-metadata",
+      data: {
+        version: 1,
+        sessionId: LEAD_SESSION_ID,
+        kind: "managed",
+        role: "worker",
+        parentSessionId: owner,
+        definition: "worker",
+        label: "impl",
+      },
+    },
+  ];
+  const pi = fakePi({
+    entries,
+    activeTools: REGISTERED_ROLE_TOOLS.map(({ name }) => name),
+    allTools: REGISTERED_ROLE_TOOLS,
+  });
+  registerExtension!(pi.pi as never);
+  try {
+    await pi.events.get("session_start")![0](
+      undefined,
+      fakeContext(entries) as any,
+    );
+    assert.deepEqual(
+      sessionMetadataRecords(entries).map((entry) => entry.data),
+      [
+        {
+          version: 1,
+          sessionId: LEAD_SESSION_ID,
+          kind: "managed",
+          role: "worker",
+          parentSessionId: owner,
+          definition: "worker",
+          label: "impl",
+        },
+      ],
+      "opening the file must not rewrite it as an operator session",
+    );
+  } finally {
+    await pi.events.get("session_shutdown")![0]();
+    setLeadEnvironment();
+  }
+});
+
+test("a legacy worker identity without a verified owner stays unclassified", async () => {
+  setLeadEnvironment();
+  const entries: unknown[] = [
+    {
+      type: "custom",
+      customType: "pi-herdsman-agent-definition",
+      data: { sessionId: LEAD_SESSION_ID, definition: "worker", label: "impl" },
+    },
+  ];
+  const pi = fakePi({
+    entries,
+    activeTools: REGISTERED_ROLE_TOOLS.map(({ name }) => name),
+    allTools: REGISTERED_ROLE_TOOLS,
+  });
+  registerExtension!(pi.pi as never);
+  try {
+    await pi.events.get("session_start")![0](
+      undefined,
+      fakeContext(entries) as any,
+    );
+    assert.deepEqual(
+      sessionMetadataRecords(entries),
+      [],
+      "unknown parentage is not invented and operator classification is not claimed",
+    );
+    assert.deepEqual(entries[0], {
+      type: "custom",
+      customType: "pi-herdsman-agent-definition",
+      data: { sessionId: LEAD_SESSION_ID, definition: "worker", label: "impl" },
+    });
+  } finally {
+    await pi.events.get("session_shutdown")![0]();
+    setLeadEnvironment();
+  }
+});
+
+test("unreadable current metadata is diagnosed without classifying or breaking the session", async () => {
+  setLeadEnvironment();
+  const entries: unknown[] = [
+    {
+      type: "custom",
+      customType: "pi-herdsman-session-metadata",
+      data: { version: 9, sessionId: LEAD_SESSION_ID },
+    },
+  ];
+  const pi = fakePi({
+    entries,
+    activeTools: REGISTERED_ROLE_TOOLS.map(({ name }) => name),
+    allTools: REGISTERED_ROLE_TOOLS,
+  });
+  registerExtension!(pi.pi as never);
+  const seeded = structuredClone(entries);
+  try {
+    await pi.events.get("session_start")![0](
+      undefined,
+      fakeContext(entries) as any,
+    );
+    const diagnoses = (entries as any[]).filter(
+      (entry) => entry.customType === "pi_herdsman_session_metadata_error",
+    );
+    assert.equal(diagnoses.length, 1, JSON.stringify(entries));
+    assert.match(diagnoses[0].data.error, /pi-herdsman-session-metadata/);
+    assert.deepEqual(
+      sessionMetadataRecords(entries),
+      seeded,
+      "nothing is written over an unreadable record",
+    );
+    assert.ok(
+      pi.tools.some((tool) => tool.name === "agent_delegate"),
+      "the live session stays usable",
+    );
+  } finally {
+    await pi.events.get("session_shutdown")![0]();
+    setLeadEnvironment();
+  }
+});
+
+test("managed startup records its direct owner and follows an owner change", async () => {
+  const label = "metadata-owner-agent";
+  const mailbox = setAgentEnvironment(label);
+  const sessionId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+  const firstOwner = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const entries: unknown[] = [];
+  const pi = fakePi({ entries });
+  registerExtension!(pi.pi as never);
+  const context = fakeAgentContext(entries) as any;
+  const sessionStart = pi.events.get("session_start")![0];
+  const sessionShutdown = pi.events.get("session_shutdown")![0];
+  const expected = (parentSessionId: string) => ({
+    version: 1,
+    sessionId,
+    kind: "managed",
+    role: "agent",
+    parentSessionId,
+    definition: "agent",
+    label,
+  });
+  try {
+    await sessionStart(undefined, context);
+    assert.deepEqual(
+      sessionMetadataRecords(entries).map((entry) => entry.data),
+      [expected(firstOwner)],
+    );
+    assert.deepEqual(
+      (entries as any[]).find(
+        (entry) => entry.customType === "pi-herdsman-agent-definition",
+      ).data,
+      { sessionId, definition: "agent", label },
+      "the existing identity entry is unchanged",
+    );
+    await sessionStart(undefined, context);
+    assert.equal(
+      sessionMetadataRecords(entries).length,
+      1,
+      "a repeated managed start appends no record",
+    );
+
+    const nextOwner = randomUUID();
+    process.env.PI_HERDSMAN_OWNER_SESSION_ID = nextOwner;
+    writeAgentState(mailbox, {
+      ...readAgentState(mailbox)!,
+      ownerSessionId: nextOwner,
+      updatedAt: Date.now(),
+    });
+    await sessionStart(undefined, context);
+    assert.deepEqual(
+      sessionMetadataRecords(entries).map((entry) => entry.data),
+      [expected(firstOwner), expected(nextOwner)],
+      "a new direct owner appends while earlier history stays intact",
+    );
+  } finally {
+    await sessionShutdown();
+    process.env.PI_HERDSMAN_OWNER_SESSION_ID = firstOwner;
+    resetAgentMailbox(mailbox);
+  }
+});
