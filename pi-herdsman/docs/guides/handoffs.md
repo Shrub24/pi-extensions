@@ -331,8 +331,8 @@ with `agent_close` once its scope is finished and no follow-up of the same kind 
 expected. Closing keeps its Pi session, so `agent_continue` can resume it later.
 Each delivered result reminds the lead of this for the worker it came from.
 
-The outcome of a continuation depends on the retained process's launch
-configuration:
+The outcome of a continuation depends on how the session's managed
+representation stands:
 
 - **reused** (`reused: true`): the launch configuration still matches the current
 definition, so the task is submitted into the existing process. No new process or
@@ -343,6 +343,12 @@ the effective tools, skills, extensions, and context inheritance), or the launch
 record is gone. The idle worker is closed and the same session continues in a
 fresh process, which restores the saved session's model and thinking unless the
 current definition overrides either field.
+- **recovered** (`relaunched: "process_lost"`): the session's worker is a proven
+lost generation — its process is gone, and its pane is either gone or survives
+as a shell. The stale record is retired and a new generation continues the same
+Pi session in a new process and pane, so recovery needs no `agent_close` and no
+manual mailbox or pane handling first. A surviving pane is left untouched, since
+it may hold unrelated operator work.
 - **fresh** (neither field): no retained process represents the session, so a new
 agent generation starts as usual.
 
@@ -350,7 +356,8 @@ A reused process keeps its launch-time system prompt and in-memory extension
 state, which is why drift forces the relaunch. Hand the next assignment an
 explicit checkpoint in the task text rather than assuming a reused worker still
 holds details from the previous one. Working, settling, or ambiguously
-represented sessions still fail closed, and an occupied logical label still
+represented sessions still fail closed, an unprovable identity still refuses
+`agent_busy` without weakening it to lost, and an occupied logical label still
 fails with `agent_label_exists`.
 
 ## Project-local coordination workspace

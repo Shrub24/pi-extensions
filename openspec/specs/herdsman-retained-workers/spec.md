@@ -54,7 +54,7 @@ A retained worker with no active assignment, no pending result, no pending owner
 
 ### Requirement: Continuation reuses an idle retained worker
 
-When `agent_continue` targets a session whose worker is `idle` and directly owned by the caller, the assignment SHALL be delivered into that live process. Herdsman SHALL NOT start a new process. The worker SHALL keep its label, pane, and Pi session. The assignment SHALL follow the normal assignment lifecycle: acknowledgement, working, owner questions, steering, interruption, exactly one result, and then retention or cleanup. The successful `agent_continue` result SHALL state that the existing worker was reused. Continuation of a session whose worker is not `idle` SHALL keep its existing rules: a live working or settling worker SHALL be rejected as busy, and a session with no live worker SHALL start a new process.
+When `agent_continue` targets a session whose worker is `idle` and directly owned by the caller, the assignment SHALL be delivered into that live process. Herdsman SHALL NOT start a new process. The worker SHALL keep its label, pane, and Pi session. The assignment SHALL follow the normal assignment lifecycle: acknowledgement, working, owner questions, steering, interruption, exactly one result, and then retention or cleanup. The successful `agent_continue` result SHALL state that the existing worker was reused. Continuation of a session whose worker is not `idle` SHALL keep its existing rules: a live working or settling worker SHALL be rejected as busy, and a session with no live worker SHALL start a new process. A session whose single directly owned record is a proven `lost` generation SHALL follow the recovery requirement below.
 
 #### Scenario: Second assignment in the same process
 
@@ -70,6 +70,30 @@ When `agent_continue` targets a session whose worker is `idle` and directly owne
 
 - **WHEN** a controller calls `agent_continue` for an `idle` worker it does not directly own
 - **THEN** the call fails closed and the worker is unchanged
+
+### Requirement: Continuation recovers a proven-lost worker
+
+When `agent_continue` targets a session whose single directly owned managed representation is a proven `lost` generation, Herdsman SHALL retire that stale record through the same preflight a lost `agent_close` uses and continue the same Pi session in a new process and pane under the same logical label, without requiring `agent_close` or manual mailbox removal first. The lost-generation safeguards SHALL be preserved: an unprovable identity SHALL refuse `agent_busy` without weakening presence to `lost`, an unretrieved durable result SHALL refuse rather than be overwritten, and a surviving pane SHALL be left untouched because it may hold unrelated operator work. The prior terminal assignment's records in the owner's session SHALL remain, and the successful result SHALL report `relaunched: "process_lost"`.
+
+#### Scenario: Recover after a vanished pane
+
+- **WHEN** a worker's process and pane are gone and the lead calls `agent_continue` with its exact saved session
+- **THEN** the stale record is retired, a new generation starts on the same Pi session under the same label, no pane is closed, and the result reports `relaunched: "process_lost"`
+
+#### Scenario: Recover behind a surviving shell
+
+- **WHEN** a worker's process is gone but its pane survives as a plain shell past the maximum startup window
+- **THEN** continuation starts a new generation and leaves the surviving pane untouched
+
+#### Scenario: Unprovable identity still refuses
+
+- **WHEN** a live foreign agent or an unclaimed pane makes the lost worker's identity unprovable
+- **THEN** continuation fails `agent_busy`, starts nothing, and the record is unchanged
+
+#### Scenario: Unretrieved result is never overwritten
+
+- **WHEN** the lost generation has a durable result that was never retrieved
+- **THEN** continuation refuses instead of discarding it
 
 ### Requirement: Definition drift relaunches instead of reusing
 

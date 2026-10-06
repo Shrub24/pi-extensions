@@ -124,11 +124,14 @@ exact details.
 `lost` means the expected physical execution is proven gone before a durable
 terminal result resolved the assignment. The durable mailbox remains owned and
 the assignment remains unresolved; loss is not completion or task failure.
-Only the direct owner may use `agent_close` to abandon the lost generation. When
-`agent_close` is listed, use it before replacing it or continuing its saved session.
-If `agent_close` is absent, resolve the condition blocking its close preflight first.
-Herdsman never redelegates or continues it automatically. Moved or conflicting
-evidence is `unknown`, not `lost`, and remains fail-closed.
+Only the direct owner may recover or abandon it. Continue the exact saved session
+with `agent_continue`: the stale record is retired and a new generation continues
+the same Pi session in a new process and pane, so no `agent_close` and no manual
+mailbox or pane handling come first. A surviving pane is left untouched. Use
+`agent_close` only to abandon the lost generation, and when it is listed it
+applies directly; if it is absent, resolve the condition blocking its close
+preflight first. Herdsman never redelegates or continues it automatically. Moved
+or conflicting evidence is `unknown`, not `lost`, and remains fail-closed.
 
 ## Inactivity advisory
 
@@ -250,6 +253,12 @@ the canonical session path, so an exact UUID and its exact path identify the
 same target. Wait for the existing assignment to finish and clean up, or close
 its exact live agent when abandoning it, then retry. Do not delegate another
 task through an agent label.
+
+## Recovering a stopped worker
+
+A session whose own generation is proven `lost` is not refused: continuation
+retires the stale record and starts a new generation on the same Pi session. See
+[Agent is `lost`](#agent-is-lost) above for the safeguards that still apply.
 
 ## Before retrying
 

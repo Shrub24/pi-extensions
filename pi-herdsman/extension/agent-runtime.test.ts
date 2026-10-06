@@ -474,6 +474,209 @@ test("a previously notified terminal task remains waiting until result review", 
   }
 });
 
+test("a recovered worker binds a finished prior-request result and settles only after retrieval", async () => {
+  const mailbox = setAgentEnvironment("carried-prior-result-agent");
+  const providerId = "carried-prior-result-provider";
+  const agent = fakePi();
+  let revision = 1;
+  // The production provider carries the finished, certified, unretrieved result
+  // of an earlier request into the next assignment and retires it only on an
+  // actual retrieval (ADR 0023). A recovered worker is a new process on the same
+  // session, so its new request is bound while that task is still outstanding.
+  let outstanding: { taskId: string; state: string; reason: string }[] = [
+    {
+      taskId: "bg-prior",
+      state: "awaiting-result-review",
+      reason: "a finished result of an earlier request awaits retrieval",
+    },
+  ];
+  const providerRegistration = registerBackgroundWorkProvider(
+    agent.pi.events as never,
+    {
+      id: providerId,
+      version: 1,
+      snapshot(scope: { sessionId: string; requestId: string }) {
+        return {
+          provider: { id: providerId, version: 1 },
+          sessionId: scope.sessionId,
+          requestId: scope.requestId,
+          revision,
+          reconciliation: { state: "ready" },
+          outstanding,
+        };
+      },
+      bind() {
+        return { ok: true };
+      },
+      protect() {
+        return { ok: true };
+      },
+    },
+  );
+  registerExtension!(agent.pi as never);
+  const context = fakeAgentContext();
+  context.mode = "rpc";
+  try {
+    await agent.events.get("session_start")![0](undefined, context);
+    const initial = readAgentState(mailbox)!;
+    const request: RequestRecord = {
+      version: 5,
+      runId: initial.runId,
+      requestId: randomUUID(),
+      ownerSessionId: initial.ownerSessionId,
+      workspaceId: initial.workspaceId,
+      agentLabel: initial.agentLabel,
+      paneId: initial.paneId,
+      kind: "task",
+      text: "continue the recovered work and retrieve the earlier result",
+      createdAt: Date.now(),
+    };
+    writeRequest(mailbox, request);
+    assert.deepEqual(
+      agent.events.get("input")![0](
+        { text: controlMarker(request.requestId) },
+        context,
+      ),
+      { action: "transform", text: request.text },
+      JSON.stringify(readAgentState(mailbox)?.lastAck),
+    );
+    const bound = readAgentState(mailbox)!;
+    assert.equal(bound.activeRequestId, request.requestId);
+    assert.deepEqual(bound.backgroundWorkProvider, {
+      id: providerId,
+      version: 1,
+    });
+
+    // The new assignment answers, but the carried result it did not start keeps
+    // it open: nothing is published and nothing is cleared silently.
+    agent.events.get("message_end")![0](
+      { message: { role: "assistant", content: "recovered work done" } },
+      context,
+    );
+    await agent.events.get("agent_settled")![0](undefined, context);
+    const waiting = readAgentState(mailbox)!;
+    assert.equal(readResult(mailbox, request.requestId), undefined);
+    assert.equal(waiting.completedRequestId, undefined);
+    assert.deepEqual(waiting.backgroundWaiting?.taskIds, ["bg-prior"]);
+
+    // Retrieval is what retires the carried result; the provider reports it gone.
+    outstanding = [];
+    revision++;
+    assert.equal(
+      providerRegistration.notifyChange({
+        sessionId: context.sessionManager.getSessionId(),
+        requestId: request.requestId,
+      }),
+      true,
+    );
+    assert.deepEqual(readAgentState(mailbox)?.backgroundWaiting?.taskIds, []);
+
+    // With the earlier result retrieved, the assignment settles normally.
+    agent.events.get("message_end")![0](
+      {
+        message: {
+          role: "assistant",
+          content: "retrieved the earlier result; recovered work done",
+        },
+      },
+      context,
+    );
+    await agent.events.get("agent_settled")![0](undefined, context);
+    assert.equal(
+      readResult(mailbox, request.requestId)?.text,
+      "retrieved the earlier result; recovered work done",
+    );
+    const settled = readAgentState(mailbox)!;
+    assert.equal(settled.backgroundWaiting, undefined);
+    assert.equal(settled.completedRequestId, request.requestId);
+  } finally {
+    fireShutdown(agent);
+    providerRegistration.dispose();
+    resetAgentMailbox(mailbox);
+  }
+});
+
+test("a recovered worker never adopts an earlier request's running or uncertified work", async () => {
+  const mailbox = setAgentEnvironment("uncertified-prior-work-agent");
+  const providerId = "uncertified-prior-work-provider";
+  const agent = fakePi();
+  const providerRegistration = registerBackgroundWorkProvider(
+    agent.pi.events as never,
+    {
+      id: providerId,
+      version: 1,
+      snapshot(scope: { sessionId: string; requestId: string }) {
+        return {
+          provider: { id: providerId, version: 1 },
+          sessionId: scope.sessionId,
+          requestId: scope.requestId,
+          revision: 1,
+          reconciliation: { state: "ready" },
+          outstanding: [],
+        };
+      },
+      // The production provider refuses a bind while unrelated work is live or
+      // its capture was never certified; the refusal reason names the work.
+      bind(scope: { requestId: string }) {
+        return {
+          ok: false,
+          reason:
+            `unresolved work not attributable to request "${scope.requestId}" ` +
+            "blocks binding: bg-prior (running, or its capture is not certified); " +
+            "reconcile it explicitly (bg_task get/stop/clear) before binding",
+        };
+      },
+      protect() {
+        return { ok: true };
+      },
+    },
+  );
+  registerExtension!(agent.pi as never);
+  const context = fakeAgentContext();
+  context.mode = "rpc";
+  try {
+    await agent.events.get("session_start")![0](undefined, context);
+    const initial = readAgentState(mailbox)!;
+    const request: RequestRecord = {
+      version: 5,
+      runId: initial.runId,
+      requestId: randomUUID(),
+      ownerSessionId: initial.ownerSessionId,
+      workspaceId: initial.workspaceId,
+      agentLabel: initial.agentLabel,
+      paneId: initial.paneId,
+      kind: "task",
+      text: "continue after the earlier request left unread work",
+      createdAt: Date.now(),
+    };
+    writeRequest(mailbox, request);
+    assert.deepEqual(
+      agent.events.get("input")![0](
+        { text: controlMarker(request.requestId) },
+        context,
+      ),
+      { action: "handled" },
+    );
+    const refused = readAgentState(mailbox)!;
+    assert.equal(refused.activeRequestId, undefined);
+    assert.equal(refused.backgroundWorkProvider, undefined);
+    assert.equal(refused.backgroundWaiting, undefined);
+    assert.equal(refused.lastAck?.requestId, request.requestId);
+    assert.equal(refused.lastAck?.accepted, false);
+    assert.equal(refused.lastAck?.code, "busy");
+    assert.match(
+      refused.lastAck?.message ?? "",
+      /unresolved work not attributable to request/u,
+    );
+    assert.equal(readRequest(mailbox, request.requestId), undefined);
+    assert.equal(readResult(mailbox, request.requestId), undefined);
+  } finally {
+    fireShutdown(agent);
+    providerRegistration.dispose();
+    resetAgentMailbox(mailbox);
+  }
+});
+
 test("post-review settlement requires a fresh response in either listener order", async () => {
   for (const listenerOrder of ["provider-first", "herdsman-first"] as const) {
     const mailbox = setAgentEnvironment(`post-review-${listenerOrder}`);
@@ -5367,7 +5570,8 @@ test("owner ask waits while busy and delivers once after settlement", async () =
   }
 });
 
-test("a background change mid-turn does not settle on a tool-call message that carries no answer", async () => {
+for (const commentary of ["", "Freezing edits now; the final build is still running."]) {
+test(`a background change mid-turn does not settle on a tool-call message ${commentary ? "with commentary" : "that carries no answer"}`, async () => {
   const mailbox = setAgentEnvironment("mid-turn-change-agent");
   const providerId = "test-mid-turn-provider";
   const agent = fakePi();
@@ -5427,10 +5631,10 @@ test("a background change mid-turn does not settle on a tool-call message that c
     await agent.events.get("agent_settled")![0](undefined, context);
     assert.equal(readResult(mailbox, request.requestId), undefined);
 
-    // The worker resumes and issues the retrieval: a tool-call message with no
-    // text, then the retrieval itself resolves the task and notifies a change.
+    // Commentary attached to a tool call is not a final answer either.
+    // Retrieval resolves the task and notifies a change before the turn ends.
     agent.events.get("message_end")![0](
-      { message: { role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", name: "bg_task" }] } },
+      { message: { role: "assistant", stopReason: "toolUse", content: [...(commentary ? [{ type: "text", text: commentary }] : []), { type: "toolCall", name: "bg_task" }] } },
       context,
     );
     outstanding = [];
@@ -5456,6 +5660,8 @@ test("a background change mid-turn does not settle on a tool-call message that c
     assert.equal(readResult(mailbox, request.requestId)?.text, "retrieved and reviewed");
   } finally {
     fireShutdown(agent);
+    registration.dispose();
     resetAgentMailbox(mailbox);
   }
 });
+}

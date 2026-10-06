@@ -26,9 +26,11 @@ gone
 If the expected pane, Pi session, and run-scoped alias are all absent from a
 coherent Herdr inventory before a durable result resolves the assignment, the
 assignment projects as `lost`. The mailbox remains the durable owner of that
-generation until the direct owner explicitly closes it; physical disappearance
-does not mean completion or task failure. Moved, conflicting, or incomplete
-evidence remains `unknown`.
+generation until its direct owner continues or closes it; physical disappearance
+does not mean completion or task failure. Continuing the exact saved session with
+`agent_continue` retires that record and starts a new generation on the same Pi
+session, so recovery needs no `agent_close` first. Moved, conflicting, or
+incomplete evidence remains `unknown`.
 
 The authoritative final result is correlated to the accepted assignment request
 ID.

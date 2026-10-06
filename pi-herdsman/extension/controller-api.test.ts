@@ -13,6 +13,7 @@ import type {
   ManagedAgentState,
 } from "./mailbox.ts";
 import { OperationError } from "./errors.ts";
+import { STARTUP_TIMEOUT_MAX } from "./herdr.ts";
 import { resultPath, resultRef } from "./storage.ts";
 import {
   listProjectAssignments,
@@ -4454,7 +4455,7 @@ test("assignment session resolution accepts exact paths and UUIDs only", async (
   ]);
   assert.throws(
     () => resolveAssignmentSession(missingContext, missing.path),
-    /ownership tree/,
+    /Saved assignment session is unavailable/,
   );
   nativeSessions.clear();
   realFs.rmSync(missing.path, { force: true });
@@ -4503,9 +4504,6 @@ test("owned continuation requires a matching persisted child edge", () => {
       { ownerSessionId: randomUUID() },
       { piSessionId: randomUUID() },
       { piSessionFile: undefined },
-      { piSessionFile: join(testTmpRoot, "absent.jsonl") },
-      { agentDefinition: "other" },
-      { agentLabel: "other" },
       { status: "unknown" },
       { requestId: "" },
     ]) {
@@ -4518,10 +4516,27 @@ test("owned continuation requires a matching persisted child edge", () => {
         /ownership tree/,
       );
     }
+    // A recorded child whose session can no longer be opened as that identity —
+    // its file is gone or it no longer holds the recorded definition and label —
+    // is named as unavailable instead of silently reported as unknown.
+    for (const details of [
+      { piSessionFile: join(testTmpRoot, "absent.jsonl") },
+      { agentDefinition: "other" },
+      { agentLabel: "other" },
+    ]) {
+      assert.throws(
+        () =>
+          resolveAssignmentSession(
+            context({ ...proof, details: { ...proof.details, ...details } }),
+            id,
+          ),
+        /Saved assignment session is unavailable/,
+      );
+    }
     session.entries = [];
     assert.throws(
       () => resolveAssignmentSession(context(proof), id),
-      /ownership tree/,
+      /Saved assignment session is unavailable/,
     );
   } finally {
     nativeSessions.clear();
@@ -4656,6 +4671,8 @@ const idleRetainedWorkerFixture = async (
     storedFingerprint?: "missing";
     onRequest?: (text: string, request?: RequestRecord) => void | Promise<void>;
     beforeClose?: () => void | Promise<void>;
+    /** The retained generation's physical state as the inventory reports it. */
+    lost?: "vanished" | "shell" | "foreign";
   } = {},
 ) => {
   const label = `${definition}-agent`;
@@ -4691,6 +4708,11 @@ const idleRetainedWorkerFixture = async (
       piSessionFile: sourcePath,
     }),
     completedRequestId: randomUUID(),
+    // A surviving shell is only a proven lost generation past the longest
+    // startup window the owner would ever wait, so age the record accordingly.
+    ...(options.lost
+      ? { updatedAt: Date.now() - STARTUP_TIMEOUT_MAX - 60_000 }
+      : {}),
   };
   writeAgentState(mailbox, state);
   const { agentLaunchFingerprint, resolveAgentLaunchInputs } = await import(
@@ -4753,8 +4775,48 @@ const idleRetainedWorkerFixture = async (
     ));
   let executor: ReturnType<typeof startupExecutor> = retainedExecutor;
   let closed = false;
+  const lostInventory = () =>
+    JSON.stringify({
+      id: AGENT_ID,
+      result: {
+        snapshot: {
+          agents:
+            options.lost === "foreign"
+              ? [
+                  {
+                    name: "foreign-agent",
+                    workspace_id: WORKSPACE,
+                    pane_id: "startup-pane",
+                    cwd: "/tmp",
+                  },
+                ]
+              : [],
+          panes:
+            options.lost === "shell"
+              ? [
+                  {
+                    pane_id: "startup-pane",
+                    workspace_id: WORKSPACE,
+                    cwd: "/tmp",
+                    agent_status: "unknown",
+                  },
+                ]
+              : options.lost === "foreign"
+                ? [
+                    {
+                      pane_id: "startup-pane",
+                      workspace_id: WORKSPACE,
+                      cwd: "/tmp",
+                    },
+                  ]
+                : [],
+        },
+      },
+    });
   const pi = fakePi({
     exec: async (command, args) => {
+      if (command === "herdr" && isApiSnapshot(args) && options.lost)
+        return { stdout: lostInventory(), stderr: "", code: 0 };
       if (
         command === "herdr" &&
         args[0] === "pane" &&
@@ -4828,6 +4890,201 @@ test("definition drift relaunches a retained worker on the same session", async 
     assert.notEqual(restarted.runId, fixture.state.runId);
     assert.equal(restarted.agentLabel, fixture.label);
     assert.equal(restarted.piSessionId, fixture.sourceId);
+  } finally {
+    fixture.pi.events.get("session_shutdown")?.[0]();
+    nativeSessions.clear();
+    resetAgentMailbox(fixture.mailbox);
+    realFs.rmSync(fixture.definitionPath, { force: true });
+    realFs.rmSync(fixture.sourcePath, { force: true });
+  }
+});
+
+test("continuation recovers a worker whose pane is gone", async () => {
+  setLeadEnvironment();
+  nativeSessions.clear();
+  const name = `recover-vanished-${randomUUID().slice(0, 8)}`;
+  const fixture = await idleRetainedWorkerFixture(name, { lost: "vanished" });
+  try {
+    const before = fixture.pi.calls.length;
+    const result = await agentTool(fixture.pi, "continue").execute(
+      "recover",
+      { session: fixture.sourcePath, task: "resume the vanished worker" },
+      undefined,
+      undefined,
+      fixture.context,
+    );
+    assert.equal(result.details.ok, true, JSON.stringify(result.details));
+    assert.equal(result.details.relaunched, "process_lost");
+    assert.equal(result.details.agent, fixture.label);
+    const calls = fixture.pi.calls.slice(before);
+    const start = calls.find(
+      (args) => args[0] === "agent" && args[1] === "start",
+    );
+    assert.ok(start, "the recovery starts a new generation");
+    assert.equal(
+      start[start.indexOf("--session") + 1],
+      realFs.realpathSync(fixture.sourcePath),
+    );
+    assert.equal(
+      calls.some(
+        (args) =>
+          (args[0] === "pane" || args[0] === "tab") && args[1] === "close",
+      ),
+      false,
+      "recovery closes no pane it cannot prove",
+    );
+    // The exact Pi session and the prior terminal assignment stay accounted
+    // for: the new generation continues the same session under the same label.
+    const state = readAgentState(fixture.mailbox)!;
+    assert.equal(state.agentLabel, fixture.label);
+    assert.equal(state.piSessionId, fixture.sourceId);
+    assert.notEqual(state.runId, fixture.state.runId);
+    const launches = fixture.pi.entries.filter(
+      (entry: any) => entry?.customType === "pi-herdsman-worker-launch",
+    ) as any[];
+    assert.deepEqual(
+      launches.map((entry) => entry.data.runId),
+      [state.runId],
+      "the new generation's launch record is appended, never replacing the owner's record",
+    );
+    // The prior terminal assignment stays accounted for: the owner's session
+    // still holds the delivered result ancestry and the session still resolves
+    // as a continuation source under the same identity.
+    assert.ok(
+      (fixture.context.sessionManager.getEntries() as any[]).some(
+        (entry: any) => entry?.customType === "pi-herdsman-agent-result",
+      ),
+      "the prior terminal assignment record is preserved",
+    );
+    assert.equal(
+      resolveAssignmentSession(fixture.context, fixture.sourcePath).id,
+      fixture.sourceId,
+    );
+  } finally {
+    fixture.pi.events.get("session_shutdown")?.[0]();
+    nativeSessions.clear();
+    resetAgentMailbox(fixture.mailbox);
+    realFs.rmSync(fixture.definitionPath, { force: true });
+    realFs.rmSync(fixture.sourcePath, { force: true });
+  }
+});
+
+test("continuation recovers a worker behind a surviving shell and leaves the shell alone", async () => {
+  setLeadEnvironment();
+  nativeSessions.clear();
+  const name = `recover-shell-${randomUUID().slice(0, 8)}`;
+  const fixture = await idleRetainedWorkerFixture(name, { lost: "shell" });
+  try {
+    const before = fixture.pi.calls.length;
+    const result = await agentTool(fixture.pi, "continue").execute(
+      "recover",
+      { session: fixture.sourceId, task: "resume behind the shell" },
+      undefined,
+      undefined,
+      fixture.context,
+    );
+    assert.equal(result.details.ok, true, JSON.stringify(result.details));
+    assert.equal(result.details.relaunched, "process_lost");
+    assert.equal(
+      fixture.pi.calls
+        .slice(before)
+        .some(
+          (args) =>
+            (args[0] === "pane" || args[0] === "tab") && args[1] === "close",
+        ),
+      false,
+      "a surviving shell may hold unrelated operator work, so it is untouched",
+    );
+    assert.equal(readAgentState(fixture.mailbox)?.piSessionId, fixture.sourceId);
+  } finally {
+    fixture.pi.events.get("session_shutdown")?.[0]();
+    nativeSessions.clear();
+    resetAgentMailbox(fixture.mailbox);
+    realFs.rmSync(fixture.definitionPath, { force: true });
+    realFs.rmSync(fixture.sourcePath, { force: true });
+  }
+});
+
+test("continuation refuses an unprovable identity instead of weakening presence", async () => {
+  setLeadEnvironment();
+  nativeSessions.clear();
+  const name = `recover-foreign-${randomUUID().slice(0, 8)}`;
+  const fixture = await idleRetainedWorkerFixture(name, { lost: "foreign" });
+  try {
+    const before = fixture.pi.calls.length;
+    const result = await agentTool(fixture.pi, "continue").execute(
+      "refuse",
+      { session: fixture.sourcePath, task: "must not launch over it" },
+      undefined,
+      undefined,
+      fixture.context,
+    );
+    assert.equal(result.details.error.category, "agent_busy");
+    assert.equal(
+      fixture.pi.calls
+        .slice(before)
+        .some(
+          (args) =>
+            args[0] === "agent" && ["start", "prompt"].includes(args[1] ?? ""),
+        ),
+      false,
+    );
+    assert.ok(
+      readAgentState(fixture.mailbox),
+      "the unresolved record is preserved",
+    );
+  } finally {
+    fixture.pi.events.get("session_shutdown")?.[0]();
+    nativeSessions.clear();
+    resetAgentMailbox(fixture.mailbox);
+    realFs.rmSync(fixture.definitionPath, { force: true });
+    realFs.rmSync(fixture.sourcePath, { force: true });
+  }
+});
+
+test("continuation preserves an unretrieved result instead of overwriting it", async () => {
+  setLeadEnvironment();
+  nativeSessions.clear();
+  const name = `recover-durable-${randomUUID().slice(0, 8)}`;
+  const fixture = await idleRetainedWorkerFixture(name, { lost: "vanished" });
+  const requestId = fixture.state.completedRequestId!;
+  writeResult(fixture.mailbox, {
+    version: 5,
+    runId: fixture.state.runId,
+    requestId,
+    ownerSessionId: fixture.state.ownerSessionId,
+    workspaceId: WORKSPACE,
+    agentLabel: fixture.label,
+    paneId: fixture.state.paneId,
+    status: "completed",
+    text: "unread terminal result",
+    completedAt: Date.now(),
+  });
+  try {
+    const before = fixture.pi.calls.length;
+    const result = await agentTool(fixture.pi, "continue").execute(
+      "recover",
+      { session: fixture.sourcePath, task: "must not discard the result" },
+      undefined,
+      undefined,
+      fixture.context,
+    );
+    assert.equal(result.details.error.category, "agent_busy");
+    assert.match(result.details.error.message, /unretrieved result/);
+    assert.equal(
+      readResult(fixture.mailbox, requestId)?.text,
+      "unread terminal result",
+      "the unread result is never silently overwritten",
+    );
+    assert.equal(
+      fixture.pi.calls
+        .slice(before)
+        .some(
+          (args) =>
+            args[0] === "agent" && ["start", "prompt"].includes(args[1] ?? ""),
+        ),
+      false,
+    );
   } finally {
     fixture.pi.events.get("session_shutdown")?.[0]();
     nativeSessions.clear();

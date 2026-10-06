@@ -441,6 +441,9 @@ const RETAINED_WORKER_CLEANUP_GUIDANCE =
   "A retained idle worker still holds a live pane and its full context: when its " +
   "scope is finished and no follow-up of the same kind is expected, close it with " +
   "agent_close. Closing keeps its Pi session, so agent_continue can resume it later.";
+const LOST_WORKER_RECOVERY_GUIDANCE =
+  "Recover a proven-stopped worker with agent_continue and its exact saved " +
+  "session. No cleanup step is required first.";
 const AGENT_HANDOFF_GUIDANCE =
   "Use agent_delegate to start a fresh bounded assignment from a definition; " +
   "use agent_continue to resume an exact historical managed-Agent Pi session " +
@@ -462,6 +465,7 @@ const AGENT_HANDOFF_GUIDANCE =
   "retained by default: its pane, process and Pi session stay alive as idle, and " +
   "a fresh agent is created only for work no live worker holds. " +
   `${RETAINED_WORKER_CLEANUP_GUIDANCE} ` +
+  `${LOST_WORKER_RECOVERY_GUIDANCE} ` +
   "Agent labels " +
   "identify the current live " +
   "generation; exact Pi sessions identify historical context and continuation. " +
@@ -486,7 +490,7 @@ const AGENT_UNRESOLVED_GUIDANCE =
   "Use agent_reply only to answer that Agent's exact pending ask_owner question. agent_close destructively closes an eligible Agent generation. agent_extend replaces one directly owned unresolved Agent's next soft-deadline window and changes no assignment. agent_inspect provides bounded live terminal/process evidence; agent_transcript provides bounded persisted conversation/tool evidence. " +
   "When Agent work is unresolved, handle required control, then continue only necessary work you still own or end the turn without concluding; results or attention resume the session automatically. Do not poll with status requests, sleep, or other waiting mechanisms. " +
   "Stale health attention is diagnosis, not progress polling: use attached evidence first and, when absent or insufficient, perform at most one bounded diagnostic read before passive waiting. A repeated reminder for the same stale episode is additional recovery evidence: unchanged qualifying activity means the Agent has not crossed an execution boundary since the previous reminder. A steer queued during that unchanged episode cannot have taken effect yet. Do not repeat diagnostic reads solely because a reminder fired. Continue waiting only while existing evidence still positively supports a legitimate long-running operation; otherwise use agent_interrupt to stop the current operation and continue the same assignment. " +
-  "A proven lost Agent remains unresolved; physical disappearance is not completion. Unknown or conflicting identity remains fail-closed. Do not take over or replace unresolved delegated work until the current generation is resolved or explicitly closed. Do not invent work merely to remain active.";
+  "A proven lost Agent remains unresolved; physical disappearance is not completion. Unknown or conflicting identity remains fail-closed. Use agent_continue with the exact saved session to replace a lost generation, or agent_close to abandon it; do not take over unresolved delegated work locally. Do not invent work merely to remain active.";
 const LEAD_SCOPE_DESCRIPTION = `Own architecture, approved scope, acceptance, integration, conflict resolution,
 and final decisions. Decompose only as far as useful. Assign each independent
 objective to the narrowest capable owner and let delegation-enabled agents own
@@ -1798,7 +1802,11 @@ function ownedAssignmentChildren(
       const path = canonicalSessionPath(child.path);
       children.set(`${child.id}\0${path}`, { ...child, path });
     } catch {
+      // The recorded path is unusable, so the session cannot be opened. Keep
+      // the child as recorded: a continuation that names it must report the
+      // session as unavailable instead of silently treating it as unknown.
       unavailable?.();
+      children.set(`${child.id}\0${child.path}`, child);
     }
   }
   return [...children.values()];
@@ -1949,7 +1957,16 @@ export function resolveAssignmentSession(
       )
         continue;
       const manager = openOwnedAssignmentSession(child);
-      if (!manager) continue;
+      if (!manager)
+        fail(
+          "invalid_request",
+          `Saved assignment session is unavailable: ${path} is missing, unreadable, or no longer holds the recorded agent identity.`,
+          "continue",
+          {
+            nextAction:
+              "Use the exact session id or path recorded with the agent's result and confirm the saved session file still exists.",
+          },
+        );
       const header = manager.getHeader();
       if (typeof header?.cwd !== "string" || !header.cwd.trim())
         fail(
@@ -3343,6 +3360,24 @@ function resolveIdleWorker(
     // Malformed or conflicting evidence cannot authorize reuse.
     return { kind: "busy" };
   }
+}
+
+/**
+ * Whether a session's own retained record is a generation whose process is
+ * provably gone. Recovery retires that stale mailbox and continues the same Pi
+ * session in a new process; an unknown presence and a foreign owner keep the
+ * existing refusal, so uncertain presence is never weakened to lost here.
+ */
+function isLostWorkerOf(
+  ctx: ExtensionContext,
+  record: ManagedAgentSnapshot,
+  label: string,
+): boolean {
+  return (
+    record.presence.kind === "lost" &&
+    record.state.agentLabel === label &&
+    record.state.ownerSessionId === ctx.sessionManager.getSessionId()
+  );
 }
 
 function managedAgentPresence(
@@ -6939,7 +6974,7 @@ async function actionUnsafe(
       definition,
       definitionScope,
     );
-    let relaunchReason: "definition_changed" | undefined;
+    let relaunchReason: "definition_changed" | "process_lost" | undefined;
     let releaseSessionActivation: (() => void) | undefined;
     const live = await listedAgents(pi, ctx, undefined, signal);
     if (!agentDefinitionEnabled(definition))
@@ -7021,9 +7056,40 @@ async function actionUnsafe(
           // keeps the worker identity its mailbox and session already carry.
           const decision =
             record && single!.state.agentLabel === resumed.label
-              ? resolveIdleWorker(ctx, record, fingerprintDefinition)
+              ? isLostWorkerOf(ctx, record, resumed.label)
+                ? ({ kind: "recover", record } as const)
+                : resolveIdleWorker(ctx, record, fingerprintDefinition)
               : ({ kind: "busy" } as const);
           if (decision.kind === "reuse") idleReuseRuntime = decision.runtime;
+          if (decision.kind === "recover") {
+            // The generation's process is gone; its pane may survive as a
+            // shell. Retire the stale mailbox through the shared lost-close
+            // seam, which revalidates identity under the assignment lock and
+            // refuses while an unretrieved durable result exists, then continue
+            // the same Pi session below in a new process and pane. A surviving
+            // pane is left untouched: it may hold unrelated operator work.
+            const recovered = decision.record;
+            const mailbox = agentMailboxPath(
+              recovered.state.workspaceId,
+              recovered.state.agentLabel,
+            );
+            if (hasDurableResult(mailbox, recovered.state))
+              fail(
+                "agent_busy",
+                `${recovered.state.agentLabel} has an unretrieved result from a previous assignment; retrieve it before continuing this session.`,
+                p.action,
+                {
+                  ids: {
+                    label: recovered.state.agentLabel,
+                    paneId: recovered.state.paneId,
+                  },
+                },
+              );
+            await closeManagedSnapshot(pi, ctx, recovered, signal);
+            relaunchReason = "process_lost";
+            labels.delete(recovered.state.agentLabel);
+            requestStatusRefresh?.();
+          }
           if (decision.kind === "relaunch") {
             // A retained process cannot adopt a changed definition: close it
             // and continue the same session in a new process below.
@@ -16056,7 +16122,7 @@ export default function (pi: ExtensionAPI): void {
       name: "agent_continue",
       label: "agent continue",
       description:
-        "Start one bounded assignment from an exact historical managed-Agent Pi session. `task` must be a fresh, role-valid delegation-brief/v1 Markdown document. Prefer this over a fresh `agent_delegate` when a retained worker already holds the relevant context.",
+        "Start one bounded assignment from an exact historical managed-Agent Pi session. Recovers a proven-stopped worker using its exact saved session. `task` must be a fresh, role-valid delegation-brief/v1 Markdown document. Prefer this over a fresh `agent_delegate` when a retained worker already holds the relevant context.",
       parameters: agentContinueParameters,
       promptSnippet: undefined,
       promptGuidelines: undefined,

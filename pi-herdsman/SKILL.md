@@ -124,14 +124,11 @@ evidence still justifies more time; it changes no assignment and is listed only
 for a directly owned worker with an armed window. Never close or interrupt a
 worker solely because a checkpoint fired.
 
-A lost agent is a managed assignment whose exact physical execution is proven
-gone before a durable terminal result resolved it. Loss is not completion or
-task failure. Treat the assignment as unresolved. When `agent_transcript` is listed,
-use it only when the last persisted work materially affects recovery. When
-`agent_close` is listed, use it to abandon the lost generation before replacing it or
-continuing its saved session. If `agent_close` is absent, resolve the condition
-blocking its close preflight first. Unknown evidence remains fail-closed and is
-not proof of loss.
+A lost worker has stopped; that is not completion or proof that its task failed.
+Continue its exact saved session with `agent_continue` to recover, or use
+`agent_close` to abandon the generation. No manual cleanup is required first.
+Use `agent_transcript` only when the last persisted work materially affects
+recovery. Unknown identity is not proof of loss and still refuses recovery.
 
 Never guess identities, paths, sessions, or control state. Treat unknown or
 conflicting evidence as unresolved. Keep one writer per worktree or file-

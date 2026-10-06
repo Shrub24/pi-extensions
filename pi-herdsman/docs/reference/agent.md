@@ -87,19 +87,22 @@ managed-agent session; delegate a fresh agent and pass the previous
 handoff/result and relevant files instead. Retired results explicitly instruct
 the controller to delegate a fresh agent.
 
-Continuation reports one of three outcomes:
+Continuation reports one of four outcomes:
 
 | Outcome     | Result evidence                      | Behavior                                                                                                                                                                                                                                                                     |
 | ----------- | ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | reused      | `reused: true`                       | With `retainWorkers` enabled, the session's single representation is a directly owned `idle` worker whose recorded launch configuration still matches the current definition: the task is submitted into that existing verified live process, so no new process, pane, or label appears. |
 | relaunched  | `relaunched: "definition_changed"`    | The idle worker's launch configuration drifted (prompt body including `@file` contents, `systemPromptMode`, model, thinking, or the effective tools, skills, extensions, and context inheritance) or its launch record is missing. The worker is closed and a fresh generation continues the same session. |
-| fresh       | neither field                        | The work starts as a new agent generation because no reusable verified live process represents the session.                                                                                                                                                                    |
+| recovered   | `relaunched: "process_lost"`         | The session's directly owned worker is a proven `lost` generation: its process is gone, and its pane is either gone too or survives as a shell. A `lost` record is retired through the shared close preflight and a new generation continues the same Pi session in a new process and pane. Nothing is closed or removed by hand first, and a surviving pane is left untouched. Unprovable identity still refuses `agent_busy`, and an unretrieved durable result still refuses rather than being overwritten. |
+| fresh       | neither field                        | The work starts as a new agent generation because no verified live process represents the session.                                                                                                                                                                    |
 
 A reused process keeps its launch-time system prompt and in-memory extension
 state, so reuse requires the same launch configuration the process started with.
 Working, settling, or ambiguously represented sessions still fail closed
 (`agent_busy`), and an occupied logical label still fails
-(`agent_label_exists`).
+(`agent_label_exists`). A continuation whose recorded session file is missing or
+unreadable fails with a session-unavailable `invalid_request` naming that
+exact path.
 
 Fresh delegate assignments receive an automatically chosen logical label when
 no label is supplied. The saved session's logical label is inherited exactly

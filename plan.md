@@ -24,9 +24,9 @@ stays resumable, driven by the assignment's state and not by a lead's memory.
 | # | Defect | Root cause | Path forward |
 |---|---|---|---|
 | 130 | **Fixed.** A worker whose process was exited by hand read `unknown`, offered no control, and could not be terminalized | Known. `managedAgentPresence` (`extension/index.ts`) returns `lost` only when the expected pane is gone; a surviving shell pane fails closed as `unknown` | Landed: a pane with no agent, session or activity status that nothing else claims reads `lost` once older than `STARTUP_TIMEOUT_MAX`. Not tested: a pane with an active `agent_status` staying `unknown` (the fixture cannot set one) |
-| 131 | **Fixed (pending commit).** `agent_continue` is refused at bind when the previous request left unread background results (`bg-*`), and the lead cannot reach a child-owned task | Known. `classifySettlementTasks` quarantines unassociated and unattributable tasks (`pi-bash-processes/extensions/background-tasks.ts`); no owner-side way to reconcile them | Admission carries a prior request's finished results into the new assignment, or an owner-side typed reconcile action. Live unattributable work still blocks. Verified workaround: open the exact session in an unmanaged Pi and `bg_task get` each id |
+| 131 | **Fixed.** Finished prior-request background results blocked continuation | Known. `classifySettlementTasks` quarantined foreign-request work indiscriminately | `fa3c6d57` carries certified finished results without discarding them. Herdsman contract tests now pin holding settlement until retrieval and refusing running/uncertified foreign work. The classifier is tested separately in pi-bash-processes; no live recovery smoke claimed |
 | 132 | A recovery turn that produces no assistant message leaves a held assignment with no further prompt | Known. The recovery prompt is sent once per request, and `freshResponse` stays false | Bound the prompt per request and fail typed when the provider reports the work resolved but the worker never answers; never while the provider reports work outstanding |
-| 133 | `leak-fix2` published a `failed` result (empty response) while its pane was still working | Unknown, narrowed. Its session (`01a10e6d`) has no `length` stop and no keepalive-shaped turn: every `stop` carried text and it ended normally with a final answer, so this is not the empty-generation shape and not the no-first-message shape | Match the failed result's request id against the owner session's delivery record and the exact text the validator saw (`inline.text`); the worker session alone cannot show it |
+| 133 | **Fixed (`d196c011`).** Mid-turn background changes settled a tool-call message as a final answer | Known. `message_end` marked every assistant message fresh; retrieval could trigger settlement on empty text or commentary before the tool/turn finished | `toolUse` messages no longer qualify as final responses. Regressions cover empty text and nonempty commentary. Radar reproduced the same class in a long-lived worker; its loaded source revision remains unknown, so reload is required before claiming that fix was exercised there |
 | 134 | The provider (omniroute `coder-high`, about 268k context) returns keepalive-only streams with `stopReason: length` | Unknown, outside this repo. Herdsman now classifies it correctly (ADR 0019) | Raise with the provider owner; not ours to fix |
 
 ## Fixed this session (for provenance)
@@ -38,16 +38,27 @@ stays resumable, driven by the assignment's state and not by a lead's memory.
 - Session-activation reservation leak and the advertised `result:<label>#<index>` ref (`99b898c1`).
 - `agent_extend` liveness guard, V5 request profile check, withheld-settlement retry (ADRs 0020, 0021).
 
+## Recovery through the tools
+
+`agent_continue` now recovers a proven lost, directly owned generation using the exact saved Pi session,
+without a close-first step or manual mailbox removal. It uses the shared locked close preflight to retire
+the stale record, preserves unread durable results, and relaunches under the same label. A surviving shell
+is left untouched; uncertain identity still refuses. `agent_close` retires resources without deleting the
+Pi session. Routine guidance speaks in workers and sessions; transport details remain diagnostic.
+
+Verification: vanished-pane and surviving-shell recovery regressions, uncertainty and unread-result
+refusals, plus carried-background-result settlement contract tests. No live recovery smoke claimed.
+
 ## Queued work
 
-1. `herdsman-control/v1` owner side (tasks 2.1 to 2.5 in `openspec/changes/herdsman-control/tasks.md`), run by
-   the fork session, after #130 and #131 because all touch `extension/index.ts`. Task 2.3 must call the
-   existing `agent_close` preflight, not a copy.
+1. `herdsman-control/v1` owner side is committed (`92e52f0e43a1`) with the shared close preflight and locked
+   generation checks. Radar's consumer is independently gated. Existing owners require reload; live
+   owner-routed control smoke remains unverified.
 2. `herdr:blocked` raised from pi-herdsman while an operator question is outstanding (the pane reads
    `working` during `ask_user_question` today, by construction).
 3. Generate the `SKILL.md` runtime-contract block from the injected constants, with a drift check (memory 4007).
 4. Sweep worker prompt snapshots on process exit and at session shutdown (the temp root is never swept).
-5. Tell Radar when the owner side of `herdsman-control/v1` has landed; its controls stay disabled until then.
+5. Verify owner-routed control integration after reload, only with explicit approval for destructive smoke.
 6. The agent-definition / handoff-schema / system-prompt workshop, deferred.
 
 ## Hygiene
