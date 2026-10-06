@@ -1014,6 +1014,7 @@ export function readUnacknowledgedRequest(
     | "paneId"
     | "lastAck"
   >,
+  options: { legacyProfileFallback?: BriefProfile } = {},
 ): RequestRecord | undefined {
   let names: string[];
   try {
@@ -1025,7 +1026,7 @@ export function readUnacknowledgedRequest(
   let pending: RequestRecord | undefined;
   for (const name of names) {
     const requestId = name.slice("request-".length, -".json".length);
-    const request = readRequest(path, requestId);
+    const request = readRequest(path, requestId, options);
     if (!request) continue;
     if (
       state &&
@@ -1053,10 +1054,11 @@ export function unacknowledgedRequestExists(
     | "paneId"
     | "lastAck"
   >,
+  options: { legacyProfileFallback?: BriefProfile } = {},
 ): boolean {
   // This is mailbox-owned durable settlement truth; it does not change the mailbox schema or protocol.
   try {
-    return readUnacknowledgedRequest(path, state) !== undefined;
+    return readUnacknowledgedRequest(path, state, options) !== undefined;
   } catch {
     return true;
   }

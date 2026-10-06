@@ -15843,12 +15843,21 @@ export default function (pi: ExtensionAPI): void {
       release();
     }
   };
+  // A request from an owner running an older build carries no profile; this
+  // worker's own launch profile is the floor on every path that reads it, not
+  // only the final delivery read, or the request is never delivered at all.
+  const legacyRequestFloor = () => ({
+    legacyProfileFallback: process.env.PI_HERDSMAN_BRIEF_PROFILE as
+      | BriefProfile
+      | undefined,
+  });
   const pumpRequest = (ctx: ExtensionContext): void => {
     if (!initialized || !state) return;
     try {
       const request = readUnacknowledgedRequest(
         process.env.PI_HERDSMAN_MAILBOX!,
         state,
+        legacyRequestFloor(),
       );
       if (!request) {
         requestPumpErrorReported = false;
@@ -15877,7 +15886,11 @@ export default function (pi: ExtensionAPI): void {
     !state.completedRequestId &&
     !pendingResult &&
     !pendingStateTransition &&
-    !unacknowledgedRequestExists(process.env.PI_HERDSMAN_MAILBOX!, state) &&
+    !unacknowledgedRequestExists(
+      process.env.PI_HERDSMAN_MAILBOX!,
+      state,
+      legacyRequestFloor(),
+    ) &&
     allDirectChildrenAskBlocked(state);
   const askRejectionReason = (): string => {
     if (!state?.activeRequestId) return "no active assignment";
@@ -15885,7 +15898,13 @@ export default function (pi: ExtensionAPI): void {
     if (state.completedRequestId || pendingResult)
       return "assignment is settling";
     if (pendingStateTransition) return "assignment state is settling";
-    if (unacknowledgedRequestExists(process.env.PI_HERDSMAN_MAILBOX!, state))
+    if (
+      unacknowledgedRequestExists(
+        process.env.PI_HERDSMAN_MAILBOX!,
+        state,
+        legacyRequestFloor(),
+      )
+    )
       return "a control request is still pending";
     if (!allDirectChildrenAskBlocked(state))
       return "direct agent work is still active";

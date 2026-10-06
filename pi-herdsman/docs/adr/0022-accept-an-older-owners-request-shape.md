@@ -48,6 +48,11 @@ change for every owner already running, and it fails invisibly.
   written is now recorded durably, and the rejection message carries the real
   reason, because an unacknowledged rejection reaches the owner as a bare
   timeout.
+- The floor applies to every child-side read of a request, not only the final
+  delivery read. The first fix covered the control-marker handler alone; the
+  startup pump reads through `readUnacknowledgedRequest`, which had no fallback,
+  so a profile-less request was never delivered, no first message was sent and
+  the owner timed out. Any new child-side reader must take the same option.
 
 ## See also
 

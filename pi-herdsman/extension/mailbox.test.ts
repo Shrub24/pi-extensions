@@ -341,6 +341,53 @@ test("a V5 request written without a profile is read against the worker's own pr
     /require a valid brief profile/u,
   );
 });
+test("the startup handoff read tolerates a profile-less request from an older owner", () => {
+  // The child finds its first request through readUnacknowledgedRequest, not
+  // readRequest. An older owner's request carries no profile; if this path does
+  // not apply the worker's own profile as the floor, the child never delivers
+  // the request, never acknowledges, and the owner times out waiting for state.
+  const path = mkdtempSync(join(tmpdir(), "pi-herdsman-mailbox-test-"));
+  const requestId = randomUUID();
+  writeFileSync(
+    join(path, `request-${requestId}.json`),
+    JSON.stringify({
+      version: 5,
+      runId: state.runId,
+      requestId,
+      ownerSessionId: state.ownerSessionId,
+      workspaceId: state.workspaceId,
+      agentLabel: state.agentLabel,
+      paneId: state.paneId,
+      kind: "task",
+      text: "work",
+      createdAt: Date.now(),
+      acceptedAssignment: createAcceptedAssignmentContract(
+        requestId,
+        parseDelegationBrief(DELEGATION_BRIEF_EXAMPLES.execution),
+        DEFAULT_RESPONSE_CONTRACT,
+        process.cwd(),
+        1024 * 1024,
+      ),
+    }),
+    "utf8",
+  );
+  assert.throws(
+    () => readUnacknowledgedRequest(path, state),
+    /require a valid brief profile/u,
+  );
+  assert.equal(
+    readUnacknowledgedRequest(path, state, {
+      legacyProfileFallback: "execution",
+    })?.requestId,
+    requestId,
+  );
+  assert.equal(
+    unacknowledgedRequestExists(path, state, {
+      legacyProfileFallback: "execution",
+    }),
+    true,
+  );
+});
 test("Pi UUIDv7 session and run identities are valid mailbox fields", () => {
   const path = mkdtempSync(join(tmpdir(), "pi-herdsman-mailbox-test-"));
   const v7State: ManagedAgentState = {
