@@ -66,6 +66,11 @@ later assignment reuses it or you close it. With `retainWorkers: false` it is
 cleaned up after delivery instead. To continue completed work with its existing
 context, use the exact session returned with the result.
 
+A retained idle worker still holds a live pane and its full context. When its
+scope is finished and no follow-up of the same kind is expected, close it with
+`agent_close`; closing keeps its Pi session, so `agent_continue` can resume it
+later. The result you receive reminds you of this for each retained worker.
+
 Continue a retained worker when it already holds the relevant context — a
 follow-on, a revision, or the same kind of work against the same scope. It keeps
 its Pi session, in-memory context, artifacts and pane; a fresh `agent_delegate`

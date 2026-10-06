@@ -423,6 +423,10 @@ const AGENT_DELEGATION_GUIDANCE =
   "When a retained worker already holds the relevant context, continue it instead of starting a fresh agent.";
 const AGENT_EXECUTION_OWNERSHIP_GUIDANCE =
   "Each unresolved unit of work has one executor. Using agent_delegate transfers that assignment's execution ownership to the Agent until it resolves. After delegation succeeds, stop executing, inspecting, or analyzing that delegated scope locally; do not assign overlapping work. Continue only concrete, necessary work clearly outside the delegated scope that you still own.";
+const RETAINED_WORKER_CLEANUP_GUIDANCE =
+  "A retained idle worker still holds a live pane and its full context: when its " +
+  "scope is finished and no follow-up of the same kind is expected, close it with " +
+  "agent_close. Closing keeps its Pi session, so agent_continue can resume it later.";
 const AGENT_HANDOFF_GUIDANCE =
   "Use agent_delegate to start a fresh bounded assignment from a definition; " +
   "use agent_continue to resume an exact historical managed-Agent Pi session " +
@@ -442,7 +446,9 @@ const AGENT_HANDOFF_GUIDANCE =
   "contract is separate and may use the role default or an explicit brief override. " +
   "Each live Agent generation exists for one assignment. A delivered worker is " +
   "retained by default: its pane, process and Pi session stay alive as idle, and " +
-  "a fresh agent is created only for work no live worker holds. Agent labels " +
+  "a fresh agent is created only for work no live worker holds. " +
+  `${RETAINED_WORKER_CLEANUP_GUIDANCE} ` +
+  "Agent labels " +
   "identify the current live " +
   "generation; exact Pi sessions identify historical context and continuation. " +
   "For new or updated assignments, `files` carries additional assignment evidence. Pass " +
@@ -3694,6 +3700,12 @@ async function deliverResultUnsafe(
       result.requestId,
       entries,
     );
+    // The decision to keep or close belongs where the lead is already reading
+    // the result. A retired session has no context left worth continuing.
+    const retentionNudge =
+      !sessionRetired && retainWorkersEnabled()
+        ? `Worker ${result.agentLabel} is retained and idle. Continue it with agent_continue for related work, or close it with agent_close when no follow-up is expected; its Pi session stays resumable either way.`
+        : undefined;
     const completionHeader = [
       "Agent result",
       `agent=${result.agentLabel}`,
@@ -3711,6 +3723,7 @@ async function deliverResultUnsafe(
           ...(reusableResultRef ? [`Result ref: ${reusableResultRef}`] : []),
           completion.content,
           ...(retirementGuidance ? [retirementGuidance] : []),
+          ...(retentionNudge ? [retentionNudge] : []),
           ...(delegationStatus ? [delegationStatus.content] : []),
         ].join("\n\n"),
         display: true,

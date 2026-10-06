@@ -3329,6 +3329,8 @@ test("parent settlement waits for agent delivery and ignores result cleanup lag"
       unresolvedStatus,
       /A proven lost Agent remains unresolved; physical disappearance is not completion\./,
     );
+    // With retention off the worker is cleaned up, so there is nothing to keep or close.
+    assert.doesNotMatch(unresolvedStatus, /is retained and idle/);
     assert.equal(
       readResult(childOneMailbox, childOne.activeRequestId!)?.text,
       "one",
@@ -3400,10 +3402,19 @@ test("parent settlement waits for agent delivery and ignores result cleanup lag"
     assert.ok(readResult(childOneMailbox, childOne.activeRequestId!));
     assert.ok(readResult(childTwoMailbox, childTwo.activeRequestId!));
     assert.equal(readResult(parentMailbox, parentRequestId), undefined);
+    updateConfig("retainWorkers", true);
     deliver(childThree, childThreeMailbox, "three");
     await new Promise<void>((resolve) => setImmediate(resolve));
     await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal(pi.sent.length, 4);
+    assert.match(
+      sentContent(3),
+      new RegExp(
+        `Worker ${childThree.agentLabel} is retained and idle\\. Continue it with agent_continue for related work, or close it with agent_close when no follow-up is expected`,
+        "u",
+      ),
+    );
+    updateConfig("retainWorkers", false);
     writeAgentState(childThreeMailbox, {
       ...childThree,
       activeRequestId: undefined,

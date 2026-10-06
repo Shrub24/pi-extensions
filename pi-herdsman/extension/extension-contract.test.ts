@@ -2795,6 +2795,10 @@ test("delegating agents receive only their allowed definition roster", async () 
   );
   assert.match(
     sharedGuidance,
+    /close it with agent_close\. Closing keeps its Pi session, so agent_continue can resume it later/,
+  );
+  assert.match(
+    sharedGuidance,
     /exact Pi sessions identify historical context and continuation/,
   );
   assert.match(sharedGuidance, /physical disappearance is not completion/);

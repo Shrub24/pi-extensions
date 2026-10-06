@@ -324,8 +324,15 @@ against the same scope. The worker keeps its Pi session, its in-memory context,
 its artifacts and its pane, and a fresh `agent_delegate` would reconstruct all of
 that from the brief and start a new pane. Delegate a fresh agent when no live
 worker holds the relevant context, or when the assignment is genuinely
-independent of every live worker. The outcome depends on the retained process's
-launch configuration:
+independent of every live worker.
+
+A retained idle worker still holds a live pane and its full context, so close it
+with `agent_close` once its scope is finished and no follow-up of the same kind is
+expected. Closing keeps its Pi session, so `agent_continue` can resume it later.
+Each delivered result reminds the lead of this for the worker it came from.
+
+The outcome of a continuation depends on the retained process's launch
+configuration:
 
 - **reused** (`reused: true`): the launch configuration still matches the current
 definition, so the task is submitted into the existing process. No new process or
