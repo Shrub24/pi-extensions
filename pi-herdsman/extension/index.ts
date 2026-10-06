@@ -181,6 +181,7 @@ import {
   inspectHerdrAgent,
   stopHerdrAgentPreservingPane,
   HerdrStartFailure,
+  STARTUP_TIMEOUT_MAX,
   type ExpectedSession,
   type StartedHerdrAgent,
   type HerdrStartPlacement,
@@ -3224,6 +3225,27 @@ function managedAgentPresence(
     exact.length === 0 &&
     relatedAgents.length === 0 &&
     relatedPanes.length === 0
+  )
+    return { kind: "lost" };
+  // The agent's process exited but its pane survives as a plain shell. Herdr
+  // lists the pane with no agent, no session and no activity status, and nothing
+  // else in the inventory claims this identity. Inside the startup window that
+  // shape is also a pane whose agent has not registered yet, so it stays
+  // unknown; past the longest startup the owner would wait, nothing can still be
+  // starting. Without this the owner could neither close nor continue the
+  // assignment, because every control needs a proven presence.
+  if (
+    expectedPane &&
+    exact.length === 0 &&
+    relatedAgents.length === 0 &&
+    relatedPanes.length === 0 &&
+    !expectedPane.agent &&
+    !expectedPane.agent_session &&
+    (expectedPane.agent_status === undefined ||
+      expectedPane.agent_status === null ||
+      expectedPane.agent_status === "unknown") &&
+    Date.now() - Math.max(state.updatedAt, state.lastActivityAt ?? 0) >
+      STARTUP_TIMEOUT_MAX
   )
     return { kind: "lost" };
   return {

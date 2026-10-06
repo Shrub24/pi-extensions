@@ -5701,6 +5701,79 @@ test("lost managed agents remain visible and repeatedly notify their owner", asy
   }
 });
 
+test("a worker exited by hand leaves a shell pane that reads unknown, then lost after the startup window", async (t) => {
+  // The process is gone and the pane survives as a plain shell: Herdr reports the
+  // pane with no agent and no session. Inside the startup window that is
+  // indistinguishable from a pane whose agent has not registered yet, so it stays
+  // unknown. Past the longest startup the owner would wait, nothing can still be
+  // starting, so the generation is lost and the owner can close it.
+  setLeadEnvironment();
+  const label = "shell-pane-agent";
+  const identity = {
+    ...recoveryIdentity(label),
+    piSessionFile: join(testTmpRoot, `${label}.jsonl`),
+  };
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const state = {
+    ...managedState(label, REQUEST_ID, identity),
+    lastActivityAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  resetAgentMailbox(mailbox);
+  writeAgentState(mailbox, state);
+  const lifecycle = cascadeExecutor([state], {
+    paneOnly: [state.paneId],
+    omitAgentLabels: [label],
+    omitPaneLabels: [label],
+  });
+  const pi = fakePi({ persistMessages: true, exec: lifecycle.exec });
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  registerExtension!(pi.pi as never);
+  const listState = async () => {
+    const listed = await agentTool(pi, "list").execute(
+      "id",
+      {},
+      undefined,
+      undefined,
+      fakeContext(pi.entries),
+    );
+    return listed.details.agents.find(
+      (candidate: any) => candidate.agent === label,
+    );
+  };
+  try {
+    await pi.events.get("session_start")![0](undefined, fakeContext());
+    for (let index = 0; index < 5; index++)
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal((await listState()).state, "unknown");
+
+    now += 6 * 60_000;
+    t.mock.timers.tick(30_000);
+    for (let index = 0; index < 8; index++)
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    const lost = await listState();
+    assert.equal(lost.state, "lost");
+    assert.ok(lost.available_tools.includes("agent_close"));
+
+    const closed = await agentTool(pi, "close").execute(
+      "id",
+      { agent: label },
+      undefined,
+      undefined,
+      fakeContext(pi.entries),
+    );
+    assert.equal(closed.details.ok, true, JSON.stringify(closed.details));
+    assert.equal(readAgentState(mailbox), undefined);
+    // The pane belongs to whoever is using the shell now; closing the lost
+    // generation must not close it.
+    assert.deepEqual(lifecycle.closeOrder, []);
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(mailbox);
+  }
+});
 test("lost parent health attention omits close when a descendant has an unread durable result", async () => {
   setLeadEnvironment();
   const parent = {
