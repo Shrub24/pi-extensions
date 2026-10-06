@@ -68,29 +68,53 @@ test("every fixture outcome, category, effect and state is documented", () => {
 
 test("every fixture request and result carries the documented shape", () => {
   const fixture = JSON.parse(read("herdsman-control.fixture.json"));
-  const byId = new Map(
-    fixture.requests.map(({ request }) => [request.requestId, request]),
+  const answers = new Map(
+    fixture.results.map(({ result }) => [result.requestId, result]),
   );
   for (const { request, expect: expected } of fixture.requests) {
-    assert.equal(request.version, 1);
+    assert.ok(Number.isInteger(request.version));
     assert.match(request.requestId, UUID);
     assert.ok(OPERATIONS.includes(request.operation));
     assert.ok(request.agent && request.runId);
-    assert.equal(request.confirmation.operation, request.operation);
-    assert.equal(request.confirmation.runId, request.runId);
-    if (expected.category !== "invalid_request")
-      assert.equal(request.confirmation.label, request.agent);
+    if (!request.confirmation)
+      assert.deepEqual(expected, {
+        outcome: "refused",
+        category: "invalid_request",
+      });
+    else {
+      assert.equal(request.confirmation.operation, request.operation);
+      assert.equal(request.confirmation.runId, request.runId);
+      if (expected.category !== "invalid_request")
+        assert.equal(request.confirmation.label, request.agent);
+    }
     assert.ok(request.requestedAt && request.expiresAt && request.requester);
     assert.ok(JSON.stringify(request).length <= MAX_BYTES);
+    // Version 1 never gains a required field: the tolerant shape is version 1,
+    // and only a version this build cannot speak is refused.
+    if (request.version !== 1)
+      assert.deepEqual(expected, {
+        outcome: "refused",
+        category: "invalid_request",
+      });
+    const result = answers.get(request.requestId);
+    if (!result) continue;
+    assert.equal(result.operation, request.operation);
+    assert.equal(result.outcome, expected.outcome);
+    assert.equal(result.category, expected.category);
   }
+  assert.ok(fixture.requests.some(({ request }) => request.version === 1));
   for (const { result } of fixture.results) {
-    const request = byId.get(result.requestId);
-    assert.ok(request, `no fixture request for result ${result.requestId}`);
+    assert.ok(
+      fixture.requests.some(({ request }) => request.requestId === result.requestId),
+      `no fixture request for result ${result.requestId}`,
+    );
     assert.equal(result.version, 1);
     assert.match(result.requestId, UUID);
-    assert.equal(result.operation, request.operation);
     assert.ok(OUTCOMES.includes(result.outcome));
-    assert.equal(result.outcome === "refused", typeof result.category === "string");
+    assert.equal(
+      result.outcome === "refused",
+      typeof result.category === "string",
+    );
     assert.ok(result.message && result.completedAt);
     assert.ok(Array.isArray(result.effects));
     assert.ok(JSON.stringify(result).length <= MAX_BYTES);
