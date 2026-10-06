@@ -60,6 +60,19 @@ refusals, plus carried-background-result settlement contract tests. No live reco
 4. Sweep worker prompt snapshots on process exit and at session shutdown (the temp root is never swept).
 5. Verify owner-routed control integration after reload, only with explicit approval for destructive smoke.
 6. The agent-definition / handoff-schema / system-prompt workshop, deferred.
+7. Make forking a session safe for herdsman and background tasks (Pi-native feature, currently unsupported by
+   design). A fork replays the parent's session branch, so extension state that lives in branch entries is
+   inherited as if the fork had produced it. Known so far: background-task snapshots came back as live in
+   the child (partly mitigated in `0c4af53a`: foreign-session terminal snapshots restore as delivered and
+   announced results are no longer advertised, but the restore still rewrites their `sessionId`, so the
+   fork cannot tell them from its own). Not yet audited: herdsman owner state, retained-worker ownership,
+   delivery ledger, result refs and the session-metadata record in a fork. Needed: classify every
+   branch-resident extension entry as session-bound or inheritable, bind session-bound ones to the
+   session id that wrote them, ignore foreign ones on restore, and add a fork regression per extension.
+   Until then, do not fork a lead that owns workers or running tasks.
+8. `herdsman-child-command` (configurable child launch command, then a probe-gated `pane run` start path)
+   goes next because it changes the Radar contract; the upstream pre-extraction alignment follows it.
+   Both edit `index.ts` and `herdr.ts`, so they run one after the other, not in parallel.
 
 ## Hygiene
 
