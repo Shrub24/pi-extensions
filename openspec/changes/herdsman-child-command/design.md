@@ -151,6 +151,17 @@ the existing shape: a structured `OperationError` naming the stage, wrapped in
 constraint above, stage 2 adds **no** `report-agent` / `report-agent-session` /
 `release-agent` call: readiness is read from Herdr, never reported to it by Herdsman.
 
+**Implemented as a registration poll.** Stage 2 accepts readiness as the record Herdr reports for
+the pane once it carries a reported session or a known status (`idle` / `working` /
+`blocked` / `done`), then applies the alias and verifies it. The probe's
+`agent wait <pane> --until idle` gate was rejected: a delegated child receives its
+assignment at startup, so it is usually already `working` when the wait is issued and the
+wait would spend the startup budget on the first assignment instead of on startup. Live on
+this machine the record arrived with `agent_session` present while `agent_status` was still
+`unknown`, so the session half of the predicate is the one that fires first.
+[ADR 0029](../../../pi-herdsman/docs/adr/0029-run-a-configured-child-in-its-pane.md)
+records the decision, the quoting rule and the rejected alternatives.
+
 ### D6. argv handling has a script fallback
 
 If `pane run` takes a single shell line, Herdsman must quote the full child argv itself; if

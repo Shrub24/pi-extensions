@@ -13,7 +13,9 @@ import {
   readFileSync,
   readSync,
   realpathSync,
+  rmSync,
   statSync,
+  writeFileSync,
 } from "node:fs";
 import { createConnection, type Socket } from "node:net";
 import { delimiter, isAbsolute, join, resolve } from "node:path";
@@ -1202,7 +1204,6 @@ export async function startHerdrAgent(
       createdTab,
       launchMayHaveStarted: false,
     };
-    let started: any;
     stage = "pane_readiness";
     try {
       await waitForShellMarker(
@@ -1257,91 +1258,19 @@ export async function startHerdrAgent(
         error("start", `tab ${tab.tab_id} topology changed before launch`);
     }
     stage = "agent_start";
-    // ponytail: temporary Herdr #3208 workaround.
-    // Remove once the supported Herdr minimum waits through fresh-shell prompt children.
-    const retryDeadline = Math.min(
-      Date.now() + FRESH_PANE_BUSY_RETRY_TIMEOUT,
-      startupDeadline - START_DIAGNOSTIC_TIMEOUT,
-    );
-    for (;;) {
-      const remaining = startupCallTimeout(startupDeadline, childTimeout);
-      if (remaining < HERDR_START_TIMEOUT_MIN)
-        error("start", "startup deadline exhausted before agent start");
-      try {
-        started = await runHerdr(
-          pi,
-          ctx,
-          [
-            "agent",
-            "start",
-            attempt.herdrAgent,
-            "--kind",
-            "pi",
-            "--pane",
-            paneId,
-            "--timeout",
-            String(Math.min(remaining, childTimeout)),
-            "--",
-            ...(options.extensionPath
-              ? ["--extension", options.extensionPath]
-              : []),
-            ...herdrReporterArgs(),
-            ...(options.agentArgs ?? []),
-          ],
-          {
-            signal: options.signal,
-            // Outlive Herdr's own readiness deadline by the diagnostic window so
-            // its structured failure is the one reported. With the identical
-            // value this command's kill always won the race, and "Herdr command
-            // was killed" replaced Herdr's reason.
-            timeout:
-              Math.min(remaining, childTimeout) + START_DIAGNOSTIC_TIMEOUT,
-          },
-        );
-        attempt.launchMayHaveStarted = true;
-        break;
-      } catch (failure) {
-        const busy =
-          failure instanceof OperationError &&
-          failure.detail.details?.herdrCode === "agent_pane_busy";
-        if (busy && Date.now() < retryDeadline) {
-          retryAttempted = true;
-          const pane = (
-            await runHerdr(pi, ctx, ["pane", "get", paneId], {
-              signal: options.signal,
-              timeout: startupCallTimeout(startupDeadline),
-            })
-          ).pane;
-          if (!matchesAttemptPane(pane, attempt))
-            error(
-              "start",
-              `pane ${paneId} identity changed during startup retry`,
-            );
-          const remainingRetry = retryDeadline - Date.now();
-          if (remainingRetry > 0)
-            await sleep(Math.min(POLL_INTERVAL, remainingRetry), undefined, {
-              signal: options.signal,
-            });
-          if (Date.now() >= retryDeadline) throw failure;
-          continue;
-        }
-        if (!busy) attempt.launchMayHaveStarted = true;
-        if (isUnstructuredResultFailure(failure))
-          throw withStartupDiagnostic(
-            failure,
-            await captureStartupDiagnostic(
-              pi,
-              ctx,
-              paneId,
-              startupDeadline,
-              options.signal,
-            ),
-          );
-        throw failure;
-      }
-    }
+    const agent = await startChildAgent(pi, ctx, {
+      paneId,
+      attempt,
+      extensionPath: options.extensionPath,
+      agentArgs: options.agentArgs ?? [],
+      childTimeout,
+      deadline: startupDeadline,
+      signal: options.signal,
+      onRetry: () => {
+        retryAttempted = true;
+      },
+    });
     stage = "agent_result";
-    const agent = started.agent;
     const session = sessionIdentity(agent.agent_session);
     const reference = session
       ? session.kind === "id"
@@ -1474,87 +1403,19 @@ export async function startHerdrAgentInPane(
       error("start", `pane ${options.paneId} identity changed before launch`);
 
     stage = "agent_start";
-    const retryDeadline = Math.min(
-      Date.now() + FRESH_PANE_BUSY_RETRY_TIMEOUT,
-      deadline - START_DIAGNOSTIC_TIMEOUT,
-    );
-    let started: any;
-    for (;;) {
-      const remaining = startupCallTimeout(deadline, childTimeout);
-      if (remaining < HERDR_START_TIMEOUT_MIN)
-        error("start", "startup deadline exhausted before agent start");
-      try {
-        started = await runHerdr(
-          pi,
-          ctx,
-          [
-            "agent",
-            "start",
-            attempt.herdrAgent,
-            "--kind",
-            "pi",
-            "--pane",
-            options.paneId,
-            "--timeout",
-            String(Math.min(remaining, childTimeout)),
-            "--",
-            ...(options.extensionPath
-              ? ["--extension", options.extensionPath]
-              : []),
-            ...herdrReporterArgs(),
-            ...(options.agentArgs ?? []),
-          ],
-          {
-            signal: options.signal,
-            timeout:
-              Math.min(remaining, childTimeout) + START_DIAGNOSTIC_TIMEOUT,
-          },
-        );
-        attempt.launchMayHaveStarted = true;
-        break;
-      } catch (failure) {
-        const busy =
-          failure instanceof OperationError &&
-          failure.detail.details?.herdrCode === "agent_pane_busy";
-        if (busy && Date.now() < retryDeadline) {
-          retryAttempted = true;
-          const observed = (
-            await runHerdr(pi, ctx, ["pane", "get", options.paneId], {
-              signal: options.signal,
-              timeout: startupCallTimeout(deadline),
-            })
-          ).pane;
-          if (!matchesAttemptPane(observed, attempt))
-            error(
-              "start",
-              `pane ${options.paneId} identity changed during startup retry`,
-            );
-          const remainingRetry = retryDeadline - Date.now();
-          if (remainingRetry > 0)
-            await sleep(Math.min(POLL_INTERVAL, remainingRetry), undefined, {
-              signal: options.signal,
-            });
-          if (Date.now() >= retryDeadline) throw failure;
-          continue;
-        }
-        if (!busy) attempt.launchMayHaveStarted = true;
-        if (isUnstructuredResultFailure(failure))
-          throw withStartupDiagnostic(
-            failure,
-            await captureStartupDiagnostic(
-              pi,
-              ctx,
-              options.paneId,
-              deadline,
-              options.signal,
-            ),
-          );
-        throw failure;
-      }
-    }
-
+    const agent = await startChildAgent(pi, ctx, {
+      paneId: options.paneId,
+      attempt,
+      extensionPath: options.extensionPath,
+      agentArgs: options.agentArgs ?? [],
+      childTimeout,
+      deadline,
+      signal: options.signal,
+      onRetry: () => {
+        retryAttempted = true;
+      },
+    });
     stage = "agent_result";
-    const agent = started.agent;
     const session = sessionIdentity(agent.agent_session);
     attempt.herdrAgent = agent.name ?? attempt.herdrAgent;
     attempt.sessionReference = session
@@ -1571,6 +1432,277 @@ export async function startHerdrAgentInPane(
   } finally {
     release();
   }
+}
+
+/**
+ * One managed launch step: the pane the child belongs to, the attempt record
+ * rollback is driven by, and the startup budget the step must stay inside.
+ */
+type ChildLaunchStep = {
+  paneId: string;
+  attempt: StartedHerdrAgent;
+  extensionPath?: string;
+  agentArgs: readonly string[];
+  childTimeout: number;
+  deadline: number;
+  signal?: AbortSignal;
+};
+
+function isHerdrCode(value: unknown, code: string): boolean {
+  return (
+    value instanceof OperationError &&
+    value.detail.details?.herdrCode === code
+  );
+}
+
+/**
+ * Starts the managed child in its pane and returns the agent record Herdr
+ * reports for it: the operator's command typed into the pane when
+ * `PI_HERDSMAN_CHILD_COMMAND` is set, Herdr's own `agent start` otherwise. An
+ * invalid value fails the launch here rather than falling back to Herdr's
+ * canonical executable.
+ */
+async function startChildAgent(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  options: ChildLaunchStep & { onRetry: () => void },
+): Promise<HerdrRecord> {
+  const command = resolveChildCommand();
+  if (command.kind === "invalid") error("start", command.reason);
+  return command.kind === "resolved"
+    ? await runChildCommand(pi, ctx, { ...options, command: command.command })
+    : await startHerdrProcess(pi, ctx, options);
+}
+
+/**
+ * Starts the configured child by typing its command into the pane, then takes
+ * Herdr's alias over the child's own registration and returns the record Herdr
+ * reports for that alias. Herdr only registers the agent once the child
+ * reports itself, so the alias cannot be applied before the record exists
+ * (probe P2/P3 in `openspec/changes/herdsman-child-command/probe.md`).
+ */
+async function runChildCommand(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  options: ChildLaunchStep & { command: string },
+): Promise<HerdrRecord> {
+  const { attempt, deadline, paneId, signal } = options;
+  const plan = childLaunchPlan(options.command, [
+    ...(options.extensionPath
+      ? ["--extension", options.extensionPath]
+      : []),
+    ...herdrReporterArgs(),
+    ...options.agentArgs,
+  ]);
+  try {
+    try {
+      // The pane is a proven shell by now and `pane run` types this line into it.
+      // A delivered line is never typed twice, so the step has no retry.
+      await runHerdr(pi, ctx, ["pane", "run", paneId, plan.line], {
+        signal,
+        timeout: startupCallTimeout(deadline, options.childTimeout),
+        noResult: true,
+      });
+    } finally {
+      // A failed `pane run` may still have delivered the line, so ownership is
+      // claimed conservatively; rollback then refuses an unproven pane instead
+      // of closing one it does not own.
+      attempt.launchMayHaveStarted = true;
+    }
+    await waitForChildRegistration(pi, ctx, options);
+    const alias = attempt.herdrAgent;
+    await runHerdr(pi, ctx, ["agent", "rename", paneId, alias], {
+      signal,
+      timeout: startupCallTimeout(deadline, options.childTimeout),
+      noResult: true,
+    });
+    const agent = (
+      await runHerdr(pi, ctx, ["agent", "get", alias], {
+        signal,
+        timeout: startupCallTimeout(deadline),
+      })
+    ).agent;
+    if (agent?.name !== alias || agent.pane_id !== paneId)
+      error(
+        "start",
+        `child in pane ${paneId} did not take the Herdsman alias ${alias}`,
+      );
+    return agent;
+  } finally {
+    // The scope covers delivery too: a `pane run` that throws before the child
+    // has read the script must not leave it behind.
+    plan.cleanup();
+  }
+}
+
+/**
+ * Waits inside the startup budget for the pane's agent record to appear. The
+ * child registers itself, so `agent_not_found` is its expected state for the
+ * first few hundred milliseconds and is the only failure retried here.
+ */
+async function waitForChildRegistration(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  options: ChildLaunchStep,
+): Promise<HerdrRecord> {
+  const { deadline, paneId, signal } = options;
+  for (;;) {
+    const remaining = deadline - START_DIAGNOSTIC_TIMEOUT - Date.now();
+    if (remaining <= 0)
+      error("start", await unregisteredChildMessage(pi, ctx, paneId, signal));
+    let agent: HerdrRecord | undefined;
+    try {
+      agent = (
+        await runHerdr(pi, ctx, ["agent", "get", paneId], {
+          signal,
+          timeout: Math.min(remaining, options.childTimeout),
+        })
+      ).agent;
+    } catch (failure) {
+      if (!isHerdrCode(failure, "agent_not_found")) throw failure;
+    }
+    if (isRegisteredAgent(agent)) return agent!;
+    await sleep(Math.min(POLL_INTERVAL, remaining), undefined, { signal });
+  }
+}
+
+/** The states Herdr reports for an agent it has observed in a pane. */
+const LIVE_AGENT_STATES: ReadonlySet<unknown> = new Set([
+  "idle",
+  "working",
+  "blocked",
+  "done",
+]);
+
+/**
+ * A direct launch that never appears in Herdr's registry reports the pane's
+ * recent output, as the other startup failures do, because the reason the child
+ * died is usually only visible there.
+ */
+async function unregisteredChildMessage(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  paneId: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const outcome = await captureStartupDiagnostic(
+    pi,
+    ctx,
+    paneId,
+    Date.now() + START_DIAGNOSTIC_TIMEOUT,
+    signal,
+  );
+  return (
+    `child in pane ${paneId} did not register with Herdr` +
+    (outcome.status === "captured"
+      ? `\nPane diagnostic:\n${outcome.snapshot}`
+      : "")
+  );
+}
+
+/**
+ * Herdr reports a status or a session for a pane only after it has observed the
+ * child there: the reporter extension supplies the session, and Herdr's own
+ * detection supplies the status when no reporter is loaded.
+ */
+function isRegisteredAgent(agent: HerdrRecord | undefined): boolean {
+  return (
+    !!agent &&
+    (sessionIdentity(agent.agent_session) !== undefined ||
+      LIVE_AGENT_STATES.has(agent.agent_status))
+  );
+}
+
+/**
+ * Herdr's own start path, kept for a launch with no configured command.
+ */
+async function startHerdrProcess(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  options: ChildLaunchStep & { onRetry: () => void },
+): Promise<HerdrRecord> {
+  const { attempt, childTimeout, deadline, paneId, signal } = options;
+  const alias = attempt.herdrAgent;
+  let started: HerdrRecord | undefined;
+  // ponytail: temporary Herdr #3208 workaround.
+  // Remove once the supported Herdr minimum waits through fresh-shell prompt children.
+  const retryDeadline = Math.min(
+    Date.now() + FRESH_PANE_BUSY_RETRY_TIMEOUT,
+    deadline - START_DIAGNOSTIC_TIMEOUT,
+  );
+  for (;;) {
+    const remaining = startupCallTimeout(deadline, childTimeout);
+    if (remaining < HERDR_START_TIMEOUT_MIN)
+      error("start", "startup deadline exhausted before agent start");
+    try {
+      started = await runHerdr(
+        pi,
+        ctx,
+        [
+          "agent",
+          "start",
+          alias,
+          "--kind",
+          "pi",
+          "--pane",
+          paneId,
+          "--timeout",
+          String(Math.min(remaining, childTimeout)),
+          "--",
+          ...(options.extensionPath
+            ? ["--extension", options.extensionPath]
+            : []),
+          ...herdrReporterArgs(),
+          ...options.agentArgs,
+        ],
+        {
+          signal,
+          // Outlive Herdr's own readiness deadline by the diagnostic window so
+          // its structured failure is the one reported. With the identical
+          // value this command's kill always won the race, and "Herdr command
+          // was killed" replaced Herdr's reason.
+          timeout:
+            Math.min(remaining, childTimeout) + START_DIAGNOSTIC_TIMEOUT,
+        },
+      );
+      attempt.launchMayHaveStarted = true;
+      break;
+    } catch (failure) {
+      const busy = isHerdrCode(failure, "agent_pane_busy");
+      if (busy && Date.now() < retryDeadline) {
+        options.onRetry();
+        const pane = (
+          await runHerdr(pi, ctx, ["pane", "get", paneId], {
+            signal,
+            timeout: startupCallTimeout(deadline),
+          })
+        ).pane;
+        if (!matchesAttemptPane(pane, attempt))
+          error("start", `pane ${paneId} identity changed during startup retry`);
+        const remainingRetry = retryDeadline - Date.now();
+        if (remainingRetry > 0)
+          await sleep(Math.min(POLL_INTERVAL, remainingRetry), undefined, {
+            signal,
+          });
+        if (Date.now() >= retryDeadline) throw failure;
+        continue;
+      }
+      if (!busy) attempt.launchMayHaveStarted = true;
+      if (isUnstructuredResultFailure(failure))
+        throw withStartupDiagnostic(
+          failure,
+          await captureStartupDiagnostic(
+            pi,
+            ctx,
+            paneId,
+            deadline,
+            signal,
+          ),
+        );
+      throw failure;
+    }
+  }
+  return started.agent;
 }
 
 function validateEnvironment(
@@ -1625,6 +1757,64 @@ function executableCommand(
       if (isExecutableFile(candidate)) return candidate;
     }
   return undefined;
+}
+
+/** The one shell line `pane run` types into a pane, and how to undo its scaffold. */
+export type ChildLaunch = Readonly<{
+  line: string;
+  cleanup: () => void;
+}>;
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+/**
+ * The one shell line `pane run` types into a pane. Herdr joins its argv with
+ * spaces and hands the result to the pane's interactive shell unquoted, so every
+ * element is single-quoted here and a command or argument holding a space, a
+ * quote or a metacharacter still reaches the child exactly as passed (probe P4
+ * in `openspec/changes/herdsman-child-command/probe.md`).
+ */
+export function childLaunchLine(
+  command: string,
+  args: readonly string[],
+): string {
+  return [command, ...args].map(shellQuote).join(" ");
+}
+
+/**
+ * What one launch types into its pane. A newline arrives as a second input line,
+ * and an interactive shell's plugins can refuse to submit that, leaving the pane
+ * holding an unterminated command instead of running it, so an argument holding
+ * a newline runs from a script file: the typed line is then one
+ * metacharacter-free path and the argv lives in the file (probe P4j, design D6).
+ */
+export function childLaunchPlan(
+  command: string,
+  args: readonly string[],
+): ChildLaunch {
+  const argv = [command, ...args];
+  if (!argv.some((value) => /[\r\n]/.test(value)))
+    return { line: childLaunchLine(command, args), cleanup: () => {} };
+  const root = join(herdsmanTempRoot(), "child-launch");
+  // The suite mocks `node:fs` with a named-export allowlist, so the private
+  // directory is created from the names it already provides.
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  const directory = join(root, `launch-${randomUUID()}`);
+  mkdirSync(directory, { mode: 0o700 });
+  const path = join(directory, "launch.sh");
+  // `exec` keeps the child the pane's only foreground process, as Herdr's own
+  // start leaves it.
+  writeFileSync(path, `#!/bin/sh\nexec ${argv.map(shellQuote).join(" ")}\n`, {
+    mode: 0o700,
+  });
+  // The pane's shell reads the script before the child can register, so the
+  // launch that owns the file retires it once the launch is over.
+  return {
+    line: childLaunchLine(path, []),
+    cleanup: () => rmSync(directory, { recursive: true, force: true }),
+  };
 }
 
 export function resolveChildCommand(

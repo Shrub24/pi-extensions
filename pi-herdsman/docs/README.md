@@ -87,6 +87,8 @@ implementation, including the upstream behavior a fork decision supersedes.
 - [0025 Record session classification in its own versioned entry](adr/0025-record-session-classification-in-its-own-entry.md)
 - [0026 Store fresh managed sessions under the target working directory](adr/0026-store-fresh-managed-sessions-under-the-target-cwd.md)
 - [0027 Ignore a foreign session record before validating it](adr/0027-ignore-a-foreign-session-record-before-validating-it.md)
+- [0028 Compact a managed worker's context at a fixed budget](adr/0028-compact-a-managed-workers-context-at-a-fixed-budget.md)
+- [0029 Run a configured child in its pane](adr/0029-run-a-configured-child-in-its-pane.md)
 
 The repository directories are organized by content type. The index is
 task-first so readers do not need to understand that structure before finding

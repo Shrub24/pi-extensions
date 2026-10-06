@@ -504,7 +504,7 @@ test("a control restart relaunches an idle retained worker and refuses a busy on
   }
 });
 
-test("a control restart reuses its pane and applies no changed child command", async (t) => {
+test("a control restart reuses its pane and applies the current child command", async (t) => {
   const worker = controlWorkerFixture("restart-command");
   try {
     await worker.open();
@@ -523,21 +523,26 @@ test("a control restart reuses its pane and applies no changed child command", a
       assert.equal(writeControlRequest(request, LEAD_SESSION_ID).ok, true);
       const result = await answered(t, request.requestId);
       assert.equal(result.outcome, "restarted", JSON.stringify(result));
-      const started = worker.starts.at(-1)!;
-      assert.ok(started, "the worker was relaunched");
+      const after = worker.pi.calls.slice(callsBeforeRestart);
       assert.equal(
-        started.some((arg) =>
-          arg.startsWith("PI_HERDSMAN_CHILD_COMMAND="),
-        ),
+        after.filter(
+          (args) =>
+            args[0] === "pane" &&
+            args[1] === "run" &&
+            String(args[3]).startsWith(`'${command}'`),
+        ).length,
+        1,
+        "the current command runs in the pane the restart reused",
+      );
+      assert.equal(
+        after.some((args) => args[0] === "agent" && args[1] === "start"),
         false,
-        "stage 1 applies a changed command only where the launch creates the pane",
+        "the restart no longer asks Herdr for its canonical executable",
       );
       assert.deepEqual(
-        worker.pi.calls
-          .slice(callsBeforeRestart)
-          .filter((args) => args[0] === "tab" && args[1] === "create"),
+        after.filter((args) => args[0] === "tab" && args[1] === "create"),
         [],
-        "a restart reuses the pane the command was not applied to",
+        "a restart reuses the pane the command was typed into",
       );
     } finally {
       delete process.env.PI_HERDSMAN_CHILD_COMMAND;

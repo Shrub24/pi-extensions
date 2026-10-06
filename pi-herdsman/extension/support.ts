@@ -2489,6 +2489,41 @@ export function startupExecutor(
   let stopped = false;
   let tabClosed = false;
   let paneClosed = false;
+  // The child a direct launch (`pane run`) started, as Herdr sees it: it
+  // registers itself, and stays nameless until `agent rename` applies the
+  // Herdsman alias.
+  let childLaunched = false;
+  let childName: string | undefined;
+  const READINESS_MARKER = "echo __PI_HERDSMAN_READY_";
+  const registerChild = () => {
+    writeAgentState(mailbox, {
+      version: 5,
+      runId,
+      ownerSessionId,
+      workspaceId: WORKSPACE,
+      agentLabel: label,
+      paneId: activePaneId,
+      piSessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      piSessionFile: sessionFile,
+      agentDefinition: "agent",
+      cwd: testCwd,
+      updatedAt: Date.now(),
+    });
+  };
+  const childAgent = () => ({
+    ...(childName ? { name: childName } : {}),
+    pane_id: activePaneId,
+    tab_id: "startup-tab",
+    workspace_id: WORKSPACE,
+    cwd: testCwd,
+    agent_status: "idle",
+    agent_session: {
+      source: "herdr:pi",
+      agent: "pi",
+      kind: "id",
+      value: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+    },
+  });
   const emptyList = () => {
     const value = JSON.parse(listResponse(label));
     value.agents = [];
@@ -2817,7 +2852,42 @@ export function startupExecutor(
         args[0] === "pane" &&
         (args[1] === "run" || args[1] === "wait-output")
       ) {
+        // `waitForShellMarker` types its readiness marker; any other line is a
+        // direct child launch, whose process registers itself with Herdr
+        // (probe P1 in `openspec/changes/herdsman-child-command/probe.md`).
+        if (
+          args[1] === "run" &&
+          !String(args[3] ?? "").startsWith(READINESS_MARKER)
+        ) {
+          childLaunched = true;
+          childName = undefined;
+          registerChild();
+        }
         return { stdout: "{}", stderr: "", code: 0 };
+      }
+      if (args[0] === "agent" && args[1] === "rename") {
+        // Renaming an unregistered target is Herdr's `agent_not_found`, which
+        // is why the direct launch polls for the record first (probe P2).
+        if (!childLaunched)
+          return {
+            stdout: JSON.stringify({
+              error: {
+                code: "agent_not_found",
+                message: `agent target ${args[2]} not found`,
+              },
+            }),
+            stderr: "",
+            code: 1,
+          };
+        childName = args[3];
+        return {
+          stdout: JSON.stringify({
+            id: AGENT_ID,
+            result: { agent: childAgent() },
+          }),
+          stderr: "",
+          code: 0,
+        };
       }
       if (isAgentList(args))
         return {
@@ -2881,16 +2951,7 @@ export function startupExecutor(
           value: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
         },
       };
-      writeAgentState(mailbox, { version: 5, runId,
-      ownerSessionId,
-      workspaceId: WORKSPACE,
-      agentLabel: label,
-      paneId: activePaneId,
-      piSessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-      piSessionFile: sessionFile,
-      agentDefinition: "agent",
-      cwd: testCwd,
-      updatedAt: Date.now(), });
+      registerChild();
       return {
         stdout: JSON.stringify({
           id: AGENT_ID,

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import fs, {
   mkdirSync,
@@ -45,7 +46,10 @@ import {
   startupTimeoutBudget,
   structuredTopologyEnvironment,
   resolveChildCommand,
+  childLaunchLine,
+  childLaunchPlan,
   type HerdrStartPlacement,
+  type StartedHerdrAgent,
 } from "./herdr.ts";
 import { claimProcessLock } from "./lock.ts";
 import { OperationError } from "./errors.ts";
@@ -153,6 +157,464 @@ test("the configured child command resolves or is refused", () => {
     else environment.PATH = previous.path;
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+type DirectChildLaunchKind =
+  | "success"
+  | "never-registers"
+  | "alias-mismatch"
+  | "run-failure"
+  | "legacy";
+
+/**
+ * One fresh-pane launch against a fixture that models the direct start path:
+ * the child registers itself after `pane run` (its first polls answer
+ * `agent_not_found`) and `agent rename` applies the Herdsman alias, as the
+ * recorded probe shows for herdr 0.9.3 (probe P1-P3 in
+ * `openspec/changes/herdsman-child-command/probe.md`).
+ */
+async function directChildLaunchCase(
+  kind: DirectChildLaunchKind,
+  options: { bareName?: boolean; args?: string[] } = {},
+) {
+  const environment = globalThis.process.env;
+  const previous = {
+    workspace: environment.HERDR_WORKSPACE_ID,
+    command: environment.PI_HERDSMAN_CHILD_COMMAND,
+    path: environment.PATH,
+  };
+  environment.HERDR_WORKSPACE_ID = "case-workspace";
+  const directory = mkdtempSync(join(tmpdir(), "pi-herdsman-direct-child-"));
+  const command = join(directory, "pi-bolt-child");
+  writeFileSync(command, "#!/bin/sh\n", { mode: 0o755 });
+  if (options.bareName) environment.PATH = directory;
+  if (kind === "legacy") delete environment.PI_HERDSMAN_CHILD_COMMAND;
+  else
+    environment.PI_HERDSMAN_CHILD_COMMAND = options.bareName
+      ? "pi-bolt-child"
+      : command;
+  const cwd = "/tmp/case-agent";
+  const calls: string[][] = [];
+  const timeouts: (number | undefined)[] = [];
+  const originalDateNow = Date.now;
+  let now = 1_000_000;
+  Date.now = () => now;
+  let name: string | undefined;
+  let closed = false;
+  const record = (observed?: string) => ({
+    ...(observed ? { name: observed } : {}),
+    pane_id: "case-pane",
+    tab_id: "case-tab",
+    workspace_id: "case-workspace",
+    cwd,
+    agent_status: "idle",
+    agent_session: {
+      source: "herdr:pi",
+      agent: "pi",
+      kind: "id",
+      value: "case-session",
+    },
+  });
+  const response = (value: unknown) => ({
+    code: 0,
+    stdout: JSON.stringify({ id: 1, result: value }),
+    stderr: "",
+  });
+  const notFound = () => ({
+    code: 1,
+    stdout: JSON.stringify({
+      error: {
+        code: "agent_not_found",
+        message: "agent target case-pane not found",
+      },
+    }),
+    stderr: "",
+  });
+  const pi = {
+    exec: async (_command: string, args: string[], execOptions?: any) => {
+      calls.push(args);
+      timeouts.push(execOptions?.timeout);
+      const key = args.slice(0, 2).join(" ");
+      if (key === "tab list")
+        return closed
+          ? response({ tabs: [] })
+          : response({
+              tabs: [
+                { tab_id: "case-tab", label: "agents", workspace_id: "case-workspace" },
+              ],
+            });
+      if (key === "tab create")
+        return response({
+          tab: { tab_id: "case-tab", label: "agents" },
+          root_pane: { pane_id: "case-pane", terminal_id: "case-terminal" },
+        });
+      if (key === "pane run") {
+        if (String(args[3]).startsWith("echo __PI_HERDSMAN_READY_"))
+          return response({});
+        return kind === "run-failure"
+          ? { code: 1, stdout: "", stderr: "pane run failed" }
+          : { code: 0, stdout: "{}", stderr: "" };
+      }
+      if (key === "pane wait-output") return response({});
+      if (key === "pane process-info")
+        return response({
+          process_info: {
+            pane_id: "case-pane",
+            shell_pid: 12,
+            foreground_process_group_id: 12,
+            foreground_processes: [{ pid: 12, argv0: "/bin/zsh" }],
+          },
+        });
+      if (key === "pane list")
+        return response({
+          panes: closed
+            ? []
+            : [
+                {
+                  pane_id: "case-pane",
+                  workspace_id: "case-workspace",
+                  tab_id: "case-tab",
+                  terminal_id: "case-terminal",
+                  agent_status: "unknown",
+                  cwd,
+                  foreground_cwd: cwd,
+                },
+              ],
+        });
+      if (key === "pane get")
+        return response({
+          pane: {
+            pane_id: "case-pane",
+            terminal_id: "case-terminal",
+            workspace_id: "case-workspace",
+            tab_id: "case-tab",
+            cwd,
+          },
+        });
+      if (key === "pane read")
+        return {
+          code: 0,
+          stdout: "$ pi-bolt-child --no-extensions\ncommand not found",
+          stderr: "",
+        };
+      if (key === "agent list") return response({ agents: [] });
+      if (key === "agent start") {
+        name = args[2];
+        return response({ agent: record(name) });
+      }
+      if (key === "agent get") {
+        if (args[2] === "case-pane") {
+          if (kind === "never-registers") {
+            now += 20_000;
+            return notFound();
+          }
+          if (kind === "alias-mismatch")
+            return response({ agent: record("stale-agent") });
+          return response({ agent: record(name) });
+        }
+        return response({
+          agent: record(kind === "alias-mismatch" ? "stale-agent" : args[2]),
+        });
+      }
+      if (key === "agent rename") {
+        if (kind !== "alias-mismatch") name = args[3];
+        return response({ agent: record(name) });
+      }
+      if (key === "tab close" || key === "pane close") {
+        closed = true;
+        return response({});
+      }
+      throw new Error("unexpected Herdr call: " + args.join(" "));
+    },
+  } as any;
+  try {
+    const outcome = await startHerdrAgent(pi, { cwd } as any, {
+      label: "case-agent",
+      runId: "case-run",
+      cwd,
+      placement: { kind: "tab", label: "agents" },
+      extensionPath: "/tmp/case-extension.ts",
+      agentArgs: options.args ?? ["--model", "case-model"],
+      timeoutMs: 30_000,
+    }).then(
+      (attempt: StartedHerdrAgent) => ({ attempt, failure: undefined }),
+      (failure: unknown) => ({ attempt: undefined, failure }),
+    );
+    return { ...outcome, calls, timeouts, pi, command, directory, cwd } as {
+      attempt: StartedHerdrAgent | undefined;
+      failure: unknown;
+      calls: string[][];
+      timeouts: (number | undefined)[];
+      pi: any;
+      command: string;
+      directory: string;
+      cwd: string;
+    };
+  } finally {
+    Date.now = originalDateNow;
+    if (previous.workspace === undefined) delete environment.HERDR_WORKSPACE_ID;
+    else environment.HERDR_WORKSPACE_ID = previous.workspace;
+    if (previous.path === undefined) delete environment.PATH;
+    else environment.PATH = previous.path;
+    if (previous.command === undefined)
+      delete environment.PI_HERDSMAN_CHILD_COMMAND;
+    else environment.PI_HERDSMAN_CHILD_COMMAND = previous.command;
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+const isLaunchRun = (args: string[]) =>
+  args[0] === "pane" &&
+  args[1] === "run" &&
+  !String(args[3]).startsWith("echo __PI_HERDSMAN_READY_");
+
+const launchRuns = (calls: string[][]) => calls.filter(isLaunchRun);
+
+test("a configured child command runs in the pane and takes the Herdsman alias", async () => {
+  const result = await directChildLaunchCase("success", { bareName: true });
+  assert.equal(result.failure, undefined);
+  const attempt = result.attempt!;
+  const alias = herdrAgentAlias("case-workspace", "case-agent", "case-run");
+  assert.equal(attempt.herdrAgent, alias);
+  assert.equal(attempt.paneId, "case-pane");
+  assert.equal(attempt.launchMayHaveStarted, true);
+  assert.equal(attempt.shellProcess?.shell_pid, 12);
+  assert.deepEqual(attempt.sessionReference, { id: "case-session" });
+
+  // The command resolved from PATH is what runs, with every argument quoted
+  // into the one shell line `pane run` types.
+  const launches = launchRuns(result.calls);
+  assert.equal(launches.length, 1);
+  assert.equal(
+    launches[0]![3],
+    childLaunchLine(result.command, [
+      "--extension",
+      "/tmp/case-extension.ts",
+      ...(herdrReporterExtensionPath()
+        ? ["--extension", herdrReporterExtensionPath()!]
+        : []),
+      "--model",
+      "case-model",
+    ]),
+  );
+  assert.ok(
+    result.calls.some((args) => args[0] === "agent" && args[1] === "start") ===
+      false,
+    "Herdr is never asked to start its canonical executable",
+  );
+
+  // Readiness is proven before the run, and the alias is applied only after the
+  // child's own registration; nothing is reported to Herdr by Herdsman.
+  const marker = result.calls.findIndex(
+    (args) => args[0] === "pane" && args[1] === "run",
+  );
+  const launch = result.calls.findIndex(isLaunchRun);
+  const shell = result.calls.findIndex(
+    (args) => args[0] === "pane" && args[1] === "process-info",
+  );
+  const registration = result.calls.findIndex(
+    (args) => args[0] === "agent" && args[1] === "get" && args[2] === "case-pane",
+  );
+  const rename = result.calls.findIndex(
+    (args) => args[0] === "agent" && args[1] === "rename",
+  );
+  assert.ok(marker >= 0 && shell > marker, "the pane is a proven shell first");
+  assert.ok(shell < launch, "the shell process is captured before the run");
+  assert.ok(registration > launch, "the record is polled for after the run");
+  assert.ok(rename > registration, "the alias follows registration");
+  assert.equal(
+    result.calls.some((args) =>
+      args.some((arg) => /report-agent|release-agent/.test(arg)),
+    ),
+    false,
+    "Herdsman never reports agent state to Herdr",
+  );
+  const budget = result.timeouts[launch];
+  assert.ok(budget !== undefined && budget <= 28_000 && budget > 27_000);
+});
+
+test("an argument holding a newline is run from a script the pane types as one line", async () => {
+  const result = await directChildLaunchCase("success", {
+    args: ["--system-prompt", "first line\nsecond line"],
+  });
+  assert.equal(result.failure, undefined);
+  const launches = launchRuns(result.calls);
+  assert.equal(launches.length, 1);
+  const typed = String(launches[0]![3]);
+  // A second input line can leave the pane's shell holding an unterminated
+  // command instead of running it, so a newline never reaches the pane.
+  assert.equal(/[\r\n]/.test(typed), false);
+  assert.match(typed, /^'.*\/child-launch\/launch-[^']*\/launch\.sh'$/);
+  const script = typed.slice(1, -1);
+  assert.equal(fs.existsSync(script), false, "the spent script is removed");
+  assert.equal(fs.existsSync(dirname(script)), false, "its directory is removed");
+});
+
+test("a launch script reproduces a newline argument byte-exact", () => {
+  assert.equal(
+    childLaunchPlan("/opt/pi-bolt-child", ["--model", "case-model"]).line,
+    childLaunchLine("/opt/pi-bolt-child", ["--model", "case-model"]),
+    "an ordinary argv is still one quoted line",
+  );
+  if (process.platform === "win32") return;
+  const directory = mkdtempSync(join(tmpdir(), "pi-herdsman-launch-dump-"));
+  try {
+    const dump = join(directory, "dump.sh");
+    writeFileSync(
+      dump,
+      '#!/bin/sh\nfor arg in "$@"; do printf \'%s\\0\' "$arg"; done\n',
+      { mode: 0o755 },
+    );
+    const args = ["a b", "nl1\nnl2", "sq'uote", "semi;echo SPLIT"];
+    const plan = childLaunchPlan(dump, args);
+    assert.equal(/[\r\n]/.test(plan.line), false);
+    // The pane's shell runs this one line, so a real shell must give the argv
+    // back byte-exact, newline included.
+    assert.equal(
+      execFileSync("/bin/sh", ["-c", plan.line], { encoding: "utf8" }),
+      args.map((arg) => `${arg}\0`).join(""),
+    );
+    plan.cleanup();
+    assert.equal(fs.existsSync(plan.line.slice(1, -1)), false);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a failed delivery still retires the launch script", async () => {
+  const result = await directChildLaunchCase("run-failure", {
+    args: ["--system-prompt", "first line\nsecond line"],
+  });
+  const failure = result.failure as HerdrStartFailure;
+  assert.ok(failure instanceof HerdrStartFailure);
+  assert.equal(failure.stage, "agent_start");
+  assert.match(String(failure.message), /pane run failed/);
+  // A failed `pane run` may still have delivered the line, so ownership stays
+  // claimed conservatively and the pane is never closed unproven.
+  assert.equal(failure.attempt.launchMayHaveStarted, true);
+  const launches = launchRuns(result.calls);
+  assert.equal(launches.length, 1);
+  const typed = String(launches[0]![3]);
+  assert.match(typed, /^'.*\/child-launch\/launch-[^']*\/launch\.sh'$/);
+  const script = typed.slice(1, -1);
+  assert.equal(fs.existsSync(script), false, "the script survives no failure");
+  assert.equal(fs.existsSync(dirname(script)), false, "its directory is removed");
+});
+
+test("a child that never registers fails the launch once and rolls back", async () => {
+  const result = await directChildLaunchCase("never-registers");
+  const failure = result.failure as HerdrStartFailure;
+  assert.ok(failure instanceof HerdrStartFailure);
+  assert.equal(failure.stage, "agent_start");
+  assert.equal(failure.attempt.launchMayHaveStarted, true);
+  assert.equal(failure.attempt.createdTab, true);
+  assert.equal(failure.attempt.shellProcess?.shell_pid, 12);
+  assert.match(String(failure.message), /did not register with Herdr/);
+  assert.match(String(failure.message), /command not found/, "the pane output is attached");
+  assert.equal(launchRuns(result.calls).length, 1, "a delivered line is never typed twice");
+  assert.equal(
+    result.calls.some((args) => args[0] === "agent" && args[1] === "rename"),
+    false,
+  );
+
+  await rollbackHerdrStart(result.pi, { cwd: result.cwd } as any, failure.attempt);
+  assert.equal(
+    result.calls.some((args) => args[0] === "tab" && args[1] === "close"),
+    true,
+    "the created tab is closed",
+  );
+  assert.equal(
+    result.calls.some((args) => args[0] === "pane" && args[1] === "close"),
+    false,
+    "closing the created tab is the whole rollback",
+  );
+});
+
+test("an alias that does not take fails the launch and names the alias", async () => {
+  const result = await directChildLaunchCase("alias-mismatch");
+  const failure = result.failure as HerdrStartFailure;
+  assert.ok(failure instanceof HerdrStartFailure);
+  assert.equal(failure.stage, "agent_start");
+  assert.match(String(failure.message), /did not take the Herdsman alias/);
+  assert.equal(
+    result.calls.filter((args) => args[0] === "agent" && args[1] === "rename")
+      .length,
+    1,
+  );
+  assert.equal(launchRuns(result.calls).length, 1);
+});
+
+test("a run failure fails the launch before any alias is applied", async () => {
+  const result = await directChildLaunchCase("run-failure");
+  const failure = result.failure as HerdrStartFailure;
+  assert.ok(failure instanceof HerdrStartFailure);
+  assert.equal(failure.stage, "agent_start");
+  assert.equal(failure.attempt.launchMayHaveStarted, true);
+  assert.match(String(failure.message), /pane run failed/);
+  assert.equal(
+    result.calls.some((args) => args[0] === "agent" && args[1] === "get"),
+    false,
+    "a failed run never reaches the registration poll",
+  );
+});
+
+test("an unset child command keeps Herdr's own agent start arguments", async () => {
+  const result = await directChildLaunchCase("legacy");
+  assert.equal(result.failure, undefined);
+  const start = result.calls.find(
+    (args) => args[0] === "agent" && args[1] === "start",
+  )!;
+  assert.ok(start, "the legacy path still starts the agent through Herdr");
+  assert.equal(
+    start[2],
+    herdrAgentAlias("case-workspace", "case-agent", "case-run"),
+  );
+  assert.equal(start[start.indexOf("--kind") + 1], "pi");
+  assert.equal(start[start.indexOf("--pane") + 1], "case-pane");
+  const timeout = Number(start[start.indexOf("--timeout") + 1]);
+  assert.ok(timeout <= 28_000 && timeout > 27_000);
+  assert.deepEqual(start.slice(start.indexOf("--") + 1), [
+    "--extension",
+    "/tmp/case-extension.ts",
+    ...(herdrReporterExtensionPath()
+      ? ["--extension", herdrReporterExtensionPath()!]
+      : []),
+    "--model",
+    "case-model",
+  ]);
+  assert.equal(launchRuns(result.calls).length, 0, "nothing is typed into the pane");
+  assert.equal(result.attempt?.launchMayHaveStarted, true);
+});
+
+test("a launch line quotes every element for the pane's shell", () => {
+  const args = [
+    "--system-prompt",
+    "/tmp/my prompt.md",
+    "sq'uote",
+    'dq"uote',
+    "semi;echo SPLIT",
+    "meta=$(echo INJECTED)",
+    "back`tick`",
+    "star*glob",
+    "k=v",
+    "nl1\nnl2",
+  ];
+  const line = childLaunchLine("/opt/pi-bolt-child", args);
+  assert.equal(
+    line,
+    "'/opt/pi-bolt-child' '--system-prompt' '/tmp/my prompt.md' 'sq'\\''uote' 'dq\"uote' 'semi;echo SPLIT' 'meta=$(echo INJECTED)' 'back`tick`' 'star*glob' 'k=v' 'nl1\nnl2'",
+  );
+  if (process.platform === "win32") return;
+  // `pane run` hands this line to the pane's interactive shell, so a real shell
+  // must give every element back byte-exact.
+  const parsed = execFileSync(
+    "/bin/sh",
+    ["-c", `set -- ${line}; printf '%s\\0' "$@"`],
+    { encoding: "utf8" },
+  )
+    .split("\0")
+    .slice(0, -1);
+  assert.deepEqual(parsed, ["/opt/pi-bolt-child", ...args]);
 });
 
 test("lists all Herdr agents without changing the current-workspace view", async () => {

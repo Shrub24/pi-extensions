@@ -4937,13 +4937,17 @@ test("a changed child command relaunches a retained worker on the same session",
     const result = await continueRetainedWorker(fixture);
     assert.equal(result.details.ok, true, JSON.stringify(result.details));
     assert.equal(result.details.relaunched, "definition_changed");
-    const start = fixture.pi.calls.find(
-      (args) => args[0] === "agent" && args[1] === "start",
-    )!;
-    assert.ok(start, "the changed command starts a new process");
-    assert.equal(
-      start[start.indexOf("--session") + 1],
-      realFs.realpathSync(fixture.sourcePath),
+    const launch = fixture.pi.calls.find(
+      (args) =>
+        args[0] === "pane" &&
+        args[1] === "run" &&
+        String(args[3]).startsWith(`'${command}'`),
+    );
+    assert.ok(launch, "the changed command starts a new process in the pane");
+    assert.ok(
+      String(launch![3]).includes(
+        `'--session' '${realFs.realpathSync(fixture.sourcePath)}'`,
+      ),
       "the new process continues the same Pi session",
     );
     assert.ok(

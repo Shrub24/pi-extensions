@@ -143,6 +143,44 @@ exporting anything. The export itself belongs to the lead process's environment
 does not manage those files. To roll back, unset the variable and restart the
 lead.
 
+### How a configured child starts
+
+When a command is configured, the launch runs it in the pane instead of asking
+Herdr to start its canonical `pi` executable. `<command> <child args…>` is typed
+as one shell line with every element single-quoted, so a path holding a space, a
+quote or a shell metacharacter reaches the child unchanged, and the pane's
+interactive shell parses the line. Nothing else about the launch changes: the
+pane, its environment, the recorded shell process, the failure shape and the
+rollback are the same start path as before.
+
+An argument holding a newline cannot be typed this way: it would arrive as a
+second input line, and an interactive shell's plugin can refuse to submit that,
+leaving the pane holding an unterminated command. Such a launch runs from a
+script instead — Herdsman writes `exec <command> <args…>` to a private file and
+types that file's path, so the pane still receives one line and the argv still
+reaches the child byte-exact. The launch retires the file once it is over, after
+the child has read it.
+
+Herdr does not start this child, so the running process registers itself in
+Herdr's agent registry and Herdsman waits for that record before it reports the
+launch successful. The Herdsman alias is then applied with `agent rename` and
+verified through `agent get`, so the child answers to the same alias as a child
+Herdr started. The session path Herdr reports is written at session start and
+the file appears with the child's first turn; a launch never fails on a session
+file that does not exist yet.
+
+This path relies on measured Herdr behaviour, recorded for herdr 0.9.3 in the
+`herdsman-child-command` change's `probe.md` (the repository's decision record
+for it is [ADR 0029](../adr/0029-run-a-configured-child-in-its-pane.md)):
+detection of a `pane run` agent, `agent rename`, registration timing, `pane
+run` quoting and the script-borne form. A Herdr version that changes any of them
+needs the probe re-run before the launch code is adjusted.
+
+A launch that fails is reported and rolled back exactly as a failed
+`agent start`: the typed command is never retried, because it may already have
+started the child, and the pane's recent output is attached to the failure when
+Herdr can still read it.
+
 ## Separate response contracts
 
 The incoming delegation brief defines the assignment; its `response` field is
