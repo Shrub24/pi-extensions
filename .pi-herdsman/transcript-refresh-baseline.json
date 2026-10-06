@@ -1,0 +1,150 @@
+{
+  "sample": "before implementation; observations not guaranteed idle",
+  "elapsedSeconds": 10.010054504993604,
+  "sourceHashes": {
+    "pi-herdsman/extension/index.ts": "d5d2c730b027074230fe04fa9edd8e526120f1837471d87c185da19dc9c6b8b7",
+    "pi-herdsman/extension/supervision.ts": "903c55196b274a067fd8e4a460699453665b765b1ab319230863859cde006a71"
+  },
+  "processes": [
+    {
+      "pid": 2351677,
+      "processStartTicks": 11488514,
+      "sessionPathArgument": null,
+      "rcharMiBPerSecond": 129.399,
+      "diskReadBytesDelta": 0,
+      "cpuCores": 0.702,
+      "rssBeforeMiB": 926.7,
+      "rssAfterMiB": 1081.6
+    },
+    {
+      "pid": 1952232,
+      "processStartTicks": 11166729,
+      "sessionPathArgument": null,
+      "rcharMiBPerSecond": 128.037,
+      "diskReadBytesDelta": 0,
+      "cpuCores": 0.974,
+      "rssBeforeMiB": 1210.0,
+      "rssAfterMiB": 1161.9
+    },
+    {
+      "pid": 594602,
+      "processStartTicks": 10324046,
+      "sessionPathArgument": "01a10e6e-8f85-70a2-ad2f-afaff03ff4c4",
+      "rcharMiBPerSecond": 0.506,
+      "diskReadBytesDelta": 20480,
+      "cpuCores": 0.353,
+      "rssBeforeMiB": 949.0,
+      "rssAfterMiB": 695.7
+    },
+    {
+      "pid": 2311373,
+      "processStartTicks": 7756457,
+      "sessionPathArgument": null,
+      "rcharMiBPerSecond": 0.143,
+      "diskReadBytesDelta": 8192,
+      "cpuCores": 0.899,
+      "rssBeforeMiB": 869.3,
+      "rssAfterMiB": 1043.3
+    },
+    {
+      "pid": 1794844,
+      "processStartTicks": 11043529,
+      "sessionPathArgument": null,
+      "rcharMiBPerSecond": 0.062,
+      "diskReadBytesDelta": 0,
+      "cpuCores": 0.018,
+      "rssBeforeMiB": 256.5,
+      "rssAfterMiB": 257.0
+    },
+    {
+      "pid": 11528,
+      "processStartTicks": 41544,
+      "sessionPathArgument": null,
+      "rcharMiBPerSecond": 0.057,
+      "diskReadBytesDelta": 0,
+      "cpuCores": 0.015,
+      "rssBeforeMiB": 325.0,
+      "rssAfterMiB": 326.8
+    },
+    {
+      "pid": 1688401,
+      "processStartTicks": 11017145,
+      "sessionPathArgument": null,
+      "rcharMiBPerSecond": 0.054,
+      "diskReadBytesDelta": 0,
+      "cpuCores": 0.016,
+      "rssBeforeMiB": 256.3,
+      "rssAfterMiB": 256.9
+    },
+    {
+      "pid": 437005,
+      "processStartTicks": 10223534,
+      "sessionPathArgument": null,
+      "rcharMiBPerSecond": 0.041,
+      "diskReadBytesDelta": 4096,
+      "cpuCores": 0.043,
+      "rssBeforeMiB": 555.0,
+      "rssAfterMiB": 557.7
+    },
+    {
+      "pid": 711188,
+      "processStartTicks": 10401580,
+      "sessionPathArgument": null,
+      "rcharMiBPerSecond": 0.037,
+      "diskReadBytesDelta": 0,
+      "cpuCores": 0.021,
+      "rssBeforeMiB": 298.2,
+      "rssAfterMiB": 299.2
+    },
+    {
+      "pid": 1442629,
+      "processStartTicks": 10804928,
+      "sessionPathArgument": "01a10a58-c4c1-7570-a8ba-a8b0ca9e8d91",
+      "rcharMiBPerSecond": 0.03,
+      "diskReadBytesDelta": 0,
+      "cpuCores": 0.015,
+      "rssBeforeMiB": 346.1,
+      "rssAfterMiB": 344.3
+    },
+    {
+      "pid": 2291394,
+      "processStartTicks": 11440235,
+      "sessionPathArgument": "/home/saurabhj/Projects/dev/custom/pi-extensions/.pi/sessions/children/2026-10-06T10-33-39-236Z_01a110c6-b0a4-7563-bdf8-13cef5507ede.jsonl",
+      "rcharMiBPerSecond": 0.024,
+      "diskReadBytesDelta": 0,
+      "cpuCores": 0.006,
+      "rssBeforeMiB": 259.3,
+      "rssAfterMiB": 262.9
+    },
+    {
+      "pid": 1688858,
+      "processStartTicks": 11017445,
+      "sessionPathArgument": null,
+      "rcharMiBPerSecond": 0.004,
+      "diskReadBytesDelta": 0,
+      "cpuCores": 0.007,
+      "rssBeforeMiB": 122.9,
+      "rssAfterMiB": 123.2
+    },
+    {
+      "pid": 1781935,
+      "processStartTicks": 11033250,
+      "sessionPathArgument": null,
+      "rcharMiBPerSecond": 0.004,
+      "diskReadBytesDelta": 0,
+      "cpuCores": 0.006,
+      "rssBeforeMiB": 122.8,
+      "rssAfterMiB": 123.5
+    },
+    {
+      "pid": 2363769,
+      "processStartTicks": 11497769,
+      "sessionPathArgument": null,
+      "rcharMiBPerSecond": 0.0,
+      "diskReadBytesDelta": 0,
+      "cpuCores": 0.023,
+      "rssBeforeMiB": 123.9,
+      "rssAfterMiB": 117.7
+    }
+  ]
+}
