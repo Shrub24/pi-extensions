@@ -42,7 +42,14 @@
             "pi_herdsman_awaited": "agent:researcher-1"
           }
         }
-      ]
+,
+        {
+          "source": "pi-herdsman:control",
+          "ttl_ms": 30000,
+          "tokens": {
+            "pi_herdsman_control": "a0000000-0000-4000-8000-000000000000:closed"
+          }
+        }      ]
     },
     {
       "pane_id": "fixture:p2",
@@ -177,7 +184,8 @@
             "pi_herdsman_role": "lead",
             "anchor": "1",
             "sort_key": "0001",
-            "pi_herdsman_awaited": "agent:researcher-1"
+            "pi_herdsman_awaited": "agent:researcher-1",
+            "pi_herdsman_control": "a0000000-0000-4000-8000-000000000000:closed"
           }
         },
         {
@@ -256,7 +264,8 @@
             "pi_herdsman_role": "lead",
             "anchor": "1",
             "sort_key": "0001",
-            "pi_herdsman_awaited": "agent:researcher-1"
+            "pi_herdsman_awaited": "agent:researcher-1",
+            "pi_herdsman_control": "a0000000-0000-4000-8000-000000000000:closed"
           }
         },
         {

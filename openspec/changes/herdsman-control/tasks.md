@@ -13,21 +13,28 @@
 
 ## 2. Owner implementation (sequenced after the lifecycle workstream releases `index.ts`)
 
-- [ ] 2.1 Create and trust-check the control directory at session start; arm the
+- [x] 2.1 Create and trust-check the control directory at session start; arm the
   `inbox` watcher.
-- [ ] 2.2 Admission: parse, version and confirmation checks, expiry, `O_EXCL`
+- [x] 2.2 Admission: parse, version and confirmation checks, expiry, `O_EXCL`
   claim, orphaned-claim finalization at start.
-- [ ] 2.3 `close`: re-run the `agent_close` preflight at execution time through the
+- [x] 2.3 `close`: re-run the `agent_close` preflight at execution time through the
   existing code path, not a copy.
-- [ ] 2.4 `restart`: idle retained managed workers through the existing relaunch path;
+- [x] 2.4 `restart`: idle retained managed workers through the existing relaunch path;
   typed refusals for every other state.
-- [ ] 2.5 Result writing, the `pi_herdsman_control` token, result pruning, and the
+- [x] 2.5 Result writing, the `pi_herdsman_control` token, result pruning, and the
   session entry that is excluded from model context.
 
 ## 3. Gates
 
-- [ ] 3.1 Run the `pi-herdsman` suite and `npm run package:audit`, and
+- [x] 3.1 Run the `pi-herdsman` suite and `npm run package:audit`, and
   `openspec validate --all --strict`, recording counts and the checkpoint. Docs slice
   (group 1) gated: 962 tests, 961 pass, 0 fail, 1 skipped; package audit 118 files;
   openspec 15/15. Repeat after group 2.
-- [ ] 3.2 Send the Radar session the reference and fixture paths.
+- [x] 3.2 Send the Radar session the reference and fixture paths.
+
+Owner implementation parent gate (`bg-839`): 985 tests, 984 pass, 0 fail,
+1 skipped; package audit 123 files; strict OpenSpec 15/15. Parent focused
+control/integration/mailbox tests: 54/54. Identity-race regression verified at
+the locked close boundary. Radar received the paths and readiness caveat;
+implementation readiness follows the commit. Live Radar-to-owner smoke remains
+a downstream integration check, not claimed by this package gate.

@@ -1,5 +1,6 @@
 import {
   createMetadataPublisher,
+  metadataArgs,
   sessionMetadata,
   OWNER_METADATA_TTL_MS,
 } from "./pane-metadata.ts";
@@ -143,6 +144,17 @@ import {
   type AgentDefinition,
 } from "./agent-definitions.ts";
 import { resolveDefinitionSkills } from "./agent-skills.ts";
+import {
+  CONTROL_METADATA_KEY,
+  CONTROL_METADATA_SOURCE,
+  CONTROL_METADATA_TTL_MS,
+  startControlOwner,
+  type ControlCategory,
+  type ControlEffect,
+  type ControlOperationOutcome,
+  type ControlOwner,
+  type ControlRequest,
+} from "./control.ts";
 import {
   BRIEF_PROFILES,
   DELEGATION_BRIEF_GUIDE,
@@ -3102,6 +3114,169 @@ function recordedLaunchFingerprint(
   return fingerprint;
 }
 
+type ManagedWorkerLaunchPlan =
+  | {
+      ok: true;
+      launchArgs: string[];
+      launchFingerprint: string;
+      env: string[];
+      promptPaths: string[];
+    }
+  | {
+      ok: false;
+      /* `prompt` means nothing was started; `configuration` failed after the
+       * prompt snapshots were written, which the caller must clean up. */
+      stage: "prompt" | "configuration";
+      error: unknown;
+      promptPaths: string[];
+    };
+
+/**
+ * Prepares the prompt snapshots, environment and Pi arguments of one managed
+ * worker process. A fresh launch, a definition_changed relaunch and an operator
+ * restart all need the same definition-derived launch configuration, so the
+ * derivation lives here and the caller owns what differs: placement, mailbox
+ * reset, session arguments and the assignment it submits.
+ */
+function prepareManagedWorkerLaunch(
+  ctx: ExtensionContext,
+  inputs: {
+    pi: ExtensionAPI;
+    operation: string;
+    definition: AgentDefinition;
+    fingerprintDefinition: AgentDefinition;
+    cwd: string;
+    projectTrusted: boolean;
+    label: string;
+    runId: string;
+    ownerSessionId: string;
+    forwardingSession: string;
+    mailbox: string;
+    workspaceId: string;
+    briefProfile: BriefProfile;
+    allowedAgentDefinitions: string[];
+    resumed: boolean;
+  },
+): ManagedWorkerLaunchPlan {
+  const { pi, operation, definition } = inputs;
+  const skillResolution = resolveDefinitionSkills({
+    agent: definition.name,
+    ...(definition.frontmatter.skills !== undefined
+      ? { skills: definition.frontmatter.skills }
+      : {}),
+    ...(definition.frontmatter.preloadedSkills !== undefined
+      ? { preloadedSkills: definition.frontmatter.preloadedSkills }
+      : {}),
+    cwd: inputs.cwd,
+  });
+  if (!skillResolution.ok)
+    fail("invalid_request", skillResolution.reason, operation);
+  let promptPaths: string[];
+  try {
+    promptPaths = writePrivatePromptSnapshots([
+      ...(definition.body ? [definition.body] : []),
+      ...skillResolution.preloaded.map((skill) => skill.body),
+      SHARED_AGENT_INSTRUCTIONS,
+    ]);
+  } catch (error) {
+    return { ok: false, stage: "prompt", error, promptPaths: [] };
+  }
+  try {
+    const bodyPromptPath = definition.body ? promptPaths[0] : undefined;
+  const preloadedSkillPromptPaths = skillResolution.preloaded.map(
+    (_skill, index) => promptPaths[(definition.body ? 1 : 0) + index]!,
+  );
+  const sharedPromptPath = promptPaths[promptPaths.length - 1]!;
+  const env = [
+    `PI_HERDSMAN_MAILBOX=${inputs.mailbox}`,
+    `PI_HERDSMAN_RUN_ID=${inputs.runId}`,
+    `PI_HERDSMAN_OWNER_SESSION_ID=${inputs.ownerSessionId}`,
+    `PI_SUBAGENT_PARENT_SESSION=${inputs.forwardingSession}`,
+    `PI_HERDSMAN_LABEL=${inputs.label}`,
+    `PI_HERDSMAN_WORKSPACE_ID=${inputs.workspaceId}`,
+    `PI_HERDSMAN_AGENT_DEFINITION=${definition.name}`,
+    `PI_HERDSMAN_BRIEF_PROFILE=${inputs.briefProfile}`,
+    `PI_HERDSMAN_ALLOWED_AGENT_DEFINITIONS=${JSON.stringify(
+      inputs.allowedAgentDefinitions,
+    )}`,
+    ...(process.env.PI_CODING_AGENT_DIR
+      ? [`PI_CODING_AGENT_DIR=${process.env.PI_CODING_AGENT_DIR}`]
+      : []),
+    "PI_OFFLINE=1",
+  ];
+  // Pi reports the providers that extensions registered; a model from one
+  // of them cannot resolve in a child denied extension discovery.
+  // Older registries and test doubles may not expose the list, in which
+  // case nothing counts as extension-provided and the model is inherited
+  // exactly as before this change.
+  const registeredProviderIds = new Set(
+    ctx.modelRegistry?.getRegisteredProviderIds?.() ?? [],
+  );
+  const childModel = resolveChildModel({
+    configured: configuredModel(definition.frontmatter),
+    inherited:
+      !inputs.resumed && ctx.model
+        ? { provider: ctx.model.provider, token: modelToken(ctx.model) }
+        : undefined,
+    isForeignProvider: (providerId) => registeredProviderIds.has(providerId),
+  });
+  // The operator's model policy, then the one contradiction the policy
+  // exists to surface: a pinned model whose provider only an extension
+  // supplies, in a child the definition denies extensions to.
+  if (childModel.kind === "use") {
+    const pinnedValue = configuredModel(definition.frontmatter);
+    const pinned =
+      pinnedValue !== undefined && pinnedValue.trim() !== ""
+        ? pinnedValue
+        : undefined;
+    const origin = pinned === undefined ? "inherited" : "pinned";
+    const scopes = readConfig().modelScopes;
+    const agentAllow = scopes.agents?.[definition.name]?.allow;
+    const violation = modelPolicyError({
+      agent: definition.name,
+      model: childModel.model,
+      origin,
+      ...(scopes.allow === undefined ? {} : { globalAllow: scopes.allow }),
+      ...(agentAllow === undefined ? {} : { agentAllow }),
+    });
+    if (violation !== undefined) throw new Error(violation);
+    if (origin === "pinned") {
+      const denied = deniedDiscoveryModelError({
+        agent: definition.name,
+        model: childModel.model,
+        noExtensions: definition.frontmatter.noExtensions === true,
+        extensions: definition.frontmatter.extensions,
+        isForeignProvider: (providerId) => registeredProviderIds.has(providerId),
+      });
+      if (denied !== undefined) throw new Error(denied);
+    }
+  }
+    const launchArgs = agentLaunchArgs(definition, {
+      ...(bodyPromptPath !== undefined ? { bodyPromptPath } : {}),
+      ...(preloadedSkillPromptPaths.length
+        ? { preloadedSkillPromptPaths }
+        : {}),
+      sharedPromptPath,
+      cwd: inputs.cwd,
+      managedAgent: true,
+      approveProject: inputs.projectTrusted && sameCwd(inputs.cwd, ctx.cwd),
+      ...(!inputs.resumed ? { inheritedThinking: pi.getThinkingLevel() } : {}),
+      modelDecision: childModel,
+      resolvedSkills: skillResolution.advertised,
+    });
+    // A retained process keeps the launch configuration it started with, so
+    // reuse compares this fingerprint with the then-current definition.
+    const launchFingerprint = agentLaunchFingerprint(
+      resolveAgentLaunchInputs(inputs.fingerprintDefinition, {
+        cwd: inputs.cwd,
+      }),
+    );
+    return { ok: true, launchArgs, launchFingerprint, env, promptPaths };
+  } catch (error) {
+    return { ok: false, stage: "configuration", error, promptPaths };
+  }
+}
+
 type IdleWorkerDecision =
   /** Not an idle, directly owned, provably live worker: keep today's busy path. */
   | { kind: "busy" }
@@ -4739,7 +4914,8 @@ function normalizeCloseFailure(
 }
 
 type StopReportCallbacks = {
-  onClosed?: (label: string) => void;
+  /** `paneClosed` separates a closed pane from a proven-absent generation. */
+  onClosed?: (label: string, paneClosed: boolean) => void;
   onCleanupFailure?: (label: string, message: string) => void;
 };
 
@@ -4859,7 +5035,7 @@ async function closeManagedAgent(
       runtime.startedAt = undefined;
       runtimes.delete(runtime.label);
     }
-    stopReport?.onClosed?.(runtime.label);
+    stopReport?.onClosed?.(runtime.label, true);
   } finally {
     release?.();
   }
@@ -4871,6 +5047,7 @@ async function closeManagedSnapshot(
   signal?: AbortSignal,
   stopReport?: StopReportCallbacks,
   assignmentLockHeld = false,
+  expected?: ManagedAgentState,
 ): Promise<void> {
   if (snapshot.presence.kind === "unknown")
     fail(
@@ -4878,6 +5055,9 @@ async function closeManagedSnapshot(
       "Managed agent presence cannot be proved safely",
       "close",
     );
+  // A control request resolves its target before the shared close runs, so the
+  // generation it resolved must still be the one under the assignment lock.
+  const target = expected ?? snapshot.state;
   const mailbox = agentMailboxPath(
     snapshot.state.workspaceId,
     snapshot.state.agentLabel,
@@ -4890,7 +5070,7 @@ async function closeManagedSnapshot(
       });
   try {
     let current = readAgentState(mailbox);
-    if (!current || !sameManagedAgentIdentity(current, snapshot.state))
+    if (!current || !sameManagedAgentIdentity(current, target))
       fail("target_ambiguous", "Managed agent changed before close", "close");
     if (hasDurableResult(mailbox, current))
       fail(
@@ -4921,7 +5101,7 @@ async function closeManagedSnapshot(
       return;
     }
     current = readAgentState(mailbox);
-    if (!current || !sameManagedAgentIdentity(current, snapshot.state))
+    if (!current || !sameManagedAgentIdentity(current, target))
       fail("target_ambiguous", "Managed agent changed before close", "close");
     if (hasDurableResult(mailbox, current))
       fail(
@@ -4932,11 +5112,680 @@ async function closeManagedSnapshot(
     removeAgentMailbox(mailbox);
     dropSoftWindow(current.activeRequestId);
     invalidateCachedRuntime(current.agentLabel);
-    stopReport?.onClosed?.(current.agentLabel);
+    stopReport?.onClosed?.(current.agentLabel, false);
   } finally {
     release?.();
   }
 }
+/**
+ * Resolves one exact owned Agent by label and closes it through the preflight
+ * `agent_close` uses, so an operator control request can never apply a weaker
+ * check than the tool. A caller that resolved its target earlier passes that
+ * identity as `expected`, and the shared path re-checks it under the locks:
+ * the label alone would let a replacement generation be closed.
+ */
+async function closeAgentByIdentity(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  agentLabel: string,
+  options: {
+    signal?: AbortSignal;
+    scope?: ControllerScope;
+    expected?: ManagedAgentState;
+    onClosed?: (label: string, paneClosed: boolean) => void;
+  } = {},
+): Promise<Record<string, unknown>> {
+  const { signal, scope, onClosed, expected } = options;
+  const closeView = await agentSnapshotView(pi, ctx, scope, signal);
+  const candidates = closeView.visible.filter(
+    ({ listed }) => listed.label === agentLabel,
+  );
+  if (candidates.length === 0)
+    fail("target_not_found", "No exact agent identity matched", "close");
+  if (candidates.length > 1)
+    fail(
+      "target_ambiguous",
+      "Agent identity matched multiple live agents",
+      "close",
+    );
+  const candidate = candidates[0]!;
+  const listed = candidate.listed;
+  const mailbox = listed.label
+    ? agentMailboxPath(listed.workspace_id as string, listed.label)
+    : undefined;
+  if (!mailbox)
+    fail("target_not_found", "Agent has no managed mailbox", "close");
+  let state: ManagedAgentState | undefined;
+  try {
+    state = readAgentState(mailbox);
+  } catch (error) {
+    fail(
+      "internal_failure",
+      `Agent mailbox state is malformed or oversized: ${String(error)}`,
+      "close",
+      {
+        ids: {
+          label: listed.label as string,
+          paneId: listed.pane_id,
+        },
+      },
+    );
+  }
+  if (!state)
+    fail(
+      "target_not_found",
+      "No valid managed state matched the agent",
+      "close",
+    );
+  const owner = ctx.sessionManager.getSessionId();
+  const directOwner = state.ownerSessionId === owner;
+  if (!directOwner)
+    fail(
+      "target_not_found",
+      "Agent belongs to another owner session",
+      "close",
+    );
+  const cleanupWarnings = new Map<string, string>();
+  const stopReport: StopReportCallbacks = {
+    onClosed: (label, paneClosed) => {
+      onClosed?.(label, paneClosed);
+    },
+    onCleanupFailure: (label, message) => {
+      cleanupWarnings.set(label, message);
+    },
+  };
+  try {
+    if (directOwner && scope?.kind === "lead")
+      await closeManagedAgentCascade(
+        pi,
+        ctx,
+        expected ?? state,
+        signal,
+        {},
+        stopReport,
+      );
+    else
+      await closeManagedSnapshot(
+        pi,
+        ctx,
+        candidate,
+        signal,
+        stopReport,
+        false,
+        expected,
+      );
+  } catch (error) {
+    const failure = normalizeCloseFailure(error, {
+      label: listed.label as string,
+      paneId: listed.pane_id,
+    });
+    const cleanup = [...cleanupWarnings.values()].at(-1);
+    if (cleanup)
+      failure.detail.cleanup = {
+        category: "internal_failure",
+        message: cleanup,
+        operation: "close",
+      };
+    if (failure.detail.category !== "agent_busy") {
+      if (cleanupWarnings.size === 0)
+        appendDurableError(pi, ctx, "pi_herdsman_cleanup_error", failure);
+    }
+    throw failure;
+  }
+  const warnings = [...cleanupWarnings];
+  return {
+    ok: true,
+    action: "close",
+    agent: agentLabel,
+    presentation_agent_definition: stateAgentDefinition(state),
+    ...(warnings.length === 1 ? { cleanup_error: warnings[0]![1] } : {}),
+    ...(warnings.length > 1
+      ? { cleanup_errors: Object.fromEntries(warnings) }
+      : {}),
+  };
+}
+
+const CONTROL_ENTRY = "pi-herdsman-control";
+/** The categories a control refusal can carry: no effect was applied. */
+const CONTROL_REFUSAL_CATEGORIES: ReadonlySet<ErrorCategory> = new Set([
+  "invalid_request",
+  "target_not_found",
+  "target_ambiguous",
+  "agent_busy",
+]);
+/** A close in one of these projected states abandons a live assignment. */
+const CONTROL_UNRESOLVED_STATES: ReadonlySet<string> = new Set([
+  "working",
+  "waiting",
+  "blocked",
+  "settling",
+]);
+
+type ControlTarget =
+  | { kind: "owned"; snapshot: ManagedAgentSnapshot }
+  | { kind: "refused"; category: ControlCategory; message: string };
+
+function controlPaneIdentity(agent: any): {
+  label?: string;
+  runId?: string;
+  parent?: string;
+} {
+  const tokens = agent?.tokens;
+  if (!tokens || typeof tokens !== "object") return {};
+  const token = (key: string): string | undefined => {
+    const value = (tokens as Record<string, unknown>)[key];
+    return typeof value === "string" && value !== "" ? value : undefined;
+  };
+  return {
+    label: token("pi_herdsman_label"),
+    runId: token("pi_herdsman_run"),
+    parent: token("pi_herdsman_parent_session"),
+  };
+}
+
+/**
+ * A supplied cross-check only corroborates: a missing or differing record
+ * refuses, instead of acting on a different generation of the target.
+ */
+function suppliedIdentityMatches(
+  request: ControlRequest,
+  listed: any,
+  state: ManagedAgentState,
+): boolean {
+  if (request.paneId !== undefined && request.paneId !== listed.pane_id)
+    return false;
+  if (
+    request.piSessionId !== undefined &&
+    request.piSessionId !== state.piSessionId
+  )
+    return false;
+  if (request.piSessionPath !== undefined) {
+    if (state.piSessionFile === undefined) return false;
+    if (request.piSessionPath !== state.piSessionFile) {
+      try {
+        if (
+          realpathSync(request.piSessionPath) !==
+          realpathSync(state.piSessionFile)
+        )
+          return false;
+      } catch {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+/**
+ * Resolves one control request to an owned worker of this session. A live Pi
+ * session that publishes a Herdsman identity but no parent pointer is a Lead,
+ * root or standalone session: it has no owner, so no owner can act on it.
+ */
+async function resolveControlTarget(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  scope: ControllerScope | undefined,
+  request: ControlRequest,
+  signal?: AbortSignal,
+): Promise<ControlTarget> {
+  const ownerSessionId = ctx.sessionManager.getSessionId();
+  const view = await agentSnapshotView(pi, ctx, scope, signal);
+  const owned = view.visible.filter(
+    ({ state }) =>
+      state.ownerSessionId === ownerSessionId &&
+      state.agentLabel === request.agent,
+  );
+  const exact = owned.filter(({ state }) => state.runId === request.runId);
+  if (exact.length > 1)
+    return {
+      kind: "refused",
+      category: "target_ambiguous",
+      message: `${request.agent} matched multiple managed workers of this session.`,
+    };
+  if (exact.length === 1) {
+    const snapshot = exact[0]!;
+    if (snapshot.presence.kind === "unknown")
+      return {
+        kind: "refused",
+        category: "target_not_found",
+        message: `Presence of ${request.agent} run ${request.runId} cannot be proved.`,
+      };
+    // Both operations re-check a supplied cross-check here, before the claim's
+    // effect: a disagreement means the operator is looking at a different
+    // generation than the one this session records.
+    if (!suppliedIdentityMatches(request, snapshot.listed, snapshot.state))
+      return {
+        kind: "refused",
+        category: "target_ambiguous",
+        message: `A supplied identity for ${request.agent} run ${request.runId} disagrees with this session's record.`,
+      };
+    return { kind: "owned", snapshot };
+  }
+  const parentless = view.liveAgents.some((agent) => {
+    const identity = controlPaneIdentity(agent);
+    return (
+      identity.label === request.agent &&
+      identity.runId === request.runId &&
+      identity.parent === undefined
+    );
+  });
+  if (parentless)
+    return {
+      kind: "refused",
+      category: "unsupported_target",
+      message: `${request.agent} is not a managed worker and has no owner session.`,
+    };
+  return {
+    kind: "refused",
+    category: "target_not_found",
+    message: `No managed worker matches ${request.agent} run ${request.runId}.`,
+  };
+}
+
+/**
+ * Resolves an assignment the close abandoned, through the result channel a
+ * failed delegation already uses: the close removes the durable record, so the
+ * owner reports the operator's decision in the same shape and the model learns
+ * it as it would any failed delegation (D8). An idle or delivered target is
+ * lifecycle only and is deliberately not reported.
+ */
+function resolveAbandonedAssignment(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  snapshot: ManagedAgentSnapshot,
+  request: ControlRequest,
+): void {
+  const { state } = snapshot;
+  const reason = `Closed by an operator through herdsman-control request ${request.requestId}.`;
+  try {
+    sendWakeMessage(
+      pi,
+      ctx,
+      {
+        customType: "pi-herdsman-agent-result",
+        content: [
+          "Agent result",
+          `agent=${state.agentLabel}`,
+          `definition=${stateAgentDefinition(state)}`,
+          `session=${state.piSessionId ?? "?"}`,
+          "status=failed",
+          "",
+          `${reason} Its assignment never produced a result and is abandoned; its Pi session is retained and can be continued.`,
+        ].join("\n"),
+        display: true,
+        details: {
+          runId: state.runId,
+          requestId: state.activeRequestId ?? state.completedRequestId,
+          ownerSessionId: state.ownerSessionId,
+          workspaceId: state.workspaceId,
+          agentLabel: state.agentLabel,
+          paneId: state.paneId,
+          cwd: state.cwd,
+          ...(state.piSessionId !== undefined
+            ? { piSessionId: state.piSessionId }
+            : {}),
+          ...(state.piSessionFile !== undefined
+            ? { piSessionFile: state.piSessionFile }
+            : {}),
+          agentDefinition: stateAgentDefinition(state),
+          status: "failed",
+          closedByOperator: true,
+        },
+      },
+      { triggerTurn: true, deliverAs: "steer" },
+    );
+  } catch (error) {
+    // The close succeeded; a failed report must not turn it into a failure.
+    appendDurableError(pi, ctx, "pi_herdsman_control_error", error);
+  }
+}
+
+/**
+ * Restarts one idle retained managed worker: the retained process ends, the
+ * pane stays, and a new process continues the same Pi session with the same
+ * label, run id and lineage (ADR 0013). Every other state refuses, and a
+ * failure at or after the process stop leaves the claim without a result,
+ * because the owner can no longer name what applied (D4).
+ */
+async function restartIdleManagedWorker(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  snapshot: ManagedAgentSnapshot,
+  scope: ControllerScope | undefined,
+  signal?: AbortSignal,
+): Promise<ControlOperationOutcome> {
+  const { state, listed } = snapshot;
+  const label = state.agentLabel;
+  const ids = { label, paneId: state.paneId };
+  if (snapshot.presence.kind === "lost")
+    fail("agent_busy", `${label} is lost; a lost target is close-only.`, "restart", {
+      ids,
+    });
+  if (listed.state !== "idle")
+    fail(
+      "agent_busy",
+      `${label} is ${String(listed.state)}; restart applies to an idle retained worker.`,
+      "restart",
+      { ids },
+    );
+  if (typeof state.piSessionFile !== "string" || !state.piSessionFile)
+    fail(
+      "agent_busy",
+      `${label} has no recorded Pi session to continue.`,
+      "restart",
+      { ids },
+    );
+  const definitionName = stateAgentDefinition(state);
+  const definition = (await contextAgentDefinitions(ctx)).definitions.find(
+    (candidate) => candidate.name === definitionName,
+  );
+  if (!definition || !agentDefinitionEnabled(definition))
+    fail(
+      "agent_busy",
+      `Agent definition ${definitionName} is unavailable; ${label} cannot be relaunched.`,
+      "restart",
+      { ids },
+    );
+  const cwd = typeof listed.cwd === "string" ? listed.cwd : state.cwd;
+  const definitionScope =
+    scope?.kind === "managed-agent" ? "leaf" : "delegating";
+  const targetDefinition = projectAgentDefinition(definition, definitionScope);
+  const mailbox = agentMailboxPath(state.workspaceId, label);
+  const release = claimAssignmentLock(mailbox, "restart", ids);
+  try {
+    const current = readAgentState(mailbox);
+    if (!current || !sameManagedAgentIdentity(current, state))
+      fail("target_ambiguous", "Managed agent changed before restart", "restart", {
+        ids,
+      });
+    if (hasDurableResult(mailbox, current))
+      fail(
+        "agent_busy",
+        `${label} has an unretrieved durable result; retrieve it before restarting.`,
+        "restart",
+        { ids },
+      );
+    // The retained-worker path's own eligibility gate: not idle, not directly
+    // owned, or unprovable live identity is not a restartable worker.
+    if (resolveIdleWorker(ctx, snapshot, targetDefinition).kind === "busy")
+      fail(
+        "agent_busy",
+        `${label} is not an idle retained worker of this session.`,
+        "restart",
+        { ids },
+      );
+    const pane = (
+      await runHerdr(pi, ctx, ["pane", "get", state.paneId], { signal })
+    ).pane;
+    if (!pane || pane.pane_id !== state.paneId)
+      fail(
+        "target_not_found",
+        `Pane ${state.paneId} is not the pane recorded for ${label}.`,
+        "restart",
+        { ids },
+      );
+    const tabId = typeof pane.tab_id === "string" ? pane.tab_id : undefined;
+    if (!tabId)
+      fail(
+        "target_not_found",
+        `Pane ${state.paneId} reported no tab identity.`,
+        "restart",
+        { ids },
+      );
+    const workspace = await worktreeGroupScope(
+      pi,
+      ctx,
+      state.workspaceId,
+      signal,
+    );
+    const launchPlan = prepareManagedWorkerLaunch(ctx, {
+      pi,
+      operation: "restart",
+      definition: targetDefinition,
+      fingerprintDefinition: targetDefinition,
+      cwd,
+      projectTrusted: ctx.isProjectTrusted(),
+      label,
+      runId: state.runId,
+      ownerSessionId: ctx.sessionManager.getSessionId(),
+      forwardingSession:
+        process.env.PI_SUBAGENT_PARENT_SESSION ??
+        ctx.sessionManager.getSessionId(),
+      mailbox,
+      workspaceId: state.workspaceId,
+      briefProfile:
+        state.briefProfile ??
+        resolveAgentLaunchInputs(targetDefinition, { cwd }).briefProfile,
+      allowedAgentDefinitions: agentDefinitionDelegationEnabled(
+        targetDefinition,
+      )
+        ? (targetDefinition.frontmatter.agents ?? [])
+        : [],
+      resumed: true,
+    });
+    if (!launchPlan.ok) {
+      removePromptSnapshots(launchPlan.promptPaths);
+      fail(
+        "agent_busy",
+        `Restart could not prepare ${label} for relaunch: ${errorMessage(launchPlan.error)}`,
+        "restart",
+        { ids },
+      );
+    }
+    const expected = expectedSession(state.piSessionId, state.piSessionFile);
+    try {
+      await stopHerdrAgentPreservingPane(
+        pi,
+        ctx,
+        herdrAgentAlias(state.workspaceId, label, state.runId),
+        {
+          paneId: state.paneId,
+          tabId,
+          workspaceId: state.workspaceId,
+          cwd,
+          session: expected,
+        },
+        signal,
+      );
+      const started = await startHerdrAgentInPane(pi, ctx, {
+        primaryWorkspaceId: workspace.primaryWorkspaceId,
+        workspaceId: state.workspaceId,
+        tabId,
+        paneId: state.paneId,
+        cwd,
+        label,
+        runId: state.runId,
+        extensionPath: HERDSMAN_EXTENSION_PATH,
+        agentArgs: [
+          ...launchPlan.launchArgs,
+          "--session",
+          state.piSessionFile,
+        ],
+        signal,
+      });
+      if (
+        !started.agent ||
+        !matchesExpectedSession(started.agent.agent_session, expected)
+      )
+        throw new Error(
+          "the relaunched process does not report the recorded Pi session",
+        );
+      try {
+        pi.appendEntry(WORKER_LAUNCH_ENTRY, {
+          runId: state.runId,
+          label,
+          fingerprint: launchPlan.launchFingerprint,
+        } satisfies WorkerLaunchEntry);
+      } catch (error) {
+        appendDurableError(pi, ctx, "pi_herdsman_state_error", error);
+      }
+      invalidateCachedRuntime(label);
+      requestStatusRefresh?.();
+    } catch (error) {
+      // The retained process may already be gone, so this is not a refusal:
+      // no named outcome is honest and the requester derives `unknown`.
+      throw new Error(
+        `Restart of ${label} did not complete: ${errorMessage(error)}`,
+      );
+    } finally {
+      removePromptSnapshots(launchPlan.promptPaths);
+    }
+    return {
+      outcome: "restarted",
+      effects: ["process_ended", "session_retained", "process_relaunched"],
+      message: `Restarted ${label} run ${state.runId} in the same pane.`,
+    };
+  } finally {
+    release?.();
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function removePromptSnapshots(paths: readonly string[]): void {
+  for (const path of paths)
+    try {
+      if (statSync(path, { throwIfNoEntry: false })) unlinkSync(path);
+    } catch {
+      // A leaked private snapshot is bounded by its own lifetime, not a failure.
+    }
+}
+
+/**
+ * Executes one control request. A named outcome is returned only when the
+ * owner knows it; anything thrown leaves the claim without a result, so the
+ * requester reads `unknown` rather than a refusal for an applied operation.
+ */
+async function executeControlRequest(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  scope: ControllerScope | undefined,
+  request: ControlRequest,
+  signal?: AbortSignal,
+): Promise<ControlOperationOutcome> {
+  const target = await resolveControlTarget(pi, ctx, scope, request, signal);
+  if (target.kind === "refused")
+    return {
+      outcome: "refused",
+      category: target.category,
+      message: target.message,
+    };
+  const { snapshot } = target;
+  try {
+    if (request.operation === "close") {
+      const abandoned = CONTROL_UNRESOLVED_STATES.has(
+        String(snapshot.listed.state),
+      );
+      let paneClosed = false;
+      await closeAgentByIdentity(pi, ctx, request.agent, {
+        signal,
+        scope,
+        expected: snapshot.state,
+        onClosed: (_label, closedPane) => {
+          paneClosed = closedPane;
+        },
+      });
+      if (abandoned) resolveAbandonedAssignment(pi, ctx, snapshot, request);
+      return {
+        outcome: "closed",
+        effects: paneClosed
+          ? ["process_ended", "pane_closed"]
+          : ["process_ended"],
+        message: paneClosed
+          ? `Closed ${request.agent} run ${request.runId}.`
+          : `Closed ${request.agent} run ${request.runId}; its pane was not closed.`,
+      };
+    }
+    return await restartIdleManagedWorker(pi, ctx, snapshot, scope, signal);
+  } catch (error) {
+    if (
+      error instanceof OperationError &&
+      CONTROL_REFUSAL_CATEGORIES.has(error.detail.category)
+    )
+      return {
+        outcome: "refused",
+        category: error.detail.category as ControlCategory,
+        message: error.detail.message,
+      };
+    throw error;
+  }
+}
+
+/**
+ * The owner-side wiring: any session that can own workers serves its own
+ * control directory, because the owner of a worker is the session in its
+ * `pi_herdsman_parent_session` (D2).
+ */
+function startSessionControlOwner(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  scope: ControllerScope,
+  previous: ControlOwner | undefined,
+): ControlOwner | undefined {
+  previous?.stop();
+  const started = startControlOwner({
+    ownerSessionId: ctx.sessionManager.getSessionId(),
+    execute: (request) => executeControlRequest(pi, ctx, scope, request),
+    onResult: (request, result) => {
+      // A control request is an operator action, not a conversation turn: a
+      // custom entry is persisted for the transcript and never enters model
+      // context.
+      pi.appendEntry(CONTROL_ENTRY, {
+        requestId: request.requestId,
+        operation: request.operation,
+        agent: request.agent,
+        runId: request.runId,
+        requester: request.requester,
+        outcome: result.outcome,
+        ...(result.category ? { category: result.category } : {}),
+        effects: result.effects,
+        completedAt: result.completedAt,
+      });
+      publishControlToken(pi, ctx, request, result.outcome);
+    },
+    onError: (error) =>
+      appendDurableError(pi, ctx, "pi_herdsman_control_error", error),
+  });
+  if (!started.ok) {
+    appendDurableError(
+      pi,
+      ctx,
+      "pi_herdsman_control_error",
+      new Error(`control directory is unavailable: ${started.reason}`),
+    );
+    return undefined;
+  }
+  return started.owner;
+}
+
+/** A wake hint with a short TTL; the result file stays authoritative. */
+function publishControlToken(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  request: ControlRequest,
+  outcome: string,
+): void {
+  const paneId = process.env.HERDR_PANE_ID;
+  if (!paneId || ctx.mode !== "tui" || !process.env.HERDR_ENV) return;
+  void runHerdr(
+    pi,
+    ctx,
+    metadataArgs(
+      {
+        paneId,
+        source: CONTROL_METADATA_SOURCE,
+        tokens: {
+          [CONTROL_METADATA_KEY]: `${request.requestId}:${outcome}`,
+        },
+      },
+      CONTROL_METADATA_TTL_MS,
+    ),
+    { noResult: true, timeout: 10_000 },
+  ).catch(() => undefined);
+}
+
 type ManagedAgentCascadePlan = {
   parent: ManagedAgentSnapshot;
   descendants: ManagedAgentSnapshot[];
@@ -5847,97 +6696,8 @@ async function actionUnsafe(
     if (p.action === "continue" && typeof p.session !== "string")
       fail("invalid_request", "continue requires session", p.action);
   }
-  if (p.action === "close") {
-    const agentLabel = p.agent;
-    const closeView = await agentSnapshotView(pi, ctx, scope, signal);
-    const candidates = closeView.visible.filter(
-      ({ listed }) => listed.label === agentLabel,
-    );
-    if (candidates.length === 0)
-      fail("target_not_found", "No exact agent identity matched", "close");
-    if (candidates.length > 1)
-      fail(
-        "target_ambiguous",
-        "Agent identity matched multiple live agents",
-        "close",
-      );
-    const candidate = candidates[0];
-    const listed = candidate.listed;
-    const mailbox = listed.label
-      ? agentMailboxPath(listed.workspace_id as string, listed.label)
-      : undefined;
-    if (!mailbox)
-      fail("target_not_found", "Agent has no managed mailbox", "close");
-    let state: ManagedAgentState | undefined;
-    try {
-      state = readAgentState(mailbox);
-    } catch (error) {
-      fail(
-        "internal_failure",
-        `Agent mailbox state is malformed or oversized: ${String(error)}`,
-        "close",
-        {
-          ids: {
-            label: listed.label as string,
-            paneId: listed.pane_id,
-          },
-        },
-      );
-    }
-    if (!state)
-      fail(
-        "target_not_found",
-        "No valid managed state matched the agent",
-        "close",
-      );
-    const owner = ctx.sessionManager.getSessionId();
-    const directOwner = state.ownerSessionId === owner;
-    if (!directOwner)
-      fail(
-        "target_not_found",
-        "Agent belongs to another owner session",
-        "close",
-      );
-    const cleanupWarnings = new Map<string, string>();
-    const stopReport: StopReportCallbacks = {
-      onCleanupFailure: (label, message) => {
-        cleanupWarnings.set(label, message);
-      },
-    };
-    try {
-      if (directOwner && scope?.kind === "lead")
-        await closeManagedAgentCascade(pi, ctx, state, signal, {}, stopReport);
-      else await closeManagedSnapshot(pi, ctx, candidate, signal, stopReport);
-    } catch (error) {
-      const failure = normalizeCloseFailure(error, {
-        label: listed.label as string,
-        paneId: listed.pane_id,
-      });
-      const cleanup = [...cleanupWarnings.values()].at(-1);
-      if (cleanup)
-        failure.detail.cleanup = {
-          category: "internal_failure",
-          message: cleanup,
-          operation: "close",
-        };
-      if (failure.detail.category !== "agent_busy") {
-        if (cleanupWarnings.size === 0)
-          appendDurableError(pi, ctx, "pi_herdsman_cleanup_error", failure);
-      }
-      throw failure;
-    }
-    const warnings = [...cleanupWarnings];
-    return {
-      ok: true,
-      action: "close",
-      agent: agentLabel,
-      presentation_agent_definition: stateAgentDefinition(state),
-      ...(warnings.length === 1 ? { cleanup_error: warnings[0]![1] } : {}),
-      ...(warnings.length > 1
-        ? { cleanup_errors: Object.fromEntries(warnings) }
-        : {}),
-    };
-  }
+  if (p.action === "close")
+    return closeAgentByIdentity(pi, ctx, p.agent, { signal, scope });
   if (p.action === "transcript") {
     const agentLabel = p.agent;
     const ownerSessionId = ctx.sessionManager.getSessionId();
@@ -6511,36 +7271,33 @@ async function actionUnsafe(
       let started: StartedHerdrAgent | undefined;
       let accepted = false;
       try {
-        const skillResolution = resolveDefinitionSkills({
-          agent: effectiveDefinition.name,
-          ...(effectiveDefinition.frontmatter.skills !== undefined
-            ? { skills: effectiveDefinition.frontmatter.skills }
-            : {}),
-          ...(effectiveDefinition.frontmatter.preloadedSkills !== undefined
-            ? { preloadedSkills: effectiveDefinition.frontmatter.preloadedSkills }
-            : {}),
+        const launchPlan = prepareManagedWorkerLaunch(ctx, {
+          pi,
+          operation: p.action,
+          definition: effectiveDefinition,
+          fingerprintDefinition,
           cwd: agentCwd,
+          projectTrusted: agentContext.projectTrusted,
+          label,
+          runId,
+          ownerSessionId: owner,
+          forwardingSession,
+          mailbox,
+          workspaceId,
+          briefProfile: roleLaunchInputs.briefProfile,
+          allowedAgentDefinitions: delegationEnabled
+            ? (effectiveDefinition.frontmatter.agents ?? [])
+            : [],
+          resumed,
         });
-        if (!skillResolution.ok)
-          fail("invalid_request", skillResolution.reason, p.action);
-        try {
-          promptPaths = writePrivatePromptSnapshots([
-            ...(preparedDefinition.body ? [preparedDefinition.body] : []),
-            ...skillResolution.preloaded.map((skill) => skill.body),
-            SHARED_AGENT_INSTRUCTIONS,
-          ]);
-        } catch (error) {
-          promptWriteFailed = true;
-          throw error;
+        promptPaths = launchPlan.promptPaths;
+        if (!launchPlan.ok) {
+          // A prompt snapshot that could not be written means nothing started
+          // yet, so the launch rollback must not run for it.
+          if (launchPlan.stage === "prompt") promptWriteFailed = true;
+          throw launchPlan.error;
         }
-        const bodyPromptPath = preparedDefinition.body
-          ? promptPaths[0]
-          : undefined;
-        const preloadedSkillPromptPaths = skillResolution.preloaded.map(
-          (_skill, index) =>
-            promptPaths[(preparedDefinition.body ? 1 : 0) + index]!,
-        );
-        const sharedPromptPath = promptPaths[promptPaths.length - 1]!;
+        const { launchArgs, launchFingerprint, env } = launchPlan;
         invalidateCachedRuntime(label);
         const resetRelease = claimAssignmentLock(mailbox, p.action, { label });
         try {
@@ -6548,94 +7305,6 @@ async function actionUnsafe(
         } finally {
           resetRelease();
         }
-        const env = [
-          `PI_HERDSMAN_MAILBOX=${mailbox}`,
-          `PI_HERDSMAN_RUN_ID=${runId}`,
-          `PI_HERDSMAN_OWNER_SESSION_ID=${owner}`,
-          `PI_SUBAGENT_PARENT_SESSION=${forwardingSession}`,
-          `PI_HERDSMAN_LABEL=${label}`,
-          `PI_HERDSMAN_WORKSPACE_ID=${workspaceId}`,
-          `PI_HERDSMAN_AGENT_DEFINITION=${agentDefinition}`,
-          `PI_HERDSMAN_BRIEF_PROFILE=${roleLaunchInputs.briefProfile}`,
-          `PI_HERDSMAN_ALLOWED_AGENT_DEFINITIONS=${JSON.stringify(
-            delegationEnabled ? effectiveDefinition.frontmatter.agents : [],
-          )}`,
-          ...(process.env.PI_CODING_AGENT_DIR
-            ? [`PI_CODING_AGENT_DIR=${process.env.PI_CODING_AGENT_DIR}`]
-            : []),
-          "PI_OFFLINE=1",
-        ];
-        // Pi reports the providers that extensions registered; a model from one
-        // of them cannot resolve in a child denied extension discovery.
-        // Older registries and test doubles may not expose the list, in which
-        // case nothing counts as extension-provided and the model is inherited
-        // exactly as before this change.
-        const registeredProviderIds = new Set(
-          ctx.modelRegistry?.getRegisteredProviderIds?.() ?? [],
-        );
-        const childModel = resolveChildModel({
-          configured: configuredModel(effectiveDefinition.frontmatter),
-          inherited:
-            !resumed && ctx.model
-              ? { provider: ctx.model.provider, token: modelToken(ctx.model) }
-              : undefined,
-          isForeignProvider: (providerId) =>
-            registeredProviderIds.has(providerId),
-        });
-        // The operator's model policy, then the one contradiction the policy
-        // exists to surface: a pinned model whose provider only an extension
-        // supplies, in a child the definition denies extensions to.
-        if (childModel.kind === "use") {
-          const pinnedValue = configuredModel(effectiveDefinition.frontmatter);
-          const pinned =
-            pinnedValue !== undefined && pinnedValue.trim() !== ""
-              ? pinnedValue
-              : undefined;
-          const origin = pinned === undefined ? "inherited" : "pinned";
-          const scopes = readConfig().modelScopes;
-          const agentAllow = scopes.agents?.[effectiveDefinition.name]?.allow;
-          const violation = modelPolicyError({
-            agent: effectiveDefinition.name,
-            model: childModel.model,
-            origin,
-            ...(scopes.allow === undefined
-              ? {}
-              : { globalAllow: scopes.allow }),
-            ...(agentAllow === undefined ? {} : { agentAllow }),
-          });
-          if (violation !== undefined) throw new Error(violation);
-          if (origin === "pinned") {
-            const denied = deniedDiscoveryModelError({
-              agent: effectiveDefinition.name,
-              model: childModel.model,
-              noExtensions:
-                effectiveDefinition.frontmatter.noExtensions === true,
-              extensions: effectiveDefinition.frontmatter.extensions,
-              isForeignProvider: (providerId) =>
-                registeredProviderIds.has(providerId),
-            });
-            if (denied !== undefined) throw new Error(denied);
-          }
-        }
-        const launchArgs = agentLaunchArgs(effectiveDefinition, {
-          ...(bodyPromptPath !== undefined ? { bodyPromptPath } : {}),
-          ...(preloadedSkillPromptPaths.length
-            ? { preloadedSkillPromptPaths }
-            : {}),
-          sharedPromptPath,
-          cwd: agentCwd,
-          managedAgent: true,
-          approveProject:
-            agentContext.projectTrusted && sameCwd(agentCwd, ctx.cwd),
-          ...(!resumed ? { inheritedThinking: pi.getThinkingLevel() } : {}),
-          modelDecision: childModel,
-          resolvedSkills: skillResolution.advertised,
-        });
-        // A retained process keeps the launch configuration it started with, so
-        // reuse compares this fingerprint with the then-current definition.
-        const launchFingerprint = agentLaunchFingerprint(
-          resolveAgentLaunchInputs(fingerprintDefinition, { cwd: agentCwd }),
-        );
         started = await startHerdrAgent(pi, ctx, {
           label,
           runId,
@@ -7648,6 +8317,12 @@ export default function (pi: ExtensionAPI): void {
             allowedAgentDefinitions: new Set(allowedAgentDefinitions),
           }
         : undefined;
+  // The owner of a worker is the session in its parent-session pointer, so any
+  // session that can own workers — a Lead, or a delegating managed agent —
+  // creates and watches its own control directory (D2). The lifecycle handlers
+  // below start and stop it; a separate handler would reorder the existing
+  // `session_start`/`session_shutdown` sequence the contract tests pin down.
+  let controlOwner: ControlOwner | undefined;
   const managerDiagnosticEvents = new Set<string>();
   const managerDiagnosticAllowlist = new Set([
     "session_start_reached",
@@ -14809,6 +15484,13 @@ export default function (pi: ExtensionAPI): void {
     };
     pi.on("session_start", async (_event: unknown, ctx: ExtensionContext) => {
       preparePaneMetadata(ctx);
+      if (controllerScope)
+        controlOwner = startSessionControlOwner(
+          pi,
+          ctx,
+          controllerScope,
+          controlOwner,
+        );
       managerDiagnostic("session_start_reached");
       startupDefinitionRoster = undefined;
       clearChiefStartPreflight();
@@ -15050,6 +15732,8 @@ export default function (pi: ExtensionAPI): void {
       if (wasChief) watchActiveAsks();
     });
     pi.on("session_shutdown", async () => {
+      controlOwner?.stop();
+      controlOwner = undefined;
       leadMetadataClosed = true;
       const metadataClear = Promise.all([
         leadMetadata?.clear(),

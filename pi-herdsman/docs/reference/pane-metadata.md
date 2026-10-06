@@ -5,6 +5,7 @@ The official Herdr Pi integration owns semantic state and session reporting. Her
 Each TUI session in Herdr publishes under `pi-herdsman:lead` (ordinary Lead, Manager or Chief) or `pi-herdsman:<runId>` (managed worker). Headless and non-Herdr sessions publish nothing. Tokens expire after one hour and refresh halfway through. Missing values are cleared; text is terminal-safe and bounded to 80 Unicode characters.
 
 Herdr applies `--ttl-ms` per updated key, so short-lived facts on the same pane use their own source slots: Herdsman publishes the pane's awaited set under `pi-herdsman:awaited`, and `pi-bash-processes` publishes its background task facts under `pi-bash-processes`. Both slots expire after 30 seconds and refresh halfway through, and a pane with nothing outstanding publishes neither.
+The same owner publishes one more short-lived slot on its own pane: after it writes a control result it publishes `pi_herdsman_control` under `pi-herdsman:control`, holding `<requestId>:<outcome>` for 30 seconds. It is a wake hint, not a second authority, so it is published once and never refreshed or cleared; the control results directory is the record, and a requester that misses the token reads the result file. Because nothing refreshes it, a missed token leaves no stale fact behind: the key expires through its own TTL.
 
 | Token                        | Value                                        | When present             |
 | ---------------------------- | -------------------------------------------- | ------------------------ |
@@ -24,6 +25,7 @@ Herdr applies `--ttl-ms` per updated key, so short-lived facts on the same pane 
 | `pi_herdsman_name`           | Lead session name                            | Named Lead               |
 | `pi_herdsman_ask`            | Pending ask UUID                             | Lead with pending ask    |
 | `pi_herdsman_awaited`        | Awaited items, comma-separated               | Anything outstanding     |
+| `pi_herdsman_control`        | `<requestId>:<outcome>`                      | Owner answered           |
 | `pi_bg_running`              | Running background task count                | A task is running        |
 | `pi_bg_tasks`                | Running task ids, comma-separated            | A task is running        |
 | `pi_bg_started`              | Oldest running task's ISO 8601 start         | A task is running        |
@@ -59,7 +61,7 @@ Step 4 reads the `pi_bg_tasks` entries, not `pi_bg_running`. The count covers on
 
 Herdr 0.9.3 keeps one flat token map per pane. `--token k=v` patches a key, `--clear-token k` removes it, the latest write to a key wins regardless of `--source`, and a clear removes the key even if another source wrote it. `--source` does not isolate publishers. Coexistence is safe only because **every token name has exactly one publisher**: Herdsman owns the generic tokens above and every `pi_herdsman_*` name, Radar owns `anchor`, `sort_key`, workspace/tab keys, glyphs and row tokens, and other extensions own their own names. Herdsman clears only names it publishes. A new Herdsman name must not collide with any other publisher's.
 
-Limits, both all-or-nothing (the whole report is rejected, nothing is evicted): at most 16 token keys per report and 32 retained keys per pane. A worker report carries 13 keys, a Lead report 9, the owner report 1, the awaited report 1 and the background-facts report 3. With Radar and other tools already writing, a worker pane is estimated at about 30 of 32, so new names need headroom. TTL applies per updated key. Token metadata is not restored after a Herdr server restart; the next refresh (at most 30 minutes, or 15 seconds for the short-lived owner, awaited and background keys) republishes it.
+Limits, both all-or-nothing (the whole report is rejected, nothing is evicted): at most 16 token keys per report and 32 retained keys per pane. A worker report carries 13 keys, a Lead report 9, the owner report 1, the awaited report 1, the background-facts report 3 and the control wake hint 1. With Radar and other tools already writing, a worker pane is estimated at about 30 of 32, so new names need headroom. TTL applies per updated key. Token metadata is not restored after a Herdr server restart; the next refresh (at most 30 minutes, or 15 seconds for the short-lived owner, awaited and background keys) republishes it.
 
 `pane report-metadata` takes an explicit pane id and works from any pane, so the owner's write onto a worker's pane is supported. Owner state is polled about every 2 seconds while the owner lives; after an owner crash the 30-second TTL is the effective window. Shutdown clears this process's names; failed clears expire through TTL.
 

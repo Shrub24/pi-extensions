@@ -39,6 +39,7 @@ disagrees.
 | Operator recovery                                      | [Recovery](../guides/recovery.md)                                   |
 | Container deployment                                   | [Container deployment](../guides/container-deployment.md)           |
 | `agent_*` contract                                     | [Agent tools](../reference/agent.md)                                |
+| Herdsman control request contract                      | [Herdsman control](../reference/herdsman-control.md)                |
 | `ask_owner` contract                                   | [`ask_owner`](../reference/ask-owner.md)                            |
 | `staff_*` and project-work contract                    | [Staff tools](../reference/staff.md)                                |
 | `supervisor_*` contract                                | [Supervisor tools](../reference/supervisor.md)                      |
