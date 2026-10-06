@@ -89,13 +89,26 @@ own target. The result names the effects actually applied
 (`process_ended`, `pane_closed`, `session_retained`, `process_relaunched`), so a
 surface can render what happened rather than what it asked for.
 
-## D8. The owner's model is not prompted
+## D8. The owner's model is told only what changes live work
 
-A control request is an operator action, not a conversation turn. The owner
-records it as a durable session entry that Pi does not send to the model, and
-`agent_list` reflects the outcome (a closed worker is gone; a restarted one
-carries `relaunched`). The model learns the effect when it next looks. This is
-the default pending the user's confirmation.
+A control request is an operator action, not a conversation turn, and creates no
+prompt. The owner records it as a session entry excluded from model context.
+
+What the owner's model needs depends on whether it was waiting on the target:
+
+- A target with an unresolved assignment (working, waiting, blocked or settling)
+  that is closed leaves the lead waiting on a result that will never arrive. The
+  assignment resolves through its normal terminal result path, typed as closed by
+  an operator, so the lead learns it as it would any failed delegation. No new
+  channel.
+- An idle or delivered target that is closed or restarted changes lifecycle only.
+  The lead sees it in `agent_list` (the worker is gone, or carries `relaunched`)
+  and is not told.
+
+The difference between a retained idle worker and a resumable closed one is
+operational, not a data-model one: the idle worker keeps its process, pane and
+warm context and is continued by label; the closed one has only its session file
+and is continued by exact session, cold, in a new pane.
 
 ## D9. Compatibility
 

@@ -202,10 +202,14 @@ partially applied.
 
 ## Handling and retention
 
-A control request is an operator action, not a conversation turn. The owner
-records it as a session entry Pi does not send to the model, and `agent_list`
-reflects the outcome: a closed worker is gone, and a restarted one carries
-`relaunched`. The owner's model learns the effect when it next looks.
+A control request is an operator action, not a conversation turn, and creates no
+prompt. The owner records it as a session entry Pi does not send to the model.
+What the model learns depends on what it was waiting on. Closing a target with an
+unresolved assignment resolves that assignment through its normal terminal result
+path, typed as closed by an operator, so the lead learns it as it would any failed
+delegation. Closing or restarting an idle or delivered target is lifecycle only:
+the model is not told, and `agent_list` reflects it (a closed worker is gone, a
+restarted one carries `relaunched`).
 
 After writing a result the owner publishes
 `pi_herdsman_control=<requestId>:<outcome>` on its own pane with a short TTL as a

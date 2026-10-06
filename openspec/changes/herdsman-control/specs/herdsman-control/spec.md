@@ -150,16 +150,23 @@ and treat every cross-check as optional, and SHALL refuse a `version` other than
 - **WHEN** a request carries a field this build does not define
 - **THEN** the request is handled as if the field were absent
 
-### Requirement: The owner's model is not prompted
+### Requirement: The owner's model learns only what changes live work
 
-Handling a control request SHALL NOT create a model turn. The owner SHALL record
-it as a session entry excluded from model context, and `agent_list` SHALL reflect
-the outcome.
+Handling a control request SHALL NOT create a model turn and SHALL be recorded as
+a session entry excluded from model context. Closing a target with an unresolved
+assignment SHALL resolve that assignment through its terminal result path, typed
+as closed by an operator. Closing or restarting an idle or delivered target SHALL
+NOT notify the model, and `agent_list` SHALL reflect the outcome.
 
-#### Scenario: A worker is closed by an operator
+#### Scenario: A working worker is closed by an operator
 
-- **WHEN** a control request closes a worker
-- **THEN** no prompt is sent to the owner's model and the worker is absent from the next `agent_list`
+- **WHEN** a control request closes a worker that has an unresolved assignment
+- **THEN** the assignment resolves as closed by an operator through the normal result path and no separate prompt is sent
+
+#### Scenario: An idle worker is closed by an operator
+
+- **WHEN** a control request closes an idle or delivered worker
+- **THEN** the model is not notified and the worker is absent from the next `agent_list`
 
 ### Requirement: Completion is signalled by a token and settled by the file
 
