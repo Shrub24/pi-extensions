@@ -29,6 +29,7 @@ schema is:
   "contextRetirement": false,
   "retainWorkers": true,
   "softTimeoutMs": 300000,
+  "workerContextBudgetTokens": 200000,
   "inlineAttachmentLimitBytes": 131072,
   "mailboxPayloadLimitBytes": 131072,
   "disabledDefinitions": [],
@@ -44,6 +45,7 @@ An absent file means these defaults:
 | `contextRetirement`          |              false | boolean                                           |
 | `retainWorkers`              |               true | boolean                                           |
 | `softTimeoutMs`              |          `300000`  | integer from 0 (disabled) through 2147483647      |
+| `workerContextBudgetTokens`  |           `200000` | integer from 16384 through 1000000|
 | `inlineAttachmentLimitBytes` | `131072` (128 KiB) | integer from 1024 (1 KiB) through 1048576 (1 MiB) |
 | `mailboxPayloadLimitBytes`   | `131072` (128 KiB) | integer from 1024 (1 KiB) through 1048576 (1 MiB) |
 | `disabledDefinitions`        |                `[]` | unique definition names, at most 64              |
@@ -83,6 +85,19 @@ expiry by up to one scan interval. `agent_extend` replaces one worker's next
 window with a longer one. The window never aborts, steers, or closes anything,
 and `0` disables soft windows entirely. Set the value from the
 `/agents` → `Soft timeout` item or the config file.
+
+`workerContextBudgetTokens` is the context budget of a managed worker. When a
+worker's reported context reaches it at the end of a turn that called a tool,
+Herdsman compacts the session at Pi's manual compaction boundary and continues
+the same assignment, so the worker carries a summary plus a retained tail rather
+than the largest context its window allows. The value is bounded by the model's
+window minus a reply reserve, so a window smaller than the budget compacts
+earlier, and one assignment is compacted at most three times. `contextRetirement`
+suppresses it. The summary comes from whichever summarizer the worker's own Pi
+configuration loads for compaction; this deployment's child build supplies one
+without a model call. Pi's own threshold compaction stays off, because it is a
+global setting that would also govern an operator session (see
+[ADR 0028](../adr/0028-compact-a-managed-workers-context-at-a-fixed-budget.md)).
 
 `retainWorkers` controls whether a worker's process and pane survive after its
 result is delivered. It defaults to `true`: a worker is a persistent session, so

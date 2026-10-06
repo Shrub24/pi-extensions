@@ -19,6 +19,14 @@ export const MIN_BYTE_LIMIT = 1024;
 export const MAX_BYTE_LIMIT = 1024 * 1024;
 export const DEFAULT_SOFT_TIMEOUT_MS = 5 * 60_000;
 export const MAX_SOFT_TIMEOUT_MS = 2_147_483_647;
+// A managed worker is compacted once its context reaches this many tokens,
+// whatever the model's window is: the point is a lean working context, not
+// protection against the window alone. A window smaller than the budget still
+// bounds it, because the route clamps the completion budget near the top of the
+// window and answers with a single token and a length stop.
+export const DEFAULT_WORKER_CONTEXT_BUDGET_TOKENS = 200_000;
+export const MIN_WORKER_CONTEXT_BUDGET_TOKENS = 16_384;
+export const MAX_WORKER_CONTEXT_BUDGET_TOKENS = 1_000_000;
 export const MAX_DISABLED_DEFINITIONS = 64;
 export const MAX_MODEL_PATTERNS = 64;
 export const MAX_MODEL_PATTERN_LENGTH = 128;
@@ -41,6 +49,7 @@ export type HerdsmanConfig = {
   contextRetirement: boolean;
   retainWorkers: boolean;
   softTimeoutMs: number;
+  workerContextBudgetTokens: number;
   inlineAttachmentLimitBytes: number;
   mailboxPayloadLimitBytes: number;
   disabledDefinitions: string[];
@@ -52,6 +61,7 @@ export const DEFAULT_CONFIG: HerdsmanConfig = {
   contextRetirement: false,
   retainWorkers: true,
   softTimeoutMs: DEFAULT_SOFT_TIMEOUT_MS,
+  workerContextBudgetTokens: DEFAULT_WORKER_CONTEXT_BUDGET_TOKENS,
   inlineAttachmentLimitBytes: DEFAULT_BYTE_LIMIT,
   mailboxPayloadLimitBytes: DEFAULT_BYTE_LIMIT,
   disabledDefinitions: [],
@@ -143,12 +153,25 @@ export function validSoftTimeout(value: unknown): value is number {
   );
 }
 
+// A context budget below a tokenizer's smallest useful summary would compact a
+// worker forever without ever gaining room, so the floor is a real figure rather
+// than a byte-limit minimum.
+export function validWorkerContextBudget(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isInteger(value) &&
+    value >= MIN_WORKER_CONTEXT_BUDGET_TOKENS &&
+    value <= MAX_WORKER_CONTEXT_BUDGET_TOKENS
+  );
+}
+
 type ConfigKey = keyof HerdsmanConfig;
 const CONFIG_KEYS = new Set<ConfigKey>([
   "spawnPlacement",
   "contextRetirement",
   "retainWorkers",
   "softTimeoutMs",
+  "workerContextBudgetTokens",
   "inlineAttachmentLimitBytes",
   "mailboxPayloadLimitBytes",
   "disabledDefinitions",
@@ -186,6 +209,13 @@ function parseRawConfig(content: string): Partial<HerdsmanConfig> {
     if (!validSoftTimeout(record.softTimeoutMs))
       throw new Error("Invalid Pi Herdsman config field softTimeoutMs");
     result.softTimeoutMs = record.softTimeoutMs;
+  }
+  if ("workerContextBudgetTokens" in record) {
+    if (!validWorkerContextBudget(record.workerContextBudgetTokens))
+      throw new Error(
+        "Invalid Pi Herdsman config field workerContextBudgetTokens",
+      );
+    result.workerContextBudgetTokens = record.workerContextBudgetTokens;
   }
   if ("modelScopes" in record) {
     if (!validModelScopes(record.modelScopes))
@@ -269,10 +299,18 @@ export function updateConfig<K extends ConfigKey>(
       if (key === "softTimeoutMs" && !validSoftTimeout(value))
         throw new Error("Invalid Pi Herdsman config field softTimeoutMs");
       if (
+        key === "workerContextBudgetTokens" &&
+        !validWorkerContextBudget(value)
+      )
+        throw new Error(
+          "Invalid Pi Herdsman config field workerContextBudgetTokens",
+        );
+      if (
         key !== "spawnPlacement" &&
         key !== "contextRetirement" &&
         key !== "retainWorkers" &&
         key !== "softTimeoutMs" &&
+        key !== "workerContextBudgetTokens" &&
         !validByteLimit(value)
       )
         throw new Error(`Invalid Pi Herdsman config field ${key}`);

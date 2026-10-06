@@ -132,6 +132,14 @@ imported at `156b1c66` (v0.18.0). The fork's own changes:
   persistent sessions that compact through their own Pi context stack and stay
   continuable, instead of retiring at the compaction threshold.
 
+- **A worker's context budget** — `workerContextBudgetTokens` (default
+  `200000`) compacts a managed worker's context at the end of a tool-call turn
+  and continues the same assignment on the compacted session, with the summary
+  supplied by the context stack the worker's own Pi configuration loads
+  ([configuration](docs/reference/configuration.md),
+  [ADR 0028](docs/adr/0028-compact-a-managed-workers-context-at-a-fixed-budget.md)).
+  Fork branches: `managedContextBudget`, `compactManagedContextIfOverBudget`.
+
 - **Retained workers across assignments** — by default (`retainWorkers: true`), a
   delivered worker keeps its verified live process, pane, label, and mailbox and
   stays `idle` until `agent_continue` reuses it; a drifted or missing launch

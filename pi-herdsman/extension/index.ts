@@ -439,12 +439,19 @@ function formatMessageLimit(bytes: number): string {
   return `${bytes / 1024} KiB · ≈${tokens.toLocaleString("en-US")} tokens`;
 }
 const MAX_RESPONSE_CORRECTIONS = 2;
-// A managed session is compacted once its context reaches this reserve below the
-// model's window. The route clamps the completion budget as the prompt
-// approaches the window and answers with a single token and a length stop at the
-// top of it (observed at a 270k prompt on a 272k window: `output: 1`, no text),
-// and this reserve is also what leaves room for a long final reply.
-const MANAGED_CONTEXT_RESERVE_TOKENS = 65_536;
+// How many times one assignment may be compacted and continued: the budget is
+// checked again after every compaction, so a worker whose summary leaves it over
+// budget would otherwise compact, abort and continue without end.
+const MAX_REQUEST_CONTEXT_COMPACTIONS = 3;
+// The budget bounds a window smaller than itself, because the route clamps the
+// completion budget as the prompt approaches the window and answers with a single
+// token and a length stop at the top of it (observed at a 270k prompt on a 272k
+// window: `output: 1`, no text). This also leaves room for a long final reply.
+const MANAGED_CONTEXT_WINDOW_RESERVE_TOKENS = 32_768;
+const CONTEXT_COMPACTION_CONTINUATION =
+  "Your context was compacted to keep this session lean. Continue the same " +
+  "assignment from where you left off rather than restarting it; write " +
+  "artifacts to disk as you go and end with your complete final response.";
 const AGENT_DELEGATION_GUIDANCE =
   "Use agent_delegate for genuinely independent or context-heavy work; keep small, tightly coupled work local. " +
   "When a retained worker already holds the relevant context, continue it instead of starting a fresh agent.";
@@ -16512,6 +16519,7 @@ export default function (pi: ExtensionAPI): void {
   let turnEmptyGeneration = false;
   let awaitingContinuation = false;
   let cutOffContinuations: { requestId: string; count: number } | undefined;
+  let compactionContinuations: { requestId: string; count: number } | undefined;
   // A compaction is in flight; a second request would stack summaries over the
   // same session.
   let contextCompactionInFlight = false;
@@ -17627,7 +17635,7 @@ export default function (pi: ExtensionAPI): void {
       turnCutOff && !latest && outputTokens !== undefined && outputTokens <= 1;
     awaitingContinuation = false;
   });
-  pi.on("turn_end", (_event: unknown, ctx: ExtensionContext) => {
+  pi.on("turn_end", (event: unknown, ctx: ExtensionContext) => {
     touchActivity();
     if (!state) return;
     const usage = ctx.getContextUsage();
@@ -17642,6 +17650,13 @@ export default function (pi: ExtensionAPI): void {
       ...(model ? { model } : {}),
       ...(thinking ? { thinking } : {}),
     });
+    // Tool-call turns are followed by another turn, which is the boundary at
+    // which an over-budget worker is compacted and its assignment continued.
+    compactManagedContextIfOverBudget(
+      ctx,
+      (event as { message?: { stopReason?: string } } | undefined)?.message
+        ?.stopReason === "toolUse",
+    );
   });
   pi.on("session_info_changed", (_event, ctx) => {
     if (state) reportMetadata(pi, ctx, agentMetadataRuntime(state, ctx), {});
@@ -18437,8 +18452,14 @@ export default function (pi: ExtensionAPI): void {
    * route's clamp is neither an overflow nor a recoverable cut-off. The child
    * build carries pi-vcc, which owns the summary from the marker without a
    * model call; without it the summary falls to whichever handler is loaded.
+   * Compacting aborts the running operation, so the caller owns what happens
+   * next: at a turn boundary that is a continuation of the same assignment.
    */
-  const compactManagedContext = (ctx: ExtensionContext): boolean => {
+  const compactManagedContext = (
+    ctx: ExtensionContext,
+    onComplete?: () => void,
+    onError?: () => void,
+  ): boolean => {
     if (contextCompactionInFlight) return false;
     if (typeof ctx.compact !== "function") return false;
     contextCompactionInFlight = true;
@@ -18448,9 +18469,11 @@ export default function (pi: ExtensionAPI): void {
         onComplete: () => {
           contextCompactionInFlight = false;
           reassertManagedIdentity(ctx);
+          onComplete?.();
         },
         onError: () => {
           contextCompactionInFlight = false;
+          onError?.();
         },
       });
     } catch {
@@ -18461,19 +18484,75 @@ export default function (pi: ExtensionAPI): void {
   };
 
   /**
-   * Compact while the worker is idle and its context has grown into the reserve
-   * below the model's window. Called after a settlement published its result,
-   * so the summary can never race the answer being judged, and never while
-   * context retirement is configured to make the opposite choice.
+   * The token count at which this worker compacts: the configured budget, bounded
+   * by the model's window so a window smaller than the budget still leaves room
+   * for a reply.
    */
-  const compactManagedContextIfFull = (ctx: ExtensionContext): void => {
+  const managedContextBudget = (contextWindow: number): number => {
+    const configured = readConfig().workerContextBudgetTokens;
+    if (!(contextWindow > 0)) return configured;
+    const ceiling = contextWindow - MANAGED_CONTEXT_WINDOW_RESERVE_TOKENS;
+    if (!(ceiling > 0)) return Math.max(Math.floor(contextWindow / 2), 1);
+    return Math.min(configured, ceiling);
+  };
+
+  /**
+   * Compact a worker whose context has reached its budget at the end of a
+   * mid-assignment turn, then continue the same assignment on the compacted
+   * session. Only a tool-call turn is compacted: the compaction aborts the
+   * running operation, and a turn that answered has nothing to continue and a
+   * result settled from the history a summary would replace. Nothing happens
+   * while context retirement makes the opposite choice, or once this assignment
+   * has been compacted up to its limit.
+   */
+  const compactManagedContextIfOverBudget = (
+    ctx: ExtensionContext,
+    turnCalledTools: boolean,
+  ): void => {
+    if (!turnCalledTools) return;
     if (readConfig().contextRetirement) return;
     const usage = ctx.getContextUsage();
     if (!usage || usage.tokens === null) return;
-    if (!(usage.contextWindow > 0)) return;
-    if (usage.tokens < usage.contextWindow - MANAGED_CONTEXT_RESERVE_TOKENS)
+    if (usage.tokens < managedContextBudget(usage.contextWindow)) return;
+    const requestId = state?.activeRequestId;
+    if (!requestId) return;
+    const used =
+      compactionContinuations?.requestId === requestId
+        ? compactionContinuations.count
+        : 0;
+    if (used >= MAX_REQUEST_CONTEXT_COMPACTIONS) return;
+    const heldLatest = latest;
+    const heldFreshResponse = freshResponse;
+    const heldContinuations = compactionContinuations;
+    // The hold goes on before the request: compacting aborts the running
+    // operation, so the settlement that ends this turn has to know that nothing
+    // was answered yet. It is released again when no compaction started and when
+    // one failed, so a turn whose compaction did not happen is still judged as
+    // the answer it is.
+    const release = (): void => {
+      awaitingContinuation = false;
+      latest = heldLatest;
+      freshResponse = heldFreshResponse;
+      compactionContinuations = heldContinuations;
+    };
+    awaitingContinuation = true;
+    latest = "";
+    freshResponse = false;
+    compactionContinuations = { requestId, count: used + 1 };
+    if (
+      compactManagedContext(
+        ctx,
+        () => {
+          pi.sendUserMessage(CONTEXT_COMPACTION_CONTINUATION, {
+            deliverAs: "followUp",
+            triggerTurn: true,
+          });
+        },
+        release,
+      )
+    )
       return;
-    compactManagedContext(ctx);
+    release();
   };
 
   pi.on("agent_settled", async (_event: unknown, ctx: ExtensionContext) => {
@@ -18491,13 +18570,11 @@ export default function (pi: ExtensionAPI): void {
         ctx,
         controllerAbortController?.signal,
       ).catch(() => {});
-    // Last: the result this settlement publishes is judged from the session
-    // history that a compaction would replace.
-    compactManagedContextIfFull(ctx);
   });
   pi.on("session_shutdown", () => {
     pendingInterruptReplacement = undefined;
     contextCompactionInFlight = false;
+    compactionContinuations = undefined;
     resetLeafStatus();
     metadataAbortController?.abort();
     metadataAbortController = undefined;

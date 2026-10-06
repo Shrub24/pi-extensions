@@ -65,7 +65,9 @@ const { createAcceptedAssignmentContract } = await import(
 const { writePrivatePromptSnapshots } = await import(
   "./agent-definitions.ts"
 );
-const { updateConfig } = await import("./config.ts");
+const { updateConfig, DEFAULT_WORKER_CONTEXT_BUDGET_TOKENS } = await import(
+  "./config.ts",
+);
 // These suites cover the one-shot lifecycle; retained workers are the default,
 // and the tests that exercise retention opt in or out explicitly.
 beforeEach(() => updateConfig("retainWorkers", false));
@@ -5110,44 +5112,88 @@ function compactingAgentContext(
     customInstructions?: string;
     onComplete?: () => void;
   }) => void = () => undefined,
+  contextWindow = COMPACTION_WINDOW,
 ): never {
   return {
     ...fakeAgentContext(entries),
     getContextUsage: () => ({
       tokens,
-      contextWindow: COMPACTION_WINDOW,
+      contextWindow,
       percent: null,
     }),
     compact,
   } as never;
 }
 
-test("a settled worker compacts into its reserve and keeps its identity entries", async (t) => {
-  const mailbox = setAgentEnvironment("compaction-agent");
+/** Accept one assignment, so this worker's turns belong to a live request. */
+async function assignManagedRequest(
+  agent: ReturnType<typeof fakePi>,
+  mailbox: string,
+  context: never,
+  text = "keep this assignment lean",
+): Promise<void> {
+  await agent.events.get("session_start")![0](undefined, context);
+  const started = readAgentState(mailbox)!;
+  writeRequest(mailbox, {
+    version: 5,
+    runId: started.runId,
+    requestId: REQUEST_ID,
+    ownerSessionId: started.ownerSessionId,
+    workspaceId: started.workspaceId,
+    agentLabel: started.agentLabel,
+    paneId: started.paneId,
+    kind: "task",
+    text,
+    createdAt: Date.now(),
+  });
+  agent.events.get("input")![0]({ text: controlMarker(REQUEST_ID) }, context);
+}
+
+/** End one turn of that assignment with an assistant stop reason. */
+function endTurn(
+  agent: ReturnType<typeof fakePi>,
+  context: never,
+  stopReason: string,
+): void {
+  agent.events.get("turn_end")![0](
+    { message: { role: "assistant", content: [], stopReason } },
+    context,
+  );
+}
+
+/** A compaction stub that drops the summarized entries, as Pi does. */
+function replacingCompaction(
+  agent: ReturnType<typeof fakePi>,
+  compactions: string[],
+) {
+  return (options: { customInstructions?: string; onComplete?: () => void }) => {
+    compactions.push(options?.customInstructions ?? "");
+    for (let index = agent.entries.length - 1; index >= 0; index--) {
+      const customType = (agent.entries[index] as any)?.customType;
+      if (
+        customType === "pi-herdsman-session-metadata" ||
+        customType === "pi-herdsman-agent-definition"
+      )
+        agent.entries.splice(index, 1);
+    }
+    options?.onComplete?.();
+  };
+}
+
+test("a worker over its context budget compacts at a tool-call turn and continues", async (t) => {
+  const mailbox = setAgentEnvironment("compaction-budget-agent");
   t.after(() => resetAgentMailbox(mailbox));
   const agent = fakePi();
   registerExtension!(agent.pi as never);
   const compactions: string[] = [];
   const context = compactingAgentContext(
     agent.entries,
-    COMPACTION_WINDOW - 32_768,
-    (options) => {
-      compactions.push(options?.customInstructions ?? "");
-      // A compaction replaces the summarized history with a summary.
-      for (let index = agent.entries.length - 1; index >= 0; index--) {
-        const customType = (agent.entries[index] as any)?.customType;
-        if (
-          customType === "pi-herdsman-session-metadata" ||
-          customType === "pi-herdsman-agent-definition"
-        )
-          agent.entries.splice(index, 1);
-      }
-      options?.onComplete?.();
-    },
+    DEFAULT_WORKER_CONTEXT_BUDGET_TOKENS + 1_000,
+    replacingCompaction(agent, compactions),
   );
-  await agent.events.get("session_start")![0](undefined, context);
+  await assignManagedRequest(agent, mailbox, context);
 
-  await agent.events.get("agent_settled")![0](undefined, context);
+  endTurn(agent, context, "toolUse");
 
   assert.deepEqual(compactions, ["/pi-vcc"]);
   // The entries the summary replaced are read back later: one classifies the
@@ -5160,10 +5206,24 @@ test("a settled worker compacts into its reserve and keeps its identity entries"
     countCustomEntries(agent.entries, "pi-herdsman-agent-definition"),
     1,
   );
+  // The compaction aborted a turn that answered nothing: the worker is told to
+  // continue, and the settlement holds until it does.
+  assert.deepEqual(agent.sentUserCalls, [
+    {
+      content: agent.sentUserCalls[0]?.content,
+      options: { deliverAs: "followUp", triggerTurn: true },
+    },
+  ]);
+  assert.match(
+    String(agent.sentUserCalls[0]?.content),
+    /compacted to keep this session lean/,
+  );
+  await agent.events.get("agent_settled")![0](undefined, context);
+  assert.equal(readResult(mailbox, REQUEST_ID), undefined);
   fireShutdown(agent);
 });
 
-test("a settled worker below its reserve does not compact", async (t) => {
+test("a worker below its context budget is left alone", async (t) => {
   const mailbox = setAgentEnvironment("compaction-room-agent");
   t.after(() => resetAgentMailbox(mailbox));
   const agent = fakePi();
@@ -5171,14 +5231,39 @@ test("a settled worker below its reserve does not compact", async (t) => {
   const compactions: string[] = [];
   const context = compactingAgentContext(
     agent.entries,
-    COMPACTION_WINDOW - 96_000,
+    DEFAULT_WORKER_CONTEXT_BUDGET_TOKENS - 1_000,
     (options) => {
       compactions.push(options?.customInstructions ?? "");
     },
   );
-  await agent.events.get("session_start")![0](undefined, context);
+  await assignManagedRequest(agent, mailbox, context);
 
-  await agent.events.get("agent_settled")![0](undefined, context);
+  endTurn(agent, context, "toolUse");
+
+  assert.deepEqual(compactions, []);
+  assert.deepEqual(agent.sentUserCalls, []);
+  fireShutdown(agent);
+});
+
+test("a turn that answered is not compacted at its budget", async (t) => {
+  const mailbox = setAgentEnvironment("compaction-answer-agent");
+  t.after(() => resetAgentMailbox(mailbox));
+  const agent = fakePi();
+  registerExtension!(agent.pi as never);
+  const compactions: string[] = [];
+  const context = compactingAgentContext(
+    agent.entries,
+    DEFAULT_WORKER_CONTEXT_BUDGET_TOKENS + 1_000,
+    (options) => {
+      compactions.push(options?.customInstructions ?? "");
+    },
+  );
+  await assignManagedRequest(agent, mailbox, context);
+
+  // Only a tool-call turn is followed by another turn. A turn that answered has
+  // nothing to continue, and its result is settled from the history a summary
+  // would replace.
+  endTurn(agent, context, "stop");
 
   assert.deepEqual(compactions, []);
   fireShutdown(agent);
@@ -5191,13 +5276,17 @@ test("unknown context usage does not compact", async (t) => {
   registerExtension!(agent.pi as never);
   const compactions: string[] = [];
   // Pi reports no token count right after a compaction, so a missing figure
-  // must not be read as a full window: that would compact forever.
-  const context = compactingAgentContext(agent.entries, null, (options) => {
-    compactions.push(options?.customInstructions ?? "");
-  });
-  await agent.events.get("session_start")![0](undefined, context);
+  // must not be read as a full context: that would compact forever.
+  const context = compactingAgentContext(
+    agent.entries,
+    null,
+    (options) => {
+      compactions.push(options?.customInstructions ?? "");
+    },
+  );
+  await assignManagedRequest(agent, mailbox, context);
 
-  await agent.events.get("agent_settled")![0](undefined, context);
+  endTurn(agent, context, "toolUse");
 
   assert.deepEqual(compactions, []);
   fireShutdown(agent);
@@ -5211,21 +5300,97 @@ test("a compaction already in flight is not started again", async (t) => {
   const compactions: string[] = [];
   const context = compactingAgentContext(
     agent.entries,
-    COMPACTION_WINDOW - 32_768,
+    DEFAULT_WORKER_CONTEXT_BUDGET_TOKENS + 1_000,
     (options) => {
       compactions.push(options?.customInstructions ?? "");
     },
   );
-  await agent.events.get("session_start")![0](undefined, context);
+  await assignManagedRequest(agent, mailbox, context);
 
-  await agent.events.get("agent_settled")![0](undefined, context);
-  await agent.events.get("agent_settled")![0](undefined, context);
+  endTurn(agent, context, "toolUse");
+  endTurn(agent, context, "toolUse");
 
   assert.deepEqual(compactions, ["/pi-vcc"]);
   fireShutdown(agent);
 });
 
-test("context retirement replaces compaction on a settled worker", async (t) => {
+test("a turn whose compaction cannot start is still settled", async (t) => {
+  const mailbox = setAgentEnvironment("compaction-unstarted-agent");
+  t.after(() => resetAgentMailbox(mailbox));
+  const agent = fakePi();
+  registerExtension!(agent.pi as never);
+  const context = compactingAgentContext(
+    agent.entries,
+    DEFAULT_WORKER_CONTEXT_BUDGET_TOKENS + 1_000,
+    () => {
+      throw new Error("compaction unavailable");
+    },
+  );
+  await assignManagedRequest(agent, mailbox, context);
+  agent.events.get("message_end")![0](
+    {
+      message: { role: "assistant", content: "Finished.", stopReason: "toolUse" },
+    },
+    context,
+  );
+
+  endTurn(agent, context, "toolUse");
+
+  // Nothing was aborted and nothing will answer later, so the turn is judged as
+  // the answer it is rather than held for a continuation that never comes.
+  assert.deepEqual(agent.sentUserCalls, []);
+  await agent.events.get("agent_settled")![0](undefined, context);
+  assert.equal(readResult(mailbox, REQUEST_ID)?.text, "Finished.");
+  fireShutdown(agent);
+});
+
+test("one assignment is compacted only up to its limit", async (t) => {
+  const mailbox = setAgentEnvironment("compaction-limit-agent");
+  t.after(() => resetAgentMailbox(mailbox));
+  const agent = fakePi();
+  registerExtension!(agent.pi as never);
+  const compactions: string[] = [];
+  const context = compactingAgentContext(
+    agent.entries,
+    DEFAULT_WORKER_CONTEXT_BUDGET_TOKENS + 1_000,
+    (options) => {
+      compactions.push(options?.customInstructions ?? "");
+      options?.onComplete?.();
+    },
+  );
+  await assignManagedRequest(agent, mailbox, context);
+
+  // The budget is checked again after every compaction, so a worker whose
+  // summary leaves it over budget cannot be compacted without end.
+  for (let index = 0; index < 5; index++) endTurn(agent, context, "toolUse");
+
+  assert.equal(compactions.length, 3);
+  fireShutdown(agent);
+});
+
+test("a window smaller than the budget compacts earlier", async (t) => {
+  const mailbox = setAgentEnvironment("compaction-narrow-agent");
+  t.after(() => resetAgentMailbox(mailbox));
+  const agent = fakePi();
+  registerExtension!(agent.pi as never);
+  const compactions: string[] = [];
+  const context = compactingAgentContext(
+    agent.entries,
+    10_000,
+    (options) => {
+      compactions.push(options?.customInstructions ?? "");
+    },
+    40_000,
+  );
+  await assignManagedRequest(agent, mailbox, context);
+
+  endTurn(agent, context, "toolUse");
+
+  assert.deepEqual(compactions, ["/pi-vcc"]);
+  fireShutdown(agent);
+});
+
+test("context retirement replaces compaction at a turn boundary", async (t) => {
   updateConfig("contextRetirement", true);
   t.after(() => updateConfig("contextRetirement", undefined));
   const mailbox = setAgentEnvironment("compaction-retired-agent");
@@ -5235,14 +5400,14 @@ test("context retirement replaces compaction on a settled worker", async (t) => 
   const compactions: string[] = [];
   const context = compactingAgentContext(
     agent.entries,
-    COMPACTION_WINDOW - 32_768,
+    DEFAULT_WORKER_CONTEXT_BUDGET_TOKENS + 1_000,
     (options) => {
       compactions.push(options?.customInstructions ?? "");
     },
   );
-  await agent.events.get("session_start")![0](undefined, context);
+  await assignManagedRequest(agent, mailbox, context);
 
-  await agent.events.get("agent_settled")![0](undefined, context);
+  endTurn(agent, context, "toolUse");
 
   assert.deepEqual(compactions, []);
   fireShutdown(agent);
