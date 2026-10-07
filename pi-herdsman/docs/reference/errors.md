@@ -54,6 +54,13 @@ not necessarily "nothing exists physically".
 
 `target_ambiguous` means Pi Herdsman refuses to choose among multiple candidates.
 
+A pane that resolves an occupant but does not report the run-scoped alias of the
+generation it is recorded for is also `target_ambiguous`: the recorded
+generation and the pane's actual occupant disagree, so nothing is closed,
+retired, or relaunched, and the refusal names the pane and the alias. A control
+request resolves the same evidence through `target_not_found`, whose meaning
+already covers a presence that cannot be proven.
+
 Both are fail-closed behavior.
 
 ## Rollback

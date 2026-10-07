@@ -131,6 +131,14 @@ Herdsman may emit one generic `unknown` attention event for that unresolved
 episode. It does not add mutation actions, prove loss, or broaden `ask_owner`.
 When exact physical evidence changes, re-evaluate the record from fresh state.
 
+A pane that resolves an occupant but not the run-scoped alias is also `unknown`.
+Every destructive control closes a generation through `herdr agent get <alias>`,
+so a pane whose agent never reported that alias — or that holds a different or
+unnamed one — cannot authorize a close, a retirement, or a relaunch. The record
+keeps its empty `available_tools` list, carries a diagnostic naming the pane and
+the alias, and preserves its mailbox and saved Pi session for the operator to
+resolve. Alias absence alone never proves loss.
+
 `lost` is different: a coherent Herdr inventory proves the expected pane,
 session, and run-scoped alias are absent. It is not completion or task failure;
 use direct-owner `agent_close` to abandon the unresolved generation when the

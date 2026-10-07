@@ -2962,7 +2962,13 @@ type ManagedAgentSnapshot = {
 };
 type ManagedAgentPresence =
   | { kind: "live"; agent: any }
-  | { kind: "unknown"; diagnostic: string; relatedAgents: any[] }
+  | {
+      kind: "unknown";
+      diagnostic: string;
+      relatedAgents: any[];
+      /** The pane holds this record but its agent claims no alias. */
+      aliasUnclaimed?: true;
+    }
   | { kind: "lost" };
 function durableIdentityKey(state: ManagedAgentState): string {
   return `${state.workspaceId}\0${state.piSessionId}`;
@@ -3540,6 +3546,29 @@ function isLostWorkerOf(
   );
 }
 
+/**
+ * The alias every destructive control resolves through `herdr agent get`, and
+ * the refusal for a pane whose agent does not claim it.
+ */
+function unclaimedAliasDiagnostic(state: ManagedAgentState): string {
+  const alias = herdrAgentAlias(
+    state.workspaceId,
+    state.agentLabel,
+    state.runId,
+  );
+  return `Managed alias ${alias} is not reported in pane ${state.paneId}; a different or unnamed agent occupies it. Inspect the pane, resolve that process, then retry; the assignment and its saved session are preserved.`;
+}
+
+/**
+ * The refusal an unprovable presence produces. An unclaimed alias already names
+ * its pane and occupant, so its diagnostic is the actionable message; every
+ * other ambiguity stays terse.
+ */
+function unprovablePresenceMessage(presence: ManagedAgentPresence): string {
+  return presence.kind === "unknown" && presence.aliasUnclaimed === true
+    ? presence.diagnostic
+    : "Managed agent presence cannot be proved safely";
+}
 function managedAgentPresence(
   state: ManagedAgentState,
   inventory: HerdrSessionSnapshot,
@@ -3580,17 +3609,29 @@ function managedAgentPresence(
   const relatedPanes = inventory.panes.filter((pane) =>
     safeMatches(pane?.agent_session),
   );
-  if (
+  const soleExactMatch =
     exact.length === 1 &&
-    expectedPane &&
+    expectedPane !== undefined &&
     relatedAgents.every((agent) => agent === exact[0]) &&
     relatedPanes.every(
       (pane) =>
         pane?.workspace_id === state.workspaceId &&
         pane?.pane_id === state.paneId,
-    )
-  )
-    return { kind: "live", agent: exact[0] };
+    );
+  // Every destructive control closes this generation through
+  // `herdr agent get <alias>`, so only the record that reports the run-scoped
+  // alias is a proved live generation. `herdrAliasMatchesIfReported` keeps
+  // tolerating an unreported name for post-launch verification, where the
+  // launch path has already matched it; here that tolerance would let a
+  // pane-id lookup alone authorise closing a different or unnamed occupant.
+  if (soleExactMatch && exact[0]?.name !== expectedAlias)
+    return {
+      kind: "unknown",
+      relatedAgents: [exact[0]],
+      diagnostic: unclaimedAliasDiagnostic(state),
+      aliasUnclaimed: true,
+    };
+  if (soleExactMatch) return { kind: "live", agent: exact[0] };
   if (
     !expectedPane &&
     exact.length === 0 &&
@@ -5262,8 +5303,11 @@ async function closeManagedSnapshot(
   if (snapshot.presence.kind === "unknown")
     fail(
       "target_ambiguous",
-      "Managed agent presence cannot be proved safely",
+      unprovablePresenceMessage(snapshot.presence),
       "close",
+      snapshot.presence.aliasUnclaimed === true
+        ? { ids: { label: snapshot.state.agentLabel, paneId: snapshot.state.paneId } }
+        : {},
     );
   // A control request resolves its target before the shared close runs, so the
   // generation it resolved must still be the one under the assignment lock.
@@ -5295,8 +5339,11 @@ async function closeManagedSnapshot(
     if (presence.kind === "unknown")
       fail(
         "target_ambiguous",
-        "Managed agent presence cannot be proved safely",
+        unprovablePresenceMessage(presence),
         "close",
+        presence.aliasUnclaimed === true
+          ? { ids: { label: current.agentLabel, paneId: current.paneId } }
+          : {},
       );
     if (presence.kind === "live") {
       await closeManagedAgent(
@@ -5558,7 +5605,12 @@ async function resolveControlTarget(
       return {
         kind: "refused",
         category: "target_not_found",
-        message: `Presence of ${request.agent} run ${request.runId} cannot be proved.`,
+        // An unclaimed alias already names the pane and the occupant, so the
+        // operator gets the same actionable line the direct tools report.
+        message:
+          snapshot.presence.aliasUnclaimed === true
+            ? snapshot.presence.diagnostic
+            : `Presence of ${request.agent} run ${request.runId} cannot be proved.`,
       };
     // Both operations re-check a supplied cross-check here, before the claim's
     // effect: a disagreement means the operator is looking at a different
@@ -6079,8 +6131,16 @@ function assertManagedAgentCascadeSafe(
     if (snapshot.presence.kind === "unknown")
       fail(
         "target_ambiguous",
-        "Managed agent presence cannot be proved safely",
+        unprovablePresenceMessage(snapshot.presence),
         "close",
+        snapshot.presence.aliasUnclaimed === true
+          ? {
+              ids: {
+                label: snapshot.state.agentLabel,
+                paneId: snapshot.state.paneId,
+              },
+            }
+          : {},
       );
 
     let current: ManagedAgentState | undefined;
@@ -7227,6 +7287,22 @@ async function actionUnsafe(
                   agent.state.paneId === single.state.paneId,
               )
             : undefined;
+          // The representation exists but reports no run-scoped alias in its
+          // pane, so the exact generation can be neither reused, relaunched,
+          // nor retired. Name the occupant instead of reporting a generic busy
+          // state the operator cannot act on.
+          if (
+            record &&
+            single!.state.agentLabel === resumed.label &&
+            record.presence.kind === "unknown" &&
+            record.presence.aliasUnclaimed === true
+          )
+            fail("target_ambiguous", record.presence.diagnostic, p.action, {
+              ids: {
+                label: record.state.agentLabel,
+                paneId: record.state.paneId,
+              },
+            });
           // Only the session's own label may be reused, so the assignment
           // keeps the worker identity its mailbox and session already carry.
           const decision =

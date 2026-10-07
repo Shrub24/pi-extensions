@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { beforeEach, mock, test } from "node:test";
@@ -12,6 +12,7 @@ import type {
   ResultRecord,
   ManagedAgentState,
 } from "./mailbox.ts";
+import type { ExecHandler, FixtureIdentity } from "./support.ts";
 import { claimProcessLock } from "./lock.ts";
 import { resultPath, resultRef } from "./storage.ts";
 import { IDLE_WAKE_PROMPT } from "./idle-wake.ts";
@@ -28,6 +29,7 @@ import support, {
   defaultFixtureIdentity,
   delegatedLifecycleExecutor,
   delegationLockPathForTest,
+  assignmentLockPathForTest,
   fakeContext,
   fakePi,
   fakeAgentContext,
@@ -8001,5 +8003,334 @@ test("a resolved assignment is never included in a later digest", async (t) => {
     pi.events.get("session_shutdown")?.[0]();
     resetAgentMailbox(mailbox);
     t.mock.timers.reset();
+  }
+});
+
+/**
+ * A pane whose registered agent never reports the run-scoped alias. The pane
+ * still resolves the generation by id, while `agent get <alias>` — the lookup
+ * every destructive control closes through — answers `agent_not_found`.
+ * `unclaim()` switches the pane to that shape, so a test can change the
+ * evidence between two inventory reads of the same generation.
+ */
+function unclaimableAliasExecutor(
+  label: string,
+  identity: FixtureIdentity,
+  siblings: ManagedAgentState[] = [],
+) {
+  const alias = herdrAlias(label);
+  const base = cascadeExecutor([
+    managedState(label, undefined, identity),
+    ...siblings,
+  ]);
+  let unclaimed = false;
+  let paneCloses = 0;
+  const withoutName = (result: { stdout: string }): { stdout: string } => {
+    const payload = JSON.parse(result.stdout);
+    const agents: any[] =
+      payload.result.agents ?? payload.result.snapshot.agents;
+    for (const agent of agents)
+      if (agent.pane_id === identity.paneId) delete agent.name;
+    return { ...result, stdout: JSON.stringify(payload) };
+  };
+  const exec: ExecHandler = (command, args, options) => {
+    if (command === "herdr") {
+      if (unclaimed && (isApiSnapshot(args) || isAgentList(args)))
+        return withoutName(base.exec(command, args, options));
+      if (unclaimed && args[0] === "agent" && args[1] === "get") {
+        if (args[2] === alias)
+          return {
+            stdout: JSON.stringify({ id: AGENT_ID, result: { agent: null } }),
+            stderr: "",
+            code: 0,
+          };
+        const result = base.exec(command, args, options);
+        const payload = JSON.parse(result.stdout);
+        if (payload.result?.agent?.pane_id === identity.paneId)
+          delete payload.result.agent.name;
+        return { ...result, stdout: JSON.stringify(payload) };
+      }
+      if (isPaneClose(args)) paneCloses += 1;
+    }
+    return base.exec(command, args, options);
+  };
+  return {
+    exec,
+    closeOrder: base.closeOrder,
+    unclaim: () => {
+      unclaimed = true;
+    },
+    paneCloses: () => paneCloses,
+  };
+}
+
+test("an unclaimed managed alias is unknown rather than idle and closable", async () => {
+  setLeadEnvironment();
+  updateConfig("retainWorkers", true);
+  const label = "unclaimed-alias";
+  const identity = recoveryIdentity(label);
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  resetAgentMailbox(mailbox);
+  writeAgentState(mailbox, {
+    ...managedState(label, undefined, identity),
+    completedRequestId: REQUEST_ID,
+  });
+  const fixture = unclaimableAliasExecutor(label, identity);
+  fixture.unclaim();
+  const pi = fakePi({ exec: fixture.exec });
+  registerExtension!(pi.pi as never);
+  try {
+    const listed = await agentTool(pi, "list").execute(
+      "id",
+      {},
+      undefined,
+      undefined,
+      fakeContext(),
+    );
+    const record = listed.details.agents.find(
+      (candidate: any) => candidate.agent === label,
+    );
+    assert.ok(record, "the generation stays listed");
+    assert.equal(record.state, "unknown");
+    assert.equal(record.recovery_only, true);
+    assert.match(String(record.diagnostic), new RegExp(identity.paneId));
+    assert.match(String(record.diagnostic), new RegExp(herdrAlias(label)));
+    assert.deepEqual(record.available_tools, []);
+
+    const closed = await agentTool(pi, "close").execute(
+      "id",
+      { agent: label },
+      undefined,
+      undefined,
+      fakeContext(),
+    );
+    assert.ok(
+      readAgentState(mailbox),
+      "an unprovable generation is never retired",
+    );
+    assert.equal(closed.details.error.category, "target_ambiguous");
+    assert.match(
+      String(closed.details.error.message),
+      new RegExp(identity.paneId),
+    );
+    assert.equal(fixture.paneCloses(), 0);
+  } finally {
+    updateConfig("retainWorkers", undefined);
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(mailbox);
+  }
+});
+
+test("a close that loses its alias claim between reads refuses without retiring the mailbox", async () => {
+  setLeadEnvironment();
+  const parent = {
+    ...managedState("alias-loss-parent", undefined, {
+      ...defaultFixtureIdentity,
+      paneId: "alias-loss-parent-pane",
+      piSessionId: PARENT_SESSION_ID,
+      piSessionFile: "/tmp/alias-loss-parent.jsonl",
+    }),
+  };
+  const child = {
+    ...managedState(
+      "alias-loss-child",
+      undefined,
+      recoveryIdentity("alias-loss-child"),
+    ),
+    ownerSessionId: parent.piSessionId,
+  };
+  const parentMailbox = agentMailboxPath(WORKSPACE, parent.agentLabel);
+  const childMailbox = agentMailboxPath(WORKSPACE, child.agentLabel);
+  resetAgentMailbox(parentMailbox);
+  resetAgentMailbox(childMailbox);
+  writeAgentState(parentMailbox, parent);
+  writeAgentState(childMailbox, child);
+  const fixture = unclaimableAliasExecutor(
+    child.agentLabel,
+    {
+      paneId: child.paneId,
+      tabId: `${child.agentLabel}-tab`,
+      piSessionId: child.piSessionId,
+      piSessionFile: child.piSessionFile!,
+    },
+    [parent],
+  );
+  // Pin the seam by evidence rather than call order: a descendant is closed
+  // after that generation's own assignment lock is claimed, so the flip is
+  // armed by the first descendant-mailbox read taken while its lock is held.
+  const childStatePath = join(childMailbox, "state.json");
+  const childLock = assignmentLockPathForTest(childMailbox);
+  support.agentStateReadHook = (path) => {
+    if (path === childStatePath && existsSync(childLock)) fixture.unclaim();
+  };
+  const pi = fakePi({ exec: fixture.exec });
+  registerExtension!(pi.pi as never);
+  try {
+    const closed = await agentTool(pi, "close").execute(
+      "id",
+      { agent: parent.agentLabel },
+      undefined,
+      undefined,
+      fakeContext(),
+    );
+    assert.ok(
+      readAgentState(childMailbox),
+      "an unprovable generation is never retired",
+    );
+    assert.equal(closed.details.error.category, "target_ambiguous");
+    assert.match(
+      String(closed.details.error.message),
+      new RegExp(child.paneId),
+    );
+    assert.match(
+      String(closed.details.error.message),
+      new RegExp(herdrAlias(child.agentLabel)),
+    );
+    assert.equal(closed.details.error.ids.label, child.agentLabel);
+    assert.equal(closed.details.error.ids.paneId, child.paneId);
+    assert.equal(fixture.paneCloses(), 0, "no pane is closed");
+    assert.deepEqual(fixture.closeOrder, [], "the cascade closes nothing");
+    assert.ok(readAgentState(parentMailbox), "the parent survives");
+  } finally {
+    support.agentStateReadHook = undefined;
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(parentMailbox);
+    resetAgentMailbox(childMailbox);
+  }
+});
+
+test("a matching managed execution still closes through the same fixture", async () => {
+  setLeadEnvironment();
+  const parent = {
+    ...managedState("claimed-parent", undefined, {
+      ...defaultFixtureIdentity,
+      paneId: "claimed-parent-pane",
+      piSessionId: PARENT_SESSION_ID,
+      piSessionFile: "/tmp/claimed-parent.jsonl",
+    }),
+  };
+  const child = {
+    ...managedState(
+      "claimed-child",
+      undefined,
+      recoveryIdentity("claimed-child"),
+    ),
+    ownerSessionId: parent.piSessionId,
+  };
+  const parentMailbox = agentMailboxPath(WORKSPACE, parent.agentLabel);
+  const childMailbox = agentMailboxPath(WORKSPACE, child.agentLabel);
+  resetAgentMailbox(parentMailbox);
+  resetAgentMailbox(childMailbox);
+  writeAgentState(parentMailbox, parent);
+  writeAgentState(childMailbox, child);
+  const fixture = unclaimableAliasExecutor(
+    child.agentLabel,
+    {
+      paneId: child.paneId,
+      tabId: `${child.agentLabel}-tab`,
+      piSessionId: child.piSessionId,
+      piSessionFile: child.piSessionFile!,
+    },
+    [parent],
+  );
+  const pi = fakePi({ exec: fixture.exec });
+  registerExtension!(pi.pi as never);
+  try {
+    const closed = await agentTool(pi, "close").execute(
+      "id",
+      { agent: parent.agentLabel },
+      undefined,
+      undefined,
+      fakeContext(),
+    );
+    assert.equal(closed.details.ok, true, JSON.stringify(closed.details));
+    assert.deepEqual(fixture.closeOrder, [
+      child.agentLabel,
+      parent.agentLabel,
+    ]);
+    assert.equal(readAgentState(childMailbox), undefined);
+    assert.equal(readAgentState(parentMailbox), undefined);
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(parentMailbox);
+    resetAgentMailbox(childMailbox);
+  }
+});
+
+test("continuing a saved session whose alias is unclaimed names the pane instead of relaunching", async () => {
+  setLeadEnvironment();
+  updateConfig("retainWorkers", true);
+  const label = "unclaimed-continue";
+  const identity = recoveryIdentity(label);
+  const sessionPath = join(testTmpRoot, "unclaimed-continue-session.jsonl");
+  const sessionId = randomUUID();
+  writeFileSync(sessionPath, "{}\n");
+  nativeSessions.set(sessionId, {
+    id: sessionId,
+    path: sessionPath,
+    cwd: "/tmp",
+    entries: [
+      {
+        type: "custom",
+        customType: "pi-herdsman-agent-definition",
+        data: { sessionId, definition: "agent", label },
+      },
+    ],
+  });
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  resetAgentMailbox(mailbox);
+  const state = {
+    ...managedState(label, undefined, {
+      ...identity,
+      piSessionId: sessionId,
+      piSessionFile: sessionPath,
+    }),
+    completedRequestId: REQUEST_ID,
+  };
+  writeAgentState(mailbox, state);
+  const entries: unknown[] = [
+    {
+      customType: "pi-herdsman-agent-result",
+      details: {
+        ...resultEntryDetails(state, REQUEST_ID),
+        agentDefinition: "agent",
+        status: "completed",
+      },
+    },
+  ];
+  const fixture = unclaimableAliasExecutor(label, {
+    ...identity,
+    piSessionId: sessionId,
+    piSessionFile: sessionPath,
+  });
+  fixture.unclaim();
+  const pi = fakePi({ entries, exec: fixture.exec });
+  registerExtension!(pi.pi as never);
+  try {
+    const continued = await agentTool(pi, "continue").execute(
+      "id",
+      { session: sessionPath, task: "continue the same assignment" },
+      undefined,
+      undefined,
+      fakeContext(entries),
+    );
+    assert.equal(continued.details.error.category, "target_ambiguous");
+    assert.match(
+      String(continued.details.error.message),
+      new RegExp(identity.paneId),
+    );
+    assert.equal(
+      pi.calls.filter((args) => args[0] === "agent" && args[1] === "start")
+        .length,
+      0,
+      "nothing is relaunched",
+    );
+    assert.ok(readAgentState(mailbox), "the mailbox is never retired");
+  } finally {
+    updateConfig("retainWorkers", undefined);
+    nativeSessions.delete(sessionId);
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(mailbox);
+    realFs.rmSync(sessionPath, { force: true });
   }
 });

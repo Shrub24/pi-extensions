@@ -653,6 +653,30 @@ test("control refusals name their category and leave the target as it was", asyn
   }
 });
 
+test("a pane that does not claim the alias refuses control with the pane named", async (t) => {
+  const worker = controlWorkerFixture("unclaimed-alias", {
+    snapshot: (snapshot: any) => {
+      // The pane holds the generation, but Herdr does not report the run-scoped
+      // alias every destructive control resolves it through.
+      for (const agent of snapshot.agents) delete agent.name;
+    },
+  });
+  try {
+    await worker.open();
+    const request = controlRequest("close", worker.label, AGENT_ID);
+    assert.equal(writeControlRequest(request, LEAD_SESSION_ID).ok, true);
+    const result = await answered(t, request.requestId);
+    assert.equal(result.outcome, "refused", JSON.stringify(result));
+    assert.equal(result.category, "target_not_found");
+    assert.match(String(result.message), /startup-pane/);
+    assert.deepEqual(result.effects, []);
+    assert.equal(worker.paneCloses().length, 0);
+    assert.ok(readAgentState(worker.mailbox), "the target is untouched");
+  } finally {
+    worker.shutdown();
+  }
+});
+
 test("a presence another pane can claim refuses without acting", async (t) => {
   const worker = controlWorkerFixture("ghost", {
     snapshot: (snapshot, details) => {
