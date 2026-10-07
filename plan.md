@@ -118,6 +118,19 @@ refusals, plus carried-background-result settlement contract tests. No live reco
     graph (`extension/support.ts` is the test harness and nothing outside `*.test.ts` imports it). Open:
     the per-module ceiling (`BUN_JSC_maximumAOTCandidateBytecodeSize=352256`) against an 18,677-line
     `extension/index.ts`.
+    Planned packaging change (owner, 2026-10-07): the profile-level bash wrapper may go, with the
+    entrypoints (`pi`, `pi-bolt`, `pi-bolt-child`) provided by the store derivation itself. That removes
+    the wrapper-to-payload hop for consumers — PATH resolves straight into the derivation, so family and
+    version are exact — which is exactly the bridge Radar's strict-literal launcher resolver was built for,
+    and it retires that parser instead of documenting it. What must survive the move: the per-user
+    `$HOME/.pi/agent/npm/...` extension flags and the conditional herdr extension (a runtime test inside the
+    store script), the child's `-e` filtering plus its `--no-extensions -e builtin:mcp -e builtin:codemode`
+    injection, and `PI_HERDSMAN_CHILD_COMMAND` (a bare PATH name or the store path; herdsman records the
+    resolved absolute path either way). Still worth emitting from the build even then: an identity stamp
+    (`$out/nix-support/pi-bolt-identity.json` — family, version, Pi version, compiled plugins, herdsman
+    revision), because a store path cannot say which plugins are compiled in and under AOT it is the only
+    build identity a process can report. Radar consumes both. Note also that `pi` is now the pi-bolt lead
+    launcher, so `pi` and `pi-bolt` distinguish nothing — family must come from the store root or the env.
 
 ## pi-jev: native classifier and AOT
 
