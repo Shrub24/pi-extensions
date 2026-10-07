@@ -1,6 +1,7 @@
 # pi-herdsman and pi-bash-processes: outstanding work
 
-Updated 2026-10-06. Local `main` equals upstream and the Nix pin; everything below is pushed.
+Updated 2026-10-07. Local `main` equals upstream and the Nix pin; everything below is pushed. A peer
+session develops pi-jev on top of `main` in this same working copy.
 Every item names its root cause (known, partly known, unknown) and the path forward.
 
 ## Worker lifecycle (direction)
@@ -18,6 +19,34 @@ stays resumable, driven by the assignment's state and not by a lead's memory.
 - Open questions: does the grace period reset on any pane activity or only on `agent_continue`; does
   `agent_list` show retired workers as resumable sessions; does Radar need a "retired, resumable" token.
 - Depends on: #130 below, because a pane left as a shell must read `lost` for cleanup to be decidable.
+
+## Herdr independence (direction)
+
+Herdr owns the pane container and the agent record, not the work. Replace both, and keep the lifecycle and
+reporting ours. This is direction, not a scheduled change, and the worker-retirement and control items
+above land first.
+
+What Herdr supplies today:
+
+- **Container and topology:** `tab create` / `pane split` / `pane list` / `pane get`, the cwd, and the
+  `--env` list a pane is born with, which is how a worker receives `PI_HERDSMAN_*`. Closing the pane is
+  the only way we terminate a worker's shell.
+- **Process start:** `agent start --kind pi` types the canonical `pi` into the pane's shell, so the shell
+  resolves the binary; `pane run` types a line we composed. After `herdsman-child-command` the second is
+  the configured path, which is the first step out.
+- **The agent record:** `agent get` / `list` / `rename` / `wait`, plus the official Herdr Pi reporter
+  extension that supplies `agent_session` and lifecycle authority, with Herdr's screen detection as a
+  status fallback when no reporter is loaded. Presence, `lost` and the alias we address a worker by all
+  read from that record, and Herdr #3208 forced the fresh-shell `agent_pane_busy` retry we carry.
+
+What is already ours: the mailbox and assignment lock, ownership records and the launch fingerprint,
+settlement and the result files, the `herdsman-control/v1` one-shot request/result transport, and the pane
+facts `pi-bash-processes` publishes. No part of the control contract calls Herdr.
+
+Target shape: our own pane and process provisioning and command execution; readiness and identity taken
+from the worker's own extensions rather than a screen-scraped status; presence and liveness for a pane we
+did not create; and a backend seam that keeps the Herdr implementation selectable until it is retired.
+Radar owning pane detection and restart is the same split from the other side.
 
 ## Known defects
 
@@ -79,12 +108,27 @@ refusals, plus carried-background-result settlement contract tests. No live reco
 9. `#258` exact-path lookup: a separate upstream improvement to the managed-Lead/worktree resolution
    (replaces another global session scan). Independent of the alignment.
 
+## pi-jev: native classifier and AOT
+
+- Replace the runtime pi-typesafe client with Pi's native classifier API. Drop daily request
+  limits rather than replacing pi-typesafe's persistent ledger. Preserve the configured model,
+  session limits, timeouts and decision semantics; adapt `noul` questions and answers to Pi's
+  `bool`/`probability` representation.
+- Keep the permission-system sibling-source import patch in the Pi-Bolt staging recipe, not
+  in the portable extension source. The staged import itself must have a literal specifier.
+- Deferred: assess the utility of `pi-typesafe/calibrate` in `pi-jev/scripts/report.ts` later.
+  Calibration is outside the runtime migration and must not pull pi-typesafe into the AOT graph.
+
 ## Hygiene
 
-- The alignment plan at `.pi-herdsman/pre-extraction-adoption-plan.md` is deliberately uncommitted until the
-alignment is approved. `.pi-herdsman/pre-extraction-restart-redelivery.md` was deleted: it designed a
-queued-restart/redelivery lifecycle the owner rejected in favour of a refusal at the delegation boundary
-plus Radar-owned restart.
+- The revised alignment plan at `.pi-herdsman/pre-extraction-adoption-plan.md` stays out of `main` until
+the alignment is approved: it is parked in a local commit, not merged.
+`.pi-herdsman/pre-extraction-restart-redelivery.md` was deleted: it designed a queued-restart/redelivery
+lifecycle the owner rejected in favour of a refusal at the delegation boundary plus Radar-owned restart.
+- In a shared working copy a bare `jj commit` / `jj new` finalizes whichever commit is checked out and
+sweeps in every other session's uncommitted files. One such `jj new` carried a deliberately-held file and
+a peer's plan section into an undescribed commit, and detaching that peer's commit from it later dropped
+the section from `main`. Path-scope the commit, or check the tree first.
 - Commit by explicit file path while a worker is live. A directory pathspec swept a worker's in-progress
   test into `ba8faea3`; the tree is correct and only history is untidy.
 - Uncommitted work left behind by a departed session is now `ac0628a2`: pi-reqcap's chain-aware
