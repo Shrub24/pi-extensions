@@ -454,6 +454,12 @@ const CONTEXT_COMPACTION_CONTINUATION =
   "Your context was compacted to keep this session lean. Continue the same " +
   "assignment from where you left off rather than restarting it; write " +
   "artifacts to disk as you go and end with your complete final response.";
+// pi-vcc's own compaction marker (`PI_VCC_COMPACT_INSTRUCTION`). It reads any
+// other instruction string as a follow-up prompt and re-sends it as a user
+// message once the compaction succeeds, which starts a turn of its own over an
+// assignment Herdsman is still holding; only its marker selects the silent,
+// extension-owned summary.
+const PI_VCC_COMPACT_INSTRUCTION = "__pi_vcc__";
 const AGENT_DELEGATION_GUIDANCE =
   "Use agent_delegate for genuinely independent or context-heavy work; keep small, tightly coupled work local. " +
   "When a retained worker already holds the relevant context, continue it instead of starting a fresh agent.";
@@ -18542,7 +18548,7 @@ export default function (pi: ExtensionAPI): void {
     contextCompactionInFlight = true;
     try {
       ctx.compact({
-        customInstructions: "/pi-vcc",
+        customInstructions: PI_VCC_COMPACT_INSTRUCTION,
         onComplete: () => {
           contextCompactionInFlight = false;
           reassertManagedIdentity(ctx);

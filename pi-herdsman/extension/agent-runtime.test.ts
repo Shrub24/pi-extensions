@@ -5161,6 +5161,32 @@ function endTurn(
   );
 }
 
+/**
+ * A compaction stub that reproduces the pinned `@sting8k/pi-vcc` 0.9.0
+ * `session_compact` branch (`src/hooks/before-compact.ts`): only its own marker
+ * (`PI_VCC_COMPACT_INSTRUCTION` = `__pi_vcc__`) is extension-owned, and any
+ * other instruction string it parsed is re-sent as a user message once the
+ * compaction succeeds, which starts a turn of its own.
+ */
+function pinnedVccCompaction(
+  agent: ReturnType<typeof fakePi>,
+  compactions: string[],
+) {
+  return (options: {
+    customInstructions?: string;
+    onComplete?: () => void;
+  }) => {
+    const instructions = options?.customInstructions?.trim();
+    compactions.push(options?.customInstructions ?? "");
+    const isPiVcc =
+      instructions === "__pi_vcc__" || instructions?.startsWith("__pi_vcc__ ");
+    // Sent inside `session_compact`, before Pi resolves the manual compaction
+    // whose completion calls onComplete.
+    if (!isPiVcc && instructions) agent.pi.sendUserMessage(instructions as never);
+    options?.onComplete?.();
+  };
+}
+
 /** A compaction stub that drops the summarized entries, as Pi does. */
 function replacingCompaction(
   agent: ReturnType<typeof fakePi>,
@@ -5195,7 +5221,7 @@ test("a worker over its context budget compacts at a tool-call turn and continue
 
   endTurn(agent, context, "toolUse");
 
-  assert.deepEqual(compactions, ["/pi-vcc"]);
+  assert.deepEqual(compactions, ["__pi_vcc__"]);
   // The entries the summary replaced are read back later: one classifies the
   // session, the other lets an owner resolve this worker's role.
   assert.equal(
@@ -5220,6 +5246,41 @@ test("a worker over its context budget compacts at a tool-call turn and continue
   );
   await agent.events.get("agent_settled")![0](undefined, context);
   assert.equal(readResult(mailbox, REQUEST_ID), undefined);
+  fireShutdown(agent);
+});
+
+test("a compaction asks pi-vcc for a silent summary rather than a new turn", async (t) => {
+  const mailbox = setAgentEnvironment("compaction-marker-agent");
+  t.after(() => resetAgentMailbox(mailbox));
+  const agent = fakePi();
+  registerExtension!(agent.pi as never);
+  const compactions: string[] = [];
+  const context = compactingAgentContext(
+    agent.entries,
+    DEFAULT_WORKER_CONTEXT_BUDGET_TOKENS + 1_000,
+    pinnedVccCompaction(agent, compactions),
+  );
+  await assignManagedRequest(agent, mailbox, context);
+
+  endTurn(agent, context, "toolUse");
+
+  // The request carries pi-vcc's marker, so the summarizer stays extension-owned
+  // and sends nothing of its own. A string it does not recognize (such as the
+  // `/pi-vcc` command name) is re-sent as a user message, which starts a second
+  // turn: that turn can settle the assignment and then leave Herdsman's own
+  // continuation to resume an already-settled worker.
+  assert.equal(agent.sentUsers.length, 1);
+  assert.match(
+    String(agent.sentUsers[0]),
+    /compacted to keep this session lean/,
+  );
+  assert.deepEqual(compactions, ["__pi_vcc__"]);
+  assert.deepEqual(agent.sentUserCalls, [
+    {
+      content: agent.sentUserCalls[0]?.content,
+      options: { deliverAs: "followUp", triggerTurn: true },
+    },
+  ]);
   fireShutdown(agent);
 });
 
@@ -5310,7 +5371,7 @@ test("a compaction already in flight is not started again", async (t) => {
   endTurn(agent, context, "toolUse");
   endTurn(agent, context, "toolUse");
 
-  assert.deepEqual(compactions, ["/pi-vcc"]);
+  assert.deepEqual(compactions, ["__pi_vcc__"]);
   fireShutdown(agent);
 });
 
@@ -5386,7 +5447,7 @@ test("a window smaller than the budget compacts earlier", async (t) => {
 
   endTurn(agent, context, "toolUse");
 
-  assert.deepEqual(compactions, ["/pi-vcc"]);
+  assert.deepEqual(compactions, ["__pi_vcc__"]);
   fireShutdown(agent);
 });
 

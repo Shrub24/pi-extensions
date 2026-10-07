@@ -14,13 +14,19 @@ another one, whereas a turn that produced an answer has nothing to continue and
 a result that would be settled from the history a summary replaces.
 
 The compaction is requested through Pi's manual compaction, carrying the
-`/pi-vcc` marker, so the summary is produced by whichever summarizer the child's
+`__pi_vcc__` marker, so the summary is produced by whichever summarizer the child's
 Pi configuration loads for `session_before_compact`. Manual compaction aborts
 the running operation, so Herdsman holds the settlement before requesting it and,
 once the compaction completes, continues the same assignment with a follow-up
 message that triggers a new turn. The aborted turn is never published as a
 result. The session classification and Agent-definition entries are re-asserted
 afterwards, because a summary replaces the history those entries live in.
+
+The marker must be pi-vcc's `PI_VCC_COMPACT_INSTRUCTION`, not the `/pi-vcc`
+command name. In pi-vcc 0.9.0, an unrecognized instruction is treated as a
+follow-up prompt and sent as a user message after compaction. That adds a second
+resume turn alongside Herdsman's continuation and can wake an already-settled
+worker. The marker keeps summarization silent; Herdsman alone owns continuation.
 
 One assignment may be compacted and continued at most three times, so a worker
 whose summary leaves it over budget cannot compact without end. Context
