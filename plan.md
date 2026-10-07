@@ -107,6 +107,17 @@ refusals, plus carried-background-result settlement contract tests. No live reco
    harness needs a model reachable inside its isolated Pi directory.
 9. `#258` exact-path lookup: a separate upstream improvement to the managed-Lead/worktree resolution
    (replaces another global session scan). Independent of the alignment.
+10. `pi-herdsman` under AOT (impending; the patch shape is already measured). It is a runtime `-e`
+    extension today, so nothing is compiled and its imports resolve at runtime. Moving it into the AOT
+    plugin set needs two `--replace-fail` patches, both for `import.meta.url`: `extension/index.ts:339`
+    (`HERDSMAN_EXTENSION_PATH`, handed to children as `--extension`) and `extension/agent-definitions.ts:83`
+    (`BUILTIN_AGENT_DIR`, read with `readdirSync`, which `$bunfs` cannot serve — point it at the pinned
+    source instead). Dropping the child's extension argument is only correct while both binaries compile
+    Herdsman in; a lead-only selection would launch children with no Herdsman at all. Neither known AOT
+    patch class applies: no variable dynamic-import specifiers and no sibling-source import in the runtime
+    graph (`extension/support.ts` is the test harness and nothing outside `*.test.ts` imports it). Open:
+    the per-module ceiling (`BUN_JSC_maximumAOTCandidateBytecodeSize=352256`) against an 18,677-line
+    `extension/index.ts`.
 
 ## pi-jev: native classifier and AOT
 
