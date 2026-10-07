@@ -592,7 +592,12 @@ session and occurs exactly once. Success is published only after the accepted
 response contract validates the requested inline and/or artifact output. Invalid
 responses are corrected in the worker's session up to twice (ADR 0019), then
 produce one terminal `invalid_response` or `artifact_error` result with bounded
-field diagnostics. After that, correction requires a new valid assignment or an
+field diagnostics. An explicit provider error is reported with the failure it
+caused: when the turn that ended carries one (a `429`, for example), the terminal
+result names the provider's own error text before the validation outcome, so an
+owner can tell a provider failure from an answer the worker could have fixed. A
+turn that ends without provider evidence reports the validation outcome alone.
+After that, correction requires a new valid assignment or an
 eligible interrupt replacement.
 A persisted reusable completion's model-visible wording is:
 

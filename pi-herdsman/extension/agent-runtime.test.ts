@@ -1904,6 +1904,196 @@ test("worker persists the accepted contract and validates the final response", a
   resetAgentMailbox(mailbox);
 });
 
+/**
+ * One assistant message of the active assignment that ends with no answer of its
+ * own, followed by the settlement it provokes. The correction budget is two, so
+ * a run of these ends in the published failure the owner sees.
+ */
+function emptyMessageTurns(
+  agent: ReturnType<typeof fakePi>,
+  context: never,
+  message: Record<string, unknown>,
+): () => Promise<void> {
+  return async () => {
+    agent.events.get("message_end")![0](
+      { message: { role: "assistant", content: [], ...message } },
+      context,
+    );
+    await agent.events.get("agent_settled")![0](undefined, context);
+    await agent.events.get("agent_settled")![0](undefined, context);
+  };
+}
+
+test("a provider error is delivered with the failure it caused", async (t) => {
+  const mailbox = setAgentEnvironment("provider-error-agent");
+  t.after(() => resetAgentMailbox(mailbox));
+  const agent = fakePi();
+  const context = fakeContext();
+  registerExtension!(agent.pi as never);
+  await assignManagedRequest(agent, mailbox, context);
+
+  const providerError = "429 Too Many Requests: rate limit exceeded";
+  const errorTurn = emptyMessageTurns(agent, context, {
+    stopReason: "error",
+    errorMessage: providerError,
+    usage: { output: 0 },
+  });
+  await errorTurn();
+  await errorTurn();
+  assert.equal(agent.sentUsers.length, 2, "corrections are bounded");
+
+  await errorTurn();
+
+  const result = readResult(mailbox, REQUEST_ID);
+  assert.equal(result?.status, "failed");
+  assert.equal(result?.error?.code, "invalid_response");
+  assert.match(
+    String(result?.error?.message),
+    /429 Too Many Requests: rate limit exceeded/,
+    "the provider's own words reach the owner",
+  );
+  assert.match(
+    String(result?.error?.message),
+    /A nonempty inline response is required/,
+    "the validation outcome is still named",
+  );
+  fireShutdown(agent);
+});
+
+test("an empty reply with no provider evidence reports the validation failure alone", async (t) => {
+  const mailbox = setAgentEnvironment("plain-empty-agent");
+  t.after(() => resetAgentMailbox(mailbox));
+  const agent = fakePi();
+  const context = fakeContext();
+  registerExtension!(agent.pi as never);
+  await assignManagedRequest(agent, mailbox, context);
+
+  const emptyTurn = emptyMessageTurns(agent, context, {
+    stopReason: "stop",
+  });
+  await emptyTurn();
+  await emptyTurn();
+  await emptyTurn();
+
+  const result = readResult(mailbox, REQUEST_ID);
+  assert.equal(result?.status, "failed");
+  assert.equal(result?.error?.code, "invalid_response");
+  assert.equal(
+    result?.error?.message,
+    "A nonempty inline response is required",
+  );
+  fireShutdown(agent);
+});
+
+test("provider evidence from an earlier turn cannot reach a later empty reply", async (t) => {
+  const mailbox = setAgentEnvironment("provider-stale-turn-agent");
+  t.after(() => resetAgentMailbox(mailbox));
+  const agent = fakePi();
+  const context = fakeContext();
+  registerExtension!(agent.pi as never);
+  await assignManagedRequest(agent, mailbox, context);
+
+  // The provider failed once, and the turns that follow it answer nothing
+  // without any provider error of their own: the judged turn is the empty one.
+  await emptyMessageTurns(agent, context, {
+    stopReason: "error",
+    errorMessage: "429 Too Many Requests: rate limit exceeded",
+  })();
+  const emptyTurn = emptyMessageTurns(agent, context, { stopReason: "stop" });
+  await emptyTurn();
+  await emptyTurn();
+
+  const result = readResult(mailbox, REQUEST_ID);
+  assert.equal(result?.status, "failed");
+  assert.equal(
+    result?.error?.message,
+    "A nonempty inline response is required",
+  );
+  fireShutdown(agent);
+});
+
+test("a provider error cannot reach the answer that follows it", async (t) => {
+  const mailbox = setAgentEnvironment("provider-recovered-agent");
+  t.after(() => resetAgentMailbox(mailbox));
+  const agent = fakePi();
+  const context = fakeContext();
+  registerExtension!(agent.pi as never);
+  await assignManagedRequest(agent, mailbox, context);
+
+  await emptyMessageTurns(agent, context, {
+    stopReason: "error",
+    errorMessage: "429 Too Many Requests: rate limit exceeded",
+  })();
+  assert.equal(readResult(mailbox, REQUEST_ID), undefined);
+
+  agent.events.get("message_end")![0](
+    {
+      message: {
+        role: "assistant",
+        content: "Answered after the provider recovered.",
+        stopReason: "stop",
+      },
+    },
+    context,
+  );
+  await agent.events.get("agent_settled")![0](undefined, context);
+  await agent.events.get("agent_settled")![0](undefined, context);
+
+  const result = readResult(mailbox, REQUEST_ID);
+  assert.equal(result?.status, "completed");
+  assert.equal(result?.text, "Answered after the provider recovered.");
+  assert.equal(result?.error, undefined);
+  assert.doesNotMatch(JSON.stringify(result), /429/);
+  fireShutdown(agent);
+});
+
+test("a provider error cannot reach the next assignment", async (t) => {
+  const mailbox = setAgentEnvironment("provider-handover-agent");
+  t.after(() => resetAgentMailbox(mailbox));
+  const agent = fakePi();
+  const context = fakeContext();
+  registerExtension!(agent.pi as never);
+  await assignManagedRequest(agent, mailbox, context);
+
+  const errorTurn = emptyMessageTurns(agent, context, {
+    stopReason: "error",
+    errorMessage: "429 Too Many Requests: rate limit exceeded",
+  });
+  await errorTurn();
+  await errorTurn();
+  await errorTurn();
+  assert.equal(readResult(mailbox, REQUEST_ID)?.status, "failed");
+
+  // Retrieving the result admits the next assignment on this retained worker.
+  removeResult(mailbox, REQUEST_ID);
+  const nextRequestId = "cccccccc-cccc-4ccc-8ccc-cccccccccccf";
+  const started = readAgentState(mailbox)!;
+  writeRequest(mailbox, {
+    version: 5,
+    runId: started.runId,
+    requestId: nextRequestId,
+    ownerSessionId: started.ownerSessionId,
+    workspaceId: started.workspaceId,
+    agentLabel: started.agentLabel,
+    paneId: started.paneId,
+    kind: "task",
+    text: "second assignment",
+    createdAt: Date.now(),
+  });
+  agent.events.get("input")![0]({ text: controlMarker(nextRequestId) }, context);
+  assert.equal(readAgentState(mailbox)?.activeRequestId, nextRequestId);
+
+  // Its run ends with no assistant message at all, so the only evidence in
+  // scope is the previous assignment's.
+  await agent.events.get("agent_settled")![0](undefined, context);
+
+  const next = readResult(mailbox, nextRequestId);
+  assert.equal(next?.status, "failed");
+  assert.match(String(next?.error?.message), /A nonempty inline response is required/);
+  assert.doesNotMatch(String(next?.error?.message), /429/);
+  fireShutdown(agent);
+});
+
 test("response text claiming another identity or passing checks stays model-authored", async () => {
   const mailbox = setAgentEnvironment("claimed-provenance-agent");
   const agent = fakePi();

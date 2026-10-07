@@ -16609,6 +16609,12 @@ export default function (pi: ExtensionAPI): void {
   // worker produced after the wait. An artifact-target contract can answer with
   // no inline text, so freshness is tracked separately from the text itself.
   let freshResponse = false;
+  // The provider's own error text for the assistant message that just ended: the
+  // only authoritative evidence that a missing or invalid answer was the
+  // provider's failure rather than the model's. Replaced by every assistant
+  // message and cleared where new input starts, so it can never describe a later
+  // reply or a later assignment.
+  let providerFailure: string | undefined;
   // The last assistant reply ended on the model's output limit. Nothing has
   // been validated yet, so the worker is asked to continue (bounded) before the
   // result is judged; this is not a repair of an invalid answer (ADR 0016).
@@ -17702,6 +17708,7 @@ export default function (pi: ExtensionAPI): void {
         return { action: "handled" };
       latest = "";
       freshResponse = false;
+      providerFailure = undefined;
       if (request.kind === "interrupt") {
         const editorText =
           ctx.mode === "tui" ? ctx.ui.getEditorText() : undefined;
@@ -17717,6 +17724,7 @@ export default function (pi: ExtensionAPI): void {
     }
     latest = "";
     freshResponse = false;
+    providerFailure = undefined;
     return { action: "transform", text: request.text };
   });
   pi.on("message_end", (event: any, ctx: ExtensionContext) => {
@@ -17733,6 +17741,15 @@ export default function (pi: ExtensionAPI): void {
     // A tool-call message with no text is not an answer; counting it would fail
     // a worker that is still working.
     freshResponse = message?.stopReason !== "toolUse";
+    // Captured where the message and its provider details end. An error stop
+    // without text carries nothing to report, and it clears the previous turn's
+    // evidence: this is the current turn's answer that is being judged.
+    providerFailure =
+      message?.stopReason === "error" &&
+      typeof message?.errorMessage === "string" &&
+      message.errorMessage.trim()
+        ? message.errorMessage.trim().slice(0, 256)
+        : undefined;
     // A reply cut off by the output limit is an incomplete turn, not an answer.
     turnCutOff = message?.stopReason === "length";
     // A length stop that produced no text and essentially no output tokens is
@@ -18277,6 +18294,19 @@ export default function (pi: ExtensionAPI): void {
       )
         return;
     }
+    // The failure the owner acts on names the provider's error when the turn that
+    // ended has one: an answer that was missing or invalid because the provider
+    // failed is reported as that failure with the validation outcome, never as
+    // the validation outcome alone. A correction is a message to the worker, so
+    // its text is unchanged.
+    if (resultError && providerFailure)
+      resultError = {
+        code: resultError.code,
+        message: `Provider error: ${providerFailure}. ${resultError.message}`.slice(
+          0,
+          512,
+        ),
+      };
     const result: ResultRecord = {
       version: 5,
       runId: state.runId,
