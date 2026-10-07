@@ -59,10 +59,47 @@ Unmanaged or invalid agent environments do not receive the managed widget.
 
 The widget refreshes managed herdr data plus mailbox state every two seconds.
 
-Refresh performs a bounded herdr pane-list lookup to validate the lead
-boundary. It does not add a socket transport or another agent-control protocol.
+Refresh performs a bounded herdr pane-list lookup to validate exact physical
+identity. It does not add a socket transport or another agent-control protocol.
 
 A refresh failure never mutates mailbox/control eligibility.
+
+## Recurring observation
+
+The widget refresh, the supervision refresh, and the health scan share one
+observation contract: they read mailbox state, the bounded herdr pane and agent
+list, and Herdsman's own published records. No recurring path opens a full Pi
+transcript body.
+
+Authority per role:
+
+- a lead session's own breadcrumb is `herd`, and its rows come from mailbox
+  state plus the herdr list;
+- a worker or leaf session learns whether its owner is a lead from the owner's
+  published coordination state, never from the owner's transcript;
+- a row's agent definition comes from the definition recorded in mailbox state,
+  else from the runtime resolved earlier in the session. A recurring tick never
+  opens a transcript body, so a mailbox whose definition exists only in its
+  transcript is resolved by the session-start continuity pass and reused
+  afterwards; with neither source the row shows `unknown`.
+
+Exact identity checks stay bounded. Matching an observed session against an
+expected one reads only the Pi session header, stopping at its first line
+within a 1 MiB budget, and never loads the transcript body.
+
+Missing or malformed evidence is displayed as unresolved and never becomes
+authority. A row with neither a recorded definition nor a resolved runtime
+reports `unknown`; an absent, unreadable, oversized, or malformed
+coordination-state record leaves the owner's lead classification unresolved.
+Neither fails the refresh, and an unresolved definition never infers `lost`.
+
+A lead whose session published no coordination state therefore shows its worker
+panes an unresolved `?` ancestor instead of `herd`. The lead's own breadcrumb
+and status rows are unaffected by that missing evidence.
+
+Explicit reads are different: the agent tools, the transcript tool, `/agents`,
+and continuation or settlement paths still resolve the persisted definition and
+transcript contents.
 
 ## Breadcrumb
 

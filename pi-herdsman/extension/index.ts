@@ -15548,7 +15548,15 @@ export default function (pi: ExtensionAPI): void {
         if (elapsedMs < currentWindow.windowMs) continue;
         dueEntries.push({
           agentLabel: current.agentLabel,
-          agentDefinition: stateAgentDefinition(current),
+          // Recurring observation resolves through the gated wrapper, so a
+          // mailbox with no recorded definition reads `unknown` instead of
+          // opening the legacy transcript body every health tick.
+          agentDefinition: agentDefinitionForRuntime(
+            agent.listed,
+            current,
+            runtimes.get(current.agentLabel),
+            false,
+          ),
           requestId,
           runId: current.runId,
           workspaceId: current.workspaceId,
