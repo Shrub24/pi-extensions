@@ -805,6 +805,137 @@ test("post-review settlement requires a fresh response in either listener order"
   }
 });
 
+test("a resolved recovery run that answers nothing fails the assignment, retrying its write", async (t) => {
+  const mailbox = setAgentEnvironment("post-review-unanswered-agent");
+  const providerId = "post-review-unanswered-provider";
+  const agent = fakePi();
+  let outstanding = [
+    {
+      taskId: "review-result",
+      state: "awaiting-result-review",
+      reason: "terminal output still needs a successful read",
+    },
+  ];
+  const providerRegistration = registerBackgroundWorkProvider(
+    agent.pi.events as never,
+    {
+      id: providerId,
+      version: 1,
+      snapshot(scope: { sessionId: string; requestId: string }) {
+        return {
+          provider: { id: providerId, version: 1 },
+          sessionId: scope.sessionId,
+          requestId: scope.requestId,
+          revision: 1,
+          reconciliation: { state: "ready" },
+          outstanding,
+        };
+      },
+      bind() {
+        return { ok: true };
+      },
+      protect() {
+        return { ok: true };
+      },
+    },
+  );
+  registerExtension!(agent.pi as never);
+  const context = fakeAgentContext();
+  context.mode = "rpc";
+  const settleListeners = async () => {
+    for (const listener of agent.events.get("agent_settled") ?? [])
+      await listener(undefined, context);
+  };
+  try {
+    await agent.events.get("session_start")![0](undefined, context);
+    const initial = readAgentState(mailbox)!;
+    const request: RequestRecord = {
+      version: 5,
+      runId: initial.runId,
+      requestId: randomUUID(),
+      ownerSessionId: initial.ownerSessionId,
+      workspaceId: initial.workspaceId,
+      agentLabel: initial.agentLabel,
+      paneId: initial.paneId,
+      kind: "task",
+      text: "review the completed task before answering",
+      createdAt: Date.now(),
+    };
+    writeRequest(mailbox, request);
+    assert.deepEqual(
+      agent.events.get("input")![0](
+        { text: controlMarker(request.requestId) },
+        context,
+      ),
+      { action: "transform", text: request.text },
+    );
+
+    agent.events.get("message_end")![0](
+      { message: { role: "assistant", content: "I will retry the failed result read." } },
+      context,
+    );
+    await settleListeners();
+    assert.deepEqual(
+      readAgentState(mailbox)?.backgroundWaiting?.taskIds,
+      ["review-result"],
+    );
+
+    // The provider resolves the work. The answer that preceded the wait is
+    // discarded, and this request spends its one recovery prompt.
+    outstanding = [];
+    await settleListeners();
+    await settleListeners();
+    assert.equal(agent.sentUsers.length, 1);
+    assert.match(
+      String(agent.sentUsers[0]),
+      /All background dependencies.*resolved/,
+    );
+    assert.equal(readResult(mailbox, request.requestId), undefined);
+
+    // A settlement run before the prompted run turns is not evidence that the
+    // worker failed to answer.
+    await settleListeners();
+    assert.equal(readResult(mailbox, request.requestId), undefined);
+    assert.equal(readAgentState(mailbox)?.activeRequestId, request.requestId);
+
+    // The prompted run turns and settles without producing an assistant message,
+    // so nothing will ever answer the recovery prompt that was already spent.
+    agent.events.get("turn_start")![0](undefined, context);
+
+    // That failure's first write fails transiently, so the failed result has to
+    // stay retryable instead of being abandoned with no timer left to retry it.
+    const resultPath = join(mailbox, `result-${request.requestId}.json`);
+    realFs.mkdirSync(resultPath);
+    t.mock.timers.enable({ apis: ["setInterval"] });
+    await settleListeners();
+    assert.equal(readAgentState(mailbox)?.activeRequestId, request.requestId);
+
+    realFs.rmdirSync(resultPath);
+    t.mock.timers.tick(250);
+    await Promise.resolve();
+
+    const published = readResult(mailbox, request.requestId);
+    assert.equal(published?.status, "failed");
+    assert.equal(published?.error?.code, "empty_result");
+    assert.match(published?.error?.message ?? "", /no final response/u);
+    assert.equal(published?.text, undefined);
+    assert.equal(readAgentState(mailbox)?.activeRequestId, undefined);
+    assert.equal(
+      agent.sentUsers.length,
+      1,
+      "the recovery prompt stays bounded to one per request",
+    );
+    // The retry publishes once and stops.
+    t.mock.timers.tick(250);
+    await Promise.resolve();
+    assert.deepEqual(readResult(mailbox, request.requestId), published);
+  } finally {
+    fireShutdown(agent);
+    providerRegistration.dispose();
+    resetAgentMailbox(mailbox);
+  }
+});
+
 test("a withheld settlement retries without a provider wake", async (t) => {
   const mailbox = setAgentEnvironment("settlement-retry-agent");
   const providerId = "settlement-retry-provider";

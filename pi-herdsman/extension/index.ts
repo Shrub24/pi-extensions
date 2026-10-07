@@ -17746,6 +17746,8 @@ export default function (pi: ExtensionAPI): void {
   });
   pi.on("turn_start", () => {
     touchActivity();
+    if (backgroundFinalResponse && !backgroundFinalResponse.runStarted)
+      backgroundFinalResponse = { ...backgroundFinalResponse, runStarted: true };
   });
   for (const event of [
     "message_update",
@@ -17926,8 +17928,16 @@ export default function (pi: ExtensionAPI): void {
     // A recovered hold has no pending agent_settled to restart settlement.
     if (current.backgroundWaiting) ensureSettlementBackstop(ctx);
   };
-  let backgroundFinalResponseRequested: string | undefined;
-  const settleCurrentAgent = (ctx: ExtensionContext): void => {
+  // The one fresh-final-response prompt this request may spend, and whether the
+  // run it prompted has started. `agent_settled` is the only caller that settles
+  // a run, so only there can the worker be known to have stopped answering.
+  let backgroundFinalResponse:
+    | { requestId: string; runStarted: boolean }
+    | undefined;
+  const settleCurrentAgent = (
+    ctx: ExtensionContext,
+    runSettled = false,
+  ): void => {
     if (
       !state?.activeRequestId ||
       state.pendingAskId ||
@@ -18258,7 +18268,7 @@ export default function (pi: ExtensionAPI): void {
     resultWriteAttempts = 0;
     resultErrorReported = false;
     const flush = (assignmentLockHeld = false) => {
-      const current = pendingResult;
+      let current = pendingResult;
       if (!current) return;
       const mailbox = process.env.PI_HERDSMAN_MAILBOX!;
       let release: (() => void) | undefined;
@@ -18367,18 +18377,43 @@ export default function (pi: ExtensionAPI): void {
             };
             writeAgentState(mailbox, waitingState);
             state = waitingState;
-            pendingResult = undefined;
-            if (retryTimer) clearInterval(retryTimer);
-            retryTimer = undefined;
-            if (backgroundFinalResponseRequested !== current.requestId) {
-              pi.sendUserMessage(
-                "All background dependencies for this assignment are resolved. " +
-                "Produce a fresh final response using the retrieved results and existing artifacts; do not rerun the work.",
-                { deliverAs: "followUp", triggerTurn: true },
-              );
-              backgroundFinalResponseRequested = current.requestId;
+            const recovery =
+              backgroundFinalResponse?.requestId === current.requestId
+                ? backgroundFinalResponse
+                : undefined;
+            if (recovery && runSettled && recovery.runStarted) {
+              // The prompted run turned and settled without answering, so no
+              // event can move this hold again: fail typed, keeping the result
+              // in `pendingResult` for the ordinary write retry.
+              current = {
+                ...current,
+                status: "failed",
+                text: undefined,
+                responseValidation: undefined,
+                error: {
+                  code: "empty_result",
+                  message:
+                    "Background work resolved, but the worker produced no final response",
+                },
+              };
+              pendingResult = current;
+            } else {
+              pendingResult = undefined;
+              if (retryTimer) clearInterval(retryTimer);
+              retryTimer = undefined;
+              if (!recovery) {
+                backgroundFinalResponse = {
+                  requestId: current.requestId,
+                  runStarted: false,
+                };
+                pi.sendUserMessage(
+                  "All background dependencies for this assignment are resolved. " +
+                    "Produce a fresh final response using the retrieved results and existing artifacts; do not rerun the work.",
+                  { deliverAs: "followUp", triggerTurn: true },
+                );
+              }
+              return;
             }
-            return;
           }
           if (currentState.backgroundWaiting) {
             const settledState: ManagedAgentState = {
@@ -18646,7 +18681,7 @@ export default function (pi: ExtensionAPI): void {
       pi.sendUserMessage(replacement);
       return;
     }
-    settleCurrentAgent(ctx);
+    settleCurrentAgent(ctx, true);
     if (delegationEnabled)
       await settlePersistedResults(
         pi,

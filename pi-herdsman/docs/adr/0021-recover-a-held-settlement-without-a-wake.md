@@ -9,6 +9,12 @@ lets settlement re-run immediately when a fresh answer is already pending.
 Publication stays inside settlement: only `settleCurrentAgent` writes a result,
 and a notification still never resolves anything by itself.
 
+The fresh-answer recovery prompt is sent once per request. If its run starts
+and then settles without a fresh answer, with all dependencies resolved, the
+assignment fails with `empty_result`. Provider notifications and backstop ticks
+cannot establish that the recovery run has ended; they must not fail a worker
+that is still answering.
+
 ## Rationale
 
 A provider that reports the outstanding work resolved without delivering a
@@ -41,6 +47,8 @@ rather than from a peer's delivery guarantee.
 - A tick that finds work still outstanding neither publishes nor re-prompts; a
   tick that finds a fresh answer pending lets the ordinary settlement path
   publish it.
+- An empty recovery uses the existing failed-result publication and write-retry
+  path rather than leaving an unmovable hold or spending another model turn.
 
 ## See also
 
