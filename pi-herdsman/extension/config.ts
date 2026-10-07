@@ -50,6 +50,7 @@ export type HerdsmanConfig = {
   retainWorkers: boolean;
   softTimeoutMs: number;
   workerContextBudgetTokens: number;
+  workerCompaction: boolean;
   inlineAttachmentLimitBytes: number;
   mailboxPayloadLimitBytes: number;
   disabledDefinitions: string[];
@@ -62,6 +63,7 @@ export const DEFAULT_CONFIG: HerdsmanConfig = {
   retainWorkers: true,
   softTimeoutMs: DEFAULT_SOFT_TIMEOUT_MS,
   workerContextBudgetTokens: DEFAULT_WORKER_CONTEXT_BUDGET_TOKENS,
+  workerCompaction: true,
   inlineAttachmentLimitBytes: DEFAULT_BYTE_LIMIT,
   mailboxPayloadLimitBytes: DEFAULT_BYTE_LIMIT,
   disabledDefinitions: [],
@@ -172,6 +174,7 @@ const CONFIG_KEYS = new Set<ConfigKey>([
   "retainWorkers",
   "softTimeoutMs",
   "workerContextBudgetTokens",
+  "workerCompaction",
   "inlineAttachmentLimitBytes",
   "mailboxPayloadLimitBytes",
   "disabledDefinitions",
@@ -199,7 +202,11 @@ function parseRawConfig(content: string): Partial<HerdsmanConfig> {
       throw new Error("Invalid Pi Herdsman config field spawnPlacement");
     result.spawnPlacement = record.spawnPlacement;
   }
-  for (const key of ["contextRetirement", "retainWorkers"] as const)
+  for (const key of [
+    "contextRetirement",
+    "retainWorkers",
+    "workerCompaction",
+  ] as const)
     if (key in record) {
       if (typeof record[key] !== "boolean")
         throw new Error(`Invalid Pi Herdsman config field ${key}`);
@@ -292,7 +299,9 @@ export function updateConfig<K extends ConfigKey>(
       if (key === "spawnPlacement" && !isSpawnPlacement(value))
         throw new Error("Invalid Pi Herdsman config field spawnPlacement");
       if (
-        (key === "contextRetirement" || key === "retainWorkers") &&
+        (key === "contextRetirement" ||
+          key === "retainWorkers" ||
+          key === "workerCompaction") &&
         typeof value !== "boolean"
       )
         throw new Error(`Invalid Pi Herdsman config field ${key}`);
@@ -309,6 +318,7 @@ export function updateConfig<K extends ConfigKey>(
         key !== "spawnPlacement" &&
         key !== "contextRetirement" &&
         key !== "retainWorkers" &&
+        key !== "workerCompaction" &&
         key !== "softTimeoutMs" &&
         key !== "workerContextBudgetTokens" &&
         !validByteLimit(value)

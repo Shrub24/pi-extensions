@@ -5293,6 +5293,38 @@ function endTurn(
 }
 
 /**
+ * Settle the run Pi aborted for this worker's compaction. Manual compaction
+ * aborts the running operation, so that run reaches `agent_settled` in the run's
+ * `finally` without ever reaching its settle boundary; a completion can still
+ * land between the request and the abort.
+ */
+async function settleAbortedRun(
+  agent: ReturnType<typeof fakePi>,
+  context: never,
+  answer: string,
+): Promise<void> {
+  agent.events.get("message_end")![0](
+    { message: { role: "assistant", content: answer, stopReason: "stop" } },
+    context,
+  );
+  await agent.events.get("agent_settled")![0](undefined, context);
+}
+
+/** Settle a run Pi carried to its settle boundary, as every other run does. */
+async function settleAtBoundary(
+  agent: ReturnType<typeof fakePi>,
+  context: never,
+  answer: string,
+): Promise<void> {
+  agent.events.get("message_end")![0](
+    { message: { role: "assistant", content: answer, stopReason: "stop" } },
+    context,
+  );
+  agent.events.get("agent_before_settle")![0](undefined, context);
+  await agent.events.get("agent_settled")![0](undefined, context);
+}
+
+/**
  * A compaction stub that reproduces the pinned `@sting8k/pi-vcc` 0.9.0
  * `session_compact` branch (`src/hooks/before-compact.ts`): only its own marker
  * (`PI_VCC_COMPACT_INSTRUCTION` = `__pi_vcc__`) is extension-owned, and any
@@ -5536,6 +5568,64 @@ test("a turn whose compaction cannot start is still settled", async (t) => {
   fireShutdown(agent);
 });
 
+test("a run the worker's own compaction aborted publishes no result", async (t) => {
+  const mailbox = setAgentEnvironment("compaction-abort-agent");
+  t.after(() => resetAgentMailbox(mailbox));
+  const agent = fakePi();
+  registerExtension!(agent.pi as never);
+  const compactions: string[] = [];
+  const context = compactingAgentContext(
+    agent.entries,
+    DEFAULT_WORKER_CONTEXT_BUDGET_TOKENS + 1_000,
+    replacingCompaction(agent, compactions),
+  );
+  await assignManagedRequest(agent, mailbox, context);
+
+  // A run can reach its settle boundary, take another turn, and only then be
+  // compacted: that boundary belongs to the turn it ended, not to the run the
+  // compaction aborts.
+  agent.events.get("agent_before_settle")![0](undefined, context);
+  endTurn(agent, context, "toolUse");
+  assert.deepEqual(compactions, ["__pi_vcc__"]);
+
+  // The aborted turn answers anyway, which clears the continuation hold: that is
+  // why the hold alone cannot decide this settlement.
+  await settleAbortedRun(agent, context, "answered the task being replaced");
+
+  assert.equal(readResult(mailbox, REQUEST_ID), undefined);
+  assert.equal(readAgentState(mailbox)?.activeRequestId, REQUEST_ID);
+  fireShutdown(agent);
+});
+
+test("the compaction's continuation turn answers the same assignment", async (t) => {
+  const mailbox = setAgentEnvironment("compaction-continuation-agent");
+  t.after(() => resetAgentMailbox(mailbox));
+  const agent = fakePi();
+  registerExtension!(agent.pi as never);
+  const compactions: string[] = [];
+  const context = compactingAgentContext(
+    agent.entries,
+    DEFAULT_WORKER_CONTEXT_BUDGET_TOKENS + 1_000,
+    replacingCompaction(agent, compactions),
+  );
+  await assignManagedRequest(agent, mailbox, context);
+
+  endTurn(agent, context, "toolUse");
+  assert.deepEqual(compactions, ["__pi_vcc__"]);
+  assert.equal(agent.sentUserCalls.length, 1);
+
+  // The continuation reaches its own settle boundary. Where a compaction
+  // completes before the aborted run's own settlement lands, that boundary is
+  // the first one after the request, and it is what lets the assignment settle.
+  await settleAtBoundary(agent, context, "answered on the compacted session");
+
+  assert.equal(
+    readResult(mailbox, REQUEST_ID)?.text,
+    "answered on the compacted session",
+  );
+  fireShutdown(agent);
+});
+
 test("one assignment is compacted only up to its limit", async (t) => {
   const mailbox = setAgentEnvironment("compaction-limit-agent");
   t.after(() => resetAgentMailbox(mailbox));
@@ -5602,6 +5692,37 @@ test("context retirement replaces compaction at a turn boundary", async (t) => {
   endTurn(agent, context, "toolUse");
 
   assert.deepEqual(compactions, []);
+  fireShutdown(agent);
+});
+
+test("worker compaction switched off requests none and settles the turn", async (t) => {
+  updateConfig("workerCompaction", false);
+  t.after(() => updateConfig("workerCompaction", undefined));
+  const mailbox = setAgentEnvironment("compaction-disabled-agent");
+  t.after(() => resetAgentMailbox(mailbox));
+  const agent = fakePi();
+  registerExtension!(agent.pi as never);
+  const compactions: string[] = [];
+  const context = compactingAgentContext(
+    agent.entries,
+    DEFAULT_WORKER_CONTEXT_BUDGET_TOKENS + 1_000,
+    (options) => {
+      compactions.push(options?.customInstructions ?? "");
+    },
+  );
+  await assignManagedRequest(agent, mailbox, context);
+
+  endTurn(agent, context, "toolUse");
+
+  // A turn over budget is left alone: no compaction is requested, no
+  // continuation follows one, and the assignment settles on its own answer.
+  assert.deepEqual(compactions, []);
+  assert.deepEqual(agent.sentUserCalls, []);
+  await settleAtBoundary(agent, context, "answered on the context it has");
+  assert.equal(
+    readResult(mailbox, REQUEST_ID)?.text,
+    "answered on the context it has",
+  );
   fireShutdown(agent);
 });
 

@@ -95,6 +95,7 @@ test("missing config resolves to defaults without creating storage", () => {
   resetConfig();
   assert.deepEqual(readConfig(), DEFAULT_CONFIG);
   assert.equal(readConfig().contextRetirement, false);
+  assert.equal(readConfig().workerCompaction, true);
   assert.equal(realFs.existsSync(herdsmanDataRoot()), false);
 });
 
@@ -106,6 +107,7 @@ test("documented soft-deadline, retention, and worker-budget defaults match", ()
   assert.equal(readConfig().retainWorkers, true);
   assert.equal(DEFAULT_WORKER_CONTEXT_BUDGET_TOKENS, 200_000);
   assert.equal(readConfig().workerContextBudgetTokens, 200_000);
+  assert.equal(readConfig().workerCompaction, true);
 });
 
 test("soft-timeout and retain-workers overlays accept only valid values", () => {
@@ -167,11 +169,14 @@ test("partial and complete valid configs overlay defaults", () => {
     retainWorkers: true,
     softTimeoutMs: DEFAULT_SOFT_TIMEOUT_MS,
     workerContextBudgetTokens: DEFAULT_WORKER_CONTEXT_BUDGET_TOKENS,
+    workerCompaction: true,
     inlineAttachmentLimitBytes: MIN_BYTE_LIMIT,
     mailboxPayloadLimitBytes: MAX_BYTE_LIMIT,
     disabledDefinitions: [],
     modelScopes: {},
   });
+  realFs.writeFileSync(herdsmanConfigPath(), JSON.stringify({ workerCompaction: false }));
+  assert.equal(readConfig().workerCompaction, false);
 });
 
 test("invalid values, malformed JSON, non-object roots, and unknown keys fail clearly", () => {
@@ -192,6 +197,8 @@ test("invalid values, malformed JSON, non-object roots, and unknown keys fail cl
     ],
     ['{"contextRetirement":"false"}', "contextRetirement"],
     ['{"retainWorkers":"true"}', "retainWorkers"],
+    ['{"workerCompaction":"true"}', "workerCompaction"],
+    ['{"workerCompaction":1}', "workerCompaction"],
     ['{"softTimeoutMs":-1}', "softTimeoutMs"],
     ['{"softTimeoutMs":1.5}', "softTimeoutMs"],
     ['{"softTimeoutMs":"300000"}', "softTimeoutMs"],
@@ -254,6 +261,7 @@ test("updates preserve configured keys, reset one key, and delete the final conf
   updateConfig("retainWorkers", false);
   updateConfig("softTimeoutMs", 0);
   updateConfig("workerContextBudgetTokens", 180_000);
+  updateConfig("workerCompaction", false);
   updateConfig("mailboxPayloadLimitBytes", 64 * 1024);
   assert.deepEqual(
     JSON.parse(realFs.readFileSync(herdsmanConfigPath(), "utf8")),
@@ -263,6 +271,7 @@ test("updates preserve configured keys, reset one key, and delete the final conf
       retainWorkers: false,
       softTimeoutMs: 0,
       workerContextBudgetTokens: 180_000,
+      workerCompaction: false,
       mailboxPayloadLimitBytes: 64 * 1024,
     },
   );
@@ -271,6 +280,7 @@ test("updates preserve configured keys, reset one key, and delete the final conf
   assert.equal(readConfig().retainWorkers, false);
   assert.equal(readConfig().softTimeoutMs, 0);
   assert.equal(readConfig().workerContextBudgetTokens, 180_000);
+  assert.equal(readConfig().workerCompaction, false);
   updateConfig("spawnPlacement", undefined);
   assert.deepEqual(
     JSON.parse(realFs.readFileSync(herdsmanConfigPath(), "utf8")),
@@ -279,6 +289,7 @@ test("updates preserve configured keys, reset one key, and delete the final conf
       retainWorkers: false,
       softTimeoutMs: 0,
       workerContextBudgetTokens: 180_000,
+      workerCompaction: false,
       mailboxPayloadLimitBytes: 64 * 1024,
     },
   );
@@ -291,17 +302,23 @@ test("updates preserve configured keys, reset one key, and delete the final conf
     readConfig().workerContextBudgetTokens,
     DEFAULT_WORKER_CONTEXT_BUDGET_TOKENS,
   );
+  updateConfig("workerCompaction", undefined);
+  assert.equal(readConfig().workerCompaction, true);
   updateConfig("mailboxPayloadLimitBytes", undefined);
   updateConfig("contextRetirement", undefined);
   assert.equal(realFs.existsSync(herdsmanConfigPath()), false);
   assert.deepEqual(readConfig(), DEFAULT_CONFIG);
 });
 
-test("update rejects invalid retain-workers, soft-timeout, and context-budget values", () => {
+test("update rejects invalid retain-workers, soft-timeout, context-budget, and compaction values", () => {
   resetConfig();
   assert.throws(
     () => updateConfig("retainWorkers", "true" as never),
     /Invalid Pi Herdsman config field retainWorkers/,
+  );
+  assert.throws(
+    () => updateConfig("workerCompaction", "false" as never),
+    /Invalid Pi Herdsman config field workerCompaction/,
   );
   assert.throws(
     () => updateConfig("softTimeoutMs", -1),

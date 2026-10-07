@@ -30,6 +30,7 @@ schema is:
   "retainWorkers": true,
   "softTimeoutMs": 300000,
   "workerContextBudgetTokens": 200000,
+  "workerCompaction": true,
   "inlineAttachmentLimitBytes": 131072,
   "mailboxPayloadLimitBytes": 131072,
   "disabledDefinitions": [],
@@ -46,6 +47,7 @@ An absent file means these defaults:
 | `retainWorkers`              |               true | boolean                                           |
 | `softTimeoutMs`              |          `300000`  | integer from 0 (disabled) through 2147483647      |
 | `workerContextBudgetTokens`  |           `200000` | integer from 16384 through 1000000|
+| `workerCompaction`           |               true | boolean                                           |
 | `inlineAttachmentLimitBytes` | `131072` (128 KiB) | integer from 1024 (1 KiB) through 1048576 (1 MiB) |
 | `mailboxPayloadLimitBytes`   | `131072` (128 KiB) | integer from 1024 (1 KiB) through 1048576 (1 MiB) |
 | `disabledDefinitions`        |                `[]` | unique definition names, at most 64              |
@@ -98,6 +100,11 @@ configuration loads for compaction; this deployment's child build supplies one
 without a model call. Pi's own threshold compaction stays off, because it is a
 global setting that would also govern an operator session (see
 [ADR 0028](../adr/0028-compact-a-managed-workers-context-at-a-fixed-budget.md)).
+
+`workerCompaction` switches that compaction request off entirely. With it
+`false`, a worker is never compacted at the budget and no continuation turn
+follows one, so it answers on the context it has and its assignment settles the
+way an under-budget one does.
 
 `retainWorkers` controls whether a worker's process and pane survive after its
 result is delivered. It defaults to `true`: a worker is a persistent session, so

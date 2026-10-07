@@ -16611,6 +16611,14 @@ export default function (pi: ExtensionAPI): void {
   // A compaction is in flight; a second request would stack summaries over the
   // same session.
   let contextCompactionInFlight = false;
+  // Pi fires `agent_before_settle` only for a run that reaches its settle
+  // boundary, and `agent_settled` from the run's `finally` either way, so a run
+  // this worker's own compaction aborts settles with no boundary behind it. Set
+  // at the request and cleared by the next settle, boundary or settlement: while
+  // it holds, that settlement is not an answer. `awaitingContinuation` cannot
+  // carry this, because any assistant `message_end` clears it — the aborted
+  // turn's own completion included.
+  let compactionAbortedRun = false;
   let pendingResult: ResultRecord | undefined;
   let pendingInterruptReplacement: string | undefined;
   let resultWriteAttempts = 0;
@@ -18628,15 +18636,19 @@ export default function (pi: ExtensionAPI): void {
    * session. Only a tool-call turn is compacted: the compaction aborts the
    * running operation, and a turn that answered has nothing to continue and a
    * result settled from the history a summary would replace. Nothing happens
-   * while context retirement makes the opposite choice, or once this assignment
-   * has been compacted up to its limit.
+   * while context retirement makes the opposite choice, with `workerCompaction`
+   * off, or once this assignment has been compacted up to its limit.
    */
   const compactManagedContextIfOverBudget = (
     ctx: ExtensionContext,
     turnCalledTools: boolean,
   ): void => {
     if (!turnCalledTools) return;
-    if (readConfig().contextRetirement) return;
+    const config = readConfig();
+    if (config.contextRetirement) return;
+    // Compaction is this deployment's choice, and with it off no continuation
+    // follows one: the worker answers on the context it has.
+    if (!config.workerCompaction) return;
     const usage = ctx.getContextUsage();
     if (!usage || usage.tokens === null) return;
     if (usage.tokens < managedContextBudget(usage.contextWindow)) return;
@@ -18650,6 +18662,7 @@ export default function (pi: ExtensionAPI): void {
     const heldLatest = latest;
     const heldFreshResponse = freshResponse;
     const heldContinuations = compactionContinuations;
+    const heldCompactionAbortedRun = compactionAbortedRun;
     // The hold goes on before the request: compacting aborts the running
     // operation, so the settlement that ends this turn has to know that nothing
     // was answered yet. It is released again when no compaction started and when
@@ -18660,11 +18673,15 @@ export default function (pi: ExtensionAPI): void {
       latest = heldLatest;
       freshResponse = heldFreshResponse;
       compactionContinuations = heldContinuations;
+      compactionAbortedRun = heldCompactionAbortedRun;
     };
     awaitingContinuation = true;
     latest = "";
     freshResponse = false;
     compactionContinuations = { requestId, count: used + 1 };
+    // The run this request aborts will settle without reaching its boundary, so
+    // it holds no answer for this assignment.
+    compactionAbortedRun = true;
     if (
       compactManagedContext(
         ctx,
@@ -18681,7 +18698,14 @@ export default function (pi: ExtensionAPI): void {
     release();
   };
 
+  // A run that reached its settle boundary was not aborted by a compaction:
+  // this is the boundary behind the settlement that follows it.
+  pi.on("agent_before_settle", () => {
+    compactionAbortedRun = false;
+  });
   pi.on("agent_settled", async (_event: unknown, ctx: ExtensionContext) => {
+    const abortedRun = compactionAbortedRun;
+    compactionAbortedRun = false;
     if (pendingInterruptReplacement) {
       const replacement = pendingInterruptReplacement;
       pendingInterruptReplacement = undefined;
@@ -18689,6 +18713,10 @@ export default function (pi: ExtensionAPI): void {
       pi.sendUserMessage(replacement);
       return;
     }
+    // A run this worker's own compaction aborted holds no answer: publishing here
+    // would settle the assignment from the turn the compaction is replacing, and
+    // the continuation turn's own settlement is the one that answers it.
+    if (abortedRun) return;
     settleCurrentAgent(ctx, true);
     if (delegationEnabled)
       await settlePersistedResults(
@@ -18701,6 +18729,7 @@ export default function (pi: ExtensionAPI): void {
     pendingInterruptReplacement = undefined;
     contextCompactionInFlight = false;
     compactionContinuations = undefined;
+    compactionAbortedRun = false;
     resetLeafStatus();
     metadataAbortController?.abort();
     metadataAbortController = undefined;
