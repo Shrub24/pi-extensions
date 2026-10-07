@@ -81,6 +81,11 @@ refusals, plus carried-background-result settlement contract tests. No live reco
 
 ## Hygiene
 
-- `pi-reqcap` has uncommitted edits from another session; do not commit them.
+- The alignment plan at `.pi-herdsman/pre-extraction-adoption-plan.md` is deliberately uncommitted until the
+alignment is approved. `.pi-herdsman/pre-extraction-restart-redelivery.md` was deleted: it designed a
+queued-restart/redelivery lifecycle the owner rejected in favour of a refusal at the delegation boundary
+plus Radar-owned restart.
 - Commit by explicit file path while a worker is live. A directory pathspec swept a worker's in-progress
   test into `ba8faea3`; the tree is correct and only history is untidy.
+- Uncommitted work left behind by a departed session is now `ac0628a2`: pi-reqcap's chain-aware
+  attribution was finished (types, changelog, two regressions) and committed.
