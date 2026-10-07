@@ -35,15 +35,51 @@ export type LeadRoleState = Readonly<{
   leadTools: readonly string[];
 }>;
 
+/**
+ * The session whose branch entries may drive this process's state. A fork
+ * replays its parent's branch, so every entry it did not write belongs to the
+ * parent session rather than to the fork.
+ */
+export type SessionOwnership = Readonly<{
+  sessionId: string;
+  forked: boolean;
+}>;
+
+export function sessionOwnership(sessionManager: {
+  getSessionId(): string;
+  getHeader?(): { parentSession?: string } | null;
+}): SessionOwnership {
+  return {
+    sessionId: sessionManager.getSessionId(),
+    // A session manager without a header cannot be a fork.
+    forked: (sessionManager.getHeader?.()?.parentSession ?? "") !== "",
+  };
+}
+
+/** A session that is not a fork owns its whole branch; a fork owns only its own entries. */
+export function entryOwnedBySession(
+  data: unknown,
+  ownership: SessionOwnership,
+): boolean {
+  if (!ownership.forked) return true;
+  return (
+    typeof data === "object" &&
+    data !== null &&
+    (data as { sessionId?: unknown }).sessionId === ownership.sessionId
+  );
+}
+
 export function sessionLeadRoleState(
   entries: unknown[],
+  ownership: SessionOwnership,
 ): LeadRoleState | undefined {
   const entry = [...entries]
     .reverse()
     .find(
       (candidate: any) =>
         candidate?.type === "custom" &&
-        candidate.customType === "pi-herdsman-role",
+        candidate.customType === "pi-herdsman-role" &&
+        entryOwnedBySession(candidate.data, ownership),
     ) as any;
   if (!entry) return undefined;
   const data = entry.data;
@@ -51,7 +87,10 @@ export function sessionLeadRoleState(
     !data ||
     typeof data !== "object" ||
     Array.isArray(data) ||
-    Object.keys(data).length !== 2 ||
+    Object.keys(data).some(
+      (key) => key !== "role" && key !== "leadTools" && key !== "sessionId",
+    ) ||
+    (data.sessionId !== undefined && typeof data.sessionId !== "string") ||
     !Object.hasOwn(data, "role") ||
     !Object.hasOwn(data, "leadTools") ||
     (data.role !== "lead" &&

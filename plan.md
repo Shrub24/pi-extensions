@@ -89,16 +89,18 @@ refusals, plus carried-background-result settlement contract tests. No live reco
 4. Sweep worker prompt snapshots on process exit and at session shutdown (the temp root is never swept).
 5. Verify owner-routed control integration after reload, only with explicit approval for destructive smoke.
 6. The agent-definition / handoff-schema / system-prompt workshop, deferred.
-7. Make forking a session safe for herdsman and background tasks (Pi-native feature, currently unsupported by
-   design). A fork replays the parent's session branch, so extension state that lives in branch entries is
-   inherited as if the fork had produced it. Known so far: background-task snapshots came back as live in
-   the child (partly mitigated in `0c4af53a`: foreign-session terminal snapshots restore as delivered and
-   announced results are no longer advertised, but the restore still rewrites their `sessionId`, so the
-   fork cannot tell them from its own). Not yet audited: herdsman owner state, retained-worker ownership,
-   delivery ledger, result refs and the session-metadata record in a fork. Needed: classify every
-   branch-resident extension entry as session-bound or inheritable, bind session-bound ones to the
-   session id that wrote them, ignore foreign ones on restore, and add a fork regression per extension.
-   Until then, do not fork a lead that owns workers or running tasks.
+7. Make forking a session safe for herdsman and background tasks. A fork replays the parent's session
+   branch, so extension state that lives in branch entries is inherited as if the fork had produced it.
+   Session-bound state is now bound to the session that wrote it and ignored on a fork: background-task
+   snapshots are filtered at the single restore ingestion point, so a foreign snapshot is neither
+   restored nor re-advertised, and `pi-herdsman-role` / `pi-herdsman-lead-state` name their writer
+   (`supervision.sessionOwnership`, `entryOwnedBySession`), so a fork starts without its parent's role,
+   coordinator generation or chief activation. The session-metadata record and the worker/agent
+   identities were already scoped this way. The fork surface is `fork-in` (`/fork-in-herdr`), which
+   copies the session JSONL with a fresh id and a `parentSession` pointer; that pointer is the signal
+   the fork check reads, so no marker of our own is needed. Not yet audited: retained-worker ownership,
+   the delivery ledger and result refs. Needed: the same classification for those surfaces, and a live
+   fork smoke. Until then, do not fork a lead that owns workers.
 8. The upstream pre-extraction alignment waits on the owner's approval of
    `.pi-herdsman/pre-extraction-adoption-plan.md` (every fork divergence classified incidental or
    deliberate, deliberate ones kept behind a separable seam). It edits `index.ts` and `herdr.ts`, so it

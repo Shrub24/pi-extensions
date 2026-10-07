@@ -278,6 +278,8 @@ import {
   writePeerLeadRecord,
   drainCoordinationInbox,
   COORDINATION_MESSAGE_KINDS,
+  entryOwnedBySession,
+  sessionOwnership,
 } from "./supervision.ts";
 import {
   fail,
@@ -9099,15 +9101,27 @@ export default function (pi: ExtensionAPI): void {
       },
     });
   };
+  // Every role and coordinator entry names the session that wrote it, so a
+  // fork cannot read its parent's identity back off the copied branch.
+  const currentSessionId = (): string => {
+    const sessionId = leadContext?.sessionManager.getSessionId();
+    if (!sessionId) throw new Error("Lead session context is unavailable");
+    return sessionId;
+  };
   const persistRole = (role: SessionRole): void => {
     if (!leadTools) throw new Error("Lead tool baseline is unavailable");
-    pi.appendEntry("pi-herdsman-role", { role, leadTools: [...leadTools] });
+    pi.appendEntry("pi-herdsman-role", {
+      role,
+      leadTools: [...leadTools],
+      sessionId: currentSessionId(),
+    });
     if (leadContext) recordOperatorSessionMetadata(pi, leadContext, role);
   };
   const persistCoordinatorState = (): boolean => {
     try {
       pi.appendEntry("pi-herdsman-lead-state", {
         instanceId: leadInstanceId,
+        sessionId: currentSessionId(),
       });
       return persistLeadCoordination();
     } catch (error) {
@@ -9377,12 +9391,14 @@ export default function (pi: ExtensionAPI): void {
     // Every lead session initialization is a new coordination generation.
     leadInstanceId = randomUUID();
     leadCoordinationHealthy = true;
+    const ownership = sessionOwnership(ctx.sessionManager);
     const entry = [...ctx.sessionManager.getEntries()]
       .reverse()
       .find(
         (candidate: any) =>
           candidate?.type === "custom" &&
-          candidate.customType === "pi-herdsman-lead-state",
+          candidate.customType === "pi-herdsman-lead-state" &&
+          entryOwnedBySession(candidate.data, ownership),
       ) as any;
     let malformed = false;
     let hasRetiredPendingAsk = false;
@@ -9392,8 +9408,10 @@ export default function (pi: ExtensionAPI): void {
         !data ||
         typeof data !== "object" ||
         Object.keys(data).some(
-          (key) => key !== "instanceId" && key !== "pendingAsk",
+          (key) =>
+            key !== "instanceId" && key !== "pendingAsk" && key !== "sessionId",
         ) ||
+        (data.sessionId !== undefined && typeof data.sessionId !== "string") ||
         (data.instanceId !== undefined &&
           (typeof data.instanceId !== "string" ||
             !LEAD_INSTANCE_ID.test(data.instanceId)))
@@ -10776,7 +10794,10 @@ export default function (pi: ExtensionAPI): void {
   const reconcileBranchRole = async (ctx: ExtensionContext): Promise<void> => {
     let branchRole: ReturnType<typeof sessionLeadRoleState>;
     try {
-      branchRole = sessionLeadRoleState(ctx.sessionManager.getBranch());
+      branchRole = sessionLeadRoleState(
+        ctx.sessionManager.getBranch(),
+        sessionOwnership(ctx.sessionManager),
+      );
     } catch (error) {
       await failClosedRole(ctx, error);
       return;
@@ -15912,6 +15933,7 @@ export default function (pi: ExtensionAPI): void {
         try {
           const persisted = sessionLeadRoleState(
             ctx.sessionManager.getEntries(),
+            sessionOwnership(ctx.sessionManager),
           );
           if (persisted) {
             persistedRole = persisted.role;

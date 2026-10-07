@@ -478,7 +478,11 @@ test("legacy Lead pendingAsk state is normalized and does not block messaging", 
     const normalized = pi.entries
       .filter((entry: any) => entry?.customType === "pi-herdsman-lead-state")
       .at(-1) as any;
-    assert.deepEqual(Object.keys(normalized.data).sort(), ["instanceId"]);
+    assert.deepEqual(Object.keys(normalized.data).sort(), [
+      "instanceId",
+      "sessionId",
+    ]);
+    assert.equal(normalized.data.sessionId, leadId);
     assert.notEqual(
       normalized.data.instanceId,
       (pi.entries[0] as any).data.instanceId,

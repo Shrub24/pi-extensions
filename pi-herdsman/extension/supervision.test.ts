@@ -647,20 +647,29 @@ test("queued traffic remains correlated to the exact lead session after restart"
 });
 
 test("lead role state requires a canonical durable tool baseline", () => {
+  const own = { sessionId: "session", forked: false };
   const valid = {
     type: "custom",
     customType: "pi-herdsman-role",
     data: { role: "lead", leadTools: ["read", "bash", "agent", "chief"] },
   };
-  assert.equal(sessionLeadRoleState([]), undefined);
-  const parsed = sessionLeadRoleState([valid]);
+  assert.equal(sessionLeadRoleState([], own), undefined);
+  const parsed = sessionLeadRoleState([valid], own);
   assert.deepEqual(parsed, valid.data);
   assert.notEqual(parsed?.leadTools, valid.data.leadTools);
   assert.deepEqual(
-    sessionLeadRoleState([
-      { ...valid, data: { role: "chief", leadTools: [] } },
-    ]),
+    sessionLeadRoleState(
+      [{ ...valid, data: { role: "chief", leadTools: [] } }],
+      own,
+    ),
     { role: "chief", leadTools: [] },
+  );
+  assert.deepEqual(
+    sessionLeadRoleState(
+      [{ ...valid, data: { ...valid.data, sessionId: "session" } }],
+      own,
+    ),
+    valid.data,
   );
   for (const data of [
     undefined,
@@ -671,15 +680,52 @@ test("lead role state requires a canonical durable tool baseline", () => {
     { role: "lead", leadTools: ["read", "read"] },
     { role: "lead", leadTools: [""] },
     { role: "lead", leadTools: [1] },
+    { role: "lead", leadTools: [], sessionId: 7 },
     { ...valid.data, extra: true },
   ]) {
     const malformed = { ...valid, data };
     assert.throws(
-      () => sessionLeadRoleState([valid, malformed]),
+      () => sessionLeadRoleState([valid, malformed], own),
       /invalid pi-herdsman-role/,
     );
-    assert.deepEqual(sessionLeadRoleState([malformed, valid]), valid.data);
+    assert.deepEqual(
+      sessionLeadRoleState([malformed, valid], own),
+      valid.data,
+    );
   }
+});
+
+test("a fork keeps only the role entries it wrote itself", () => {
+  const role = (data: unknown) => ({
+    type: "custom",
+    customType: "pi-herdsman-role",
+    data,
+  });
+  const inherited = role({ role: "chief", leadTools: ["read"] });
+  const written = role({
+    role: "manager",
+    leadTools: ["read"],
+    sessionId: "fork",
+  });
+  assert.equal(
+    sessionLeadRoleState([inherited], { sessionId: "fork", forked: true }),
+    undefined,
+  );
+  assert.deepEqual(
+    sessionLeadRoleState([inherited, written], {
+      sessionId: "fork",
+      forked: true,
+    }),
+    { role: "manager", leadTools: ["read"] },
+  );
+  // A session that is not a fork owns its whole branch, header or not.
+  assert.deepEqual(
+    sessionLeadRoleState([inherited, written], {
+      sessionId: "parent",
+      forked: false,
+    }),
+    { role: "manager", leadTools: ["read"] },
+  );
 });
 
 test("supervision authority is coordinator state, not metadata", () => {

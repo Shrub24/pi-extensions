@@ -42,6 +42,7 @@ import {
   supervisionRuntime,
   readLeadCoordinationState,
   sessionLeadRoleState,
+  sessionOwnership,
   writeLeadCoordinationState,
   writeChiefMessage,
   writeCoordinationMessage,
@@ -2487,7 +2488,10 @@ test("selecting a pre-Chief branch restores the Lead lifecycle", async () => {
   await pi.events.get("session_start")![0](undefined, context);
   const baseline = pi.pi.getActiveTools();
   const preChiefBranch = [...entries];
-  assert.equal(sessionLeadRoleState(preChiefBranch), undefined);
+  assert.equal(
+    sessionLeadRoleState(preChiefBranch, sessionOwnership(context.sessionManager)),
+    undefined,
+  );
   await pi.commandOptions.get("chief").handler("", context);
   assert.equal(
     readPeerLeadRecord(peerRuntime(), context.sessionManager.getSessionId()),
@@ -2510,7 +2514,10 @@ test("selecting a pre-Chief branch restores the Lead lifecycle", async () => {
   });
   replacement.release();
   assert.equal(
-    sessionLeadRoleState(context.sessionManager.getBranch())?.role,
+    sessionLeadRoleState(
+      context.sessionManager.getBranch(),
+      sessionOwnership(context.sessionManager),
+    )?.role,
     "lead",
   );
   assert.ok(
@@ -2566,7 +2573,11 @@ test("selecting a historical Chief branch activates its lease and staff tools", 
         workspaceId: WORKSPACE,
       }),
     );
-    assert.equal(sessionLeadRoleState(entries)?.role, "chief");
+    assert.equal(
+      sessionLeadRoleState(entries, sessionOwnership(context.sessionManager))
+        ?.role,
+      "chief",
+    );
   } finally {
     await pi.events.get("session_shutdown")?.[0]();
     delete process.env.HERDR_SOCKET_PATH;
@@ -2665,7 +2676,11 @@ test("manual chief leave completes lead cleanup when tool restoration fails", as
     entries
       .filter((entry: any) => entry.customType === "pi-herdsman-role")
       .at(-1)?.data,
-    { role: "lead", leadTools: baseline },
+    {
+      role: "lead",
+      leadTools: baseline,
+      sessionId: context.sessionManager.getSessionId(),
+    },
   );
   const lease = claimChiefLease({
     piSessionId: context.sessionManager.getSessionId(),
@@ -3165,7 +3180,11 @@ test("Lead resume repairs stale staff from its durable displaced loadout", async
   const role = entries
     .filter((entry: any) => entry.customType === "pi-herdsman-role")
     .at(-1) as any;
-  assert.deepEqual(role.data, { role: "lead", leadTools: ordinaryTools });
+  assert.deepEqual(role.data, {
+    role: "lead",
+    leadTools: ordinaryTools,
+    sessionId: context.sessionManager.getSessionId(),
+  });
 
   const reloaded = fakeChiefPi({
     activeTools: [
