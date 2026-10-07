@@ -249,14 +249,32 @@ export function diff(prevFp: Fingerprint | null, cur: Fingerprint): Divergence {
     if (prevFp.messages[i].hash !== cur.messages[i].hash) {
       const was = prevFp.messages[i];
       const now = cur.messages[i];
-      return {
-        kind: "mutate",
-        at: `messages[${i}]`,
-        role: now.role,
-        detail: `${was.role} ${was.chars}ch (${was.hash}) -> ${now.role} ${now.chars}ch (${now.hash})`,
-        was: was.preview,
-        now: now.preview,
-      };
+      const moved = `${was.role} ${was.chars}ch (${was.hash}) -> ${now.role} ${now.chars}ch (${now.hash})`;
+      // An inserted or removed message shifts every index after it, and that reads as a
+      // mutation at the first index that moved. Say which it was instead.
+      const removedAt = prevFp.messages.findIndex((m, k) => k > i && m.hash === now.hash);
+      if (removedAt > i) {
+        return {
+          kind: "removed",
+          at: `messages[${i}]`,
+          role: now.role,
+          detail: `${removedAt - i} message(s) removed at messages[${i}] — ${was.role} ${was.chars}ch gone, later messages moved up`,
+          was: was.preview,
+          now: now.preview,
+        };
+      }
+      const insertedAt = cur.messages.findIndex((m, k) => k > i && m.hash === was.hash);
+      if (insertedAt > i) {
+        return {
+          kind: "inserted",
+          at: `messages[${i}]`,
+          role: was.role,
+          detail: `${insertedAt - i} message(s) inserted at messages[${i}] — ${now.role} ${now.chars}ch pushed down`,
+          was: was.preview,
+          now: now.preview,
+        };
+      }
+      return { kind: "mutate", at: `messages[${i}]`, role: now.role, detail: moved, was: was.preview, now: now.preview };
     }
   }
   if (cur.messages.length < prevFp.messages.length) {
@@ -304,6 +322,7 @@ export function usageFlags(usage: Record<string, any> | undefined, prevPromptTok
 export interface TraceSubject {
   seq?: number;
   at?: string;
+  pid?: number;
   model?: string;
   bodyChars?: number;
   params?: Record<string, unknown>;
@@ -327,7 +346,8 @@ function breakpointList(s: TraceSubject): string {
  */
 export function prefixTrace(prev: TraceSubject | null, cur: TraceSubject): string[] {
   const out: string[] = [];
-  out.push(`prefix trace   ${prev ? `#${prev.seq ?? "?"}` : "(no previous request)"} ${prev?.model ?? ""} → #${cur.seq ?? "?"} ${cur.model ?? ""}`);
+  const tag = (r: TraceSubject | null | undefined) => (r?.pid ? ` pid=${r.pid}` : "");
+  out.push(`prefix trace   ${prev ? `#${prev.seq ?? "?"}` : "(no previous request)"} ${prev?.model ?? ""}${tag(prev)} → #${cur.seq ?? "?"} ${cur.model ?? ""}${tag(cur)}`);
   if (!prev) {
     out.push("  nothing to compare against: first request of this session and model");
     return out;

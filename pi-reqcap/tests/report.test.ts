@@ -94,3 +94,26 @@ test("a bust line carries cost and cause", () => {
   expect(line).toContain("write=133,924");
   expect(line).toContain("system[2]");
 });
+
+// `seq` counts per process, so a log holding two processes has a #1 in each. The
+// comparison has to stay inside one chain rather than pair the two #1s up.
+const twoChains = [
+  { kind: "request", session: "s", pid: 100, key: "k1", seq: 1, at: "2026-10-04T11:00:00.000Z", model: "m", tools: { n: 1, hash: "a" }, messages: [], system: [], bodyChars: 10, divergence: { kind: "first" } },
+  { kind: "response", session: "s", pid: 100, seq: 1, usage: { read: 0, write: 0, input: 10, output: 1, promptTokens: 10 }, cold: true, reBilled: false },
+  { kind: "request", session: "s", pid: 200, key: "k2", seq: 1, at: "2026-10-04T11:00:05.000Z", model: "m", tools: { n: 1, hash: "a" }, messages: [], system: [], bodyChars: 10, divergence: { kind: "first" } },
+  { kind: "response", session: "s", pid: 200, seq: 1, usage: { read: 0, write: 0, input: 10, output: 1, promptTokens: 10 }, cold: true, reBilled: false },
+];
+
+test("a diff report stays inside one process chain", () => {
+  const lines = diffReport(twoChains as any, 1).join("\n");
+  expect(lines).toContain("no previous request");
+  expect(lines).toContain("2 chains have seq 1");
+  expect(lines).toContain("pid 200");
+});
+
+test("the trace names the process only once a log holds two", () => {
+  const two = traceLines(twoChains as any, 10);
+  expect(two.length).toBe(2);
+  for (const line of two) expect(line).toContain("pid=");
+  for (const line of traceLines(records, 10)) expect(line).not.toContain("pid=");
+});

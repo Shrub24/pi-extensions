@@ -11,6 +11,7 @@ All notable changes to `pi-reqcap` will be documented in this file.
   `traces/`, so the evidence outlives the toast.
 - Commands: `/reqcap` (session overview), `/reqcap all`, `/reqcap trace [n]`,
   `/reqcap diff [seq]` (full prefix comparison), `/reqcap where`, `/reqcap help`.
+- `/reqcap trace` names the process (`pid=`) once one log holds more than one.
 
 ### Fixed
 
@@ -19,6 +20,13 @@ All notable changes to `pi-reqcap` will be documented in this file.
 - Re-bill detection no longer fires on a provider that simply never caches the whole
   prefix: the cached prefix now has to collapse (to half the previous read or less)
   while the prompt holds or grows, or the provider has to charge a cache write.
+- Records carry the real session id, read from Pi's event context: the env var is not
+  set for the process itself, so every record used to read `unknown-session`.
+- `/reqcap diff` no longer compares across processes. `seq` counts per process, so a
+  log holding two processes has a `#1` in each; the comparison stays inside one chain
+  and says which one it took.
+- An inserted or deleted message is reported as `inserted`/`removed` rather than a
+  `mutate` at the first index the shift moved.
 
 ## [0.1.0]
 

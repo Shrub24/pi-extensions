@@ -25,7 +25,6 @@ import { bustLine, diffReport, overview, short, traceLines } from "./report.js";
 import {
   CAPTURE_BODIES,
   DIR,
-  SESSION,
   ensureDir,
   keyFor,
   loadState,
@@ -33,6 +32,8 @@ import {
   readRecords,
   record,
   saveState,
+  sessionId,
+  setSession,
   writeBody,
   writeTrace,
 } from "./store.js";
@@ -61,7 +62,7 @@ type Inflight = {
 export default function piReqcap(pi: ExtensionAPI): void {
   ensureDir();
   log([
-    `[${new Date().toISOString()}] pi-reqcap start session=${SESSION} pid=${process.pid} dir=${DIR} bodies=${CAPTURE_BODIES ? "on" : "off"}`,
+    `[${new Date().toISOString()}] pi-reqcap start session=${sessionId()} pid=${process.pid} dir=${DIR} bodies=${CAPTURE_BODIES ? "on" : "off"}`,
   ]);
 
   const chain = new Map<string, Fingerprint>();
@@ -75,6 +76,15 @@ export default function piReqcap(pi: ExtensionAPI): void {
   // fire-and-forget, and a session without UI simply ignores them.
   let lastCtx: any = null;
   const totals = { busts: 0, tokens: 0 };
+
+  // The session id comes from Pi's own context: the env var is not set for the
+  // process itself, so records would otherwise all read "unknown-session".
+  const remember = (ctx: any): void => {
+    lastCtx = ctx ?? lastCtx;
+    if (setSession(ctx?.sessionManager?.getSessionId?.())) {
+      log([`[${new Date().toISOString()}] pi-reqcap session resolved id=${sessionId()}`]);
+    }
+  };
 
   const setStatus = (): void => {
     try {
@@ -97,8 +107,9 @@ export default function piReqcap(pi: ExtensionAPI): void {
     lastReadTokens.set(req.key, u.read);
     record({
       kind: "response",
-      session: SESSION,
+      session: sessionId(),
       pid: process.pid,
+      key: req.key,
       seq: req.seq,
       at: new Date().toISOString(),
       api: req.api ?? null,
@@ -121,7 +132,7 @@ export default function piReqcap(pi: ExtensionAPI): void {
     writeBody(`${stamp}-${d.kind}`, req.body);
     writeBody(`${stamp}-PREVIOUS`, predecessorBody.get(req.key));
     log([
-      `[${new Date().toISOString()}] session=${SESSION} pid=${process.pid} seq=${req.seq} model=${req.fp.model} ${u.cold ? "COLD read=0" : "RE-BILL"} read=${u.read} write=${u.write} (1h=${u.write1h}) input=${u.input} prompt=${u.promptTokens} prevPrompt=${prevPrompt}`,
+      `[${new Date().toISOString()}] session=${sessionId()} pid=${process.pid} seq=${req.seq} model=${req.fp.model} ${u.cold ? "COLD read=0" : "RE-BILL"} read=${u.read} write=${u.write} (1h=${u.write1h}) input=${u.input} prompt=${u.promptTokens} prevPrompt=${prevPrompt}`,
       `    divergence vs previous request: ${d.kind}${d.at ? ` ${d.at}` : ""}${d.detail ? ` — ${d.detail}` : ""}`,
       d.kind === "append" ? "    (append only: the prompt changed without an edit — a section or a send-time transform)" : "",
       d.was ? `    was: ${d.was}` : "",
@@ -161,16 +172,16 @@ export default function piReqcap(pi: ExtensionAPI): void {
 
   pi.on("before_provider_request", (event: any, ctx: any) => {
     try {
-      lastCtx = ctx ?? lastCtx;
+      remember(ctx);
       flush();
       const payload = event?.payload;
       const body = payload as any;
       const chat = Array.isArray(body?.messages) && Array.isArray(body?.tools) && body.tools.length > 0;
       seq += 1;
-      const fp = fingerprint(body, { pid: process.pid, session: SESSION, at: new Date().toISOString() });
+      const fp = fingerprint(body, { pid: process.pid, session: sessionId(), at: new Date().toISOString() });
       const key = keyFor(fp.model);
       if (!chat) {
-        record({ kind: "request", session: SESSION, pid: process.pid, seq, at: fp.at, model: fp.model ?? null, utility: true, divergence: { kind: "utility" } });
+        record({ kind: "request", session: sessionId(), pid: process.pid, seq, at: fp.at, model: fp.model ?? null, utility: true, divergence: { kind: "utility" } });
         return;
       }
       loadState(key, chain, predecessorBody);
@@ -179,8 +190,9 @@ export default function piReqcap(pi: ExtensionAPI): void {
       inflight = { seq, key, fp, divergence, prevFp, body };
       record({
         kind: "request",
-        session: SESSION,
+        session: sessionId(),
         pid: process.pid,
+        key,
         seq,
         at: fp.at,
         model: fp.model ?? null,
@@ -206,7 +218,7 @@ export default function piReqcap(pi: ExtensionAPI): void {
 
   pi.on("before_provider_headers", (event: any, ctx: any) => {
     try {
-      lastCtx = ctx ?? lastCtx;
+      remember(ctx);
       if (!inflight) return;
       const headers = event?.headers;
       if (!headers || typeof headers !== "object") return;
@@ -222,7 +234,7 @@ export default function piReqcap(pi: ExtensionAPI): void {
 
   pi.on("after_provider_response", (event: any, ctx: any) => {
     try {
-      lastCtx = ctx ?? lastCtx;
+      remember(ctx);
       if (!inflight) return;
       inflight.status = Number(event?.status ?? 0) || undefined;
       const headers = event?.headers;
@@ -240,7 +252,7 @@ export default function piReqcap(pi: ExtensionAPI): void {
 
   pi.on("provider_stream_event", (event: any, ctx: any) => {
     try {
-      lastCtx = ctx ?? lastCtx;
+      remember(ctx);
       if (!inflight) return;
       inflight.provider = typeof event?.provider === "string" ? event.provider : inflight.provider;
       inflight.api = typeof event?.api === "string" ? event.api : inflight.api;
@@ -259,10 +271,10 @@ export default function piReqcap(pi: ExtensionAPI): void {
   for (const name of CAUSE_EVENTS) {
     pi.on(name as any, (event: any, ctx: any) => {
       try {
-        lastCtx = ctx ?? lastCtx;
+        remember(ctx);
         const detail = event?.reason ?? event?.name ?? event?.model ?? event?.level ?? event?.value ?? null;
-        record({ kind: "cause", event: name, session: SESSION, pid: process.pid, seq, at: new Date().toISOString(), detail });
-        log([`[${new Date().toISOString()}] cause session=${SESSION} event=${name}${detail ? ` detail=${JSON.stringify(detail)}` : ""}`]);
+        record({ kind: "cause", event: name, session: sessionId(), pid: process.pid, seq, at: new Date().toISOString(), detail });
+        log([`[${new Date().toISOString()}] cause session=${sessionId()} event=${name}${detail ? ` detail=${JSON.stringify(detail)}` : ""}`]);
       } catch {
         /* ignore */
       }
@@ -272,7 +284,7 @@ export default function piReqcap(pi: ExtensionAPI): void {
   for (const name of ["agent_settled", "agent_end", "session_shutdown"] as const) {
     pi.on(name as any, (_event: any, ctx: any) => {
       try {
-        lastCtx = ctx ?? lastCtx;
+        remember(ctx);
         flush();
         setStatus();
       } catch {
@@ -283,7 +295,7 @@ export default function piReqcap(pi: ExtensionAPI): void {
 
   const recordsFor = (all: boolean): any[] => {
     const records = readRecords(MAX_SCAN_LINES);
-    return all ? records : records.filter((r) => r.session === SESSION);
+    return all ? records : records.filter((r) => r.session === sessionId());
   };
 
   const emit = (ctx: any, lines: string[], type: "info" | "warning" = "info"): void => {
@@ -301,7 +313,7 @@ export default function piReqcap(pi: ExtensionAPI): void {
       try {
         if (sub === "trace") {
           const n = Math.min(200, Math.max(1, Number(rest) || 20));
-          emit(ctx, [`reqcap trace — last ${n} requests (${SESSION})`, ...traceLines(recordsFor(false), n)]);
+          emit(ctx, [`reqcap trace — last ${n} requests (${sessionId()})`, ...traceLines(recordsFor(false), n)]);
           return;
         }
         if (sub === "diff") {
@@ -335,7 +347,7 @@ export default function piReqcap(pi: ExtensionAPI): void {
           return;
         }
         const all = sub === "all";
-        emit(ctx, overview(recordsFor(all), { scope: all ? `all sessions in ${DIR}` : `session ${SESSION}` }));
+        emit(ctx, overview(recordsFor(all), { scope: all ? `all sessions in ${DIR}` : `session ${sessionId()}` }));
       } catch (error) {
         emit(ctx, [`reqcap: ${error instanceof Error ? error.message : String(error)}`], "warning");
       }

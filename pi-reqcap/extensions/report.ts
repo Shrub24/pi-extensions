@@ -3,7 +3,14 @@
 
 import { prefixTrace, type TraceSubject } from "./diff.js";
 
-export type ReqRecord = TraceSubject & { kind: "request"; session?: string; utility?: boolean; divergence?: Record<string, any> };
+export type ReqRecord = TraceSubject & {
+  kind: "request";
+  session?: string;
+  /** The chain this request was diffed against; absent in records written before it existed. */
+  key?: string;
+  utility?: boolean;
+  divergence?: Record<string, any>;
+};
 export type ResRecord = {
   kind: "response";
   session?: string;
@@ -103,34 +110,51 @@ export function traceLines(records: AnyRecord[], limit: number): string[] {
   const responses = new Map<number, ResRecord>();
   for (const r of records) if ((r as ResRecord).kind === "response") responses.set(Number((r as ResRecord).seq), r as ResRecord);
   const out: string[] = [];
+  const pids = new Set(requests.map((r) => r.pid).filter(Boolean));
+  const showPid = pids.size > 1;
   for (const req of requests.slice(-limit)) {
     const res = responses.get(Number(req.seq));
     const d = divOf(req);
     const verdict = !res ? "live" : classify(res);
-    const cost = res ? `read=${short(res.usage?.read ?? 0)} write=${short(res.usage?.write ?? 0)}` : "";
+    const which = showPid ? ` pid=${req.pid ?? "?"}` : "";
+    const cost = res ? `read=${short(res.usage?.read ?? 0)} write=${short(res.usage?.write ?? 0)}${which}` : "";
     const what = `${d.kind ?? "?"}${d.at ? ` ${d.at}` : ""}${d.detail ? ` — ${String(d.detail).slice(0, 70)}` : ""}`;
     out.push(`#${req.seq} ${clock(req.at)} ${String(req.model ?? "?").padEnd(22)} ${verdict.padEnd(8)} ${cost.padEnd(28)} ${what}`);
   }
   return out.length ? out : ["no requests recorded yet"];
 }
 
+/** The chain a request was diffed against: the key its divergence was computed with, or the
+ *  identity a record written before that key existed still implies. */
+function chainOf(r: ReqRecord): string {
+  return r.key ?? `${r.session ?? "?"}|${r.pid ?? "?"}|${r.model ?? "?"}`;
+}
+
 /** The full prefix comparison for one request against its predecessor. */
 export function diffReport(records: AnyRecord[], seq?: number): string[] {
   const requests = records.filter((r) => (r as ReqRecord).kind === "request" && !(r as ReqRecord).utility) as ReqRecord[];
   if (!requests.length) return ["no requests recorded yet"];
-  let index = requests.length - 1;
-  if (seq !== undefined) {
-    const found = requests.findIndex((r) => Number(r.seq) === seq);
-    if (found >= 0) index = found;
-    else return [`no request with seq ${seq} in this scan; try /reqcap trace`];
+  let cur: ReqRecord;
+  let duplicated = 0;
+  if (seq === undefined) {
+    cur = requests[requests.length - 1];
+  } else {
+    // seq counts per process, so two processes in one log both have a #1. Take the
+    // newest match and never compare across chains.
+    const found = requests.filter((r) => Number(r.seq) === seq);
+    if (!found.length) return [`no request with seq ${seq} in this scan; try /reqcap trace`];
+    duplicated = found.length;
+    cur = found[found.length - 1];
   }
-  const cur = requests[index];
+  const chain = chainOf(cur);
   let prev: ReqRecord | null = null;
-  for (let i = index - 1; i >= 0; i -= 1) {
-    if (requests[i].model === cur.model) {
+  for (let i = requests.indexOf(cur) - 1; i >= 0; i -= 1) {
+    if (chainOf(requests[i]) === chain) {
       prev = requests[i];
       break;
     }
   }
-  return prefixTrace(prev, cur);
+  const head = prefixTrace(prev, cur);
+  if (duplicated > 1) head.push(`note: ${duplicated} chains have seq ${seq} (seq counts per process); compared the newest, pid ${cur.pid ?? "?"}`);
+  return head;
 }

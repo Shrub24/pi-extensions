@@ -108,6 +108,25 @@ test("cold and re-billed are read from usage", () => {
   expect(usageFlags(undefined, 0).seen).toBe(false);
 });
 
+test("a removed message reads as a removal, not a mutation", () => {
+  const before = body({ messages: [{ role: "user", content: "a" }, { role: "user", content: "b" }, { role: "user", content: "c" }] });
+  const after = body({ messages: [{ role: "user", content: "a" }, { role: "user", content: "c" }] });
+  const d = diff(fingerprint(before, META), fingerprint(after, META));
+  expect(d.kind).toBe("removed");
+  expect(d.at).toBe("messages[1]");
+
+  const inserted = body({ messages: [{ role: "user", content: "a" }, { role: "user", content: "n" }, { role: "user", content: "c" }] });
+  const d2 = diff(fingerprint(after, META), fingerprint(inserted, META));
+  expect(d2.kind).toBe("inserted");
+  expect(d2.at).toBe("messages[1]");
+});
+
+test("an edited message in place is still a mutation", () => {
+  const before = body({ messages: [{ role: "user", content: "a" }, { role: "user", content: "b" }] });
+  const after = body({ messages: [{ role: "user", content: "a" }, { role: "user", content: "b2" }] });
+  expect(diff(fingerprint(before, META), fingerprint(after, META)).kind).toBe("mutate");
+});
+
 test("an OpenAI-shaped prompt is not double counted", () => {
   // The gateway reports prompt_tokens inclusive of the cached part.
   const u = usageFlags({ prompt_tokens: 30288, cached_tokens: 6144, prompt_tokens_details: { cached_tokens: 6144 }, completion_tokens: 99 }, 0);

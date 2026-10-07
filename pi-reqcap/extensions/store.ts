@@ -5,7 +5,20 @@ import { createHash } from "node:crypto";
 import type { Fingerprint } from "./diff.js";
 
 export const DIR = process.env.PI_REQCAP_DIR ?? `${process.env.HOME}/.local/share/pi-reqcap/out`;
-export const SESSION = (process.env.PI_SESSION_FILE ?? "unknown-session").split("/").pop() ?? "unknown-session";
+
+let session = (process.env.PI_SESSION_FILE ?? "unknown-session").split("/").pop() ?? "unknown-session";
+
+/** The session this process serves. Pi does not export the session file, so index.ts
+ *  sets this from the event context on the first event; the env var is only a fallback. */
+export function sessionId(): string {
+  return session;
+}
+
+export function setSession(id: string | undefined): boolean {
+  if (!id || id === session) return false;
+  session = id;
+  return true;
+}
 
 // Bodies are full prompts on disk. On by default because a divergence without the
 // payload is hard to act on, but they are written only for a request that paid, and
@@ -25,7 +38,7 @@ export function ensureDir(): void {
 
 /** Caches are per model, and a process is not a session lifetime: resume must continue the chain. */
 export function keyFor(model: string | undefined): string {
-  return createHash("sha1").update(`${SESSION}|${model ?? "?"}`).digest("hex").slice(0, 12);
+  return createHash("sha1").update(`${session}|${model ?? "?"}`).digest("hex").slice(0, 12);
 }
 
 export function loadState(key: string, chain: Map<string, Fingerprint>, predecessorBody: Map<string, unknown>): void {
@@ -96,11 +109,12 @@ export function writeBody(name: string, body: unknown): void {
 }
 
 /** Tail of requests.jsonl, oldest first, so a long session's log stays cheap to read. */
-export function readRecords(maxLines = 4000): any[] {
+export function readRecords(maxLines: number = 4000): any[] {
+  const limit = Number.isFinite(maxLines) && maxLines > 0 ? maxLines : 4000;
   try {
     const lines = readFileSync(`${DIR}/requests.jsonl`, "utf8").split("\n").filter(Boolean);
     const out: any[] = [];
-    for (const line of lines.slice(Math.max(0, lines.length - maxLines))) {
+    for (const line of lines.slice(Math.max(0, lines.length - limit))) {
       try {
         out.push(JSON.parse(line));
       } catch {
