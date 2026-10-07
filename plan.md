@@ -1,23 +1,31 @@
 # pi-herdsman and pi-bash-processes: outstanding work
 
-Updated 2026-10-07. Local `main` equals upstream and the Nix pin; everything below is pushed. A peer
-session develops pi-jev on top of `main` in this same working copy.
+Updated 2026-10-07. Local `main` equals upstream plus six unpushed commits; the Nix pin is at the last
+push. A peer session develops pi-jev on top of `main` in this same working copy.
 Every item names its root cause (known, partly known, unknown) and the path forward.
 
 ## Worker lifecycle (direction)
 
-**Now (landed with this file):** guidance and a delivery nudge. The lead contract, tool descriptions,
-`SKILL.md` and `docs/guides/handoffs.md` say to close a retained idle worker once its scope is finished,
-and each delivered result reminds the lead of the worker's label, `agent_continue` and `agent_close`.
+**Now (landed):** guidance and a delivery nudge. The lead contract, tool descriptions, `SKILL.md` and
+`docs/guides/handoffs.md` say to close a retained idle worker once its scope is finished, and each
+delivered result reminds the lead of the worker's label, `agent_continue` and `agent_close`.
 
-**Next, as an openspec change: retire by task state.** Retire the live pane and process while the worker
-stays resumable, driven by the assignment's state and not by a lead's memory.
-- Trigger: a delivered result has been retrieved and the worker has no awaited children, no unread
-  background results and no pending owner ask. Retirement uses the existing close path with its preflight.
-- Retained state: the Pi session file, the mailbox record and the label lineage. `agent_continue` relaunches
-  it into a new process (the existing `relaunched` path, ADR 0013).
+**Live retention is off (owner decision, 2026-10-07).** `retainWorkers = false` in the dotfiles Herdsman
+config and in the live `~/.pi/agent/pi-herdsman/config.json`. Persisting a live pane/process past delivery
+makes every lifecycle defect reachable — the orphan continuation turn could only exist because a settled
+worker still had a running session — so the default is now: delivery closes the live execution, the
+mailbox, result file, label lineage and Pi session survive, and `agent_continue` relaunches the saved
+session into a new process (ADR 0013). The toggle and its seam stay; they can be reduced or removed once
+the replacement proves out. `retainWorkers` is read at process start, so a running lead keeps the old
+behaviour until it reloads.
+
+**Next: advertise resumable workers from the durable record, not a live pane.** With retention off, a
+delivered worker no longer appears in the inventory, so a lead that would have continued it respawns
+instead — the capability survives in the mailbox and session, but nothing advertises it. The fix is to
+list owned closed generations as resumable (label, last result, `agent_continue`) and let `agent_continue`
+relaunch them. This is what makes retention-off strictly better than retention-on rather than merely safer.
 - Open questions: does the grace period reset on any pane activity or only on `agent_continue`; does
-  `agent_list` show retired workers as resumable sessions; does Radar need a "retired, resumable" token.
+  Radar need a "retired, resumable" token.
 - Depends on: #130 below, because a pane left as a shell must read `lost` for cleanup to be decidable.
 
 ## Herdr independence (direction)
@@ -83,8 +91,11 @@ refusals, plus carried-background-result settlement contract tests. No live reco
 1. `herdsman-control/v1` owner side is committed (`92e52f0e43a1`) with the shared close preflight and locked
    generation checks. Radar's consumer is independently gated. Existing owners require reload; live
    owner-routed control smoke remains unverified.
-2. `herdr:blocked` raised from pi-herdsman while an operator question is outstanding (the pane reads
-   `working` during `ask_user_question` today, by construction).
+2. ~~`herdr:blocked` raised from pi-herdsman while an operator question is outstanding~~ — landed
+   (`9972d951`): a worker-side `rpiv:ask-user:blocked` bridge persists a run/session/request-scoped sidecar
+   that the managed projection reads ahead of lifecycle `working`. Nothing synthesizes `pendingAskId`, and
+   health attention still keys on the raw Herdr lifecycle. A live questionnaire has not been observed
+   through it yet.
 3. Generate the `SKILL.md` runtime-contract block from the injected constants, with a drift check (memory 4007).
 4. Sweep worker prompt snapshots on process exit and at session shutdown (the temp root is never swept).
 5. Verify owner-routed control integration after reload, only with explicit approval for destructive smoke.
@@ -92,15 +103,15 @@ refusals, plus carried-background-result settlement contract tests. No live reco
 7. Make forking a session safe for herdsman and background tasks. A fork replays the parent's session
    branch, so extension state that lives in branch entries is inherited as if the fork had produced it.
    Session-bound state is now bound to the session that wrote it and ignored on a fork: background-task
-   snapshots are filtered at the single restore ingestion point, so a foreign snapshot is neither
-   restored nor re-advertised, and `pi-herdsman-role` / `pi-herdsman-lead-state` name their writer
-   (`supervision.sessionOwnership`, `entryOwnedBySession`), so a fork starts without its parent's role,
-   coordinator generation or chief activation. The session-metadata record and the worker/agent
-   identities were already scoped this way. The fork surface is `fork-in` (`/fork-in-herdr`), which
-   copies the session JSONL with a fresh id and a `parentSession` pointer; that pointer is the signal
-   the fork check reads, so no marker of our own is needed. Not yet audited: retained-worker ownership,
-   the delivery ledger and result refs. Needed: the same classification for those surfaces, and a live
-   fork smoke. Until then, do not fork a lead that owns workers.
+   snapshots are filtered at the single restore ingestion point (`4edca82d`), so a foreign snapshot is
+   neither restored nor re-advertised, and `pi-herdsman-role` / `pi-herdsman-lead-state` name their writer
+   (`supervision.sessionOwnership`, `entryOwnedBySession`, `581744d6`), so a fork starts without its
+   parent's role, coordinator generation or chief activation. The session-metadata record and the
+   worker/agent identities were already scoped this way. The fork surface is `fork-in`
+   (`/fork-in-herdr`), which copies the session JSONL with a fresh id and a `parentSession` pointer; that
+   pointer is the signal the fork check reads, so no marker of our own is needed. Not yet audited:
+   retained-worker ownership, the delivery ledger and result refs. Needed: the same classification for
+   those surfaces, and a live fork smoke. Until then, do not fork a lead that owns workers.
 8. The upstream pre-extraction alignment waits on the owner's approval of
    `.pi-herdsman/pre-extraction-adoption-plan.md` (every fork divergence classified incidental or
    deliberate, deliberate ones kept behind a separable seam). It edits `index.ts` and `herdr.ts`, so it
@@ -130,6 +141,23 @@ refusals, plus carried-background-result settlement contract tests. No live reco
     revision), because a store path cannot say which plugins are compiled in and under AOT it is the only
     build identity a process can report. Radar consumes both. Note also that `pi` is now the pi-bolt lead
     launcher, so `pi` and `pi-bolt` distinguish nothing — family must come from the store root or the env.
+11. Live residuals of the landed worker-lifecycle fixes. Landed and gate-green but not yet observed in a
+    real session: the settlement discriminator (`1863bc41` — a compaction request disarms settlement and
+    the aborted run publishes nothing), the continuation guard (`a2da5b9e` — a continuation is withheld
+    once its assignment settled, recorded as `pi_herdsman_state_compaction_continuation_skipped`), provider
+    error text in a failure result (`34506f46`), and the unclaimed-alias refusal (`3fcdfeb3`). Each needs
+    the shape that produced it: a budget crossing with the assignment settling mid-compaction, a real
+    provider failure, and a pane whose occupant does not claim its alias. Retention-off (below) is what
+    makes the orphan-continuation class unreachable rather than merely guarded.
+12. Residuals from the stale-generation slice (`3fcdfeb3`). The guard lives in `managedAgentPresence`, so
+    an unclaimed alias is refused everywhere, but nothing in the product can *resolve* the nameless-pane
+    shape: `proveExactRunningAgent` still reports `agent_not_found` for it, so an operator has to inspect
+    the pane and resolve the occupant by hand. A diagnosis inside that lookup (resolve by pane id, then
+    classify) is the only route to an in-product recovery, and it was deliberately left out of the slice
+    because no managed control reaches it today. Related: durable launch-time pane-process provenance would
+    prove the same generation without the alias, and an existing test leaves a mailbox in a
+    `${WORKSPACE}-replacement` workspace that `clearTestMailboxes()` does not remove, which can skew any
+    future test that filters global states by session id.
 
 ## pi-jev: native classifier and AOT
 
