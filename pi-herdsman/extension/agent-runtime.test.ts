@@ -59,6 +59,11 @@ import support, {
   writeAgentState,
   testTmpRoot,
 } from "./support.ts";
+const {
+  readQuestionWaitEvidence,
+  RPIV_ASK_USER_BLOCKED_EVENT,
+  writeQuestionWaitEvidence,
+} = await import("./question-waiting.ts");
 const { createAcceptedAssignmentContract } = await import(
   "./response-validation.ts"
 );
@@ -1768,8 +1773,19 @@ test("managed pump retries a request after acknowledgement persistence fails", a
 
 test("registered agent writes state, handles input, and settles one result", async () => {
   const mailbox = setAgentEnvironment();
+  const staleQuestionWait = {
+    runId: randomUUID(),
+    requestId: randomUUID(),
+    piSessionId: randomUUID(),
+  };
+  writeQuestionWaitEvidence(mailbox, staleQuestionWait);
   const agent = fakePi();
   registerExtension!(agent.pi as never);
+  assert.equal(
+    readQuestionWaitEvidence(mailbox, staleQuestionWait),
+    "clear",
+    "a restarted worker clears a stale question wait",
+  );
   assert.equal(
     agent.tools.filter((tool) => tool.name === "ask_owner").length,
     1,
@@ -1837,6 +1853,23 @@ test("registered agent writes state, handles input, and settles one result", asy
     action: "transform",
     text: request.text,
   });
+  const activeState = readAgentState(mailbox)!;
+  const activeQuestionWait = {
+    runId: activeState.runId,
+    requestId: request.requestId,
+    piSessionId: activeState.piSessionId,
+  };
+  agent.pi.events.emit(RPIV_ASK_USER_BLOCKED_EVENT, { active: true });
+  assert.equal(
+    readQuestionWaitEvidence(mailbox, activeQuestionWait),
+    "waiting",
+  );
+  agent.pi.events.emit(RPIV_ASK_USER_BLOCKED_EVENT, { active: false });
+  assert.equal(
+    readQuestionWaitEvidence(mailbox, activeQuestionWait),
+    "clear",
+    "question completion/cancel/error clears the wait marker",
+  );
   agent.events.get("message_end")![0](
     { message: { role: "user", content: "ignored" } },
     context,
@@ -1852,6 +1885,7 @@ test("registered agent writes state, handles input, and settles one result", asy
   assert.equal(result?.text, "done");
   assert.equal(readAgentState(mailbox)?.completedRequestId, request.requestId);
   assert.equal(readAgentState(mailbox)?.lastActivityAt, undefined);
+  fireShutdown(agent);
 });
 
 test("worker persists the accepted contract and validates the final response", async () => {

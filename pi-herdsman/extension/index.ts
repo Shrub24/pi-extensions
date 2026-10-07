@@ -129,6 +129,11 @@ import {
   type SpawnPlacement,
 } from "./core.ts";
 import {
+  clearQuestionWaitEvidence,
+  readQuestionWaitEvidence,
+  registerQuestionWaitReporter,
+} from "./question-waiting.ts";
+import {
   AGENT_COORDINATION_TOOLS,
   agentLaunchArgs,
   agentLaunchFingerprint,
@@ -3047,20 +3052,35 @@ async function managedAgentSnapshots(
       state.completedRequestId,
     );
     const handoffPending = unacknowledgedRequestExists(path, state);
+    const questionWaitEvidence = agent
+      ? readQuestionWaitEvidence(
+          path,
+          state.activeRequestId
+            ? {
+                runId: state.runId,
+                requestId: state.activeRequestId,
+                piSessionId,
+              }
+            : undefined,
+        )
+      : "clear";
     // A live worker whose assignment is delivered still owns its resolved
     // request id, but no result file is pending: that is the retained shape.
     const delivered = !!state.completedRequestId && !completionPending;
     const liveState = agent
-      ? agentControlState(
-          lifecycleState,
-          state.activeRequestId,
-          completionPending,
-          handoffPending,
-          !!state.pendingAskId,
-          !!state.resultError,
-          delivered,
-          state.backgroundWaiting?.taskIds ?? [],
-        )
+      ? questionWaitEvidence === "invalid"
+        ? "unknown"
+        : agentControlState(
+            lifecycleState,
+            state.activeRequestId,
+            completionPending,
+            handoffPending,
+            !!state.pendingAskId,
+            !!state.resultError,
+            delivered,
+            state.backgroundWaiting?.taskIds ?? [],
+            questionWaitEvidence === "waiting",
+          )
       : "unknown";
     const pendingDirectChildWork = hasPendingDirectChildWork(state, mailboxes);
     const waitingForChildren =
@@ -16602,6 +16622,8 @@ export default function (pi: ExtensionAPI): void {
   }
   if (processRole !== "managed-agent") return;
   agentControllerReady = false;
+  const questionWaitMailbox = process.env.PI_HERDSMAN_MAILBOX!;
+  clearQuestionWaitEvidence(questionWaitMailbox);
   let state: ManagedAgentState | undefined;
   let initialized = false;
   let latest = "";
@@ -16686,6 +16708,32 @@ export default function (pi: ExtensionAPI): void {
       release();
     }
   };
+  const questionWaitUnsubscribe = registerQuestionWaitReporter(
+    pi.events,
+    questionWaitMailbox,
+    () => {
+      const current = state;
+      if (!current?.activeRequestId) return undefined;
+      const latestState = readAgentState(questionWaitMailbox);
+      if (
+        !latestState ||
+        !sameManagedAgentIdentity(latestState, current) ||
+        latestState.runId !== current.runId ||
+        latestState.piSessionId !== current.piSessionId ||
+        latestState.activeRequestId !== current.activeRequestId
+      )
+        return undefined;
+      return {
+        runId: current.runId,
+        requestId: current.activeRequestId,
+        piSessionId: current.piSessionId,
+      };
+    },
+    (error) => {
+      if (agentContext)
+        appendDurableError(pi, agentContext, "pi_herdsman_state_error", error);
+    },
+  );
   const reportAcknowledgementFailure = (
     ctx: ExtensionContext,
     error: unknown,
@@ -17087,7 +17135,11 @@ export default function (pi: ExtensionAPI): void {
   });
   pi.on("session_before_switch", () => ({ cancel: true }));
   pi.on("session_before_fork", () => ({ cancel: true }));
-  pi.on("session_shutdown", () => stopBackgroundWorkChangeSubscription());
+  pi.on("session_shutdown", () => {
+    stopBackgroundWorkChangeSubscription();
+    questionWaitUnsubscribe();
+    clearQuestionWaitEvidence(questionWaitMailbox);
+  });
   pi.on("session_start", async (_e: unknown, ctx: ExtensionContext) => {
     preparePaneMetadata(ctx);
     resetRequestPump();

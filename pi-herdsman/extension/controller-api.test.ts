@@ -83,6 +83,7 @@ import support, {
   writeAgentState,
   testTmpRoot,
 } from "./support.ts";
+const { writeQuestionWaitEvidence } = await import("./question-waiting.ts");
 function fakeChiefPi(options: Parameters<typeof fakePi>[0] = {}) {
   let fixture: ReturnType<typeof fakePi>;
   const initialTools = Array.isArray(options.activeTools)
@@ -6725,6 +6726,47 @@ test("successful controls persist their definition before runtime teardown", asy
       teardown();
       resetAgentMailbox(mailbox);
     }
+  }
+});
+
+test("agent list projects an active user-question wait as blocked without owner reply", async () => {
+  setLeadEnvironment();
+  const state = {
+    ...managedState(
+      "question-waiting-parent",
+      REQUEST_ID,
+      recoveryIdentity("question-waiting-parent"),
+    ),
+    piSessionId: PARENT_SESSION_ID,
+    piSessionFile: "/tmp/question-waiting-parent.jsonl",
+  };
+  const mailbox = agentMailboxPath(WORKSPACE, state.agentLabel);
+  resetAgentMailbox(mailbox);
+  writeAgentState(mailbox, state);
+  const pi = fakePi({ exec: agentControllerExecutor(state) });
+  registerExtension!(pi.pi as never);
+  const context = fakeContext();
+  try {
+    await pi.events.get("session_start")![0](undefined, context);
+    writeQuestionWaitEvidence(mailbox, {
+      runId: state.runId,
+      requestId: REQUEST_ID,
+      piSessionId: state.piSessionId,
+    });
+    const blocked = await agentTool(pi, "list").execute(
+      "list",
+      {},
+      undefined,
+      undefined,
+      context,
+    );
+    const listedAgent = blocked.details.agents[0];
+    assert.equal(listedAgent?.state, "blocked");
+    assert.ok(!listedAgent?.available_tools.includes("agent_reply"));
+    assert.ok(!listedAgent?.available_tools.includes("agent_interrupt"));
+  } finally {
+    for (const handler of pi.events.get("session_shutdown") ?? []) handler();
+    resetAgentMailbox(mailbox);
   }
 });
 

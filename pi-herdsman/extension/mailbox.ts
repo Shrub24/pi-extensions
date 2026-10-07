@@ -138,6 +138,7 @@ export interface ResultRecord {
 const UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 export const MAILBOX_PROTOCOL_VERSION = 5 as const;
+export const QUESTION_WAITING_MARKER_FILE = "question-waiting.json" as const;
 
 /**
  * Pi reports the size of the context it holds, which can exceed the window
@@ -941,6 +942,7 @@ export function resetAgentMailbox(path: string): void {
   for (const name of [
     "state.json",
     "ask.json",
+    QUESTION_WAITING_MARKER_FILE,
     ...readdirSync(path).filter((x: string) =>
       /^(request|result)-.*\.json$/.test(x),
     ),

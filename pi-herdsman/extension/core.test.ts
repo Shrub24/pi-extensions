@@ -286,6 +286,51 @@ test("projects lifecycle and assignment state into control states", () => {
     "blocked",
     "pending owner questions retain their reply state",
   );
+  assert.equal(
+    agentControlState(
+      "working",
+      "request",
+      false,
+      false,
+      false,
+      false,
+      false,
+      [],
+      true,
+    ),
+    "blocked",
+    "an active user-question wait takes precedence over an executing tool call",
+  );
+  assert.equal(
+    agentControlState(
+      "unknown",
+      "request",
+      false,
+      false,
+      false,
+      false,
+      false,
+      [],
+      true,
+    ),
+    "unknown",
+    "question-wait evidence does not override an unknown lifecycle",
+  );
+  assert.equal(
+    agentControlState(
+      "working",
+      "request",
+      true,
+      false,
+      false,
+      false,
+      false,
+      [],
+      true,
+    ),
+    "settling",
+    "pending completion remains higher precedence than a question wait",
+  );
 });
 
 test("rejects invalid file content", () => {

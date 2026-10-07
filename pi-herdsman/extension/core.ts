@@ -520,9 +520,14 @@ export function agentControlState(
   recoveryPending = false,
   delivered = false,
   backgroundWorkTaskIds: readonly string[] = [],
+  waitingForUserQuestion = false,
 ): ManagedAgentControlState {
   if (completionPending || handoffPending || recoveryPending) return "settling";
   if (activeRequestId) {
+    if (waitingForUserQuestion) {
+      if (lifecycle === "unknown") return "unknown";
+      return "blocked";
+    }
     if (lifecycle === "working") return "working";
     if (waitingForOwner) {
       if (lifecycle === "unknown") return "unknown";

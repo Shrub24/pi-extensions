@@ -12,7 +12,7 @@ durable assignment/convergence evidence. It is not a raw herdr lifecycle string.
 | `idle`     | A retained worker: its terminal result was delivered and its verified live process is available for one new assignment. |
 | `working`  | An assignment is active; `stale` remains an advisory field on this state.                                |
 | `waiting`  | The model turn has yielded, but provider-backed work or its required post-review response remains unresolved. |
-| `blocked`  | Active assignment waits for an owner answer or another condition.                                        |
+| `blocked`  | Active assignment is waiting for owner input or another condition, including an active question-tool dialog. |
 | `settling` | Assignment handoff, completion/result delivery, launch, direct-agent gate, or cleanup is converging.     |
 | `unknown`  | Exact safe control state cannot be proved.                                                               |
 | `lost`     | Physical execution is proven absent before a durable terminal result; the assignment remains unresolved. |
@@ -93,11 +93,21 @@ rules as any other worker.
 An agent waiting on a valid `ask_owner` reply projects as `blocked` after its ask
 turn settles. Answer through the exact direct owner using `agent_reply` with the exact `agent` identity.
 
+When `@juicesharp/rpiv-ask-user-question` emits its public
+`rpiv:ask-user:blocked` event, the managed worker projects as `blocked` while
+the dialog waits for input. The signal clears when the question completes,
+is cancelled, or errors; it is scoped to the exact run, Pi session, and active
+assignment. Because the event is process-local, Herdsman relays only that
+identity through a transient mailbox marker rather than forking the question
+tool. This is not a Herdsman `ask_owner` request and does not enable
+`agent_reply`.
+
 A delegating parent can also project as `blocked` while it waits for direct
 children. That is progress-capable parent waiting, not evidence that the child
 runtime is externally blocked. Recovery attention for `blocked` is reserved for
-a live Herdr runtime that reports `blocked` while an active request exists and
-no `ask_owner` question is pending.
+a live Herdr runtime that itself reports `blocked` while an active request
+exists and no `ask_owner` question is pending; a question-tool wait does not
+produce that attention.
 
 ## `settling`
 
