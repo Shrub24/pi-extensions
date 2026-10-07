@@ -139,11 +139,13 @@ try {
 		catch (error) { resultError = error instanceof Error ? error.message : String(error); }
 	}
 
-	// Renderer-degradation contract: with no renderer module present, the bash
-	// tool must still return renderable components, never undefined.
-	const callComponent = (bash as unknown as { renderCall?: (...a: unknown[]) => unknown }).renderCall?.({ command: "x" }, {}, ctx);
-	const resultComponent = (bash as unknown as { renderResult?: (...a: unknown[]) => unknown }).renderResult?.({ content: [{ type: "text", text: "out" }] }, { expanded: false, isPartial: false }, {}, ctx);
+	// Renderer-degradation contract: whether or not the optional presentation
+	// module has finished loading, the bash tool must return renderable components
+	// that carry the command — never undefined, and never nothing.
+	const callComponent = (bash as unknown as { renderCall?: (...a: unknown[]) => unknown }).renderCall?.({ command: "x" }, widgetTheme, ctx);
+	const resultComponent = (bash as unknown as { renderResult?: (...a: unknown[]) => unknown }).renderResult?.({ content: [{ type: "text", text: "out" }] }, { expanded: false, isPartial: false }, widgetTheme, ctx);
 	const renderable = (component: unknown) => Boolean(component) && typeof (component as { render?: unknown }).render === "function";
+	const renderedLines = (component: unknown): string[] => renderable(component) ? (component as { render(width: number): string[] }).render(120) : [];
 
 	await events.get("before_agent_start")!({}, ctx);
 	const widgetAfterSettle = widgetLines();
@@ -161,6 +163,8 @@ try {
 		scenario: input.scenario,
 		managedBashPublished,
 		callRenderable: renderable(callComponent),
+		callLines: renderedLines(callComponent),
+		resultLines: renderedLines(resultComponent),
 		partialTexts: partialUpdates.map((partial) => {
 			const content = (partial as { content?: { text?: string }[] }).content;
 			return content?.[0]?.text ?? "";

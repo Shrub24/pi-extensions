@@ -79,7 +79,8 @@ import {
 	bgTree,
 	frameWidget,
 	makeToolResult,
-	renderEmpty,
+	renderManagedBashFallbackCall,
+	renderManagedBashFallbackResult,
 	renderTaskEventMessage,
 } from "./render.js";
 import { logBackgroundDiagnostic } from "./diagnostics.js";
@@ -143,6 +144,7 @@ import {
 	rememberSnapshot,
 	resolveTaskByToken,
 	restoredTaskFromSnapshot,
+	snapshotBelongsToSession,
 	taskSnapshot,
 } from "./snapshot.js";
 import { MINI_DASHBOARD_RANK, setMiniDashboardWidget } from "./stacked-widget.js";
@@ -1236,9 +1238,15 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		tasks.clear();
 		taskCounter = 0;
 		activeSessionId = sessionIdForContext(ctx);
+		// Forks replay their parent's branch, but those tasks remain owned by the parent session.
+		const forked = ctx.sessionManager.getHeader?.()?.parentSession != null;
 		const replayed = new Map<string, BackgroundTaskSnapshot>();
 		const rememberRestoredSnapshot = (snapshot: BackgroundTaskSnapshot) => {
-			if (!snapshot?.id || !snapshot.command) return;
+			if (
+				!snapshot?.id ||
+				!snapshot.command ||
+				!snapshotBelongsToSession(snapshot, activeSessionId ?? undefined, forked)
+			) return;
 			const existing = replayed.get(snapshot.id);
 			if (existing && existing.updatedAt >= snapshot.updatedAt) return;
 			replayed.set(snapshot.id, snapshot);
@@ -3308,7 +3316,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		},
 		renderCall(args: any, theme: any, context: any) {
 			if (managedBashPresentation) return managedBashPresentation.renderManagedBashCall({ args, context, theme, cwd: activeCtx?.cwd ?? process.cwd() });
-			return renderEmpty();
+			return renderManagedBashFallbackCall(args, theme);
 		},
 		renderResult(result: any, options: any, theme: any, context: any) {
 			if (managedBashPresentation) {
@@ -3328,7 +3336,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 					cwd: activeCtx?.cwd ?? process.cwd(),
 				});
 			}
-			return renderEmpty();
+			return renderManagedBashFallbackResult(result, options, theme, context, activeCtx?.cwd ?? process.cwd());
 		},
 	});
 	interop[MANAGED_BASH_SYMBOL] = true;

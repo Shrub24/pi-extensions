@@ -236,12 +236,25 @@ export interface RestoreOptions {
 	// Current Pi session id. Snapshots whose sessionId disagrees with this
 	// value are still rehydrated (so the dashboard can show their final
 	// state) but are not eligible for missed-exit replay; replay is scoped
-	// to the session that spawned the task.
+	// to the session that spawned the task. A fork discards them before
+	// this point instead — see snapshotBelongsToSession.
 	sessionId?: string;
 	// Optional systemd unit liveness probe for resource-controlled tasks.
 	// Resolves true while the persisted transient unit is active, false
 	// when it is known inactive, and null when the unit cannot be queried.
 	unitActiveProbe?: (unitName: string) => Promise<boolean | null>;
+}
+
+// A fork inherits its parent's branch, so the snapshots it replays still
+// belong to the session that spawned them. A session that is not a fork keeps
+// rehydrating foreign snapshots so the dashboard can show their final state.
+export function snapshotBelongsToSession(
+	snapshot: BackgroundTaskSnapshot,
+	sessionId: string | undefined,
+	forked: boolean,
+): boolean {
+	if (!forked) return true;
+	return typeof sessionId === "string" && snapshot.sessionId === sessionId;
 }
 
 // Rehydrate a persisted snapshot into a ManagedTask placeholder. The child

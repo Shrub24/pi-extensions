@@ -5,6 +5,8 @@ interface FixtureResult {
 	scenario: string;
 	managedBashPublished: boolean;
 	callRenderable: boolean;
+	callLines: string[];
+	resultLines: string[];
 	resultRenderable: boolean;
 	widgetDuringForeground: string;
 	widgetAfterSettle: string;
@@ -33,6 +35,9 @@ test("managed bash v1: fast exit returns truthful output and no async wake", () 
 	expect(result.managedBashPublished).toBe(true);
 	expect(result.callRenderable, "renderCall returns a renderable component without the renderer package").toBe(true);
 	expect(result.resultRenderable, "renderResult returns a renderable component without the renderer package").toBe(true);
+	// An empty component would erase the row the transcript is supposed to carry.
+	expect(result.callLines.join("\n"), "the pending call row names the command").toContain("x");
+	expect(result.resultLines.join("\n"), "the result row carries the output").toContain("out");
 	expect(result.managedBashCleared).toBe(true);
 	expect(result.spawns, "exactly one spawn").toBe(1);
 	expect(result.spawnsAfterExecute, "spawn happens inside execute").toBe(1);

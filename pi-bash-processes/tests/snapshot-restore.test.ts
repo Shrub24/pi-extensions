@@ -1,7 +1,19 @@
 import { expect, test } from "bun:test";
-import { restoredTaskFromSnapshot, selectMissedExits, type RestoreOptions } from "../extensions/snapshot.js";
+import { restoredTaskFromSnapshot, selectMissedExits, snapshotBelongsToSession, type RestoreOptions } from "../extensions/snapshot.js";
 import type { BackgroundTaskSnapshot, ManagedTask } from "../extensions/types.js";
 import { fakeIdent, fakeSnapshot, reading } from "./fixtures/lifecycle.js";
+
+test("fork restore admits only task snapshots owned by the fork session", () => {
+	const parent = fakeSnapshot({ sessionId: "parent-session" });
+	const fork = fakeSnapshot({ sessionId: "fork-session" });
+	const legacy = fakeSnapshot();
+	delete (legacy as { sessionId?: string }).sessionId;
+
+	expect(snapshotBelongsToSession(parent, "fork-session", true)).toBe(false);
+	expect(snapshotBelongsToSession(fork, "fork-session", true)).toBe(true);
+	expect(snapshotBelongsToSession(legacy, "fork-session", true)).toBe(false);
+	expect(snapshotBelongsToSession(legacy, "parent-session", false)).toBe(true);
+});
 
 test("restoredTaskFromSnapshot restores task state and missed exit eligibility", async () => {
 	const rows: {

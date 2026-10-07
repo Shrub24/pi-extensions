@@ -372,6 +372,34 @@ function renderBgLogResult(task: BackgroundTaskSnapshot | undefined, output: str
 	return text;
 }
 
+function renderBgGetResult(details: any, theme: Theme, expanded: boolean, cwd?: string): string {
+	const task = latestSnapshot(details.task as BackgroundTaskSnapshot | undefined);
+	const observation = (details.observation ?? {}) as Record<string, unknown>;
+	const preview = typeof observation.outputPreview === "string" ? observation.outputPreview : "";
+	const output = takeTailLines(preview, expanded ? outputLineLimit(cwd) : TOOL_PREVIEW_LINES);
+	const readiness = typeof observation.readiness === "string" && observation.readiness !== task?.status ? observation.readiness : undefined;
+	const bytes = typeof observation.outputBytes === "number" ? `${observation.outputBytes} byte${observation.outputBytes === 1 ? "" : "s"}` : undefined;
+	const summary = [readiness, bytes, expanded ? undefined : "ctrl+o to expand"].filter((part): part is string => Boolean(part)).join(" · ");
+	const status = task ? `${theme.fg("accent", task.id)} ${bgStatusText(task, theme)}` : theme.fg("accent", "result");
+	const lines = [`${theme.fg("accent", "● ")}${bgToolLabel(theme, "Background result ")}${status}${summary ? theme.fg("dim", ` · ${summary}`) : ""}`];
+	if (typeof details.captureError === "string" && details.captureError) {
+		lines.push(`${bgTree(theme, "│", cwd)}${theme.fg("warning", details.captureError)}`);
+	}
+	if (expanded) {
+		if (task) lines.push(...renderTaskDetails(task, theme, cwd));
+		if (output.lines.length > 0) {
+			if (output.hidden > 0) lines.push(`${bgTree(theme, "│", cwd)}${theme.fg("muted", `… ${output.hidden} older line(s)`)}`);
+			lines.push(...output.lines.map((line) => `${bgTree(theme, "│", cwd)}${theme.fg("dim", line)}`));
+		}
+		const snapshotPath = typeof details.fullOutputPath === "string" ? details.fullOutputPath : undefined;
+		if (snapshotPath) lines.push(`${bgTree(theme, "└", cwd)}${theme.fg("muted", `Full output: ${snapshotPath}`)}`);
+		else if (task) lines.push(`${bgTree(theme, "└", cwd)}${theme.fg("muted", "Full result: bg_task get output:\"full\"")}`);
+	} else if (output.lines.length > 0 && toolRenderMode(cwd) === "stacked") {
+		lines.push(`${bgTree(theme, "└", cwd)}${theme.fg("muted", compactText(output.lines[output.lines.length - 1] ?? "", 120))}`);
+	}
+	return lines.join("\n");
+}
+
 export function renderBgToolResult(result: any, options: any, theme: Theme, context: any): RenderedLines | ReturnType<typeof renderEmpty> {
 	if (options?.isPartial) return renderBgToolPartial(context?.args ?? {}, theme);
 	const action = bgToolAction(context?.args ?? {}, result?.details);
@@ -400,6 +428,8 @@ export function renderBgToolResult(result: any, options: any, theme: Theme, cont
 
 	if (action === "log") return renderLines(renderBgLogResult(details.task as BackgroundTaskSnapshot | undefined, raw, theme, expanded, cwd));
 
+	if (action === "get") return renderLines(renderBgGetResult(details, theme, expanded, cwd));
+
 	if (action === "stop") {
 		const task = latestSnapshot(details.task as BackgroundTaskSnapshot | undefined);
 		// A stop of a task that had already ended is a no-op that reports its real
@@ -419,6 +449,40 @@ export function renderBgToolResult(result: any, options: any, theme: Theme, cont
 	}
 
 	return raw ? renderLines(raw) : renderEmpty();
+}
+
+function fallbackBashCommand(args: any): string {
+	return compactText(typeof args?.command === "string" ? args.command : "", 96);
+}
+
+function fallbackBashOutput(result: any): string {
+	const parts = result?.content;
+	if (!Array.isArray(parts)) return "";
+	return parts.filter((part: any) => part?.type === "text").map((part: any) => String(part.text ?? "")).join("\n");
+}
+
+// With renderShell: "self", an empty fallback removes the row instead of
+// deferring to Pi. Keep the command visible even before execution starts.
+export function renderManagedBashFallbackCall(args: any, theme: Theme): RenderedLines {
+	return renderLines(`${theme.fg("accent", "● ")}${bgToolLabel(theme, "Bash ")}${theme.fg("dim", "$ ")}${theme.fg("accent", fallbackBashCommand(args))}`);
+}
+
+export function renderManagedBashFallbackResult(result: any, options: any, theme: Theme, context: any, cwd?: string): RenderedLines {
+	const failed = Boolean(context?.isError || result?.isError);
+	const header = `${failed ? theme.fg("error", `${ICONS.times} `) : theme.fg("accent", "● ")}${bgToolLabel(theme, "Bash ")}${theme.fg(
+		"dim",
+		"$ ",
+	)}${theme.fg("accent", fallbackBashCommand(context?.args))}${failed ? theme.fg("error", " · failed") : ""}`;
+	const output = fallbackBashOutput(result).trimEnd();
+	if (!output) return renderLines(header);
+
+	const all = output.split(/\r?\n/);
+	const limit = Math.max(1, Math.floor(options?.expanded ? outputLineLimit(cwd) : TOOL_PREVIEW_LINES));
+	// Keep refusals at the head, successful command output at the tail.
+	const shown = (failed ? all.slice(0, limit) : all.slice(-limit)).map((line) => theme.fg("dim", line));
+	const hidden = Math.max(0, all.length - limit);
+	const marker = hidden > 0 ? [theme.fg("muted", `… ${hidden} ${failed ? "later" : "older"} line(s)`)] : [];
+	return renderLines(`${header}\n${(failed ? [...shown, ...marker] : [...marker, ...shown]).join("\n")}`);
 }
 
 export function activePill(theme: Theme, label: string): string {
