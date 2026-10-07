@@ -18,7 +18,7 @@
  *     leases join it and the last one out drops it, so a finished session leaves
  *     nothing for the next to inherit answers from. Whichever entry leases first
  *     supplies the judge, because both read the same settings file and a second
- *     client would double pi-typesafe's per-client request cap rather than share
+ *     client would double the per-client request cap rather than share
  *     it.
  *   - One log writer per core. Every record is derived from the same config, so a
  *     second writer would only append a duplicate of every line.

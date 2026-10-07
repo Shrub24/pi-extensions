@@ -44,9 +44,7 @@ For the permission link, name it in the permission system's configuration:
 
 Registration alone grants no authority. Until the name appears in `authorizerChain` the link decides nothing, and the judge is never called.
 
-The judge needs a TypeSafe key: install [pi-typesafe](https://github.com/DevMortimer/pi-typesafe) and run `/typesafe login`, or set `TYPESAFE_API_KEY`.
-
-The package is found two ways, because this extension is loaded two ways. Installed with `pi install`, pi-typesafe sits beside it and the import resolves as usual. Loaded from a checkout, nothing sits beside it, and pi-jev falls back to the copy Pi's extension manager installed (`<agent dir>/npm/node_modules/pi-typesafe`) — the same package the session is already running. Both routes report the same message when neither exists: `pi-typesafe is not installed; install it and run /typesafe login`.
+The judge uses Pi's native TypeSafe classifier provider. Set `TYPESAFE_API_KEY` or log in to the `typesafe` provider in Pi. No pi-typesafe package is required.
 
 ## The substrate
 
@@ -138,7 +136,7 @@ Open `/extensions:settings`; values live under `kendex.extensionManager.config["
 - `mode`: `shadow` (default), `advisory`, or `live`. `shadow` records and defers every ask to you; `advisory` allows every ask and steers instead — the judge's objection becomes a sentence to the agent, never a prompt or a refusal, and only material harm can refuse; `live` enforces the composition as written.
 - `authorizerName`: the link name for `authorizerChain`; default `pi-jev`.
 - `defaultThreshold`: the veto band edge, default `0.70`; `advisoryThreshold`: the advisory edge, default `0.75`. A question may also declare its own refused boundary (`violatedAt`) when its answers cluster away from 0.5 — `safety.no_material_harm` refuses at `<= 0.35`, because real harm measures 0.09-0.32 and the mirror of the satisfied edge (0.30) cut through that cluster. Both sit inside *measured gaps* rather than at round numbers: over three lab runs the harm question answered 0.10-0.28 on real harm and 0.78-0.97 on harmless work, with nothing between, and the advisory questions answered 0.09-0.22 on contradictions and 0.75-0.95 on matches. A per-question `thresholds` map in the settings file overrides either once a question has been measured.
-- `model`, `timeoutMs` (default 3000). Budget: `maxRequestsPerSession` (default 5000) is a backstop, not a budget; `maxRequestsPerDay` (default 5000, counted by pi-typesafe's ledger so it survives restarts) is the spend guard; `rateLimitPerMinute` (60) and `rateLimitPerHour` (1000) are spike guards. A request past a window is skipped with error code `rate` rather than spent. Each is `0`-disableable — except the session backstop — and none of them is the thing that decides whether the judge works.
+- `model`, `timeoutMs` (default 3000). `maxRequestsPerSession` (default 5000) is a backstop against a runaway loop; `rateLimitPerMinute` (60) and `rateLimitPerHour` (1000) are spike guards. A request past a window is skipped with error code `rate` rather than spent. Set either rate limit to `0` to disable it. There is no daily cap.
 - `stateRetention`: `hash` (default) or `full`.
 - `recentUserMessages` (2), `recentToolCalls` (5), `maxPlanChars` (500), `maxToolbox` (12), `maxStateChars` (4000).
 - `deliverNudges` (default false): send the permission consumer's veto findings to the agent as a steer. `deliverIntentNudges` (default false) is the same switch for the intent consumer's advisories. `deliverSubagentNudges` (default false) sends the orchestrator's steering sentences when a forwarded ask departs from its dispatch or its role. All off until the log shows how often a nudge would fire on your own sessions.
@@ -146,9 +144,9 @@ Open `/extensions:settings`; values live under `kendex.extensionManager.config["
 - `nudgeCooldownMs` (default 60000): how long the same finding stays quiet after it has been said. The first occurrence goes as written, a repeat inside the window is counted and not sent, and a repeat after it returns as an accumulated reminder — "3rd time this session", the same sentence, and the calls it is counting. The window doubles per delivery up to 15 minutes, so a habit the agent is not changing gets rarer rather than louder. `0` delivers every occurrence as written.
 - `logFile`: default `<agent dir>/pi-jev/decisions.jsonl`.
 
-Environment overrides, for headless runs and tests: `PI_JEV_MODE`, `PI_JEV_MODEL`, `PI_JEV_TIMEOUT_MS`, `PI_JEV_THRESHOLD`, `PI_JEV_AUTHORIZER_NAME`, `PI_JEV_STATE_RETENTION`, `PI_JEV_API_KEY`, `PI_JEV_LOG`, `PI_JEV_MAX_REQUESTS_PER_SESSION`, `PI_JEV_MAX_REQUESTS_PER_DAY`, `PI_JEV_RATE_PER_MINUTE`, `PI_JEV_RATE_PER_HOUR`, `PI_JEV_NUDGE_COOLDOWN_MS`. TypeSafe's own caps (`PI_TYPESAFE_MAX_*`) apply underneath and can only lower this judge's budget.
+Environment overrides, for headless runs and tests: `PI_JEV_MODE`, `PI_JEV_MODEL`, `PI_JEV_TIMEOUT_MS`, `PI_JEV_THRESHOLD`, `PI_JEV_AUTHORIZER_NAME`, `PI_JEV_STATE_RETENTION`, `PI_JEV_API_KEY`, `PI_JEV_LOG`, `PI_JEV_MAX_REQUESTS_PER_SESSION`, `PI_JEV_RATE_PER_MINUTE`, `PI_JEV_RATE_PER_HOUR`, `PI_JEV_NUDGE_COOLDOWN_MS`.
 
-The key: a settings `apiKey` wins, then `PI_JEV_API_KEY` in the environment, then pi-typesafe's own resolution (`TYPESAFE_API_KEY`, then the key `/typesafe login` stored). On a shared machine prefer the env var — a key in the settings file is read by every process that loads the entry.
+The key: `PI_JEV_API_KEY` overrides a settings `apiKey`; absent both, Pi resolves `TYPESAFE_API_KEY` or its stored provider credentials. On a shared machine prefer the env var — a key in the settings file is read by every process that loads the entry.
 
 ## Nudges
 

@@ -12,7 +12,7 @@
  *   bun scripts/lab.ts --json          # machine-readable, for diffing runs
  *
  * Costs one Jev request per question set per scenario. Six scenarios is a
- * dozen requests, well inside pi-typesafe's per-client budget.
+ * dozen requests, well inside the lab client's request budget.
  */
 
 import {
@@ -29,6 +29,7 @@ import {
 import type { ActionContext, ConversationFacts } from "../extensions/action-pack.js";
 import { createDecisionCore } from "../extensions/decision-core.js";
 import { askRecordFromCore } from "../extensions/decision-record.js";
+import { ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { createJevClient } from "../extensions/jev.js";
 import { DEFAULTS } from "../extensions/config.js";
 import { bandFor, interpretBands, INTENT_QUESTIONS, INTENT_SPECS, PERMISSION_CONSUMER, PERMISSION_QUESTIONS } from "../extensions/consumers.js";
@@ -374,7 +375,8 @@ const only = argv.filter((arg) => !arg.startsWith("--"));
 const { policy, problem: policyProblem } = loadToolPolicy();
 if (policyProblem) console.error(`policy: ${policyProblem}`);
 
-const jev = createJevClient({ model: config.model, timeoutMs: config.timeoutMs, maxRequests: 60 });
+const models = new ModelRegistry(await ModelRuntime.create());
+const jev = createJevClient({ models: () => models, model: config.model, timeoutMs: config.timeoutMs, maxRequests: 60 });
 const records: unknown[] = [];
 const core = createDecisionCore<ActionContext>({
 	ask: (state, questions, options) => jev.ask(state, questions, options),

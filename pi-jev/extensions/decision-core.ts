@@ -12,7 +12,7 @@
  *      time, and assembles one state object out of them under their names. A
  *      block is built once per flush however many questions read it.
  *   3. Ask. One request per flush, carrying the whole merged state. Questions are
- *      chunked only when pi-typesafe's 32-question cap forces it, and a
+ *      chunked only when the 32-question request ceiling forces it, and a
  *      consumer's set is never split across chunks: a consumer is answered from
  *      one request or reported failed.
  *   4. Remember. Answers are cached per subject and per question, and concurrent
@@ -272,7 +272,7 @@ export interface DecisionCoreOptions<A = unknown> {
 	>;
 	/** One record per request, written by the host's log. Never throws out. */
 	record?(context: CoreRecordContext): void;
-	/** Questions one request may carry; pi-typesafe's cap is 32. */
+	/** Questions one request may carry; the default ceiling is 32. */
 	maxQuestionsPerRequest?: number;
 	/** How many subjects keep their answers cached. Oldest are dropped first. */
 	maxRememberedSubjects?: number;
@@ -532,7 +532,7 @@ export function createDecisionCore<A = unknown>(options: DecisionCoreOptions<A>)
 	/**
 	 * Chunk a flush into requests, keeping each consumer's set whole.
 	 *
-	 * Chunking exists only because pi-typesafe caps a request at 32 questions. A
+	 * Chunking keeps each request inside the existing 32-question ceiling. A
 	 * consumer larger than one request cannot keep its atomicity; it becomes one
 	 * oversized chunk the admission layer rejects, so the failure is attributed
 	 * rather than silently split.

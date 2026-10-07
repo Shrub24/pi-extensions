@@ -23,13 +23,7 @@
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": "*",
-		"pi-typesafe": ">=0.6 <1",
 		"typebox": "*"
-	},
-	"peerDependenciesMeta": {
-		"pi-typesafe": {
-			"optional": true
-		}
 	},
 	"files": [
 		"extensions/",
@@ -108,7 +102,7 @@
 				{
 					"key": "maxRequestsPerSession",
 					"label": "Session request cap",
-					"description": "Attempts this judge may make in one session, including failed ones. Reaching it defers every later ask. Daily caps from PI_TYPESAFE_MAX_* still apply and can only lower this.",
+					"description": "Attempts this judge may make in one session, including failed ones. Reaching it defers every later ask.",
 					"type": "number",
 					"default": 200,
 					"category": "Judge",

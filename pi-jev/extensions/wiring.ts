@@ -91,9 +91,11 @@ export function wirePermissionAuthorizer(pi: ExtensionAPI, deps: WiringDeps = {}
 	const logLease = deps.log ? undefined : acquireLog(config.logFile);
 	const log: DecisionLog = deps.log ?? (logLease?.log as DecisionLog);
 	const now = deps.now ?? (() => new Date());
+	let ctx: ExtensionContext | undefined;
 	const jev =
 		deps.jev ??
 		createJevClient({
+			models: () => (ctx as ExtensionContext).modelRegistry,
 			model: config.model,
 			timeoutMs: config.timeoutMs,
 			...budgetFrom(config),
@@ -101,7 +103,6 @@ export function wirePermissionAuthorizer(pi: ExtensionAPI, deps: WiringDeps = {}
 		});
 	const locator = deps.locator ?? createSeamLocator();
 
-	let ctx: ExtensionContext | undefined;
 	let sessionId: string | null = null;
 	let registeredOn: { service: object; dispose: () => void } | undefined;
 	/** This entry's hold on the session's core, taken when the session starts. */
@@ -272,16 +273,11 @@ export function wirePermissionAuthorizer(pi: ExtensionAPI, deps: WiringDeps = {}
 		}
 		// A local resolution, no request: the user learns the judge is unusable
 		// when the session starts, rather than from a silent run of deferrals.
-		// The probe also warms the connection: pi-heed measured a ~900 ms first
-		// request against ~330 ms warm, and the first request here is one that a
-		// human is waiting on.
 		void jev
 			.probe()
 			.then(() => {
 				const unavailable = jev.unavailable();
 				if (unavailable) report(`pi-jev: ${unavailable} Every ask is deferred to you.`);
-				// Warm in the background: a failure here is the probe's finding, not news.
-				return unavailable ? undefined : jev.warm();
 			});
 	});
 

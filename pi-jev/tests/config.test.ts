@@ -23,7 +23,6 @@ test("defaults hold when there is no settings file, and a malformed file is not 
 	expect(empty.defaultThreshold).toBe(DEFAULTS.defaultThreshold);
 	expect(empty.stateRetention).toBe("hash");
 	expect(empty.maxRequestsPerSession).toBe(DEFAULTS.maxRequestsPerSession);
-	expect(empty.maxRequestsPerDay).toBe(5_000);
 	expect(empty.rateLimitPerMinute).toBe(60);
 	expect(empty.rateLimitPerHour).toBe(1_000);
 
@@ -47,7 +46,6 @@ test("settings resolve under the extension manager's config key", () => {
 		maxStateChars: 2_000,
 		maxFieldChars: 300,
 		maxRequestsPerSession: 25,
-		maxRequestsPerDay: 400,
 		rateLimitPerMinute: 5,
 		rateLimitPerHour: 40,
 	});
@@ -64,7 +62,6 @@ test("settings resolve under the extension manager's config key", () => {
 		maxStateChars: 2_000,
 		maxFieldChars: 300,
 		maxRequestsPerSession: 25,
-		maxRequestsPerDay: 400,
 		rateLimitPerMinute: 5,
 		rateLimitPerHour: 40,
 	});
@@ -72,13 +69,12 @@ test("settings resolve under the extension manager's config key", () => {
 });
 
 test("the environment overrides the file, and nonsense values fall back", () => {
-	const env = { ...writeSettings({ mode: "shadow", model: "from-file", timeoutMs: 9_000 }), PI_JEV_MODE: "live", PI_JEV_MODEL: "from-env", PI_JEV_TIMEOUT_MS: "1500", PI_JEV_RATE_PER_MINUTE: "7", PI_JEV_MAX_REQUESTS_PER_DAY: "250" } as NodeJS.ProcessEnv;
+	const env = { ...writeSettings({ mode: "shadow", model: "from-file", timeoutMs: 9_000 }), PI_JEV_MODE: "live", PI_JEV_MODEL: "from-env", PI_JEV_TIMEOUT_MS: "1500", PI_JEV_RATE_PER_MINUTE: "7" } as NodeJS.ProcessEnv;
 	const config = resolveConfig(readSettingsFile(env), env);
 	expect(config.mode).toBe("live");
 	expect(config.model).toBe("from-env");
 	expect(config.timeoutMs).toBe(1_500);
 	expect(config.rateLimitPerMinute).toBe(7);
-	expect(config.maxRequestsPerDay).toBe(250);
 
 	const nonsense = resolveConfig({ mode: "yolo", stateRetention: "everything", defaultThreshold: 0.5, maxStateChars: 10, timeoutMs: 5 }, {} as NodeJS.ProcessEnv);
 	expect(nonsense.mode).toBe("shadow");
@@ -89,9 +85,9 @@ test("the environment overrides the file, and nonsense values fall back", () => 
 	expect(nonsense.timeoutMs).toBe(DEFAULTS.timeoutMs);
 });
 
-test("the api key comes from settings or the environment, or is left to pi-typesafe", () => {
+test("the api key comes from settings or the environment, or is left to Pi", () => {
 	// Settings key wins over the environment; absent both, the field is unset so
-	// pi-typesafe resolves TYPESAFE_API_KEY / the stored key itself.
+	// Pi resolves TYPESAFE_API_KEY / its credential store itself.
 	const fromFile = resolveConfig({ apiKey: "  sk-file  " }, {} as NodeJS.ProcessEnv);
 	expect(fromFile.apiKey).toBe("sk-file");
 	const fromEnv = resolveConfig({ apiKey: "sk-file" }, { PI_JEV_API_KEY: "sk-env" } as unknown as NodeJS.ProcessEnv);

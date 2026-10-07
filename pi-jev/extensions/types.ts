@@ -1,9 +1,9 @@
 /*
- * Structural mirrors of the two third-party seams this package talks to.
+ * The permission-system seam and the internal judge contract.
  *
- * Neither package is a build dependency. Both are resolved at runtime by
- * dynamic import, and what follows is the subset of their public shapes this
- * package actually reads. They are copied from the versions named below, so a
+ * The permission system is resolved by dynamic import; the judge uses Pi's
+ * native classifier through the adapter in jev.ts. The permission shapes below
+ * are the subset this package actually reads. They are copied from the versions named below, so a
  * consumer compiled against a different major gets a defensive read rather
  * than a type error:
  *
@@ -13,9 +13,6 @@
  *     src/service/permission-events.ts   PermissionsReadyEvent, PermissionDecisionEvent
  *     src/authority/permission-prompter.ts     PromptPermissionDetails
  *     src/presentation/prompt-payload.ts       PromptRequestFacts, PromptPayload
- *
- *   pi-typesafe 0.6.0
- *     src/ask.ts, src/client.ts, src/schema.ts
  *
  * The permission system's own doc comment states the intent of the first
  * mirror: "fields may be added, but existing fields will not be removed or
@@ -167,7 +164,7 @@ export interface Authorizer {
 	): Promise<AuthorizerVerdict>;
 }
 
-// ── pi-typesafe ────────────────────────────────────────────────────────────
+// ── Internal judge contract ────────────────────────────────────────────────
 
 export interface NoulQuestion {
 	type: "noul";
@@ -201,8 +198,8 @@ export type JevAnswer =
 	| {
 			type: "score";
 			score: number;
-			legend: string;
-			probabilities: Record<string, number>;
+			legend?: string;
+			probabilities?: Record<string, number>;
 			confidence: number;
 	  };
 
@@ -225,8 +222,7 @@ export interface JevEvaluation {
 }
 
 /**
- * The narrow judge seam: anything with pi-typesafe's `evaluate`. Tests pass a
- * stub; the session passes the client `createTypeSafe` builds.
+ * Evaluation seam used by fixtures and offline consumers.
  */
 export interface JevJudge {
 	evaluate(
@@ -236,8 +232,8 @@ export interface JevJudge {
 }
 
 /**
- * `ask`'s settled result: a failure is a value carrying pi-typesafe's own
- * error code, never a thrown error. The codes are
+ * `ask`'s settled result: a failure is a value carrying an error code,
+ * never a thrown error. The codes are
  * `configuration | validation | budget | aborted | timeout | http |
  * connection | response`.
  */

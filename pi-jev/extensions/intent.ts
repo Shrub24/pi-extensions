@@ -7,7 +7,7 @@
  * deliberate:
  *
  *   It queues rather than sends. Asking on every tool call would spend a request
- *   per call against pi-typesafe's own request cap. A queue entry costs nothing,
+ *   per call against the judge's request cap. A queue entry costs nothing,
  *   and the questions go out with the next flush — the permission gate's ask for a
  *   gated call, or the turn boundary otherwise — so a call nothing gated is read
  *   once per turn at most.
@@ -222,7 +222,7 @@ export function wireIntentConsumer(pi: ExtensionAPI, deps: IntentDeps = {}): voi
 			sessionId = null;
 		}
 		if (sessionId === null || lease) return;
-		const client = (jev ??= deps.jev ?? createJevClient({ model: config.model, timeoutMs: config.timeoutMs, ...budgetFrom(config), ...(config.apiKey === undefined ? {} : { apiKey: config.apiKey }) }));
+		const client = (jev ??= deps.jev ?? createJevClient({ models: () => (ctx as ExtensionContext).modelRegistry, model: config.model, timeoutMs: config.timeoutMs, ...budgetFrom(config), ...(config.apiKey === undefined ? {} : { apiKey: config.apiKey }) }));
 		lease = acquireCore({
 			sessionId,
 			options: {
@@ -245,7 +245,6 @@ export function wireIntentConsumer(pi: ExtensionAPI, deps: IntentDeps = {}): voi
 				.then(() => {
 					const unavailable = client.unavailable();
 					if (unavailable) report(`pi-jev: ${unavailable} Intent nudges are off.`);
-					return unavailable ? undefined : client.warm();
 				});
 		}
 		// One interpretation, registered by both consumers: the record then carries

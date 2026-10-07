@@ -20,7 +20,7 @@ import { join, resolve } from "node:path";
 export const CONFIG_ID = "@vanillagreen/pi-jev";
 
 /**
- * Questions one request may carry. pi-typesafe's own cap is 32; this stays under
+ * Questions one request may carry. The existing transport ceiling is 32; this stays under
  * it so a defect in packing lands as a clear refusal rather than a schema error.
  */
 export const MAX_QUESTIONS_PER_REQUEST = 32;
@@ -51,8 +51,6 @@ export interface JevConfig {
 	stateRetention: StateRetention;
 	/** Attempts one client instance may make; a backstop against a runaway loop. */
 	maxRequestsPerSession: number;
-	/** Requests per local day, counted by pi-typesafe's ledger. 0 leaves it uncapped. */
-	maxRequestsPerDay: number;
 	/** Requests inside one minute before the rest are skipped. 0 disables the window. */
 	rateLimitPerMinute: number;
 	/** Requests inside one hour before the rest are skipped. 0 disables the window. */
@@ -97,9 +95,8 @@ export interface JevConfig {
 	 */
 	orchestratorCheckInMs: number;
 	/**
-	 * The TypeSafe key, when configured here. Unset means pi-typesafe resolves its
-	 * own: TYPESAFE_API_KEY in the environment, then the key /typesafe login
-	 * stored. A key in the settings file is read by every process that loads the
+	 * The TypeSafe key, when configured here. Unset uses Pi's native provider
+	 * authentication: TYPESAFE_API_KEY or Pi's credential store. A key in the settings file is read by every process that loads the
 	 * entry, so prefer the env var on a shared machine.
 	 */
 	apiKey?: string;
@@ -148,7 +145,6 @@ export const DEFAULTS: JevConfig = {
 	thresholds: {},
 	stateRetention: "hash",
 	maxRequestsPerSession: 5_000,
-	maxRequestsPerDay: 5_000,
 	rateLimitPerMinute: 60,
 	rateLimitPerHour: 1_000,
 	maxStateChars: 4_000,
@@ -272,15 +268,11 @@ export function resolveConfig(
 	if (maxStateChars !== undefined) config.maxStateChars = maxStateChars;
 
 	// The per-session number is a backstop, not a budget: a session that reaches it
-	// has a defect, and the day cap plus the two windows below are what protect
-	// against an ordinary heavy day and against a spike. 5,000 requests is on the
+	// has a defect, and the two windows below protect against a spike. 5,000 requests is on the
 	// order of twenty cents at our state sizes, so none of these numbers are the
 	// thing standing between the judge and a working session.
 	const maxRequests = pickNumber(env.PI_JEV_MAX_REQUESTS_PER_SESSION ?? settings.maxRequestsPerSession, 1, 1_000_000);
 	if (maxRequests !== undefined) config.maxRequestsPerSession = maxRequests;
-
-	const perDay = pickNumber(env.PI_JEV_MAX_REQUESTS_PER_DAY ?? settings.maxRequestsPerDay, 0, 1_000_000);
-	if (perDay !== undefined) config.maxRequestsPerDay = perDay;
 
 	const perMinute = pickNumber(env.PI_JEV_RATE_PER_MINUTE ?? settings.rateLimitPerMinute, 0, 100_000);
 	if (perMinute !== undefined) config.rateLimitPerMinute = perMinute;
