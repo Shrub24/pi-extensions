@@ -3639,3 +3639,118 @@ test("managed startup records its direct owner and follows an owner change", asy
     resetAgentMailbox(mailbox);
   }
 });
+
+test("a session replacement clears the queued supervision rerun instead of running it", async (t) => {
+  setLeadEnvironment();
+  process.env.HERDR_PANE_ID = "chief-pane";
+  process.env.HERDR_TAB_ID = "chief-tab";
+  process.env.HERDR_SOCKET_PATH = join(
+    tmpdir(),
+    `supervision-queued-rerun-${randomUUID()}.sock`,
+  );
+  const entries = [
+    {
+      type: "custom",
+      customType: "pi-herdsman-role",
+      data: {
+        role: "chief",
+        leadTools: REGISTERED_ROLE_TOOLS.map(({ name }) => name),
+      },
+    },
+  ];
+  const chiefA = `chief-a-${randomUUID()}`;
+  const chiefB = `chief-b-${randomUUID()}`;
+  let sessionId = chiefA;
+  // A supervision refresh enters the loop with a herdrSessionSnapshot whose
+  // immediate caller is refreshSupervisionOnce; its later reads go through
+  // directReports. Counting only the entry frames isolates loop iterations
+  // from the snapshot fan-out inside a single refresh.
+  const isRefreshEntry = (stack: string | undefined): boolean => {
+    const lines = (stack ?? "").split("\n");
+    const index = lines.findIndex((line) => line.includes("herdrSessionSnapshot"));
+    return index >= 0 && lines[index + 1]?.includes("refreshSupervisionOnce") === true;
+  };
+  let entriesSeen = 0;
+  let blockNext = false;
+  let releaseBlocked!: () => void;
+  const snapshotResult = () => ({
+    stdout: JSON.stringify({
+      id: AGENT_ID,
+      result: { snapshot: { agents: [], panes: [] } },
+    }),
+    stderr: "",
+    code: 0,
+  });
+  const pi = fakePi({
+    entries,
+    allTools: REGISTERED_ROLE_TOOLS,
+    exec: async (_command, args) => {
+      if (!isApiSnapshot(args)) return { stdout: "{}", stderr: "", code: 0 };
+      if (isRefreshEntry(new Error("snapshot").stack)) entriesSeen++;
+      if (blockNext) {
+        blockNext = false;
+        await new Promise<void>((resolve) => {
+          releaseBlocked = resolve;
+        });
+      }
+      return snapshotResult();
+    },
+  });
+  registerExtension!(pi.pi as never);
+  const context = fakeContext(entries) as any;
+  context.mode = "rpc";
+  context.isIdle = () => false;
+  context.sessionManager = {
+    ...context.sessionManager,
+    getSessionId: () => sessionId,
+  };
+  const sessionStart = pi.events.get("session_start")![0];
+  const beforeStart = () =>
+    pi.events.get("before_agent_start")![0](
+      { systemPromptOptions: { contextFiles: [] } },
+      context,
+    );
+  try {
+    await sessionStart(undefined, context);
+    await beforeStart();
+    const baseEntries = entriesSeen;
+    assert.equal(baseEntries, 1, "the initial refresh did not enter the loop");
+
+    blockNext = true;
+    const inFlight = beforeStart();
+    await t.waitFor(() => assert.ok(releaseBlocked, "refresh did not start"));
+    assert.equal(entriesSeen - baseEntries, 1, "the in-flight refresh did not start");
+    const queued = beforeStart();
+    assert.equal(
+      entriesSeen - baseEntries,
+      1,
+      "the queued rerun ran before the in-flight refresh finished",
+    );
+
+    sessionId = chiefB;
+    await sessionStart(undefined, context);
+
+    releaseBlocked();
+    const stale = await inFlight;
+    await queued;
+    for (let index = 0; index < 10; index++)
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.equal(
+      entriesSeen - baseEntries,
+      1,
+      "the queued supervision rerun ran after the session was replaced",
+    );
+    assert.equal(
+      stale?.message,
+      undefined,
+      "the superseded refresh published a stale supervision context",
+    );
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    delete process.env.HERDR_PANE_ID;
+    delete process.env.HERDR_TAB_ID;
+    delete process.env.HERDR_SOCKET_PATH;
+    setLeadEnvironment();
+  }
+});

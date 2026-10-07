@@ -7014,3 +7014,99 @@ test("active Manager supervision refreshes serialize and coalesce concurrent req
   assert.equal(snapshots - refreshSnapshotBase, 2);
 });
 
+test("lead status refreshes keep one in-flight refresh and one trailing rerun", async (t) => {
+  setLeadEnvironment();
+  const originalSetInterval = globalThis.setInterval;
+  let refreshTimer: TimerHandler | undefined;
+  globalThis.setInterval = ((callback: TimerHandler, delay?: number) => {
+    if (delay === 2000) refreshTimer = callback;
+    return { unref: () => undefined } as any;
+  }) as typeof setInterval;
+  t.after(() => {
+    globalThis.setInterval = originalSetInterval;
+  });
+
+  const release = Promise.withResolvers<void>();
+  let active = 0;
+  let maxActive = 0;
+  let snapshots = 0;
+  let block = false;
+  const envelope = JSON.stringify({
+    id: AGENT_ID,
+    result: { snapshot: { agents: [], panes: [] } },
+  });
+  const pi = fakePi({
+    activeTools: [],
+    exec: async (command, args) => {
+      if (command === "herdr" && isApiSnapshot(args)) {
+        snapshots++;
+        active++;
+        maxActive = Math.max(maxActive, active);
+        if (block) {
+          block = false;
+          await release.promise;
+        }
+        active--;
+        return { stdout: envelope, stderr: "", code: 0 };
+      }
+      return { stdout: "{}", stderr: "", code: 0 };
+    },
+  });
+  const context = fakeContext() as any;
+  context.mode = "tui";
+  context.hasUI = true;
+  let widget: StatusWidget | undefined;
+  context.ui = {
+    setWidget: (_key: string, content: unknown) => {
+      if (typeof content === "function")
+        widget = (content as any)(
+          { requestRender: () => undefined },
+          {
+            fg: (_color: string, text: string) => text,
+            bold: (text: string) => text,
+          },
+        );
+    },
+    notify: () => undefined,
+    select: async () => "tab",
+  };
+  registerExtension!(pi.pi as never);
+  t.after(async () => {
+    await pi.events.get("session_shutdown")?.[0]();
+  });
+  await pi.events.get("session_start")![0](undefined, context);
+  for (let index = 0; index < 30; index++)
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.ok(refreshTimer, "lead status timer registered");
+  assert.ok(widget);
+  const base = snapshots;
+
+  block = true;
+  (refreshTimer as () => void)();
+  await t.waitFor(() =>
+    assert.equal(snapshots - base, 1, "the status refresh did not start"),
+  );
+  (refreshTimer as () => void)();
+  (refreshTimer as () => void)();
+  (refreshTimer as () => void)();
+  assert.equal(
+    snapshots - base,
+    1,
+    "a second status refresh overlapped the in-flight one",
+  );
+  assert.equal(active, 1, "more than one status refresh ran concurrently");
+
+  release.resolve();
+  await t.waitFor(() =>
+    assert.equal(
+      snapshots - base,
+      2,
+      "the trailing status rerun did not run exactly once",
+    ),
+  );
+  for (let index = 0; index < 10; index++)
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(snapshots - base, 2, "the status refresh queue kept growing");
+  assert.equal(maxActive, 1);
+  assert.match(widget!.render(160)[0], /herd/);
+});

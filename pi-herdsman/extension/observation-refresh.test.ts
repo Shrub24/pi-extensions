@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
 import {
@@ -9,17 +9,26 @@ import {
   WORKSPACE,
   agentMailboxPath,
   agentFromState,
+  fakeAgentContext,
   fakeContext,
   fakePi,
+  isAgentList,
+  isApiSnapshot,
   managedState,
   nativeSessions,
   realFs,
   recoveryIdentity,
   registerExtension,
   resetAgentMailbox,
+  setAgentEnvironment,
   setLeadEnvironment,
   writeAgentState,
 } from "./support.ts";
+import {
+  leadCoordinationStatePath,
+  supervisionRuntime,
+  writeLeadCoordinationState,
+} from "./supervision.ts";
 
 const settle = async (n = 20) => {
   for (let i = 0; i < n; i++) await new Promise<void>((r) => setImmediate(r));
@@ -305,4 +314,191 @@ test("recurring lead status does not open transcript bodies, and explicit legacy
   const resolved = await list.execute("explicit-list", {}, undefined, undefined, context);
   assert.ok(opens > beforeExplicit, `explicit legacy resolution did not open entries: ${JSON.stringify(resolved)}`);
   assert.match(JSON.stringify(resolved), /worker/);
+});
+
+// Drives the recurring worker-leaf status tick. The leaf owns one mailbox whose
+// owner is a lead Pi session; the lead boundary is proven from published
+// coordination state (never the owner's transcript).
+const startLeafStatusProbe = async (
+  t: any,
+  label: string,
+  leadSession: Record<string, unknown>,
+) => {
+  setAgentEnvironment(label);
+  process.env.HERDR_SOCKET_PATH = join(
+    tmpdir(),
+    `${label}-${randomUUID()}.sock`,
+  );
+  const runtime = supervisionRuntime();
+  const coordinatorPath = leadCoordinationStatePath(runtime, LEAD_SESSION_ID);
+  t.after(() => {
+    realFs.rmSync(coordinatorPath, { force: true });
+    delete process.env.HERDR_SOCKET_PATH;
+    setLeadEnvironment();
+  });
+
+  const leafState = managedState(label);
+  const leafAgent = {
+    ...agentFromState(leafState, "working"),
+    agent: "pi",
+    tokens: {},
+  };
+  const leadAgent = {
+    agent: "pi",
+    workspace_id: WORKSPACE,
+    pane_id: "lead-pane",
+    tab_id: "lead-tab",
+    agent_session: leadSession,
+  };
+  const envelope = JSON.stringify({
+    id: AGENT_ID,
+    result: {
+      snapshot: {
+        agents: [leafAgent, leadAgent],
+        panes: [leafAgent, leadAgent],
+      },
+      agents: [leafAgent, leadAgent],
+      panes: [leafAgent, leadAgent],
+    },
+  });
+  const pi = fakePi({
+    activeTools: [],
+    exec: (command, args) =>
+      command === "herdr" && (isApiSnapshot(args) || isAgentList(args))
+        ? { stdout: envelope, stderr: "", code: 0 }
+        : { stdout: "{}", stderr: "", code: 0 },
+  });
+
+  const context = fakeAgentContext() as any;
+  context.mode = "tui";
+  context.hasUI = true;
+  let widget: any;
+  context.ui = {
+    setWidget: (_key: string, content: unknown) => {
+      if (typeof content === "function")
+        widget = (content as any)(
+          { requestRender: () => undefined },
+          { fg: (_color: string, text: string) => text, bold: (text: string) => text },
+        );
+    },
+    notify: () => undefined,
+    select: async () => "tab",
+  };
+
+  const originalSetInterval = globalThis.setInterval;
+  let leafTimer: TimerHandler | undefined;
+  globalThis.setInterval = ((callback: TimerHandler, delay?: number) => {
+    if (delay === 2000) leafTimer = callback;
+    return { unref: () => undefined } as any;
+  }) as typeof setInterval;
+  t.after(async () => {
+    globalThis.setInterval = originalSetInterval;
+    await pi.events.get("session_shutdown")?.[0]();
+  });
+
+  registerExtension!(pi.pi as never);
+  await pi.events.get("session_start")![0](undefined, context);
+  await settle(30);
+  assert.ok(leafTimer, "leaf status timer registered");
+  assert.ok(widget, "leaf status widget registered");
+  const tick = async () => {
+    (leafTimer as () => void)();
+    await settle(30);
+  };
+  return { pi, context, runtime, coordinatorPath, widget, tick };
+};
+
+test("recurring leaf observation keeps malformed and absent coordinator state unknown", async (t) => {
+  const { runtime, coordinatorPath, widget, tick } = await startLeafStatusProbe(
+    t,
+    "coordinator-probe",
+    {
+      source: "herdr:pi",
+      agent: "pi",
+      kind: "id",
+      value: LEAD_SESSION_ID,
+    },
+  );
+
+  // No coordinator record: the lead boundary stays unknown rather than proven.
+  await tick();
+  assert.match(widget.render(160)[0], /^● \? → agent:coordinator-probe/);
+  assert.doesNotMatch(widget.render(160)[0], /unavailable/);
+
+  // Malformed coordinator record: the read throws and the guard reports unknown.
+  realFs.mkdirSync(dirname(coordinatorPath), { recursive: true });
+  realFs.writeFileSync(coordinatorPath, "{ not json", "utf8");
+  await tick();
+  assert.match(widget.render(160)[0], /^● \? → agent:coordinator-probe/);
+  assert.doesNotMatch(widget.render(160)[0], /unavailable/);
+
+  // A valid record proves the lead boundary, so later ticks can grant authority.
+  writeLeadCoordinationState(runtime, {
+    version: 1,
+    role: "lead",
+    instanceId: randomUUID(),
+    piSessionId: LEAD_SESSION_ID,
+    updatedAt: Date.now(),
+  });
+  await tick();
+  assert.match(widget.render(160)[0], /^● herd → agent:coordinator-probe/);
+});
+
+test("recurring worker-leaf status ticks open no transcript body", async (t) => {
+  const leadFile = join(tmpdir(), `leaf-open-lead-${randomUUID()}.jsonl`);
+  realFs.writeFileSync(
+    leadFile,
+    JSON.stringify({ type: "session", id: LEAD_SESSION_ID, cwd: "/tmp" }) +
+      "\n",
+  );
+  t.after(() => realFs.rmSync(leadFile, { force: true }));
+
+  const { runtime, widget, tick } = await startLeafStatusProbe(
+    t,
+    "leaf-open-probe",
+    {
+      source: "herdr:pi",
+      agent: "pi",
+      kind: "path",
+      value: leadFile,
+    },
+  );
+  writeLeadCoordinationState(runtime, {
+    version: 1,
+    role: "lead",
+    instanceId: randomUUID(),
+    piSessionId: LEAD_SESSION_ID,
+    updatedAt: Date.now(),
+  });
+
+  // The bounded Pi-session header read proves the owner lead without a body load.
+  const { SessionManager } = await import("@earendil-works/pi-coding-agent");
+  const manager = SessionManager as any;
+  const originalOpen = manager.open;
+  let opens = 0;
+  manager.open = (...args: unknown[]) => {
+    opens++;
+    return originalOpen(...args);
+  };
+  t.after(() => {
+    manager.open = originalOpen;
+  });
+
+  const bootOpens = opens;
+  await tick();
+  const after1 = opens;
+  await tick();
+  const after2 = opens;
+
+  assert.equal(
+    after1 - bootOpens,
+    0,
+    "the recurring worker-leaf tick opened a transcript body",
+  );
+  assert.equal(
+    after2 - after1,
+    0,
+    "the second recurring worker-leaf tick opened a transcript body",
+  );
+  assert.match(widget.render(160)[0], /^● herd → agent:leaf-open-probe/);
 });
