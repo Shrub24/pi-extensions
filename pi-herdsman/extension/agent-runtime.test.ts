@@ -5626,6 +5626,86 @@ test("the compaction's continuation turn answers the same assignment", async (t)
   fireShutdown(agent);
 });
 
+test("a continuation is withheld once its assignment has settled", async (t) => {
+  const mailbox = setAgentEnvironment("compaction-settled-agent");
+  t.after(() => resetAgentMailbox(mailbox));
+  const agent = fakePi();
+  registerExtension!(agent.pi as never);
+  // The test completes the compaction, not the stub: that is what puts a
+  // settlement between the request and the commit, as the live incident did.
+  const completions: Array<() => void> = [];
+  const context = compactingAgentContext(
+    agent.entries,
+    DEFAULT_WORKER_CONTEXT_BUDGET_TOKENS + 1_000,
+    (options) => {
+      if (options?.onComplete) completions.push(options.onComplete);
+    },
+  );
+  await assignManagedRequest(agent, mailbox, context);
+
+  endTurn(agent, context, "toolUse");
+  assert.equal(completions.length, 1);
+  assert.deepEqual(agent.sentUserCalls, []);
+
+  // The assignment answers and settles while the compaction is still running.
+  await settleAtBoundary(agent, context, "the delivered answer");
+  const delivered = readResult(mailbox, REQUEST_ID);
+  assert.equal(delivered?.text, "the delivered answer");
+  assert.equal(readAgentState(mailbox)?.activeRequestId, undefined);
+  const wakes = agent.sent.length;
+
+  for (const complete of completions) complete();
+
+  // Nothing resumes a request that is gone, and the delivered result stands:
+  // it is neither retracted nor published a second time.
+  assert.deepEqual(agent.sentUserCalls, []);
+  assert.equal(agent.sent.length, wakes);
+  assert.deepEqual(readResult(mailbox, REQUEST_ID), delivered);
+  // An absent continuation is diagnosable from the session's own records.
+  const skipped = agent.entries.find(
+    (entry: any) =>
+      entry.customType === "pi_herdsman_state_compaction_continuation_skipped",
+  ) as any;
+  assert.deepEqual(
+    { ...skipped?.data, timestamp: undefined },
+    {
+      requestId: REQUEST_ID,
+      activeRequestId: null,
+      reason:
+        "the assignment that requested this compaction is no longer active",
+      timestamp: undefined,
+    },
+  );
+
+  // The hold that request installed does not follow the next assignment on the
+  // same retained worker: once the owner has retrieved the delivered result
+  // (which removes its file), that assignment is admissible and settles on its
+  // own answer.
+  removeResult(mailbox, REQUEST_ID);
+  const nextRequestId = "cccccccc-cccc-4ccc-8ccc-ccccccccccce";
+  const started = readAgentState(mailbox)!;
+  writeRequest(mailbox, {
+    version: 5,
+    runId: started.runId,
+    requestId: nextRequestId,
+    ownerSessionId: started.ownerSessionId,
+    workspaceId: started.workspaceId,
+    agentLabel: started.agentLabel,
+    paneId: started.paneId,
+    kind: "task",
+    text: "second assignment",
+    createdAt: Date.now(),
+  });
+  agent.events.get("input")![0]({ text: controlMarker(nextRequestId) }, context);
+  assert.equal(readAgentState(mailbox)?.activeRequestId, nextRequestId);
+  await settleAtBoundary(agent, context, "answered the second assignment");
+  assert.equal(
+    readResult(mailbox, nextRequestId)?.text,
+    "answered the second assignment",
+  );
+  fireShutdown(agent);
+});
+
 test("one assignment is compacted only up to its limit", async (t) => {
   const mailbox = setAgentEnvironment("compaction-limit-agent");
   t.after(() => resetAgentMailbox(mailbox));

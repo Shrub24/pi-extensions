@@ -454,6 +454,10 @@ const CONTEXT_COMPACTION_CONTINUATION =
   "Your context was compacted to keep this session lean. Continue the same " +
   "assignment from where you left off rather than restarting it; write " +
   "artifacts to disk as you go and end with your complete final response.";
+// A continuation withheld because its assignment had already settled. Recorded
+// so a worker that never resumed is diagnosable from the session's own entries.
+const COMPACTION_CONTINUATION_SKIPPED_ENTRY =
+  "pi_herdsman_state_compaction_continuation_skipped";
 // pi-vcc's own compaction marker (`PI_VCC_COMPACT_INSTRUCTION`). It reads any
 // other instruction string as a follow-up prompt and re-sends it as a user
 // message once the compaction succeeds, which starts a turn of its own over an
@@ -1102,17 +1106,25 @@ const role = (): Role =>
         ? "lead"
         : "unmanaged";
 const json = (v: unknown) => JSON.stringify(v, null, 2);
+function appendDurableRecord(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  type: string,
+  data: Record<string, unknown>,
+): void {
+  try {
+    pi.appendEntry(type, { ...data, timestamp: Date.now() });
+  } catch {
+    ctx.ui.notify(type, "error");
+  }
+}
 function appendDurableError(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   type: string,
   error: unknown,
 ): void {
-  try {
-    pi.appendEntry(type, { error: String(error), timestamp: Date.now() });
-  } catch {
-    ctx.ui.notify(type, "error");
-  }
+  appendDurableRecord(pi, ctx, type, { error: String(error) });
 }
 const SESSION_METADATA_DIAGNOSTIC_ENTRY =
   "pi_herdsman_session_metadata_error";
@@ -18686,6 +18698,33 @@ export default function (pi: ExtensionAPI): void {
       compactManagedContext(
         ctx,
         () => {
+          // The continuation resumes the assignment that asked for this
+          // compaction. When that assignment settled while the compaction ran,
+          // its result was delivered from the turn the continuation would
+          // replace: sending it now starts a turn with no request behind it, and
+          // anything published from that turn retracts or duplicates a result
+          // the owner already has.
+          const active = state?.activeRequestId;
+          if (active !== requestId) {
+            // The hold this request installed has nothing left to hold, and the
+            // next assignment on this retained worker settles on its own turns.
+            awaitingContinuation = false;
+            latest = "";
+            freshResponse = false;
+            compactionContinuations = undefined;
+            appendDurableRecord(
+              pi,
+              ctx,
+              COMPACTION_CONTINUATION_SKIPPED_ENTRY,
+              {
+                requestId,
+                activeRequestId: active ?? null,
+                reason:
+                  "the assignment that requested this compaction is no longer active",
+              },
+            );
+            return;
+          }
           pi.sendUserMessage(CONTEXT_COMPACTION_CONTINUATION, {
             deliverAs: "followUp",
             triggerTurn: true,

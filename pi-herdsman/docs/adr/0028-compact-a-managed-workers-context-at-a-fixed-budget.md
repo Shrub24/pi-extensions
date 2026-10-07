@@ -22,6 +22,17 @@ message that triggers a new turn. The aborted turn is never published as a
 result. The session classification and Agent-definition entries are re-asserted
 afterwards, because a summary replaces the history those entries live in.
 
+That continuation is sent only while the assignment that requested it is still
+active. A compaction can commit after the assignment has settled its result — the
+observed incident recorded exactly that order — and a continuation sent then
+resumes a worker that has no request to answer, unsupervised, while anything
+published from that turn retracts or duplicates a result the owner already has.
+When the requesting request id is no longer the active one, the continuation is
+withheld, the settlement hold the request installed is cleared, and the skip is
+recorded as a durable `pi_herdsman_state_compaction_continuation_skipped` entry
+naming the request and its reason, so a worker that never resumed is diagnosable
+from the session's own records.
+
 The marker must be pi-vcc's `PI_VCC_COMPACT_INSTRUCTION`, not the `/pi-vcc`
 command name. In pi-vcc 0.9.0, an unrecognized instruction is treated as a
 follow-up prompt and sent as a user message after compaction. That adds a second
@@ -108,6 +119,7 @@ budget cannot cover, such as a single turn that crosses the window.
 
 The trigger is exercised by the runtime tests against the fake Agent (budget,
 answered turn, unknown usage, in-flight compaction, the per-assignment cap, a
-window smaller than the budget, context retirement, and a compaction that cannot
-start), and remains to be observed live: a real worker crossing its budget in a
-pane, and the worker's context reading in the widget afterwards.
+window smaller than the budget, context retirement, a compaction that cannot
+start, and a compaction that commits after its assignment settled), and remains
+to be observed live: a real worker crossing its budget in a pane, and the
+worker's context reading in the widget afterwards.
