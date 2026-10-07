@@ -1,12 +1,11 @@
-# herdsman-child-command
+# herdsman-child-command Specification
 
 ## Purpose
-
 Let the operator choose, through their own environment, which binary a managed child
 session runs, so the choice is validated and recorded with the launch instead of being made
 by a shell function, and so a worker started under a different choice is detected.
 
-## ADDED Requirements
+## Requirements
 
 ### Requirement: Child command is a launch environment input
 
@@ -88,30 +87,47 @@ reused, and a record with no command identity SHALL be treated as a mismatch.
 - **WHEN** the command is set where it was previously unset, or cleared where it was previously set
 - **THEN** the retained worker is relaunched rather than reused under the old decision
 
-### Requirement: Direct child start applies the current command
+### Requirement: A configured child start runs the command in the pane
 
 Once the recorded start-path probe for the installed Herdr version establishes detection,
 alias, readiness and argv behaviour, Herdsman SHALL start a child with a configured command
-by running that command in the pane instead of asking Herdr to start its canonical
-executable. The running child SHALL be registered under the Herdsman agent alias, readiness
-SHALL be established before the launch is reported successful, and a start that fails or
-times out SHALL be reported as a structured launch failure and rolled back like a failed
-`agent start`. Until that probe is recorded, this requirement SHALL NOT be implemented.
+by running that command in the pane instead of asking Herdr to start its canonical executable.
+Until that probe is recorded, this requirement SHALL NOT be implemented.
+
+#### Scenario: Command is run in the pane
+
+- **WHEN** a child is started with a configured command
+- **THEN** the command is run in the pane and Herdr's canonical executable is not started
 
 #### Scenario: Alias is established
 
 - **WHEN** a child is started directly by the configured command
 - **THEN** the running child is addressable by its Herdsman agent alias through Herdr's agent queries
 
+### Requirement: Readiness is observed before a direct start reports success
+
+Herdsman SHALL establish readiness of the running child before reporting the launch successful,
+within the existing startup budget.
+
 #### Scenario: Readiness precedes success
 
 - **WHEN** the command has been run but the child is not yet interactive
 - **THEN** the launch is not reported successful until readiness is observed, within the existing startup budget
 
+### Requirement: A failed direct start is structured and rolled back
+
+A start that fails or times out SHALL be reported as a structured launch failure and rolled back
+like a failed `agent start`.
+
 #### Scenario: Failure is structured and rolled back
 
 - **WHEN** the command cannot be run, the child never reaches readiness, or the pane is unusable
 - **THEN** the launch fails with a structured failure naming the stage, ownership evidence is preserved, and no orphaned pane or agent record is left behind
+
+### Requirement: A pane-reusing restart applies the current command
+
+A restart that reuses an existing pane SHALL run the command current at that moment, even though
+the pane's creation-time environment is unchanged.
 
 #### Scenario: Pane-reusing restart applies the current command
 
