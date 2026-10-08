@@ -65,6 +65,8 @@ Radar owning pane detection and restart is the same split from the other side.
 | 132 | **Fixed.** An empty recovery turn left a resolved-work assignment held indefinitely | Known. The single recovery prompt was spent but `freshResponse` stayed false | Fail with `empty_result` only after the prompted run starts and settles without a fresh answer, with all dependencies resolved. Preserve ordinary result-write retries. Runtime suite: 86/86; no live recovery smoke claimed |
 | 133 | **Fixed (`d196c011`).** Mid-turn background changes settled a tool-call message as a final answer | Known. `message_end` marked every assistant message fresh; retrieval could trigger settlement on empty text or commentary before the tool/turn finished | `toolUse` messages no longer qualify as final responses. Regressions cover empty text and nonempty commentary. Radar reproduced the same class in a long-lived worker; its loaded source revision remains unknown, so reload is required before claiming that fix was exercised there |
 | 134 | The provider (omniroute `coder-high`, about 268k context) returns keepalive-only streams with `stopReason: length` | Unknown, outside this repo. Herdsman now classifies it correctly (ADR 0019) | Raise with the provider owner; not ours to fix |
+| 135 | **Fixed (`1863bc41`, `a2da5b9e`, `043bb041`).** A worker's compaction could publish a result from the very turn it replaced, or resume an assignment that had already settled, unsupervised | Known. Settlement eligibility was inferred from which settle boundary a run reached, and the compaction continuation was sent unconditionally once it committed | Pi 1.1.0 reports how the settled run ended, so the aborted run is read from `agent_settled.aborted` rather than inferred; a settlement withholds only while this worker's own compaction continuation is still pending, and the continuation goes out only while the request that asked for it is still active (otherwise the skip is recorded durably). Not yet observed live: needs a real worker crossing its budget |
+| 136 | **Fixed (`34506f46`).** A worker that ended on a provider error reported only the response-contract failure | Known. The failure message was composed from the validation outcome and the provider's own error text was dropped | An `error` stop's `errorMessage` now prefixes the failure message, so the owner sees the provider's text. Nothing is inferred from an empty answer, and an error stop that still yields contract-valid text publishes `completed`. Not yet observed live: no real provider failure has passed through it |
 
 ## Fixed this session (for provenance)
 
@@ -142,8 +144,12 @@ refusals, plus carried-background-result settlement contract tests. No live reco
     build identity a process can report. Radar consumes both. Note also that `pi` is now the pi-bolt lead
     launcher, so `pi` and `pi-bolt` distinguish nothing — family must come from the store root or the env.
 11. Live residuals of the landed worker-lifecycle fixes. Landed and gate-green but not yet observed in a
-    real session: the settlement discriminator (`1863bc41` — a compaction request disarms settlement and
-    the aborted run publishes nothing), the continuation guard (`a2da5b9e` — a continuation is withheld
+    real session: the aborted-run fact and the hold belonging to it (`043bb041` — Pi 1.1.0 reports how the
+    settled run ended, so Herdsman reads `agent_settled.aborted` instead of inferring it from which boundary
+    a run reached, and withholds a settlement only while this worker's own compaction continuation is still
+    pending; an aborted run with no continuation is judged as its answer. Supersedes the `1863bc41`
+    boundary-order marker and deletes the `agent_before_settle` handler), the continuation guard
+    (`a2da5b9e` — a continuation is withheld
     once its assignment settled, recorded as `pi_herdsman_state_compaction_continuation_skipped`), provider
     error text in a failure result (`34506f46`), and the unclaimed-alias refusal (`3fcdfeb3`). Each needs
     the shape that produced it: a budget crossing with the assignment settling mid-compaction, a real
@@ -158,6 +164,20 @@ refusals, plus carried-background-result settlement contract tests. No live reco
     prove the same generation without the alias, and an existing test leaves a mailbox in a
     `${WORKSPACE}-replacement` workspace that `clearTestMailboxes()` does not remove, which can skew any
     future test that filters global states by session id.
+13. The Pi type pin has drifted behind the deployed runtime. `pi-herdsman` and `pi-bash-processes` pin
+    `@earendil-works/pi-{ai,coding-agent,tui}` at 0.99.2 in devDependencies while the deployed pi-bolt is
+    Pi 1.1.0 (Pi-Bolt 0.7.2, adopted 2026-10-08). The installed types cannot catch fields added since
+    0.99.2: `AgentSettledEvent` carries no `aborted` at 0.99.2 and gains it at 1.1.0, and our handlers are
+    typed `(event: unknown)`, so a wrong new field name still compiles — which is why the 1.1.0 migration
+    (`043bb041`) had to pin the read with a test rather than rely on the type. Bumping the pin is its own
+    change, because it moves every type assertion in the suites at once. The session-header surface the
+    fork ownership check reads is stable across both tags (`parentSession`, `getSessionId`, `getHeader`),
+    so that check does not depend on the bump.
+14. The same abort migration applies to `pi-subagents`. Its `src/runs/shared/abort-recovery.ts` infers a
+    terminal abort from the terminal assistant message's `stopReason` (plus a provider-abort error text)
+    and feeds it into `planAbortRecovery`, to decide whether a compaction-induced child abort may be
+    resumed. `agent_settled.aborted` is the direct fact for that question. Check first whether the path
+    receives settled events in this deployment. Not started; no owner assigned.
 
 ## pi-jev: native classifier and AOT
 
