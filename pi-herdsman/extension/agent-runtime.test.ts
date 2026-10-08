@@ -1473,7 +1473,7 @@ test("managed interrupt continues the same assignment after abort settlement", a
       },
       context,
     );
-    await agent.events.get("agent_settled")![0](undefined, context);
+    await agent.events.get("agent_settled")![0](settlement(true), context);
     assert.equal(readResult(mailbox, assignmentRequestId), undefined);
     assert.equal(readAgentState(mailbox)?.activeRequestId, assignmentRequestId);
     assert.equal(readAgentState(mailbox)?.completedRequestId, undefined);
@@ -1953,8 +1953,8 @@ function emptyMessageTurns(
       { message: { role: "assistant", content: [], ...message } },
       context,
     );
-    await agent.events.get("agent_settled")![0](undefined, context);
-    await agent.events.get("agent_settled")![0](undefined, context);
+    await agent.events.get("agent_settled")![0](settlement(false), context);
+    await agent.events.get("agent_settled")![0](settlement(false), context);
   };
 }
 
@@ -5517,35 +5517,35 @@ function endTurn(
 }
 
 /**
- * Settle the run Pi aborted for this worker's compaction. Manual compaction
- * aborts the running operation, so that run reaches `agent_settled` in the run's
- * `finally` without ever reaching its settle boundary; a completion can still
- * land between the request and the abort.
+ * Pi's settlement event for one run. `aborted` is Pi's own report of how that
+ * run ended, which the fixture states as Pi states it rather than leaving the
+ * coordinator to infer.
  */
-async function settleAbortedRun(
-  agent: ReturnType<typeof fakePi>,
-  context: never,
-  answer: string,
-): Promise<void> {
-  agent.events.get("message_end")![0](
-    { message: { role: "assistant", content: answer, stopReason: "stop" } },
-    context,
-  );
-  await agent.events.get("agent_settled")![0](undefined, context);
+function settlement(aborted: boolean): {
+  type: "agent_settled";
+  aborted: boolean;
+} {
+  return { type: "agent_settled", aborted };
 }
 
-/** Settle a run Pi carried to its settle boundary, as every other run does. */
-async function settleAtBoundary(
+/**
+ * Settle one run with the outcome Pi reports for it. Manual compaction and an
+ * owner interrupt abort the running operation, so that shape reaches
+ * `agent_settled` in the run's `finally`; a completion can still land between
+ * the request and the abort. This build registers no `agent_before_settle`
+ * handler, so Pi's settle boundary is not part of these fixtures.
+ */
+async function settleRun(
   agent: ReturnType<typeof fakePi>,
   context: never,
   answer: string,
+  aborted: boolean,
 ): Promise<void> {
   agent.events.get("message_end")![0](
     { message: { role: "assistant", content: answer, stopReason: "stop" } },
     context,
   );
-  agent.events.get("agent_before_settle")![0](undefined, context);
-  await agent.events.get("agent_settled")![0](undefined, context);
+  await agent.events.get("agent_settled")![0](settlement(aborted), context);
 }
 
 /**
@@ -5805,19 +5805,175 @@ test("a run the worker's own compaction aborted publishes no result", async (t) 
   );
   await assignManagedRequest(agent, mailbox, context);
 
-  // A run can reach its settle boundary, take another turn, and only then be
-  // compacted: that boundary belongs to the turn it ended, not to the run the
-  // compaction aborts.
-  agent.events.get("agent_before_settle")![0](undefined, context);
+  // A run can take turns of its own before this worker's compaction is
+  // requested of it: the settlement that follows is Pi's report on the run the
+  // compaction aborted, whatever the run did before the request.
   endTurn(agent, context, "toolUse");
   assert.deepEqual(compactions, ["__pi_vcc__"]);
 
-  // The aborted turn answers anyway, which clears the continuation hold: that is
-  // why the hold alone cannot decide this settlement.
-  await settleAbortedRun(agent, context, "answered the task being replaced");
+  // The aborted turn answers anyway, and that answer clears the continuation
+  // hold: the compaction hold, not that, is what withholds this settlement.
+  await settleRun(agent, context, "answered the task being replaced", true);
 
   assert.equal(readResult(mailbox, REQUEST_ID), undefined);
   assert.equal(readAgentState(mailbox)?.activeRequestId, REQUEST_ID);
+  fireShutdown(agent);
+});
+
+test("a run Pi does not report as aborted is judged as the answer it is", async (t) => {
+  const mailbox = setAgentEnvironment("compaction-completed-run-agent");
+  t.after(() => resetAgentMailbox(mailbox));
+  const agent = fakePi();
+  registerExtension!(agent.pi as never);
+  const compactions: string[] = [];
+  const context = compactingAgentContext(
+    agent.entries,
+    DEFAULT_WORKER_CONTEXT_BUDGET_TOKENS + 1_000,
+    replacingCompaction(agent, compactions),
+  );
+  await assignManagedRequest(agent, mailbox, context);
+
+  endTurn(agent, context, "toolUse");
+  assert.deepEqual(compactions, ["__pi_vcc__"]);
+
+  // The request holds a continuation back; Pi's report on the run it settled is
+  // what decides whether that settlement is the aborted run's. Pi does not
+  // report this one as aborted, so the turn it produced is an answer, and
+  // withholding it for a continuation that may never come would leave the
+  // assignment with no wake.
+  await settleRun(agent, context, "answered while its compaction ran", false);
+
+  assert.equal(
+    readResult(mailbox, REQUEST_ID)?.text,
+    "answered while its compaction ran",
+  );
+  fireShutdown(agent);
+});
+
+test("an aborted run with no compaction continuation pending settles normally", async (t) => {
+  const mailbox = setAgentEnvironment("aborted-run-agent");
+  t.after(() => resetAgentMailbox(mailbox));
+  const agent = fakePi();
+  registerExtension!(agent.pi as never);
+  const context = fakeAgentContext();
+  await assignManagedRequest(agent, mailbox, context);
+
+  // Nothing of this worker's own is waiting on the abort: aborting stopped a
+  // turn, it did not cancel the assignment, so the turn it produced is the
+  // answer, and withholding it would hold the assignment with no wake.
+  await settleRun(agent, context, "answered before the abort", true);
+
+  assert.equal(
+    readResult(mailbox, REQUEST_ID)?.text,
+    "answered before the abort",
+  );
+  fireShutdown(agent);
+});
+
+test("a compaction hold does not outlive the settlement that ends its run", async (t) => {
+  const mailbox = setAgentEnvironment("compaction-hold-agent");
+  t.after(() => resetAgentMailbox(mailbox));
+  const agent = fakePi();
+  registerExtension!(agent.pi as never);
+  const compactions: string[] = [];
+  const context = compactingAgentContext(
+    agent.entries,
+    DEFAULT_WORKER_CONTEXT_BUDGET_TOKENS + 1_000,
+    replacingCompaction(agent, compactions),
+  );
+  await assignManagedRequest(agent, mailbox, context);
+
+  // This worker's own compaction aborts the run that requested it, and that
+  // settlement is held back...
+  endTurn(agent, context, "toolUse");
+  await settleRun(agent, context, "answered the task being replaced", true);
+  assert.equal(readResult(mailbox, REQUEST_ID), undefined);
+
+  // ... until the continuation answers the same assignment, which consumes the
+  // hold: it belongs to that compaction, not to the worker.
+  await settleRun(agent, context, "answered on the compacted session", false);
+  assert.equal(
+    readResult(mailbox, REQUEST_ID)?.text,
+    "answered on the compacted session",
+  );
+
+  // The next assignment on this retained worker is aborted with no compaction
+  // behind it, so its answer settles as the answer it is.
+  removeResult(mailbox, REQUEST_ID);
+  const nextRequestId = "cccccccc-cccc-4ccc-8ccc-cccccccccccf";
+  const started = readAgentState(mailbox)!;
+  writeRequest(mailbox, {
+    version: 5,
+    runId: started.runId,
+    requestId: nextRequestId,
+    ownerSessionId: started.ownerSessionId,
+    workspaceId: started.workspaceId,
+    agentLabel: started.agentLabel,
+    paneId: started.paneId,
+    kind: "task",
+    text: "the next assignment",
+    createdAt: Date.now(),
+  });
+  agent.events.get("input")![0]({ text: controlMarker(nextRequestId) }, context);
+  assert.equal(readAgentState(mailbox)?.activeRequestId, nextRequestId);
+
+  await settleRun(agent, context, "answered the next assignment", true);
+
+  assert.equal(
+    readResult(mailbox, nextRequestId)?.text,
+    "answered the next assignment",
+  );
+  fireShutdown(agent);
+});
+
+test("an interrupt replacement outranks the aborted run of a pending compaction", async (t) => {
+  const mailbox = setAgentEnvironment("compaction-interrupt-agent");
+  t.after(() => resetAgentMailbox(mailbox));
+  const agent = fakePi();
+  registerExtension!(agent.pi as never);
+  const compactions: string[] = [];
+  const context = compactingAgentContext(
+    agent.entries,
+    DEFAULT_WORKER_CONTEXT_BUDGET_TOKENS + 1_000,
+    replacingCompaction(agent, compactions),
+  );
+  (context as any).isIdle = () => false;
+  (context as any).mode = "rpc";
+  const assignmentRequestId = REQUEST_ID;
+  writeAgentState(
+    mailbox,
+    managedState("compaction-interrupt-agent", assignmentRequestId),
+  );
+  agent.events.get("session_start")![0](undefined, context);
+
+  // The compaction's continuation and the owner's replacement are both waiting
+  // on this settlement, and the replacement is what continues the assignment:
+  // withholding it here would strand the assignment the owner interrupted.
+  endTurn(agent, context, "toolUse");
+  const started = readAgentState(mailbox)!;
+  const interruptId = randomUUID();
+  writeRequest(mailbox, {
+    version: 5,
+    runId: started.runId,
+    requestId: interruptId,
+    ownerSessionId: started.ownerSessionId,
+    workspaceId: started.workspaceId,
+    agentLabel: started.agentLabel,
+    paneId: started.paneId,
+    kind: "interrupt",
+    text: "Stop this operation and continue differently.",
+    createdAt: Date.now(),
+  });
+  assert.deepEqual(
+    agent.events.get("input")![0]({ text: controlMarker(interruptId) }, context),
+    { action: "handled" },
+  );
+
+  await settleRun(agent, context, "partial output from the aborted turn", true);
+
+  assert.equal(readResult(mailbox, assignmentRequestId), undefined);
+  assert.equal(readAgentState(mailbox)?.activeRequestId, assignmentRequestId);
+  assert.match(String(agent.sentUserCalls.at(-1)?.content), /^Owner interrupt:/);
   fireShutdown(agent);
 });
 
@@ -5838,10 +5994,11 @@ test("the compaction's continuation turn answers the same assignment", async (t)
   assert.deepEqual(compactions, ["__pi_vcc__"]);
   assert.equal(agent.sentUserCalls.length, 1);
 
-  // The continuation reaches its own settle boundary. Where a compaction
-  // completes before the aborted run's own settlement lands, that boundary is
-  // the first one after the request, and it is what lets the assignment settle.
-  await settleAtBoundary(agent, context, "answered on the compacted session");
+  // The continuation turn settles with Pi reporting that run as completed, which
+  // is what answers the assignment. The stub completes its compaction before the
+  // run that request aborted settles, and that ordering no longer decides
+  // anything: Pi's report does.
+  await settleRun(agent, context, "answered on the compacted session", false);
 
   assert.equal(
     readResult(mailbox, REQUEST_ID)?.text,
@@ -5872,7 +6029,7 @@ test("a continuation is withheld once its assignment has settled", async (t) => 
   assert.deepEqual(agent.sentUserCalls, []);
 
   // The assignment answers and settles while the compaction is still running.
-  await settleAtBoundary(agent, context, "the delivered answer");
+  await settleRun(agent, context, "the delivered answer", false);
   const delivered = readResult(mailbox, REQUEST_ID);
   assert.equal(delivered?.text, "the delivered answer");
   assert.equal(readAgentState(mailbox)?.activeRequestId, undefined);
@@ -5922,7 +6079,7 @@ test("a continuation is withheld once its assignment has settled", async (t) => 
   });
   agent.events.get("input")![0]({ text: controlMarker(nextRequestId) }, context);
   assert.equal(readAgentState(mailbox)?.activeRequestId, nextRequestId);
-  await settleAtBoundary(agent, context, "answered the second assignment");
+  await settleRun(agent, context, "answered the second assignment", false);
   assert.equal(
     readResult(mailbox, nextRequestId)?.text,
     "answered the second assignment",
@@ -6022,7 +6179,7 @@ test("worker compaction switched off requests none and settles the turn", async 
   // continuation follows one, and the assignment settles on its own answer.
   assert.deepEqual(compactions, []);
   assert.deepEqual(agent.sentUserCalls, []);
-  await settleAtBoundary(agent, context, "answered on the context it has");
+  await settleRun(agent, context, "answered on the context it has", false);
   assert.equal(
     readResult(mailbox, REQUEST_ID)?.text,
     "answered on the context it has",

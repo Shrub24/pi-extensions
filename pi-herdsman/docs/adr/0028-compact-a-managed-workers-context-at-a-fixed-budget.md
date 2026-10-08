@@ -16,11 +16,19 @@ a result that would be settled from the history a summary replaces.
 The compaction is requested through Pi's manual compaction, carrying the
 `__pi_vcc__` marker, so the summary is produced by whichever summarizer the child's
 Pi configuration loads for `session_before_compact`. Manual compaction aborts
-the running operation, so Herdsman holds the settlement before requesting it and,
-once the compaction completes, continues the same assignment with a follow-up
-message that triggers a new turn. The aborted turn is never published as a
-result. The session classification and Agent-definition entries are re-asserted
-afterwards, because a summary replaces the history those entries live in.
+the running operation, and Pi reports that run as aborted on `agent_settled`;
+Herdsman reads that report rather than inferring the abort from which boundary a
+run reached. The settlement of a run this worker's own compaction aborted
+publishes nothing while its continuation is still pending, and once the
+compaction completes the same assignment continues with a follow-up message that
+triggers a new turn. That hold is released by the settlement which ends the
+aborted run, not by the send of the continuation: both orders are reachable, and
+a hold released on send would let the aborted run's later settlement publish the
+very turn the compaction replaces. An aborted run with no such continuation pending is still
+judged as the answer it is: an abort ends a turn, it does not cancel the
+assignment, and withholding it would leave the assignment held with no wake. The
+session classification and Agent-definition entries are re-asserted afterwards,
+because a summary replaces the history those entries live in.
 
 That continuation is sent only while the assignment that requested it is still
 active. A compaction can commit after the assignment has settled its result — the

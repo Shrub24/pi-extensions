@@ -16749,14 +16749,14 @@ export default function (pi: ExtensionAPI): void {
   // A compaction is in flight; a second request would stack summaries over the
   // same session.
   let contextCompactionInFlight = false;
-  // Pi fires `agent_before_settle` only for a run that reaches its settle
-  // boundary, and `agent_settled` from the run's `finally` either way, so a run
-  // this worker's own compaction aborts settles with no boundary behind it. Set
-  // at the request and cleared by the next settle, boundary or settlement: while
-  // it holds, that settlement is not an answer. `awaitingContinuation` cannot
-  // carry this, because any assistant `message_end` clears it — the aborted
-  // turn's own completion included.
-  let compactionAbortedRun = false;
+  // This worker's own compaction continuation is still to be answered: set at
+  // the request, cleared where the hold ends. Pi reports whether the run it
+  // settled was aborted, so only the settlement of a run this compaction
+  // aborted, while this holds, is not an answer. `awaitingContinuation` cannot
+  // carry it — any assistant `message_end` clears that, the aborted turn's own
+  // completion included — and `compactionContinuations` is the per-assignment
+  // budget, not a live hold.
+  let compactionContinuationPending = false;
   let pendingResult: ResultRecord | undefined;
   let pendingInterruptReplacement: string | undefined;
   let resultWriteAttempts = 0;
@@ -18854,7 +18854,7 @@ export default function (pi: ExtensionAPI): void {
     const heldLatest = latest;
     const heldFreshResponse = freshResponse;
     const heldContinuations = compactionContinuations;
-    const heldCompactionAbortedRun = compactionAbortedRun;
+    const heldCompactionContinuationPending = compactionContinuationPending;
     // The hold goes on before the request: compacting aborts the running
     // operation, so the settlement that ends this turn has to know that nothing
     // was answered yet. It is released again when no compaction started and when
@@ -18865,15 +18865,13 @@ export default function (pi: ExtensionAPI): void {
       latest = heldLatest;
       freshResponse = heldFreshResponse;
       compactionContinuations = heldContinuations;
-      compactionAbortedRun = heldCompactionAbortedRun;
+      compactionContinuationPending = heldCompactionContinuationPending;
     };
     awaitingContinuation = true;
     latest = "";
     freshResponse = false;
     compactionContinuations = { requestId, count: used + 1 };
-    // The run this request aborts will settle without reaching its boundary, so
-    // it holds no answer for this assignment.
-    compactionAbortedRun = true;
+    compactionContinuationPending = true;
     if (
       compactManagedContext(
         ctx,
@@ -18892,6 +18890,7 @@ export default function (pi: ExtensionAPI): void {
             latest = "";
             freshResponse = false;
             compactionContinuations = undefined;
+            compactionContinuationPending = false;
             appendDurableRecord(
               pi,
               ctx,
@@ -18917,14 +18916,20 @@ export default function (pi: ExtensionAPI): void {
     release();
   };
 
-  // A run that reached its settle boundary was not aborted by a compaction:
-  // this is the boundary behind the settlement that follows it.
-  pi.on("agent_before_settle", () => {
-    compactionAbortedRun = false;
-  });
-  pi.on("agent_settled", async (_event: unknown, ctx: ExtensionContext) => {
-    const abortedRun = compactionAbortedRun;
-    compactionAbortedRun = false;
+  pi.on("agent_settled", async (event: unknown, ctx: ExtensionContext) => {
+    // Pi reports how the run it settled ended, and nothing here infers that.
+    // Only the settlement of a run this worker's own compaction aborted, while
+    // its continuation is still pending, is not an answer: publishing that one
+    // would settle the assignment from the turn the compaction replaces, and the
+    // continuation turn's own settlement is the one that answers it. An aborted
+    // run with no such continuation is judged as the answer it is — the abort
+    // ended a turn, it did not cancel the assignment, and withholding it would
+    // hold the assignment with no wake. An interrupt replacement goes out ahead
+    // of both decisions.
+    const abortedCompactionRun =
+      (event as { aborted?: boolean } | undefined)?.aborted === true &&
+      compactionContinuationPending;
+    compactionContinuationPending = false;
     if (pendingInterruptReplacement) {
       const replacement = pendingInterruptReplacement;
       pendingInterruptReplacement = undefined;
@@ -18932,10 +18937,7 @@ export default function (pi: ExtensionAPI): void {
       pi.sendUserMessage(replacement);
       return;
     }
-    // A run this worker's own compaction aborted holds no answer: publishing here
-    // would settle the assignment from the turn the compaction is replacing, and
-    // the continuation turn's own settlement is the one that answers it.
-    if (abortedRun) return;
+    if (abortedCompactionRun) return;
     settleCurrentAgent(ctx, true);
     if (delegationEnabled)
       await settlePersistedResults(
@@ -18948,7 +18950,7 @@ export default function (pi: ExtensionAPI): void {
     pendingInterruptReplacement = undefined;
     contextCompactionInFlight = false;
     compactionContinuations = undefined;
-    compactionAbortedRun = false;
+    compactionContinuationPending = false;
     resetLeafStatus();
     metadataAbortController?.abort();
     metadataAbortController = undefined;
