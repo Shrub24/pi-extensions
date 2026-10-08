@@ -3754,3 +3754,81 @@ test("a session replacement clears the queued supervision rerun instead of runni
     setLeadEnvironment();
   }
 });
+
+test("an assignment snapshot adds waiting evidence without redefining activity", async () => {
+  const { assignmentSnapshot } = await import("./index.ts");
+  const state = (patch: Record<string, unknown>) =>
+    ({
+      pendingAskId: undefined,
+      backgroundWaiting: undefined,
+      resultError: undefined,
+      activeRequestId: undefined,
+      completedRequestId: undefined,
+      ...patch,
+    }) as Parameters<typeof assignmentSnapshot>[0];
+
+  // The owner's own projection word reaches the wire unchanged.
+  assert.deepEqual(assignmentSnapshot(state({}), "waiting"), {
+    activity: "waiting",
+  });
+  // An unrecognized projection is reported as unknown, not as a new state.
+  assert.deepEqual(assignmentSnapshot(state({}), undefined), {
+    activity: "unknown",
+  });
+
+  // A questionnaire is the more specific wait between the two.
+  assert.deepEqual(
+    assignmentSnapshot(
+      state({
+        pendingAskId: "ask-1",
+        backgroundWaiting: {
+          sessionId: "session",
+          requestId: "req-1",
+          provider: { id: "tasks", version: 1 },
+          revision: 1,
+          taskIds: ["task-1"],
+        },
+      }),
+      "waiting",
+    ),
+    { activity: "waiting", waiting_reason: "questionnaire" },
+  );
+  assert.deepEqual(
+    assignmentSnapshot(
+      state({
+        backgroundWaiting: {
+          sessionId: "session",
+          requestId: "req-1",
+          provider: { id: "tasks", version: 1 },
+          revision: 1,
+          taskIds: ["task-1"],
+        },
+      }),
+      "waiting",
+    ),
+    { activity: "waiting", waiting_reason: "background-work" },
+  );
+
+  // A result waiting to be read is an outcome, not a reason for activity to say
+  // something else, and only bounded machine words are published.
+  assert.deepEqual(
+    assignmentSnapshot(
+      state({ activeRequestId: undefined, completedRequestId: "req-1" }),
+      "idle",
+    ),
+    { activity: "idle", last_outcome: { result: "delivered" } },
+  );
+  assert.deepEqual(
+    assignmentSnapshot(state({ resultError: { code: "write_failure" } }), "idle"),
+    {
+      activity: "idle",
+      last_outcome: { result: "failed", detail: "write_failure" },
+    },
+  );
+  assert.equal(
+    JSON.stringify(
+      assignmentSnapshot(state({ pendingAskId: "read /private/session/SENTINEL" }), "blocked"),
+    ),
+    '{"activity":"blocked","waiting_reason":"questionnaire"}',
+  );
+});

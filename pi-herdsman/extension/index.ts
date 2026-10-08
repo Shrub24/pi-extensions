@@ -5,6 +5,12 @@ import {
   OWNER_METADATA_TTL_MS,
 } from "./pane-metadata.ts";
 import { createAwaitedFacts } from "./awaited-facts.ts";
+import { createRadarClient, type RadarSnapshot } from "./radar-client.ts";
+import {
+  createRadarExecutionAdapter,
+  type RadarExecutionEventApi,
+} from "./radar-execution.ts";
+import { radarBindingKey, type RadarPublication } from "./radar-publication.ts";
 import {
   SESSION_METADATA_ENTRY,
   readSessionMetadata,
@@ -61,6 +67,7 @@ import {
   subscribeBackgroundWorkChanges,
 } from "../../pi-bash-processes/extensions/background-work.ts";
 import {
+  herdsmanDataRoot,
   herdsmanTempRoot,
   resultPath as canonicalResultPath,
   resultRef,
@@ -129,6 +136,7 @@ import {
   type SpawnPlacement,
 } from "./core.ts";
 import {
+  RPIV_ASK_USER_BLOCKED_EVENT,
   clearQuestionWaitEvidence,
   readQuestionWaitEvidence,
   registerQuestionWaitReporter,
@@ -907,6 +915,55 @@ type MetadataPatch = {
   thinking?: string | null;
 };
 let workerMetadata: ReturnType<typeof createMetadataPublisher> | undefined;
+let radarPublication: RadarPublication | undefined;
+
+/**
+ * The owner-side correlation with a managed child's Radar subject. The child
+ * writes this sidecar itself, keyed by the durable managed tuple both processes
+ * can derive, so no mailbox schema and no registry-wide search is involved.
+ */
+function radarChildBinding(
+  state: Pick<ManagedAgentState, "runId" | "ownerSessionId" | "agentLabel">,
+) {
+  return radarPublication?.binding(
+    radarBindingKey(state.runId, state.ownerSessionId, state.agentLabel),
+  );
+}
+
+/** Retire the assignment channel of a child this process actually published. */
+function retireRadarSubject(
+  state: Pick<ManagedAgentState, "runId" | "ownerSessionId" | "agentLabel">,
+): void {
+  const binding = radarChildBinding(state);
+  if (binding) radarPublication?.retireAssignment(binding.agent_id);
+}
+
+/**
+ * The assignment channel's snapshot, taken from the operator projection rather
+ * than a second scanner. Waiting evidence is additive: the projection's own word
+ * stays the activity, task text never enters a published field, and a delivered
+ * or failed result is an outcome rather than a change of activity.
+ */
+export function assignmentSnapshot(
+  state: ManagedAgentState,
+  projection: unknown,
+): RadarSnapshot {
+  const waitingReason = state.pendingAskId
+    ? "questionnaire"
+    : state.backgroundWaiting?.taskIds?.length
+      ? "background-work"
+      : undefined;
+  const outcome = state.resultError
+    ? { result: "failed", detail: state.resultError.code }
+    : !state.activeRequestId && state.completedRequestId
+      ? { result: "delivered" }
+      : undefined;
+  return {
+    activity: typeof projection === "string" ? projection : "unknown",
+    ...(waitingReason !== undefined ? { waiting_reason: waitingReason } : {}),
+    ...(outcome !== undefined ? { last_outcome: outcome } : {}),
+  };
+}
 let workerMetadataActivity: MetadataActivity | undefined;
 let workerMetadataOwner: ExtensionAPI | undefined;
 let publishOwnerView:
@@ -4364,8 +4421,12 @@ async function finalizeDeliveredRoot(
       !after.activeRequestId &&
       after.completedRequestId === requestId &&
       !newerMailboxWorkExists(mailbox, after, requestId)
-    )
+    ) {
+      // This process owned the assignment channel, so it retires it as the
+      // child's record goes away.
+      retireRadarSubject(state);
       removeAgentMailbox(mailbox);
+    }
     invalidateCachedRuntime(state.agentLabel);
   } finally {
     release?.();
@@ -5268,6 +5329,7 @@ async function closeManagedAgent(
         "close",
       );
     try {
+      retireRadarSubject(current);
       removeAgentMailbox(mailbox);
     } catch (error) {
       const message = `Agent pane closed but mailbox cleanup failed: ${String(error)}`;
@@ -5368,6 +5430,7 @@ async function closeManagedSnapshot(
         "Managed agent has a durable result; close result delivery first",
         "close",
       );
+    retireRadarSubject(current);
     removeAgentMailbox(mailbox);
     dropSoftWindow(current.activeRequestId);
     invalidateCachedRuntime(current.agentLabel);
@@ -8429,6 +8492,44 @@ export default function (pi: ExtensionAPI): void {
     ownerMetadata.clear();
   };
 
+  const publishRadarAssignments = (
+    ctx: ExtensionContext,
+    entries: {
+      state: ManagedAgentState;
+      projection: unknown;
+      agentSession?: unknown;
+    }[],
+  ): void => {
+    if (!radarPublication) return;
+    const owner = ctx.sessionManager.getSessionId();
+    // Radar needs no pane, no TUI and no Herdr: an owned assignment is published
+    // wherever the owner's projection shows it.
+    for (const { state, projection, agentSession } of entries) {
+      if (state.ownerSessionId !== owner) continue;
+      if (
+        agentSession !== undefined &&
+        !matchesExpectedSession(agentSession, {
+          id: state.piSessionId,
+          path: state.piSessionFile,
+        })
+      )
+        continue;
+      const binding = radarChildBinding(state);
+      // The child's own sidecar names its subject, but the owned assignment must
+      // still match it before this process writes that subject's channel.
+      if (
+        !binding ||
+        binding.run !== state.runId ||
+        binding.owner !== state.ownerSessionId ||
+        binding.label !== state.agentLabel
+      )
+        continue;
+      radarPublication
+        .assignment(binding.agent_id, owner)
+        .update(assignmentSnapshot(state, projection));
+    }
+  };
+
   const publishOwnerStates = (
     ctx: ExtensionContext,
     entries: {
@@ -8437,6 +8538,8 @@ export default function (pi: ExtensionAPI): void {
       agentSession?: unknown;
     }[],
   ): void => {
+    // Radar publication is independent of Herdr: it needs no pane and no TUI.
+    publishRadarAssignments(ctx, entries);
     if (
       ownerMetadataClosed ||
       ctx.mode !== "tui" ||
@@ -18973,4 +19076,40 @@ export default function (pi: ExtensionAPI): void {
       clearOwnerMetadata(),
     ]).then(() => undefined);
   });
+
+  // Radar publication is registered last on purpose. Herdsman's own lifecycle
+  // handlers must stay the first subscriber of a Pi event, and this adapter is
+  // additive: its listener observes the session, it never drives one.
+  const managedIdentity =
+    role() === "managed-agent"
+      ? {
+          run: String(process.env.PI_HERDSMAN_RUN_ID),
+          owner: String(process.env.PI_HERDSMAN_OWNER_SESSION_ID),
+          label: String(process.env.PI_HERDSMAN_LABEL),
+        }
+      : undefined;
+  // The process-local slot owns subject identity, so an extension reload reuses
+  // this process's registration and writer binding instead of minting a second
+  // subject. The adapter persists the immutable registration before dialing and
+  // owns its own listeners and timers across a reload.
+  radarPublication = createRadarExecutionAdapter(
+    pi as unknown as RadarExecutionEventApi,
+    {
+      client: createRadarClient(),
+      dataRoot: join(herdsmanDataRoot(), "radar"),
+      questionnaireEvent: RPIV_ASK_USER_BLOCKED_EVENT,
+      ...(managedIdentity !== undefined
+        ? {
+            managedBinding: {
+              ...managedIdentity,
+              key: radarBindingKey(
+                managedIdentity.run,
+                managedIdentity.owner,
+                managedIdentity.label,
+              ),
+            },
+          }
+        : {}),
+    },
+  ).publication;
 }

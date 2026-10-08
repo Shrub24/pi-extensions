@@ -90,6 +90,7 @@ implementation, including the upstream behavior a fork decision supersedes.
 - [0028 Compact a managed worker's context at a fixed budget](adr/0028-compact-a-managed-workers-context-at-a-fixed-budget.md)
 - [0029 Run a configured child in its pane](adr/0029-run-a-configured-child-in-its-pane.md)
 - [0030 Prove a live managed generation by a claimed alias](adr/0030-prove-a-live-managed-generation-by-a-claimed-alias.md)
+- [0031 Publish agent facts to the Radar daemon registry](adr/0031-publish-agent-facts-to-the-radar-daemon-registry.md)
 
 The repository directories are organized by content type. The index is
 task-first so readers do not need to understand that structure before finding

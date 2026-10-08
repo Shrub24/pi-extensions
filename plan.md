@@ -1,8 +1,8 @@
 # pi-herdsman and pi-bash-processes: outstanding work
 
-Updated 2026-10-07. Local `main` equals upstream plus six unpushed commits; the Nix pin is at the last
-push. A peer session develops pi-jev on top of `main` in this same working copy.
-Every item names its root cause (known, partly known, unknown) and the path forward.
+Reviewed 2026-10-08. Local `main` and tracked `upstream/main` are at `b27bf1df`.
+Deployment pins and loaded pane revisions must be checked separately; a push does not update a running
+process. This working copy is shared: scope edits and commits to explicit paths.
 
 ## Worker lifecycle (direction)
 
@@ -12,27 +12,35 @@ delivered result reminds the lead of the worker's label, `agent_continue` and `a
 
 **Live retention is off (owner decision, 2026-10-07).** `retainWorkers = false` in the dotfiles Herdsman
 config and in the live `~/.pi/agent/pi-herdsman/config.json`. Persisting a live pane/process past delivery
-makes every lifecycle defect reachable — the orphan continuation turn could only exist because a settled
-worker still had a running session — so the default is now: delivery closes the live execution, the
-mailbox, result file, label lineage and Pi session survive, and `agent_continue` relaunches the saved
-session into a new process (ADR 0013). The toggle and its seam stay; they can be reduced or removed once
+increases exposure to post-delivery lifecycle races. Closing at delivery reduces that exposure but does
+not replace settlement and continuation guards. The configured policy is now: delivery closes the live execution, the
+saved Pi session and caller-side result provenance survive. Normal delivered-result cleanup removes
+the mailbox and its result file; label lineage and continuation selectors survive in the caller's
+session entries. `agent_continue` already relaunches that saved session (ADR 0013). The toggle and its seam stay; they can be reduced or removed once
 the replacement proves out. `retainWorkers` is read at process start, so a running lead keeps the old
 behaviour until it reloads.
 
-**Next: advertise resumable workers from the durable record, not a live pane.** With retention off, a
-delivered worker no longer appears in the inventory, so a lead that would have continued it respawns
-instead — the capability survives in the mailbox and session, but nothing advertises it. The fix is to
-list owned closed generations as resumable (label, last result, `agent_continue`) and let `agent_continue`
-relaunch them. This is what makes retention-off strictly better than retention-on rather than merely safer.
-- Open questions: does the grace period reset on any pane activity or only on `agent_continue`; does
-  Radar need a "retired, resumable" token.
-- Depends on: #130 below, because a pane left as a shell must read `lost` for cleanup to be decidable.
+**Next: advertise resumable workers from the durable record, not a live pane.** The desired contract is
+that a lead can discover directly owned saved workers after their execution closes, with the label,
+saved session, last result and continuation route. The scoping investigation must establish how much
+of this current `agent_list` and `agent_continue` already provide before adding another projection.
+Recon at `b27bf1df` establishes that mailbox deletion, not inventory-only discovery, explains the
+missing row. Continuation already resolves the saved session from owned result entries; the missing
+slice is discovery and guidance. See `.pi-herdsman/resumable-worker-discovery-scope.md`.
+Discovery must suppress a saved-session candidate when any workspace has a mailbox representation:
+a foreign or uncertain execution must not be disguised as safely resumable. Detailed interface
+choices remain proposals, not implemented behavior.
+- Initial scope: discovery and guidance only, reusing existing exact-session continuation. No grace
+  period, new retention policy, or Radar presentation token is required for this slice.
+- Preserve the distinction between a deliberately closed generation, proven loss, and an uncertain
+  occupant; never advertise uncertainty as safe to resume.
 
 ## Herdr independence (direction)
 
 Herdr owns the pane container and the agent record, not the work. Replace both, and keep the lifecycle and
-reporting ours. This is direction, not a scheduled change, and the worker-retirement and control items
-above land first.
+reporting ours. The planned Radar-linked mux coordinator will initially wrap the existing operations
+roughly 1:1, with other backends such as tmux later. Durable resumption discovery does not require that
+migration, and should not add another Herdr-specific lifecycle.
 
 What Herdr supplies today:
 
@@ -43,7 +51,7 @@ What Herdr supplies today:
   resolves the binary; `pane run` types a line we composed. After `herdsman-child-command` the second is
   the configured path, which is the first step out.
 - **The agent record:** `agent get` / `list` / `rename` / `wait`, plus the official Herdr Pi reporter
-  extension that supplies `agent_session` and lifecycle authority, with Herdr's screen detection as a
+  extension that supplies `agent_session` and reported execution status, with Herdr's screen detection as a
   status fallback when no reporter is loaded. Presence, `lost` and the alias we address a worker by all
   read from that record, and Herdr #3208 forced the fresh-shell `agent_pane_busy` retry we carry.
 
@@ -79,7 +87,8 @@ Radar owning pane detection and restart is the same split from the other side.
 
 ## Recovery through the tools
 
-`agent_continue` now recovers a proven lost, directly owned generation using the exact saved Pi session,
+`agent_continue` already resumes a directly owned saved session with no mailbox representation. It
+also recovers a proven lost, directly owned generation using the exact saved Pi session,
 without a close-first step or manual mailbox removal. It uses the shared locked close preflight to retire
 the stale record, preserves unread durable results, and relaunches under the same label. A surviving shell
 is left untouched; uncertain identity still refuses. `agent_close` retires resources without deleting the
@@ -117,31 +126,35 @@ refusals, plus carried-background-result settlement contract tests. No live reco
 8. The upstream pre-extraction alignment waits on the owner's approval of
    `.pi-herdsman/pre-extraction-adoption-plan.md` (every fork divergence classified incidental or
    deliberate, deliberate ones kept behind a separable seam). It edits `index.ts` and `herdr.ts`, so it
-   takes those two files alone. `herdsman-child-command` is landed (`73dc8bc3`, `37f2ec32`); open under it
-   are the dotfiles-side pane-env verification and the model-driven delegated launch/restart smoke, whose
-   harness needs a model reachable inside its isolated Pi directory.
+   requires exclusive ownership of those files during integration. `herdsman-child-command` is landed
+   (`73dc8bc3`, `37f2ec32`); only archived dotfiles-side verification task 3.2 remains unticked. The operator confirmed the model-driven
+   launch/restart smoke; the change is archived and synced. The isolated harness limitation remains
+   recorded as provenance, not an outstanding production smoke.
 9. `#258` exact-path lookup: a separate upstream improvement to the managed-Lead/worktree resolution
    (replaces another global session scan). Independent of the alignment.
 10. `pi-herdsman` AOT integration is implemented and build-verified in dotfiles at source pin
-    `305068ec`; activation is pending the coordinated host switch. Both lead and child compile it.
+    `305068ec`; both lead and child compile it in the adopted Pi-Bolt deployment. The original build evidence was
+    recorded before activation; current source-pin adoption is a separate deployment check.
     The staging recipe pins `HERDSMAN_EXTENSION_PATH` and `BUILTIN_AGENT_DIR` to readable source paths,
     and maps the background-work import to the staged bash-processes sibling. The recipe stages that
     dependency even if it is not registered. No portable runtime-source patch is needed.
     Both package builds pass with the measured AOT ceiling `367961`. Isolated RPC startup smokes load
     compiled Herdsman with discovery disabled; the configured child launcher also drops a redundant
-    herdsman extension path. No live delegated-launch/compaction smoke is claimed.
-    Planned packaging change (owner, 2026-10-07): the profile-level bash wrapper may go, with the
-    entrypoints (`pi`, `pi-bolt`, `pi-bolt-child`) provided by the store derivation itself. That removes
+    herdsman extension path. The child-command smoke was operator-confirmed; a separate AOT-specific
+    launch/compaction observation is not established by that earlier confirmation.
+    The entrypoint packaging move is committed in dotfiles (`b5bb7235`):
+    `pi`, `pi-bolt` and `pi-bolt-child` are provided by the package derivation. That removes
     the wrapper-to-payload hop for consumers — PATH resolves straight into the derivation, so family and
     version are exact — which is exactly the bridge Radar's strict-literal launcher resolver was built for,
-    and it retires that parser instead of documenting it. What must survive the move: the per-user
+    and allows that transition parser to be retired once Radar verifies the new entrypoints.
+    The packaging contract to preserve is the per-user
     `$HOME/.pi/agent/npm/...` extension flags and the conditional herdr extension (a runtime test inside the
     store script), the child's `-e` filtering plus its `--no-extensions -e builtin:mcp -e builtin:codemode`
     injection, and `PI_HERDSMAN_CHILD_COMMAND` (a bare PATH name or the store path; herdsman records the
     resolved absolute path either way). Still worth emitting from the build even then: an identity stamp
     (`$out/nix-support/pi-bolt-identity.json` — family, version, Pi version, compiled plugins, herdsman
     revision), because a store path cannot say which plugins are compiled in and under AOT it is the only
-    build identity a process can report. Radar consumes both. Note also that `pi` is now the pi-bolt lead
+    build identity a process can report. Radar's exact metadata-consumer status must be verified separately. Note also that `pi` is now the pi-bolt lead
     launcher, so `pi` and `pi-bolt` distinguish nothing — family must come from the store root or the env.
 11. Live residuals of the landed worker-lifecycle fixes. Landed and gate-green but not yet observed in a
     real session: the aborted-run fact and the hold belonging to it (`043bb041` — Pi 1.1.0 reports how the
@@ -153,8 +166,8 @@ refusals, plus carried-background-result settlement contract tests. No live reco
     once its assignment settled, recorded as `pi_herdsman_state_compaction_continuation_skipped`), provider
     error text in a failure result (`34506f46`), and the unclaimed-alias refusal (`3fcdfeb3`). Each needs
     the shape that produced it: a budget crossing with the assignment settling mid-compaction, a real
-    provider failure, and a pane whose occupant does not claim its alias. Retention-off (below) is what
-    makes the orphan-continuation class unreachable rather than merely guarded.
+    provider failure, and a pane whose occupant does not claim its alias. Retention-off reduces the lifetime of a delivered execution;
+    it does not make continuation guards or live verification unnecessary.
 12. Residuals from the stale-generation slice (`3fcdfeb3`). The guard lives in `managedAgentPresence`, so
     an unclaimed alias is refused everywhere, but nothing in the product can *resolve* the nameless-pane
     shape: `proveExactRunningAgent` still reports `agent_not_found` for it, so an operator has to inspect
@@ -178,6 +191,18 @@ refusals, plus carried-background-result settlement contract tests. No live reco
     and feeds it into `planAbortRecovery`, to decide whether a compaction-induced child abort may be
     resumed. `agent_settled.aborted` is the direct fact for that question. Check first whether the path
     receives settled events in this deployment. Not started; no owner assigned.
+
+15. Radar daemon publication adoption (landed, live adoption unverified):
+    Herdsman publishes Pi execution facts and owner assignment facts to Radar's control-socket
+    registry (contract v1, wire pin `92ea9d37`, corrected consumer reference `4af0ff6b`; vendored
+    fixture byte-identical to canonical). `radar-client.ts`, `radar-publication.ts`,
+    `radar-execution.ts` plus wiring in `index.ts`; ADR 0031 records identity, containment and read
+    boundary decisions. Radar-only publication, no new Herdr mirror; existing launch readiness,
+    presence proofs and control-state consumers still use Herdr until a separately scoped coordinator
+    cutover. Remaining: controlled live assignment in a deployed lead and child (no live daemon read
+    exists yet); Radar contract gap for mutable current-session association; Radar-side registry
+    pruning (records accumulate per incarnation, and a vanished target's assignment writer retries
+    one acquire per heartbeat until that child closes).
 
 ## pi-jev: native classifier and AOT
 
