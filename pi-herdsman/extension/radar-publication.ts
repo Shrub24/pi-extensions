@@ -84,7 +84,7 @@ export function readProcessBirth(): ProcessBirth | undefined {
 	}
 }
 
-const RECORD_NAME = /^(?:subjects|channels|bindings)\/[a-z0-9-]{1,64}\.json$/;
+const RECORD_NAME = /^(?:subjects|channels|context|bindings)\/[a-z0-9-]{1,64}\.json$/;
 const MAX_RECORD_BYTES = 64 * 1024;
 const PRIVATE_MODE = 0o700;
 const RECORD_MODE = 0o600;
@@ -305,6 +305,30 @@ type ChannelRecord = {
 	diagnostic?: string;
 };
 
+/** One current-session report, before or after the daemon accepted it. */
+type ContextReport = {
+	sequence: number;
+	session: string | null;
+	lease_ms: number;
+	observed_at: string;
+};
+
+/**
+ * The persisted state of one process's current-session record. It is separate
+ * from the channel records because the daemon keeps it in its own per-subject
+ * file, with its own writer binding and sequence.
+ */
+type ContextRecord = {
+	version: typeof RADAR_PUBLICATION_VERSION;
+	agent_id: string;
+	publisher: RadarPublisherIdentity;
+	writer?: { handle: string; generation: number };
+	sequence: number;
+	accepted?: ContextReport & { sent_at: number };
+	pending?: ContextReport;
+	diagnostic?: string;
+};
+
 /** What a managed child tells its owner: which exact subject to publish about. */
 export type RadarChildBinding = {
 	version: typeof RADAR_PUBLICATION_VERSION;
@@ -389,6 +413,32 @@ function pendingAt(value: unknown, keys = PENDING_KEYS): PendingPublish | undefi
 	if (lease === undefined || observed === undefined || snapshot === undefined)
 		return undefined;
 	return { sequence, snapshot, lease_ms: lease, observed_at: observed };
+}
+
+const CONTEXT_PENDING_KEYS = "lease_ms,observed_at,sequence,session";
+const CONTEXT_ACCEPTED_KEYS = "lease_ms,observed_at,sent_at,sequence,session";
+
+/** The reported session, or `undefined` when the field is not one of the two. */
+function sessionAt(value: unknown): string | null | undefined {
+	if (typeof value !== "object" || value === null) return undefined;
+	const found = (value as Record<string, unknown>).session;
+	if (found === null) return null;
+	return typeof found === "string" ? found : undefined;
+}
+
+function contextReportAt(
+	value: unknown,
+	keys: string,
+): ContextReport | undefined {
+	if (!exactKeys(value, keys)) return undefined;
+	const sequence = numberAt(value, "sequence");
+	const lease = numberAt(value, "lease_ms");
+	const observed = textAt(value, "observed_at");
+	const session = sessionAt(value);
+	if (sequence === undefined || sequence < 1) return undefined;
+	if (lease === undefined || observed === undefined || session === undefined)
+		return undefined;
+	return { sequence, session, lease_ms: lease, observed_at: observed };
 }
 
 export type RadarChannelWriter = {
@@ -730,9 +780,310 @@ function createChannelWriter(input: ChannelWriterInput): RadarChannelWriter {
 	};
 }
 
+export type RadarContextWriter = {
+	/**
+	 * Report this process's current session. `null` is the explicit "no current
+	 * session" the daemon serves; `undefined` never is, because a process that
+	 * does not know its session has nothing to assert.
+	 */
+	update(session: string | null): void;
+	/** Release this writer's timers. The accepted report stays until it goes stale. */
+	stop(): void;
+	/** Re-arm a stopped writer after an extension reload. */
+	reopen(): void;
+	diagnostic(): string | undefined;
+};
+
+type ContextWriterInput = {
+	store: PublicationStore;
+	client: RadarClient;
+	scheduler: RadarScheduler;
+	recordName: string;
+	publisher: RadarPublisherIdentity;
+	/**
+	 * The exact subject this process registered. `recheck` forgets a cached
+	 * subject so the identical immutable content is registered again, which is
+	 * what a daemon that lost its state root needs.
+	 */
+	subject(recheck: boolean): Promise<string | undefined>;
+	leaseMs: number;
+	heartbeatMs: number;
+};
+
+/**
+ * This process's own current session, under the channel discipline: one writer,
+ * a strictly forward sequence and a lease. The first publish binds the writer
+ * the daemon issues; a later session is a newer sequence under that same
+ * binding, and the lease is renewed from the same cadence as the process's
+ * facts rather than from a second heartbeat.
+ *
+ * A refusal is a real disagreement about ownership, so it stops this writer
+ * with one diagnostic instead of taking over a binding it did not observe.
+ */
+function createContextWriter(input: ContextWriterInput): RadarContextWriter {
+	const { store, client, scheduler, recordName, publisher } = input;
+	let record = loadRecord();
+	let desired: string | null | undefined;
+	let running = false;
+	let again = false;
+	let recovering = false;
+	let stopped = false;
+	let fenced = false;
+	let pump: RadarTimer | undefined;
+
+	function blank(agentId: string): ContextRecord {
+		return {
+			version: RADAR_PUBLICATION_VERSION,
+			agent_id: agentId,
+			publisher,
+			sequence: 0,
+		};
+	}
+
+	function loadRecord(): ContextRecord {
+		const value = store.read(recordName);
+		const agentId = textAt(value, "agent_id");
+		const storedPublisher = recordAt(value, "publisher");
+		// A record written for another publisher is not this writer's binding:
+		// adopting it would publish under someone else's identity.
+		if (
+			numberAt(value, "version") !== RADAR_PUBLICATION_VERSION ||
+			agentId === undefined ||
+			(!isUuid(agentId) && agentId !== "") ||
+			textAt(storedPublisher, "source") !== publisher.source ||
+			textAt(storedPublisher, "incarnation") !== publisher.incarnation ||
+			textAt(storedPublisher, "reporting_owner") !== publisher.reporting_owner
+		)
+			return blank("");
+		const writer = recordAt(value, "writer");
+		const handle = textAt(writer, "handle");
+		const generation = numberAt(writer, "generation");
+		if (
+			writer !== undefined &&
+			(!exactKeys(writer, WRITER_KEYS) || !isUuid(handle) || generation === undefined)
+		)
+			return blank(agentId);
+		const pending = contextReportAt(recordAt(value, "pending"), CONTEXT_PENDING_KEYS);
+		const acceptedValue = recordAt(value, "accepted");
+		const accepted = contextReportAt(acceptedValue, CONTEXT_ACCEPTED_KEYS);
+		const sentAt = numberAt(acceptedValue, "sent_at");
+		return {
+			version: RADAR_PUBLICATION_VERSION,
+			agent_id: agentId,
+			publisher,
+			...(handle !== undefined && generation !== undefined
+				? { writer: { handle, generation } }
+				: {}),
+			sequence: numberAt(value, "sequence") ?? 0,
+			...(pending !== undefined ? { pending } : {}),
+			...(accepted !== undefined && sentAt !== undefined
+				? { accepted: { ...accepted, sent_at: sentAt } }
+				: {}),
+			...(textAt(value, "diagnostic") !== undefined
+				? { diagnostic: textAt(value, "diagnostic") }
+				: {}),
+		};
+	}
+
+	/** One bounded diagnostic: the first cause is the one a reader reconciles. */
+	function note(message: string): void {
+		if (record.diagnostic !== undefined) return;
+		record.diagnostic = message.slice(0, 256);
+		save();
+	}
+
+	function save(): void {
+		store.write(recordName, record);
+	}
+
+	function fence(message: string): void {
+		fenced = true;
+		stopPump();
+		note(`context stopped: ${message}`);
+	}
+
+	function startPump(): void {
+		if (pump !== undefined || stopped || fenced) return;
+		pump = scheduler.setInterval(() => kick(), input.heartbeatMs);
+		pump.unref?.();
+	}
+
+	function stopPump(): void {
+		if (pump === undefined) return;
+		scheduler.clearInterval(pump);
+		pump = undefined;
+	}
+
+	async function ensureSubject(): Promise<boolean> {
+		if (record.writer !== undefined) return true;
+		// A subject the daemon no longer holds is registered again from the
+		// identical immutable content that was persisted with it.
+		const agentId = await input.subject(recovering);
+		if (agentId === undefined) return false;
+		if (record.agent_id !== agentId) {
+			// A different subject incarnation is a different context record: the
+			// previous binding, sequence and unresolved report do not apply to it.
+			record = blank(agentId);
+			save();
+		}
+		return true;
+	}
+
+	function heartbeatDue(): boolean {
+		return (
+			record.accepted !== undefined &&
+			scheduler.now() - record.accepted.sent_at >= input.heartbeatMs
+		);
+	}
+
+	async function send(pending: ContextReport): Promise<void> {
+		const writer = record.writer;
+		const answer = await client.context({
+			agent_id: record.agent_id,
+			publisher,
+			// A first publish presents no handle: the daemon binds the writer the
+			// publisher already is, which is the binding this writer then keeps.
+			...(writer !== undefined ? { writer_handle: writer.handle } : {}),
+			sequence: pending.sequence,
+			lease_ms: pending.lease_ms,
+			observed_at: pending.observed_at,
+			context: { session: pending.session },
+		});
+		if (answer.ok) {
+			recovering = false;
+			record.writer = {
+				handle: answer.value.writer.handle,
+				generation: answer.value.writer.generation,
+			};
+			record.sequence = Math.max(record.sequence, answer.value.writer.sequence);
+			record.accepted = {
+				...pending,
+				sent_at: answer.value.warning === undefined
+					? scheduler.now()
+					: record.accepted?.sent_at ?? scheduler.now(),
+			};
+			record.pending = undefined;
+			save();
+			return;
+		}
+		if (
+			answer.code === "refused" ||
+			answer.code === "bad_params" ||
+			// A daemon that speaks the registry but does not serve this record would
+			// refuse every retry the same way; one diagnostic beats a silent retry
+			// loop once per heartbeat.
+			answer.code === "unknown_method"
+		) {
+			fence(answer.message);
+			return;
+		}
+		if (answer.code === "not_found") {
+			// The subject is gone. Nothing of the old subject can be republished
+			// against, so the whole record is dropped: the next heartbeat registers
+			// the identical content again and binds a fresh writer to it.
+			record = blank("");
+			recovering = true;
+			save();
+			return;
+		}
+		// A timeout, a closed connection or a lost reply leaves the exact request
+		// pending, so the retry replays it byte for byte and the lease does not
+		// silently advance.
+	}
+
+	async function stage(session: string | null): Promise<void> {
+		const pending: ContextReport = {
+			sequence: record.sequence + 1,
+			session,
+			lease_ms: input.leaseMs,
+			observed_at: new Date(scheduler.now()).toISOString(),
+		};
+		// Persisted before it is sent, so a lost reply replays this exact request.
+		record.pending = pending;
+		save();
+		await send(pending);
+	}
+
+	async function drainOnce(): Promise<void> {
+		if (fenced) return;
+		if (record.pending !== undefined) {
+			// An unresolved request is never overwritten by newer content.
+			await send(record.pending);
+			return;
+		}
+		if (desired === undefined) return;
+		if (!(await ensureSubject())) return;
+		if (fenced) return;
+		if (
+			record.writer === undefined ||
+			record.accepted === undefined ||
+			record.accepted.session !== desired
+		) {
+			await stage(desired);
+			return;
+		}
+		if (heartbeatDue()) await stage(record.accepted.session);
+	}
+
+	async function drain(): Promise<void> {
+		if (running || stopped || fenced) return;
+		running = true;
+		try {
+			await drainOnce();
+		} catch (error) {
+			fenced = true;
+			stopPump();
+			try {
+				note(`context storage failure: ${String(error).slice(0, 180)}`);
+			} catch {
+				// Persistence failure is diagnostic-only; never escape into the host.
+			}
+		} finally {
+			running = false;
+			if (again && !stopped && !fenced) {
+				again = false;
+				kick();
+			}
+		}
+	}
+
+	function kick(): void {
+		if (stopped || fenced) return;
+		startPump();
+		if (running) {
+			again = true;
+			return;
+		}
+		void drain().catch(() => undefined);
+	}
+
+	return {
+		update(session) {
+			if (fenced || session === desired) return;
+			// A session reported while this writer is stopped is remembered, not
+			// published: only `reopen` restarts the timers, and it must see the
+			// session the process is in now rather than the one it left.
+			desired = session;
+			if (stopped) return;
+			kick();
+		},
+		stop() {
+			stopped = true;
+			stopPump();
+		},
+		reopen() {
+			stopped = false;
+			if (desired !== undefined || record.pending !== undefined) kick();
+		},
+		diagnostic: () => record.diagnostic,
+	};
+}
+
 export type RadarPublication = {
 	/** This process's own execution channel. */
 	execution: RadarChannelWriter;
+	/** This process's own current session. */
+	context: RadarContextWriter;
 	/** The assignment channel of one owned child subject. */
 	assignment(agentId: string, reportingOwner: string): RadarChannelWriter;
 	/** The exact subject an owned child registered, when it published one. */
@@ -806,6 +1157,12 @@ function unavailablePublication(error?: unknown): RadarPublication {
 	};
 	return {
 		execution: writer,
+		context: {
+			update: () => undefined,
+			stop: () => undefined,
+			reopen: () => undefined,
+			diagnostic: () => diagnostic,
+		},
 		assignment: () => writer,
 		binding: () => undefined,
 		retireAssignment: () => undefined,
@@ -852,6 +1209,12 @@ function createRadarPublicationInner(
 			.update(`${channel}\0${incarnation}\0${target ?? ""}`)
 			.digest("hex")
 			.slice(0, 32)}.json`;
+
+	/** One current-session record per publisher, for the same reason as channels. */
+	const contextRecord = `context/${createHash("sha256")
+		.update(`context\0${incarnation}`)
+		.digest("hex")
+		.slice(0, 32)}.json`;
 
 	/**
 	 * The immutable registration is written before it is ever sent, and the
@@ -957,10 +1320,22 @@ function createRadarPublicationInner(
 		heartbeatMs: options.heartbeatMs ?? RADAR_HEARTBEAT_MS,
 	});
 
+	const context = createContextWriter({
+		store,
+		client,
+		scheduler,
+		recordName: contextRecord,
+		publisher: publisher("herdsman-pi"),
+		subject: ensureSubject,
+		leaseMs: options.leaseMs ?? RADAR_LEASE_MS,
+		heartbeatMs: options.heartbeatMs ?? RADAR_HEARTBEAT_MS,
+	});
+
 	const assignmentWriters = new Map<string, RadarChannelWriter>();
 
 	const publication: RadarPublication = {
 		execution,
+		context,
 		assignment(target, reportingOwner: string) {
 			const existing = assignmentWriters.get(target);
 			if (existing !== undefined) return existing;
@@ -1025,14 +1400,17 @@ function createRadarPublicationInner(
 			// acquiring first would be an implicit takeover of the channel.
 			assignmentWriters.get(targetAgentId)?.retire();
 		},
-		diagnostic: () => registrationDiagnostic ?? execution.diagnostic(),
+		diagnostic: () =>
+			registrationDiagnostic ?? execution.diagnostic() ?? context.diagnostic(),
 		stop() {
 			for (const writer of assignmentWriters.values()) writer.stop();
 			execution.stop();
+			context.stop();
 		},
 		reopen() {
 			for (const writer of assignmentWriters.values()) writer.reopen();
 			execution.reopen();
+			context.reopen();
 		},
 	};
 

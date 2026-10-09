@@ -32,7 +32,12 @@ const frozenScheduler: RadarScheduler = {
 };
 
 function harness(
-	options: { managed?: boolean; slot?: RadarProcessSlot; root?: string } = {},
+	options: {
+		managed?: boolean;
+		slot?: RadarProcessSlot;
+		root?: string;
+		scheduler?: RadarScheduler;
+	} = {},
 ) {
 	const handlers = new Map<
 		string,
@@ -68,6 +73,21 @@ function harness(
 			calls.push({ method: "agent.publish", params });
 			return ok({ sequence: params.sequence });
 		},
+		context: async (params) => {
+			calls.push({ method: "agent.context", params });
+			minted += 1;
+			return ok({
+				writer: {
+					handle:
+						params.writer_handle ??
+						`00000000-0000-4000-8000-${String(minted).padStart(12, "0")}`,
+					source: params.publisher.source,
+					incarnation: params.publisher.incarnation,
+					generation: 1,
+					sequence: params.sequence,
+				},
+			});
+		},
 		retire: async (params) => {
 			calls.push({ method: "agent.retire", params });
 			return ok(undefined);
@@ -97,7 +117,7 @@ function harness(
 			// Present and undefined: this platform reports no process claim, and
 			// absence is never inferred from a later successful read.
 			birth: undefined,
-			scheduler: frozenScheduler,
+			scheduler: options.scheduler ?? frozenScheduler,
 			...(options.managed
 				? {
 						managedBinding: {
@@ -114,6 +134,10 @@ function harness(
 		calls
 			.filter((call) => call.method === "agent.publish")
 			.map((call) => call.params.snapshot);
+	const contexts = () =>
+		calls
+			.filter((call) => call.method === "agent.context")
+			.map((call) => call.params);
 	const emit = (
 		name: string,
 		event: unknown = {},
@@ -127,6 +151,7 @@ function harness(
 		emit,
 		events,
 		snapshots,
+		contexts,
 		async settled(): Promise<void> {
 			for (let tick = 0; tick < 8; tick += 1)
 				await new Promise((resolve) => setImmediate(resolve));
@@ -327,6 +352,102 @@ test("a managed child registers its binding and hands the subject to its owner",
 			observed_at: new Date(frozenScheduler.now()).toISOString(),
 		});
 		assert.equal(h.adapter.binding()?.incarnation, INCARNATION);
+	} finally {
+		h.stop();
+	}
+});
+
+test("the current session is published as a mutable fact of the same subject", async () => {
+	const h = harness();
+	const session = (id: string, idle: boolean) => ({
+		isIdle: () => idle,
+		sessionManager: { getSessionId: () => id },
+	});
+	const SESSION_A = "11111111-2222-4333-8444-555555555555";
+	const SESSION_B = "66666666-7777-4888-8999-aaaaaaaaaaaa";
+	try {
+		h.emit("session_start", {}, session(SESSION_A, true));
+		await h.settled();
+		const [first] = h.contexts();
+		// A first publish binds the writer and carries the session alone.
+		assert.equal("writer_handle" in first, false);
+		assert.deepEqual(first.context, { session: SESSION_A });
+		assert.equal(first.sequence, 1);
+		assert.deepEqual(first.publisher, {
+			source: "herdsman-pi",
+			incarnation: INCARNATION,
+		});
+		assert.equal(
+			first.agent_id,
+			h.calls.find((call) => call.method === "agent.publish")!.params.agent_id,
+		);
+
+		// A replaced session is a newer sequence under the same subject, never a
+		// second registration.
+		h.emit("session_shutdown");
+		h.emit("session_start", {}, session(SESSION_B, false));
+		await h.settled();
+		assert.equal(
+			h.calls.filter((call) => call.method === "agent.register").length,
+			1,
+		);
+		const [, switched] = h.contexts();
+		assert.match(switched.writer_handle, /^[0-9a-f]{8}-[0-9a-f]{4}-/);
+		assert.equal(switched.sequence, 2);
+		assert.deepEqual(switched.context, { session: SESSION_B });
+		assert.equal(switched.agent_id, first.agent_id);
+	} finally {
+		h.stop();
+	}
+});
+
+test("a session Pi cannot name is left unreported", async () => {
+	const h = harness();
+	try {
+		// A session file path is not a session UUID, and an explicit null would
+		// claim this process has no session at all: neither is published.
+		h.emit(
+			"session_start",
+			{},
+			{ isIdle: () => true, sessionManager: { getSessionId: () => "/home/dev/.pi/sessions/one.jsonl" } },
+		);
+		await h.settled();
+		assert.deepEqual(h.contexts(), []);
+		assert.equal(h.snapshots().length, 1);
+	} finally {
+		h.stop();
+	}
+});
+
+test("a replaced session is never renewed as the one it replaced", async () => {
+	// A clock that moves without ever firing: the adapter is still driven only by
+	// Pi's events, but the heartbeat that renewal is measured against has lapsed.
+	let now = 1_700_000_000_000;
+	const h = harness({
+		scheduler: {
+			setTimeout: () => ({ unref: () => {} }),
+			clearTimeout: () => {},
+			setInterval: () => ({ unref: () => {} }),
+			clearInterval: () => {},
+			now: () => now,
+		},
+	});
+	const session = (id: string) => ({
+		isIdle: () => true,
+		sessionManager: { getSessionId: () => id },
+	});
+	const FIRST = "11111111-2222-4333-8444-555555555555";
+	const SECOND = "66666666-7777-4888-8999-aaaaaaaaaaaa";
+	try {
+		h.emit("session_start", {}, session(FIRST));
+		await h.settled();
+		h.emit("session_shutdown");
+		now += 60_000;
+		h.emit("session_start", {}, session(SECOND));
+		await h.settled();
+		const contexts = h.contexts();
+		assert.equal(contexts.length, 2);
+		assert.deepEqual(contexts[1].context, { session: SECOND });
 	} finally {
 		h.stop();
 	}

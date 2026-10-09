@@ -78,8 +78,8 @@ Location includes only known backend-qualified facts, never guessed tab identifi
 Radar's owner confirmed the immutable-registration policy against `92ea9d37`: register stable process
 facts only. Omit session/location/owner/run/label wherever they can change for the same process; include
 managed run/owner only when fixed for its lifetime. Session switch or in-process fork does not rotate
-subject identity or retire writers. Mutable current-session context is a separate protocol gap; do not
-encode it into prose fields or freeze stale context in registration. Immutable retries stay identical.
+subject identity or retire writers. Mutable current-session context is published through `agent.context`
+using the same writer with a newer sequence. Registration remains immutable and retries stay identical.
 
 ## Publication ownership and vocabulary
 
@@ -171,10 +171,7 @@ breaking launch readiness. Preserve its behavior in Radar now; retire its transp
 
 ## Contract gates and follow-ups sent to Radar
 
-G1 resolved by Radar owner: use stable process registration and omit mutable session association.
-Report follow-up context needs: current Pi session UUID, association change at session_start/switch/fork,
-and source-labelled session association shared by execution/assignment. Session file paths remain
-private. Do not overload activity/waiting/outcome vocabulary to carry identity context.
+G1 resolved and implemented: Radar feature pin `4e37697826c2ba4a28c92a93e22747df2bc7097e` adds source-labelled `agent.context`; fixture-validation/reference pin `da0ba99a09643736e39c44903d69ffdc1e5df65b` corrects the canonical fixture and validates full response equality. Publish only the current session UUID or explicit null through the same writer with a strictly newer sequence. Session changes do not re-register or change subject, agent_id or writer generation. Renew on the existing 15-second publication cadence under the default 30-second lease. A warned identical replay does not renew local accepted time. Session paths remain private; never overload registration or execution/assignment snapshots.
 
 G2 corrected by Radar owner: pagination already exists in `92ea9d37`; the reference omitted it.
 `agent.list` takes `limit` (1..100, default 50) and optional `after`; its result contains `agents` and

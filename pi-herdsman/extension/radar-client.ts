@@ -114,6 +114,15 @@ export type RadarWriterBinding = {
 	retired_at?: string;
 };
 
+/**
+ * The one mutable fact this process owns about itself: its current Pi session.
+ * `null` is an explicit "no current session", which the daemon serves
+ * differently from a record it never received.
+ */
+export type RadarContextValue = {
+	session: string | null;
+};
+
 export type RadarCapabilities = {
 	protocol: number;
 	backend?: string;
@@ -265,6 +274,34 @@ function numberAt(value: unknown, field: string): number | undefined {
 		: undefined;
 }
 
+/** A writer binding a channel or context reply hands back to its publisher. */
+function writerBinding(value: unknown): RadarWriterBinding | undefined {
+	const handle = stringAt(value, "handle");
+	const source = stringAt(value, "source");
+	const incarnation = stringAt(value, "incarnation");
+	const generation = numberAt(value, "generation");
+	const sequence = numberAt(value, "sequence");
+	if (
+		!isUuid(handle) ||
+		source === undefined ||
+		incarnation === undefined ||
+		generation === undefined ||
+		sequence === undefined
+	)
+		return undefined;
+	const reportingOwner = stringAt(value, "reporting_owner");
+	const retiredAt = stringAt(value, "retired_at");
+	return {
+		handle,
+		source,
+		incarnation,
+		...(reportingOwner !== undefined ? { reporting_owner: reportingOwner } : {}),
+		generation,
+		sequence,
+		...(retiredAt !== undefined ? { retired_at: retiredAt } : {}),
+	};
+}
+
 export type RadarClient = {
 	socketPath(): string;
 	ping(): Promise<RadarResult<RadarCapabilities>>;
@@ -286,6 +323,16 @@ export type RadarClient = {
 		observed_at?: string;
 		snapshot: RadarSnapshot;
 	}): Promise<RadarResult<{ sequence: number }>>;
+	context(request: {
+		agent_id: string;
+		publisher: RadarPublisherIdentity;
+		writer_handle?: string;
+		replace?: { generation: number; handle: string };
+		sequence: number;
+		lease_ms?: number;
+		observed_at?: string;
+		context: RadarContextValue;
+	}): Promise<RadarResult<{ writer: RadarWriterBinding; warning?: string }>>;
 	retire(request: {
 		agent_id: string;
 		channel: RadarChannel;
@@ -501,20 +548,12 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 					...(request.replace !== undefined ? { replace: request.replace } : {}),
 				});
 				if (!answer.ok) return answer;
-				const writer = (answer.value as { writer?: unknown }).writer;
-				const handle = stringAt(writer, "handle");
-				const generation = numberAt(writer, "generation");
-				if (!isUuid(handle) || generation === undefined || numberAt(writer, "sequence") === undefined || stringAt(writer, "source") === undefined || stringAt(writer, "incarnation") === undefined)
+				const writer = writerBinding(
+					(answer.value as { writer?: unknown }).writer,
+				);
+				if (writer === undefined)
 					return protocol("acquire reply carries no writer binding");
-				return { ok: true, value: {
-					handle,
-					source: stringAt(writer, "source") ?? "",
-					incarnation: stringAt(writer, "incarnation") ?? "",
-					...(stringAt(writer, "reporting_owner") !== undefined ? { reporting_owner: stringAt(writer, "reporting_owner") } : {}),
-					generation,
-					sequence: numberAt(writer, "sequence") ?? 0,
-					...(stringAt(writer, "retired_at") !== undefined ? { retired_at: stringAt(writer, "retired_at") } : {}),
-				} };
+				return { ok: true, value: writer };
 			});
 		},
 		async publish(request) {
@@ -534,6 +573,35 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 				const sequence = numberAt(writer, "sequence");
 				if (sequence === undefined) return protocol("publish reply carries no accepted sequence");
 				return { ok: true, value: { sequence } };
+			});
+		},
+		async context(request) {
+			return withRegistry(async () => {
+				const answer = await call("agent.context", {
+					agent_id: request.agent_id,
+					publisher: request.publisher,
+					...(request.writer_handle !== undefined
+						? { writer_handle: request.writer_handle }
+						: {}),
+					...(request.replace !== undefined ? { replace: request.replace } : {}),
+					sequence: request.sequence,
+					...(request.lease_ms !== undefined ? { lease_ms: request.lease_ms } : {}),
+					...(request.observed_at !== undefined
+						? { observed_at: request.observed_at }
+						: {}),
+					context: request.context,
+				});
+				if (!answer.ok) return answer;
+				const writer = writerBinding(
+					(answer.value as { writer?: unknown }).writer,
+				);
+				if (writer === undefined)
+					return protocol("context reply carries no writer binding");
+				const warning = stringAt(answer.value, "warning");
+				return {
+					ok: true,
+					value: { writer, ...(warning !== undefined ? { warning } : {}) },
+				};
 			});
 		},
 		async retire(request) {

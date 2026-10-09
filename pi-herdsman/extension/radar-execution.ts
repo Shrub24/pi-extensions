@@ -1,5 +1,6 @@
 import {
 	boundedRadarSnapshot,
+	isUuid,
 	type RadarClient,
 	type RadarScheduler,
 	type RadarSnapshot,
@@ -93,6 +94,12 @@ function unavailablePublication(): RadarPublication {
 	};
 	return {
 		execution: writer,
+		context: {
+			update: () => undefined,
+			stop: () => undefined,
+			reopen: () => undefined,
+			diagnostic: () => "Radar private storage is unavailable",
+		},
 		assignment: () => writer,
 		binding: () => undefined,
 		retireAssignment: () => undefined,
@@ -111,7 +118,8 @@ function unavailablePublication(): RadarPublication {
  * requires a pane, or restricts itself to TUI mode.
  *
  * Pi session association is deliberately absent from immutable registration: a
- * process can switch, resume or fork sessions without becoming another subject.
+ * process can switch, resume or fork sessions without becoming another subject,
+ * so the current session is the mutable context record instead.
  */
 export function createRadarExecutionAdapter(
 	pi: RadarExecutionEventApi,
@@ -183,6 +191,21 @@ export function createRadarExecutionAdapter(
 		};
 	}
 
+	/**
+	 * Report the session this process is now in. A session Pi cannot name as a
+	 * canonical UUID is left unreported: absent context is unknown, and publishing
+	 * the explicit null would claim there is no session at all.
+	 */
+	function reportSession(context: any): void {
+		const session = context?.sessionManager?.getSessionId?.();
+		if (!isUuid(session)) return;
+		try {
+			publication.context.update(session);
+		} catch {
+			// Optional publication must not interfere with Pi's lifecycle handler.
+		}
+	}
+
 	function emit(): void {
 		if (stopped || !rootSession) return;
 		const snapshot = boundedRadarSnapshot(currentSnapshot());
@@ -223,6 +246,9 @@ export function createRadarExecutionAdapter(
 
 	on("session_start", (_event, context) => {
 		rootSession = true;
+		// The session comes first: re-arming the publication must renew the session
+		// this process is in now, never the one a previous session left behind.
+		reportSession(context);
 		// A process can replace or resume its session without a new process, so the
 		// same publication is re-armed rather than replaced.
 		publication.reopen();

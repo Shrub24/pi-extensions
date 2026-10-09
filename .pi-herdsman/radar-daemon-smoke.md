@@ -61,6 +61,19 @@ Two harness expectations were also updated to match approved fixes:
 - The owner test channel used a 1000 ms lease and 1000 ms heartbeat with a scratch-only accelerated
   scheduler pump; the execution adapter used its production default lease/heartbeat.
 
+## Mutable session-context extension
+
+The scratch harness supplied a canonical session UUID via Herdsman's actual `session_start` adapter and
+queried the local Radar daemon. It passed **25/25** checks at
+`/var/tmp/radar-consumer-certified-nqpW7H/result.json`: the context is visible as a fresh public
+projection (source/incarnation/generation/sequence/lease plus the UUID), while registration still omits
+session, owner, run and label. The run also repeated restart refresh, state-root reset, exact replay and
+fencing. The local daemon source was at `f05f045f`, whose ancestry includes the required feature pin
+`4e376978`; the fixture/reference validator was pinned separately at `da0ba99a`. This is a disposable
+real-daemon consumer smoke, not live-session adoption. The initial run's single failure was a harness
+timing assertion that read before asynchronous republish; widening the assertion to wait for the expected
+fact yielded 25/25.
+
 ## Limits
 
 This validates the actual TS consumer path against an isolated real daemon; it does not certify live

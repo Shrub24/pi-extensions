@@ -86,6 +86,20 @@ function fakeDaemon(script: Script = {}) {
 		}),
 		publish: async (params) =>
 			answer("agent.publish", params, () => ok({ sequence: params.sequence })),
+		context: async (params) =>
+			answer("agent.context", params, () => {
+				const handle = params.writer_handle ?? mint();
+				if (params.writer_handle === undefined) handles.push(handle);
+				return ok({
+					writer: {
+						handle,
+						source: params.publisher.source,
+						incarnation: params.publisher.incarnation,
+						generation: 1,
+						sequence: params.sequence,
+					},
+				});
+			}),
 		retire: async (params) => answer("agent.retire", params, () => ok(undefined)),
 	};
 	function answer(
@@ -674,6 +688,225 @@ test("the owner publishes about a child's subject and retires only its own write
 		assert.equal(daemon.params("agent.retire").writer_handle, daemon.handles[1]);
 	} finally {
 		cleanup();
+	}
+});
+
+const SESSION_A = "11111111-2222-4333-8444-555555555555";
+const SESSION_B = "66666666-7777-4888-8999-aaaaaaaaaaaa";
+
+test("a current session is published once and renewed from the same cadence", async () => {
+	const { root, store, cleanup } = makeRoot();
+	try {
+		const daemon = fakeDaemon();
+		const { scheduler, advance } = fakeScheduler();
+		const publication = publicationFor(daemon, {
+			dataRoot: root,
+			store,
+			scheduler,
+			slot: createRadarProcessSlot(),
+		});
+		publication.context.update(SESSION_A);
+		await settle();
+		const first = daemon.params("agent.context");
+		// A first publish presents no credential: the daemon binds the writer this
+		// publisher already is, and the payload is the session alone.
+		assert.equal("writer_handle" in first, false);
+		assert.deepEqual(first.context, { session: SESSION_A });
+		assert.equal(first.sequence, 1);
+		assert.equal(first.lease_ms, RADAR_LEASE_MS);
+
+		await advance(HEARTBEAT_MS);
+		// Renewal is a newer sequence under the issued binding, on the cadence that
+		// already carries this process's facts: no second heartbeat, no longer lease.
+		const renewed = daemon.params("agent.context", 1);
+		assert.equal(renewed.writer_handle, daemon.handles[0]);
+		assert.equal(renewed.sequence, 2);
+		assert.deepEqual(renewed.context, { session: SESSION_A });
+		assert.equal(renewed.lease_ms, RADAR_LEASE_MS);
+	} finally {
+		cleanup();
+	}
+});
+
+test("a session switch is a newer sequence under the same subject", async () => {
+	const { root, store, cleanup } = makeRoot();
+	try {
+		const daemon = fakeDaemon();
+		const { scheduler } = fakeScheduler();
+		const publication = publicationFor(daemon, {
+			dataRoot: root,
+			store,
+			scheduler,
+			slot: createRadarProcessSlot(),
+		});
+		publication.context.update(SESSION_A);
+		await settle();
+		publication.context.update(SESSION_B);
+		await settle();
+		// Switching or forking a session is not becoming another subject: no second
+		// registration, no second writer binding and no regressed sequence.
+		assert.equal(daemon.count("agent.register"), 1);
+		assert.equal(daemon.count("agent.context"), 2);
+		assert.equal(
+			daemon.params("agent.context", 0).agent_id,
+			daemon.params("agent.context", 1).agent_id,
+		);
+		assert.equal(daemon.params("agent.context", 1).writer_handle, daemon.handles[0]);
+		assert.equal(daemon.params("agent.context", 1).sequence, 2);
+		assert.deepEqual(daemon.params("agent.context", 1).context, {
+			session: SESSION_B,
+		});
+
+		// An unchanged session is not re-sent between heartbeats.
+		publication.context.update(SESSION_B);
+		await settle();
+		assert.equal(daemon.count("agent.context"), 2);
+
+		// An explicit null is the record's own value for "no current session": it
+		// is published as that fact, not as a missing one.
+		publication.context.update(null);
+		await settle();
+		assert.equal(daemon.params("agent.context", 2).sequence, 3);
+		assert.equal("session" in daemon.params("agent.context", 2).context, true);
+		assert.equal(daemon.params("agent.context", 2).context.session, null);
+	} finally {
+		cleanup();
+	}
+});
+
+test("a warned replay renews on the original lease origin, not on the replay", async () => {
+	const { root, store, cleanup } = makeRoot();
+	try {
+		// The daemon's answer to an identical replay: the stored record, with a
+		// warning that the lease was not renewed.
+		const replayWarning = (params: any) =>
+			ok({
+				writer: {
+					handle: params.writer_handle,
+					source: params.publisher.source,
+					incarnation: params.publisher.incarnation,
+					generation: 1,
+					sequence: params.sequence,
+				},
+				warning: "answered replay: the lease was not renewed",
+			});
+		const daemon = fakeDaemon({
+			"agent.context": (params, nth) => {
+				if (nth === 1) return refused("timeout", "lost ack");
+				return nth === 2 ? replayWarning(params) : undefined;
+			},
+		});
+		const { scheduler, advance } = fakeScheduler();
+		const publication = publicationFor(daemon, {
+			dataRoot: root,
+			store,
+			scheduler,
+			slot: createRadarProcessSlot(),
+		});
+		publication.context.update(SESSION_A);
+		await settle();
+
+		// One heartbeat in, the renewal goes out and its reply is lost.
+		await advance(HEARTBEAT_MS + HEARTBEAT_MS / 2);
+		assert.equal(daemon.count("agent.context"), 2);
+
+		// An extension reload between heartbeats replays the unresolved request, and
+		// the daemon answers that identical replay with the warning.
+		publication.context.reopen();
+		await settle();
+		assert.equal(daemon.count("agent.context"), 3);
+		assert.deepEqual(
+			daemon.params("agent.context", 2),
+			daemon.params("agent.context", 1),
+		);
+
+		// The lease the warning did not renew still started at the original
+		// acceptance, so the next heartbeat tick renews instead of waiting another
+		// full heartbeat after the replay.
+		await advance(HEARTBEAT_MS / 2);
+		assert.equal(daemon.count("agent.context"), 4);
+		const renewed = daemon.params("agent.context", 3);
+		assert.equal(renewed.sequence, 3);
+		assert.equal(renewed.writer_handle, daemon.handles[0]);
+		assert.deepEqual(renewed.context, { session: SESSION_A });
+
+		// An ordinary acceptance does draw the clock forward to its own time: this
+		// reload is half a heartbeat after it and stages nothing.
+		await advance(HEARTBEAT_MS / 2);
+		publication.context.reopen();
+		await settle();
+		assert.equal(daemon.count("agent.context"), 4);
+	} finally {
+		cleanup();
+	}
+});
+
+test("a context for a lost subject is bound again from a fresh sequence", async () => {
+	const { root, store, cleanup } = makeRoot();
+	try {
+		const daemon = fakeDaemon({
+			"agent.context": (_params, nth) =>
+				nth === 0 ? refused("not_found", "unknown agent") : undefined,
+		});
+		const { scheduler, advance } = fakeScheduler();
+		const publication = publicationFor(daemon, {
+			dataRoot: root,
+			store,
+			scheduler,
+			slot: createRadarProcessSlot(),
+		});
+		publication.context.update(SESSION_A);
+		await settle();
+		// A lost subject is registered again on the heartbeat, not in a hot loop.
+		assert.equal(daemon.count("agent.register"), 1);
+		await advance(HEARTBEAT_MS);
+		assert.equal(daemon.count("agent.register"), 2);
+		const rebound = daemon.params("agent.context", 1);
+		assert.equal("writer_handle" in rebound, false);
+		assert.equal(rebound.sequence, 1);
+		assert.deepEqual(rebound.context, { session: SESSION_A });
+	} finally {
+		cleanup();
+	}
+});
+
+test("a refused context stops with one diagnostic and no takeover", async () => {
+	// A refusal and a method this daemon does not serve are both permanent for the
+	// record's lifetime: neither is retried, and neither provokes a takeover.
+	for (const [code, message] of [
+		["refused", "context has a writer this publisher did not present"],
+		["unknown_method", "unknown method agent.context"],
+	] as const) {
+		const { root, store, cleanup } = makeRoot();
+		try {
+			const daemon = fakeDaemon({
+				"agent.context": (_params, nth) =>
+					nth === 0 ? refused(code, message) : undefined,
+			});
+			const { scheduler, advance } = fakeScheduler();
+			const publication = publicationFor(daemon, {
+				dataRoot: root,
+				store,
+				scheduler,
+				slot: createRadarProcessSlot(),
+			});
+			publication.context.update(SESSION_A);
+			await settle();
+			const diagnostic = `context stopped: ${message}`;
+			assert.equal(publication.context.diagnostic(), diagnostic);
+			assert.equal(publication.diagnostic(), diagnostic);
+			await advance(HEARTBEAT_MS * 4);
+			assert.equal(daemon.count("agent.context"), 1);
+			// Replacement stays explicit: a fenced writer never asks to take over.
+			assert.ok(
+				daemon
+					.all("agent.context")
+					.every((params) => params.replace === undefined),
+			);
+			assert.equal(publication.context.diagnostic(), diagnostic);
+		} finally {
+			cleanup();
+		}
 	}
 });
 

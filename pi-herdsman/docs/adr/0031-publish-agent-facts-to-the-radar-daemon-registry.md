@@ -2,11 +2,12 @@
 
 ## Decision
 
-Herdsman publishes two independent streams to Agent Radar's control-socket
-registry (contract version 1): Pi execution facts on the `execution` channel,
-authored by the running process, and owner assignment facts on the `assignment`
-channel, authored by the Herdsman that owns the assignment. Publisher code lives
-in `extension/radar-client.ts`, `extension/radar-publication.ts` and
+Herdsman publishes three records to Agent Radar's control-socket registry (contract
+version 1): Pi execution facts on the `execution` channel, authored by the running
+process; owner assignment facts on the `assignment` channel, authored by the
+Herdsman that owns the assignment; and that process's current Pi session as the
+registry's mutable context record, authored by the same running process. Publisher
+code lives in `extension/radar-client.ts`, `extension/radar-publication.ts` and
 `extension/radar-execution.ts`, wired from `extension/index.ts`. The generic
 execution adapter is role-independent: it also reports an ordinary or
 operator-owned Pi session that merely loads Herdsman, and it omits owner, run and
@@ -22,11 +23,20 @@ publication under `~/.pi/agent/pi-herdsman/radar/`. Linux
 be read; it never supplies identity.
 
 Registration carries only facts that are stable for the life of the process.
-Location, launch specification, current session and mutable assignment context
-are deliberately not published; mutable session association is a Radar contract
-gap that is neither faked in a prose field nor frozen into process identity. The
-owner learns the child's exact `agent_id` from a private binding record that is
-validated against the run, owner, label and process generation before it is used.
+Location, launch specification and mutable assignment context are deliberately not
+published: nothing consumes them, and a location would be a mux-specific guess.
+The current session is published, but as the registry's own mutable context record
+(`agent.context`) rather than in registration: a process that switches, resumes or
+forks its session keeps its subject, `agent_id`, writer binding and generation, and
+only advances the record's sequence under the same lease discipline as the
+channels. The context method is implemented at Radar commit `4e376978`; the
+fully verified vendored fixture and validator are pinned at `da0ba99a`. A warned
+identical replay does not renew the lease, so local renewal timing remains
+anchored to the prior daemon-accepted context until a newer sequence is
+acknowledged. Session association is therefore neither faked in a prose field
+nor frozen into process identity. The owner learns the child's exact `agent_id` from a
+private binding record that is validated against the run, owner, label and process
+generation before it is used.
 
 Publication is best-effort and never load-bearing. An absent daemon, an
 unreachable socket, a corrupt private record or a fenced writer produces a
@@ -114,6 +124,18 @@ client therefore replays what it is uncertain about and then republishes a newer
 complete snapshot, instead of trusting its own clock. Writer replacement stays
 explicit — a successor must name the exact incumbent generation and handle, and a
 fenced publisher stops and reports instead of rotating identity to get back in.
+
+Context publication shares the registry's debt and adds one of its own. Its
+records accumulate per incarnation like the channels, and the first publish of a
+context record is the only write that carries no credential: if that reply is
+lost, the retry is refused because the record now exists, so the writer stops with
+one diagnostic rather than claiming a successor takeover it never observed. The
+refusal is not parsed for an incumbent handle: protocol prose is not a credential
+transfer mechanism, and replacement requires explicit observation of the exact
+retired or expired writer. The
+refusal is not parsed for an incumbent handle: protocol prose is not a credential
+transfer mechanism, and replacement requires explicit observation of the exact
+retired or expired writer.
 
 Process claim remains a claim. The daemon verifies it independently, and no
 publication, lease or retirement state qualifies as proof of process exit,
