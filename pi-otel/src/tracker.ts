@@ -66,7 +66,9 @@ import {
   ATTR_GEN_AI_RESPONSE_MODEL,
   ATTR_GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK,
   ATTR_GEN_AI_SYSTEM,
+  ATTR_GEN_AI_SYSTEM_INSTRUCTIONS,
   ATTR_GEN_AI_SYSTEM_PROMPT_HASH,
+  ATTR_GEN_AI_TOOL_DEFINITIONS,
   ATTR_GEN_AI_TOKEN_TYPE,
   GEN_AI_SYSTEM,
   ATTR_GEN_AI_TOOL_CALL_ARGUMENTS,
@@ -89,6 +91,14 @@ import {
   ATTR_PI_CONTEXT_TOKENS,
   ATTR_PI_CONTEXT_WINDOW,
   ATTR_PI_CWD,
+  ATTR_PI_RUN_KIND,
+  ATTR_PI_SESSION_MODE,
+  ATTR_PI_SESSION_NAME,
+  ATTR_PI_AGENT_ROLE,
+  ATTR_PI_AGENT_LABEL,
+  ATTR_PI_AGENT_RUN_ID,
+  ATTR_PI_AGENT_OWNER_SESSION_ID,
+  ATTR_PI_AGENT_WORKSPACE_ID,
   ATTR_PI_ERROR_COUNT,
   ATTR_PI_INTERACTION_ID,
   ATTR_PI_INTERACTION_ORIGIN,
@@ -117,6 +127,7 @@ import {
   EVENT_GEN_AI_FIRST_TOKEN,
   EVENT_GEN_AI_TOOL_MESSAGE,
   EVENT_GEN_AI_USER_MESSAGE,
+  EVENT_PI_MESSAGE,
   hashPrompt,
   SPAN_ATTEMPT,
   SPAN_COMPACTION,
@@ -158,6 +169,10 @@ export interface TrackerOptions {
   metrics: () => Metrics | null;
   /** Lazy context usage, read when an LLM span opens and when the run closes. */
   contextUsage?: () => ContextUsageShape | undefined;
+  /** Stable run/agent labels copied onto every span in the run. */
+  runAttributes?: Attributes;
+  /** Lazy display name for the current Pi session. */
+  sessionName?: () => string | undefined;
   /** Orphan sweep interval in ms. Default 60_000. */
   orphanSweepIntervalMs?: number;
   /** Age at which an open span is considered orphaned, in ms. Default 30 * 60 * 1000. */
@@ -195,6 +210,7 @@ interface PendingLlm {
   /** Monotonic ns, used for duration metrics so they measure the real request. */
   startedNs: bigint;
   responses: Array<{ status: number; headers: Record<string, string> }>;
+  toolDefinitions?: unknown[];
 }
 
 /** Fields shared by a pending record and an open LLM span. */
@@ -218,6 +234,7 @@ interface LlmState {
   /** HTTP status of the most recent failed attempt. */
   lastErrorStatus?: number;
   inputMessages: Array<Record<string, unknown>>;
+  inputMessageCount: number;
   firstTokenSeen?: boolean;
   completionRecorded?: boolean;
 }
@@ -289,6 +306,7 @@ export class SpanTracker {
   /** Provider request awaiting an assistant lifecycle event to claim it. */
   private pendingLlm: PendingLlm | null = null;
   private tools = new Map<string, ToolSlot>();
+  private systemPrompt: string | undefined;
 
   private interactionCount = 0;
   /** Attempts in the current interaction (reset each startInteraction). */
@@ -570,6 +588,7 @@ export class SpanTracker {
       span.end();
       this.interaction = null;
       this.interactionStartMs = 0;
+      this.systemPrompt = undefined;
       this.pendingInput = [];
     }
     this.withdrawPublishedTraceparent();
@@ -660,13 +679,18 @@ export class SpanTracker {
    * `before_provider_request`, and only an assistant lifecycle event proves
    * this request became an agent generation (see claimPendingLlm).
    */
-  noteProviderRequest(requestModel: string | undefined, providerSystem: string | undefined): void {
+  noteProviderRequest(
+    requestModel: string | undefined,
+    providerSystem: string | undefined,
+    toolDefinitions?: unknown[],
+  ): void {
     this.pendingLlm = {
       requestModel,
       providerSystem,
       startedAtMs: this.now(),
       startedNs: process.hrtime.bigint(),
       responses: [],
+      toolDefinitions,
     };
   }
 
@@ -698,6 +722,12 @@ export class SpanTracker {
     const parent = this.turn?.ctx ?? this.attempt?.ctx ?? this.interaction?.ctx ?? this.runParentContext();
     const attrs = this.commonAttrs();
     attrs[ATTR_GEN_AI_OPERATION_NAME] = OP_NAME_CHAT;
+    if (this.shouldCapturePrompt() && this.systemPrompt) {
+      attrs[ATTR_GEN_AI_SYSTEM_INSTRUCTIONS] = clampAttr([{ type: "text", content: this.systemPrompt }]);
+    }
+    if (this.shouldCapturePrompt() && pending?.toolDefinitions?.length) {
+      attrs[ATTR_GEN_AI_TOOL_DEFINITIONS] = clampAttr(pending.toolDefinitions);
+    }
     // Agent identity is the harness (pi). Provider identity is the dialect's
     // provider key: gen_ai.provider.name in 1.37 (the 2025-10 rename,
     // semantic-conventions v1.37.0), gen_ai.system in 1.36. Each dialect
@@ -741,6 +771,7 @@ export class SpanTracker {
       attempts: 0,
       failedAttempts: 0,
       inputMessages: [],
+      inputMessageCount: 0,
     };
     this.applyContextUsage(span);
     // Drain any user/tool messages that arrived before the LLM span opened.
@@ -783,17 +814,30 @@ export class SpanTracker {
   }
 
   noteSystemPrompt(prompt: string): void {
+    this.systemPrompt = prompt;
     const hash = hashPrompt(prompt);
     if (!hash) return;
     const target = this.interaction?.span;
     if (target) target.setAttribute(ATTR_GEN_AI_SYSTEM_PROMPT_HASH, hash);
   }
 
-  /** Buffer an input message (user or tool result) to flush when the LLM span opens. */
-  private pendingInput: Array<{ role: "user" | "tool"; text: string; toolCallId?: string; toolName?: string }> = [];
+  /** Buffer input until the LLM span opens, preserving custom-message provenance. */
+  private pendingInput: Array<{
+    role: "user" | "tool";
+    text: string;
+    toolCallId?: string;
+    toolName?: string;
+    source?: string;
+    details?: unknown;
+  }> = [];
 
   noteUserInput(text: string): void {
     this.pendingInput.push({ role: "user", text });
+    this.flushPendingInput();
+  }
+
+  noteCustomInput(text: string, source: string, details?: unknown): void {
+    this.pendingInput.push({ role: "user", text, source, details });
     this.flushPendingInput();
   }
 
@@ -811,6 +855,17 @@ export class SpanTracker {
     if (!this.llm || this.pendingInput.length === 0) return;
     const emitEvents = this.semconv === "1.36";
     for (const m of this.pendingInput) {
+      const index = this.llm.inputMessageCount++;
+      if (m.source) {
+        const attrs: Attributes = {
+          "pi.message.source": clampAttr(m.source),
+          "pi.message.index": index,
+        };
+        if (this.shouldCapturePrompt() && m.details !== undefined) {
+          attrs["pi.message.details"] = clampAttr(m.details);
+        }
+        this.llm.span.addEvent(EVENT_PI_MESSAGE, attrs);
+      }
       if (m.role === "user") {
         if (!this.shouldCapturePrompt()) continue;
         if (emitEvents) {
@@ -1280,7 +1335,10 @@ export class SpanTracker {
   private commonAttrs(): Attributes {
     const attrs: Attributes = {
       [ATTR_PI_CWD]: this.opts.cwd,
+      ...(this.opts.runAttributes ?? {}),
     };
+    const sessionName = this.opts.sessionName?.();
+    if (sessionName) attrs[ATTR_PI_SESSION_NAME] = sessionName;
     const sid = this.opts.sessionId();
     if (sid) {
       attrs[ATTR_PI_SESSION_ID] = sid;

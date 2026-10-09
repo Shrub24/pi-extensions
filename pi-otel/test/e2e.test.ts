@@ -203,6 +203,12 @@ function fakePi(sessionManager: Record<string, unknown> = {}) {
       emit(ch: string, d: unknown) { for (const fn of eventListeners.get(ch) ?? []) fn(d); },
     },
     getThinkingLevel: () => "off",
+    getActiveTools: () => ["test-tool"],
+    getAllTools: () => [{
+      name: "test-tool",
+      description: "A fixture tool",
+      parameters: { type: "object", properties: {} },
+    }],
   } as unknown as ExtensionAPI;
   return { pi, handlers, commands, ctx };
 }
@@ -293,6 +299,12 @@ describe("end-to-end over real HTTP OTLP (JSON protocol)", () => {
     assert.equal(llmAttrs["gen_ai.system"], undefined, "1.43 does not write the pre-rename key");
     assert.equal(llmAttrs["gen_ai.request.model"], "test-model");
     assert.equal(llmAttrs["gen_ai.request.stream"], true, "1.43 records gen_ai.request.stream");
+    assert.deepEqual(JSON.parse(String(llmAttrs["gen_ai.tool.definitions"])), [{
+      type: "function",
+      name: "test-tool",
+      description: "A fixture tool",
+      parameters: { type: "object", properties: {} },
+    }], "active tool definitions are attached to the model request span");
     assert.equal(llmAttrs["gen_ai.usage.input_tokens"], 10);
     assert.equal(llmAttrs["gen_ai.usage.output_tokens"], 5);
     assert.equal(llmAttrs["gen_ai.usage.cache_read.input_tokens"], 3);

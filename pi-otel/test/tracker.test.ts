@@ -18,6 +18,8 @@ import {
   ATTR_GEN_AI_RESPONSE_ID,
   ATTR_GEN_AI_SYSTEM,
   ATTR_GEN_AI_SYSTEM_PROMPT_HASH,
+  ATTR_GEN_AI_SYSTEM_INSTRUCTIONS,
+  ATTR_GEN_AI_TOOL_DEFINITIONS,
   ATTR_GEN_AI_TOOL_NAME,
   ATTR_GEN_AI_TOOL_CALL_ID,
   ATTR_GEN_AI_TOOL_CALL_ARGUMENTS,
@@ -30,6 +32,14 @@ import {
   ATTR_PI_SESSION_REASON,
   ATTR_PI_SESSION_PARENT_ID,
   ATTR_PI_TURN_INDEX,
+  ATTR_PI_RUN_KIND,
+  ATTR_PI_SESSION_MODE,
+  ATTR_PI_SESSION_NAME,
+  ATTR_PI_AGENT_ROLE,
+  ATTR_PI_AGENT_LABEL,
+  ATTR_PI_AGENT_RUN_ID,
+  ATTR_PI_AGENT_OWNER_SESSION_ID,
+  ATTR_PI_AGENT_WORKSPACE_ID,
   ATTR_PI_TOOL_IS_ERROR,
   ATTR_PI_CANCELLED,
   ATTR_PI_ORPHANED,
@@ -60,6 +70,7 @@ import {
   SPAN_INTERACTION,
   SPAN_TURN,
   SPAN_LLM_REQUEST,
+  EVENT_PI_MESSAGE,
 } from "../src/attrs.ts";
 import { BasicTracerProvider, BatchSpanProcessor, InMemorySpanExporter } from "@opentelemetry/sdk-trace-base";
 import { resourceFromAttributes } from "@opentelemetry/resources";
@@ -894,6 +905,7 @@ describe("content capture modes", () => {
     h2.tracker.startLlm("m", "anthropic");
     h2.tracker.noteUserInput("the-prompt-secret");
     h2.tracker.noteToolResultInput("call_1", "bash", "the-tool-output-secret");
+    h2.tracker.noteCustomInput("the-wake-secret", "pi-herdsman-agent-attention", { message: "the-wake-secret" });
     h2.tracker.completeLlm(asstMsg({ text: "the-completion-secret" }));
     h2.tracker.endTurn();
     h2.tracker.endInteraction();
@@ -911,7 +923,10 @@ describe("content capture modes", () => {
     assert.equal(eventNames.has("gen_ai.assistant.message"), false, "no gen_ai.assistant.message event");
     assert.equal(eventNames.has("gen_ai.choice"), false, "no gen_ai.choice event");
     // Nothing on the span (attributes or events) contains the secrets.
-    const secrets = ["the-prompt-secret", "the-tool-output-secret", "the-completion-secret"];
+    const provenanceEvent = llm.events.find((e) => e.name === EVENT_PI_MESSAGE);
+    assert.equal(provenanceEvent?.attributes?.["pi.message.source"], "pi-herdsman-agent-attention");
+    assert.equal(provenanceEvent?.attributes?.["pi.message.details"], undefined);
+    const secrets = ["the-prompt-secret", "the-tool-output-secret", "the-wake-secret", "the-completion-secret"];
     const attrBlob = JSON.stringify(llm.attributes);
     const eventBlob = JSON.stringify(llm.events);
     for (const s of secrets) {
@@ -1255,7 +1270,90 @@ describe("time to first token", () => {
   });
 });
 
-describe("system prompt hash", () => {
+describe("system prompt hash and capture", () => {
+  test("captured LLM span includes full system instructions and active tool definitions", async () => {
+    const prompt = "Follow the local system instructions.";
+    const definitions = [{
+      type: "function",
+      name: "search",
+      description: "Search the repository",
+      parameters: { type: "object", properties: { query: { type: "string" } } },
+    }];
+    h.tracker.startSession();
+    h.tracker.startInteraction("p");
+    h.tracker.noteSystemPrompt(prompt);
+    h.tracker.startTurn(0);
+    h.tracker.noteProviderRequest("m", "anthropic", definitions);
+    h.tracker.claimPendingLlm();
+    h.tracker.completeLlm(asstMsg({ text: "done" }));
+    h.tracker.endTurn();
+    h.tracker.endInteraction();
+    h.tracker.endSession();
+    await h.flush();
+
+    const llm = h.span(SPAN_LLM_REQUEST);
+    assert.deepEqual(JSON.parse(String(llm.attributes[ATTR_GEN_AI_SYSTEM_INSTRUCTIONS])), [
+      { type: "text", content: prompt },
+    ]);
+    assert.deepEqual(JSON.parse(String(llm.attributes[ATTR_GEN_AI_TOOL_DEFINITIONS])), definitions);
+    assert.equal(h.span(SPAN_INTERACTION).attributes[ATTR_GEN_AI_SYSTEM_PROMPT_HASH], hashPrompt(prompt));
+  });
+
+  test("system instructions and tool definitions follow prompt capture mode", async () => {
+    const h2 = makeHarness({ captureContent: "metadata_only" });
+    h2.tracker.startSession();
+    h2.tracker.startInteraction("p");
+    h2.tracker.noteSystemPrompt("private system prompt");
+    h2.tracker.startTurn(0);
+    h2.tracker.noteProviderRequest("m", "anthropic", [{ type: "function", name: "secret-tool" }]);
+    h2.tracker.claimPendingLlm();
+    h2.tracker.completeLlm(asstMsg({ text: "done" }));
+    h2.tracker.endTurn();
+    h2.tracker.endInteraction();
+    h2.tracker.endSession();
+    await h2.flush();
+
+    const llm = h2.span(SPAN_LLM_REQUEST);
+    assert.equal(ATTR_GEN_AI_SYSTEM_INSTRUCTIONS in llm.attributes, false);
+    assert.equal(ATTR_GEN_AI_TOOL_DEFINITIONS in llm.attributes, false);
+    assert.ok(ATTR_GEN_AI_SYSTEM_PROMPT_HASH in h2.span(SPAN_INTERACTION).attributes);
+  });
+
+  test("run and session labels are copied onto all spans", async () => {
+    const h2 = makeHarness({
+      runAttributes: {
+        [ATTR_PI_RUN_KIND]: "herdsman_worker",
+        [ATTR_PI_SESSION_MODE]: "print",
+        [ATTR_PI_AGENT_ROLE]: "worker",
+        [ATTR_PI_AGENT_LABEL]: "review-1",
+        [ATTR_PI_AGENT_RUN_ID]: "run-1",
+        [ATTR_PI_AGENT_OWNER_SESSION_ID]: "parent-1",
+        [ATTR_PI_AGENT_WORKSPACE_ID]: "workspace-1",
+      },
+      sessionName: () => "review pass",
+    });
+    h2.tracker.startSession();
+    h2.tracker.startInteraction("p");
+    h2.tracker.startTurn(0);
+    h2.tracker.startLlm("m", "anthropic");
+    h2.tracker.completeLlm(asstMsg({ text: "done" }));
+    h2.tracker.endTurn();
+    h2.tracker.endInteraction();
+    h2.tracker.endSession();
+    await h2.flush();
+
+    for (const span of [h2.span(SPAN_INTERACTION), h2.span(SPAN_TURN), h2.span(SPAN_LLM_REQUEST)]) {
+      assert.equal(span.attributes[ATTR_PI_RUN_KIND], "herdsman_worker");
+      assert.equal(span.attributes[ATTR_PI_SESSION_MODE], "print");
+      assert.equal(span.attributes[ATTR_PI_SESSION_NAME], "review pass");
+      assert.equal(span.attributes[ATTR_PI_AGENT_ROLE], "worker");
+      assert.equal(span.attributes[ATTR_PI_AGENT_LABEL], "review-1");
+      assert.equal(span.attributes[ATTR_PI_AGENT_RUN_ID], "run-1");
+      assert.equal(span.attributes[ATTR_PI_AGENT_OWNER_SESSION_ID], "parent-1");
+      assert.equal(span.attributes[ATTR_PI_AGENT_WORKSPACE_ID], "workspace-1");
+    }
+  });
+
   test("noteSystemPrompt sets hash on interaction span", async () => {
     const prompt = "You are a helpful assistant.";
     h.tracker.startSession();
@@ -1460,17 +1558,16 @@ describe("ensureInteraction", () => {
   });
 
   test("captures extension-injected custom messages as LLM input", async () => {
-    // pi emits message_start for custom messages (before_agent_start results
-    // and sendCustomMessage deliveries) alongside the user message; index.ts
-    // feeds both through noteUserInput. Verify the buffered input lands in
-    // gen_ai.input.messages.
+    // Extension custom messages retain their customType/details as provenance
+    // events while their content remains in the standard input-message list.
     const hx = makeHarness();
     hx.tracker.startSession();
     hx.tracker.startInteraction("user prompt");
     hx.tracker.startTurn(0);
     hx.tracker.startLlm("m", "anthropic");
     hx.tracker.noteUserInput("user prompt");
-    hx.tracker.noteUserInput("extension-injected context"); // custom message
+    hx.tracker.noteCustomInput("herdsman wake", "pi-herdsman-agent-attention", { reason: "idle" });
+    hx.tracker.noteCustomInput("intercom message", "intercom_message", { from: { sessionId: "source-session" } });
     hx.tracker.completeLlm(asstMsg({ text: "t" }));
     hx.tracker.endTurn();
     hx.tracker.endInteraction();
@@ -1478,8 +1575,15 @@ describe("ensureInteraction", () => {
     await hx.flush();
     const a = hx.span(SPAN_LLM_REQUEST).attributes;
     const parsed = JSON.parse(String(a[ATTR_GEN_AI_INPUT_MESSAGES])) as Array<{ role: string; parts: Array<{ content: string }> }>;
-    assert.equal(parsed.length, 2, "both user and custom inputs captured");
-    assert.deepEqual(parsed.map((m) => m.parts[0]?.content), ["user prompt", "extension-injected context"]);
+    assert.equal(parsed.length, 3, "user and custom inputs captured");
+    assert.deepEqual(parsed.map((m) => m.parts[0]?.content), ["user prompt", "herdsman wake", "intercom message"]);
+    const provenance = hx.span(SPAN_LLM_REQUEST).events.filter((e) => e.name === EVENT_PI_MESSAGE);
+    assert.deepEqual(provenance.map((e) => e.attributes?.["pi.message.source"]), [
+      "pi-herdsman-agent-attention",
+      "intercom_message",
+    ]);
+    assert.deepEqual(JSON.parse(String(provenance[0]?.attributes?.["pi.message.details"])), { reason: "idle" });
+    assert.deepEqual(JSON.parse(String(provenance[1]?.attributes?.["pi.message.details"])), { from: { sessionId: "source-session" } });
   });
 
   test("no-op when an interaction is already open", async () => {

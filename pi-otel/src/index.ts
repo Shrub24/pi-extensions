@@ -48,6 +48,13 @@ import {
   ATTR_PI_COMPACTION_TOKENS_AFTER,
   ATTR_PI_COMPACTION_TOKENS_BEFORE,
   ATTR_PI_COMPACTION_WILL_RETRY,
+  ATTR_PI_RUN_KIND,
+  ATTR_PI_SESSION_MODE,
+  ATTR_PI_AGENT_ROLE,
+  ATTR_PI_AGENT_LABEL,
+  ATTR_PI_AGENT_RUN_ID,
+  ATTR_PI_AGENT_OWNER_SESSION_ID,
+  ATTR_PI_AGENT_WORKSPACE_ID,
   ATTR_PI_ERROR_COUNT,
   ATTR_PI_TOOL_COUNT,
   ATTR_PI_TURN_COUNT,
@@ -91,6 +98,33 @@ export function normalizeLogPayload(data: unknown): LogChannelPayload | null {
     }
   }
   return { eventName, severity, body, attributes };
+}
+
+/** Resolve stable per-run identity from explicit configuration and launcher metadata. */
+export function resolveRunAttributes(
+  mode: string,
+  environment: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
+  const env = (name: string): string | undefined => environment[name]?.trim() || undefined;
+  const herdsmanRole = env("PI_HERDSMAN_AGENT_DEFINITION");
+  const isMagicContextWorker = env("MAGIC_CONTEXT_PI_SUBAGENT") === "1";
+  const role = env("PI_OTEL_AGENT_ROLE") ?? herdsmanRole;
+  const label = env("PI_OTEL_AGENT_LABEL") ?? env("PI_HERDSMAN_LABEL");
+  const agentRunId = env("PI_OTEL_AGENT_RUN_ID") ?? env("PI_HERDSMAN_RUN_ID");
+  const ownerSessionId = env("PI_OTEL_AGENT_OWNER_SESSION_ID") ?? env("PI_HERDSMAN_OWNER_SESSION_ID");
+  const workspaceId = env("PI_OTEL_AGENT_WORKSPACE_ID") ?? env("PI_HERDSMAN_WORKSPACE_ID");
+  const runKind = env("PI_OTEL_RUN_KIND") ??
+    (isMagicContextWorker ? "magic_context_worker" :
+      herdsmanRole ? "herdsman_worker" : mode === "tui" ? "interactive" : "headless");
+  return {
+    [ATTR_PI_RUN_KIND]: runKind,
+    [ATTR_PI_SESSION_MODE]: mode,
+    ...(role ? { [ATTR_PI_AGENT_ROLE]: role } : {}),
+    ...(label ? { [ATTR_PI_AGENT_LABEL]: label } : {}),
+    ...(agentRunId ? { [ATTR_PI_AGENT_RUN_ID]: agentRunId } : {}),
+    ...(ownerSessionId ? { [ATTR_PI_AGENT_OWNER_SESSION_ID]: ownerSessionId } : {}),
+    ...(workspaceId ? { [ATTR_PI_AGENT_WORKSPACE_ID]: workspaceId } : {}),
+  };
 }
 
 /**
@@ -193,6 +227,7 @@ export default function (pi: ExtensionAPI): void {
       if (!cfg.enabled) return;
       const next = await startRuntime(cfg, { hasUI: ctx.hasUI, mode: ctx.mode });
       runtime = next;
+      const runAttributes = resolveRunAttributes(ctx.mode);
       tracker = new SpanTracker({
         tracer: next.tracer,
         captureContent: cfg.captureContent,
@@ -200,6 +235,10 @@ export default function (pi: ExtensionAPI): void {
         sessionId,
         sessionFile,
         cwd: ctx.cwd,
+        runAttributes,
+        sessionName: () => {
+          try { return pi.getSessionName(); } catch { return undefined; }
+        },
         metrics: () => next.metrics,
         contextUsage: () => lastCtx?.getContextUsage?.(),
       });
@@ -410,7 +449,16 @@ export default function (pi: ExtensionAPI): void {
     const model = ctx.model;
     // A candidate generation, not a turn: cache warmers and probes reach this
     // hook too. The span opens only when an assistant event claims it.
-    tracker?.noteProviderRequest(model?.id, model?.provider);
+    const activeTools = new Set(pi.getActiveTools());
+    const toolDefinitions = pi.getAllTools()
+      .filter((tool) => activeTools.has(tool.name))
+      .map((tool) => ({
+        type: "function",
+        name: tool.name,
+        ...(tool.description ? { description: tool.description } : {}),
+        ...(tool.parameters ? { parameters: tool.parameters } : {}),
+      }));
+    tracker?.noteProviderRequest(model?.id, model?.provider, toolDefinitions);
   });
 
   pi.on("after_provider_response", async (event, _ctx) => {
@@ -449,10 +497,9 @@ export default function (pi: ExtensionAPI): void {
       // request that never produced one stays unclaimed and emits no span.
       tracker?.claimPendingLlm();
     } else if (msg.role === "custom") {
-      // Extension-injected context (before_agent_start result messages and
-      // sendCustomMessage deliveries) is part of the next LLM call's input;
-      // without this branch it never reached gen_ai.input.messages.
-      tracker?.noteUserInput(extractMessageText(msg));
+      // Keep Pi's original customType/details alongside the user-like message
+      // content so extension wakes and intercom deliveries remain attributable.
+      tracker?.noteCustomInput(extractMessageText(msg), msg.customType, msg.details);
     } else if (msg.role === "toolResult") {
       const tr = msg as { toolCallId: string; toolName: string };
       tracker?.noteToolResultInput(tr.toolCallId, tr.toolName, extractMessageText(msg));

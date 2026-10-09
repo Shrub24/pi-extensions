@@ -1,6 +1,41 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { extractSessionId, normalizeLogPayload, normalizeParentRef } from "../src/index.ts";
+import { extractSessionId, normalizeLogPayload, normalizeParentRef, resolveRunAttributes } from "../src/index.ts";
+
+describe("resolveRunAttributes", () => {
+  test("uses explicit run kind and copies Herdsman identity", () => {
+    assert.deepEqual(resolveRunAttributes("rpc", {
+      PI_OTEL_RUN_KIND: "magic_context_worker",
+      PI_HERDSMAN_AGENT_DEFINITION: "worker",
+      PI_HERDSMAN_LABEL: "review-1",
+      PI_HERDSMAN_RUN_ID: "run-1",
+      PI_HERDSMAN_OWNER_SESSION_ID: "parent-1",
+      PI_HERDSMAN_WORKSPACE_ID: "workspace-1",
+    }), {
+      "pi.run.kind": "magic_context_worker",
+      "pi.session.mode": "rpc",
+      "pi.agent.role": "worker",
+      "pi.agent.label": "review-1",
+      "pi.agent.run_id": "run-1",
+      "pi.agent.owner_session_id": "parent-1",
+      "pi.agent.workspace_id": "workspace-1",
+    });
+  });
+
+  test("infers interactive, headless, and managed-worker run kinds", () => {
+    assert.equal(resolveRunAttributes("tui", {})["pi.run.kind"], "interactive");
+    assert.equal(resolveRunAttributes("print", {})["pi.run.kind"], "headless");
+    assert.equal(resolveRunAttributes("tui", { PI_HERDSMAN_AGENT_DEFINITION: "worker" })["pi.run.kind"], "herdsman_worker");
+  });
+
+  test("recognizes Magic Context worker children and honors explicit override", () => {
+    assert.equal(resolveRunAttributes("rpc", { MAGIC_CONTEXT_PI_SUBAGENT: "1" })["pi.run.kind"], "magic_context_worker");
+    assert.equal(resolveRunAttributes("rpc", {
+      MAGIC_CONTEXT_PI_SUBAGENT: "1",
+      PI_OTEL_RUN_KIND: "custom_kind",
+    })["pi.run.kind"], "custom_kind");
+  });
+});
 
 describe("extractSessionId", () => {
   test("strips the timestamp prefix from an interactive session file stem", () => {

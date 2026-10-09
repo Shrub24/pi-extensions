@@ -5,7 +5,7 @@
 
 import { BasicTracerProvider, BatchSpanProcessor, InMemorySpanExporter } from "@opentelemetry/sdk-trace-base";
 import { resourceFromAttributes } from "@opentelemetry/resources";
-import { SpanKind, type Tracer } from "@opentelemetry/api";
+import { SpanKind, type Attributes, type Tracer } from "@opentelemetry/api";
 import { ATTR_SERVICE_NAME } from "@opentelemetry/semantic-conventions";
 import { SpanTracker, type MessageShapes } from "../src/tracker.ts";
 import type { Metrics } from "../src/metrics.ts";
@@ -110,6 +110,8 @@ export function makeHarness(
     captureContent?: "metadata_only" | "no_tool_content" | "full";
     semconv?: "1.36" | "1.37" | "1.43";
     contextUsage?: () => { tokens: number | null; contextWindow: number; percent: number | null } | undefined;
+    runAttributes?: Attributes;
+    sessionName?: () => string | undefined;
   } = {},
 ): Harness {
   const captureContent = opts.captureContent ?? "full";
@@ -132,6 +134,8 @@ export function makeHarness(
     cwd: "/test",
     metrics: () => recordingMetricsOf(metrics),
     contextUsage: opts.contextUsage,
+    runAttributes: opts.runAttributes,
+    sessionName: opts.sessionName,
   });
 
   return {

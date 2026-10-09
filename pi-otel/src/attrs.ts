@@ -92,6 +92,10 @@ export const ATTR_GEN_AI_TOOL_CALL_RESULT = "gen_ai.tool.call.result";
 export const ATTR_GEN_AI_INPUT_MESSAGES = "gen_ai.input.messages";
 export const ATTR_GEN_AI_OUTPUT_MESSAGES = "gen_ai.output.messages";
 export const ATTR_GEN_AI_SYSTEM_PROMPT_HASH = "gen_ai.system.prompt.hash";
+/** Development-status GenAI attribute; captured with prompt content. */
+export const ATTR_GEN_AI_SYSTEM_INSTRUCTIONS = "gen_ai.system_instructions";
+/** Opt-in GenAI attribute containing the function definitions sent to the model. */
+export const ATTR_GEN_AI_TOOL_DEFINITIONS = "gen_ai.tool.definitions";
 
 // gen_ai.* span events (older message-pipeline convention)
 export const EVENT_GEN_AI_USER_MESSAGE = "gen_ai.user.message";
@@ -100,6 +104,7 @@ export const EVENT_GEN_AI_ASSISTANT_MESSAGE = "gen_ai.assistant.message";
 export const EVENT_GEN_AI_CHOICE = "gen_ai.choice";
 export const EVENT_GEN_AI_FIRST_TOKEN = "gen_ai.first_token";
 export const EVENT_GEN_AI_COMPLETION = "gen_ai.completion";
+export const EVENT_PI_MESSAGE = "pi.message";
 
 // ---------------------------------------------------------------------------
 // error / http
@@ -113,6 +118,14 @@ export const ATTR_HTTP_STATUS_CODE = "http.response.status_code";
 // pi.* (extension-specific)
 // ---------------------------------------------------------------------------
 
+export const ATTR_PI_RUN_KIND = "pi.run.kind";
+export const ATTR_PI_SESSION_MODE = "pi.session.mode";
+export const ATTR_PI_SESSION_NAME = "pi.session.name";
+export const ATTR_PI_AGENT_ROLE = "pi.agent.role";
+export const ATTR_PI_AGENT_LABEL = "pi.agent.label";
+export const ATTR_PI_AGENT_RUN_ID = "pi.agent.run_id";
+export const ATTR_PI_AGENT_OWNER_SESSION_ID = "pi.agent.owner_session_id";
+export const ATTR_PI_AGENT_WORKSPACE_ID = "pi.agent.workspace_id";
 export const ATTR_PI_SESSION_ID = "pi.session.id";
 export const ATTR_PI_SESSION_FILE = "pi.session.file";
 /** Why the pi session started. Values: startup | reload | new | resume | fork. Mirrors pi's SessionStartEvent.reason. */
