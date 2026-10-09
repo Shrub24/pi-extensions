@@ -449,7 +449,7 @@ test("snapshots reject NUL, invalid UTF-8, and byte limits", () => {
   );
   assert.throws(
     () => snapshotTextFiles(["over-limit.txt"], cwd, "assign", { maxBytes: 3 }),
-    /Request exceeds the mailbox size limit/,
+    /Mailbox payload is 4 bytes; configured limit is 3 bytes \(mailboxPayloadLimitBytes\)/,
   );
   assert.equal(
     snapshotTextFiles(["at-limit.txt"], cwd, "assign", { maxBytes: 3 })[0].text,

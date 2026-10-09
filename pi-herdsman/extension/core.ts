@@ -233,6 +233,10 @@ function resolveRegularFiles(
   });
 }
 
+function payloadOverflow(bytes: number, limitBytes: number): string {
+  return `Mailbox payload is ${bytes} bytes; configured limit is ${limitBytes} bytes (mailboxPayloadLimitBytes)`;
+}
+
 export function snapshotTextFiles(
   inputs: readonly string[],
   cwd: string,
@@ -260,14 +264,14 @@ export function snapshotTextFiles(
       if (stat.size + totalBytes > maxBytes)
         fail(
           "invalid_request",
-          "Request exceeds the mailbox size limit",
+          payloadOverflow(stat.size + totalBytes, maxBytes),
           operation,
         );
       const bytes = readFileSync(fd);
       if (bytes.length + totalBytes > maxBytes)
         fail(
           "invalid_request",
-          "Request exceeds the mailbox size limit",
+          payloadOverflow(bytes.length + totalBytes, maxBytes),
           operation,
         );
       if (bytes.includes(0)) throw new Error("binary content");
@@ -338,22 +342,19 @@ export function prepareMessageInput(
 ): PreparedMessageInput {
   if (!text.trim())
     fail("invalid_request", "Message must not be empty", operation);
+  const mailboxLimitBytes =
+    options.mailboxLimitBytes ?? MAILBOX_PROTOCOL_LIMIT_BYTES;
+  const measureBytes =
+    options.serializedBytes ??
+    ((value: string) => Buffer.byteLength(value, "utf8"));
   if (!files.length) {
     const fits =
       options.fits ??
-      (options.serializedBytes
-        ? (value: string) =>
-            options.serializedBytes!(value) <=
-            (options.mailboxLimitBytes ?? MAILBOX_PROTOCOL_LIMIT_BYTES)
-        : (value: string) =>
-            Buffer.byteLength(value, "utf8") <=
-            (options.mailboxLimitBytes ?? MAILBOX_PROTOCOL_LIMIT_BYTES));
+      ((value: string) => measureBytes(value) <= mailboxLimitBytes);
     if (!fits(text))
       fail(
         "invalid_request",
-        options.serializedBytes
-          ? `Mailbox payload is ${options.serializedBytes(text)} bytes; configured limit is ${options.mailboxLimitBytes ?? MAILBOX_PROTOCOL_LIMIT_BYTES} bytes`
-          : "Request exceeds the mailbox size limit",
+        payloadOverflow(measureBytes(text), mailboxLimitBytes),
         operation,
       );
     return { text, canonicalPaths: [] };
@@ -369,17 +370,11 @@ export function prepareMessageInput(
   const rendered = () => [...sections, `${heading}:\n${text}`].join("\n\n");
   const fits =
     options.fits ??
-    ((value: string) =>
-      (options.serializedBytes
-        ? options.serializedBytes(value)
-        : Buffer.byteLength(value, "utf8")) <=
-      (options.mailboxLimitBytes ?? MAILBOX_PROTOCOL_LIMIT_BYTES));
+    ((value: string) => measureBytes(value) <= mailboxLimitBytes);
   if (!fits(rendered()))
     fail(
       "invalid_request",
-      options.serializedBytes
-        ? `Mailbox payload is ${options.serializedBytes(rendered())} bytes; configured limit is ${options.mailboxLimitBytes ?? MAILBOX_PROTOCOL_LIMIT_BYTES} bytes`
-        : "Request exceeds the mailbox size limit",
+      payloadOverflow(measureBytes(rendered()), mailboxLimitBytes),
       operation,
     );
   for (const file of regular) {

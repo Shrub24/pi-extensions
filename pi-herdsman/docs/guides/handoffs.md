@@ -133,6 +133,14 @@ The fixed 1 MiB mailbox protocol safety ceiling is a separate read limit for
 mailbox records; it does not replace the configured admission limit for new
 messages.
 
+A brief's `context.inputs` are snapshotted against the configured budget, and
+nothing is sampled or split to make them fit. A rejection names the observed
+total and the budget; raise `mailboxPayloadLimitBytes` in the herdsman config file
+(see [configuration](../reference/configuration.md)) when the snapshot is
+legitimately larger. If the recipient can read the original file, attach it via
+`files` instead: a non-fitting file is sent as a path reference rather than
+snapshotted.
+
 No file is partially embedded. Embedded text is a submission-time snapshot.
 Reference-only files are not copied or snapshotted; their contents may change
 or disappear after submission, and the recipient must already have local
