@@ -200,9 +200,16 @@ refusals, plus carried-background-result settlement contract tests. No live reco
     boundary decisions. Radar-only publication, no new Herdr mirror; existing launch readiness,
     presence proofs and control-state consumers still use Herdr until a separately scoped coordinator
     cutover. Remaining: controlled live assignment in a deployed lead and child (no live daemon read
-    exists yet); Radar contract gap for mutable current-session association; Radar-side registry
-    pruning (records accumulate per incarnation, and a vanished target's assignment writer retries
-    one acquire per heartbeat until that child closes).
+    exists yet); Radar-side registry pruning (records accumulate per incarnation, and a vanished
+    target's assignment writer retries one acquire per heartbeat until that child closes); Radar-side
+    retention is accepted as a separate daemon change, not a client workaround.
+    Pending Radar change (do not implement against a guess): a source-labelled mutable context record,
+    fenced by the same writer generation/sequence/lease discipline and published by the same writer,
+    carrying the current session UUID only — never the session file path. Republish on
+    session_start/switch/fork with a newer sequence; subject, `agent_id` and writer generation do not
+    change and no process identity is re-registered. Radar pins the commit and sends the exact
+    method/fixture. Launch spec and location stay omitted: nothing consumes them and location would be
+    a mux-specific guess.
 
 ## pi-jev: native classifier and AOT
 
