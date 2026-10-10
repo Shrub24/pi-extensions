@@ -1,5 +1,4 @@
 import { getCapabilities, hyperlink, wrapTextWithAnsi } from "@earendil-works/pi-tui";
-import * as PiTui from "@earendil-works/pi-tui";
 import * as os from "node:os";
 import { basename, extname, resolve as resolvePath } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -59,11 +58,7 @@ export function componentHasVisibleLines(component: unknown): boolean {
 }
 
 export function normalizeTerminalText(text: string): string {
-	const normalizedNewlines = text.replace(/\r\n|\r/g, "\n");
-	const normalizeTerminalOutput = (PiTui as any).normalizeTerminalOutput;
-	return typeof normalizeTerminalOutput === "function"
-		? normalizeTerminalOutput(normalizedNewlines)
-		: normalizedNewlines.replace(/\t/g, "   ");
+	return text.replace(/\r\n|\r/g, "\n").replace(/\t/g, "   ");
 }
 
 export function splitTerminalLines(text: string): string[] {
