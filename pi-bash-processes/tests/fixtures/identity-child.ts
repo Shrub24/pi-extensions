@@ -6,7 +6,7 @@ const script = `
 printf 'bash-ready\\n'
 IFS= read -r release || exit 64
 case "$release" in
-  exec) exec /bin/sh -c 'printf "exec-ready\\n"; IFS= read -r release; test "$release" = exit' ;;
+  exec) exec sh -c 'printf "exec-ready\\n"; IFS= read -r release; test "$release" = exit' ;;
   exit) exit 0 ;;
   *) exit 64 ;;
 esac
@@ -28,9 +28,9 @@ async function beforeDeadline<T>(operation: Promise<T>, label: string): Promise<
 
 /** Owns a shell that waits for an explicit exec or exit release. */
 export function identityChild() {
-	const child = spawn("/bin/bash", ["--noprofile", "--norc", "-c", script], {
+	const child = spawn(process.env.BASH ?? "bash", ["--noprofile", "--norc", "-c", script], {
 		stdio: ["pipe", "pipe", "pipe"],
-		env: { PATH: "/usr/bin:/bin", LC_ALL: "C" },
+		env: { PATH: process.env.PATH ?? "", LC_ALL: "C" },
 	});
 	let spawnError: Error | undefined;
 	child.on("error", (error) => { spawnError = error; });
