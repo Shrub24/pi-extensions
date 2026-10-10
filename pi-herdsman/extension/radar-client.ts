@@ -256,6 +256,11 @@ function decodeReply(
 const UUID =
 	/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+function recordAt(value: unknown, field: string): unknown {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+	return (value as Record<string, unknown>)[field];
+}
+
 export function isUuid(value: unknown): value is string {
 	return typeof value === "string" && UUID.test(value);
 }
@@ -338,6 +343,13 @@ export type RadarClient = {
 		channel: RadarChannel;
 		writer_handle: string;
 	}): Promise<RadarResult<void>>;
+	childClose(request: {
+		request_id: string;
+		spawn_request_id: string;
+		source: string;
+		incarnation: string;
+		intent: "complete" | "cancel";
+	}): Promise<RadarResult<{ outcome: "completed"; pane: string }>>;
 };
 
 export type RadarClientOptions = {
@@ -610,6 +622,24 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 				return answer.ok ? { ok: true, value: undefined } : answer;
 			});
 		},
+		async childClose(request) {
+			if (!isUuid(request.request_id) || !isUuid(request.spawn_request_id) || !isUuid(request.incarnation))
+				return { ok: false, code: "bad_params", message: "child.close requires canonical request, spawn and incarnation UUIDs" };
+			const answer = await call("child.close", {
+				spawn_request_id: request.spawn_request_id,
+				source: request.source,
+				incarnation: request.incarnation,
+				intent: request.intent,
+			});
+			if (!answer.ok) return answer;
+			const close = recordAt(answer.value, "close");
+			const outcome = stringAt(close, "outcome");
+			const pane = stringAt(close, "pane");
+			return outcome === "completed" && pane !== undefined
+				? { ok: true, value: { outcome, pane } }
+				: protocol("child.close reply does not confirm pane closure");
+		},
+
 	};
 }
 

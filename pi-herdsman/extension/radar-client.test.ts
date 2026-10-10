@@ -169,6 +169,45 @@ function cleanup(fixture: Fixture): void {
 	if (fixture.server.listening) fixture.server.close();
 }
 
+test("child.close sends the exact spawn edge and accepts only confirmed pane closure", async () => {
+	const fixture = makeFixture((request) => {
+		if (request.method === "ping") return reply(request, { protocol: 1, capabilities: ["agent_registry"] });
+		assert.equal(request.method, "child.close");
+		assert.deepEqual(request.params, {
+			spawn_request_id: UUID_A,
+			source: "herdsman-child",
+			incarnation: UUID_B,
+			intent: "complete",
+		});
+		return reply(request, { close: { outcome: "completed", intent: "complete", pane: "wA:p2" } });
+	});
+	try {
+		await listen(fixture);
+		assert.deepEqual(await fixture.client().childClose({
+			request_id: UUID_B,
+			spawn_request_id: UUID_A,
+			source: "herdsman-child",
+			incarnation: UUID_B,
+			intent: "complete",
+		}), { ok: true, value: { outcome: "completed", pane: "wA:p2" } });
+	} finally { cleanup(fixture); }
+});
+
+test("child.close unknown outcome is preserved as failure", async () => {
+	const fixture = makeFixture((request) => request.method === "ping"
+		? reply(request, { protocol: 1, capabilities: ["agent_registry"] })
+		: refuse(request, "backend_unavailable", "managed child close outcome is unknown"));
+	try {
+		await listen(fixture);
+		const result = await fixture.client().childClose({
+			request_id: UUID_B, spawn_request_id: UUID_A, source: "herdsman-child",
+			incarnation: UUID_B, intent: "cancel",
+		});
+		assert.equal(result.ok, false);
+		assert.equal(result.ok ? "" : result.code, "backend_unavailable");
+	} finally { cleanup(fixture); }
+});
+
 test("an untrusted control socket is refused without dialling", async () => {
 	const fixture = makeFixture(() => undefined);
 	try {
