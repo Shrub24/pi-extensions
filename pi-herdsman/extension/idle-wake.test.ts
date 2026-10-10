@@ -82,6 +82,26 @@ test("a session without a prompt seam keeps the caller's delivery", async () => 
   assert.deepEqual(sentUsers, []);
 });
 
+test("a claimed soft deadline may release through the native idle path", async () => {
+  const { pi, sentMessageCalls, sentUsers } = fakePi();
+  pi.events.on("pi-wake-consumer:v1:offer", (raw: unknown) => {
+    const offer = raw as { token: string };
+    pi.events.emit("pi-wake-consumer:v1:claim", {
+      protocol: "pi-wake-consumer/v1",
+      token: offer.token,
+      answer: (resolve: (decision: "release" | "skip") => void) => queueMicrotask(() => resolve("release")),
+    });
+  });
+  sendWakeMessage(pi as never, fakeContext() as never, MESSAGE as never, BUSY_OPTIONS, {
+    kind: "soft-deadline", id: "request-1", sessionId: "session-1", metadata: { count: 1 }, isCurrent: () => true,
+  });
+  assert.equal(sentMessageCalls.length, 0);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(sentMessageCalls.length, 1);
+  assert.deepEqual(sentMessageCalls[0]?.options, {});
+  assert.deepEqual(sentUsers, [IDLE_WAKE_PROMPT]);
+});
+
 test("a throwing idle probe reads as busy", async () => {
   const { pi, sentMessageCalls } = fakePi();
   const ctx = fakeContext();

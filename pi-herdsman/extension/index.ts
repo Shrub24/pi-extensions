@@ -15865,12 +15865,20 @@ export default function (pi: ExtensionAPI): void {
             },
           },
           { triggerTurn: true },
+          {
+            kind: "soft-deadline",
+            id: String(dueEntries[0]?.requestId ?? ownerSessionId),
+            sessionId: ownerSessionId,
+            metadata: { count: dueEntries.length },
+            isCurrent: () => !signal.aborted && generation === healthGeneration && ctx.isIdle() && dueEntries.every((entry) => softWindows.has(String(entry.requestId))),
+            onError: (reason) => managerDiagnostic("advisory wake", { source: "soft-deadline", reason: reason.slice(0, 160) }),
+          },
         );
       } catch {
         // Best-effort delivery; the next scan retries the digest.
         return;
       }
-      // Re-arm only after a successful delivery, so a failed send retries.
+      // An offered advisory consumes this window whether released or skipped.
       const nextWindowMs = configuredWindowMs;
       for (const entry of dueEntries) {
         const requestId = String(entry.requestId);

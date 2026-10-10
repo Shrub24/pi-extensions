@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { offerWakeConsumer, type WakeConsumerEventBus } from "./wake-consumer.js";
 
 import type {
 	BackgroundTaskEventDetails,
@@ -401,6 +402,29 @@ export interface SendTaskWakeDeps {
 	 * consults it; output and soft-timeout events are unaffected.
 	 */
 	exitMandatory?: (task: ManagedTask) => boolean;
+	advisoryBus?: WakeConsumerEventBus;
+	sessionId?: () => string | undefined;
+	isCurrent?: (task: ManagedTask) => boolean;
+	onAdvisoryError?: (reason: string, task: ManagedTask) => void;
+}
+
+function sendSoftAdvisory(deps: SendTaskWakeDeps, task: ManagedTask, sequence: number, deliver: () => void): void {
+	const sessionId = deps.sessionId?.();
+	if (!deps.advisoryBus || !sessionId) {
+		deliver();
+		return;
+	}
+	offerWakeConsumer({
+		bus: deps.advisoryBus,
+		source: "pi-background-tasks",
+		kind: "soft-timeout",
+		id: task.id,
+		sessionId,
+		metadata: { sequence },
+		isCurrent: () => !deps.isShuttingDown() && deps.sessionId?.() === sessionId && task.status === "running" && task.stopReason == null && (deps.isCurrent?.(task) ?? true),
+		deliver,
+		onError: (reason) => deps.onAdvisoryError?.(reason, task),
+	});
 }
 
 export interface SendTaskWakeOptions {
@@ -571,12 +595,12 @@ export function sendTaskWake(
 			...(hardRemaining != null ? [`Hard timeout backstop: about ${formatElapsed(hardRemaining)} remaining; it will kill the task if you let it lapse.`] : []),
 			guidance.softReminderChoices,
 		].join("\n");
-		deliverWakeMessage(deps, {
+		sendSoftAdvisory(deps, task, options.sequence ?? task.wakeSequence ?? 0, () => deliverWakeMessage(deps, {
 			content,
 			customType: deps.messageType,
 			details,
 			display: true,
-		}, { deliverAs: "steer", triggerTurn: true });
+		}, { deliverAs: "steer", triggerTurn: true }));
 		return true;
 	}
 	const pending: WakePendingRecord = {

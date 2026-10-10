@@ -15,6 +15,7 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { offerWakeConsumer, type WakeConsumerEventBus } from "./advisory-wake.ts";
 
 /**
  * The short prompt that starts an idle session's run. It carries no content of
@@ -53,15 +54,29 @@ export function sendWakeMessage(
   context: ExtensionContext | null | undefined,
   message: WakeMessage,
   busyOptions: WakeOptions,
+  advisory?: { kind: "soft-deadline"; id: string; sessionId: string; metadata: Record<string, string | number | boolean | null>; isCurrent: () => boolean; onError?: (reason: string) => void },
 ): void {
   const sendUserMessage = (
     pi as { sendUserMessage?: (content: string) => void }
   ).sendUserMessage;
-  if (typeof sendUserMessage === "function" && contextIsIdle(context)) {
-    // Append without a trigger; the user prompt below starts the run.
-    pi.sendMessage(message, {});
-    sendUserMessage.call(pi, IDLE_WAKE_PROMPT);
-    return;
-  }
-  pi.sendMessage(message, busyOptions);
+  const native = (): void => {
+    if (typeof sendUserMessage === "function" && contextIsIdle(context)) {
+      pi.sendMessage(message, {});
+      sendUserMessage.call(pi, IDLE_WAKE_PROMPT);
+      return;
+    }
+    pi.sendMessage(message, busyOptions);
+  };
+  if (!advisory) { native(); return; }
+  offerWakeConsumer({
+    bus: pi.events as unknown as WakeConsumerEventBus,
+    source: "pi-herdsman",
+    kind: advisory.kind,
+    id: advisory.id,
+    sessionId: advisory.sessionId,
+    metadata: advisory.metadata,
+    isCurrent: advisory.isCurrent,
+    deliver: native,
+    onError: advisory.onError,
+  });
 }

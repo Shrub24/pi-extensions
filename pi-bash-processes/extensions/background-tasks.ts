@@ -1673,6 +1673,10 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 	 * (pi#5581, #10267), so an idle wake is started by a short user prompt.
 	 */
 	const wakeSend = {
+		advisoryBus: pi.events as unknown as import("./wake-consumer.js").WakeConsumerEventBus,
+		sessionId: () => activeSessionId ?? undefined,
+		isCurrent: (task: ManagedTask) => !shuttingDown && tasks.get(task.id) === task,
+		onAdvisoryError: (reason: string, task: ManagedTask) => logBackgroundDiagnostic("advisory wake", { reason: reason.slice(0, 160), taskId: task.id, timestamp: Date.now() }),
 		isIdle: (): boolean => {
 			try {
 				return activeCtx?.isIdle() === true;
