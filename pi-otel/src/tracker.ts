@@ -116,6 +116,7 @@ import {
   ATTR_PI_PARENT_TRACE_ID,
   ATTR_PI_PROMPT_LENGTH,
   ATTR_PI_ROUTE_PREVIOUS_MODEL,
+  ATTR_PI_ROUTE_VIRTUAL_MODEL,
   ATTR_PI_ROUTE_TRANSITION_REASON,
   ATTR_PI_SESSION_FILE,
   ATTR_PI_SESSION_ID,
@@ -130,6 +131,7 @@ import {
   OP_NAME_EXECUTE_TOOL,
   OP_NAME_INVOKE_AGENT,
   clampAttr,
+  jsonAttr,
   EVENT_GEN_AI_ASSISTANT_MESSAGE,
   EVENT_GEN_AI_CHOICE,
   EVENT_GEN_AI_COMPLETION,
@@ -214,6 +216,7 @@ interface ToolSlot extends TimedSlot {
 interface PendingLlm {
   requestModel?: string;
   providerSystem?: string;
+  virtualModel?: string;
   /** Wall-clock ms, used to backdate the span once the record is claimed. */
   startedAtMs: number;
   /** Monotonic ns, used for duration metrics so they measure the real request. */
@@ -538,7 +541,7 @@ export class SpanTracker {
       if (this.shouldCapturePrompt()) {
         attrs[ATTR_PI_USER_PROMPT] = clampAttr(prompt);
         if (prompt.length > 0) {
-          attrs[ATTR_LANGFUSE_OBSERVATION_INPUT] = clampAttr({
+          attrs[ATTR_LANGFUSE_OBSERVATION_INPUT] = jsonAttr({
             messages: [{ role: "user", parts: [{ type: "text", content: prompt }] }],
           });
         }
@@ -718,13 +721,13 @@ export class SpanTracker {
    * this request became an agent generation (see claimPendingLlm).
    */
   noteProviderRequest(
-    requestModel: string | undefined,
-    providerSystem: string | undefined,
+    virtualModelOrTools?: string | unknown[],
     toolDefinitions?: unknown[],
   ): void {
+    const virtualModel = typeof virtualModelOrTools === "string" && virtualModelOrTools.includes("/") ? virtualModelOrTools : undefined;
+    if (Array.isArray(virtualModelOrTools)) toolDefinitions = virtualModelOrTools;
     this.pendingLlm = {
-      requestModel,
-      providerSystem,
+      virtualModel,
       startedAtMs: this.now(),
       startedNs: process.hrtime.bigint(),
       responses: [],
@@ -737,10 +740,10 @@ export class SpanTracker {
    * pending or a span is already open. The span is backdated to the request
    * start, so latency and TTFT cover the real request, not the claim.
    */
-  claimPendingLlm(): void {
+  claimPendingLlm(message?: { model?: string; provider?: string }): void {
     const pending = this.pendingLlm;
     if (!pending || this.llm) return;
-    this.openLlm(pending.requestModel, pending.providerSystem, pending);
+    this.openLlm(message?.model, message?.provider, pending);
   }
 
   /** Open an LLM span directly (tests and the claim path). Consumes any
@@ -768,10 +771,10 @@ export class SpanTracker {
       ? pending.toolDefinitions
       : undefined;
     if (systemInstructions) {
-      attrs[ATTR_GEN_AI_SYSTEM_INSTRUCTIONS] = clampAttr(systemInstructions);
+      attrs[ATTR_GEN_AI_SYSTEM_INSTRUCTIONS] = jsonAttr(systemInstructions);
     }
     if (toolDefinitions) {
-      attrs[ATTR_GEN_AI_TOOL_DEFINITIONS] = clampAttr(toolDefinitions);
+      attrs[ATTR_GEN_AI_TOOL_DEFINITIONS] = jsonAttr(toolDefinitions);
     }
     // Agent identity is the harness (pi). Provider identity is the dialect's
     // provider key: gen_ai.provider.name in 1.37 (the 2025-10 rename,
@@ -783,6 +786,7 @@ export class SpanTracker {
       attrs[this.providerNameKey()] = providerSystem;
     }
     if (requestModel) attrs[ATTR_GEN_AI_REQUEST_MODEL] = requestModel;
+    if (pending?.virtualModel) attrs[ATTR_PI_ROUTE_VIRTUAL_MODEL] = pending.virtualModel;
     // pi always consumes assistant responses as a stream; registry-defined
     // from semantic-conventions 1.43.
     if (this.semconv === "1.43") {
@@ -828,12 +832,14 @@ export class SpanTracker {
     for (const r of pending?.responses ?? []) this.applyResponseToLlm(r.status, r.headers);
   }
 
-  noteFirstToken(message: { role?: string }): void {
+  noteFirstToken(message: { role?: string; model?: string; provider?: string }): void {
     if (!this.llm || message.role !== "assistant" || this.llm.firstTokenSeen) return;
+    this.resolveLlmIdentity(message);
     this.llm.firstTokenSeen = true;
     const elapsedSec = Number(process.hrtime.bigint() - this.llm.startNs) / 1e9;
     const base: Attributes = this.commonAttrs();
     if (this.llm.requestModel) base[ATTR_GEN_AI_REQUEST_MODEL] = this.llm.requestModel;
+    if (this.llm.providerSystem) base[this.providerNameKey()] = this.llm.providerSystem;
     try {
       this.opts.metrics()?.timeToFirstToken.record(elapsedSec, base);
     } catch { /* best-effort */ }
@@ -844,16 +850,18 @@ export class SpanTracker {
     this.llm.span.addEvent(EVENT_GEN_AI_FIRST_TOKEN, { elapsed_s: elapsedSec } as Attributes);
   }
 
-  noteLlmComplete(message: { role?: string }): void {
+  noteLlmComplete(message: { role?: string; model?: string; provider?: string }): void {
     if (message.role !== "assistant") return;
     // An assistant message ending is proof the pending request became a
     // generation, even when no message_start/update was observed.
-    this.claimPendingLlm();
+    this.claimPendingLlm(message);
     if (!this.llm || this.llm.completionRecorded) return;
+    this.resolveLlmIdentity(message);
     this.llm.completionRecorded = true;
     const elapsedSec = Number(process.hrtime.bigint() - this.llm.startNs) / 1e9;
     const base: Attributes = this.commonAttrs();
     if (this.llm.requestModel) base[ATTR_GEN_AI_REQUEST_MODEL] = this.llm.requestModel;
+    if (this.llm.providerSystem) base[this.providerNameKey()] = this.llm.providerSystem;
     try {
       this.opts.metrics()?.timeToCompletion.record(elapsedSec, base);
     } catch { /* best-effort */ }
@@ -906,7 +914,7 @@ export class SpanTracker {
     if (llm.inputMessages.length) input.messages = llm.inputMessages;
     if (llm.toolDefinitions?.length) input.tools = llm.toolDefinitions;
     if (Object.keys(input).length > 0) {
-      llm.span.setAttribute(ATTR_LANGFUSE_OBSERVATION_INPUT, clampAttr(input));
+      llm.span.setAttribute(ATTR_LANGFUSE_OBSERVATION_INPUT, jsonAttr(input));
     }
   }
 
@@ -1026,13 +1034,26 @@ export class SpanTracker {
     });
   }
 
+  private resolveLlmIdentity(message: { model?: string; provider?: string }): void {
+    if (!this.llm) return;
+    if (message.provider) {
+      this.llm.providerSystem = message.provider;
+      this.llm.span.setAttribute(this.providerNameKey(), message.provider);
+    }
+    if (message.model && (message.provider || !this.llm.requestModel)) {
+      this.llm.requestModel = message.model;
+      this.llm.span.setAttribute(ATTR_GEN_AI_REQUEST_MODEL, message.model);
+    }
+  }
+
   /** Finalize the LLM span from the completed AssistantMessage. */
   completeLlm(message: MessageShapes.AssistantMessage): void {
     // turn_end with an assistant message also claims a still-pending request:
     // on a path that skipped message_end the generation is still real.
-    this.claimPendingLlm();
+    this.claimPendingLlm(message);
     if (!this.llm) return;
     const llm = this.llm;
+    this.resolveLlmIdentity(message);
     if (message.responseModel) {
       llm.responseModel = message.responseModel;
       llm.span.setAttribute(ATTR_GEN_AI_RESPONSE_MODEL, message.responseModel);
@@ -1149,6 +1170,7 @@ export class SpanTracker {
     const elapsedSec = Number(process.hrtime.bigint() - this.llm.startNs) / 1e9;
     const base: Attributes = this.commonAttrs();
     if (this.llm.requestModel) base[ATTR_GEN_AI_REQUEST_MODEL] = this.llm.requestModel;
+    if (this.llm.providerSystem) base[this.providerNameKey()] = this.llm.providerSystem;
     if (this.llm.responseModel) base[ATTR_GEN_AI_RESPONSE_MODEL] = this.llm.responseModel;
     try {
       m.opDuration.record(elapsedSec, base);
@@ -1198,7 +1220,7 @@ export class SpanTracker {
       }
       // Aspire-style JSON message attributes (read by 9.x AI panel and others).
       if (this.llm.inputMessages.length > 0) {
-        this.llm.span.setAttribute(ATTR_GEN_AI_INPUT_MESSAGES, clampAttr(this.llm.inputMessages));
+        this.llm.span.setAttribute(ATTR_GEN_AI_INPUT_MESSAGES, jsonAttr(this.llm.inputMessages));
       }
       this.writeLangfuseInput();
       const outputParts: Array<Record<string, unknown>> = [];
@@ -1207,7 +1229,7 @@ export class SpanTracker {
         outputParts.push({ type: "tool_call", id: tc.id, name: tc.function.name, arguments: tc.function.arguments });
       }
       const outputMessages = [{ role: "assistant", parts: outputParts, finish_reason: m.stopReason ?? "stop" }];
-      const output = clampAttr(outputMessages);
+      const output = jsonAttr(outputMessages);
       this.llm.span.setAttribute(ATTR_GEN_AI_OUTPUT_MESSAGES, output);
       this.llm.span.setAttribute(ATTR_LANGFUSE_OBSERVATION_OUTPUT, output);
       this.interactionOutput = output;
@@ -1701,6 +1723,8 @@ export namespace MessageShapes {
   export type ContentPart = TextPart | ToolCallPart | { type: "thinking" } | { type: "other" };
   export interface AssistantMessage {
     role: "assistant";
+    api?: string;
+    provider?: string;
     // `content` is a discriminated union on `type`. The last member is a
     // catch-all for parts we don't model (thinking, redacted_thought, ...).
     content: ContentPart[];

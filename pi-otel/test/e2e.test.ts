@@ -171,6 +171,8 @@ async function emitRun(
     turnIndex: 0,
     message: {
       role: "assistant",
+      api: "openai-completions",
+      provider: "test",
       content: [{ type: "text", text: "ok" }],
       model: "test-model",
       usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
@@ -239,12 +241,12 @@ describe("end-to-end over real HTTP OTLP (JSON protocol)", () => {
     await emit("after_provider_response", { status: 200, headers: {} });
     // The assistant stream opens before pi runs the tools the response asked
     // for, so the LLM span is open (and linkable) while they execute.
-    await emit("message_start", { message: { role: "assistant", content: [], model: "test-model" } });
+    await emit("message_start", { message: { role: "assistant", content: [], api: "openai-completions", provider: "test", model: "test-model" } });
     await emit("tool_execution_start", { toolCallId: "t1", toolName: "read", args: { path: "/x" } });
     await emit("tool_execution_end", { toolCallId: "t1", toolName: "read", result: { out: "contents" }, isError: false });
     await emit("turn_end", {
       turnIndex: 0,
-      message: { role: "assistant", content: [{ type: "toolCall", id: "t1", name: "read", arguments: { path: "/x" } }], model: "test-model", usage: { input: 10, output: 5, cacheRead: 3, cacheWrite: 0, cost: { total: 0.001 } }, stopReason: "tool_use" },
+      message: { role: "assistant", content: [{ type: "toolCall", id: "t1", name: "read", arguments: { path: "/x" } }], api: "openai-completions", provider: "test", model: "test-model", usage: { input: 10, output: 5, cacheRead: 3, cacheWrite: 0, cost: { total: 0.001 } }, stopReason: "tool_use" },
       toolResults: [],
     });
     // Turn 1: plain completion.
@@ -253,7 +255,7 @@ describe("end-to-end over real HTTP OTLP (JSON protocol)", () => {
     await emit("after_provider_response", { status: 200, headers: {} });
     await emit("turn_end", {
       turnIndex: 1,
-      message: { role: "assistant", content: [{ type: "text", text: "done" }], model: "test-model", usage: { input: 20, output: 8, cacheRead: 0, cacheWrite: 0, cost: { total: 0.002 } }, stopReason: "stop" },
+      message: { role: "assistant", content: [{ type: "text", text: "done" }], api: "openai-completions", provider: "test", model: "test-model", usage: { input: 20, output: 8, cacheRead: 0, cacheWrite: 0, cost: { total: 0.002 } }, stopReason: "stop" },
       toolResults: [],
     });
     await emit("agent_end", { messages: [] });
@@ -520,7 +522,7 @@ describe("end-to-end over real HTTP OTLP (JSON protocol)", () => {
       await emit("after_provider_response", { status: 200, headers: {} });
       await emit("turn_end", {
         turnIndex: 0,
-        message: { role: "assistant", content: [{ type: "text", text: "ok" }], model: "test-model", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }, stopReason: "stop" },
+        message: { role: "assistant", content: [{ type: "text", text: "ok" }], api: "openai-completions", provider: "test", model: "test-model", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }, stopReason: "stop" },
         toolResults: [],
       });
       await emit("agent_end", { messages: [] });

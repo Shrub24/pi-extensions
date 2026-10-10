@@ -1318,7 +1318,7 @@ describe("system prompt hash and capture", () => {
     h.tracker.startInteraction("p");
     h.tracker.noteSystemPrompt(prompt);
     h.tracker.startTurn(0);
-    h.tracker.noteProviderRequest("m", "anthropic", definitions);
+    h.tracker.noteProviderRequest(undefined, definitions);
     h.tracker.claimPendingLlm();
     h.tracker.completeLlm(asstMsg({ text: "done" }));
     h.tracker.endTurn();
@@ -1334,13 +1334,61 @@ describe("system prompt hash and capture", () => {
     assert.equal(h.span(SPAN_INTERACTION).attributes[ATTR_GEN_AI_SYSTEM_PROMPT_HASH], hashPrompt(prompt));
   });
 
+  test("prompts and tool definitions above the attribute ceiling stay valid JSON", async () => {
+    const prompt = "p".repeat(80 * 1024);
+    const definitions = [{
+      type: "function",
+      name: "search",
+      description: "d".repeat(80 * 1024),
+      parameters: { type: "object", properties: {} },
+    }];
+    h.tracker.startSession();
+    h.tracker.startInteraction("p");
+    h.tracker.noteSystemPrompt(prompt);
+    h.tracker.startTurn(0);
+    h.tracker.noteProviderRequest(undefined, definitions);
+    h.tracker.claimPendingLlm();
+    h.tracker.completeLlm(asstMsg({ text: "done" }));
+    h.tracker.endTurn();
+    h.tracker.endInteraction();
+    h.tracker.endSession();
+    await h.flush();
+
+    const llm = h.span(SPAN_LLM_REQUEST);
+    assert.deepEqual(JSON.parse(String(llm.attributes[ATTR_GEN_AI_SYSTEM_INSTRUCTIONS])), [
+      { type: "text", content: prompt },
+    ]);
+    assert.deepEqual(JSON.parse(String(llm.attributes[ATTR_GEN_AI_TOOL_DEFINITIONS])), definitions);
+  });
+
+  test("long conversation messages stay parseable JSON on the LLM span", async () => {
+    const long = "m".repeat(80 * 1024);
+    h.tracker.startSession();
+    h.tracker.startInteraction("p");
+    h.tracker.startTurn(0);
+    h.tracker.noteUserInput(long);
+    h.tracker.noteProviderRequest(undefined, []);
+    h.tracker.claimPendingLlm();
+    h.tracker.completeLlm(asstMsg({ text: long }));
+    h.tracker.endTurn();
+    h.tracker.endInteraction();
+    h.tracker.endSession();
+    await h.flush();
+
+    const llm = h.span(SPAN_LLM_REQUEST);
+    const input = JSON.parse(String(llm.attributes[ATTR_GEN_AI_INPUT_MESSAGES]));
+    assert.equal(input[0].parts[0].content, long);
+    const output = JSON.parse(String(llm.attributes[ATTR_GEN_AI_OUTPUT_MESSAGES]));
+    assert.equal(output[0].parts[0].content, long);
+  });
+
   test("system instructions and tool definitions follow prompt capture mode", async () => {
     const h2 = makeHarness({ captureContent: "metadata_only" });
     h2.tracker.startSession();
     h2.tracker.startInteraction("p");
     h2.tracker.noteSystemPrompt("private system prompt");
     h2.tracker.startTurn(0);
-    h2.tracker.noteProviderRequest("m", "anthropic", [{ type: "function", name: "secret-tool" }]);
+    h2.tracker.noteProviderRequest(undefined, [{ type: "function", name: "secret-tool" }]);
     h2.tracker.claimPendingLlm();
     h2.tracker.completeLlm(asstMsg({ text: "done" }));
     h2.tracker.endTurn();
@@ -1435,7 +1483,7 @@ describe("system prompt hash and capture", () => {
     h.tracker.noteSystemPrompt("system prompt");
     h.tracker.startTurn(0);
     h.tracker.noteUserInput("user prompt");
-    h.tracker.noteProviderRequest("test-model", "test-provider", tools);
+    h.tracker.noteProviderRequest(undefined, tools);
     h.tracker.startLlm("test-model", "test-provider");
     h.tracker.completeLlm(asstMsg({ text: "assistant answer" }));
     h.tracker.endTurn({ reason: "end" });
@@ -1994,7 +2042,7 @@ describe("pending generation claim", () => {
     h.tracker.startTurn(0);
     // A cache warmer reaches the provider hooks but never becomes an
     // assistant generation.
-    h.tracker.noteProviderRequest("m", "anthropic");
+    h.tracker.noteProviderRequest();
     h.tracker.recordProviderResponse(200, { "x-request-id": "warm-1" });
     h.tracker.endTurn();
     h.tracker.endInteraction();
@@ -2011,7 +2059,7 @@ describe("pending generation claim", () => {
     h.tracker.startSession();
     h.tracker.startInteraction("p");
     h.tracker.startTurn(0);
-    h.tracker.noteProviderRequest("m", "anthropic");
+    h.tracker.noteProviderRequest();
     h.tracker.recordProviderResponse(429, { "x-request-id": "req-1" });
     h.tracker.recordProviderResponse(200, { "x-request-id": "req-1", "cf-ray": "abc123" });
     h.tracker.claimPendingLlm();
@@ -2046,7 +2094,7 @@ describe("pending generation claim", () => {
     tracker.startSession();
     tracker.startInteraction("p");
     tracker.startTurn(0);
-    tracker.noteProviderRequest("m", "anthropic");
+    tracker.noteProviderRequest();
     // The generation is claimed five seconds into the request.
     now += 5_000;
     tracker.claimPendingLlm();
@@ -2063,7 +2111,7 @@ describe("pending generation claim", () => {
   test("an unclaimed request is discarded at the next run boundary", async () => {
     h.tracker.startSession();
     h.tracker.startInteraction("first");
-    h.tracker.noteProviderRequest("m", "anthropic");
+    h.tracker.noteProviderRequest();
     h.tracker.endInteraction();
     // The next run must not inherit the previous run's candidate request.
     h.tracker.startInteraction("second");
@@ -2126,7 +2174,7 @@ describe("compaction span", () => {
     h.tracker.startCompaction("threshold", { tokensBefore: 150_000 });
     h.tracker.endCompaction({ reason: "threshold" });
     h.tracker.startTurn(1);
-    h.tracker.noteProviderRequest("m", "anthropic");
+    h.tracker.noteProviderRequest();
     h.tracker.claimPendingLlm();
     h.tracker.completeLlm(asstMsg({ text: "after" }));
     h.tracker.endTurn();
@@ -2185,7 +2233,7 @@ describe("compaction span", () => {
   test("a pending provider record at compaction close is discarded, not claimed", async () => {
     h.tracker.startSession();
     h.tracker.startInteraction("p");
-    h.tracker.noteProviderRequest("m", "anthropic");
+    h.tracker.noteProviderRequest();
     h.tracker.startCompaction("overflow", { tokensBefore: 200_000 });
     h.tracker.endCompaction({ reason: "overflow" });
     // The next assistant event must not backdate an llm span across the

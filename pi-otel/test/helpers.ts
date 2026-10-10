@@ -187,6 +187,8 @@ export function asstMsg(opts: {
   cost?: number;
   stopReason?: string;
   responseModel?: string;
+  model?: string;
+  provider?: string;
   responseId?: string;
   errorMessage?: string;
 }): MessageShapes.AssistantMessage {
@@ -198,7 +200,8 @@ export function asstMsg(opts: {
   return {
     role: "assistant",
     content,
-    model: "test-model",
+    model: opts.model ?? "test-model",
+    provider: opts.provider,
     responseModel: opts.responseModel,
     responseId: opts.responseId,
     usage: {

@@ -49,6 +49,7 @@ import {
   ATTR_PI_COMPACTION_TOKENS_BEFORE,
   ATTR_PI_COMPACTION_WILL_RETRY,
   ATTR_PI_RUN_KIND,
+  ATTR_PI_ROUTE_VIRTUAL_MODEL,
   ATTR_PI_SESSION_MODE,
   ATTR_PI_AGENT_ROLE,
   ATTR_PI_AGENT_LABEL,
@@ -458,7 +459,8 @@ export default function (pi: ExtensionAPI): void {
         ...(tool.description ? { description: tool.description } : {}),
         ...(tool.parameters ? { parameters: tool.parameters } : {}),
       }));
-    tracker?.noteProviderRequest(model?.id, model?.provider, toolDefinitions);
+    const virtualModel = model?.api === "pi-virtual" ? `${model.provider}/${model.id}` : undefined;
+    tracker?.noteProviderRequest(virtualModel, toolDefinitions);
   });
 
   pi.on("after_provider_response", async (event, _ctx) => {
@@ -478,7 +480,7 @@ export default function (pi: ExtensionAPI): void {
   pi.on("message_update", async (event, _ctx) => {
     // A real streamed delta is proof the request became an agent generation.
     const delta = (event.assistantMessageEvent as { delta?: unknown } | undefined)?.delta;
-    if (typeof delta === "string" && delta.length > 0) tracker?.claimPendingLlm();
+    if (typeof delta === "string" && delta.length > 0) tracker?.claimPendingLlm(event.message as MessageShapes.AssistantMessage);
     tracker?.noteFirstToken(event.message);
   });
 
@@ -495,7 +497,7 @@ export default function (pi: ExtensionAPI): void {
     } else if (msg.role === "assistant") {
       // The assistant message claims the pending provider request, so a
       // request that never produced one stays unclaimed and emits no span.
-      tracker?.claimPendingLlm();
+      tracker?.claimPendingLlm(msg as MessageShapes.AssistantMessage);
     } else if (msg.role === "custom") {
       // Keep Pi's original customType/details alongside the user-like message
       // content so extension wakes and intercom deliveries remain attributable.

@@ -176,6 +176,7 @@ export const ATTR_PI_CONTEXT_PERCENT = "pi.context.percent";
  * prefix, so requests under different epochs are never cache hits of each other. */
 export const ATTR_PI_CACHE_EPOCH = "pi.cache.epoch";
 export const ATTR_PI_ROUTE_PREVIOUS_MODEL = "pi.route.previous_model";
+export const ATTR_PI_ROUTE_VIRTUAL_MODEL = "pi.route.virtual_model";
 export const ATTR_PI_ROUTE_TRANSITION_REASON = "pi.route.transition_reason";
 /** Remote parent this process inherited through TRACEPARENT (a spawning pi). */
 export const ATTR_PI_PARENT_TRACE_ID = "pi.parent.trace_id";
@@ -256,6 +257,14 @@ const TRUNC_SUFFIX = "…[truncated]";
  * it never splits a multi-byte sequence and never trusts UTF-16 code-unit
  * indices as byte offsets.
  */
+/**
+ * Serialize a structured GenAI payload without the byte ceiling. Clamping its
+ * JSON text would cut mid-token and leave the value unparseable.
+ */
+export function jsonAttr(value: unknown): string {
+  return safeStringify(value);
+}
+
 export function clampAttr(value: unknown): string {
   let s: string;
   if (typeof value === "string") {
