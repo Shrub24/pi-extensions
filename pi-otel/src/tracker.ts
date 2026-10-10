@@ -94,6 +94,15 @@ import {
   ATTR_PI_RUN_KIND,
   ATTR_PI_SESSION_MODE,
   ATTR_PI_SESSION_NAME,
+  ATTR_LANGFUSE_TRACE_NAME,
+  ATTR_LANGFUSE_TRACE_TAGS,
+  ATTR_LANGFUSE_TRACE_METADATA_PREFIX,
+  ATTR_LANGFUSE_OBSERVATION_TYPE,
+  ATTR_LANGFUSE_OBSERVATION_INPUT,
+  ATTR_LANGFUSE_OBSERVATION_OUTPUT,
+  ATTR_LATITUDE_CAPTURE_NAME,
+  ATTR_LATITUDE_METADATA,
+  ATTR_LATITUDE_TAGS,
   ATTR_PI_AGENT_ROLE,
   ATTR_PI_AGENT_LABEL,
   ATTR_PI_AGENT_RUN_ID,
@@ -235,6 +244,8 @@ interface LlmState {
   lastErrorStatus?: number;
   inputMessages: Array<Record<string, unknown>>;
   inputMessageCount: number;
+  systemInstructions?: Array<Record<string, unknown>>;
+  toolDefinitions?: unknown[];
   firstTokenSeen?: boolean;
   completionRecorded?: boolean;
 }
@@ -299,6 +310,9 @@ export class SpanTracker {
   /** Restores the previous TRACEPARENT when the current run closes. */
   private withdrawTraceparent: (() => void) | null = null;
   private interaction: (Slot) | null = null;
+  private interactionSessionName: string | undefined;
+  private interactionNameSnapshotTaken = false;
+  private interactionOutput: string | undefined;
   private attempt: (TimedSlot & { number: number }) | null = null;
   private compaction: (TimedSlot & { reason: string }) | null = null;
   private turn: (TimedSlot & { index: number }) | null = null;
@@ -505,7 +519,11 @@ export class SpanTracker {
     // A provider request that no assistant event claimed belongs to the run
     // that just ended, not to this one.
     this.pendingLlm = null;
+    this.interactionSessionName = this.opts.sessionName?.()?.trim() || undefined;
+    this.interactionNameSnapshotTaken = true;
+    this.interactionOutput = undefined;
     const attrs = this.commonAttrs();
+    attrs[ATTR_LANGFUSE_OBSERVATION_TYPE] = "agent";
     attrs[ATTR_PI_INTERACTION_ID] = this.interactionCount;
     attrs[ATTR_PI_INTERACTION_ORIGIN] = origin;
     attrs[ATTR_GEN_AI_OPERATION_NAME] = OP_NAME_INVOKE_AGENT;
@@ -519,6 +537,11 @@ export class SpanTracker {
       attrs[ATTR_PI_PROMPT_LENGTH] = prompt.length;
       if (this.shouldCapturePrompt()) {
         attrs[ATTR_PI_USER_PROMPT] = clampAttr(prompt);
+        if (prompt.length > 0) {
+          attrs[ATTR_LANGFUSE_OBSERVATION_INPUT] = clampAttr({
+            messages: [{ role: "user", parts: [{ type: "text", content: prompt }] }],
+          });
+        }
       } else {
         Object.assign(attrs, prefixKeys("pi.user_prompt", fingerprint(prompt)));
       }
@@ -531,7 +554,10 @@ export class SpanTracker {
       attrs[ATTR_PI_PARENT_TRACE_ID] = this.inheritedParent.traceId;
       attrs[ATTR_PI_PARENT_SPAN_ID] = this.inheritedParent.spanId;
     }
-    const span = this.opts.tracer.startSpan(SPAN_INTERACTION, { attributes: attrs }, parent);
+    const sessionName = attrs[ATTR_PI_SESSION_NAME];
+    const spanName = typeof sessionName === "string" ? sessionName : SPAN_INTERACTION;
+    attrs[ATTR_LATITUDE_CAPTURE_NAME] = spanName;
+    const span = this.opts.tracer.startSpan(spanName, { attributes: attrs }, parent);
     this.interaction = { span, ctx: trace.setSpan(parent, span) };
     this.interactionStartMs = this.now();
     this.publishRunTraceparent(span.spanContext());
@@ -584,10 +610,20 @@ export class SpanTracker {
       // Context alive at the end of the run, so a run row shows both ends of
       // its context growth.
       this.applyContextUsage(span);
+      if (this.shouldCapturePrompt() && this.interactionOutput) {
+        span.setAttribute(ATTR_LANGFUSE_OBSERVATION_OUTPUT, this.interactionOutput);
+      }
       this.setStatusFromError(span, opts.error);
+      const finalAttrs = this.commonAttrs();
+      span.setAttributes(finalAttrs);
+      const finalName = finalAttrs[ATTR_PI_SESSION_NAME];
+      if (typeof finalName === "string") span.updateName(finalName);
       span.end();
       this.interaction = null;
       this.interactionStartMs = 0;
+      this.interactionSessionName = undefined;
+      this.interactionNameSnapshotTaken = false;
+      this.interactionOutput = undefined;
       this.systemPrompt = undefined;
       this.pendingInput = [];
     }
@@ -606,6 +642,7 @@ export class SpanTracker {
     this.attemptCount++;
     this.attemptHadError = false;
     const attrs = this.commonAttrs();
+    attrs[ATTR_LANGFUSE_OBSERVATION_TYPE] = "span";
     attrs[ATTR_PI_ATTEMPT_NUMBER] = this.attemptCount;
     const reason = this.nextAttemptReason();
     if (reason) attrs[ATTR_PI_ATTEMPT_REASON] = reason;
@@ -651,6 +688,7 @@ export class SpanTracker {
     this.interactionTurnCount++;
     this.sessionTurnCount++;
     const attrs = this.commonAttrs();
+    attrs[ATTR_LANGFUSE_OBSERVATION_TYPE] = "chain";
     attrs[ATTR_PI_TURN_INDEX] = turnIndex;
     attrs[ATTR_GEN_AI_OPERATION_NAME] = OP_NAME_CHAT;
     const parent = this.attempt?.ctx ?? this.interaction.ctx;
@@ -722,11 +760,18 @@ export class SpanTracker {
     const parent = this.turn?.ctx ?? this.attempt?.ctx ?? this.interaction?.ctx ?? this.runParentContext();
     const attrs = this.commonAttrs();
     attrs[ATTR_GEN_AI_OPERATION_NAME] = OP_NAME_CHAT;
-    if (this.shouldCapturePrompt() && this.systemPrompt) {
-      attrs[ATTR_GEN_AI_SYSTEM_INSTRUCTIONS] = clampAttr([{ type: "text", content: this.systemPrompt }]);
+    attrs[ATTR_LANGFUSE_OBSERVATION_TYPE] = "generation";
+    const systemInstructions = this.shouldCapturePrompt() && this.systemPrompt
+      ? [{ type: "text", content: this.systemPrompt }]
+      : undefined;
+    const toolDefinitions = this.shouldCapturePrompt() && pending?.toolDefinitions?.length
+      ? pending.toolDefinitions
+      : undefined;
+    if (systemInstructions) {
+      attrs[ATTR_GEN_AI_SYSTEM_INSTRUCTIONS] = clampAttr(systemInstructions);
     }
-    if (this.shouldCapturePrompt() && pending?.toolDefinitions?.length) {
-      attrs[ATTR_GEN_AI_TOOL_DEFINITIONS] = clampAttr(pending.toolDefinitions);
+    if (toolDefinitions) {
+      attrs[ATTR_GEN_AI_TOOL_DEFINITIONS] = clampAttr(toolDefinitions);
     }
     // Agent identity is the harness (pi). Provider identity is the dialect's
     // provider key: gen_ai.provider.name in 1.37 (the 2025-10 rename,
@@ -772,6 +817,8 @@ export class SpanTracker {
       failedAttempts: 0,
       inputMessages: [],
       inputMessageCount: 0,
+      systemInstructions,
+      toolDefinitions,
     };
     this.applyContextUsage(span);
     // Drain any user/tool messages that arrived before the LLM span opened.
@@ -851,8 +898,24 @@ export class SpanTracker {
     return ps ? { [this.providerNameKey()]: ps } : undefined;
   }
 
+  private writeLangfuseInput(): void {
+    const llm = this.llm;
+    if (!llm || !this.shouldCapturePrompt()) return;
+    const input: Record<string, unknown> = {};
+    if (llm.systemInstructions?.length) input.system_instructions = llm.systemInstructions;
+    if (llm.inputMessages.length) input.messages = llm.inputMessages;
+    if (llm.toolDefinitions?.length) input.tools = llm.toolDefinitions;
+    if (Object.keys(input).length > 0) {
+      llm.span.setAttribute(ATTR_LANGFUSE_OBSERVATION_INPUT, clampAttr(input));
+    }
+  }
+
   private flushPendingInput(): void {
-    if (!this.llm || this.pendingInput.length === 0) return;
+    if (!this.llm) return;
+    if (this.pendingInput.length === 0) {
+      this.writeLangfuseInput();
+      return;
+    }
     const emitEvents = this.semconv === "1.36";
     for (const m of this.pendingInput) {
       const index = this.llm.inputMessageCount++;
@@ -892,6 +955,7 @@ export class SpanTracker {
       }
     }
     this.pendingInput = [];
+    this.writeLangfuseInput();
   }
 
   /**
@@ -1136,15 +1200,17 @@ export class SpanTracker {
       if (this.llm.inputMessages.length > 0) {
         this.llm.span.setAttribute(ATTR_GEN_AI_INPUT_MESSAGES, clampAttr(this.llm.inputMessages));
       }
+      this.writeLangfuseInput();
       const outputParts: Array<Record<string, unknown>> = [];
       if (text) outputParts.push({ type: "text", content: text });
       for (const tc of toolCalls) {
         outputParts.push({ type: "tool_call", id: tc.id, name: tc.function.name, arguments: tc.function.arguments });
       }
-      this.llm.span.setAttribute(
-        ATTR_GEN_AI_OUTPUT_MESSAGES,
-        clampAttr([{ role: "assistant", parts: outputParts, finish_reason: m.stopReason ?? "stop" }]),
-      );
+      const outputMessages = [{ role: "assistant", parts: outputParts, finish_reason: m.stopReason ?? "stop" }];
+      const output = clampAttr(outputMessages);
+      this.llm.span.setAttribute(ATTR_GEN_AI_OUTPUT_MESSAGES, output);
+      this.llm.span.setAttribute(ATTR_LANGFUSE_OBSERVATION_OUTPUT, output);
+      this.interactionOutput = output;
     }
   }
 
@@ -1157,6 +1223,7 @@ export class SpanTracker {
   startCompaction(reason: string, preparation?: { tokensBefore?: number }): void {
     if (this.compaction) this.closeCompactionDefensively();
     const attrs = this.commonAttrs();
+    attrs[ATTR_LANGFUSE_OBSERVATION_TYPE] = "span";
     attrs[ATTR_PI_COMPACTION_REASON] = reason;
     if (typeof preparation?.tokensBefore === "number") {
       attrs[ATTR_PI_COMPACTION_TOKENS_BEFORE] = preparation.tokensBefore;
@@ -1262,10 +1329,13 @@ export class SpanTracker {
     const parent = this.turn?.ctx ?? this.attempt?.ctx ?? this.interaction?.ctx ?? this.runParentContext();
     const attrs = this.commonAttrs();
     attrs[ATTR_GEN_AI_OPERATION_NAME] = OP_NAME_EXECUTE_TOOL;
+    attrs[ATTR_LANGFUSE_OBSERVATION_TYPE] = "tool";
     attrs[ATTR_GEN_AI_TOOL_NAME] = toolName;
     attrs[ATTR_GEN_AI_TOOL_CALL_ID] = toolCallId;
     if (this.shouldCaptureToolContent() && input !== undefined) {
-      attrs[ATTR_GEN_AI_TOOL_CALL_ARGUMENTS] = clampAttr(input);
+      const capturedInput = clampAttr(input);
+      attrs[ATTR_GEN_AI_TOOL_CALL_ARGUMENTS] = capturedInput;
+      attrs[ATTR_LANGFUSE_OBSERVATION_INPUT] = capturedInput;
     }
     const spanOptions: { attributes: Attributes; links?: Array<{ context: SpanContext }> } = { attributes: attrs };
     if (this.llm) {
@@ -1296,7 +1366,9 @@ export class SpanTracker {
     this.tools.delete(toolCallId);
     slot.span.setAttribute(ATTR_PI_TOOL_IS_ERROR, isError);
     if (this.shouldCaptureToolContent() && result !== undefined) {
-      slot.span.setAttribute(ATTR_GEN_AI_TOOL_CALL_RESULT, clampAttr(result));
+      const capturedOutput = clampAttr(result);
+      slot.span.setAttribute(ATTR_GEN_AI_TOOL_CALL_RESULT, capturedOutput);
+      slot.span.setAttribute(ATTR_LANGFUSE_OBSERVATION_OUTPUT, capturedOutput);
     }
     const errorMessage = isError && this.shouldCaptureToolContent()
       ? this.toolErrorMessage(result)
@@ -1370,8 +1442,64 @@ export class SpanTracker {
       [ATTR_PI_CWD]: this.opts.cwd,
       ...(this.opts.runAttributes ?? {}),
     };
-    const sessionName = this.opts.sessionName?.();
-    if (sessionName) attrs[ATTR_PI_SESSION_NAME] = sessionName;
+    const sessionName = this.interactionNameSnapshotTaken
+      ? this.interactionSessionName
+      : this.opts.sessionName?.()?.trim();
+    if (sessionName) {
+      attrs[ATTR_PI_SESSION_NAME] = sessionName;
+      attrs[ATTR_LANGFUSE_TRACE_NAME] = sessionName;
+    }
+    const tags: string[] = [];
+    for (const [prefix, key] of [
+      ["run-kind", ATTR_PI_RUN_KIND],
+      ["mode", ATTR_PI_SESSION_MODE],
+      ["role", ATTR_PI_AGENT_ROLE],
+      ["agent", ATTR_PI_AGENT_LABEL],
+    ] as const) {
+      const value = attrs[key];
+      if (typeof value === "string" && value.length > 0) {
+        const tag = `${prefix}:${value}`;
+        if (tag.length <= 200) tags.push(tag);
+      }
+    }
+    if (tags.length > 0) {
+      attrs[ATTR_LANGFUSE_TRACE_TAGS] = tags;
+      attrs[ATTR_LATITUDE_TAGS] = JSON.stringify(tags);
+    }
+    for (const [key, attr] of [
+      ["pi_run_kind", ATTR_PI_RUN_KIND],
+      ["pi_session_mode", ATTR_PI_SESSION_MODE],
+      ["pi_session_name", ATTR_PI_SESSION_NAME],
+      ["pi_agent_role", ATTR_PI_AGENT_ROLE],
+      ["pi_agent_label", ATTR_PI_AGENT_LABEL],
+      ["pi_agent_run_id", ATTR_PI_AGENT_RUN_ID],
+      ["pi_agent_owner_session_id", ATTR_PI_AGENT_OWNER_SESSION_ID],
+      ["pi_agent_workspace_id", ATTR_PI_AGENT_WORKSPACE_ID],
+    ] as const) {
+      const value = attrs[attr];
+      if (typeof value === "string" && value.length > 0) {
+        attrs[`${ATTR_LANGFUSE_TRACE_METADATA_PREFIX}${key}`] = value.slice(0, 256);
+      }
+    }
+    const latitudeMetadata: Record<string, string> = {};
+    for (const key of [
+      ATTR_PI_RUN_KIND,
+      ATTR_PI_SESSION_MODE,
+      ATTR_PI_SESSION_NAME,
+      ATTR_PI_AGENT_ROLE,
+      ATTR_PI_AGENT_LABEL,
+      ATTR_PI_AGENT_RUN_ID,
+      ATTR_PI_AGENT_OWNER_SESSION_ID,
+      ATTR_PI_AGENT_WORKSPACE_ID,
+    ]) {
+      const value = attrs[key];
+      if (typeof value === "string" && value.length > 0) {
+        latitudeMetadata[key] = value.slice(0, 256);
+      }
+    }
+    if (Object.keys(latitudeMetadata).length > 0) {
+      attrs[ATTR_LATITUDE_METADATA] = JSON.stringify(latitudeMetadata);
+    }
     const sid = this.opts.sessionId();
     if (sid) {
       attrs[ATTR_PI_SESSION_ID] = sid;

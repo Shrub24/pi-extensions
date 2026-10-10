@@ -115,6 +115,22 @@ export const ATTR_EXCEPTION_MESSAGE = "exception.message";
 export const ATTR_HTTP_STATUS_CODE = "http.response.status_code";
 
 // ---------------------------------------------------------------------------
+// Langfuse trace-level mapping attributes
+// ---------------------------------------------------------------------------
+
+export const ATTR_LANGFUSE_TRACE_NAME = "langfuse.trace.name";
+export const ATTR_LANGFUSE_TRACE_TAGS = "langfuse.trace.tags";
+export const ATTR_LANGFUSE_TRACE_METADATA_PREFIX = "langfuse.trace.metadata.";
+export const ATTR_LANGFUSE_OBSERVATION_TYPE = "langfuse.observation.type";
+export const ATTR_LANGFUSE_OBSERVATION_INPUT = "langfuse.observation.input";
+export const ATTR_LANGFUSE_OBSERVATION_OUTPUT = "langfuse.observation.output";
+
+// Latitude capture and trace metadata mappings.
+export const ATTR_LATITUDE_CAPTURE_NAME = "latitude.capture.name";
+export const ATTR_LATITUDE_TAGS = "latitude.tags";
+export const ATTR_LATITUDE_METADATA = "latitude.metadata";
+
+// ---------------------------------------------------------------------------
 // pi.* (extension-specific)
 // ---------------------------------------------------------------------------
 

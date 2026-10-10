@@ -35,6 +35,15 @@ import {
   ATTR_PI_RUN_KIND,
   ATTR_PI_SESSION_MODE,
   ATTR_PI_SESSION_NAME,
+  ATTR_LANGFUSE_TRACE_NAME,
+  ATTR_LANGFUSE_TRACE_TAGS,
+  ATTR_LANGFUSE_TRACE_METADATA_PREFIX,
+  ATTR_LANGFUSE_OBSERVATION_TYPE,
+  ATTR_LANGFUSE_OBSERVATION_INPUT,
+  ATTR_LANGFUSE_OBSERVATION_OUTPUT,
+  ATTR_LATITUDE_CAPTURE_NAME,
+  ATTR_LATITUDE_METADATA,
+  ATTR_LATITUDE_TAGS,
   ATTR_PI_AGENT_ROLE,
   ATTR_PI_AGENT_LABEL,
   ATTR_PI_AGENT_RUN_ID,
@@ -179,7 +188,7 @@ describe("span tree shape", () => {
     h.tracker.endInteraction();
     h.tracker.endSession();
     await h.flush();
-    const interactions = h.spanExporter.getFinishedSpans().filter((s) => s.name === SPAN_INTERACTION);
+    const interactions = h.spanExporter.getFinishedSpans().filter((s) => s.attributes[ATTR_PI_INTERACTION_ID] !== undefined);
     assert.equal(interactions.length, 2);
     assert.notEqual(
       interactions[0]!.spanContext().traceId,
@@ -619,13 +628,16 @@ describe("llm metrics", () => {
 // ---------------------------------------------------------------------------
 
 describe("tool spans", () => {
-  test("carry gen_ai.tool.name, call.id, and is_error", async () => {
+  test("carry gen_ai tool identity and Langfuse tool input/output", async () => {
     runHappyPath(h, { tool: true });
     await h.flush();
     const a = h.span("pi.tool.bash").attributes;
     assert.equal(a[ATTR_GEN_AI_TOOL_NAME], "bash");
     assert.equal(a[ATTR_GEN_AI_TOOL_CALL_ID], "call_1");
     assert.equal(a[ATTR_PI_TOOL_IS_ERROR], false);
+    assert.equal(a[ATTR_LANGFUSE_OBSERVATION_TYPE], "tool");
+    assert.deepEqual(JSON.parse(String(a[ATTR_LANGFUSE_OBSERVATION_INPUT])), { command: "ls" });
+    assert.deepEqual(JSON.parse(String(a[ATTR_LANGFUSE_OBSERVATION_OUTPUT])), { output: "file.txt" });
   });
 
   test("failed tool spans preserve the actual error message", async () => {
@@ -659,6 +671,8 @@ describe("tool spans", () => {
     const span = restricted.span("pi.tool.bash");
     assert.equal(span.status.message, "tool execution failed");
     assert.equal(span.attributes["exception.message"], undefined);
+    assert.equal(span.attributes[ATTR_LANGFUSE_OBSERVATION_INPUT], undefined);
+    assert.equal(span.attributes[ATTR_LANGFUSE_OBSERVATION_OUTPUT], undefined);
     assert.equal(span.attributes[ATTR_GEN_AI_TOOL_CALL_RESULT], undefined);
   });
 
@@ -865,7 +879,7 @@ describe("orphan hygiene", () => {
     h.tracker.endSession();
     await h.flush();
     // Both interactions must be ended (no leak).
-    const interactionSpans = h.spanExporter.getFinishedSpans().filter(s => s.name === SPAN_INTERACTION);
+    const interactionSpans = h.spanExporter.getFinishedSpans().filter(s => s.attributes[ATTR_PI_INTERACTION_ID] !== undefined);
     assert.equal(interactionSpans.length, 2);
     assert.ok(interactionSpans.every(s => s.ended));
   });
@@ -1179,7 +1193,7 @@ describe("session summary attributes", () => {
     assert.equal(summary.turns, 3, "session totals turns across interactions");
     assert.equal(summary.tools, 3, "session totals tools across interactions");
     // Per-interaction totals remain scoped to that interaction.
-    const interactions = h.spanExporter.getFinishedSpans().filter(s => s.name === SPAN_INTERACTION);
+    const interactions = h.spanExporter.getFinishedSpans().filter(s => s.attributes[ATTR_PI_INTERACTION_ID] !== undefined);
     assert.equal(interactions.length, 2);
     assert.equal(interactions[0]!.attributes[ATTR_PI_TURN_COUNT], 2);
     assert.equal(interactions[0]!.attributes[ATTR_PI_TOOL_COUNT], 1);
@@ -1337,7 +1351,12 @@ describe("system prompt hash and capture", () => {
     const llm = h2.span(SPAN_LLM_REQUEST);
     assert.equal(ATTR_GEN_AI_SYSTEM_INSTRUCTIONS in llm.attributes, false);
     assert.equal(ATTR_GEN_AI_TOOL_DEFINITIONS in llm.attributes, false);
-    assert.ok(ATTR_GEN_AI_SYSTEM_PROMPT_HASH in h2.span(SPAN_INTERACTION).attributes);
+    const root = h2.span(SPAN_INTERACTION);
+    assert.equal(ATTR_LANGFUSE_OBSERVATION_INPUT in llm.attributes, false);
+    assert.equal(ATTR_LANGFUSE_OBSERVATION_OUTPUT in llm.attributes, false);
+    assert.equal(ATTR_LANGFUSE_OBSERVATION_INPUT in root.attributes, false);
+    assert.equal(ATTR_LANGFUSE_OBSERVATION_OUTPUT in root.attributes, false);
+    assert.ok(ATTR_GEN_AI_SYSTEM_PROMPT_HASH in root.attributes);
   });
 
   test("run and session labels are copied onto all spans", async () => {
@@ -1367,12 +1386,80 @@ describe("system prompt hash and capture", () => {
       assert.equal(span.attributes[ATTR_PI_RUN_KIND], "herdsman_worker");
       assert.equal(span.attributes[ATTR_PI_SESSION_MODE], "print");
       assert.equal(span.attributes[ATTR_PI_SESSION_NAME], "review pass");
+      const tags = span.attributes[ATTR_LANGFUSE_TRACE_TAGS] as string[];
+      assert.ok(tags.includes("run-kind:herdsman_worker"));
+      assert.ok(tags.includes("role:worker"));
+      assert.equal(span.attributes[`${ATTR_LANGFUSE_TRACE_METADATA_PREFIX}pi_run_kind`], "herdsman_worker");
+      assert.equal(span.attributes[`${ATTR_LANGFUSE_TRACE_METADATA_PREFIX}pi_agent_role`], "worker");
       assert.equal(span.attributes[ATTR_PI_AGENT_ROLE], "worker");
       assert.equal(span.attributes[ATTR_PI_AGENT_LABEL], "review-1");
       assert.equal(span.attributes[ATTR_PI_AGENT_RUN_ID], "run-1");
       assert.equal(span.attributes[ATTR_PI_AGENT_OWNER_SESSION_ID], "parent-1");
       assert.equal(span.attributes[ATTR_PI_AGENT_WORKSPACE_ID], "workspace-1");
     }
+    const root = h2.span(SPAN_INTERACTION);
+    const latitudeTags = JSON.parse(String(root.attributes[ATTR_LATITUDE_TAGS])) as string[];
+    assert.ok(latitudeTags.includes("run-kind:herdsman_worker"));
+    assert.ok(latitudeTags.includes("role:worker"));
+    const latitudeMetadata = JSON.parse(String(root.attributes[ATTR_LATITUDE_METADATA]));
+    assert.equal(latitudeMetadata[ATTR_PI_RUN_KIND], "herdsman_worker");
+    assert.equal(latitudeMetadata[ATTR_PI_AGENT_ROLE], "worker");
+    assert.equal(latitudeMetadata[ATTR_PI_AGENT_LABEL], "review-1");
+  });
+
+  test("interaction root tracks session title while retaining stable operation identity", async () => {
+    let sessionName = "initial title";
+    const named = makeHarness({ sessionName: () => sessionName });
+    named.tracker.startSession();
+    named.tracker.startInteraction("p");
+    sessionName = "recapped title";
+    named.tracker.endInteraction();
+    named.tracker.endSession();
+    await named.flush();
+
+    const root = named.span(SPAN_INTERACTION);
+    assert.equal(root.name, "initial title");
+    assert.equal(root.attributes[ATTR_LANGFUSE_TRACE_NAME], "initial title");
+    assert.equal(root.attributes[ATTR_LATITUDE_CAPTURE_NAME], "initial title");
+    assert.equal(root.attributes[`${ATTR_LANGFUSE_TRACE_METADATA_PREFIX}pi_session_name`], "initial title");
+    assert.equal(root.attributes[ATTR_GEN_AI_OPERATION_NAME], "invoke_agent");
+    assert.equal(root.attributes[ATTR_SESSION_ID], "test-session");
+    const metadata = JSON.parse(String(root.attributes[ATTR_LATITUDE_METADATA]));
+    assert.equal(metadata[ATTR_PI_SESSION_NAME], "initial title");
+  });
+
+  test("Langfuse observations expose system prompt, messages, tools, and response", async () => {
+    const tools = [{ type: "function", name: "lookup", description: "Look up a value", parameters: { type: "object" } }];
+    h.tracker.startSession();
+    h.tracker.startInteraction("user prompt");
+    h.tracker.noteSystemPrompt("system prompt");
+    h.tracker.startTurn(0);
+    h.tracker.noteUserInput("user prompt");
+    h.tracker.noteProviderRequest("test-model", "test-provider", tools);
+    h.tracker.startLlm("test-model", "test-provider");
+    h.tracker.completeLlm(asstMsg({ text: "assistant answer" }));
+    h.tracker.endTurn({ reason: "end" });
+    h.tracker.endInteraction({ reason: "end" });
+    h.tracker.endSession();
+    await h.flush();
+
+    const root = h.span(SPAN_INTERACTION);
+    const turn = h.span(SPAN_TURN);
+    const llm = h.span(SPAN_LLM_REQUEST);
+    assert.equal(root.attributes[ATTR_LANGFUSE_OBSERVATION_TYPE], "agent");
+    assert.equal(turn.attributes[ATTR_LANGFUSE_OBSERVATION_TYPE], "chain");
+    assert.equal(llm.attributes[ATTR_LANGFUSE_OBSERVATION_TYPE], "generation");
+    assert.deepEqual(JSON.parse(String(root.attributes[ATTR_LANGFUSE_OBSERVATION_INPUT])), {
+      messages: [{ role: "user", parts: [{ type: "text", content: "user prompt" }] }],
+    });
+    assert.deepEqual(JSON.parse(String(llm.attributes[ATTR_LANGFUSE_OBSERVATION_INPUT])), {
+      system_instructions: [{ type: "text", content: "system prompt" }],
+      messages: [{ role: "user", parts: [{ type: "text", content: "user prompt" }] }],
+      tools,
+    });
+    const output = [{ role: "assistant", parts: [{ type: "text", content: "assistant answer" }], finish_reason: "stop" }];
+    assert.deepEqual(JSON.parse(String(llm.attributes[ATTR_LANGFUSE_OBSERVATION_OUTPUT])), output);
+    assert.deepEqual(JSON.parse(String(root.attributes[ATTR_LANGFUSE_OBSERVATION_OUTPUT])), output);
   });
 
   test("noteSystemPrompt sets hash on interaction span", async () => {
@@ -1619,7 +1706,7 @@ describe("ensureInteraction", () => {
     hx.tracker.endInteraction({ reason: "end" });
     hx.tracker.endSession();
     await hx.flush();
-    const interactions = hx.spanExporter.getFinishedSpans().filter((s) => s.name === SPAN_INTERACTION);
+    const interactions = hx.spanExporter.getFinishedSpans().filter((s) => s.attributes[ATTR_PI_INTERACTION_ID] !== undefined);
     assert.equal(interactions.length, 1, "agent_start does not supersede the user interaction");
     assert.equal(interactions[0]!.attributes[ATTR_PI_INTERACTION_ORIGIN], "user");
     assert.equal(interactions[0]!.attributes[ATTR_PI_PROMPT_LENGTH], "user prompt".length);
@@ -1646,7 +1733,7 @@ describe("ensureInteraction", () => {
     hx.tracker.endSession();
     await hx.flush();
     const spans = hx.spanExporter.getFinishedSpans();
-    const interactions = spans.filter((s) => s.name === SPAN_INTERACTION);
+    const interactions = spans.filter((s) => s.attributes[ATTR_PI_INTERACTION_ID] !== undefined);
     assert.equal(spans.filter((s) => s.name === SPAN_TURN).length, 2, "both turns recorded");
     for (const s of spans) {
       // Each run is its own trace: the retry after agent_end is a new one.
@@ -1831,6 +1918,7 @@ describe("attempts", () => {
     const attempts = h.spanExporter.getFinishedSpans().filter((s) => s.name === SPAN_ATTEMPT);
     assert.equal(attempts.length, 2);
     assert.deepEqual(attempts.map((a) => a.attributes[ATTR_PI_ATTEMPT_NUMBER]), [1, 2]);
+    assert.ok(attempts.every((a) => a.attributes[ATTR_LANGFUSE_OBSERVATION_TYPE] === "span"));
     assert.equal(attempts[0]!.attributes[ATTR_PI_ATTEMPT_REASON], undefined, "a first attempt has no reason");
     assert.equal(attempts[1]!.attributes[ATTR_PI_ATTEMPT_REASON], undefined, "a clean re-run has no reason");
     assert.ok(attempts.every((a) => a.ended));
@@ -2015,6 +2103,7 @@ describe("compaction span", () => {
     await h.flush();
     const compaction = h.span(SPAN_COMPACTION);
     const attrs = compaction.attributes;
+    assert.equal(attrs[ATTR_LANGFUSE_OBSERVATION_TYPE], "span");
     assert.equal(attrs[ATTR_PI_COMPACTION_REASON], "overflow");
     assert.equal(attrs[ATTR_PI_COMPACTION_TOKENS_BEFORE], 150_000);
     assert.equal(attrs[ATTR_PI_COMPACTION_TOKENS_AFTER], 32_000);

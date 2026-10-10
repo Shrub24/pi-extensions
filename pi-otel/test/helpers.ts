@@ -10,6 +10,7 @@ import { ATTR_SERVICE_NAME } from "@opentelemetry/semantic-conventions";
 import { SpanTracker, type MessageShapes } from "../src/tracker.ts";
 import type { Metrics } from "../src/metrics.ts";
 import type { ResolvedConfig } from "../src/config.ts";
+import { ATTR_PI_INTERACTION_ID, SPAN_INTERACTION } from "../src/attrs.ts";
 
 export interface Harness {
   tracer: Tracer;
@@ -18,10 +19,10 @@ export interface Harness {
   metrics: RecordingMetrics;
   /** Force-flush the batch processor so ended spans land in the exporter. */
   flush: () => Promise<void>;
-  /** All finished spans, keyed by name (last one wins on collision). */
+  /** All finished spans keyed by name, with title-named roots indexed as SPAN_INTERACTION. */
   spansByName: () => Record<string, ReturnType<InMemorySpanExporter["getFinishedSpans"]>[number]>;
-  /** Finished span by name (last one wins); throws when absent so a missing
-   * span fails the test instead of tripping strict-index checks. */
+  /** Finished span by name or interaction identity; throws when absent so a
+   * missing span fails the test instead of tripping strict-index checks. */
   span: (name: string) => ReturnType<InMemorySpanExporter["getFinishedSpans"]>[number];
   reset: () => void;
 }
@@ -148,11 +149,18 @@ export function makeHarness(
     },
     spansByName() {
       const out: Record<string, ReturnType<InMemorySpanExporter["getFinishedSpans"]>[number]> = {};
-      for (const s of spanExporter.getFinishedSpans()) out[s.name] = s;
+      for (const s of spanExporter.getFinishedSpans()) {
+        const name = typeof s.attributes[ATTR_PI_INTERACTION_ID] === "number" ? SPAN_INTERACTION : s.name;
+        out[name] = s;
+      }
       return out;
     },
     span(name: string) {
-      const spans = spanExporter.getFinishedSpans().filter((s) => s.name === name);
+      const spans = spanExporter.getFinishedSpans().filter((s) =>
+        name === SPAN_INTERACTION
+          ? typeof s.attributes[ATTR_PI_INTERACTION_ID] === "number"
+          : s.name === name,
+      );
       const last = spans[spans.length - 1];
       if (!last) throw new Error(`span not found: ${name}`);
       return last;

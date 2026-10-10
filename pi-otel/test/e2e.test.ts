@@ -215,6 +215,7 @@ function fakePi(sessionManager: Record<string, unknown> = {}) {
 
 describe("end-to-end over real HTTP OTLP (JSON protocol)", () => {
   test("a full prompt with a tool call exports traces, metrics, and logs", async () => {
+    const systemPrompt = "E2E system instructions from Pi";
     resetReceived();
     process.env.OTEL_EXPORTER_OTLP_ENDPOINT = ENDPOINT;
     process.env.OTEL_METRIC_EXPORT_INTERVAL = "500";
@@ -227,7 +228,7 @@ describe("end-to-end over real HTTP OTLP (JSON protocol)", () => {
     };
 
     await emit("session_start", { reason: "startup" });
-    await emit("before_agent_start", { prompt: "read the file", systemPrompt: "" });
+    await emit("before_agent_start", { prompt: "read the file", systemPrompt });
     await emit("agent_start", {});
     // Turn 0: the model returns a tool call; pi executes the tool inside the
     // turn (before turn_end), so the LLM span is still open and linkable.
@@ -298,6 +299,11 @@ describe("end-to-end over real HTTP OTLP (JSON protocol)", () => {
     assert.equal(llmAttrs["gen_ai.provider.name"], "test");
     assert.equal(llmAttrs["gen_ai.system"], undefined, "1.43 does not write the pre-rename key");
     assert.equal(llmAttrs["gen_ai.request.model"], "test-model");
+    assert.deepEqual(
+      JSON.parse(String(llmAttrs["gen_ai.system_instructions"])),
+      [{ type: "text", content: systemPrompt }],
+      "system prompt from before_agent_start reaches the exported LLM span",
+    );
     assert.equal(llmAttrs["gen_ai.request.stream"], true, "1.43 records gen_ai.request.stream");
     assert.deepEqual(JSON.parse(String(llmAttrs["gen_ai.tool.definitions"])), [{
       type: "function",

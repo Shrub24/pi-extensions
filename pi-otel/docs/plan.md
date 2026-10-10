@@ -187,6 +187,6 @@ examples go under `docs/collector-configs/` alongside the existing ones.
 
 ## 7. Non-goals
 
-- No backend-branded attributes or env names in the canonical model.
+- The canonical identity model remains standard `session.id` plus portable `pi.*` fields. Additive `langfuse.*` and `latitude.*` attributes are explicit UI-compatibility mappings, not replacements for those canonical fields.
 - No re-derivation of known usage/cost from provider payloads.
 - No wrapper spans added for tree aesthetics; no session-long trace.
