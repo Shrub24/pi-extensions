@@ -285,7 +285,7 @@
         {
           "key": "logTailMaxChars",
           "label": "Dashboard/log tail",
-          "description": "Characters shown by dashboard and log actions. Log tool output includes the full log path when truncated.",
+          "description": "Characters shown by dashboard and log actions. Capture paths remain in operator-only details, not model-facing text.",
           "type": "number",
           "default": 10000,
           "category": "Output",

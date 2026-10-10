@@ -66,6 +66,8 @@ export interface TaskSurfaceGuidance {
 	recentRerun: (id: string) => string;
 	/** What a soft reminder offers: continue (optionally re-arming the interval), inspect, or stop. */
 	softReminderChoices: string;
+	/** How an unretrieved result is explicitly dismissed when it is no longer wanted. */
+	dismiss: (id: string) => string;
 }
 
 const TUI_GUIDANCE: TaskSurfaceGuidance = {
@@ -80,6 +82,7 @@ const TUI_GUIDANCE: TaskSurfaceGuidance = {
 	recentRerun: (id) => `Rerun only what changed (bg_task action:"get" id: "${id}" shows the captured result) unless the code changed since.`,
 	softReminderChoices:
 		'Choose one: let it continue (it will ask again in the same interval, or re-arm it now with bg_task action:"extend" id:... softTimeoutMs:...), inspect it with bg_task action:"get", or stop the task with bg_task action:"stop". Nothing was stopped; the exit wake is still armed.',
+	dismiss: (id) => `bg_task action:"clear" ids:["${id}"]`,
 };
 
 const COMPAT_GUIDANCE: TaskSurfaceGuidance = {
@@ -94,8 +97,33 @@ const COMPAT_GUIDANCE: TaskSurfaceGuidance = {
 	recentRerun: (id) => `Rerun only what changed (bg_task log ${id} shows the previous tail) unless the code changed since.`,
 	softReminderChoices:
 		'Choose one: continue (it will ask again in the same interval, or extend it now with bg_task action:"extend" id:... softTimeoutMs:...), inspect it with bg_task action:"get", or stop the task with bg_task action:"stop". Nothing was stopped; the exit wake is still armed.',
+	dismiss: (id) => `bg_task action:"clear" ids:["${id}"]`,
 };
 
 export function taskSurfaceGuidance(surface: TaskToolSurface): TaskSurfaceGuidance {
 	return surface === "tui" ? TUI_GUIDANCE : COMPAT_GUIDANCE;
+}
+
+export interface WakeTaskState {
+	id: string;
+	status?: string;
+	exitCode?: number | null;
+	resultResolution?: "delivered" | "error" | "dismissed";
+}
+
+/**
+ * One wake line for one task: what it did, and what its result still owes the
+ * reader. A wake reports every task it covers in this shape, so a batch cannot
+ * be read as work that is done with, and a finished task is never confused with
+ * one whose result has been handed over.
+ */
+export function wakeTaskLine(task: WakeTaskState, guidance: TaskSurfaceGuidance): string {
+	if (task.status === "running") return `${task.id} · still running · result pending`;
+	const outcome = task.exitCode == null ? "ended without an exit code" : `exit ${task.exitCode}`;
+	// `unretrieved` is the only state that still owes the reader something; a
+	// resolution — delivery, capture error, or an explicit dismissal — does not.
+	const owed = task.resultResolution === undefined
+		? `result unretrieved — ${guidance.inspect} id: ${task.id}, or dismiss it with ${guidance.dismiss(task.id)}`
+		: "result already resolved";
+	return `${task.id} · ${outcome} · ${owed}`;
 }

@@ -40,6 +40,8 @@ test("a growing capture is copied to a boundary-named artifact, and later output
 	const second = await prepareSnapshot({ generation: "bg-2@1", laneDir: dir, logFile: log, partial: true, taskId: "bg-2" });
 	expect(second.ok).toBe(true);
 	if (!second.ok) return;
+	// The copied capture holds raw command output, so it is owner-only.
+	expect(statSync(first.artifact.path).mode & 0o777).toBe(0o600);
 	expect(second.artifact.path).not.toBe(first.artifact.path);
 	expect(readFileSync(second.artifact.path, "utf8")).toBe("prefix\nmore output that arrived later\n");
 	// The earlier artifact still holds exactly what it was handed over with.

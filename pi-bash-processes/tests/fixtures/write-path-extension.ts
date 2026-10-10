@@ -27,7 +27,7 @@ const native = await interceptNativeEffects({
 	deferAppends: input.mode === "log-hold" || input.mode === "exit-held" || input.mode === "log-stall" || input.mode === "bound-held",
 });
 mock.module("@earendil-works/pi-ai", () => ({ StringEnum: (values: readonly string[]) => ({ enum: values }) }));
-mock.module("typebox", () => ({ Type: { Object: (value: unknown) => value, Optional: (value: unknown) => value, Number: () => ({}), String: () => ({}), Boolean: () => ({}) } }));
+mock.module("typebox", () => ({ Type: { Object: (value: unknown) => value, Optional: (value: unknown) => value, Number: () => ({}), String: () => ({}), Array: () => ({}), Boolean: () => ({}) } }));
 const unused = () => { throw new Error("write_path_fixture.sdk_operation=unexpected_render"); };
 const hasUI = input.mode === "exit-held";
 // The runner's user settings hide the widget; this project's settings show it.

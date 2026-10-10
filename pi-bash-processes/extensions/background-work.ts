@@ -69,12 +69,24 @@ export interface BackgroundWorkScope {
 /** How one outstanding task is currently outstanding. */
 export type BackgroundWorkTaskState = "running" | "flushing" | "awaiting-result-review";
 
-/** One task the provider still counts against assignment settlement. */
+/**
+ * One task the provider still counts against assignment settlement.
+ *
+ * `captureCertified: false` is the provider's explicit readiness distinction
+ * for a restored terminal capture that can never certify (`taskReadiness`
+ * `incomplete`). It appears only on such an `awaiting-result-review` entry: a
+ * consumer keeps it blocking, while an entry without the field is either
+ * non-terminal or a certified result that is merely unretrieved, which is
+ * advisory. A snapshot written before the field reads as certified there,
+ * which is the pre-existing behavior.
+ */
 export interface BackgroundWorkOutstandingTask {
 	taskId: string;
 	state: BackgroundWorkTaskState;
 	/** Why the task is outstanding; bounded to BACKGROUND_WORK_MAX_REASON_CHARS. */
 	reason: string;
+	/** False only on an `awaiting-result-review` entry whose capture can never be certified. */
+	captureCertified?: boolean;
 }
 
 /**
@@ -416,7 +428,21 @@ function parseSnapshot(raw: unknown): ParsedSnapshot {
 		if (!isBoundedId(entry.taskId) || entry.taskId.trim().length === 0) return { reason: "snapshot task id is empty or oversized" };
 		if (entry.state !== "running" && entry.state !== "flushing" && entry.state !== "awaiting-result-review") return { reason: "snapshot task state is unknown" };
 		if (!isNonEmptyString(entry.reason) || entry.reason.trim().length === 0) return { reason: "snapshot task reason is empty" };
-		outstanding.push({ taskId: entry.taskId, state: entry.state, reason: boundedText(entry.reason) });
+		// `captureCertified: false` is the provider's explicit readiness
+		// distinction for a restored terminal capture that can never certify.
+		// It is only meaningful on `awaiting-result-review` entries and must
+		// never be `true`: absence already reads as certified, so an explicit
+		// `true` would be a second spelling of the default with no consumer.
+		if (entry.captureCertified !== undefined) {
+			if (entry.state !== "awaiting-result-review") return { reason: "snapshot task readiness is only meaningful on an awaiting-result-review entry" };
+			if (entry.captureCertified !== false) return { reason: "snapshot task readiness must be false when present" };
+		}
+		outstanding.push({
+			taskId: entry.taskId,
+			state: entry.state,
+			reason: boundedText(entry.reason),
+			...(entry.captureCertified === false ? { captureCertified: false as const } : {}),
+		});
 	}
 	return {
 		snapshot: {

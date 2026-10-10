@@ -206,30 +206,33 @@ If it is still unacceptable, the result is a one-shot failure with a typed
 ## Background-work waiting
 
 A registered background-work provider binds spawned tasks to the accepted
-request. An exit notification records that a wake was delivered; it does not
-resolve the task. A protected waiter receives one mandatory terminal-resolution
-wake even when `notifyOnExit` is false; the shared scheduler coalesces it with
-existing exit notifications and cancels a held wake if `get` or confirmed `stop`
-resolves the task first. Resolution requires a certified result handoff or
-delivery of an unrecoverable-error notice. While assigned work is running, flushing, or
-awaiting review, the worker remains on the same request and no successful final
-result is published. While its model turn has yielded but provider completion or
-the required post-review answer is still outstanding, `agent_list` reports
-`waiting`: the assignment stays busy, cannot be interrupted, continued, replaced,
-or selected by Clear idle. The owner may inspect or transcribe it, steer it,
-extend an armed soft window, or explicitly close it as cancellation.
-Herdsman persists the provider, revision, and outstanding task IDs, then
-revalidates them during recovery and immediately before result
-persistence. A missing, failing, or identity-changed provider for a bound
-request fails closed. After the work resolves, the worker reviews it and emits
-a post-review response before the assignment settles. A waiting assignment does
-not depend on the provider's wake arriving: while an assignment is held, the
-worker re-queries the provider on a bounded cadence and re-runs settlement when
-a change notification arrives while a fresh answer is pending, so a provider
-that reports resolution without delivering a wake still produces exactly one
-result. The bounded re-query stops once the assignment settles, the worker is
-reused, or it is closed. Assignments accepted
-without a provider keep the ordinary lifecycle; `retainWorkers` affects only
+request. An exit notification is notification only; it carries no output and
+does not itself resolve unfinished work. Running processes, captures still
+flushing, and terminal captures explicitly marked uncertified hold settlement.
+A certified terminal result whose output has not been retrieved is advisory: it
+does not keep the worker in `waiting`, withhold its answer, or restrict the
+ordinary owner controls. Instead, the published result names each such task
+and the outcome/reason available from the provider, so the owner can judge
+whether the answer was informed. Retrieval or explicit provider resolution
+still controls the task's own lifecycle and retention.
+
+For terminal task snapshots, the provider marks `captureCertified: false` on an
+entry whose capture can never be certified, so a restored terminal capture that
+is shape-identical to a certified one is still distinguishable. Certified
+entries omit the field entirely. `awaiting-result-review` entries that are not
+marked are advisory; explicitly uncertified ones remain outstanding until
+explicit recovery, error delivery, or dismissal. The consumer identifies this
+distinction only from that field; it does not parse task reason text.
+
+While assigned work is unfinished, the worker remains on the same request and
+no successful final result is published. After it resolves, the worker's next
+answer settles through the ordinary path. Herdsman persists unfinished provider,
+revision and task-ID evidence, then revalidates it during recovery and
+immediately before result persistence. A missing, failing, or identity-changed
+provider for a bound request fails closed. The bounded re-query and change
+subscription still recover holds without a wake; they stop once the assignment
+settles, the worker is reused, or it is closed. Assignments accepted without a
+provider keep the ordinary lifecycle; `retainWorkers` affects only
 post-delivery cleanup and does not abandon an unresolved request.
 
 Mailbox envelopes use protocol v5 while retaining the existing `mailboxes-v4`

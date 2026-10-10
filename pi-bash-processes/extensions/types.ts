@@ -42,8 +42,9 @@ export type BackgroundTaskTerminationReason =
 	| "reconcile-on-restart"
 	| "orphaned-pid-gone"
 	| "orphaned-pid-reused";
-export type TaskEventType = "output" | "exit" | "soft-timeout";
-export type WakeEventType = Exclude<TaskEventType, "soft-timeout">;
+export type TaskEventType = "output" | "exit" | "soft-timeout" | "result-review";
+/** Events carried by the queued output/exit wake machinery; the two review reminders are delivered inline instead. */
+export type WakeEventType = Exclude<TaskEventType, "soft-timeout" | "result-review">;
 export type NotifyMode = "always" | "transition" | "first-match-only";
 
 export type WakeDropReason =
@@ -218,14 +219,14 @@ export interface BackgroundTaskSnapshot {
 	 * Durable result-resolution observation (openspec `herdsman-background-
 	 * handoffs` tasks 2.2-2.3), deliberately distinct from `exitNotified`:
 	 * that one records whether a *host wake* was sent (notification), while
-	 * this records that a terminal result was actually handed to the worker
-	 * ("delivered": certified bytes/outcome through a completed get, bounded
-	 * wait, foreground wait, or declared-CLI receipt) or that an unrecoverable
-	 * capture/read error was actually handed over ("error"). Absent means
-	 * unresolved — inspection (`list`), a queued or delivered host wake, and a
-	 * failed handoff never set it. Written once; the first observation stands.
+	 * this records why a terminal result left the outstanding ledger: a
+	 * successful handoff (`delivered`), an unrecoverable capture/read error
+	 * actually handed over (`error`), or an explicit user dismissal
+	 * (`dismissed`). Absent means unresolved — inspection (`list`), a queued or
+	 * delivered host wake, and a failed handoff never set it. First observation
+	 * stands; dismissal never claims output was delivered.
 	 */
-	resultResolution?: "delivered" | "error";
+	resultResolution?: "delivered" | "error" | "dismissed";
 	/** Set when a newer identical task superseded this one; suppresses its exit wake. */
 	supersededBy?: string;
 	// True after sendTaskEvent('exit') has fired for this task. Persisted so

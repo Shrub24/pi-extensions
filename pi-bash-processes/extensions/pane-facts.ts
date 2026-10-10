@@ -22,7 +22,7 @@ export type PaneFactTask = {
 	id: string;
 	status: BackgroundTaskStatus;
 	startedAt: number;
-	resultResolution?: "delivered" | "error";
+	resultResolution?: "delivered" | "error" | "dismissed";
 	resultReady?: boolean;
 	restored?: boolean;
 	exitNotified?: boolean;

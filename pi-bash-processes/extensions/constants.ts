@@ -43,6 +43,11 @@ export const DEFAULT_OUTPUT_ALERT_MAX_CHARS = 2_000;
 // give a quick excerpt. 10KB stays well below pi-output-policy's spill
 // threshold so repeated log inspections cannot grow the transcript.
 export const DEFAULT_LOG_TAIL_MAX_CHARS = 10_000;
+// Capture files (task logs and the immutable snapshot artifacts copied from
+// them) hold raw command output, which can contain anything the command
+// printed. They are created owner-only; nothing else on the machine has a
+// reason to read a task's captured bytes.
+export const CAPTURE_FILE_MODE = 0o600;
 
 // Foreground bash streams its bounded tail at this cadence. Slow enough to
 // avoid rerender storms, fast enough to look live.

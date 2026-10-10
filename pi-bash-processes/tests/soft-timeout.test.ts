@@ -49,6 +49,9 @@ test("soft expiry reviews once, never stops the process, and keeps the later exi
 	expect(afterWake.state.softExpiresAt, "the next interval is measured from the delivered review").toBe(1_700_000_060_000);
 	expect(afterWake.exitWakes, "a reminder is not an exit wake").toBe(0);
 	expect(afterWake.text).toContain("still running after");
+	// The progress wake carries the same per-task line the completion wakes do:
+	// what the task is doing, and that its result is not in hand yet.
+	expect(afterWake.text).toContain("bg-1 · still running · result pending");
 	expect(afterWake.text).toContain('bg_task action:"extend"');
 	expect(afterWake.text).toContain('bg_task action:"stop"');
 	expect(afterExit.state.status, "the real exit still finalized the task").toBe("completed");
@@ -104,19 +107,31 @@ test("extend with softTimeoutMs 0 disables further reminders", () => {
 	expect(afterExit.softWakes, "and no reminder after the exit").toBe(1);
 }, SPAWN_FIXTURE_TIMEOUT_MS * 2);
 
-/** A task that exits before its soft deadline never gets a reminder. */
-test("a terminal task emits no soft wake and leaves no timer behind", () => {
+/**
+ * A task that exits before its soft deadline never gets a progress reminder — the
+ * promise that reminder made transfers to the result it left behind: the finished,
+ * unretrieved capture now owns the interval, and its reminder says what is owed.
+ */
+test("a terminal task emits no soft wake and reminds for the unretrieved result instead", () => {
 	const result = runSpawnFixture("spawn-extension.ts", { mode: "soft-terminal", softTimeoutMs: 60_000 }) as SoftFixtureResult;
 	const scenario = soft(result) as {
-		softTimers: number;
 		softWakes: number;
 		exitWakes: number;
+		reviewWakes: string[];
 		timers: { kind: string; ms: number }[];
 	};
-	expect(scenario.softTimers, "the finalize cleared the soft timer").toBe(0);
-	expect(scenario.softWakes, "no reminder for a finished task").toBe(0);
+	expect(scenario.softWakes, "no progress reminder for a finished task").toBe(0);
 	expect(scenario.exitWakes, "the exit still woke normally").toBe(1);
-	expect(scenario.timers, "only the orphan-watcher interval remains").toEqual([{ kind: "interval", ms: 30_000 }]);
+	// One wake, naming the task and both ways out; a reminder that only nagged
+	// would leave the reader with no sanctioned way to settle it.
+	expect(scenario.reviewWakes).toHaveLength(1);
+	expect(scenario.reviewWakes[0]).toContain("bg-1 finished, and its result is still unretrieved");
+	expect(scenario.reviewWakes[0]).toContain('bg_task action:"get" id: bg-1');
+	expect(scenario.reviewWakes[0]).toContain('bg_task action:"clear" ids:["bg-1"]');
+	expect(scenario.timers, "the orphan watcher and the re-armed next interval").toEqual([
+		{ kind: "interval", ms: 30_000 },
+		{ kind: "timeout", ms: 60_000 },
+	]);
 }, SPAWN_FIXTURE_TIMEOUT_MS);
 
 /**

@@ -21,7 +21,7 @@ mock.module("@earendil-works/pi-tui", () => ({
 }));
 mock.module("typebox", () => {
 	const schema = (value?: unknown) => ({ schema: value });
-	return { Type: { Object: schema, Optional: schema, String: schema, Number: schema, Boolean: schema } };
+	return { Type: { Object: schema, Optional: schema, String: schema, Number: schema, Array: schema, Boolean: schema } };
 });
 
 const { openDashboard } = await import("../../extensions/dashboard.js");

@@ -116,9 +116,9 @@ export function formatTaskResultText(handoff: TaskResultHandoff, ack: TaskResult
 	const changed = o.outputChanged ? "changed since the last review" : "unchanged since the last review";
 	const bytes = `${o.outputBytes} byte${o.outputBytes === 1 ? "" : "s"}`;
 	if (handoff.artifact) {
-		const { bytes: size, complete, partial, path } = handoff.artifact;
+		const { bytes: size, complete, partial } = handoff.artifact;
 		lines.push(
-			`output: full immutable snapshot — ${bound(path)} (${size} byte${size === 1 ? "" : "s"}, ${complete ? "complete" : "not certified complete"}, ${partial ? "partial" : "final"}, ${changed})`,
+			`output: full immutable snapshot (${size} byte${size === 1 ? "" : "s"}, ${complete ? "complete" : "not certified complete"}, ${partial ? "partial" : "final"}, ${changed})`,
 		);
 	} else {
 		const partial = o.readiness !== "terminal";

@@ -19,7 +19,7 @@ mock.module("@earendil-works/pi-tui", () => ({
 }));
 mock.module("typebox", () => {
 	const schema = (value?: unknown) => ({ schema: value });
-	return { Type: { Object: schema, Optional: schema, String: schema, Number: schema, Boolean: schema } };
+	return { Type: { Object: schema, Optional: schema, String: schema, Number: schema, Array: schema, Boolean: schema } };
 });
 
 const { default: backgroundTasks } = await import("../../extensions/background-tasks.js");
@@ -80,6 +80,9 @@ function createSession(completed: boolean) {
 			getBranch: () => completed ? [{ type: "message", message: { role: "toolResult", toolName: "bg_task", details: { tasks: [{
 				id: "bg-1", title: "true", command: "true", cwd: process.cwd(), pid: 0, status: "completed", exitCode: 0,
 				startedAt: start, updatedAt: start, lastOutputAt: null, expiresAt: null, outputBytes: 0,
+				// Persisted by every real snapshot: with the interval at 0 the only
+				// timer this fixture drives is the widget expiry it is testing.
+				softTimeoutMs: 0,
 				logFile: join(process.cwd(), "task.log"), notifyOnExit: false, notifyOnOutput: false, exitNotified: true,
 			} satisfies BackgroundTaskSnapshot] } } }] : [],
 		},

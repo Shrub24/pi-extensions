@@ -217,7 +217,8 @@ test("the review clock measures from the last review, never from output or the h
 
 	expect(reviewReminderArmed(resultTask()), "a running task with an enabled interval arms one reminder").toBe(true);
 	expect(reviewReminderArmed(resultTask({ softTimeoutMs: 0 })), "a disabled interval arms nothing").toBe(false);
-	expect(reviewReminderArmed(resultTask({ status: "completed" })), "a terminal task gets no progress reminder").toBe(false);
+	expect(reviewReminderArmed(resultTask({ status: "completed" })), "an unresolved terminal result arms a result-review reminder").toBe(true);
+	expect(reviewReminderArmed(resultTask({ status: "completed", resultResolution: "delivered" })), "a delivered result arms no further reminder").toBe(false);
 	expect(reviewReminderArmed(resultTask({ stopReason: "user" })), "a task already being stopped arms nothing").toBe(false);
 });
 

@@ -11,7 +11,7 @@ durable assignment/convergence evidence. It is not a raw herdr lifecycle string.
 | ---------- | -------------------------------------------------------------------------------------------------------- |
 | `idle`     | A retained worker: its terminal result was delivered and its verified live process is available for one new assignment. |
 | `working`  | An assignment is active; `stale` remains an advisory field on this state.                                |
-| `waiting`  | The model turn has yielded, but provider-backed work or its required post-review response remains unresolved. |
+| `waiting`  | The model turn has yielded while unfinished provider-backed work (running, flushing, or explicitly uncertified capture) or a required response remains unresolved. A certified unretrieved terminal result alone is advisory and does not produce `waiting`. |
 | `blocked`  | Active assignment is waiting for owner input or another condition, including an active question-tool dialog. |
 | `settling` | Assignment handoff, completion/result delivery, launch, direct-agent gate, or cleanup is converging.     |
 | `unknown`  | Exact safe control state cannot be proved.                                                               |
@@ -35,10 +35,15 @@ mutation.
 
 A delegating agent may be blocked while direct agent work is pending and still accept
 steering when `agent_steer` is listed, but it cannot expose `agent_interrupt` without a
-currently working Pi operation. A `waiting` worker remains on its active assignment:
-`agent_interrupt`, continuation, replacement assignment, and Clear idle are unavailable.
-Inspection, transcript, steering, and an armed `agent_extend` remain available; an
-explicit `agent_close` may still abandon the assignment when its close preflight permits.
+currently working Pi operation. A `waiting` worker remains on its active assignment while unfinished provider-backed
+work (running, flushing, or explicitly uncertified capture) is unresolved. A
+certified terminal result the worker has not retrieved is advisory: it does not
+by itself project `waiting`, withhold the worker's answer, or restrict ordinary
+controls. The published answer names any such unreviewed task results. While
+genuinely waiting, `agent_interrupt`, continuation, replacement assignment,
+and Clear idle are unavailable. Inspection,
+transcript, steering, and an armed `agent_extend` remain available; an explicit
+`agent_close` may still abandon the assignment when its close preflight permits.
 Stale or inactive fields are advisory and do not automatically authorize or recommend
 interrupt. Descendant visibility does not imply authority;
 records outside the controller's direct ownership can have an empty action list.

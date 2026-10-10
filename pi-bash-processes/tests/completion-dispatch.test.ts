@@ -54,7 +54,7 @@ test("a stop revalidates a held completion and fulfils the same obligation once"
 	expect((await taskById(id))?.exitNotified, "and the obligation stays fulfilled").toBe(true);
 });
 
-test("a delivered reminder is not re-sent when the task then completes", async () => {
+test("completion switches an unread result to result-review reminders", async () => {
 	await host.dispatch("before_agent_start");
 	const spawned = await execute({
 		action: "spawn",
@@ -74,12 +74,12 @@ test("a delivered reminder is not re-sent when the task then completes", async (
 	expect(soft.length, "each elapsed interval produced its own review").toBeGreaterThanOrEqual(1);
 	const delivered = soft.length;
 	const deadlineAtTerminal = (await taskById(id))?.softExpiresAt ?? null;
-	// The task is terminal now: no further interval may produce a reminder, and
-	// the recorded deadline must not be re-armed forward for one.
+	// The terminal result remains owed, but it is no longer a progress review.
+	// Completion starts its own review interval after the previous progress wake.
 	await Bun.sleep(400);
-	expect(events("soft-timeout").length, "a finished task receives no further reminder").toBe(delivered);
-	expect((await taskById(id))?.softExpiresAt ?? null, "and its last deadline does not advance").toBe(deadlineAtTerminal);
-	expect(deadlineAtTerminal, "the deadline it did reach is in the past").toBeLessThanOrEqual(Date.now());
+	expect(events("soft-timeout").length, "a finished task receives no further progress reminder").toBe(delivered);
+	expect(events("result-review").length, "the unread terminal result receives its own reminder").toBeGreaterThan(0);
+	expect((await taskById(id))?.softExpiresAt ?? 0, "result review re-arms from delivery").toBeGreaterThan(deadlineAtTerminal);
 	const exit = events("exit");
 	expect(exit, "the completion is delivered separately, exactly once").toHaveLength(1);
 	expect(JSON.stringify(exit[0]), "the completion names its own task").toContain(id);
@@ -88,10 +88,7 @@ test("a delivered reminder is not re-sent when the task then completes", async (
 		{ status: final?.status, notified: final?.exitNotified },
 		"the reminder never became the completion's acknowledgment",
 	).toStrictEqual({ status: "completed", notified: true });
-	// The reminder's own timer is retired by the terminal transition; that the
-	// deadline is still *recorded* is not a pending reminder, which is what the
-	// no-further-reminder assertion above establishes.
-	expect(events("soft-timeout").length).toBe(delivered);
+expect(events("soft-timeout").length).toBe(delivered);
 });
 
 test("completions in an idle session are batched into one wake, each acknowledged once", async () => {

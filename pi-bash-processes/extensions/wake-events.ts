@@ -14,7 +14,7 @@ import type {
 	WakeEventRecord,
 	WakePendingRecord,
 } from "./types.js";
-import { taskSurfaceGuidance, type TaskToolSurface } from "./tool-surface.js";
+import { taskSurfaceGuidance, wakeTaskLine, type TaskToolSurface } from "./tool-surface.js";
 
 export const NOTIFY_MODES = ["always", "transition", "first-match-only"] as const;
 const MAX_WAKE_EVENTS = 50;
@@ -567,7 +567,7 @@ export function sendTaskWake(
 		const deliveredAt = now();
 		const { tail, truncated } = pickOutputTail(deps, task, options);
 		const compactTask = compactBackgroundTaskSnapshot(deps.rememberSnapshot(task));
-		const softTimeout = options.softTimeout ?? {
+			const softTimeout = options.softTimeout ?? {
 			elapsedMs: Math.max(0, deliveredAt - task.startedAt),
 			softTimeoutMs: task.softTimeoutMs ?? 0,
 		};
@@ -591,6 +591,7 @@ export function sendTaskWake(
 		const content = [
 			`Background task ${task.id} is still running after ${formatElapsed(softTimeout.elapsedMs)} (soft reminder at ${formatElapsed(softTimeout.softTimeoutMs)}).`,
 			`Command: ${commandPreview}`,
+			wakeTaskLine(task, guidance),
 			`Output so far:\n${tail || "(no output yet)"}`,
 			`Inspect it with ${guidance.inspect} id: ${task.id} — Running is not success, so do not read a partial result as one.`,
 			...(hardRemaining != null ? [`Hard timeout backstop: about ${formatElapsed(hardRemaining)} remaining; it will kill the task if you let it lapse.`] : []),
@@ -604,8 +605,34 @@ export function sendTaskWake(
 		}, { deliverAs: "steer", triggerTurn: true }));
 		return true;
 	}
+	if (eventType === "result-review") {
+		// An unretrieved result stays owed until it is delivered or dismissed.
+		if (deps.isShuttingDown() || task.status === "running" || task.resultResolution !== undefined) return false;
+		const deliveredAt = now();
+		const compactTask = compactBackgroundTaskSnapshot(deps.rememberSnapshot(task));
+		const details: BackgroundTaskEventDetails = {
+			deliveredAt,
+			eventAt: options.eventAt ?? task.updatedAt ?? deliveredAt,
+			eventType,
+			sequence: task.wakeSequence ?? 0,
+			task: compactTask,
+			taskStatusAtEmit: task.status,
+		};
+		deliverWakeMessage(deps, {
+			content: [
+				`Background task ${task.id} finished, and its result is still unretrieved.`,
+				`Command: ${truncateField(task.command, WAKE_CONTENT_COMMAND_MAX_CHARS) ?? ""}`,
+				wakeTaskLine(task, guidance),
+			].join("\n"),
+			customType: deps.messageType,
+			details,
+			display: true,
+		}, { deliverAs: "steer", triggerTurn: true });
+		return true;
+	}
 	const pending: WakePendingRecord = {
 		eventAt: options.eventAt ?? (eventType === "output" ? (task.lastOutputAt ?? now()) : (task.updatedAt ?? now())),
+
 		eventType,
 		sequence: options.sequence ?? nextWakeSequence(task),
 	};
@@ -673,9 +700,7 @@ export function sendTaskWake(
 		? ""
 		: cancelled
 			? "\nNo result will arrive; rerun the work if it is still needed."
-			: (task.exitCode ?? 0) === 0
-				? "\nIf you already consumed this result, nothing more to do."
-				: `\n${guidance.reviewFailures} (the failed task is ${task.id}).`;
+			: `\n${wakeTaskLine(task, guidance)}${(task.exitCode ?? 0) === 0 ? "" : `\n${guidance.reviewFailures} (the failed task is ${task.id}).`}`;
 	const inventory = deps.runningInventory?.();
 	const commandPreview = truncateField(task.command, WAKE_CONTENT_COMMAND_MAX_CHARS) ?? "";
 

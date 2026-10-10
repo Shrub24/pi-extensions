@@ -64,7 +64,7 @@ export interface RegistrationDeps {
 		signal: AbortSignal | undefined,
 		ctx: ExtensionContext,
 	) => Promise<AgentToolResult<unknown>>;
-	clearFinishedTasks: () => { removed: number; kept: number };
+	clearFinishedTasks: (ids?: string[]) => { removed: number; kept: number; dismissed: number };
 	/** True when a deferred exit wake for this task was dropped. */
 	consumeObservedExitWake: (taskId: string) => boolean;
 	armForcedBackground: (ctx: ExtensionContext, source: "shortcut" | "command") => void;
@@ -96,7 +96,7 @@ function bgTaskGuidelines(surface: TaskToolSurface): string[] {
 			shared[0]!,
 			"Use bg_task list/get/stop/extend to inspect, re-arm, or terminate tasks started by bg_task or /bg. get is the task's result, including its readiness and outcome; there is no separate status tool in this mode.",
 			"For a long-running watcher or monitor, set softTimeoutMs generously at spawn (or 0 to disable it); the periodic soft reminder can be re-armed later with bg_task action:\"extend\" id:... softTimeoutMs:....",
-			shared[1]!,
+			"Use bg_task clear ids:[...] to explicitly dismiss named finished results. Dismissal does not hand over output; a bulk clear keeps an assignment-owned result nobody received and never touches running tasks.",
 			"Running is not success. Do not poll: no sleep/tail loops and no repeated list/get calls. Do independent work; if nothing independent remains, finish the turn with a brief waiting status and go idle, and the task's completion wakes the agent in a new turn.",
 			"Use bg_task for pi-bridge, session, tmux, agent/delegate, or log monitoring instead of raw foreground bash polling loops.",
 			"If a bash monitor is auto-backgrounded, continue the turn and inspect it later with bg_task get/list/stop rather than waiting on foreground bash.",
@@ -105,7 +105,7 @@ function bgTaskGuidelines(surface: TaskToolSurface): string[] {
 	return [
 		shared[0]!,
 		"Use bg_task list/log/get/stop to inspect or terminate tasks started by bg_task or /bg. log is the raw captured tail; get is the task's result, including its readiness and outcome.",
-		shared[1]!,
+		"Use bg_task clear ids:[...] to explicitly dismiss named finished results. Dismissal does not hand over output; a bulk clear keeps an assignment-owned result nobody received and never touches running tasks.",
 		"Running is not success. In an interactive session, do independent work and end the turn to await the completion wake instead of polling. A noninteractive or child caller that must have a shell result before its session closes can call bg_task action:\"wait\" once with a bounded waitSeconds: that yields only its own turn, never stops the task, and is the retained compatibility wait. Do not repeatedly call list/log/get/wait in a polling loop.",
 		"Use bg_task for pi-bridge, session, tmux, agent/delegate, or log monitoring instead of raw foreground bash polling loops.",
 		"If a bash monitor is auto-backgrounded, continue the turn and inspect it later with bg_task log/list/stop rather than waiting on foreground bash.",
@@ -170,6 +170,7 @@ function bgTaskSchema(surface: TaskToolSurface) {
 				? "Task id for action=get, action=stop, or action=extend."
 				: "Task id for action=log, action=get, action=stop, action=wait, or action=extend. action=wait without an id waits on the oldest running task.",
 		})),
+		ids: Type.Optional(Type.Array(Type.String(), { description: "For action=clear: dismiss the named finished tasks (a result never retrieved is recorded as dismissed, an already-delivered one is removed). Without ids, finished tasks are removed but an assignment-owned result nobody received is kept. Running tasks are never cleared." })),
 		notifyOnExit: Type.Optional(Type.Boolean({ description: "Wake the agent when the task exits. Defaults to true." })),
 		notifyOnOutput: Type.Optional(Type.Boolean({ description: "Wake the agent when new output arrives. Defaults to false." })),
 		notifyPattern: Type.Optional(Type.String({ description: "Substring or /regex/flags gate for output wakeups." })),
@@ -269,21 +270,22 @@ function registerBgTaskTool(pi: ExtensionAPI, deps: RegistrationDeps, surface: T
 				return makeToolResult(deps.formatTaskListText(), { action: "list", tasks: bgToolResultTasks(tasks) });
 			}
 			if (params.action === "clear") {
-				const { removed, kept } = deps.clearFinishedTasks();
-				// Clearing only drops finished rows. When running tasks remain, say so
-				// and name the action that actually silences them: the reported failure
-				// (a clear that looked like it had dealt with the tasks, followed by a
-				// wake per remaining task) came from that gap. Tasks kept because an
-				// assignment-owned result was never delivered are named as counts too:
-				// a skip the caller cannot see would make the clear look stuck.
+				if (params.ids !== undefined && (!Array.isArray(params.ids) || params.ids.some((id) => typeof id !== "string"))) {
+					throw new TypeError("bg_task clear ids must be an array of task ids");
+				}
+				const { removed, kept, dismissed } = deps.clearFinishedTasks(params.ids as string[] | undefined);
 				const running = deps.sortedTasks().filter((candidate) => candidate.status === "running" && candidate.stopReason == null);
 				const stillRunning = running.length > 0
-					? `\nStill running: ${running.map((candidate) => candidate.id).join(", ")} — clear does not touch running tasks. Each will send an exit wake; use bg_task stop id:"all" to end them without a wake.`
+					? `\nStill running: ${running.map((candidate) => candidate.id).join(", ")} — clear does not touch running tasks. Use bg_task stop to end them.`
 					: "";
-				const keptNote = kept > 0
-					? `\nKept ${kept} task(s) whose assignment-owned result has never been delivered — retrieve them with get (or stop) before they clear.`
-					: "";
-				return makeToolResult(`Removed ${removed} finished background task(s).${keptNote}${stillRunning}`, { action: "clear", removed, ...(kept > 0 ? { kept } : {}) });
+				// A bulk clear keeps what is still owed; a targeted one keeps only what
+				// it could not act on. Either way the caller is told, never left to read
+				// a smaller removal count as a full success.
+				const keptNote = params.ids !== undefined
+					? kept > 0 ? `\nKept ${kept} selected task(s): running or unknown. Nothing was dismissed for them.` : ""
+					: kept > 0 ? `\nKept ${kept} unretrieved terminal task(s); retrieve one with get, or dismiss a named finished result with clear ids:[...].` : "";
+				const dismissedNote = dismissed > 0 ? ` Dismissed ${dismissed} selected result(s); dismissal is not an output handoff.` : "";
+				return makeToolResult(`Removed ${removed} eligible finished background task(s).${dismissedNote}${keptNote}${stillRunning}`, { action: "clear", removed, dismissed, ...(kept > 0 ? { kept } : {}) });
 			}
 			if (params.action === "spawn") {
 				const task = deps.spawnTask({
@@ -498,7 +500,7 @@ function registerCommands(pi: ExtensionAPI, deps: RegistrationDeps): void {
 			if (!trimmed) { await openDashboard(ctx, deps.dashboardDeps); return; }
 			if (trimmed === "list") { ctx.ui.notify(deps.formatTaskListText(), "info"); return; }
 			if (trimmed === "next") { deps.armForcedBackground(ctx, "command"); return; }
-			if (trimmed === "clear") { const { removed, kept } = deps.clearFinishedTasks(); ctx.ui.notify(`Removed ${removed} finished background task(s).${kept > 0 ? ` Kept ${kept} assignment-owned result(s) awaiting delivery.` : ""}`, "info"); return; }
+			if (trimmed === "clear") { const { removed, kept } = deps.clearFinishedTasks(); ctx.ui.notify(`Removed ${removed} finished background task(s).${kept > 0 ? ` Kept ${kept} running or unretrieved task(s).` : ""}`, "info"); return; }
 			if (trimmed.startsWith("run ")) {
 				const task = deps.spawnTask({ command: trimmed.slice(4), cwd: ctx.cwd });
 				ctx.ui.notify(`Started ${task.id} (pid ${task.pid}) in the background.`, "info");
@@ -531,7 +533,7 @@ function registerCommands(pi: ExtensionAPI, deps: RegistrationDeps): void {
 	});
 	pi.registerCommand(`${BG_COMMAND}:clear`, {
 		description: "Remove finished background tasks",
-		handler: async (_args, ctx) => { deps.setActiveCtx(ctx); const { removed, kept } = deps.clearFinishedTasks(); ctx.ui.notify(`Removed ${removed} finished background task(s).${kept > 0 ? ` Kept ${kept} assignment-owned result(s) awaiting delivery.` : ""}`, "info"); },
+		handler: async (_args, ctx) => { deps.setActiveCtx(ctx); const { removed, kept } = deps.clearFinishedTasks(); ctx.ui.notify(`Removed ${removed} finished background task(s).${kept > 0 ? ` Kept ${kept} running or unretrieved task(s).` : ""}`, "info"); },
 	});
 	pi.registerCommand(`${BG_COMMAND}:run`, {
 		description: "Spawn a background shell task: /bg:run <command>",

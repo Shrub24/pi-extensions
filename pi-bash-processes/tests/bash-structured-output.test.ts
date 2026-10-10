@@ -73,10 +73,23 @@ test("output past the structured cap keeps its head and tail around an omission 
 	expectMatchesSchema(BASH_OUTPUT_SCHEMA as unknown as JsonSchema, structured);
 	expect(structured.output.startsWith("1\n2\n3\n"), "head kept").toBe(true);
 	expect(structured.output.endsWith("400000\n"), "tail kept").toBe(true);
-	// `full_output_path` names the task log, which holds all of it.
-	expect(structured.full_output_path).toBeString();
-	const bytes = statSync(structured.full_output_path!).size;
+	// The structured result names no file: `structuredContent` is model-facing (a
+	// codemode script reads it in place of the text), and the only file holding
+	// the complete output is the task capture. The capture path stays an operator
+	// detail (`details.task.logFile`), and the complete output is reached through
+	// the declared `bg_task` operations.
+	expect(structured).not.toHaveProperty("full_output_path");
+	const logFile = (result.details.task as { logFile: string }).logFile;
+	expect(logFile, "the operator detail keeps the path").toBeString();
+	const bytes = statSync(logFile).size;
 	expect(bytes).toBeGreaterThan(STRUCTURED_OUTPUT_MAX_BYTES);
+	for (const [surface, value] of Object.entries({
+		structured: JSON.stringify(structured),
+		text: result.content[0]?.text ?? "",
+	})) {
+		expect(value, `${surface} names no capture path`).not.toContain(logFile);
+		expect(value, `${surface} names no lane directory`).not.toContain(logFile.slice(0, logFile.lastIndexOf("/")));
+	}
 	// The kept head and tail plus the marker are the whole cap.
 	const marker = structuredOutputOmittedMarker(bytes - STRUCTURED_OUTPUT_MAX_BYTES);
 	expect(structured.output).toContain(marker);

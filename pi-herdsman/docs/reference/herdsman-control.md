@@ -173,7 +173,7 @@ lock held. See [Agent tools](agent.md#agent_close).
 | -------------------------------------- | -------------------------------------------------------------------------------- | ------------------------------------------------------- |
 | `idle` retained managed worker | Allowed when the preflight passes. | `restarted`, same run id, same pane. |
 | `working` | Allowed when the preflight passes; the assignment is abandoned. | Refused `agent_busy`. |
-| `waiting` | Allowed when the preflight passes; the assignment is abandoned. | Refused `agent_busy`. |
+| `waiting` | Allowed when the preflight passes; the assignment is abandoned. | Refused `agent_busy` while the worker has unfinished background work (running, flushing, or explicitly uncertified capture). An unretrieved certified terminal result alone does not restrict interrupt. |
 | `blocked` | Allowed when the preflight passes; a pending owner question is abandoned. | Refused `agent_busy`. |
 | `settling` | Allowed only when the preflight passes; an unretrieved durable result refuses it. | Refused `agent_busy`. |
 | `lost` | Allowed when the preflight passes over proven absence. | Refused `agent_busy`; a lost target is close-only. |

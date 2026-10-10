@@ -58,9 +58,16 @@ test("three staggered mid-run exits produce one grouped wake", () => {
 	}) as { staggered: { listAfterRun: string; wakeTexts: string[]; wakes: number; grouped: boolean } };
 	expect(result.staggered.wakes, "one wake per run, not one per task").toBe(1);
 	expect(result.staggered.grouped, "the wake names the completions").toBe(true);
+	const text = result.staggered.wakeTexts.join("\n");
 	for (const id of ["bg-2", "bg-3", "bg-4"]) {
-		expect(result.staggered.wakeTexts.join("\n"), `${id} is reported by the single wake`).toContain(id);
+		// Each task keeps its own line: a batch may not be reduced to a count or a
+		// single summary line, so every one of them names its outcome and the result
+		// it still owes the reader.
+		expect(text, `${id} is reported by the single wake`).toContain(`${id} · exit 0 · result unretrieved`);
 	}
+	// The sibling still running is reported with its own state rather than being
+	// silently absent from the batch.
+	expect(text, "the running sibling is named as still running").toContain("Tasks still running: bg-1");
 }, SPAWN_FIXTURE_TIMEOUT_MS);
 
 /**

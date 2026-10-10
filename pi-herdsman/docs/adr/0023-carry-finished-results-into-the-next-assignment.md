@@ -2,11 +2,14 @@
 
 ## Decision
 
+**Superseded for the settlement hold by [ADR 0032](0032-do-not-hold-settlement-on-an-unretrieved-result.md).** A certified finished result of an earlier assignment is still carried into the next assignment as durable advisory state, but it no longer blocks binding or settlement. Running and uncertified tasks still block binding as described below.
+
 When a resumed worker binds a new assignment, a background task of an earlier
 assignment that has finished with a certified result and has not been retrieved
-is carried: it counts as outstanding (`awaiting-result-review`) for the request
-now bound, and binding succeeds. The task keeps the association it was spawned
-with and is never cleared; only an actual retrieval (`bg_task get`) retires it.
+is carried as `awaiting-result-review` for the request now bound, and binding
+succeeds. It remains durable advisory state until retrieval or explicit dismissal;
+it does not block the new assignment's settlement. The task keeps the association
+it was spawned with.
 
 A task of an earlier assignment that is still running or whose capture is not
 certified, and a task that belongs to no assignment, still block the bind.

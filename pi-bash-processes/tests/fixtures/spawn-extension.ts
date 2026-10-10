@@ -11,7 +11,7 @@ const native = await interceptNativeEffects(input);
 const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
 const unused = () => { throw new Error("spawn_fixture.sdk_operation=unexpected_render"); };
 mock.module("@earendil-works/pi-ai", () => ({ StringEnum: (values: readonly string[]) => ({ enum: values }) }));
-mock.module("typebox", () => ({ Type: { Object: (value: unknown) => value, Optional: (value: unknown) => value, Number: () => ({}), String: () => ({}), Boolean: () => ({}) } }));
+mock.module("typebox", () => ({ Type: { Object: (value: unknown) => value, Optional: (value: unknown) => value, Number: () => ({}), String: () => ({}), Array: () => ({}), Boolean: () => ({}) } }));
 mock.module("@earendil-works/pi-tui", () => ({ matchesKey: unused, truncateToWidth: unused, visibleWidth: unused, wrapTextWithAnsi: unused }));
 mock.module("@earendil-works/pi-coding-agent", () => ({ getShellConfig: () => ({ shell: "fixture-shell", args: ["-c"] }) }));
 
@@ -207,7 +207,7 @@ try {
 		await dispatch("agent_end");
 		await dispatch("agent_settled");
 		const wakes = messages.slice(during).filter(([m]: any[]) => m?.customType === "kendex-background-tasks:event" && (m?.details?.grouped === true || m?.details?.eventType === "exit"));
-		const wakeTexts = wakes.map(([m]: any[]) => String(m?.content ?? "").slice(0, 200));
+		const wakeTexts = wakes.map(([m]: any[]) => String(m?.content ?? "").slice(0, 1_200));
 		const listed = await execute({ action: "list" });
 		staggered = {
 			grouped: wakes.some(([m]: any[]) => String(m?.content ?? "").includes("background tasks finished")),
@@ -304,10 +304,20 @@ try {
 		await dispatch("agent_end");
 		await dispatch("agent_settled");
 		const exitWakes = exitWakeCount();
+		// The exit wake notifies; it does not read the result. The interval the
+		// running task would have used now belongs to the result it left behind, so
+		// firing it produces the reminder that says what is still owed.
+		native.fireTimeout(softMs);
+		await Promise.resolve();
+		const reviewWakes = messages
+			.map((args) => args[0] as { content?: unknown; details?: { eventType?: string } })
+			.filter((message) => message?.details?.eventType === "result-review")
+			.map((message) => String(message.content ?? ""));
 		soft = {
 			softTimers: softTimers(softMs).length,
 			softWakes: softWakeTexts().length,
 			exitWakes,
+			reviewWakes,
 			timers: native.activeTimers(),
 		};
 	} else if (input.mode === "soft-review-reset") {

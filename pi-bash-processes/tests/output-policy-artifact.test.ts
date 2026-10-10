@@ -45,6 +45,8 @@ test("a managed foreground completion preserves the complete output before any i
 	expect(captured).toContain(FIRST);
 	expect(captured).toContain(LAST);
 	expect(statSync(logFile).size).toBe(Buffer.byteLength(captured, "utf8"));
+	// Raw captured output is owner-only on disk.
+	expect(statSync(logFile).mode & 0o777).toBe(0o600);
 
 	// The inline text is the bounded tail of that capture, not the whole of it.
 	expect(inline.length).toBeLessThan(captured.length);
@@ -53,15 +55,17 @@ test("a managed foreground completion preserves the complete output before any i
 	expect(inline, "the inline text is bounded, so it does not carry the whole capture").not.toContain(FIRST);
 
 	// The structured result carries the head and the tail around an explicit
-	// omission, and names where the complete output is.
+	// omission, and names no file: `structuredContent` is model-facing, and the
+	// only file holding the complete output is the task capture.
 	expect(structured.truncated).toBe(true);
 	expect(structured.output).toContain(FIRST);
 	expect(structured.output).toContain(LAST);
 	expect(structured.exit_code).toBe(0);
-	expect(structured.full_output_path).toBe(logFile);
+	expect(structured).not.toHaveProperty("full_output_path");
+	expect(JSON.stringify(structured), "the structured result names no capture path").not.toContain(logFile);
 
-	// Reading the reference yields every byte the command produced.
-	expect(readFileSync(structured.full_output_path!, "utf8")).toBe(captured);
+	// The complete output is still on disk behind the operator detail.
+	expect(readFileSync(logFile, "utf8")).toBe(captured);
 });
 
 test("output-policy truncation leaves the handed-off artifact and its reference intact", async () => {
@@ -71,7 +75,7 @@ test("output-policy truncation leaves the handed-off artifact and its reference 
 	const captured = readFileSync(logFile, "utf8");
 
 	// The policy truncates the model-visible text. What it must not do is touch
-	// what the caller follows to reach the complete output.
+	// the capture behind the operator detail, or put either path in the text.
 	const processed = await processContent(
 		{ input: { command: BIG_COMMAND }, toolName: "bash", toolCallId: "policy-artifact-1" },
 		host.ctx,
@@ -82,12 +86,12 @@ test("output-policy truncation leaves the handed-off artifact and its reference 
 	expect(Buffer.byteLength(processed.content[0]?.text ?? "", "utf8")).toBeLessThan(Buffer.byteLength(result.content[0]!.text!, "utf8"));
 	expect(processed.content[0]?.text ?? "", "the text keeps the end of the output").toContain(LAST);
 
-	// The truncation reports where the full text went, and the task's own
-	// reference is untouched by the policy.
+	// The truncation reports where the full text went. That artifact is the
+	// policy's own copy; the tool's structured result still names no capture.
 	const meta = processed.meta as { artifactPath?: string; truncated?: boolean };
 	if (meta.artifactPath) artifacts.add(meta.artifactPath);
 	expect(meta.truncated).toBe(true);
-	expect(structured.full_output_path, "the tool's own reference survives policy processing").toBe(logFile);
+	expect(structured).not.toHaveProperty("full_output_path");
 	expect(readFileSync(logFile, "utf8"), "the artifact still holds every byte").toBe(captured);
 	expect(captured).toContain(FIRST);
 	expect(captured).toContain(LAST);
@@ -101,7 +105,10 @@ test("output-policy truncation leaves a full get's artifact reference intact", a
 	const get = await bgTask().execute("policy-get", { action: "get", id, output: "full" }, undefined, undefined, host.ctx);
 	const artifact = get.details.artifact as { bytes: number; path: string };
 	const text = get.content[0]?.text ?? "";
-	expect(text).toContain(artifact.path);
+	// The capture path is an operator detail: the model reads the result, never a
+	// filesystem location it has no sanctioned way to open.
+	expect(text).not.toContain(artifact.path);
+	expect(text).not.toMatch(/\/lanes\//);
 	expect(artifact.bytes).toBeGreaterThan(1_000_000);
 
 	const processed = await processContent(
@@ -111,9 +118,15 @@ test("output-policy truncation leaves a full get's artifact reference intact", a
 		{ enabled: true, inlineTailKb: 4, inlineTailLines: 40, maxLineCount: 40, maxTextBlockKb: 4, preserveFullOutput: true, spillThresholdKb: 4 },
 	);
 	expect(processed.changed, "the policy shortened the get result too").toBe(true);
+	const meta = processed.meta as { artifactPath?: string };
+	if (meta.artifactPath) artifacts.add(meta.artifactPath);
 
-	// The shortened text is no longer where the reference lives: the tool's own
-	// details carry it, and the artifact behind it is still the complete capture.
+	// The reference offered for the complete content is the policy's own
+	// truncated-output artifact, never the capture file behind it.
+	expect(processed.content[0]?.text ?? "", "the shortened text still names no capture").not.toContain(artifact.path);
+	expect(meta.artifactPath, "and the artifact the policy offers is its own").not.toBe(artifact.path);
+	// The reference lives in the tool's own details, and the artifact behind it
+	// is still the complete capture.
 	expect(get.details.fullOutputPath).toBe(artifact.path);
 	expect(statSync(artifact.path).size).toBe(artifact.bytes);
 	expect(readFileSync(artifact.path, "utf8")).toContain(LAST);

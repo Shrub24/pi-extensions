@@ -26,6 +26,8 @@ import { mkdir, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { pipeline } from "node:stream/promises";
 
+import { CAPTURE_FILE_MODE } from "./constants.js";
+
 /** Suffix marking a copied prefix artifact. */
 export const SNAPSHOT_ARTIFACT_SUFFIX = ".snapshot";
 
@@ -66,12 +68,12 @@ async function realCopyPrefix(from: string, to: string, bytes: number): Promise<
 	if (bytes <= 0) {
 		// An empty capture is a real artifact, not a missing one: it gets a real
 		// (empty) file rather than an absent path.
-		await writeFile(to, new Uint8Array(0));
+		await writeFile(to, new Uint8Array(0), { mode: CAPTURE_FILE_MODE });
 		return;
 	}
 	// `end` is inclusive, so byte N is index N-1: the copy holds exactly the
 	// boundary's bytes even if the producer appends while it runs.
-	await pipeline(createReadStream(from, { end: bytes - 1 }), createWriteStream(to, { flags: "w" }));
+	await pipeline(createReadStream(from, { end: bytes - 1 }), createWriteStream(to, { flags: "w", mode: CAPTURE_FILE_MODE }));
 }
 
 const DEFAULT_DEPS: SnapshotDeps = {

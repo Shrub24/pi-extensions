@@ -12,7 +12,7 @@ const input: Input = JSON.parse(await Bun.stdin.text());
 const native = await interceptNativeEffects({});
 const unused = () => { throw new Error("managed_bash_fixture.sdk_operation=unexpected_render"); };
 mock.module("@earendil-works/pi-ai", () => ({ StringEnum: (values: readonly string[]) => ({ enum: values }) }));
-mock.module("typebox", () => ({ Type: { Object: (value: unknown) => value, Optional: (value: unknown) => value, Number: () => ({}), String: () => ({}), Boolean: () => ({}) } }));
+mock.module("typebox", () => ({ Type: { Object: (value: unknown) => value, Optional: (value: unknown) => value, Number: () => ({}), String: () => ({}), Array: () => ({}), Boolean: () => ({}) } }));
 // Widget rendering is asserted, so the width helpers must work; every other
 // host render entry point stays guarded against unexpected use.
 mock.module("@earendil-works/pi-tui", () => ({

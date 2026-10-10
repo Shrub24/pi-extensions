@@ -1,5 +1,27 @@
 # @vanillagreen/pi-background-tasks
 
+## Advisory wake contract
+
+Background-task soft-timeout and Herdsman soft-deadline advisories share the
+session-local `pi-wake-consumer/v1` contract over `pi.events`. Offers contain
+source, kind, identity, a unique token and bounded plain metadata only. A
+consumer claims synchronously during the offer event and answers once with
+`release` or `skip` before the five-second deadline. No claim retains the
+producer's synchronous native send and error behavior. Expiry or consumer
+failure falls back to one native delivery only while the originating session
+and work remain current. Skipping consumes that advisory interval, never a
+result, settlement or required notification obligation. Unknown kinds are not
+gateable. Herdsman imports the public helper via
+`../../pi-bash-processes/extensions/wake-consumer.ts`; the staged sibling-source
+mapping is owned by packaging. A consumer should subscribe on load, track the
+offer token/session, unsubscribe on teardown, and use the same handler for both
+sources, branching on `source` and `kind`. To claim an offer, synchronously emit
+`pi-wake-consumer:v1:claim` with `{ protocol, token, answer }`; `answer` receives
+a resolver that must be called with `release` or `skip` before `deadlineMs`.
+For example, a consumer may start bounded classification inside `answer` and
+call the resolver when it finishes. If the decision times out, the producer falls back to the native wake
+only while the session and work are still current.
+
 A Pi extension for shell commands that run while the conversation continues. It supports builds, development servers and log monitors.
 
 ![Spawning background tasks](https://raw.githubusercontent.com/vanillagreencom/kendex/main/pi-extensions/pi-background-tasks/assets/spawn-tasks.png) ![Inline mini-dashboard](https://raw.githubusercontent.com/vanillagreencom/kendex/main/pi-extensions/pi-background-tasks/assets/inline-dashboard.png)

@@ -399,7 +399,7 @@ export async function restoredTaskFromSnapshot(snapshot: BackgroundTaskSnapshot,
 		// parent's branch). This session can never retrieve its result, so nothing
 		// here waits on it: a terminal one is closed as `delivered` instead of
 		// being advertised as awaiting review for the life of the fork.
-		resultResolution: snapshot.resultResolution === "delivered" || snapshot.resultResolution === "error"
+		resultResolution: snapshot.resultResolution === "delivered" || snapshot.resultResolution === "error" || snapshot.resultResolution === "dismissed"
 			? snapshot.resultResolution
 			: foreignSession ? "delivered" : undefined,
 		pendingWakes: [],

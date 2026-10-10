@@ -16,6 +16,10 @@ test("task logs follow the lane retention rule, and finished tasks are bounded a
 		// A retained log that was removed reads as an explicit expiry error, never
 		// as a successful empty result.
 		newestLog: "explicit-expiry-error",
+		// None of these tasks is assignment-owned, so a bulk clear removes them as
+		// ordinary finished history; the bound is what caps the list. What a bulk
+		// clear must never do is drop an owned result nobody received — see
+		// `assignment-evidence-retention.test.ts`.
 		logsAfterClear: 0,
 		longLog: { tail: true, head: false },
 		unloggedLog: "late-output",

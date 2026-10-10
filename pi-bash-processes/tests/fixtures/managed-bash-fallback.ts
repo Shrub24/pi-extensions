@@ -12,7 +12,7 @@ mock.module(PRESENTATION, () => { throw new Error(`Cannot find package '${PRESEN
 
 const unused = () => { throw new Error("bash fallback fixture reached an unexpected host operation"); };
 mock.module("@earendil-works/pi-ai", () => ({ StringEnum: (values: readonly string[]) => ({ enum: values }) }));
-mock.module("typebox", () => ({ Type: { Object: (value: unknown) => value, Optional: (value: unknown) => value, Number: () => ({}), String: () => ({}), Boolean: () => ({}) } }));
+mock.module("typebox", () => ({ Type: { Object: (value: unknown) => value, Optional: (value: unknown) => value, Number: () => ({}), String: () => ({}), Array: () => ({}), Boolean: () => ({}) } }));
 mock.module("@earendil-works/pi-tui", () => ({
 	matchesKey: unused,
 	truncateToWidth: (text: string, width: number) => text.slice(0, width),

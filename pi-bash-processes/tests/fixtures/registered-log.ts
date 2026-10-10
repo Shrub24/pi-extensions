@@ -7,7 +7,7 @@ import { fakeTask } from "./lifecycle.js";
 // Peer mocks stay in this child. Production result, snapshot, and log functions run unchanged.
 const unused = () => { throw new Error("registered log fixture reached an unrelated operation"); };
 mock.module("@earendil-works/pi-ai", () => ({ StringEnum: (values: readonly string[]) => ({ enum: values }) }));
-mock.module("typebox", () => ({ Type: { Object: (value: unknown) => value, Optional: (value: unknown) => value, Number: () => ({}), String: () => ({}), Boolean: () => ({}) } }));
+mock.module("typebox", () => ({ Type: { Object: (value: unknown) => value, Optional: (value: unknown) => value, Number: () => ({}), String: () => ({}), Array: () => ({}), Boolean: () => ({}) } }));
 mock.module("@earendil-works/pi-tui", () => ({ matchesKey: unused, truncateToWidth: unused, visibleWidth: unused, wrapTextWithAnsi: unused }));
 const { applyTaskToolSurface } = await import("../../extensions/registrations.js");
 const { buildTaskResultObservation } = await import("../../extensions/task-result.js");

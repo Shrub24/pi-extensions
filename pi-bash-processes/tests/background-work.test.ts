@@ -500,6 +500,45 @@ test("outstanding task count beyond the bound is rejected, never truncated", () 
 	});
 });
 
+test("an outstanding entry's capture readiness is validated, never widened", () => {
+	const entry = (overrides: Record<string, unknown>) => ({
+		taskId: "bg-1",
+		state: "awaiting-result-review",
+		reason: "terminal result not handed over",
+		...overrides,
+	});
+	const query = (outstanding: unknown[]) => {
+		const bus = fakeEventBus();
+		registerBackgroundWorkProvider(
+			bus,
+			fakeProvider({
+				snapshot: (scope) => readySnapshot({ sessionId: scope.sessionId, requestId: scope.requestId, outstanding: outstanding as BackgroundWorkSnapshot["outstanding"] }),
+			}),
+		);
+		return queryBackgroundWorkSnapshot(bus, SCOPE);
+	};
+
+	// The provider's explicit "this capture can never certify" mark; everything
+	// else about the entry is unchanged.
+	const marked = query([entry({ captureCertified: false })]);
+	expect(marked).toMatchObject({ state: "ready" });
+	if (marked.state !== "ready") throw new Error("expected ready");
+	expect(marked.snapshot.outstanding).toStrictEqual([{ taskId: "bg-1", state: "awaiting-result-review", reason: "terminal result not handed over", captureCertified: false }]);
+
+	// Absence is the certified default, so an explicit `true` is a second
+	// spelling of it and is refused rather than silently dropped.
+	expect(query([entry({ captureCertified: true })])).toMatchObject({
+		state: "error",
+		error: { code: "provider-malformed", message: expect.stringContaining("readiness must be false") },
+	});
+	// Readiness on a running or flushing entry would claim to classify work that
+	// has no terminal capture at all.
+	expect(query([entry({ captureCertified: false, state: "running" })])).toMatchObject({
+		state: "error",
+		error: { code: "provider-malformed", message: expect.stringContaining("only meaningful on an awaiting-result-review entry") },
+	});
+});
+
 test("outstanding task count at the bound passes through in full", () => {
 	const atBound = Array.from({ length: BACKGROUND_WORK_MAX_OUTSTANDING }, (_, i) => ({ taskId: `t${i}`, state: "running" as const, reason: "pending" }));
 	const bus = fakeEventBus();

@@ -5,6 +5,7 @@ import { taskSnapshot } from "../extensions/snapshot.js";
 import { scheduleTaskWake, sendTaskWake, voidPendingTaskWakes, WAKE_CONTENT_COMMAND_MAX_CHARS, WAKE_MANIFEST_FIELD_MAX_CHARS } from "../extensions/wake-events.js";
 import { fakeTask, fakeIdent } from "./fixtures/lifecycle.js";
 import { sendDeps } from "./fixtures/wake.js";
+import { WAKE_CONSUMER_CLAIM, WAKE_CONSUMER_OFFER, WAKE_CONSUMER_PROTOCOL, type WakeConsumerEventBus } from "../extensions/wake-consumer.js";
 
 test("wake send lifecycle rows", () => {
 	const rows = [
@@ -39,6 +40,38 @@ test("wake send lifecycle rows", () => {
 			] : row.sent ? [] : [{ reason: row.reason, sequence: 1, timestamp: 2_000 }],
 		});
 	}
+});
+
+test("soft-timeout delivery waits for a claimed advisory decision", async () => {
+	const handlers = new Map<string, Set<(data: unknown) => void>>();
+	const bus: WakeConsumerEventBus = {
+		on(channel, handler) { const listeners = handlers.get(channel) ?? new Set(); listeners.add(handler); handlers.set(channel, listeners); return () => listeners.delete(handler); },
+		emit(channel, data) { for (const handler of handlers.get(channel) ?? []) handler(data); },
+	};
+	bus.on(WAKE_CONSUMER_OFFER, (raw) => {
+		const offer = raw as { token: string };
+		bus.emit(WAKE_CONSUMER_CLAIM, { protocol: WAKE_CONSUMER_PROTOCOL, token: offer.token, answer: (answer: (decision: unknown) => void) => queueMicrotask(() => answer("release")) });
+	});
+	const task = fakeTask({ id: "bg-soft", status: "running", softTimeoutMs: 60_000 });
+	const { deps, messages } = sendDeps("partial output");
+	const sent = sendTaskWake({ ...deps, advisoryBus: bus, sessionId: () => "session-1", isCurrent: () => true }, "soft-timeout", task);
+	expect(sent).toBe(true);
+	expect(messages).toHaveLength(0);
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	expect(messages).toHaveLength(1);
+});
+
+test("a completion wake names the task's outcome and the result it still owes", () => {
+	const task = fakeTask({ id: "bg-9", status: "completed", exitCode: 0, exitNotified: false, notifyOnExit: true });
+	const { deps, messages } = sendDeps("ready\n");
+	expect(sendTaskWake(deps, "exit", task, {})).toBe(true);
+	const content = String(messages.at(-1)?.message.content ?? "");
+	// A count or a bare "finished" is not enough: the reader has to be able to tell
+	// what the task did and that its result is still unread, and how to settle it.
+	expect(content).toContain("bg-9 finished");
+	expect(content).toContain("bg-9 · exit 0 · result unretrieved");
+	expect(content).toContain('bg_task action:"get" id: bg-9');
+	expect(content).toContain('bg_task action:"clear" ids:["bg-9"]');
 });
 
 test("wake payload retained content", () => {

@@ -185,7 +185,7 @@ import {
 	WAKE_MANIFEST_FIELD_MAX_CHARS,
 	type OutputWakeBudgetLimits,
 } from "./wake-events.js";
-import { taskSurfaceGuidance, type TaskToolSurface } from "./tool-surface.js";
+import { taskSurfaceGuidance, wakeTaskLine, type TaskToolSurface } from "./tool-surface.js";
 
 /**
  * The surface the current session declared, resolved once at `session_start`.
@@ -325,7 +325,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 	 * notification, not settlement. Never applies to a running task: running
 	 * work is inspected, not resolved.
 	 */
-	const recordResultResolution = (task: ManagedTask, kind: "delivered" | "error" | null): boolean => {
+	const recordResultResolution = (task: ManagedTask, kind: "delivered" | "error" | "dismissed" | null): boolean => {
 		if (kind === null) return false;
 		if (task.status === "running") return false;
 		if (task.resultResolution !== undefined) return false;
@@ -1302,13 +1302,11 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		// Reconcile markers with what we just restored: a session that died
 		// mid-task leaves markers behind, and a restored running task needs one.
 		for (const task of tasks.values()) {
-			if (task.status === "running") {
-				markTaskRunning(task);
-				// Arming is idempotent per deadline, so a rehydrated running task
-				// always ends up with exactly one timer — including one whose
-				// previous reminder already fired and was re-armed from that review.
-				scheduleSoftTimeout(task);
-			} else clearRunningMarker(task);
+			if (task.status === "running") markTaskRunning(task);
+			else clearRunningMarker(task);
+			// Running work reviews progress; a terminal task can still owe its result.
+			// The same persisted deadline is re-armed once for either state.
+			scheduleSoftTimeout(task);
 		}
 		if (tasks.size > 0) persistSnapshots();
 	};
@@ -1771,6 +1769,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			exitMandatory: exitWakeIsMandatory,
 		}, eventType, task, options);
 		publishBackgroundTaskActivity(eventType, task, { ...options, sequence: options.sequence ?? task.wakeSequence ?? 0 });
+		if (eventType === "exit" && sent && task.resultResolution === undefined) recordReview(task);
 		rememberSnapshot(task);
 		persistSnapshots();
 		return sent;
@@ -1907,11 +1906,13 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		const revision = task.reviewRevision ?? 0;
 		task.softTimeoutTimer = setTimeout(() => {
 			task.softTimeoutTimer = null;
-			// Revalidate at dispatch: a successful review, or a terminal
-			// transition, makes this reminder stale.
+			// Revalidate at dispatch: a successful review, resolution, or stop
+			// makes the scheduled reminder stale.
 			if ((task.reviewRevision ?? 0) !== revision) return;
-			if (task.status !== "running" || task.stopReason != null) return;
-			deliverReviewReminder(task, deadline, revision);
+			if (task.stopReason != null) return;
+			const eventType = task.status === "running" ? "soft-timeout" : task.resultResolution === undefined ? "result-review" : null;
+			if (eventType == null) return;
+			deliverReviewReminder(task, deadline, revision, eventType);
 		}, Math.max(1, deadline - Date.now()));
 		task.softTimeoutTimer.unref?.();
 	};
@@ -1922,15 +1923,17 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 	 * measured from delivery. A wake the host would not take (shutdown) is left
 	 * re-armable.
 	 */
-	const deliverReviewReminder = (task: ManagedTask, deadline: number, revision: number): void => {
+	const deliverReviewReminder = (task: ManagedTask, deadline: number, revision: number, eventType: "soft-timeout" | "result-review"): void => {
 		task.softTimeoutNotified = true;
 		const deliveredAt = Date.now();
-		const sent = sendTaskEvent("soft-timeout", task, {
+		const sent = sendTaskEvent(eventType, task, {
 			eventAt: deadline,
-			softTimeout: {
-				elapsedMs: Math.max(0, deliveredAt - task.startedAt),
-				softTimeoutMs: task.softTimeoutMs ?? 0,
-			},
+			...(eventType === "soft-timeout" ? {
+				softTimeout: {
+					elapsedMs: Math.max(0, deliveredAt - task.startedAt),
+					softTimeoutMs: task.softTimeoutMs ?? 0,
+				},
+			} : {}),
 		});
 		if (!sent) {
 			task.softTimeoutNotified = false;
@@ -2059,6 +2062,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 				// unsettled: that is how a foreground bash wait or a bounded task
 				// wait is recognised as the delivery channel for this exit.
 				sendExitWakeLifecycle(task, lifecycleHooks);
+				scheduleSoftTimeout(task);
 				if (logSettled && existsSync(task.logFile)) {
 					task.output = "";
 					task.lastAnnouncedLength = 0;
@@ -2605,22 +2609,22 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			}, "exit", task, options);
 			// The send is the delivery: acknowledge through the shared entry point so
 			// a restart cannot replay a wake the agent already received.
-			if (sent) ackCompletion(task, "host-notification");
+			if (sent) {
+				ackCompletion(task, "host-notification");
+				if (task.resultResolution === undefined) recordReview(task);
+				rememberSnapshot(task);
+				persistSnapshots();
+			}
 			return;
 		}
 		// Grouped wake: several mid-turn completions become one message.
-		const summaries = finished.map((task) => {
-			const exit = task.exitCode ?? 0;
-			const status = exit === 0 ? "exit 0" : `exit ${exit}`;
-			return `${task.id} · ${status} · ${compactText(task.command, 60)}`;
-		});
+		const guidance = taskSurfaceGuidance(taskToolSurface);
+		const summaries = finished.map((task) => `${wakeTaskLine(task, guidance)} · ${compactText(task.command, 60)}`);
 		const failures = finished.filter((task) => (task.exitCode ?? 0) !== 0);
 		const content = [
 			`${finished.length} background tasks finished.`,
 			...summaries.map((line) => `• ${line}`),
-			failures.length > 0
-				? `${failures.length} failed: ${taskSurfaceGuidance(taskToolSurface).reviewFailures}.`
-				: "If these results are already consumed, nothing more to do.",
+			...(failures.length > 0 ? [`${failures.length} failed: ${guidance.reviewFailures}.`] : []),
 			runningInventory(),
 		].join("\n");
 		deliverWakeMessage(
@@ -2631,7 +2635,12 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		// One message named every task in the batch, so every obligation it
 		// fulfilled is recorded. An idle-batched completion never carried this
 		// record before, which left it replay-eligible after a restart.
-		for (const task of finished) ackCompletion(task, "host-notification");
+		for (const task of finished) {
+			ackCompletion(task, "host-notification");
+			if (task.resultResolution === undefined) recordReview(task);
+			rememberSnapshot(task);
+		}
+		persistSnapshots();
 	};
 
 	/**
@@ -2726,7 +2735,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		const softExpiresAt = reviewDeadlineFor({ softTimeoutMs, startedAt: now });
 		const laneDir = openLaneDir(ownLaneDir(), activeCtx?.cwd ?? cwd);
 		const logFile = logFilePath(laneDir, id, now);
-		writeFileSync(logFile, "");
+		writeFileSync(logFile, "", { mode: 0o600 });
 
 		const { shell, args } = getShellConfig();
 		const spawnPlan = planResourceControlledSpawn({
@@ -2923,17 +2932,28 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		return task;
 	};
 
-	const clearFinishedTasks = (): { removed: number; kept: number } => {
+	const clearFinishedTasks = (ids?: string[]): { removed: number; kept: number; dismissed: number } => {
 		let removed = 0;
 		let kept = 0;
-		for (const task of [...tasks.values()]) {
-			if (task.status === "running") continue;
-			// An assignment-owned terminal result that was never delivered is
-			// outstanding evidence, not finished clutter (openspec tasks 2.1-2.2):
-			// `clear` skips it so an explicit clear can never turn owned outstanding
-			// work into apparent completion. Resolved history and unassociated tasks
-			// clear as before; retrieve the kept task (get/stop) to clear it after.
-			if (task.assignmentRequestId !== undefined && !resultIsResolved(task)) {
+		let dismissed = 0;
+		const selected = ids === undefined ? [...tasks.values()] : [...new Set(ids)].map((id) => tasks.get(id));
+		for (const task of selected) {
+			if (!task) {
+				kept += 1;
+				continue;
+			}
+			if (task.status === "running") {
+				if (ids !== undefined) kept += 1;
+				continue;
+			}
+			if (ids !== undefined && !resultIsResolved(task)) {
+				if (recordResultResolution(task, "dismissed")) dismissed += 1;
+				else kept += 1;
+				continue;
+			}
+			// Bulk clear preserves assignment-owned results until an explicit
+			// handoff or targeted dismissal; targeted clear is the owner's decision.
+			if (ids === undefined && task.assignmentRequestId !== undefined && !resultIsResolved(task)) {
 				kept += 1;
 				continue;
 			}
@@ -2942,7 +2962,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		}
 		persistSnapshots();
 		refreshUi();
-		return { removed, kept };
+		return { removed, kept, dismissed };
 	};
 
 	const formatTaskListText = (): string => {

@@ -65,7 +65,9 @@ export function normalizeManagedBashTimeoutSeconds(input: unknown): number {
  * Pi's built-in bash `outputSchema` (`bashOutputSchema` in the coding agent's
  * core bash tool), field for field. The replacement bash tool declares it
  * unchanged so a programmatic caller — a codemode script, for example — reads
- * the same structured result from either bash.
+ * the same shape from either bash. One field's *value* differs on purpose:
+ * `full_output_path` is never populated here (see below), because the file that
+ * would hold the complete output is the task capture.
  */
 export const BASH_OUTPUT_SCHEMA = Type.Object({
 	output: Type.String({
@@ -76,6 +78,12 @@ export const BASH_OUTPUT_SCHEMA = Type.Object({
 	exit_code: Type.Number(),
 	wall_time_seconds: Type.Number(),
 });
+
+// `full_output_path` is declared for that shape parity but never populated:
+// the only file holding the complete output is the task capture, so naming it
+// would hand this model-facing programmatic result the capture path. Complete
+// output is reached through `bg_task get`, or — when the output-policy layer
+// shortens the text — through that layer's own artifact.
 
 /** Byte cap of `structuredContent.output`; Pi's built-in bash uses the same cap. */
 export const STRUCTURED_OUTPUT_MAX_BYTES = 1024 * 1024;
@@ -92,8 +100,7 @@ export function structuredOutputOmittedMarker(omittedBytes: number): string {
  * (dropped bytes included).
  */
 export interface StructuredOutputSource {
-	logFile: string;
-	/** Output read from `logFile`, or null when the log cannot supply it. */
+	/** Output read from the task's log, or null when the log cannot supply it. */
 	read: { output: string; truncated: boolean } | null;
 	/** Bounded text the caller holds — the same tail the model reads. */
 	text: string;
@@ -104,7 +111,6 @@ export interface StructuredOutputSource {
 export interface ManagedBashStructuredOutput {
 	output: string;
 	truncated: boolean;
-	full_output_path?: string;
 	exit_code: number;
 	wall_time_seconds: number;
 }
@@ -115,10 +121,15 @@ export interface ManagedBashStructuredOutput {
  *
  * `output` is the log read whenever the caller has one, and the bounded text it
  * already holds otherwise: a log whose last write failed or is stalled is short
- * by whatever it dropped, so it is not this command's record and
- * `full_output_path` — which promises the complete output — is left out with
- * it. `truncated` compares the recorded byte count with what the returned text
- * carries, so a caller is never told that an incomplete output is complete.
+ * by whatever it dropped, so it is not this command's record. `truncated`
+ * compares the recorded byte count with what the returned text carries, so a
+ * caller is never told that an incomplete output is complete.
+ *
+ * `full_output_path` is never set, even when `truncated` is true: the file a
+ * full output would live in is the task capture, and this structured result
+ * reaches the model (a codemode script reads it in place of the text). The
+ * complete output is available through the declared `bg_task` operations, which
+ * is where the reference belongs — see `BASH_OUTPUT_SCHEMA`.
  *
  * `exitCode` is a real exit code. A command that ended without one is a
  * termination failure the caller reports; nothing here invents a `0` for it.
@@ -135,7 +146,6 @@ export function structuredOutputFor(
 	return {
 		output: output.output,
 		truncated: output.truncated,
-		...(output.truncated && source.read ? { full_output_path: source.logFile } : {}),
 		exit_code: exitCode,
 		wall_time_seconds: Math.round(elapsedMs / 100) / 10,
 	};

@@ -342,8 +342,8 @@ export function reviewDeadlineFor(task: { startedAt: number; lastReviewedAt?: nu
 }
 
 /** Whether a running task should currently have one review reminder armed. */
-export function reviewReminderArmed(task: { status: BackgroundTaskStatus; stopReason?: string | null; startedAt: number; lastReviewedAt?: number; softTimeoutMs?: number }): boolean {
-	if (task.status !== "running" || task.stopReason != null) return false;
+export function reviewReminderArmed(task: { status: BackgroundTaskStatus; stopReason?: string | null; resultResolution?: "delivered" | "error" | "dismissed"; startedAt: number; lastReviewedAt?: number; softTimeoutMs?: number }): boolean {
+	if (task.stopReason != null || (task.status !== "running" && task.resultResolution !== undefined)) return false;
 	return reviewDeadlineFor(task) != null;
 }
 
@@ -407,7 +407,7 @@ export function acknowledgeCompletion<T extends { id: string; exitNotified?: boo
  * terminal task without a recorded resolution is outstanding — waiting,
  * flushing, or awaiting result review — regardless of `exitNotified`.
  */
-export function resultIsResolved<T extends { status: BackgroundTaskStatus; resultResolution?: "delivered" | "error" }>(
+export function resultIsResolved<T extends { status: BackgroundTaskStatus; resultResolution?: "delivered" | "error" | "dismissed" }>(
 	task: T,
 ): boolean {
 	if (task.status === "running") return false;
@@ -449,7 +449,7 @@ export function selectPrunableFinishedTasks<T extends {
 	status: BackgroundTaskStatus;
 	updatedAt: number;
 	assignmentRequestId?: string;
-	resultResolution?: "delivered" | "error";
+	resultResolution?: "delivered" | "error" | "dismissed";
 }>(
 	tasks: Iterable<T>,
 	options: { maxFinished: number; protectedIds?: ReadonlySet<string> },
@@ -463,7 +463,8 @@ export function selectPrunableFinishedTasks<T extends {
 			// result was never delivered is an assignment's outstanding work
 			// (openspec tasks 2.1-2.2), and eviction would let a provider query
 			// read its disappearance as completion. Resolved history and
-			// unassociated tasks remain prunable as before.
+			// unassociated tasks remain prunable as before, so the finished-task
+			// bound still caps an ordinary session's history.
 			!(task.assignmentRequestId !== undefined && !resultIsResolved(task)),
 	);
 	const excess = finished.length - Math.max(0, Math.floor(options.maxFinished));

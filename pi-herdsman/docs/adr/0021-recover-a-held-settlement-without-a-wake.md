@@ -2,6 +2,8 @@
 
 ## Decision
 
+**Superseded for certified unretrieved results by [ADR 0032](0032-do-not-hold-settlement-on-an-unretrieved-result.md).** The bounded re-query and recovery prompt below now apply only while unfinished or uncertified work genuinely holds the assignment; a certified terminal result no longer withholds settlement.
+
 A withheld settlement no longer depends on the background-work provider
 delivering a wake. While an assignment is held, a bounded `unref`ed backstop
 re-runs settlement on a 5-second cadence, and a provider change notification
