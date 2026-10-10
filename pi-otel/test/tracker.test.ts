@@ -628,17 +628,38 @@ describe("tool spans", () => {
     assert.equal(a[ATTR_PI_TOOL_IS_ERROR], false);
   });
 
-  test("ERROR status when tool fails", async () => {
+  test("failed tool spans preserve the actual error message", async () => {
     h.tracker.startSession();
     h.tracker.startInteraction("p");
     h.tracker.startTurn(0);
     h.tracker.startTool("t1", "bash", { command: "bad" });
-    h.tracker.endTool("t1", true, { error: "exit 1" });
+    h.tracker.endTool("t1", true, {
+      content: [{ type: "text", text: "ENOENT: no such file or directory" }],
+      isError: true,
+    });
     h.tracker.endTurn(); h.tracker.endInteraction(); h.tracker.endSession();
     await h.flush();
     const span = h.span("pi.tool.bash");
     assert.equal(span.status.code, SpanStatusCode.ERROR);
+    assert.equal(span.status.message, "ENOENT: no such file or directory");
+    assert.equal(span.attributes["exception.message"], "ENOENT: no such file or directory");
     assert.equal(span.attributes["error.type"], "tool_error");
+  });
+
+  test("tool error details follow the configured content-capture mode", async () => {
+    const restricted = makeHarness({ captureContent: "metadata_only" });
+    restricted.tracker.startSession();
+    restricted.tracker.startTool("t1", "bash", {});
+    restricted.tracker.endTool("t1", true, {
+      content: [{ type: "text", text: "sensitive failure detail" }],
+      isError: true,
+    });
+    restricted.tracker.endSession();
+    await restricted.flush();
+    const span = restricted.span("pi.tool.bash");
+    assert.equal(span.status.message, "tool execution failed");
+    assert.equal(span.attributes["exception.message"], undefined);
+    assert.equal(span.attributes[ATTR_GEN_AI_TOOL_CALL_RESULT], undefined);
   });
 
   test("increments tool.calls counter per tool", async () => {

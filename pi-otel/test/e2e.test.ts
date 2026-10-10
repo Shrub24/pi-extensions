@@ -667,7 +667,13 @@ describe("end-to-end over real HTTP OTLP (JSON protocol)", () => {
     await emit("before_provider_request", { payload: {} });
     await emit("after_provider_response", { status: 500, headers: {} });
     await emit("tool_execution_start", { toolCallId: "t1", toolName: "bash", args: {} });
-    await emit("tool_execution_end", { toolCallId: "t1", toolName: "bash", result: "err", isError: true });
+    const toolErrorMessage = "ENOENT: no such file or directory";
+    await emit("tool_execution_end", {
+      toolCallId: "t1",
+      toolName: "bash",
+      result: { content: [{ type: "text", text: toolErrorMessage }], isError: true },
+      isError: true,
+    });
     await emit("turn_end", {
       turnIndex: 0,
       message: {
@@ -724,6 +730,9 @@ describe("end-to-end over real HTTP OTLP (JSON protocol)", () => {
     assert.equal(compactAttrs["pi.compaction.reason"], "overflow");
     assert.ok(eventNames.includes("pi.llm_request.error"), "pi.llm_request.error on HTTP >=400");
     assert.ok(eventNames.includes("pi.tool.error"), "pi.tool.error on failed tool");
+    const toolError = allLogRecords().find((r) => attrsToRecord(r.attributes)["event.name"] === "pi.tool.error");
+    assert.equal(toolError?.body?.stringValue, `tool bash failed: ${toolErrorMessage}`);
+    assert.equal(attrsToRecord(toolError?.attributes)["exception.message"], toolErrorMessage);
 
     // The compaction is a span on the run trace, and the retry that follows
     // is tagged post_compaction (pi only retries after an overflow).

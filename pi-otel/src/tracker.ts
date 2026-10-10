@@ -1290,19 +1290,27 @@ export class SpanTracker {
     this.sessionToolCount++;
   }
 
-  endTool(toolCallId: string, isError: boolean, result: unknown): void {
+  endTool(toolCallId: string, isError: boolean, result: unknown): string | undefined {
     const slot = this.tools.get(toolCallId);
-    if (!slot) return;
+    if (!slot) return undefined;
     this.tools.delete(toolCallId);
     slot.span.setAttribute(ATTR_PI_TOOL_IS_ERROR, isError);
     if (this.shouldCaptureToolContent() && result !== undefined) {
       slot.span.setAttribute(ATTR_GEN_AI_TOOL_CALL_RESULT, clampAttr(result));
     }
+    const errorMessage = isError && this.shouldCaptureToolContent()
+      ? this.toolErrorMessage(result)
+      : undefined;
+    const capturedError = errorMessage ? clampAttr(errorMessage) : undefined;
     const elapsedMs = Number(process.hrtime.bigint() - slot.startNs) / 1e6;
     slot.span.setAttribute("pi.tool.duration_ms", elapsedMs);
     if (isError) {
       slot.span.setAttribute(ATTR_ERROR_TYPE, "tool_error");
-      slot.span.setStatus({ code: SpanStatusCode.ERROR, message: "tool execution failed" });
+      if (capturedError) slot.span.setAttribute(ATTR_EXCEPTION_MESSAGE, capturedError);
+      slot.span.setStatus({
+        code: SpanStatusCode.ERROR,
+        message: capturedError ?? "tool execution failed",
+      });
     }
     slot.span.end();
     try {
@@ -1311,6 +1319,31 @@ export class SpanTracker {
       if (isError) attrs[ATTR_ERROR_TYPE] = "tool_error";
       this.opts.metrics()?.toolCalls.add(1, attrs);
     } catch { /* noop */ }
+    return capturedError;
+  }
+
+  private toolErrorMessage(result: unknown): string | undefined {
+    if (result instanceof Error) return result.message || result.name;
+    if (typeof result === "string") return result.trim() || undefined;
+    if (typeof result !== "object" || result === null) return undefined;
+
+    const record = result as Record<string, unknown>;
+    if (Array.isArray(record.content)) {
+      const text = record.content
+        .flatMap((part) => {
+          if (typeof part !== "object" || part === null) return [];
+          const item = part as { type?: unknown; text?: unknown };
+          return item.type === "text" && typeof item.text === "string" ? [item.text] : [];
+        })
+        .join("\n")
+        .trim();
+      if (text) return text;
+    }
+
+    if (record.error instanceof Error) return record.error.message || record.error.name;
+    if (typeof record.error === "string") return record.error.trim() || undefined;
+    if (typeof record.message === "string") return record.message.trim() || undefined;
+    return undefined;
   }
 
   private endAllTools(reason: string): void {

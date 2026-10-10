@@ -540,14 +540,19 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.on("tool_execution_end", async (event, _ctx) => {
-    tracker?.endTool(event.toolCallId, event.isError, event.result);
+    const errorMessage = tracker?.endTool(event.toolCallId, event.isError, event.result);
     if (event.isError && cfg.selfLogs) {
+      const attributes: Record<string, string> = {
+        "gen_ai.tool.name": event.toolName,
+        "gen_ai.tool.call.id": event.toolCallId,
+      };
+      if (errorMessage) attributes["exception.message"] = errorMessage;
       emitLog(
         runtime?.logger,
         "pi.tool.error",
         SeverityNumber.ERROR,
-        `tool ${event.toolName} failed`,
-        { "gen_ai.tool.name": event.toolName, "gen_ai.tool.call.id": event.toolCallId },
+        errorMessage ? `tool ${event.toolName} failed: ${errorMessage}` : `tool ${event.toolName} failed`,
+        attributes,
       );
     }
   });
