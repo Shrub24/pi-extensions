@@ -12,10 +12,11 @@ function fixture() {
 
 describe("wake consumer", () => {
   test("no claim sends synchronously and preserves send errors", () => {
-    const bus = fixture(); let sends = 0;
-    bus.on(WAKE_CONSUMER_OFFER, () => {});
-    offerWakeConsumer({ bus, source: "pi-background-tasks", kind: "soft-timeout", id: "t1", sessionId: "s1", metadata: {}, isCurrent: () => true, deliver: () => { sends++; } });
+    const bus = fixture(); let sends = 0; let offered: unknown;
+    bus.on(WAKE_CONSUMER_OFFER, (raw) => { offered = raw; });
+    offerWakeConsumer({ bus, source: "pi-background-tasks", kind: "soft-timeout", id: "t1", sessionId: "s1", metadata: {}, command: "sleep 60 && echo done", isCurrent: () => true, deliver: () => { sends++; } });
     expect(sends).toBe(1);
+    expect((offered as { command?: string }).command).toBe("sleep 60 && echo done");
     let failedSends = 0;
     expect(() => offerWakeConsumer({ bus, source: "pi-background-tasks", kind: "soft-timeout", id: "t1", sessionId: "s1", metadata: {}, isCurrent: () => true, deliver: () => { failedSends++; throw new Error("send failed"); } })).toThrow("send failed");
     expect(failedSends).toBe(1);

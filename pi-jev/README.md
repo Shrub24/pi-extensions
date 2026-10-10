@@ -156,6 +156,14 @@ A finding is not "violated, therefore sent". It is counted per session and the c
 
 The defaults are off for the same reason the mode defaults to shadow: a nudge spends the agent's attention, and pi-warden's own numbers show what a miscalibrated advisory costs — 52 of 67 steers over two days were credential warnings, 51 of them about fixture values read from a test file, and the fix was to stop announcing them. `bun scripts/report.ts` prints each advisory's fire rate so the threshold is chosen from your sessions rather than from this file.
 
+## Advisory wake consumer
+
+The `tool-intent` entry also listens for the shared `pi-wake-consumer/v1` offer. Jev consumes the versioned wire protocol locally and has no runtime import of `pi-bash-processes`, so it remains independently installable. It claims only background-task soft timeouts and Herdsman soft deadlines; completion, result-review, owner-question, and recovery wakes remain producer-owned. In `advisory` and `live` modes, Jev asks `wake.attention` and skips the reminder only when the probability that the owner needs to act now is at or below `1 - advisoryThreshold`. Ambiguous readings, classifier failures, and timeouts release the original wake. In `shadow` mode it makes no claim, so the producer uses its original synchronous path.
+
+For a background-task reminder, the classifier receives the complete command string, event metadata, default attention guidance, and optional dispatch-time guidance. Herdsman offers currently carry event metadata only. Captured task output and working directory are not included. The command is sent to the configured model, but this question's local decision record stores its reading and state hash/size rather than the command text. Treat commands as potentially sensitive when enabling the consumer. The dispatch-guidance field is available for a producer to supply; current producers do not set it yet.
+
+The consumer uses Jev's existing client, threshold, bounded decision core, and decision-log path. It has a 4.5-second decision ceiling inside the producer's 5-second fallback window. This first pass uses a deliberately conservative default question; the context and threshold should be calibrated from actual decisions before changing them.
+
 ## Modes, then calibration
 
 Run normally for a while — `advisory` is the useful one, `shadow` is for watching the would-be verdicts before you let them steer anything. Every ask the judge sees is recorded with its probabilities, and the permission system's own resolution of that ask — which is usually a person's answer — is recorded beside it. Then:
@@ -179,7 +187,7 @@ Move a question's threshold only after its samples say where the edge belongs, a
 - `safety.reversibility` and `tool.fit` have no labelled samples behind their bars yet, and say so in the log, the deny text, and the report. Reversibility is advisory regardless: irreversibility a session can live with is a sentence, not a stop.
 - The intent consumer's nudge can be late. A call nothing gated is read at the turn boundary, which is too late to steer that turn; a gated call is nudged while the human is already being asked. `queueFlushGapMs` is the middle ground, and the reading is recorded either way.
 - The judge sees the conversation at the node that adjudicates the ask. A forwarded ask from a subagent is judged against the serving session's instruction, which is the one that carried the authority to ask.
-- It never reads file contents, diffs, or tool output; the state is the ask, the user's messages, and a line per recent tool call.
+- The permission and intent consumers never read file contents, diffs, or tool output; their state is the ask, the user's messages, and a line per recent tool call. The advisory wake consumer's separate command context is documented above.
 - Jev knows only what those fields say. Deterministic policy remains the outer boundary: the permission system caps an `allow` on its `external_directory` and `path` surfaces to `defer`, whatever the judge says.
 - A question that has not been calibrated has no measured edge. The defaults are band settings, not results.
 

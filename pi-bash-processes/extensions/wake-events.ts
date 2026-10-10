@@ -421,6 +421,7 @@ function sendSoftAdvisory(deps: SendTaskWakeDeps, task: ManagedTask, sequence: n
 		id: task.id,
 		sessionId,
 		metadata: { sequence },
+		command: task.command,
 		isCurrent: () => !deps.isShuttingDown() && deps.sessionId?.() === sessionId && task.status === "running" && task.stopReason == null && (deps.isCurrent?.(task) ?? true),
 		deliver,
 		onError: (reason) => deps.onAdvisoryError?.(reason, task),

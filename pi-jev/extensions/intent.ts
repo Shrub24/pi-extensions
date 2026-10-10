@@ -44,6 +44,7 @@ import { skillLoadText, TOOL_CHOICE_QUESTIONS, toolAvoidNudgeText, toolChoiceBan
 import { callSubject, conversationOf } from "./action-pack.js";
 import type { ToolPolicy } from "./tool-choice.js";
 import { loadToolPolicy, applyGuidance } from "./tool-policy.js";
+import { wireAdvisoryWakes } from "./advisory-wakes.js";
 
 export interface IntentDeps {
 	config?: JevConfig;
@@ -187,6 +188,7 @@ export function wireIntentConsumer(pi: ExtensionAPI, deps: IntentDeps = {}): voi
 	let ctx: ExtensionContext | undefined;
 	let sessionId: string | null = null;
 	let lease: CoreLease | undefined;
+	let disposeAdvisoryWakes: (() => void) | undefined;
 	let calls = 0;
 	let checkInTimer: ReturnType<typeof setTimeout> | undefined;
 	/** Notices already asked about, so a scan reads each one once. */
@@ -246,6 +248,18 @@ export function wireIntentConsumer(pi: ExtensionAPI, deps: IntentDeps = {}): voi
 					const unavailable = client.unavailable();
 					if (unavailable) report(`pi-jev: ${unavailable} Intent nudges are off.`);
 				});
+		}
+		const wakeSessionId = sessionId;
+		try {
+			disposeAdvisoryWakes = wireAdvisoryWakes(pi, {
+				client,
+				config,
+				sessionId: wakeSessionId,
+				isSessionCurrent: () => sessionId === wakeSessionId,
+				...(log ? { record: logSink({ log, now, mode: config.mode, model: client.model }) } : {}),
+			});
+		} catch (error) {
+			report(`pi-jev: advisory wake consumer could not register (${error instanceof Error ? error.message : String(error)}).`);
 		}
 		// One interpretation, registered by both consumers: the record then carries
 		// the plan bands and the tool band together, and a boundary flush — whose
@@ -471,6 +485,8 @@ export function wireIntentConsumer(pi: ExtensionAPI, deps: IntentDeps = {}): voi
 	pi.on("session_shutdown", () => {
 		if (checkInTimer !== undefined) clearTimeout(checkInTimer);
 		checkInTimer = undefined;
+		disposeAdvisoryWakes?.();
+		disposeAdvisoryWakes = undefined;
 		lease?.release();
 		lease = undefined;
 		logLease?.release();

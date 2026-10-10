@@ -16,8 +16,40 @@ import { wireIntentConsumer } from "../extensions/intent.js";
 import { callValue, toolCallFacts } from "../extensions/intent.js";
 import { resetRegistry } from "../extensions/registry.js";
 import { wirePermissionAuthorizer } from "../extensions/wiring.js";
+import { WAKE_CONSUMER_CLAIM, WAKE_CONSUMER_OFFER, WAKE_CONSUMER_PROTOCOL, type WakeConsumerClaim, type WakeConsumerEventBus } from "../extensions/wake-protocol.js";
 
 beforeEach(() => resetRegistry());
+
+test("the loaded intent entry claims background soft reminders through Jev", async () => {
+	const host = fakeHost();
+	const command = "python worker.py --resume";
+	const client = fakeJevClient({ "wake.attention": noul(0.1) });
+	wireIntentConsumer(host.pi, { config: testConfig({ mode: "advisory", advisoryThreshold: 0.75 }), jev: client, log: fakeLog() });
+	await host.sessionStart("session-wake");
+
+	let claim: WakeConsumerClaim | undefined;
+	const bus = (host.pi as unknown as { events: WakeConsumerEventBus }).events;
+	bus.on(WAKE_CONSUMER_CLAIM, (raw) => { claim = raw as WakeConsumerClaim; });
+	// The consumer's claim is delivered synchronously while the producer emits the offer.
+	host.emit(WAKE_CONSUMER_OFFER, {
+		protocol: WAKE_CONSUMER_PROTOCOL,
+		source: "pi-background-tasks",
+		kind: "soft-timeout",
+		id: "bg-1",
+		sessionId: "session-wake",
+		token: "offer-1",
+		deadlineMs: 5_000,
+		metadata: { sequence: 1 },
+		command,
+	});
+	expect(claim).toBeDefined();
+	const decision = await new Promise((resolve) => claim!.answer(resolve));
+	expect(decision).toBe("skip");
+	expect(client.requests).toHaveLength(1);
+	expect(JSON.stringify(client.requests[0]?.state)).toContain(command);
+	await host.shutdown();
+	expect(host.listenerCount(WAKE_CONSUMER_OFFER)).toBe(0);
+});
 
 /** Both entries on one host, as a real session has them. */
 function session(options: { answers: Parameters<typeof fakeJevClient>[0]; deliverIntentNudges?: boolean }) {

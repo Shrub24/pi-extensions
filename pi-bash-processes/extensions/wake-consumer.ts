@@ -25,6 +25,10 @@ export interface WakeConsumerOffer {
 	/** Relative decision window in milliseconds. */
 	deadlineMs: number;
 	metadata: WakeConsumerMetadata;
+	/** Exact shell input for background tasks; never contains captured task output. */
+	command?: string;
+	/** Optional instruction supplied at dispatch time by the spawning agent. */
+	dispatchGuidance?: string;
 }
 
 /** Emitted synchronously during an offer; answer starts the async decision. */
@@ -44,6 +48,8 @@ export function offerWakeConsumer(input: {
 	id: string;
 	sessionId: string;
 	metadata: WakeConsumerMetadata;
+	command?: string;
+	dispatchGuidance?: string;
 	isCurrent: () => boolean;
 	deliver: () => void;
 	onError?: (reason: string) => void;
@@ -100,6 +106,8 @@ export function offerWakeConsumer(input: {
 		token: randomUUID(),
 		deadlineMs: WAKE_CONSUMER_DECISION_MS,
 		metadata,
+		...(input.command === undefined ? {} : { command: input.command }),
+		...(input.dispatchGuidance === undefined ? {} : { dispatchGuidance: input.dispatchGuidance }),
 	};
 	let claimCount = 0;
 	let settled = false;
