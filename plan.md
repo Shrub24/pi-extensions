@@ -195,7 +195,9 @@ refusals, plus carried-background-result settlement contract tests. No live reco
 15. Radar daemon publication adoption (landed, live adoption unverified):
     Herdsman publishes Pi execution facts and owner assignment facts to Radar's control-socket
     registry (contract v1, wire pin `92ea9d37`, corrected consumer reference `4af0ff6b`; vendored
-    fixture byte-identical to canonical). `radar-client.ts`, `radar-publication.ts`,
+    fixture byte-identical to canonical), and each process's current session as the daemon's mutable
+    context record (Radar feature pin `4e376978`, with the reference-only documentation/fixture
+    commit `a46f27ae` vendored byte-for-byte). `radar-client.ts`, `radar-publication.ts`,
     `radar-execution.ts` plus wiring in `index.ts`; ADR 0031 records identity, containment and read
     boundary decisions. Radar-only publication, no new Herdr mirror; existing launch readiness,
     presence proofs and control-state consumers still use Herdr until a separately scoped coordinator
@@ -203,13 +205,13 @@ refusals, plus carried-background-result settlement contract tests. No live reco
     exists yet); Radar-side registry pruning (records accumulate per incarnation, and a vanished
     target's assignment writer retries one acquire per heartbeat until that child closes); Radar-side
     retention is accepted as a separate daemon change, not a client workaround.
-    Pending Radar change (do not implement against a guess): a source-labelled mutable context record,
-    fenced by the same writer generation/sequence/lease discipline and published by the same writer,
-    carrying the current session UUID only — never the session file path. Republish on
-    session_start/switch/fork with a newer sequence; subject, `agent_id` and writer generation do not
-    change and no process identity is re-registered. Radar pins the commit and sends the exact
-    method/fixture. Launch spec and location stay omitted: nothing consumes them and location would be
-    a mux-specific guess.
+    Mutable session context landed with the daemon support: a source-labelled record fenced by the
+    same writer generation/sequence/lease discipline and published by the same writer, carrying the
+    current session UUID only — never the session file path. Republished on session_start/switch/fork
+    with a newer sequence and renewed on the existing publication cadence; subject, `agent_id` and
+    writer generation do not change and no process identity is re-registered. Launch spec and location
+    stay omitted: nothing consumes them and location would be a mux-specific guess. Not yet exercised
+    against a disposable daemon.
 
 ## pi-jev: native classifier and AOT
 
