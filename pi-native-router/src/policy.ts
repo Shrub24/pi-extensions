@@ -121,3 +121,26 @@ export function choose(route: RouteConfig, available: Resolved[], health: Health
   const usable = available.filter(({ model, candidate }) => !excluded(identity(model, candidate.account)) && health.eligible(model, candidate.account) && model.contextWindow >= Math.max(route.contextWindow, floor, tokens + Math.max(route.outputReserve, model.maxTokens)) && model.maxTokens >= route.outputReserve);
   return usable.find(c => identity(c.model, c.candidate.account) === preferred) ?? usable[0];
 }
+
+// Pi's thinking levels in increasing order, and the clamp Pi applies to a model's supported set (pi-ai).
+export const THINKING_ORDER = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+/** Levels a physical model supports, mirroring pi-ai's getSupportedThinkingLevels. */
+export function supportedLevels(model: { reasoning?: boolean; thinkingLevelMap?: Partial<Record<string, string | null>> }): string[] {
+  if (!model.reasoning) return ["off"];
+  return THINKING_ORDER.filter(level => {
+    const mapped = model.thinkingLevelMap?.[level];
+    if (mapped === null) return false;
+    if (level === "xhigh" || level === "max") return mapped !== undefined;
+    return true;
+  });
+}
+/** Clamps a requested level to the nearest supported one, upward first, then downward (pi-ai's rule). */
+export function clampLevel(model: Parameters<typeof supportedLevels>[0], level: string): string {
+  const available = supportedLevels(model);
+  if (available.includes(level)) return level;
+  const index = THINKING_ORDER.indexOf(level as (typeof THINKING_ORDER)[number]);
+  if (index === -1) return available[0] ?? "off";
+  for (let i = index; i < THINKING_ORDER.length; i++) if (available.includes(THINKING_ORDER[i])) return THINKING_ORDER[i];
+  for (let i = index - 1; i >= 0; i--) if (available.includes(THINKING_ORDER[i])) return THINKING_ORDER[i];
+  return available[0] ?? "off";
+}

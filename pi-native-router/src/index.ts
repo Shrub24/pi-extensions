@@ -2,7 +2,7 @@ import {
   estimateTokens, VIRTUAL_MODEL_STATE_ENTRY,
   type ExtensionAPI, type ExtensionContext, type ModelRouteRequest, type ModelRoute,
 } from "@earendil-works/pi-coding-agent";
-import type { Api, Message, Model } from "@earendil-works/pi-ai";
+import type { Api, Message, Model, ThinkingLevel as ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -15,7 +15,7 @@ import { codexbarConfigPath, generateCodexbarConfig, writeCodexbarConfig } from 
 import { defaultPricingPath, loadSnapshot, refreshSnapshot, saveSnapshot } from "./pricing/cache";
 import { lookup } from "./pricing/catalog";
 import { applyPeak, backfillCost, type CostUsage } from "./pricing/reconcile";
-import { accountOf, admissionKeys, cacheExpiry, choose, classify, Health, identity, observe, partialOutput, physicalOf, restore, type Resolved, type State } from "./policy";
+import { accountOf, admissionKeys, cacheExpiry, choose, classify, clampLevel, Health, identity, observe, partialOutput, physicalOf, restore, THINKING_ORDER, type Resolved, type State } from "./policy";
 import { beforeTransition, flushBridge, type FlushHook, type TransitionHook } from "./transition";
 
 function tokens(messages: readonly Message[]): number {
@@ -50,6 +50,16 @@ async function activeOnly(candidates: Resolved[], ctx: ExtensionContext, account
   return kept;
 }
 const CACHE_ACTIVITY_ENTRY = "@vanillagreen/pi-native-router/cache-activity";
+/** The user's explicit thinking level while on a route, per role. Persisted so resumed branches keep it. */
+const THINKING_CHOICE_ENTRY = "@vanillagreen/pi-native-router/thinking-choice";
+const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+
+/** The latest explicit route thinking choice on this branch, if the user made one. */
+function userThinking(ctx: ExtensionContext, role: string): ModelThinkingLevel | undefined {
+  const entry = ctx.sessionManager.getBranch().findLast(e => e.type === "custom" && e.customType === THINKING_CHOICE_ENTRY && (e.data as { role?: string })?.role === role);
+  const level = entry?.type === "custom" ? (entry.data as { level?: unknown }).level : undefined;
+  return typeof level === "string" && THINKING_LEVELS.has(level) ? (level as ModelThinkingLevel) : undefined;
+}
 function branchState(ctx: ExtensionContext, role: string): State | undefined {
   const branch = ctx.sessionManager.getBranch();
   const entry = branch.findLast(e => e.type === "custom" && e.customType === VIRTUAL_MODEL_STATE_ENTRY && (e.data as { provider?: string; modelId?: string })?.provider === "route" && (e.data as { modelId?: string })?.modelId === role);
@@ -201,7 +211,10 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       state.floor = Math.max(state.floor, selected.model.contextWindow);
       delete state.next;
       const unchanged = old && JSON.stringify(old) === JSON.stringify(state);
-      return { model: selected.model, thinkingLevel: selected.candidate.thinkingLevel, state: unchanged ? request.state : state };
+      // An explicit user choice on this route overrides the candidate default; reasoning-less models keep theirs.
+      const explicit = userThinking(ctx, role);
+      const thinkingLevel = (explicit === undefined ? selected.candidate.thinkingLevel : clampLevel(selected.model, explicit)) as ModelThinkingLevel;
+      return { model: selected.model, thinkingLevel, state: unchanged ? request.state : state };
     };
     pi.on("message_end", (event, ctx) => {
       if (event.message.role !== "assistant" || event.message.stopReason === "error" || event.message.stopReason === "aborted") return;
@@ -219,6 +232,8 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     });
     pi.registerVirtualModel<State>({
       provider: "route", id: role, name: `Route: ${role}`, contextWindow: route.contextWindow, maxTokens: route.outputReserve,
+      // Every level is offered so Shift+Tab can change it; each physical candidate clamps the choice to what it supports.
+      thinkingLevels: [...THINKING_ORDER],
       route: (request, ctx) => request.reason === "direct" ? resolve(request, ctx) : serialized(ctx.sessionManager.getSessionId(), () => resolve(request, ctx)),
     });
   }
@@ -238,6 +253,24 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
   // concurrent processes from refreshing the same account twice.
   let quotaTimer: ReturnType<typeof setInterval> | undefined;
   const refreshQuotaQuietly = () => { void refreshQuotas().catch(degrade); };
+  // The model that was active before the latest switch. Pi applies the thinking level for a switch before
+  // it emits model_select, so a thinking change counts as a user choice only when the model did not just change.
+  const activeModel = new Map<string, string>();
+  pi.on("session_start", (_event, ctx) => {
+    if (ctx.model) activeModel.set(ctx.sessionManager.getSessionId(), `${ctx.model.provider}/${ctx.model.id}`);
+  });
+  pi.on("model_select", (event, ctx) => {
+    activeModel.set(ctx.sessionManager.getSessionId(), `${event.model.provider}/${event.model.id}`);
+  });
+  pi.on("thinking_level_select", (event, ctx) => {
+    const model = ctx.model;
+    if (!model || model.provider !== "route" || !config.routes[model.id]) return;
+    // A switch emits model_select before its thinking change is applied to the new model, so the
+    // current model is the route only when the last switch (or the session's initial model) was the route.
+    const known = activeModel.get(ctx.sessionManager.getSessionId());
+    if (known !== undefined && known !== `route/${model.id}`) return;
+    pi.appendEntry(THINKING_CHOICE_ENTRY, { role: model.id, level: event.level });
+  });
   pi.on("session_start", () => {
     if (quotaAccounts.length === 0 || !store) return;
     refreshQuotaQuietly();

@@ -106,6 +106,12 @@ An account may map to a CodexBar provider so `/quotas` can show its windows:
   - When Pi's model registry has no price for a physical model and the snapshot has a complete record, the message cost is priced from the snapshot. Partial or tiered records leave cost unknown rather than zero.
   - **DeepSeek peak pricing:** OpenCode Go bills DeepSeek models (`deepseek-v4-flash`, `deepseek-v4-pro`, `deepseek-v4.1-flash`) at DeepSeek's peak rate, which is twice the off-peak rate Pi records. On weekdays 01:00–04:00 and 06:00–10:00 UTC, the router doubles each recorded cost component on the finished message before pi-otel reads it. Weekends are off-peak.
 
+## Thinking level
+
+A route advertises every thinking level, so Shift+Tab and `/thinking` work on `route/<role>`. Your explicit choice is stored on the session branch, per role, and applies to every later request on that route until you change it. Each physical candidate clamps the choice to the levels it supports, using pi-ai's rule (upward first, then downward). Without an explicit choice, each candidate's configured `thinkingLevel` applies.
+
+Switching model does not count as a choice: a physical model's own thinking level never becomes a route choice.
+
 ## Decision log
 
 Each change of physical target is appended to `$PI_CODING_AGENT_DIR/pi-native-router/decisions.jsonl` (default `~/.pi/agent/...`, mode `0600`), one JSON object per line:

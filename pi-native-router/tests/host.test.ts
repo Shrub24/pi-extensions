@@ -14,11 +14,11 @@ import { parseConfig } from "../src/config";
 import { nativeHttpError } from "./native-error";
 
 type Outcome = "ok" | "quota" | "transient" | "partial" | "abort" | "tool" | "bad" | 401 | 403 | 429;
-async function host(outcomes: Outcome[], opts: { retry?: boolean; flush?: "failed" | "absent"; maxRecoveries?: number; maxTransitions?: number; smaller?: boolean; manager?: SessionManager; packaged?: boolean; unauthedFirst?: boolean; ttl?: number; startTime?: number; clock?: { value: number }; accounts?: boolean } = {}) {
+async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateThinking?: "off" | "low" | "medium" | "high"; retry?: boolean; flush?: "failed" | "absent"; maxRecoveries?: number; maxTransitions?: number; smaller?: boolean; manager?: SessionManager; packaged?: boolean; unauthedFirst?: boolean; ttl?: number; startTime?: number; clock?: { value: number }; accounts?: boolean } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "native-router-"));
   const settings = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: opts.retry ?? false, maxRetries: 3, baseDelayMs: 1 }, cacheWarming: "off" });
   const runtime = await ModelRuntime.create({ authPath: join(dir, "auth.json"), modelsPath: null, refreshOnCreate: false });
-  const dispatches: { physical: string; context: string }[] = [];
+  const dispatches: { physical: string; context: string; thinking?: string }[] = [];
   const order: string[] = [];
   let pending = false;
   let materialized = false;
@@ -30,11 +30,11 @@ async function host(outcomes: Outcome[], opts: { retry?: boolean; flush?: "faile
   for (const [provider, window] of [["fake-a", 300_000], ["fake-b", opts.smaller ? 200_000 : 300_000], ["fake-c", 300_000]] as const) {
     runtime.registerProvider(provider, {
       api: "openai-completions", baseUrl: "https://unused.invalid", apiKey: opts.accounts ? undefined : opts.unauthedFirst && provider === "fake-a" ? undefined : "fake-test-key",
-      models: [{ id: "model", name: provider, reasoning: false, input: ["text"], contextWindow: window, maxTokens: 16_384, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
-      streamSimple(model, context) {
+      models: [{ id: "model", name: provider, reasoning: opts.reasoning ?? false, input: ["text"], contextWindow: window, maxTokens: 16_384, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
+      streamSimple(model, context, streamOptions) {
         const stream = createAssistantMessageEventStream();
         const outcome = outcomes.shift() ?? "ok";
-        dispatches.push({ physical: model.provider, context: JSON.stringify(context) });
+        dispatches.push({ physical: model.provider, context: JSON.stringify(context), thinking: (streamOptions as { reasoning?: string } | undefined)?.reasoning });
         order.push(`dispatch:${model.provider}`);
         const errorMessage = typeof outcome === "number" ? nativeHttpError(outcome) : outcome === "quota" ? "insufficient_quota" : outcome === "transient" ? "503 overloaded" : outcome === "partial" ? "insufficient_quota" : outcome === "bad" ? "invalid request" : undefined;
         const message: AssistantMessage = {
@@ -54,7 +54,7 @@ async function host(outcomes: Outcome[], opts: { retry?: boolean; flush?: "faile
       },
     });
   }
-  const config = parseConfig({ flushTimeoutMs: 10, ...(opts.accounts ? { accounts: Object.fromEntries(["fake-a", "fake-b", "fake-c"].map(provider => [`acct-${provider}`, { provider, apiKeyEnv: `NATIVE_ROUTER_TEST_KEY_${provider.replace("-", "_").toUpperCase()}` }])) } : {}), routes: { worker: { candidates: ["fake-a", "fake-b", "fake-c"].map(provider => ({ provider, id: "model", ...(opts.ttl ? { cacheTtlMs: opts.ttl } : {}), ...(opts.accounts ? { account: `acct-${provider}` } : {}) })), maxRecoveries: opts.maxRecoveries ?? 2, maxTransitions: opts.maxTransitions ?? 3 } } });
+  const config = parseConfig({ flushTimeoutMs: 10, ...(opts.accounts ? { accounts: Object.fromEntries(["fake-a", "fake-b", "fake-c"].map(provider => [`acct-${provider}`, { provider, apiKeyEnv: `NATIVE_ROUTER_TEST_KEY_${provider.replace("-", "_").toUpperCase()}` }])) } : {}), routes: { worker: { candidates: ["fake-a", "fake-b", "fake-c"].map(provider => ({ provider, id: "model", thinkingLevel: opts.candidateThinking ?? "off", ...(opts.ttl ? { cacheTtlMs: opts.ttl } : {}), ...(opts.accounts ? { account: `acct-${provider}` } : {}) })), maxRecoveries: opts.maxRecoveries ?? 2, maxTransitions: opts.maxTransitions ?? 3 } } });
   runtime.registerVirtualModel({ provider: "route", id: "worker", name: "placeholder", route: () => { throw new Error("Adapter not installed"); } });
   const loader = new DefaultResourceLoader({
     cwd: dir, agentDir: dir, settingsManager: settings, noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
@@ -370,4 +370,26 @@ test("a named account without its key environment variable is unavailable and ne
     expect(h.dispatches.map(d => d.physical)).toEqual(["fake-b"]);
     expect(await h.runtime.getAuth("fake-a")).toBeUndefined();
   } finally { h.close(); delete process.env.NATIVE_ROUTER_TEST_KEY_FAKE_B; delete process.env.NATIVE_ROUTER_TEST_KEY_FAKE_C; }
+});
+
+test("a Shift+Tab thinking choice on a route applies to the next request; the candidate default is the fallback", async () => {
+  const h = await host(["ok", "ok"], { reasoning: true, candidateThinking: "low" });
+  try {
+    await h.session.prompt("default thinking");
+    expect(h.dispatches.at(-1)?.thinking).toBe("low");
+    h.session.setThinkingLevel("high");
+    await h.session.prompt("user chose high");
+    expect(h.dispatches.at(-1)?.thinking).toBe("high");
+  } finally { h.close(); }
+});
+
+test("a model switch into a route does not turn the physical model's thinking level into a route choice", async () => {
+  const h = await host(["ok", "ok"], { reasoning: true, candidateThinking: "low" });
+  try {
+    await h.session.setModel(h.runtime.getModel("fake-a", "model")!);
+    h.session.setThinkingLevel("high");
+    await h.session.setModel(h.runtime.getModel("route", "worker")!);
+    await h.session.prompt("after switching into the route");
+    expect(h.dispatches.at(-1)?.thinking).toBe("low");
+  } finally { h.close(); }
 });
