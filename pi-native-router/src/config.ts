@@ -1,10 +1,11 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import type { QuotaSource } from "./quota";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 
 export const PACKAGE_ID = "@vanillagreen/pi-native-router";
-export interface Account { provider: string; apiKeyEnv: string }
+export interface Account { provider: string; apiKeyEnv: string; quota?: QuotaSource }
 export interface Candidate { provider: string; id: string; thinkingLevel: ModelThinkingLevel; cacheTtlMs?: number; account?: string }
 export interface RouteConfig {
   candidates: Candidate[];
@@ -36,9 +37,20 @@ export function parseConfig(raw: unknown): Config {
   for (const [id, value] of Object.entries(record(config.accounts ?? {}))) {
     if (!/^[a-z][a-z0-9_-]{0,31}$/.test(id)) throw new Error(`Invalid account id: ${id}`);
     const account = record(value);
-    keys(account, ["provider", "apiKeyEnv"]);
+    keys(account, ["provider", "apiKeyEnv", "quota"]);
     if (typeof account.provider !== "string" || !account.provider || account.provider === "route" || typeof account.apiKeyEnv !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(account.apiKeyEnv)) throw new Error(`Invalid account ${id}: provider and API-key environment variable are required`);
-    accounts[id] = { provider: account.provider, apiKeyEnv: account.apiKeyEnv };
+    let quota: QuotaSource | undefined;
+    if (account.quota !== undefined) {
+      const q = record(account.quota);
+      keys(q, ["source", "provider", "account", "enforce"]);
+      if (q.source !== "codexbar") throw new Error(`Invalid account ${id}: quota source must be codexbar`);
+      if (typeof q.provider !== "string" || !q.provider) throw new Error(`Invalid account ${id}: quota provider is required`);
+      if (q.account !== undefined && (typeof q.account !== "string" || !q.account)) throw new Error(`Invalid account ${id}: quota account must be a label`);
+      if (q.enforce !== undefined && typeof q.enforce !== "boolean") throw new Error(`Invalid account ${id}: quota enforce must be a boolean`);
+      // Enforcement is opt-in until the source is verified to reflect account-wide usage.
+      quota = { source: "codexbar", provider: q.provider, ...(q.account === undefined ? {} : { account: q.account }), enforce: q.enforce === true };
+    }
+    accounts[id] = { provider: account.provider, apiKeyEnv: account.apiKeyEnv, ...(quota ? { quota } : {}) };
   }
   const routes: Record<string, RouteConfig> = {};
   for (const [role, value] of Object.entries(record(config.routes ?? {}))) {

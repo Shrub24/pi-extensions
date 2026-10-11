@@ -28,10 +28,12 @@ export class HealthStore {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS causes (
-        key TEXT PRIMARY KEY, kind TEXT NOT NULL, until INTEGER NOT NULL,
-        revision INTEGER NOT NULL, reason TEXT NOT NULL);
+        key TEXT NOT NULL, kind TEXT NOT NULL, until INTEGER NOT NULL,
+        revision INTEGER NOT NULL, reason TEXT NOT NULL, PRIMARY KEY (key, kind));
       CREATE TABLE IF NOT EXISTS leases (
         key TEXT PRIMARY KEY, holder TEXT NOT NULL, expires INTEGER NOT NULL, revision INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS quota_snapshots (
+        account TEXT PRIMARY KEY, observed_at INTEGER NOT NULL, body TEXT, error TEXT);
       INSERT OR IGNORE INTO meta (k, v) VALUES ('schema', ${SCHEMA_VERSION}), ('revision', 0);
     `);
     const version = this.db.prepare("SELECT v FROM meta WHERE k = 'schema'").get() as { v: number };
@@ -77,11 +79,12 @@ export class HealthStore {
   mark(key: string, kind: string, until: number, reason: string): void {
     this.tx(() => {
       const revision = this.nextRevision();
-      const current = this.db.prepare("SELECT until, kind, reason FROM causes WHERE key = ?").get(key) as { until: number; kind: string; reason: string } | undefined;
-      const keepCurrent = current !== undefined && current.until > until;
       this.db.prepare(`INSERT INTO causes (key, kind, until, revision, reason) VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(key) DO UPDATE SET kind = excluded.kind, until = excluded.until, revision = excluded.revision, reason = excluded.reason`)
-        .run(key, keepCurrent ? current.kind : kind, keepCurrent ? current.until : until, revision, keepCurrent ? current.reason : reason);
+        ON CONFLICT(key, kind) DO UPDATE SET
+          until = MAX(causes.until, excluded.until),
+          revision = excluded.revision,
+          reason = CASE WHEN causes.until > excluded.until THEN causes.reason ELSE excluded.reason END`)
+        .run(key, kind, until, revision, reason);
     });
   }
 
@@ -94,11 +97,11 @@ export class HealthStore {
       const at = this.now();
       const leases: ProbeLease[] = [];
       for (const key of keys) {
-        const cause = this.db.prepare("SELECT until, revision FROM causes WHERE key = ?").get(key) as { until: number; revision: number } | undefined;
-        if (cause && cause.until > at) return undefined;
+        const causes = this.db.prepare("SELECT until, revision FROM causes WHERE key = ?").all(key) as Array<{ until: number; revision: number }>;
+        if (causes.some(cause => cause.until > at)) return undefined;
         const lease = this.db.prepare("SELECT holder, expires FROM leases WHERE key = ?").get(key) as { holder: string; expires: number } | undefined;
         if (lease && lease.expires > at && lease.holder !== holder) return undefined;
-        if (cause) leases.push({ key, revision: cause.revision });
+        if (causes.length > 0) leases.push({ key, revision: Math.max(...causes.map(cause => cause.revision)) });
       }
       for (const lease of leases) {
         this.db.prepare("INSERT INTO leases (key, holder, expires, revision) VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET holder = excluded.holder, expires = excluded.expires, revision = excluded.revision")
@@ -139,6 +142,46 @@ export class HealthStore {
       this.db.prepare("DELETE FROM leases WHERE key LIKE ? ESCAPE '\\'").run(`%${suffix.replace(/[%_\\]/g, "\\$&")}`);
       this.nextRevision();
       return Number(causes.changes);
+    });
+  }
+
+  /** Takes a refresh lease unless another live holder has it. */
+  acquireLease(key: string, holder: string, ttlMs: number): boolean {
+    return this.tx(() => {
+      const at = this.now();
+      const lease = this.db.prepare("SELECT holder, expires FROM leases WHERE key = ?").get(key) as { holder: string; expires: number } | undefined;
+      if (lease && lease.expires > at && lease.holder !== holder) return false;
+      this.db.prepare("INSERT INTO leases (key, holder, expires, revision) VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET holder = excluded.holder, expires = excluded.expires")
+        .run(key, holder, at + ttlMs, this.revision());
+      return true;
+    });
+  }
+
+  releaseLease(key: string, holder: string): void {
+    this.tx(() => { this.db.prepare("DELETE FROM leases WHERE key = ? AND holder = ?").run(key, holder); });
+  }
+
+  /** Stores the latest observation for an account, or its refresh error. Bodies stay secret-free. */
+  putSnapshot(account: string, observedAt: number, snapshot: unknown | null, error: string | null): void {
+    this.tx(() => {
+      this.db.prepare(`INSERT INTO quota_snapshots (account, observed_at, body, error) VALUES (?, ?, ?, ?)
+        ON CONFLICT(account) DO UPDATE SET observed_at = excluded.observed_at, body = excluded.body, error = excluded.error`)
+        .run(account, observedAt, snapshot === null ? null : JSON.stringify(snapshot), error);
+    });
+  }
+
+  getSnapshot(account: string): { observedAt: number; body: unknown | null; error: string | null } | undefined {
+    const row = this.db.prepare("SELECT observed_at, body, error FROM quota_snapshots WHERE account = ?").get(account) as { observed_at: number; body: string | null; error: string | null } | undefined;
+    return row && { observedAt: row.observed_at, body: row.body === null ? null : JSON.parse(row.body), error: row.error };
+  }
+
+  /**
+   * Clears a tracker-sourced quota cause, but only one written before `startedRevision`.
+   * Error-derived causes (auth, rate, outage, error quota) carry a different kind and are never touched.
+   */
+  clearTrackerQuota(key: string, startedRevision: number): void {
+    this.tx(() => {
+      this.db.prepare("DELETE FROM causes WHERE key = ? AND kind = 'tracker-quota' AND revision <= ?").run(key, startedRevision);
     });
   }
 

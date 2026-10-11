@@ -9,6 +9,8 @@ import { join } from "node:path";
 import { readConfig, type Config, type RouteConfig } from "./config";
 import { accountActive, accountSecret, useAccount } from "./accounts";
 import { HealthStore } from "./health-store";
+import { codexbarRunner, QUOTA_FRESH_MS, refreshQuota, type QuotaSnapshot } from "./quota";
+import { codexbarConfigPath, generateCodexbarConfig, writeCodexbarConfig } from "./codexbar-config";
 import { accountOf, admissionKeys, cacheExpiry, choose, classify, Health, identity, observe, partialOutput, physicalOf, restore, type Resolved, type State } from "./policy";
 import { beforeTransition, flushBridge, type FlushHook, type TransitionHook } from "./transition";
 
@@ -211,6 +213,58 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       route: (request, ctx) => request.reason === "direct" ? resolve(request, ctx) : serialized(ctx.sessionManager.getSessionId(), () => resolve(request, ctx)),
     });
   }
+  // Tracker-sourced quota: snapshots are refreshed off the dispatch path and shown here.
+  const quotaHolder = randomUUID();
+  const quotaAccounts = Object.entries(config.accounts).filter(([, account]) => account.quota !== undefined);
+  const refreshQuotas = async (): Promise<string[]> => {
+    if (!store || quotaAccounts.length === 0) return [];
+    const lines: string[] = [];
+    for (const [id, account] of quotaAccounts) {
+      const outcome = await refreshQuota(store, { id, provider: account.provider }, account.quota!, codexbarRunner, options.now ?? Date.now, quotaHolder);
+      lines.push(outcome.status === "unavailable" ? `  ${id}: unknown (${outcome.reason})` : outcome.status === "leased" ? `  ${id}: refresh already in progress elsewhere` : `  ${id}: refreshed`);
+    }
+    return lines;
+  };
+  pi.registerCommand("quotas-config", {
+    description: "Generate CodexBar's config from quota-mapped router accounts: /quotas-config [--replace] [path]",
+    handler: async (args, ctx) => {
+      const tokens = args.trim().split(/\s+/).filter(Boolean);
+      const replace = tokens.includes("--replace");
+      const pathArg = tokens.filter(t => t !== "--replace");
+      if (pathArg.length > 1) { ctx.ui.notify("usage: /quotas-config [--replace] [path]", "error"); return; }
+      const path = pathArg[0] ?? codexbarConfigPath();
+      const generated = generateCodexbarConfig(config.accounts, process.env, Math.floor((options.now?.() ?? Date.now()) / 1000));
+      if (generated.included.length === 0) { ctx.ui.notify(`native-router: no quota-mapped accounts with keys set (${generated.skipped.map(s => `${s.account}: ${s.reason}`).join("; ") || "none mapped"})`, "warning"); return; }
+      try { writeCodexbarConfig(path, generated.document, replace); }
+      catch (error) { ctx.ui.notify(`native-router: ${error instanceof Error ? error.message : String(error)}`, "error"); return; }
+      const skipped = generated.skipped.length ? `; skipped ${generated.skipped.map(s => `${s.account} (${s.reason})`).join(", ")}` : "";
+      ctx.ui.notify(`native-router: wrote CodexBar config to ${path} for ${generated.included.join(", ")} (keys written; file is 0600)${skipped}`, "info");
+    },
+  });
+  pi.registerCommand("quotas", {
+    description: "Show tracker quota windows per account and refresh them",
+    handler: async (_args, ctx) => {
+      if (quotaAccounts.length === 0) { ctx.ui.notify("native-router: no account has a quota mapping", "info"); return; }
+      if (!store) { ctx.ui.notify("native-router: quotas need shared health; set sharedHealth to true", "warning"); return; }
+      const refreshed = await refreshQuotas();
+      const now = options.now?.() ?? Date.now();
+      const lines = [`native-router quotas (${new Date(now).toISOString()})`, ...refreshed];
+      for (const [id, account] of quotaAccounts) {
+        const record = store.getSnapshot(id);
+        if (!record?.body) { lines.push(`  ${id}: no snapshot${record?.error ? ` (${record.error})` : ""}`); continue; }
+        const snapshot = record.body as QuotaSnapshot;
+        const age = Math.round((now - snapshot.observedAt) / 1000);
+        const blocked = store.blocked([`${account.provider}#${id}`]);
+        lines.push(`  ${id} (${account.quota!.provider}${account.quota!.account ? `/${account.quota!.account}` : ""}) observed ${age}s ago${now - snapshot.observedAt > QUOTA_FRESH_MS ? " [stale]" : ""}, enforcement ${account.quota!.enforce ? "on" : "off"}`);
+        for (const w of snapshot.windows) {
+          const reset = w.resetsAt === undefined ? "reset unknown" : `resets ${new Date(w.resetsAt).toISOString()}`;
+          lines.push(`    ${w.label}: ${w.usedPercent}% used, ${reset}`);
+        }
+        if (blocked?.kind === "tracker-quota") lines.push(`    blocking routing until ${new Date(blocked.until).toISOString()}`);
+      }
+      ctx.ui.notify(lines.join("\n"), "info");
+    },
+  });
   pi.registerCommand("native-router-health", {
     description: "Inspect shared native-router health, or reset one account: /native-router-health [reset <account>]",
     handler: async (args, ctx) => {

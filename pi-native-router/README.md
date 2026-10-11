@@ -73,6 +73,27 @@ Account and provider causes are shared across Pi processes of the same user on o
 - **Inspect and reset:** `/native-router-health` lists causes and probe leases; `/native-router-health reset <account>` clears that account's causes and fences its in-flight probes.
 - **Rollback:** set `"sharedHealth": false` at the top level of the router configuration to return to process-local health. Parent and worker processes need the same setting to share state.
 
+## Account quotas (CodexBar)
+
+An account may map to a CodexBar provider so `/quotas` can show its windows:
+
+```json
+"accounts": {
+  "go-a": {
+    "provider": "opencode-go",
+    "apiKeyEnv": "OPENCODE_GO_KEY_A",
+    "quota": { "source": "codexbar", "provider": "opencodego", "account": "go-a", "enforce": false }
+  }
+}
+```
+
+- `/quotas` runs `codexbar usage --provider <provider> [--account <label>] --format json` with a 15 s deadline and a 64 KiB output cap, under a per-account refresh lease, and prints each window with its usage, reset and observation age. Missing binary, timeout or unrecognised output is shown as unknown and never counts as capacity or as a generation failure.
+- `enforce: true` writes a tracker-sourced cause that skips the account until its exhausted window resets. It is **off by default**: enforcement stays disabled until CodexBar's OpenCode Go source is confirmed to reflect account-wide usage rather than a local estimate.
+- A healthy snapshot clears only tracker-sourced causes. Auth, rate, outage and error-derived quota causes are unaffected.
+- `/quotas-config [--replace] [path]` writes CodexBar's config from the quota-mapped accounts: each becomes a token account labelled with its quota account (or router id) and its key read from the same environment variable. Providers are set to `source: "api"` so their meters are account-authoritative rather than device-local. The file is written 0600 via a temporary file and rename, and an existing file is refused unless `--replace` is given. Accounts whose key variable is unset are reported and skipped.
+- Dispatch never waits for CodexBar. Refresh currently happens only through `/quotas`; automatic refresh at session start is not built yet.
+- Snapshots are authoritative only when the tracker reports server meters (`source` api, web or oauth, or an explicit authoritative confidence). A `local+api` blend or estimate never enforces a block.
+
 ## Stickiness and capacity
 
 JSON branch state persists the last dispatched identity, non-decreasing context-window floor and bounded turn-recovery bookkeeping. Restore, fork and compaction retain it. Healthy user turns and tool continuations stay on the physical model; successful failover stays there rather than automatically returning to the first candidate. Candidate/config/catalog changes reconcile against the current registry while retaining the floor. Per-turn counters reset when a new real user transcript entry appears, not at native `agent_start` retry boundaries.
