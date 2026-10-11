@@ -106,6 +106,14 @@ An account may map to a CodexBar provider so `/quotas` can show its windows:
   - When Pi's model registry has no price for a physical model and the snapshot has a complete record, the message cost is priced from the snapshot. Partial or tiered records leave cost unknown rather than zero.
   - **DeepSeek peak pricing:** OpenCode Go bills DeepSeek models (`deepseek-v4-flash`, `deepseek-v4-pro`, `deepseek-v4.1-flash`) at DeepSeek's peak rate, which is twice the off-peak rate Pi records. On weekdays 01:00–04:00 and 06:00–10:00 UTC, the router doubles each recorded cost component on the finished message before pi-otel reads it. Weekends are off-peak.
 
+## Decision log
+
+Each change of physical target is appended to `$PI_CODING_AGENT_DIR/pi-native-router/decisions.jsonl` (default `~/.pi/agent/...`, mode `0600`), one JSON object per line:
+
+`{"at","session","logical","previous?","physical","account?","reason","contextTokens?","floor?"}`
+
+`reason` is `initial` (first selection), `failover` (after a failed request), or `sticky` (any other change). The log holds identities and reasons only, never keys, prompts or responses. Logging is best-effort and never affects dispatch. Read it with `jq`, for example `jq -c 'select(.reason=="failover")' decisions.jsonl`.
+
 ## Stickiness and capacity
 
 JSON branch state persists the last dispatched identity, non-decreasing context-window floor and bounded turn-recovery bookkeeping. Restore, fork and compaction retain it. Healthy user turns and tool continuations stay on the physical model; successful failover stays there rather than automatically returning to the first candidate. Candidate/config/catalog changes reconcile against the current registry while retaining the floor. Per-turn counters reset when a new real user transcript entry appears, not at native `agent_start` retry boundaries.

@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { readConfig, type Config, type RouteConfig } from "./config";
 import { accountActive, accountSecret, readAccountKey, useAccount } from "./accounts";
 import { HealthStore } from "./health-store";
+import { defaultDecisionLogPath, recordDecision, type DecisionReason } from "./decision-log";
 import { codexbarRunner, QUOTA_FRESH_MS, refreshQuota, type QuotaSnapshot } from "./quota";
 import { codexbarConfigPath, generateCodexbarConfig, writeCodexbarConfig } from "./codexbar-config";
 import { defaultPricingPath, loadSnapshot, refreshSnapshot, saveSnapshot } from "./pricing/cache";
@@ -67,7 +68,7 @@ export function defaultHealthPath(): string {
 }
 /** Admission made before a physical dispatch; settled by its own success or failure. */
 interface Admission { holder: string; keys: string[]; revision: number; physical: string }
-export function installRouter(pi: ExtensionAPI, config: Config, options: { transition?: TransitionHook; now?: () => number; healthPath?: string } = {}) {
+export function installRouter(pi: ExtensionAPI, config: Config, options: { transition?: TransitionHook; now?: () => number; healthPath?: string; decisionLogPath?: string } = {}) {
   let lastDegradation: string | undefined;
   const degrade = (error: unknown) => {
     const message = error instanceof Error ? error.message : String(error);
@@ -81,6 +82,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     catch (error) { degrade(error); }
   }
   const health = new Health(options.now, store, degrade);
+  const decisionLogPath = options.decisionLogPath ?? defaultDecisionLogPath();
   const admissions = new Map<string, Admission>();
   /** Settles this session's pending admission. Success clears only the causes it proved recovered. */
   const settleAdmission = (activityKey: string, outcome: { recovered: boolean }) => {
@@ -163,6 +165,10 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       if (!selected) throw new Error(`Native route/${role} exhausted: no compatible authenticated candidate outside cooldown`);
       const physical = identity(selected.model, selected.candidate.account);
       const account = selected.candidate.account === undefined ? undefined : config.accounts[selected.candidate.account];
+      if (state.physical !== physical) {
+        const reason: DecisionReason = !old || !state.physical ? "initial" : request.failed ? "failover" : "sticky";
+        recordDecision(decisionLogPath, { at: new Date(options.now?.() ?? Date.now()).toISOString(), session: ctx.sessionManager.getSessionId(), logical: `route/${role}`, ...(state.physical ? { previous: state.physical } : {}), physical, ...(selected.candidate.account ? { account: selected.candidate.account } : {}), reason, contextTokens: estimate, floor: state.floor }, degrade);
+      }
       if (account) await useAccount(ctx, selected.candidate.provider, account);
       if (account) pi.events.emit("native-router:account-active", { provider: selected.candidate.provider, account: selected.candidate.account });
       const now = options.now?.() ?? Date.now();
