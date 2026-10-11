@@ -74,7 +74,7 @@ async function host(outcomes: Outcome[], opts: { retry?: boolean; flush?: "faile
         if (pending) { pending = false; materialized = true; order.push("materialized"); }
         return materialized ? { messages: [...event.messages, { role: "user", content: "MATERIALIZED DROP RESULT", timestamp: 1 }] } : undefined;
       });
-      if (!opts.packaged) installRouter(pi, config, { now });
+      if (!opts.packaged) installRouter(pi, config, { now, healthPath: join(dir, "health.sqlite") });
       pi.events.on("native-router:transition", () => order.push("transition"));
     }],
   });

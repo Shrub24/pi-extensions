@@ -61,6 +61,18 @@ Optional `accounts` map (user settings only) binds an opaque ID to a provider an
 
 Activation uses Pi's runtime key operation (`ModelRuntime.setRuntimeApiKey`, reached through the same private facade as `pi-accounts`) before the selected candidate's request is prepared, and verifies the effective key. **This is provider-global within one Pi runtime**: one active key per provider serves all requests in that process, including overlapping or direct calls. Concurrent isolation requires separate Pi runtimes. Parent and worker processes each keep their own active key. A missing environment variable makes that candidate unavailable, never a silent fallback. A host without the runtime operation fails the named-account candidate before dispatch; default-auth candidates are unaffected. Literal keys are rejected. Cooldowns are per account and provider-scoped failures apply to that account only.
 
+## Shared health
+
+Account and provider causes are shared across Pi processes of the same user on one machine, in a private SQLite store at `$PI_CODING_AGENT_DIR/pi-native-router/health.sqlite` (default `~/.pi/agent/...`; directory `0700`, file `0600`). It holds only secret-free records: scope key (provider, account, or provider/model with account), cause kind, deadline, revision and probe lease. Keys, headers and response bodies are never stored.
+
+- **Scopes:** explicit quota and invalid-key evidence block the account across all its models; a model-access 403 blocks only that model; provider-wide evidence blocks the provider. Other accounts and providers are unaffected.
+- **Quota and auth deadlines** are kept up to eight days when the provider supplies them as epoch milliseconds; transient and rate hints stay capped at 15 minutes. Ambiguous reset units fall back to the default backoff.
+- **Recovery** after a deadline admits exactly one probe per scope through an atomic lease (60 s, expiring if its holder crashes). Success clears only the causes the probe proved recovered; a newer failure, an operator reset or a late result cannot be erased by an older one.
+- **Partial output** from a quota or auth failure still records health, but the request is never replayed.
+- **Degradation:** if the store cannot be opened or accessed, routing keeps the process-local mirror and emits one `native-router:health-degraded` event per distinct error. Dispatch is not stalled by coordination.
+- **Inspect and reset:** `/native-router-health` lists causes and probe leases; `/native-router-health reset <account>` clears that account's causes and fences its in-flight probes.
+- **Rollback:** set `"sharedHealth": false` at the top level of the router configuration to return to process-local health. Parent and worker processes need the same setting to share state.
+
 ## Stickiness and capacity
 
 JSON branch state persists the last dispatched identity, non-decreasing context-window floor and bounded turn-recovery bookkeeping. Restore, fork and compaction retain it. Healthy user turns and tool continuations stay on the physical model; successful failover stays there rather than automatically returning to the first candidate. Candidate/config/catalog changes reconcile against the current registry while retaining the floor. Per-turn counters reset when a new real user transcript entry appears, not at native `agent_start` retry boundaries.
@@ -73,7 +85,7 @@ Direct registry requests select deterministically from current candidates/health
 
 - Safe transient transport/server errors stay for `stayRetries` native retry callbacks, then cool down that model and advance.
 - Rate limits cool down the model by default. Quota/billing exhaustion and authentication failures cool down the provider. Structured JSON error text can specify `status`, `scope:"provider"`, `retryAfterSeconds` or epoch-millisecond `resetAt`.
-- Default cooldowns: transient 30s, rate 60s, quota/auth 300s; available hints clamp to 1s–900s. Health is process-local and expires on restart. Provider scope is coarse (all configured accounts behind that provider), not cross-process shared health. Pi's public assistant error exposes strings, not reliable raw HTTP headers; no header parsing is promised.
+- Default cooldowns: transient 30s, rate 60s, quota/auth 300s; available hints clamp to 1s–900s. Health is shared across same-user processes through the store described under Shared health, and survives restarts until each deadline. Provider-wide scope applies only to provider-wide evidence; account evidence stays on its account. Pi's public assistant error exposes strings, not reliable raw HTTP headers; no header parsing is promised.
 - Aborts, invalid requests, context overflow, unknown/non-provider errors, tool/deferred content and nonempty partial text/thinking do not migrate. Native Pi may independently retry errors under its own policy; the router refuses unsafe migration.
 - Safe terminal errors recover only at `agent_before_settle`, when another candidate and both budgets remain. A `context_edit:null` omits only the empty failed assistant from projected context; raw history is retained. The existing user/tool-result context continues without synthetic instructions or replaying completed tools. Partial output is never omitted by this extension.
 - No candidate or budget remaining means settlement. Recovery uses native scheduling only; no custom execution/retry loop exists.

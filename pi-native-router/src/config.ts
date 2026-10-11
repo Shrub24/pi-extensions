@@ -14,7 +14,7 @@ export interface RouteConfig {
   maxTransitions: number;
   maxRecoveries: number;
 }
-export interface Config { routes: Record<string, RouteConfig>; accounts: Record<string, Account>; flushTimeoutMs: number }
+export interface Config { routes: Record<string, RouteConfig>; accounts: Record<string, Account>; flushTimeoutMs: number; sharedHealth: boolean }
 const levels = ["off", "minimal", "low", "medium", "high", "xhigh"];
 function record(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Router config must be an object");
@@ -30,7 +30,8 @@ function integer(value: unknown, fallback: number, min: number, max: number): nu
 }
 export function parseConfig(raw: unknown): Config {
   const config = record(raw);
-  keys(config, ["routes", "accounts", "flushTimeoutMs"]);
+  keys(config, ["routes", "accounts", "flushTimeoutMs", "sharedHealth"]);
+  if (config.sharedHealth !== undefined && typeof config.sharedHealth !== "boolean") throw new Error("sharedHealth must be a boolean");
   const accounts: Record<string, Account> = {};
   for (const [id, value] of Object.entries(record(config.accounts ?? {}))) {
     if (!/^[a-z][a-z0-9_-]{0,31}$/.test(id)) throw new Error(`Invalid account id: ${id}`);
@@ -70,7 +71,7 @@ export function parseConfig(raw: unknown): Config {
   for (const [role, route] of Object.entries(routes)) for (const candidate of route.candidates) {
     if (namedProviders.has(candidate.provider) && !candidate.account) throw new Error(`Route ${role} must name an account for ${candidate.provider}; runtime credentials are provider-global`);
   }
-  return { routes, accounts, flushTimeoutMs: integer(config.flushTimeoutMs, 5000, 1, 60_000) };
+  return { routes, accounts, flushTimeoutMs: integer(config.flushTimeoutMs, 5000, 1, 60_000), sharedHealth: config.sharedHealth !== false };
 }
 
 // User-owned settings only: project config must not silently redirect paid requests.

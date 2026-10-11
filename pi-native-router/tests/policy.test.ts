@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import type { Api, AssistantMessage, Model } from "@earendil-works/pi-ai";
 import { parseConfig } from "../src/config";
-import { cacheExpiry, choose, classify, Health, restore } from "../src/policy";
+import { cacheExpiry, choose, classify, Health, observe, partialOutput, restore } from "../src/policy";
 import { nativeHttpError } from "./native-error";
 
 const error = (errorMessage: string, content: AssistantMessage["content"] = []) => ({ stopReason: "error" as const, errorMessage, content });
@@ -54,7 +54,8 @@ test("model cooldown isolates siblings; provider cooldown suppresses siblings; e
   expect(choose(config, models, health, 10, 200_000)?.model.id).toBe("one");
   health.mark(models[0].model, classify(error("insufficient_quota"), now));
   expect(choose(config, models, health, 10, 200_000)?.model.provider).toBe("b");
-  expect(classify(error('{"status":429,"scope":"provider","resetAt":999999999999}'), now)).toMatchObject({ scope: "provider", delayMs: 900_000 });
+  expect(classify(error('{"status":429,"scope":"provider","resetAt":2000000000000}'), now)).toMatchObject({ scope: "provider", delayMs: 900_000 });
+  expect(classify(error('{"status":429,"resetAt":999999999999}'), now).delayMs).toBe(60_000);
   expect(classify(error('{"status":429,"retryAfterSeconds":-1}'), now).delayMs).toBe(1000);
   now += 300_001;
   expect(health.eligible(models[0].model)).toBe(true);
@@ -118,4 +119,12 @@ test("cache epochs are tied to one account and model combination", () => {
   expect(cacheExpiry(activity, "route/work", "opencode-go/m#go-a", 100, 1100)).toBe(true);
   expect(cacheExpiry(activity, "route/work", "opencode-go/m#go-b", 100, 1100)).toBe(false);
   expect(cacheExpiry(activity, "route/work", "opencode-go/other#go-a", 100, 1100)).toBe(false);
+});
+
+test("partial-output provider quota is observed for health but never replayable", () => {
+  const partial = { stopReason: "error" as const, content: [{ type: "text" as const, text: "partial work" }], errorMessage: "insufficient_quota" };
+  expect(classify(partial).kind).toBe("unsafe");
+  expect(observe(partial)).toMatchObject({ kind: "quota", scope: "provider" });
+  expect(observe({ stopReason: "aborted", content: [], errorMessage: "insufficient_quota" }).kind).toBe("unsafe");
+  expect(partialOutput({ content: [{ type: "text", text: "  " }] })).toBe(false);
 });

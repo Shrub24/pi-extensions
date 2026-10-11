@@ -3,9 +3,13 @@ import {
   type ExtensionAPI, type ExtensionContext, type ModelRouteRequest, type ModelRoute,
 } from "@earendil-works/pi-coding-agent";
 import type { Api, Message, Model } from "@earendil-works/pi-ai";
+import { randomUUID } from "node:crypto";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { readConfig, type Config, type RouteConfig } from "./config";
 import { accountActive, accountSecret, useAccount } from "./accounts";
-import { accountOf, cacheExpiry, choose, classify, Health, identity, physicalOf, restore, type Resolved, type State } from "./policy";
+import { HealthStore } from "./health-store";
+import { accountOf, admissionKeys, cacheExpiry, choose, classify, Health, identity, observe, partialOutput, physicalOf, restore, type Resolved, type State } from "./policy";
 import { beforeTransition, flushBridge, type FlushHook, type TransitionHook } from "./transition";
 
 function tokens(messages: readonly Message[]): number {
@@ -52,8 +56,37 @@ function branchState(ctx: ExtensionContext, role: string): State | undefined {
   }
   return state;
 }
-export function installRouter(pi: ExtensionAPI, config: Config, options: { transition?: TransitionHook; now?: () => number } = {}) {
-  const health = new Health(options.now);
+/** Default store: user state under the Pi agent directory, never inside a project. */
+export function defaultHealthPath(): string {
+  return join(process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"), "pi-native-router", "health.sqlite");
+}
+/** Admission made before a physical dispatch; settled by its own success or failure. */
+interface Admission { holder: string; keys: string[]; revision: number; physical: string }
+export function installRouter(pi: ExtensionAPI, config: Config, options: { transition?: TransitionHook; now?: () => number; healthPath?: string } = {}) {
+  let lastDegradation: string | undefined;
+  const degrade = (error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message === lastDegradation) return;
+    lastDegradation = message;
+    pi.events.emit("native-router:health-degraded", { message });
+  };
+  let store: HealthStore | undefined;
+  if (config.sharedHealth) {
+    try { store = new HealthStore(options.healthPath ?? defaultHealthPath(), options.now ?? Date.now); }
+    catch (error) { degrade(error); }
+  }
+  const health = new Health(options.now, store, degrade);
+  const admissions = new Map<string, Admission>();
+  /** Settles this session's pending admission. Success clears only the causes it proved recovered. */
+  const settleAdmission = (activityKey: string, outcome: { recovered: boolean }) => {
+    const pending = admissions.get(activityKey);
+    if (!pending || !store) return;
+    admissions.delete(activityKey);
+    try {
+      store.settleProbe(pending.holder, outcome.recovered);
+      if (outcome.recovered) store.recordSuccess(pending.keys, pending.revision);
+    } catch (error) { degrade(error); }
+  };
   const hook = options.transition ?? flushBridge(pi, config.flushTimeoutMs);
   const flush = flushBridge(pi, config.flushTimeoutMs);
   const queues = new Map<string, Promise<unknown>>();
@@ -86,15 +119,42 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       if (state.turn !== turn) Object.assign(state, { turn, retries: 0, transitions: 0, recoveries: 0, next: undefined });
       state.floor = Math.max(state.floor, request.previous?.model.contextWindow ?? 0);
       let exclude: string | undefined;
+      if (admissions.has(activityKey)) settleAdmission(activityKey, { recovered: false });
       if (request.failed) {
         const failure = classify(request.failed.message, options.now?.());
-        if (failure.kind === "unsafe") throw new Error(`Native route/${role} refuses unsafe retry migration`);
+        if (failure.kind === "unsafe") {
+          // Partial output is never replayed, but provider quota/auth evidence still updates shared health.
+          const observed = observe(request.failed.message, options.now?.());
+          if (observed.kind !== "unsafe" && observed.kind !== "transient") {
+            const observedAccount = old?.physical !== undefined && physicalOf(old.physical) === identity(request.failed.model) ? accountOf(old.physical) : undefined;
+            health.mark(request.failed.model, observed, observedAccount);
+          }
+          throw new Error(`Native route/${role} refuses unsafe retry migration`);
+        }
         state.retries++;
         const stay = failure.kind === "transient" && state.retries <= route.stayRetries;
         const failedAccount = old?.physical !== undefined && physicalOf(old.physical) === identity(request.failed.model) ? accountOf(old.physical) : undefined;
         if (!stay) { health.mark(request.failed.model, failure, failedAccount); exclude = identity(request.failed.model, failedAccount); }
       }
-      const selected = choose(route, candidates, health, estimate, state.floor, state.next ?? state.physical, exclude);
+      // Admit one recovery probe per expired scope on the chosen target, or move to the next target.
+      const skipped = new Set<string>(exclude ? [exclude] : []);
+      let selected: Resolved | undefined;
+      for (;;) {
+        selected = choose(route, candidates, health, estimate, state.floor, state.next ?? state.physical, skipped);
+        if (!selected) break;
+        const target = identity(selected.model, selected.candidate.account);
+        if (!store) break;
+        const holder = randomUUID();
+        const keys = admissionKeys(selected.model, selected.candidate.account);
+        let granted: boolean;
+        try {
+          const revision = store.revision();
+          granted = store.admitProbe(keys, holder) !== undefined;
+          if (granted) admissions.set(activityKey, { holder, keys, revision, physical: target });
+        } catch (error) { degrade(error); break; }
+        if (granted) break;
+        skipped.add(target);
+      }
       if (!selected) throw new Error(`Native route/${role} exhausted: no compatible authenticated candidate outside cooldown`);
       const physical = identity(selected.model, selected.candidate.account);
       const account = selected.candidate.account === undefined ? undefined : config.accounts[selected.candidate.account];
@@ -138,6 +198,9 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       if (!role || !config.routes[role]) return;
       const state = branchState(ctx, role);
       const physical = `${event.message.provider}/${event.message.model}`;
+      const activityKey = `${ctx.sessionManager.getSessionId()}:${role}`;
+      const pending = admissions.get(activityKey);
+      if (pending && physicalOf(pending.physical) === physical) settleAdmission(activityKey, { recovered: true });
       if (!state || physicalOf(state.physical) !== physical) return;
       const activity = { logical: `route/${role}`, physical: state.physical, at: options.now?.() ?? Date.now() };
       activities.set(`${ctx.sessionManager.getSessionId()}:${role}`, activity);
@@ -148,6 +211,26 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       route: (request, ctx) => request.reason === "direct" ? resolve(request, ctx) : serialized(ctx.sessionManager.getSessionId(), () => resolve(request, ctx)),
     });
   }
+  pi.registerCommand("native-router-health", {
+    description: "Inspect shared native-router health, or reset one account: /native-router-health [reset <account>]",
+    handler: async (args, ctx) => {
+      if (!store) { ctx.ui.notify("native-router: shared health is disabled or unavailable; only process-local health applies", "warning"); return; }
+      const reset = args.trim().match(/^reset\s+([a-z][a-z0-9_-]{0,31})$/);
+      if (args.trim() && !reset) { ctx.ui.notify("usage: /native-router-health [reset <account>]", "error"); return; }
+      if (reset) {
+        const changed = store.resetAccount(reset[1]);
+        ctx.ui.notify(`native-router: reset account ${reset[1]} (${changed} cause record${changed === 1 ? "" : "s"} cleared; other accounts and provider outages unchanged)`, "info");
+        return;
+      }
+      const state = store.inspect();
+      const now = options.now?.() ?? Date.now();
+      const lines = [`native-router shared health (revision ${state.revision}, shared)`];
+      for (const cause of state.causes) lines.push(`  ${cause.key}: ${cause.kind} until ${new Date(cause.until).toISOString()}${cause.until <= now ? " (expired, probe eligible)" : ""}`);
+      for (const lease of state.leases) lines.push(`  probe ${lease.key}: held until ${new Date(lease.expires).toISOString()}`);
+      if (state.causes.length === 0 && state.leases.length === 0) lines.push("  no active causes");
+      ctx.ui.notify(lines.join("\n"), "info");
+    },
+  });
   pi.on("agent_before_settle", (event, ctx) => {
     if (event.outcome !== "error" || ctx.signal?.aborted || ctx.model?.provider !== "route" || ctx.hasPendingMessages()) return;
     const role = ctx.model.id;
@@ -157,11 +240,13 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     const last = event.context.contextEntries.findLast(e => e.messages.length > 0);
     const message = last?.messages.at(-1);
     if (!message || message.role !== "assistant" || message.stopReason !== "error") return;
-    const failure = classify(message, options.now?.());
-    if (failure.kind === "unsafe") return;
     const failed: Pick<Model<Api>, "provider" | "id"> = { provider: message.provider, id: message.model };
     if (physicalOf(state.physical) !== identity(failed)) return;
-    health.mark(failed, failure, accountOf(state.physical));
+    const failure = classify(message, options.now?.());
+    const observed = observe(message, options.now?.());
+    settleAdmission(`${ctx.sessionManager.getSessionId()}:${role}`, { recovered: false });
+    if (observed.kind !== "unsafe") health.mark(failed, observed, accountOf(state.physical));
+    if (failure.kind === "unsafe") return;
     const selected = choose(route, available(route, ctx, config.accounts), health, Math.max(tokens(event.context.llmMessages), ctx.getContextUsage()?.tokens ?? 0), state.floor, undefined, state.physical);
     if (!selected) return;
     const before = event.context.contextMessages.slice(0, -1);

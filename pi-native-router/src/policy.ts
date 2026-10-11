@@ -1,14 +1,28 @@
 import type { Api, AssistantMessage, Model } from "@earendil-works/pi-ai";
 import type { RouteConfig, Candidate } from "./config";
+import type { HealthStore } from "./health-store";
 
 export const identity = (model: { provider: string; id: string }, account?: string) => `${model.provider}/${model.id}${account ? `#${account}` : ""}`;
 export const physicalOf = (key: string) => key.split("#")[0];
 export const accountOf = (key: string) => key.split("#")[1];
 export type FailureKind = "transient" | "rate" | "quota" | "auth" | "unsafe";
 export interface Failure { kind: FailureKind; scope: "model" | "provider"; delayMs: number }
+/** Quota and auth resets can be days away; transient and rate hints stay short. */
+const HINT_CAP_MS = { quota: 8 * 24 * 3_600_000, auth: 8 * 24 * 3_600_000, transient: 900_000, rate: 900_000 } as const;
+/** Replay safety: output already produced, or a tool call, makes migration unsafe. */
+export function partialOutput(message: Pick<AssistantMessage, "content">): boolean {
+  return message.content.some(c => c.type === "text" ? c.text.trim().length > 0 : c.type === "thinking" ? c.thinking.trim().length > 0 : true);
+}
+/**
+ * Health observation, independent of replay safety. Provider evidence after partial output still
+ * updates shared health; the caller must not replay that request.
+ */
+export function observe(message: Pick<AssistantMessage, "stopReason" | "content" | "errorMessage">, now = Date.now()): Failure {
+  return classify({ ...message, content: [] }, now);
+}
 export function classify(message: Pick<AssistantMessage, "stopReason" | "content" | "errorMessage">, now = Date.now()): Failure {
   const unsafe: Failure = { kind: "unsafe", scope: "model", delayMs: 0 };
-  if (message.stopReason !== "error" || message.content.some(c => c.type === "text" ? c.text.trim().length > 0 : c.type === "thinking" ? c.thinking.trim().length > 0 : true)) return unsafe;
+  if (message.stopReason !== "error" || partialOutput(message)) return unsafe;
   const text = message.errorMessage ?? "";
   if (/context.{0,20}(length|window|limit)|too many tokens|invalid.request|malformed|abort|cancel/i.test(text)) return unsafe;
   let fields: Record<string, unknown> = {};
@@ -16,31 +30,63 @@ export function classify(message: Pick<AssistantMessage, "stopReason" | "content
   const nativeStatus = text.match(/^(?:(\d{3})(?=:| status code\b)|[^\r\n]+ error \((\d{3})\):)/i);
   const status = fields.status ?? Number(nativeStatus?.[1] ?? nativeStatus?.[2]);
   let kind: FailureKind = "unsafe";
+  // A 403 that names a model/entitlement is a model-access denial, not a dead key.
+  const modelAccess = status === 403 && /model|entitle|not.{0,20}(allowed|available|access)/i.test(text) && !/invalid.api.key|unauthorized|authentication/i.test(text);
   if (/insufficient.quota|quota.{0,30}(exhaust|exceed)|credit.{0,20}(balance|exhaust)|billing|usage.?limit|available balance|out of budget/i.test(text)) kind = "quota";
+  else if (modelAccess) kind = "auth";
   else if (status === 401 || status === 403 || /unauthorized|invalid.api.key|authentication|permission.denied/i.test(text)) kind = "auth";
   else if (status === 429 || /rate.limit|too many requests/i.test(text)) kind = "rate";
   else if ((typeof status === "number" && status >= 500 && status <= 599) || /\b50[0-9]\b|overloaded|server.error|service.unavailable|timeout|timed out|ECONNRESET|ECONNREFUSED|fetch failed/i.test(text)) kind = "transient";
   if (kind === "unsafe") return unsafe;
   const base = { transient: 30_000, rate: 60_000, quota: 300_000, auth: 300_000 }[kind];
-  const hint = typeof fields.retryAfterSeconds === "number" ? fields.retryAfterSeconds * 1000 : typeof fields.resetAt === "number" ? fields.resetAt - now : base;
-  return { kind, scope: kind === "quota" || kind === "auth" || fields.scope === "provider" ? "provider" : "model", delayMs: Number.isFinite(hint) ? Math.min(900_000, Math.max(1000, hint)) : base };
+  // resetAt must be epoch milliseconds; anything earlier than 2001 is an ambiguous unit and stays unknown.
+  const resetAt = typeof fields.resetAt === "number" && fields.resetAt >= 1e12 ? fields.resetAt - now : undefined;
+  const retryAfter = typeof fields.retryAfterSeconds === "number" ? fields.retryAfterSeconds * 1000 : undefined;
+  const hint = retryAfter ?? resetAt ?? base;
+  const scope = modelAccess ? "model" : kind === "quota" || kind === "auth" || fields.scope === "provider" ? "provider" : "model";
+  return { kind, scope, delayMs: Number.isFinite(hint) ? Math.min(HINT_CAP_MS[kind as keyof typeof HINT_CAP_MS] ?? 900_000, Math.max(1000, hint)) : base };
 }
 
+/** Scope keys for a target: the account-wide or provider-wide key, and the model key. */
+export function scopeKeys(model: { provider: string; id: string }, failure: Pick<Failure, "scope">, account?: string): string {
+  return failure.scope === "provider" ? `${model.provider}${account ? `#${account}` : ""}` : identity(model, account);
+}
+export function admissionKeys(model: { provider: string; id: string }, account?: string): string[] {
+  return [`${model.provider}${account ? `#${account}` : ""}`, identity(model, account)];
+}
+
+/**
+ * Health used by routing. With a shared store it reads and writes that store; otherwise, or when the
+ * store fails, it uses the process-local mirror and reports the degradation once per failure.
+ */
 export class Health {
-  private until = new Map<string, number>();
-  constructor(private now: () => number = Date.now) {}
+  private local = new Map<string, number>();
+  constructor(
+    private now: () => number = Date.now,
+    private store?: HealthStore,
+    private onDegrade: (error: unknown) => void = () => {},
+  ) {}
   mark(model: { provider: string; id: string }, failure: Failure, account?: string) {
     if (failure.kind === "unsafe") return;
-    const key = failure.scope === "provider" ? `${model.provider}${account ? `#${account}` : ""}` : identity(model, account);
-    this.until.set(key, Math.max(this.until.get(key) ?? 0, this.now() + failure.delayMs));
+    const key = scopeKeys(model, failure, account);
+    const until = this.now() + failure.delayMs;
+    this.local.set(key, Math.max(this.local.get(key) ?? 0, until));
+    this.attempt(() => this.store?.mark(key, failure.kind, until, failure.kind));
   }
   eligible(model: { provider: string; id: string }, account?: string) {
-    for (const key of [`${model.provider}${account ? `#${account}` : ""}`, identity(model, account)]) {
-      const until = this.until.get(key);
+    const keys = admissionKeys(model, account);
+    for (const key of keys) {
+      const until = this.local.get(key);
       if (until !== undefined && until > this.now()) return false;
-      if (until !== undefined) this.until.delete(key);
     }
-    return true;
+    if (!this.store) return true;
+    return this.attempt(() => this.store!.blocked(keys) === undefined, true) ?? true;
+  }
+  /** Runs a store operation, degrading to local health on failure instead of stalling dispatch. */
+  attempt<T>(run: () => T): T | undefined;
+  attempt<T>(run: () => T, fallback: T): T;
+  attempt<T>(run: () => T, fallback?: T): T | undefined {
+    try { return run(); } catch (error) { this.onDegrade(error); return fallback; }
   }
 }
 export interface CacheActivity { logical: string; physical: string; at: number; consumedAt?: number }
@@ -70,7 +116,8 @@ export function cacheExpiry(activity: CacheActivity | undefined, logical: string
   return ttl !== undefined && activity?.logical === logical && activity.physical === physical && activity.consumedAt !== activity.at && now >= activity.at && now - activity.at >= ttl;
 }
 export interface Resolved { candidate: Candidate; model: Model<Api> }
-export function choose(route: RouteConfig, available: Resolved[], health: Health, tokens: number, floor: number, preferred?: string, exclude?: string): Resolved | undefined {
-  const usable = available.filter(({ model, candidate }) => identity(model, candidate.account) !== exclude && health.eligible(model, candidate.account) && model.contextWindow >= Math.max(route.contextWindow, floor, tokens + Math.max(route.outputReserve, model.maxTokens)) && model.maxTokens >= route.outputReserve);
+export function choose(route: RouteConfig, available: Resolved[], health: Health, tokens: number, floor: number, preferred?: string, exclude?: string | ReadonlySet<string>): Resolved | undefined {
+  const excluded = (id: string) => typeof exclude === "string" ? exclude === id : exclude?.has(id) ?? false;
+  const usable = available.filter(({ model, candidate }) => !excluded(identity(model, candidate.account)) && health.eligible(model, candidate.account) && model.contextWindow >= Math.max(route.contextWindow, floor, tokens + Math.max(route.outputReserve, model.maxTokens)) && model.maxTokens >= route.outputReserve);
   return usable.find(c => identity(c.model, c.candidate.account) === preferred) ?? usable[0];
 }

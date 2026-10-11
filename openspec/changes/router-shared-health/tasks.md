@@ -4,17 +4,17 @@ Prerequisite: router-api-key-accounts must supply stable account and correlated 
 
 ## 1. Error observation and scope policy
 
-- [ ] 1.1 Separate normalized provider health evidence from replay safety; test partial-text/thinking/tool-call quota observations update account health without continuing/replaying, while aborts, malformed requests, context overflow and extension errors do not penalize health.
-- [ ] 1.2 Implement evidence-specific account, account/model and provider-service scopes; verify explicit quota/invalid-key blocks the account, model-access 403 stays narrow, opaque 429 defaults narrow, and native-formatted status errors remain recognized.
-- [ ] 1.3 Preserve credible long reset deadlines separately from bounded unknown-reset backoff; test a seven-day account reset is not truncated by the current transient hint cap and invalid/ambiguous units become unknown.
-- [ ] 1.4 Document scope precedence, final OAuth-auth failure boundaries and observation-versus-retry safety; verify examples do not classify all 403/429 as quota or infer provider outage from local transport failure.
+- [x] 1.1 Separate normalized provider health evidence from replay safety; test partial-text/thinking/tool-call quota observations update account health without continuing/replaying, while aborts, malformed requests, context overflow and extension errors do not penalize health.
+- [x] 1.2 Implement evidence-specific account, account/model and provider-service scopes; verify explicit quota/invalid-key blocks the account, model-access 403 stays narrow, opaque 429 defaults narrow, and native-formatted status errors remain recognized.
+- [x] 1.3 Preserve credible long reset deadlines separately from bounded unknown-reset backoff; test a seven-day account reset is not truncated by the current transient hint cap and invalid/ambiguous units become unknown.
+- [x] 1.4 Document scope precedence, final OAuth-auth failure boundaries and observation-versus-retry safety; verify examples do not classify all 403/429 as quota or infer provider outage from local transport failure.
 
 ## 2. Transactional local health store
 
 - [ ] 2.1 Prove one SQLite binding works in the deployed Pi runtime and declared Node test host, then add a private versioned store with bounded transactions; verify creation/permissions/schema and bounded busy/unavailable handling without a daemon or Bun-only assumption.
-- [ ] 2.2 Implement cause-specific records, attempt admission revisions and fenced update/reset operations; test older in-flight success cannot clear newer quota, independent auth/outage causes survive quota recovery and operator reset fences late results.
-- [ ] 2.3 Add atomic all-applicable-scope probe admission with bounded lease expiry; run two-process tests proving one winner, no leaked lease for rejected candidates and recovery after a crashed holder.
-- [ ] 2.4 Document state location, same-user/machine scope and degraded local-only behavior; verify bounded diagnostics and retained local health on storage failure without persisting synthetic keys, headers or raw error bodies.
+- [x] 2.2 Implement cause-specific records, attempt admission revisions and fenced update/reset operations; test older in-flight success cannot clear newer quota, independent auth/outage causes survive quota recovery and operator reset fences late results.
+- [x] 2.3 Add atomic all-applicable-scope probe admission with bounded lease expiry; run two-process tests proving one winner, no leaked lease for rejected candidates and recovery after a crashed holder.
+- [x] 2.4 Document state location, same-user/machine scope and degraded local-only behavior; verify bounded diagnostics and retained local health on storage failure without persisting synthetic keys, headers or raw error bodies.
 
 ## 3. Router admission and diagnostics
 
