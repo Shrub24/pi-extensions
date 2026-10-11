@@ -143,3 +143,17 @@ test("generated config is written 0600 and never overwrites without an explicit 
     expect(readFileSync(path, "utf8")).toContain('"x"');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test("refresh always selects the mapped CodexBar account, defaulting to the router account id", async () => {
+  const root = dir();
+  try {
+    const store = new HealthStore(join(root, "h.sqlite"), () => NOW);
+    const seen: string[][] = [];
+    const run = async (args: string[]) => { seen.push(args); return goOutput.replace('"source":"local+api"', '"source":"api"'); };
+    await refreshQuota(store, { id: "commandcode-a", provider: "commandcode" }, { source: "codexbar", provider: "commandcode", enforce: false }, run, () => NOW, "h1");
+    await refreshQuota(store, { id: "go-a", provider: "opencode-go" }, { source: "codexbar", provider: "opencodego", account: "go-a", enforce: false }, run, () => NOW, "h1");
+    expect(seen[0]).toEqual(expect.arrayContaining(["--provider", "commandcode", "--account", "commandcode-a"]));
+    expect(seen[1]).toEqual(expect.arrayContaining(["--provider", "opencodego", "--account", "go-a"]));
+    store.close();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

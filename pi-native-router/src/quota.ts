@@ -98,7 +98,8 @@ export async function refreshQuota(
   try {
     const started = store.revision();
     const args = ["usage", "--provider", source.provider, "--format", "json"];
-    if (source.account !== undefined) args.push("--account", source.account);
+    // The generated CodexBar config labels each account by its quota label, defaulting to the router id.
+    args.push("--account", source.account ?? account.id);
     let raw: string;
     try { raw = await run(args, QUOTA_TIMEOUT_MS); }
     catch (error) {

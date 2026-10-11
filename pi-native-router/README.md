@@ -61,6 +61,26 @@ Optional `accounts` map (user settings only) binds an opaque ID to a provider an
 
 Activation uses Pi's runtime key operation (`ModelRuntime.setRuntimeApiKey`, reached through the same private facade as `pi-accounts`) before the selected candidate's request is prepared, and verifies the effective key. **This is provider-global within one Pi runtime**: one active key per provider serves all requests in that process, including overlapping or direct calls. Concurrent isolation requires separate Pi runtimes. Parent and worker processes each keep their own active key. A candidate with no `account` on a provider that has named accounts expands to one candidate per account, in configured order, so a bare `opencode-go` candidate is a pool; each expansion keeps its own health, stickiness and cache epoch. A missing environment variable makes that candidate unavailable, never a silent fallback. A host without the runtime operation fails the named-account candidate before dispatch; default-auth candidates are unaffected. Literal keys are rejected. Cooldowns are per account and provider-scoped failures apply to that account only.
 
+## Per-model cache TTL
+
+`cacheTtlMs` is set per candidate, so each physical model can carry its own cache lifetime. It is opt-in: a candidate without it never expires its cache and triggers no flush.
+
+```json
+"coder": { "candidates": [
+  { "provider": "anthropic", "id": "opus-5-5", "thinkingLevel": "medium", "cacheTtlMs": 300000 },
+  { "provider": "opencode-go", "id": "deepseek-v4.1-flash", "thinkingLevel": "medium", "cacheTtlMs": 300000 }
+] }
+```
+
+- Use the retention the provider actually gives you (for example `300000` for 5 minutes, `3600000` for 1 hour). The TTL is an estimate: an expired TTL flushes Magic Context before the next dispatch, but it does not prove the provider missed the cache.
+- Cache age is tracked per account and model. Switching accounts or models starts a new epoch, and an account never inherits another's cache age.
+- Successful assistant responses refresh the age; aborted, errored and direct calls do not.
+- Routing stays sticky. Expiry alone never switches a healthy route.
+
+## Command Code
+
+`commandcode` candidates use the `COMMANDCODE_API_KEY` account above (`commandcode-a`). Because the provider now has a named account, a bare `commandcode` candidate expands to that account and no longer uses Pi's `/login` credential. Without `COMMANDCODE_API_KEY` in the environment the account is unavailable, and its candidates are skipped. Its quota is read from CodexBar's `commandcode` provider under the same key.
+
 ## Shared health
 
 Account and provider causes are shared across Pi processes of the same user on one machine, in a private SQLite store at `$PI_CODING_AGENT_DIR/pi-native-router/health.sqlite` (default `~/.pi/agent/...`; directory `0700`, file `0600`). It holds only secret-free records: scope key (provider, account, or provider/model with account), cause kind, deadline, revision and probe lease. Keys, headers and response bodies are never stored.
