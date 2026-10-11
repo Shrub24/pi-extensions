@@ -10,7 +10,7 @@ import { readConfig, type Config, type RouteConfig } from "./config";
 import { accountActive, accountSecret, readAccountKey, useAccount } from "./accounts";
 import { HealthStore } from "./health-store";
 import { defaultDecisionLogPath, recordDecision, type DecisionReason } from "./decision-log";
-import { codexbarRunner, QUOTA_FRESH_MS, refreshQuota, type QuotaSnapshot } from "./quota";
+import { codexbarRunner, QUOTA_FRESH_MS, quotaScopeKey, refreshQuota, type QuotaSnapshot, type QuotaSource } from "./quota";
 import { codexbarConfigPath, generateCodexbarConfig, writeCodexbarConfig } from "./codexbar-config";
 import { defaultPricingPath, loadSnapshot, refreshSnapshot, saveSnapshot } from "./pricing/cache";
 import { lookup } from "./pricing/catalog";
@@ -239,13 +239,19 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
   }
   // Tracker-sourced quota: snapshots are refreshed off the dispatch path and shown here.
   const quotaHolder = randomUUID();
-  const quotaAccounts = Object.entries(config.accounts).filter(([, account]) => account.quota !== undefined);
+  // Every tracker-quota scope: named accounts, plus default-auth providers (Pi's own login).
+  const quotaScopes: Array<{ label: string; key: string; scope: { provider: string; account?: string }; quota: QuotaSource }> = [
+    ...Object.entries(config.accounts).filter(([, account]) => account.quota !== undefined).map(([id, account]) => ({
+      label: id, key: quotaScopeKey(account.provider, id), scope: { provider: account.provider, account: id }, quota: account.quota!,
+    })),
+    ...Object.entries(config.quotas).map(([provider, quota]) => ({ label: provider, key: quotaScopeKey(provider), scope: { provider }, quota })),
+  ];
   const refreshQuotas = async (): Promise<string[]> => {
-    if (!store || quotaAccounts.length === 0) return [];
+    if (!store || quotaScopes.length === 0) return [];
     const lines: string[] = [];
-    for (const [id, account] of quotaAccounts) {
-      const outcome = await refreshQuota(store, { id, provider: account.provider }, account.quota!, codexbarRunner, options.now ?? Date.now, quotaHolder);
-      lines.push(outcome.status === "unavailable" ? `  ${id}: unknown (${outcome.reason})` : outcome.status === "leased" ? `  ${id}: refresh already in progress elsewhere` : `  ${id}: refreshed`);
+    for (const { label, scope, quota } of quotaScopes) {
+      const outcome = await refreshQuota(store, scope, quota, codexbarRunner, options.now ?? Date.now, quotaHolder);
+      lines.push(outcome.status === "unavailable" ? `  ${label}: unknown (${outcome.reason})` : outcome.status === "leased" ? `  ${label}: refresh already in progress elsewhere` : `  ${label}: refreshed`);
     }
     return lines;
   };
@@ -272,7 +278,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     pi.appendEntry(THINKING_CHOICE_ENTRY, { role: model.id, level: event.level });
   });
   pi.on("session_start", () => {
-    if (quotaAccounts.length === 0 || !store) return;
+    if (quotaScopes.length === 0 || !store) return;
     refreshQuotaQuietly();
     if (quotaTimer) clearInterval(quotaTimer);
     quotaTimer = setInterval(refreshQuotaQuietly, QUOTA_FRESH_MS);
@@ -328,18 +334,18 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
   pi.registerCommand("quotas", {
     description: "Show tracker quota windows per account and refresh them",
     handler: async (_args, ctx) => {
-      if (quotaAccounts.length === 0) { ctx.ui.notify("native-router: no account has a quota mapping", "info"); return; }
+      if (quotaScopes.length === 0) { ctx.ui.notify("native-router: no account or provider has a quota mapping", "info"); return; }
       if (!store) { ctx.ui.notify("native-router: quotas need shared health; set sharedHealth to true", "warning"); return; }
       const refreshed = await refreshQuotas();
       const now = options.now?.() ?? Date.now();
       const lines = [`native-router quotas (${new Date(now).toISOString()})`, ...refreshed];
-      for (const [id, account] of quotaAccounts) {
-        const record = store.getSnapshot(id);
-        if (!record?.body) { lines.push(`  ${id}: no snapshot${record?.error ? ` (${record.error})` : ""}`); continue; }
+      for (const { label, key, quota } of quotaScopes) {
+        const record = store.getSnapshot(key);
+        if (!record?.body) { lines.push(`  ${label}: no snapshot${record?.error ? ` (${record.error})` : ""}`); continue; }
         const snapshot = record.body as QuotaSnapshot;
         const age = Math.round((now - snapshot.observedAt) / 1000);
-        const blocked = store.blocked([`${account.provider}#${id}`]);
-        lines.push(`  ${id} (${account.quota!.provider}${account.quota!.account ? `/${account.quota!.account}` : ""}) observed ${age}s ago${now - snapshot.observedAt > QUOTA_FRESH_MS ? " [stale]" : ""}, enforcement ${account.quota!.enforce ? "on" : "off"}`);
+        const blocked = store.blocked([key]);
+        lines.push(`  ${label} (${quota.provider}${quota.account ? `/${quota.account}` : ""}) observed ${age}s ago${now - snapshot.observedAt > QUOTA_FRESH_MS ? " [stale]" : ""}, enforcement ${quota.enforce ? "on" : "off"}`);
         for (const w of snapshot.windows) {
           const reset = w.resetsAt === undefined ? "reset unknown" : `resets ${new Date(w.resetsAt).toISOString()}`;
           lines.push(`    ${w.label}: ${w.usedPercent}% used, ${reset}`);

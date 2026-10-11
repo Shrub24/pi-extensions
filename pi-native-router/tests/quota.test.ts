@@ -3,7 +3,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HealthStore } from "../src/health-store";
-import { exhaustedUntil, parseCodexbar, refreshQuota, type QuotaSource } from "../src/quota";
+import { exhaustedUntil, parseCodexbar, quotaScopeKey, refreshQuota, type QuotaSource } from "../src/quota";
+import { parseConfig } from "../src/config";
+import { Health } from "../src/policy";
 import { generateCodexbarConfig, stableUuid } from "../src/codexbar-config";
 import { readAccountKey } from "../src/accounts";
 import type { Account } from "../src/config";
@@ -49,7 +51,7 @@ test("a local-and-API blend never enforces, even when it reports exhaustion", as
   const root = dir();
   try {
     const store = new HealthStore(join(root, "h.sqlite"), () => NOW);
-    await refreshQuota(store, { id: "go-a", provider: "opencode-go" }, source(true), async () => goOutput, () => NOW, "h1");
+    await refreshQuota(store, { provider: "opencode-go", account: "go-a" }, source(true), async () => goOutput, () => NOW, "h1");
     expect(store.blocked(["opencode-go#go-a"])).toBeUndefined();
     store.close();
   } finally { rmSync(root, { recursive: true, force: true }); }
@@ -60,9 +62,9 @@ test("enforced exhaustion blocks the account until its reset; unenforced exhaust
   try {
     const store = new HealthStore(join(root, "h.sqlite"), () => NOW);
     const run = async () => goOutput.replace('"source":"local+api"', '"source":"api"');
-    await refreshQuota(store, { id: "go-a", provider: "opencode-go" }, source(false), run, () => NOW, "h1");
+    await refreshQuota(store, { provider: "opencode-go", account: "go-a" }, source(false), run, () => NOW, "h1");
     expect(store.blocked(["opencode-go#go-a"])).toBeUndefined();
-    await refreshQuota(store, { id: "go-a", provider: "opencode-go" }, source(true), run, () => NOW, "h1");
+    await refreshQuota(store, { provider: "opencode-go", account: "go-a" }, source(true), run, () => NOW, "h1");
     expect(store.blocked(["opencode-go#go-a"])?.kind).toBe("tracker-quota");
     expect(store.blocked(["opencode-go#go-b"])).toBeUndefined();
     store.close();
@@ -74,9 +76,9 @@ test("an unavailable tracker records unknown and does not block or clear health"
   try {
     const store = new HealthStore(join(root, "h.sqlite"), () => NOW);
     store.mark("opencode-go#go-a", "auth", NOW + 60_000, "auth");
-    const outcome = await refreshQuota(store, { id: "go-a", provider: "opencode-go" }, source(true), async () => { throw new Error("spawn codexbar ENOENT"); }, () => NOW, "h1");
+    const outcome = await refreshQuota(store, { provider: "opencode-go", account: "go-a" }, source(true), async () => { throw new Error("spawn codexbar ENOENT"); }, () => NOW, "h1");
     expect(outcome.status).toBe("unavailable");
-    expect(store.getSnapshot("go-a")?.body).toBeNull();
+    expect(store.getSnapshot("opencode-go#go-a")?.body).toBeNull();
     expect(store.blocked(["opencode-go#go-a"])?.kind).toBe("auth");
     store.close();
   } finally { rmSync(root, { recursive: true, force: true }); }
@@ -86,10 +88,10 @@ test("a healthy snapshot clears only tracker quota, never an auth block", async 
   const root = dir();
   try {
     const store = new HealthStore(join(root, "h.sqlite"), () => NOW);
-    await refreshQuota(store, { id: "go-a", provider: "opencode-go" }, source(true), async () => goOutput, () => NOW, "h1");
+    await refreshQuota(store, { provider: "opencode-go", account: "go-a" }, source(true), async () => goOutput, () => NOW, "h1");
     store.mark("opencode-go#go-a", "auth", NOW + 3_600_000, "auth");
     const healthy = goOutput.replace('"usedPercent":100', '"usedPercent":40');
-    await refreshQuota(store, { id: "go-a", provider: "opencode-go" }, source(true), async () => healthy, () => NOW + 1, "h1");
+    await refreshQuota(store, { provider: "opencode-go", account: "go-a" }, source(true), async () => healthy, () => NOW + 1, "h1");
     expect(store.blocked(["opencode-go#go-a"])?.kind).toBe("auth");
     store.close();
   } finally { rmSync(root, { recursive: true, force: true }); }
@@ -150,10 +152,36 @@ test("refresh always selects the mapped CodexBar account, defaulting to the rout
     const store = new HealthStore(join(root, "h.sqlite"), () => NOW);
     const seen: string[][] = [];
     const run = async (args: string[]) => { seen.push(args); return goOutput.replace('"source":"local+api"', '"source":"api"'); };
-    await refreshQuota(store, { id: "commandcode-a", provider: "commandcode" }, { source: "codexbar", provider: "commandcode", enforce: false }, run, () => NOW, "h1");
-    await refreshQuota(store, { id: "go-a", provider: "opencode-go" }, { source: "codexbar", provider: "opencodego", account: "go-a", enforce: false }, run, () => NOW, "h1");
+    await refreshQuota(store, { provider: "commandcode", account: "commandcode-a" }, { source: "codexbar", provider: "commandcode", enforce: false }, run, () => NOW, "h1");
+    await refreshQuota(store, { provider: "opencode-go", account: "go-a" }, { source: "codexbar", provider: "opencodego", account: "go-a", enforce: false }, run, () => NOW, "h1");
     expect(seen[0]).toEqual(expect.arrayContaining(["--provider", "commandcode", "--account", "commandcode-a"]));
     expect(seen[1]).toEqual(expect.arrayContaining(["--provider", "opencodego", "--account", "go-a"]));
     store.close();
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("a default-auth provider quota queries CodexBar's own account and blocks every model on that provider", async () => {
+  const root = dir();
+  try {
+    const store = new HealthStore(join(root, "h.sqlite"), () => NOW);
+    const seen: string[][] = [];
+    const run = async (args: string[]) => { seen.push(args); return goOutput.replace('"source":"local+api"', '"source":"api"').replace('"provider":"opencodego"', '"provider":"codex"'); };
+    const outcome = await refreshQuota(store, { provider: "openai-codex" }, { source: "codexbar", provider: "codex", enforce: true }, run, () => NOW, "h1");
+    expect(outcome.status).toBe("refreshed");
+    expect(seen[0]).not.toContain("--account");
+    expect(store.blocked([quotaScopeKey("openai-codex")])?.kind).toBe("tracker-quota");
+    const health = new Health(() => NOW, store);
+    expect(health.eligible({ provider: "openai-codex", id: "gpt-a" })).toBe(false);
+    expect(health.eligible({ provider: "openai-codex", id: "gpt-b" })).toBe(false);
+    expect(health.eligible({ provider: "anthropic", id: "opus" })).toBe(true);
+    store.close();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("provider-level quotas parse strictly and cannot overlap named accounts of the same provider", () => {
+  const parsed = parseConfig({ quotas: { "openai-codex": { source: "codexbar", provider: "codex", enforce: true }, anthropic: { source: "codexbar", provider: "claude" } } });
+  expect(parsed.quotas["openai-codex"]).toEqual({ source: "codexbar", provider: "codex", enforce: true });
+  expect(parsed.quotas.anthropic.enforce).toBe(false);
+  expect(() => parseConfig({ accounts: { "go-a": { provider: "opencode-go", apiKeyEnv: "K", quota: { source: "codexbar", provider: "opencodego" } } }, quotas: { "opencode-go": { source: "codexbar", provider: "opencodego" } } })).toThrow(/conflicts with named accounts/);
+  expect(() => parseConfig({ quotas: { codex: { source: "other", provider: "codex" } } })).toThrow(/quota source must be codexbar/);
 });

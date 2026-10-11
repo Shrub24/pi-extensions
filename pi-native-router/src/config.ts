@@ -16,7 +16,7 @@ export interface RouteConfig {
   maxTransitions: number;
   maxRecoveries: number;
 }
-export interface Config { routes: Record<string, RouteConfig>; accounts: Record<string, Account>; flushTimeoutMs: number; sharedHealth: boolean; pricingOverrides: Record<string, { input?: number; output?: number; cacheRead?: number; cacheWrite?: number }> }
+export interface Config { routes: Record<string, RouteConfig>; accounts: Record<string, Account>; quotas: Record<string, QuotaSource>; flushTimeoutMs: number; sharedHealth: boolean; pricingOverrides: Record<string, { input?: number; output?: number; cacheRead?: number; cacheWrite?: number }> }
 const levels = ["off", "minimal", "low", "medium", "high", "xhigh"];
 function record(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Router config must be an object");
@@ -30,9 +30,20 @@ function integer(value: unknown, fallback: number, min: number, max: number): nu
   if (typeof n !== "number" || !Number.isSafeInteger(n) || n < min || n > max) throw new Error(`Router integer must be ${min}..${max}`);
   return n;
 }
+/** Strict CodexBar quota mapping. Enforcement is opt-in until the source is verified as authoritative. */
+function parseQuota(where: string, value: unknown): QuotaSource {
+  const q = record(value);
+  keys(q, ["source", "provider", "account", "enforce"]);
+  if (q.source !== "codexbar") throw new Error(`Invalid ${where}: quota source must be codexbar`);
+  if (typeof q.provider !== "string" || !q.provider) throw new Error(`Invalid ${where}: quota provider is required`);
+  if (q.account !== undefined && (typeof q.account !== "string" || !q.account)) throw new Error(`Invalid ${where}: quota account must be a label`);
+  if (q.enforce !== undefined && typeof q.enforce !== "boolean") throw new Error(`Invalid ${where}: quota enforce must be a boolean`);
+  return { source: "codexbar", provider: q.provider, ...(q.account === undefined ? {} : { account: q.account }), enforce: q.enforce === true };
+}
+
 export function parseConfig(raw: unknown): Config {
   const config = record(raw);
-  keys(config, ["routes", "accounts", "flushTimeoutMs", "sharedHealth", "pricing"]);
+  keys(config, ["routes", "accounts", "quotas", "flushTimeoutMs", "sharedHealth", "pricing"]);
   const pricingOverrides: Record<string, { input?: number; output?: number; cacheRead?: number; cacheWrite?: number }> = {};
   for (const [id, value] of Object.entries(record(record(config.pricing ?? {}).overrides ?? {}))) {
     const parts = id.split("/");
@@ -59,19 +70,16 @@ export function parseConfig(raw: unknown): Config {
     if (hasFile && (typeof account.apiKeyFile !== "string" || !account.apiKeyFile.startsWith("/"))) throw new Error(`Invalid account ${id}: apiKeyFile must be an absolute path`);
     if (typeof account.provider !== "string" || !account.provider || account.provider === "route") throw new Error(`Invalid account ${id}: a provider is required`);
     if (hasEnv && (typeof account.apiKeyEnv !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(account.apiKeyEnv))) throw new Error(`Invalid account ${id}: apiKeyEnv must be an environment variable name, not a key`);
-    let quota: QuotaSource | undefined;
-    if (account.quota !== undefined) {
-      const q = record(account.quota);
-      keys(q, ["source", "provider", "account", "enforce"]);
-      if (q.source !== "codexbar") throw new Error(`Invalid account ${id}: quota source must be codexbar`);
-      if (typeof q.provider !== "string" || !q.provider) throw new Error(`Invalid account ${id}: quota provider is required`);
-      if (q.account !== undefined && (typeof q.account !== "string" || !q.account)) throw new Error(`Invalid account ${id}: quota account must be a label`);
-      if (q.enforce !== undefined && typeof q.enforce !== "boolean") throw new Error(`Invalid account ${id}: quota enforce must be a boolean`);
-      // Enforcement is opt-in until the source is verified to reflect account-wide usage.
-      quota = { source: "codexbar", provider: q.provider, ...(q.account === undefined ? {} : { account: q.account }), enforce: q.enforce === true };
-    }
+    const quota = account.quota === undefined ? undefined : parseQuota(`account ${id}`, account.quota);
     const source = hasFile ? { apiKeyFile: account.apiKeyFile as string } : { apiKeyEnv: account.apiKeyEnv as string };
     accounts[id] = { provider: account.provider, ...source, ...(quota ? { quota } : {}) };
+  }
+  // Provider-level quota for default-auth providers (Pi's own login), with no named accounts.
+  const quotas: Record<string, QuotaSource> = {};
+  for (const [provider, value] of Object.entries(record(config.quotas ?? {}))) {
+    if (!provider || provider === "route") throw new Error(`Invalid quota provider: ${provider}`);
+    if (Object.values(accounts).some(account => account.provider === provider)) throw new Error(`quotas.${provider} conflicts with named accounts for ${provider}; put the quota on those accounts`);
+    quotas[provider] = parseQuota(`quotas.${provider}`, value);
   }
   const routes: Record<string, RouteConfig> = {};
   for (const [role, value] of Object.entries(record(config.routes ?? {}))) {
@@ -106,7 +114,7 @@ export function parseConfig(raw: unknown): Config {
     };
     if (routes[role].outputReserve >= routes[role].contextWindow) throw new Error("outputReserve must be below contextWindow");
   }
-  return { routes, accounts, flushTimeoutMs: integer(config.flushTimeoutMs, 5000, 1, 60_000), sharedHealth: config.sharedHealth !== false, pricingOverrides };
+  return { routes, accounts, quotas, flushTimeoutMs: integer(config.flushTimeoutMs, 5000, 1, 60_000), sharedHealth: config.sharedHealth !== false, pricingOverrides };
 }
 
 // User-owned settings only: project config must not silently redirect paid requests.

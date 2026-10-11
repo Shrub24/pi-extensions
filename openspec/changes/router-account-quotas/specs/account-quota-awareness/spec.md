@@ -65,3 +65,11 @@ A `/quotas` command SHALL list each account's windows, percent used, reset, obse
 #### Scenario: Stale snapshot beside an active error cause
 - **WHEN** an account has a stale snapshot and an active error-derived block
 - **THEN** the output distinguishes the stale monitoring data from the active cause
+
+### Requirement: Default-auth providers are quota scopes without an account
+
+A provider configured with Pi's own login SHALL be quota-scoped at provider level, with no named account and no key. Its tracker query SHALL NOT pass an account label, and an exhausted window SHALL block every model on that provider until reset. Provider-level quota SHALL NOT overlap named accounts of the same provider.
+
+#### Scenario: Codex exhausted, Claude available
+- **WHEN** the Codex provider-level snapshot is exhausted until a future reset
+- **THEN** every Codex candidate is skipped until that reset and Claude candidates remain eligible

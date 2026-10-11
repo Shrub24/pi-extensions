@@ -85,36 +85,46 @@ export type RefreshOutcome =
  * cause for exhausted windows; a fresh, complete healthy snapshot clears only causes that were
  * already present when this fetch started.
  */
+/**
+ * Scope key for quota state: a named account (`provider#account`), or a default-auth provider
+ * whose single login is the whole account (`provider`). Causes, snapshots and leases use this key.
+ */
+export function quotaScopeKey(provider: string, account?: string): string {
+  return account === undefined ? provider : `${provider}#${account}`;
+}
+
 export async function refreshQuota(
   store: HealthStore,
-  account: { id: string; provider: string },
+  scope: { provider: string; account?: string },
   source: QuotaSource,
   run: Runner,
   now: () => number,
   holder: string,
 ): Promise<RefreshOutcome> {
-  const leaseKey = `quota:${account.id}`;
+  const key = quotaScopeKey(scope.provider, scope.account);
+  const leaseKey = `quota:${key}`;
   if (!store.acquireLease(leaseKey, holder, QUOTA_TIMEOUT_MS + 5_000)) return { status: "leased" };
   try {
     const started = store.revision();
     const args = ["usage", "--provider", source.provider, "--format", "json"];
-    // The generated CodexBar config labels each account by its quota label, defaulting to the router id.
-    args.push("--account", source.account ?? account.id);
+    // Named accounts are labelled in the generated CodexBar config (router id by default); default-auth
+    // providers query CodexBar's own logged-in account, so no label is passed.
+    const label = source.account ?? scope.account;
+    if (label !== undefined) args.push("--account", label);
     let raw: string;
     try { raw = await run(args, QUOTA_TIMEOUT_MS); }
     catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
-      store.putSnapshot(account.id, now(), null, `tracker unavailable: ${reason}`);
+      store.putSnapshot(key, now(), null, `tracker unavailable: ${reason}`);
       return { status: "unavailable", reason };
     }
-    const parsed = parseCodexbar(raw, account.id, source.provider, now());
+    const parsed = parseCodexbar(raw, key, source.provider, now());
     if ("error" in parsed) {
-      store.putSnapshot(account.id, now(), null, parsed.error);
+      store.putSnapshot(key, now(), null, parsed.error);
       return { status: "unavailable", reason: parsed.error };
     }
     const snapshot = parsed.snapshot;
-    store.putSnapshot(account.id, now(), snapshot, null);
-    const key = `${account.provider}#${account.id}`;
+    store.putSnapshot(key, now(), snapshot, null);
     if (!isFresh(snapshot, now())) return { status: "refreshed", snapshot };
     const until = exhaustedUntil(snapshot, now());
     if (source.enforce && snapshot.authoritative && until !== undefined) {
