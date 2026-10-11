@@ -691,6 +691,8 @@ type Params =
       label?: string;
       task: string;
       files?: string[];
+      /** Instruction for the assignment's soft-deadline advisory offer. */
+      watcherGuidance?: string;
     }
   | {
       action: "continue";
@@ -713,7 +715,13 @@ type Params =
   | { action: "close"; agent: string }
   | { action: "inspect"; agent: string }
   | { action: "transcript"; agent: string }
-  | { action: "extend"; agent: string; windowMs: number };
+  | {
+      action: "extend";
+      agent: string;
+      windowMs: number;
+      /** Replaces the assignment's advisory instruction; omitted keeps it. */
+      watcherGuidance?: string;
+    };
 type StaffParams =
   | { action: "list" }
   | {
@@ -772,6 +780,12 @@ type SoftWindow = {
   workspaceId: string;
   armedAt: number;
   windowMs: number;
+  /**
+   * The assignment's instruction for the soft-deadline advisory offer, carried
+   * to a wake consumer as `dispatchGuidance`. Omitted when the delegate and
+   * every later extend supplied none.
+   */
+  watcherGuidance?: string;
 };
 const SOFT_WINDOW_ENTRY = "pi-herdsman-soft-window";
 const SOFT_DEADLINE_EVENT = "pi-herdsman:soft-deadline";
@@ -820,7 +834,8 @@ function recordSoftWindow(
 }
 
 // Arm a fresh window of `windowMs` from `armedAt`. A non-positive length (the
-// disabled configuration) drops any existing window instead.
+// disabled configuration) drops any existing window instead. `watcherGuidance`
+// is the assignment's advisory instruction; omitting it arms a window with none.
 function armSoftWindow(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -828,6 +843,7 @@ function armSoftWindow(
   requestId: string,
   windowMs: number,
   armedAt = Date.now(),
+  watcherGuidance?: string,
 ): void {
   if (windowMs <= 0) {
     dropSoftWindow(requestId);
@@ -844,6 +860,7 @@ function armSoftWindow(
       workspaceId: runtime.workspaceId,
       armedAt,
       windowMs,
+      watcherGuidance,
     },
     {
       requestId,
@@ -851,18 +868,22 @@ function armSoftWindow(
       runId: runtime.runId,
       armedAt,
       windowMs,
+      watcherGuidance,
     },
   );
 }
 
 // Replay the last recorded window for one request id from the owner's durable
 // session entries. Delivery entries record the next arming directly, so the
-// latest entry always describes the currently armed window.
+// latest entry always describes the currently armed window. Absent guidance is
+// authoritative: every entry written from a window records what was in force.
 function softWindowFromEntries(
   entries: readonly unknown[],
   requestId: string,
-): { armedAt: number; windowMs: number } | undefined {
-  let latest: { armedAt: number; windowMs: number } | undefined;
+): { armedAt: number; windowMs: number; watcherGuidance?: string } | undefined {
+  let latest:
+    | { armedAt: number; windowMs: number; watcherGuidance?: string }
+    | undefined;
   for (const entry of entries) {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
     const record = entry as {
@@ -887,7 +908,15 @@ function softWindowFromEntries(
       windowMs <= 0
     )
       continue;
-    latest = { armedAt, windowMs };
+    latest = {
+      armedAt,
+      windowMs,
+      watcherGuidance:
+        typeof value.watcherGuidance === "string" &&
+        value.watcherGuidance.trim().length > 0
+          ? value.watcherGuidance.trim()
+          : undefined,
+    };
   }
   return latest;
 }
@@ -2828,6 +2857,7 @@ async function submit(
   operation = kind === "task" ? "delegate" : kind,
   acceptedAssignment?: AcceptedAssignmentContract,
   briefProfile?: BriefProfile,
+  watcherGuidance?: string,
 ): Promise<string> {
   if (!text.trim())
     fail("invalid_request", "Message must not be empty", operation);
@@ -2947,7 +2977,15 @@ async function submit(
       runtime.task = text;
       runtime.startedAt = Date.now();
       runtime.contextPercent = undefined;
-      armSoftWindow(pi, ctx, runtime, requestId, readConfig().softTimeoutMs);
+      armSoftWindow(
+        pi,
+        ctx,
+        runtime,
+        requestId,
+        readConfig().softTimeoutMs,
+        undefined,
+        watcherGuidance,
+      );
       watchResult(pi, runtime, ctx, controllerAbortController?.signal);
       watchAsk(pi, runtime, ctx, controllerAbortController?.signal);
     }
@@ -7554,6 +7592,9 @@ async function actionUnsafe(
           p.action,
           acceptedAssignment,
           roleLaunchInputs.briefProfile,
+          // A continued assignment keeps its window's instruction; only a
+          // fresh delegate supplies one.
+          p.action === "delegate" ? p.watcherGuidance : undefined,
         );
         requestStatusRefresh?.();
         return {
@@ -7915,6 +7956,9 @@ async function actionUnsafe(
           p.action,
           acceptedAssignment,
           roleLaunchInputs.briefProfile,
+          // A continued assignment keeps its window's instruction; only a
+          // fresh delegate supplies one.
+          p.action === "delegate" ? p.watcherGuidance : undefined,
         );
         pendingStart.requestId = requestId;
         accepted = true;
@@ -8169,6 +8213,9 @@ async function actionUnsafe(
     validateIdentity(runtime, extendedState);
     const extendedAt = Date.now();
     const windowMs = p.windowMs;
+    // Only an explicitly supplied instruction replaces the assignment's; an
+    // omitted one keeps whichever the delegate or an earlier extend set.
+    const watcherGuidance = p.watcherGuidance ?? armed.watcherGuidance;
     recordSoftWindow(
       pi,
       ctx,
@@ -8180,6 +8227,7 @@ async function actionUnsafe(
         workspaceId: runtime.workspaceId,
         armedAt: extendedAt,
         windowMs,
+        watcherGuidance,
       },
       {
         requestId,
@@ -8187,6 +8235,7 @@ async function actionUnsafe(
         runId: runtime.runId,
         armedAt: extendedAt,
         windowMs,
+        watcherGuidance,
         extended: true,
       },
     );
@@ -8879,6 +8928,14 @@ export default function (pi: ExtensionAPI): void {
         }),
       ),
       files: FILES_SCHEMA,
+      watcherGuidance: Type.Optional(
+        Type.String({
+          maxLength: 240,
+          pattern: "\\S",
+          description:
+            "Optional instruction for this assignment's advisory soft-deadline offer. A wake consumer may read it when deciding whether a checkpoint is worth delivering now; it is data for that consumer, never a command the Agent is given, and it changes no checkpoint when no consumer is loaded.",
+        }),
+      ),
     },
     { additionalProperties: false },
   );
@@ -8922,6 +8979,14 @@ export default function (pi: ExtensionAPI): void {
         description:
           "Length of the worker's next soft window in milliseconds, measured from this call.",
       }),
+      watcherGuidance: Type.Optional(
+        Type.String({
+          maxLength: 240,
+          pattern: "\\S",
+          description:
+            "Replacement instruction for this assignment's advisory soft-deadline offer. Omit it to keep the guidance the assignment already has; providing one replaces it. It changes neither the window nor the assignment.",
+        }),
+      ),
     },
     { additionalProperties: false },
   );
@@ -15008,6 +15073,7 @@ export default function (pi: ExtensionAPI): void {
                   workspaceId: runtime.workspaceId,
                   armedAt,
                   windowMs: recorded?.windowMs ?? recoveredSoftTimeoutMs,
+                  watcherGuidance: recorded?.watcherGuidance,
                 });
             }
             watchResult(pi, runtime, ctx, sessionSignal);
@@ -15854,6 +15920,7 @@ export default function (pi: ExtensionAPI): void {
           workspaceId: current.workspaceId,
           elapsedMs,
           windowMs: currentWindow.windowMs,
+          watcherGuidance: currentWindow.watcherGuidance,
           availableActions: currentAvailableActions(
             agent,
             view,
@@ -15879,6 +15946,13 @@ export default function (pi: ExtensionAPI): void {
         Array.isArray(actions) && actions.length
           ? actions.map((action) => `agent_${String(action)}`).join(", ")
           : "none";
+      // One instruction describes one assignment, so a checkpoint covering
+      // several Agents carries none and its consumer falls back to the default.
+      const advisoryGuidance =
+        dueEntries.length === 1 &&
+        typeof dueEntries[0]?.watcherGuidance === "string"
+          ? { dispatchGuidance: String(dueEntries[0].watcherGuidance) }
+          : {};
       try {
         sendWakeMessage(
           pi,
@@ -15930,6 +16004,7 @@ export default function (pi: ExtensionAPI): void {
             id: String(dueEntries[0]?.requestId ?? ownerSessionId),
             sessionId: ownerSessionId,
             metadata: { count: dueEntries.length },
+            ...advisoryGuidance,
             isCurrent: () =>
               !signal.aborted &&
               generation === healthGeneration &&
@@ -15968,12 +16043,14 @@ export default function (pi: ExtensionAPI): void {
             workspaceId: String(entry.workspaceId),
             armedAt: deliveredAt,
             windowMs: nextWindowMs,
+            watcherGuidance: entry.watcherGuidance,
           },
           {
             requestId,
             deliveredAt,
             nextArmedAt: deliveredAt,
             windowMs: nextWindowMs,
+            watcherGuidance: entry.watcherGuidance,
           },
         );
       }

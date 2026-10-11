@@ -85,6 +85,17 @@ test("the environment overrides the file, and nonsense values fall back", () => 
 	expect(nonsense.timeoutMs).toBe(DEFAULTS.timeoutMs);
 });
 
+test("the watcher has its own switch, independent of the permission mode", () => {
+	expect(resolveConfig({}, {} as NodeJS.ProcessEnv).watcherMode).toBe("off");
+	expect(resolveConfig({ mode: "live", watcherMode: "shadow" }, {} as NodeJS.ProcessEnv).watcherMode).toBe("shadow");
+	const env = { PI_JEV_MODE: "live", PI_JEV_WATCHER_MODE: "advisory" } as unknown as NodeJS.ProcessEnv;
+	const config = resolveConfig({ watcherMode: "shadow" }, env);
+	expect(config.mode).toBe("live");
+	expect(config.watcherMode).toBe("advisory");
+	// A value outside the three modes keeps the default rather than guessing.
+	expect(resolveConfig({ watcherMode: "on" }, {} as NodeJS.ProcessEnv).watcherMode).toBe("off");
+});
+
 test("the api key comes from settings or the environment, or is left to Pi", () => {
 	// Settings key wins over the environment; absent both, the field is unset so
 	// Pi resolves TYPESAFE_API_KEY / its credential store itself.

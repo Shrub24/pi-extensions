@@ -5,8 +5,10 @@ import {
 	type CoreRecordContext,
 	type DecisionResult,
 	type QuestionEntry,
+	type Reading,
 	type StateBlock,
 } from "./decision-core.js";
+import type { AskBandRecord, WatcherRecord } from "./decision-record.js";
 import type { JevConfig } from "./config.js";
 import type { JevClient } from "./jev.js";
 import {
@@ -20,6 +22,12 @@ import {
 
 export const ADVISORY_WAKE_QUESTION = "wake.attention";
 export const ADVISORY_WAKE_DEFAULT_GUIDANCE = "Wake the owner now only when this notice suggests an actionable issue that should not wait for task completion or a later reminder.";
+/**
+ * Version of the watcher's question wording and state shape. Recorded with every
+ * reading because a guidance hash says which instruction was in force, not
+ * whether the prompt around it still reads the same.
+ */
+export const ADVISORY_WAKE_PROMPT_VERSION = 1;
 const WAKE_STATE_BLOCK = "wake.event";
 const WAKE_DECISION_CEILING_MS = 4_500;
 const WAKE_MAX_REMEMBERED_SUBJECTS = 64;
@@ -99,15 +107,55 @@ function wakeQuestion(config: JevConfig): QuestionEntry<WakeConsumerOffer> {
 	};
 }
 
+/** Skip only below the advisory edge; an absent or uncertain reading releases. */
+function wakeDecision(probability: number | null, threshold: number): WakeConsumerDecision {
+	return probability !== null && probability <= 1 - threshold ? "skip" : "release";
+}
+
 function decisionFor(result: DecisionResult, threshold: number): WakeConsumerDecision {
 	const reading = result.readings[ADVISORY_WAKE_QUESTION];
-	if (!result.ok || !reading?.ok || typeof reading.probability !== "number") return "release";
-	return reading.probability <= 1 - threshold ? "skip" : "release";
+	const probability = result.ok && reading?.ok && typeof reading.probability === "number" ? reading.probability : null;
+	return wakeDecision(probability, threshold);
+}
+
+/**
+ * What one ask leaves in the log: the reading in the pack's band shape, the
+ * decision it produced, and which watcher produced it. The guidance text itself
+ * stays out — the record keeps its origin and a hash of it, and the state only
+ * under an explicitly configured `full` retention.
+ */
+function interpretWake(readings: readonly Reading[], offer: WakeConsumerOffer, mode: WatcherRecord["mode"], threshold: number): unknown {
+	const reading = readings.find((item) => item.question === ADVISORY_WAKE_QUESTION);
+	const probability = reading?.ok && typeof reading.probability === "number" ? reading.probability : null;
+	const decision = wakeDecision(probability, threshold);
+	const bands: AskBandRecord[] = [{
+		id: ADVISORY_WAKE_QUESTION,
+		role: "advisory",
+		// Same edges the decision uses, so a band and a verdict cannot disagree.
+		band: probability === null ? "missing" : probability >= threshold ? "satisfied" : probability <= 1 - threshold ? "violated" : "unclear",
+		probability,
+		level: null,
+		edge: threshold,
+		measured: false,
+	}];
+	const watcher: WatcherRecord = {
+		source: offer.source,
+		kind: offer.kind,
+		mode,
+		guidance: offer.dispatchGuidance === undefined ? "default" : "dispatch",
+		guidanceHash: createHash("sha256").update(offer.dispatchGuidance ?? ADVISORY_WAKE_DEFAULT_GUIDANCE).digest("hex").slice(0, 16),
+		promptVersion: ADVISORY_WAKE_PROMPT_VERSION,
+	};
+	return { bands, would: decision, verdict: decision, watcher };
 }
 
 /**
  * Wire Jev as an optional consumer of bounded advisory offers. A failed or
  * ambiguous judgment releases the producer's original wake.
+ *
+ * `off` never listens; `shadow` classifies and records without claiming, so the
+ * producer keeps its synchronous path and the reading is a counterfactual;
+ * `advisory` claims and may skip the wake.
  */
 export function wireAdvisoryWakes(pi: ExtensionAPI, deps: {
 	client: JevClient;
@@ -116,9 +164,9 @@ export function wireAdvisoryWakes(pi: ExtensionAPI, deps: {
 	isSessionCurrent?: () => boolean;
 	record?: (context: CoreRecordContext) => void;
 }): () => void {
-	// Shadow mode must not delay or suppress an advisory wake; without a claim,
-	// the producer takes its original synchronous path.
-	if (deps.config.mode === "shadow") return () => {};
+	const configured = deps.config.watcherMode;
+	if (configured === "off") return () => {};
+	const mode: WatcherRecord["mode"] = configured;
 	const bus = pi.events as unknown as WakeConsumerEventBus;
 	const pending = new Set<AbortController>();
 	let active = true;
@@ -140,8 +188,29 @@ export function wireAdvisoryWakes(pi: ExtensionAPI, deps: {
 	core.registerBlock(wakeStateBlock());
 	core.registerQuestions([wakeQuestion(deps.config)]);
 
+	/** One judgment per offer; the caller decides whether the producer hears it. */
+	const run = (offer: WakeConsumerOffer): Promise<DecisionResult> => {
+		const controller = new AbortController();
+		pending.add(controller);
+		return core.sendDecisions({
+			subject: { key: `wake:${offer.token}`, kind: "advisory-wake", correlationId: offer.id },
+			input: offer,
+			consumer: "pi-jev:advisory-wake",
+			questions: [ADVISORY_WAKE_QUESTION],
+			timeoutMs: Math.min(deps.config.timeoutMs, WAKE_DECISION_CEILING_MS),
+			signal: controller.signal,
+			interpret: (readings) => interpretWake(readings, offer, mode, deps.config.advisoryThreshold),
+		}).finally(() => pending.delete(controller));
+	};
+
 	const unsubscribe = bus.on(WAKE_CONSUMER_OFFER, (raw) => {
 		if (!isWakeOffer(raw) || raw.sessionId !== deps.sessionId || !isSessionCurrent()) return;
+		if (mode === "shadow") {
+			// Shadow must not delay the producer: with no claim emitted here the
+			// offer's synchronous path runs while the judgment is still in flight.
+			void run(raw).catch(() => undefined);
+			return;
+		}
 		bus.emit(WAKE_CONSUMER_CLAIM, {
 			protocol: WAKE_CONSUMER_PROTOCOL,
 			token: raw.token,
@@ -150,25 +219,9 @@ export function wireAdvisoryWakes(pi: ExtensionAPI, deps: {
 					resolve("release");
 					return;
 				}
-				const controller = new AbortController();
-				pending.add(controller);
-				void core.sendDecisions({
-					subject: { key: `wake:${raw.token}`, kind: "advisory-wake", correlationId: raw.id },
-					input: raw,
-					consumer: "pi-jev:advisory-wake",
-					questions: [ADVISORY_WAKE_QUESTION],
-					timeoutMs: Math.min(deps.config.timeoutMs, WAKE_DECISION_CEILING_MS),
-					signal: controller.signal,
-					interpret: (readings) => {
-						const reading = readings.find((item) => item.question === ADVISORY_WAKE_QUESTION);
-						const wouldSkip = !!reading?.ok
-							&& typeof reading.probability === "number"
-							&& reading.probability <= 1 - deps.config.advisoryThreshold;
-						return { would: wouldSkip ? "skip" : "release", verdict: wouldSkip ? "skip" : "release" };
-					},
-				}).then((result) => resolve(decisionFor(result, deps.config.advisoryThreshold)))
-					.catch(() => resolve("release"))
-					.finally(() => pending.delete(controller));
+				void run(raw)
+					.then((result) => resolve(decisionFor(result, deps.config.advisoryThreshold)))
+					.catch(() => resolve("release"));
 			},
 		});
 	});

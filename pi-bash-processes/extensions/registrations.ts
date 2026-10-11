@@ -194,6 +194,10 @@ function bgTaskSchema(surface: TaskToolSurface) {
 				waitSeconds: Type.Optional(Type.Number({ description: "Bounded wait window in seconds for action=wait. Omitted values use taskWaitDefaultSeconds and values are capped by taskWaitMaxSeconds. This is a wait budget, not a task timeout: it never stops the task." })),
 			}),
 		title: Type.Optional(Type.String({ description: "Optional display label for action=spawn" })),
+		watcherGuidance: Type.Optional(Type.String({
+			maxLength: 240,
+			description: "Optional instruction for the soft reminder's advisory offer: action=spawn sets it, action=extend replaces it, and an extend that omits it keeps the stored one. A wake consumer may read it when deciding whether the reminder is worth delivering now. It is data for that consumer, never a command the task runs, and it changes no reminder when no consumer is loaded.",
+		})),
 	});
 }
 
@@ -298,6 +302,7 @@ function registerBgTaskTool(pi: ExtensionAPI, deps: RegistrationDeps, surface: T
 					dedupeKey: params.dedupeKey,
 					timeoutSeconds: params.timeoutSeconds,
 					softTimeoutMs: params.softTimeoutMs,
+					watcherGuidance: params.watcherGuidance,
 					title: params.title,
 				});
 				const safeCommand = truncateForTranscript(task.command, WAKE_MANIFEST_FIELD_MAX_CHARS) ?? "";
@@ -352,7 +357,7 @@ function registerBgTaskTool(pi: ExtensionAPI, deps: RegistrationDeps, surface: T
 			
 			if (params.action === "wait") return deps.waitForTask(task, params.waitSeconds, signal, ctx);
 			if (params.action === "extend") {
-				const extended = deps.extendSoftTimeout(task, params.softTimeoutMs);
+				const extended = deps.extendSoftTimeout(task, params.softTimeoutMs, params.watcherGuidance);
 				if (!extended.ok) throw new Error(extended.message);
 				return makeToolResult(extended.message, { action: "extend", task: compactBackgroundTaskSnapshot(deps.rememberSnapshot(task)) });
 			}

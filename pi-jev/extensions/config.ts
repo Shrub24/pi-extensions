@@ -28,11 +28,24 @@ export const MAX_QUESTIONS_PER_REQUEST = 32;
 /** `shadow` defers, `advisory` allows and steers, `live` enforces. */
 export type JevMode = "shadow" | "advisory" | "live";
 
+/**
+ * The advisory watcher's own switch. `off` does not listen at all, `shadow`
+ * classifies and records without claiming the advisory, and `advisory` may skip
+ * one. Independent of `mode`: judging an advisory costs a request and an
+ * attention call, so the permission posture must not decide whether it runs.
+ */
+export type WatcherMode = "off" | "shadow" | "advisory";
+
 /** Whether the decision log keeps the state, or only its hash. */
 export type StateRetention = "hash" | "full";
 
 export interface JevConfig {
 	mode: JevMode;
+	/**
+	 * Whether the advisory watcher runs, and whether it may skip a wake. `off`
+	 * leaves the producer's synchronous path untouched.
+	 */
+	watcherMode: WatcherMode;
 	/** Name the operator lists in the permission system's `authorizerChain`. */
 	authorizerName: string;
 	model: string;
@@ -137,6 +150,10 @@ export const DEFAULT_ADVISORY_THRESHOLD = 0.75;
 
 export const DEFAULTS: JevConfig = {
 	mode: "shadow",
+	// Off like every other consumer's delivery: an advisory judgment spends a
+	// request per offer, so the operator turns it on rather than being charged
+	// for it by an upgrade.
+	watcherMode: "off",
 	authorizerName: "pi-jev",
 	model: "jev-latest",
 	timeoutMs: DEFAULT_TIMEOUT_MS,
@@ -202,6 +219,10 @@ function pickMode(value: unknown): JevMode | undefined {
 	return value === "shadow" || value === "advisory" || value === "live" ? value : undefined;
 }
 
+function pickWatcherMode(value: unknown): WatcherMode | undefined {
+	return value === "off" || value === "shadow" || value === "advisory" ? value : undefined;
+}
+
 function pickNumber(value: unknown, min: number, max: number): number | undefined {
 	if (typeof value === "number" && Number.isFinite(value) && value >= min && value <= max) return value;
 	if (typeof value === "string" && value.trim() !== "") {
@@ -246,6 +267,9 @@ export function resolveConfig(
 
 	const name = pickString(env.PI_JEV_AUTHORIZER_NAME) ?? pickString(settings.authorizerName);
 	if (name) config.authorizerName = name;
+
+	const watcherMode = pickWatcherMode(env.PI_JEV_WATCHER_MODE) ?? pickWatcherMode(settings.watcherMode);
+	if (watcherMode) config.watcherMode = watcherMode;
 
 	const model = pickString(env.PI_JEV_MODEL) ?? pickString(settings.model);
 	if (model) config.model = model;

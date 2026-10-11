@@ -28,19 +28,24 @@ controller and authorized delegating-agent controllers.
 {
   "definition": "implementer",
   "label": "approved-change",
+  "watcherGuidance": "Only check in if the tests cannot be made to pass.",
   "task": "---\nschema: delegation-brief/v1\nprofile: execution\nobjective: Implement the approved change\ncontext:\n  summary: none\n  inputs: []\nscope:\n  allowed: [\"pi-herdsman/extension\"]\n  excluded: []\nconstraints: []\nacceptance: [\"The targeted behavior is implemented and verified\"]\nresponse: role-defaults\nexecution:\n  affectedArea: \"pi-herdsman/extension\"\n  validationExpectations: [\"Run the focused test and package check\"]\n---\nMake the requested change."
 }
 ```
 
 Call `agent_delegate` with `definition`, a complete versioned Markdown brief in
-`task`, and optional `label` and `files`. A plain task sentence is rejected with
-field-specific guidance before a pane, request, or advisory window is created.
+`task`, and optional `label`, `files`, and `watcherGuidance` (at most 240
+characters). A plain task sentence is rejected with field-specific guidance
+before a pane, request, or advisory window is created.
 The brief must satisfy the selected definition's profile; custom definitions use
 the common profile unless configured stricter. Include all common fields, even
 when lists are intentionally empty, and use `context.summary: none` with
 `inputs: []` when no context is required. Context inputs are privately
 snapshotted and bound to the accepted request. Use `files` for additional
-assignment evidence. The optional `label` must match
+assignment evidence. Use `watcherGuidance` for an instruction to this
+assignment's advisory checkpoint: it travels to whichever optional wake
+consumer decides whether a checkpoint is worth delivering now, and changes no
+checkpoint when none is loaded. The optional `label` must match
 `^[a-z][a-z0-9_-]{0,31}$` and sets the requested logical agent label; an existing
 live-label collision fails. Fresh delegation runs in the calling controller's cwd.
 The definition is resolved from the effective roster and delegating agent
@@ -535,17 +540,22 @@ tools may not stop immediately; `agent_close` remains the destructive fallback.
 ```json
 {
   "agent": "implementer-1",
-  "windowMs": 1800000
+  "windowMs": 1800000,
+  "watcherGuidance": "Only check in if the tests cannot be made to pass."
 }
 ```
 
 Call `agent_extend` only when `available_tools` lists it. It accepts the exact
 live `agent` identity and an integer `windowMs` from `1` through
-`2147483647`; no other field is accepted. It replaces that worker's current
+`2147483647`, and an optional `watcherGuidance` of at most 240 characters; no
+other field is accepted. It replaces that worker's current
 soft-deadline window with a fresh window of `windowMs`, measured from the call,
 so the worker is not checkpointed again until that window elapses. It changes
 no assignment, does not steer or interrupt the worker, and creates no result.
-Windows armed after that one use the configured `softTimeoutMs` again.
+Windows armed after that one use the configured `softTimeoutMs` again, and
+the replacement window keeps the assignment's `watcherGuidance` unless this call
+supplies another one, because the instruction describes the assignment rather
+than one window.
 
 It is unavailable for any worker that is not directly owned, for a worker whose
 live presence is not currently proved (including a closed or proven `lost`

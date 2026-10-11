@@ -157,8 +157,9 @@ imported at `156b1c66` (v0.18.0). The fork's own changes:
   and it never aborts, steers, or closes anything
   ([configuration](docs/reference/configuration.md)). Fork branches:
   `softWindowsEnabled` (`softTimeoutMs`), `submit`, `scanAgentHealth`,
-  `recoverControllerRuntimes`, and the `agent_extend` listing in
-  `listedAgentRecord`.
+  `recoverControllerRuntimes`, the `agent_extend` listing in
+  `listedAgentRecord`, and the `watcherGuidance` the digest carries to an
+  optional wake consumer.
 
 Every function named above carries a fork-specific branch: the retention
 branches are either gated by `retainWorkers` or derived from the retained

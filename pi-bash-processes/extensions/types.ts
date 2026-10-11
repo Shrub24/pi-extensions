@@ -163,6 +163,12 @@ export interface BackgroundTaskSnapshot {
 	softExpiresAt?: number | null;
 	softTimeoutNotified?: boolean;
 	/**
+	 * Per-task instruction for the soft reminder's advisory offer, carried to a
+	 * wake consumer as `dispatchGuidance`. The producer never interprets it: it
+	 * is data for whichever consumer skips or releases the reminder.
+	 */
+	watcherGuidance?: string;
+	/**
 	 * When the last successful review of this running task happened, and the
 	 * output length it observed. The next progress-review deadline is measured
 	 * from `lastReviewedAt` (falling back to `startedAt`); output activity never
@@ -381,6 +387,8 @@ export interface SpawnTaskOptions {
 	timeoutSeconds?: number;
 	/** Soft progress reminder in milliseconds; 0 disables it. */
 	softTimeoutMs?: number;
+	/** Instruction for the soft reminder's advisory offer. */
+	watcherGuidance?: string;
 	title?: string;
 	origin?: "bg_task" | "auto-background" | "managed-bash";
 }

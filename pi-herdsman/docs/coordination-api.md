@@ -26,7 +26,8 @@ agent_transcript
 
 `agent_extend` appears only for a directly owned worker with an armed soft
 window; it lengthens that worker's next advisory checkpoint without changing
-its assignment.
+its assignment, and can replace that assignment's `watcherGuidance` for a
+consumer that filters checkpoints.
 
 Managed Agents contact their exact direct owner through
 [`ask_owner`](reference/ask-owner.md).

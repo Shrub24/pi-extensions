@@ -248,7 +248,11 @@ test("the documented agent_extend schema matches the registered tool", () => {
     section.indexOf("```", fence + "```json".length),
   );
   const documented = JSON.parse(block) as Record<string, unknown>;
-  assert.deepEqual(Object.keys(documented).sort(), ["agent", "windowMs"]);
+  assert.deepEqual(Object.keys(documented).sort(), [
+    "agent",
+    "watcherGuidance",
+    "windowMs",
+  ]);
   assert.equal(
     Value.Check(tool.parameters, documented),
     true,
@@ -257,6 +261,7 @@ test("the documented agent_extend schema matches the registered tool", () => {
   assert.equal(tool.parameters.additionalProperties, false);
   assert.deepEqual(Object.keys(tool.parameters.properties).sort(), [
     "agent",
+    "watcherGuidance",
     "windowMs",
   ]);
   assert.equal(tool.parameters.properties.windowMs.type, "integer");

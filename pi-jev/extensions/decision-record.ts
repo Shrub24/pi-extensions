@@ -60,6 +60,30 @@ export interface AskSignalRecord {
 	text: string;
 }
 
+/**
+ * Which watcher asked, when a consumer other than the permission chain owned the
+ * ask. The permission chain's own records leave this out.
+ *
+ * The reading itself is in `bands`; this block says who produced it and under
+ * which mode, because the same question id answers for two producers and the
+ * mode decides whether the answer changed anything: a `shadow` reading is a
+ * counterfactual the producer never saw.
+ */
+export interface WatcherRecord {
+	/** The advisory producer, e.g. `pi-background-tasks` or `pi-herdsman`. */
+	source: string;
+	/** The advisory kind within that producer, e.g. `soft-timeout`. */
+	kind: string;
+	/** The watcher mode in force; `off` records nothing at all. */
+	mode: "shadow" | "advisory";
+	/** Whether the ask carried an instruction of its own or the default one. */
+	guidance: "default" | "dispatch";
+	/** Hash of the guidance text actually used. The text itself is never logged. */
+	guidanceHash: string;
+	/** Version of the watcher question wording; bumped when that wording changes. */
+	promptVersion: number;
+}
+
 export interface AskRecord {
 	record: "ask";
 	version: number;
@@ -86,6 +110,8 @@ export interface AskRecord {
 	/** Present only when state retention is `full`. */
 	state?: unknown;
 	bands: AskBandRecord[];
+	/** Present only when a watcher, not the permission chain, owned this ask. */
+	watcher?: WatcherRecord;
 	/**
 	 * What the judge read, kept only for records where a question was violated.
 	 * Present to make a false alarm diagnosable: without it a hash-only log says
@@ -188,8 +214,10 @@ export function askRecordFromCore(context: CoreRecordContext, options: AskRecord
 		verdict?: string;
 		decidedBy?: string | null;
 		signals?: string[];
+		watcher?: unknown;
 	};
 	const bands = Array.isArray(interpreted.bands) ? (interpreted.bands as AskBandRecord[]) : [];
+	const watcher = interpreted.watcher ? (interpreted.watcher as WatcherRecord) : undefined;
 	const failed = context.request.readings.some((reading) => !reading.ok);
 	return {
 		record: "ask",
@@ -207,6 +235,7 @@ export function askRecordFromCore(context: CoreRecordContext, options: AskRecord
 		blocks: context.request.blocks.map((block) => ({ id: block.id, hash: block.hash, chars: block.chars, truncated: [...block.truncated] })),
 		stateChars: context.request.chars,
 		bands,
+		...(watcher ? { watcher } : {}),
 		signals: (failed ? [] : (interpreted.signals ?? [])).map((source) => ({
 			source,
 			role: "advisory",
@@ -216,8 +245,11 @@ export function askRecordFromCore(context: CoreRecordContext, options: AskRecord
 		})),
 		questions: [...context.request.questions],
 		// Only an objection keeps the state: a log of every state is a transcript,
-		// and a log of the ones that went wrong is a diagnosis.
-		...(bands.some((band) => band.band === "violated") ? { evidence: objectionEvidence(context.request.state, context.request.blocks) } : {}),
+		// and a log of the ones that went wrong is a diagnosis. A watcher is the
+		// exception: its state carries the producer's command and instruction text,
+		// which this log must not retain, and its guidance hash and band edge are
+		// what a tuning pass reads instead.
+		...(bands.some((band) => band.band === "violated") && !watcher ? { evidence: objectionEvidence(context.request.state, context.request.blocks) } : {}),
 		would: interpreted.would ?? "defer",
 		verdict: interpreted.verdict ?? "defer",
 		latencyMs: context.request.latencyMs,

@@ -1965,9 +1965,11 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 	/**
 	 * `bg_task action:"extend"`: clear the one-shot latch and start a fresh soft
 	 * window from now. Optional `softTimeoutMs` sets that window; omitted keeps the
-	 * task's configured value. The hard `timeoutSeconds` budget is never touched.
+	 * task's configured value. `watcherGuidance` replaces the task's advisory
+	 * guidance and is likewise kept when omitted. The hard `timeoutSeconds` budget
+	 * is never touched.
 	 */
-	const extendSoftTimeout = (task: ManagedTask | null, softTimeoutMs?: number): { ok: boolean; message: string } => {
+	const extendSoftTimeout = (task: ManagedTask | null, softTimeoutMs?: number, watcherGuidance?: string): { ok: boolean; message: string } => {
 		if (!task) return { ok: false, message: "No background task matched that id or pid." };
 		if (task.status !== "running") {
 			return { ok: false, message: `${task.id} is already ${summarizeTaskStatus(task.status, task.exitCode, task.terminationReason)}.` };
@@ -1976,6 +1978,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			? task.softTimeoutMs ?? 0
 			: Number.isFinite(softTimeoutMs) ? Math.max(0, Math.floor(softTimeoutMs)) : 0;
 		task.softTimeoutMs = nextMs;
+		if (watcherGuidance !== undefined) task.watcherGuidance = watcherGuidance.trim() || undefined;
 		task.updatedAt = Date.now();
 		// The legacy soft-window reset is a review: the next interval is measured
 		// from now and the absolute hard timeout is untouched.
@@ -2791,6 +2794,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			softExpiresAt,
 			softTimeoutNotified: false,
 			softTimeoutMs,
+			watcherGuidance: options.watcherGuidance?.trim() || undefined,
 			lastReviewedAt: undefined,
 			reviewedOutputBytes: undefined,
 			reviewRevision: 0,

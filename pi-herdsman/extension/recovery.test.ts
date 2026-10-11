@@ -16,6 +16,7 @@ import type { ExecHandler, FixtureIdentity } from "./support.ts";
 import { claimProcessLock } from "./lock.ts";
 import { resultPath, resultRef } from "./storage.ts";
 import { IDLE_WAKE_PROMPT } from "./idle-wake.ts";
+import { WAKE_CONSUMER_OFFER } from "./advisory-wake.ts";
 import support, {
   CHILD_SESSION_ID,
   DEFAULT_PI_SESSION_ID,
@@ -6926,10 +6927,18 @@ const softWindowEntry = (
   requestId: string,
   armedAt: number,
   windowMs: number,
+  watcherGuidance?: string,
 ) => ({
   type: "custom",
   customType: "pi-herdsman-soft-window",
-  data: { requestId, label, runId: AGENT_ID, armedAt, windowMs },
+  data: {
+    requestId,
+    label,
+    runId: AGENT_ID,
+    armedAt,
+    windowMs,
+    ...(watcherGuidance === undefined ? {} : { watcherGuidance }),
+  },
 });
 
 const softDigests = (pi: ReturnType<typeof fakePi>) =>
@@ -7382,6 +7391,7 @@ type SoftWindowSpec = {
   lastActivityAt?: number;
   waiting?: boolean;
   lifecycle?: "idle" | "working";
+  watcherGuidance?: string;
 };
 
 // Build a live multi-agent controller fixture whose snapshot lists every spec,
@@ -7434,6 +7444,7 @@ function softDeadlineFixture(specs: SoftWindowSpec[]) {
           target.requestId,
           target.armedAt!,
           target.windowMs ?? 300_000,
+          target.watcherGuidance,
         );
       });
     return {
@@ -7540,6 +7551,73 @@ test("two overdue workers produce one digest covering both", async (t) => {
     String((digests[0] as any).content),
     /no Agent was aborted, steered, or closed/i,
   );
+  pi.events.get("session_shutdown")?.[0]();
+  for (const fixture of fixtures) resetAgentMailbox(fixture.mailbox);
+});
+
+test("a one-Agent checkpoint offers that assignment's watcher instruction", async (t) => {
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const { pi, fixtures, entries } = softDeadlineFixture([
+    {
+      label: "soft-guided-one",
+      requestId: randomUUID(),
+      armedAt: now - 400_000,
+      watcherGuidance: "Only wake me if this is blocked.",
+    },
+  ]);
+  const offers: any[] = [];
+  (pi.pi as any).events.on(WAKE_CONSUMER_OFFER, (offer: any) =>
+    offers.push(offer),
+  );
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  await pi.events.get("session_start")![0](undefined, fakeContext(entries));
+  await new Promise((resolve) => setImmediate(resolve));
+  // A consumer that claims nothing leaves the checkpoint on the path it always
+  // had: the instruction travels beside the wake, it never replaces it.
+  assert.equal(softDigests(pi).length, 1, "the checkpoint is still delivered");
+  assert.deepEqual(
+    offers.map((offer) => [offer.source, offer.kind, offer.dispatchGuidance]),
+    [["pi-herdsman", "soft-deadline", "Only wake me if this is blocked."]],
+  );
+  pi.events.get("session_shutdown")?.[0]();
+  for (const fixture of fixtures) resetAgentMailbox(fixture.mailbox);
+});
+
+test("a checkpoint covering several Agents offers no single instruction", async (t) => {
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const { pi, fixtures, entries } = softDeadlineFixture([
+    {
+      label: "soft-guided-mixed",
+      requestId: randomUUID(),
+      armedAt: now - 400_000,
+      watcherGuidance: "Only wake me if this is blocked.",
+    },
+    {
+      label: "soft-guided-plain",
+      requestId: randomUUID(),
+      armedAt: now - 350_000,
+    },
+  ]);
+  const offers: any[] = [];
+  (pi.pi as any).events.on(WAKE_CONSUMER_OFFER, (offer: any) =>
+    offers.push(offer),
+  );
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  await pi.events.get("session_start")![0](undefined, fakeContext(entries));
+  await new Promise((resolve) => setImmediate(resolve));
+  const digests = softDigests(pi);
+  assert.equal(digests.length, 1, "one digest still covers both workers");
+  assert.equal(
+    (digests[0] as any).details.entries.length,
+    2,
+    "and it still names both",
+  );
+  // One instruction describes one assignment, so the batch carries none rather
+  // than borrowing the first Agent's.
+  assert.equal(offers.length, 1);
+  assert.equal(offers[0].dispatchGuidance, undefined);
   pi.events.get("session_shutdown")?.[0]();
   for (const fixture of fixtures) resetAgentMailbox(fixture.mailbox);
 });

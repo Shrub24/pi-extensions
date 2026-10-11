@@ -49,6 +49,7 @@ export function taskSnapshot(task: ManagedTask): BackgroundTaskSnapshot {
 		softExpiresAt: task.softExpiresAt,
 		softTimeoutNotified: task.softTimeoutNotified === true,
 		softTimeoutMs: task.softTimeoutMs,
+		watcherGuidance: task.watcherGuidance,
 		pid: task.pid,
 		procIdent: task.procIdent,
 		resourceControl: task.resourceControl,

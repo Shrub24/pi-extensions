@@ -54,7 +54,7 @@ export function sendWakeMessage(
   context: ExtensionContext | null | undefined,
   message: WakeMessage,
   busyOptions: WakeOptions,
-  advisory?: { kind: "soft-deadline"; id: string; sessionId: string; metadata: Record<string, string | number | boolean | null>; isCurrent: () => boolean; onError?: (reason: string) => void },
+  advisory?: { kind: "soft-deadline"; id: string; sessionId: string; metadata: Record<string, string | number | boolean | null>; dispatchGuidance?: string; isCurrent: () => boolean; onError?: (reason: string) => void },
 ): void {
   const sendUserMessage = (
     pi as { sendUserMessage?: (content: string) => void }
@@ -75,6 +75,7 @@ export function sendWakeMessage(
     id: advisory.id,
     sessionId: advisory.sessionId,
     metadata: advisory.metadata,
+    dispatchGuidance: advisory.dispatchGuidance,
     isCurrent: advisory.isCurrent,
     deliver: native,
     onError: advisory.onError,

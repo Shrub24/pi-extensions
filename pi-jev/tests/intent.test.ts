@@ -24,7 +24,7 @@ test("the loaded intent entry claims background soft reminders through Jev", asy
 	const host = fakeHost();
 	const command = "python worker.py --resume";
 	const client = fakeJevClient({ "wake.attention": noul(0.1) });
-	wireIntentConsumer(host.pi, { config: testConfig({ mode: "advisory", advisoryThreshold: 0.75 }), jev: client, log: fakeLog() });
+	wireIntentConsumer(host.pi, { config: testConfig({ watcherMode: "advisory", advisoryThreshold: 0.75 }), jev: client, log: fakeLog() });
 	await host.sessionStart("session-wake");
 
 	let claim: WakeConsumerClaim | undefined;

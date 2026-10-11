@@ -203,6 +203,21 @@
 					"apply": "reload",
 					"requiresReload": true
 				},
+				{
+					"key": "watcherMode",
+					"label": "Advisory watcher",
+					"description": "Whether Jev judges optional advisory wakes: background-task soft reminders and Herdsman soft-deadline checkpoints. off does not listen at all, so every wake stays exactly as its producer sent it. shadow asks the judge for each offer and records the reading without claiming it, so the wake is never delayed or suppressed. advisory claims each offer and may skip the reminder. Independent of Mode, and off by default because judging an advisory spends a request per offer.",
+					"type": "enum",
+					"enumValues": [
+						"off",
+						"shadow",
+						"advisory"
+					],
+					"default": "off",
+					"category": "Delivery",
+					"apply": "reload",
+					"requiresReload": true
+				},
 {
 			    "key": "nudgeCooldownMs",
 			    "label": "Nudge cooldown",
