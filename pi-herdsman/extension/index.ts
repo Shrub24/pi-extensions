@@ -54,7 +54,14 @@ import {
   watchFile,
   unwatchFile,
 } from "node:fs";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+} from "node:path";
 import { homedir } from "node:os";
 import { setTimeout as delay } from "node:timers/promises";
 import { isDeepStrictEqual } from "node:util";
@@ -1190,8 +1197,7 @@ function appendDurableError(
 ): void {
   appendDurableRecord(pi, ctx, type, { error: String(error) });
 }
-const SESSION_METADATA_DIAGNOSTIC_ENTRY =
-  "pi_herdsman_session_metadata_error";
+const SESSION_METADATA_DIAGNOSTIC_ENTRY = "pi_herdsman_session_metadata_error";
 /**
  * Records this session's classification and role. Unreadable current metadata
  * is reported and left unresolved rather than guessed, and never fails the
@@ -3407,77 +3413,88 @@ function prepareManagedWorkerLaunch(
   }
   try {
     const bodyPromptPath = definition.body ? promptPaths[0] : undefined;
-  const preloadedSkillPromptPaths = skillResolution.preloaded.map(
-    (_skill, index) => promptPaths[(definition.body ? 1 : 0) + index]!,
-  );
-  const sharedPromptPath = promptPaths[promptPaths.length - 1]!;
-  const env = [
-    `PI_HERDSMAN_MAILBOX=${inputs.mailbox}`,
-    `PI_HERDSMAN_RUN_ID=${inputs.runId}`,
-    `PI_HERDSMAN_OWNER_SESSION_ID=${inputs.ownerSessionId}`,
-    `PI_SUBAGENT_PARENT_SESSION=${inputs.forwardingSession}`,
-    `PI_HERDSMAN_LABEL=${inputs.label}`,
-    `PI_HERDSMAN_WORKSPACE_ID=${inputs.workspaceId}`,
-    `PI_HERDSMAN_AGENT_DEFINITION=${definition.name}`,
-    `PI_HERDSMAN_BRIEF_PROFILE=${inputs.briefProfile}`,
-    `PI_HERDSMAN_ALLOWED_AGENT_DEFINITIONS=${JSON.stringify(
-      inputs.allowedAgentDefinitions,
-    )}`,
-    ...(process.env.PI_CODING_AGENT_DIR
-      ? [`PI_CODING_AGENT_DIR=${process.env.PI_CODING_AGENT_DIR}`]
-      : []),
-    "PI_OFFLINE=1",
-    ...(childCommand.kind === "resolved"
-      ? [`${CHILD_COMMAND_ENV}=${childCommand.command}`]
-      : []),
-  ];
-  // Pi reports the providers that extensions registered; a model from one
-  // of them cannot resolve in a child denied extension discovery.
-  // Older registries and test doubles may not expose the list, in which
-  // case nothing counts as extension-provided and the model is inherited
-  // exactly as before this change.
-  const registeredProviderIds = new Set(
-    ctx.modelRegistry?.getRegisteredProviderIds?.() ?? [],
-  );
-  const childModel = resolveChildModel({
-    configured: configuredModel(definition.frontmatter),
-    inherited:
-      !inputs.resumed && ctx.model
-        ? { provider: ctx.model.provider, token: modelToken(ctx.model) }
-        : undefined,
-    isForeignProvider: (providerId) => registeredProviderIds.has(providerId),
-  });
-  // The operator's model policy, then the one contradiction the policy
-  // exists to surface: a pinned model whose provider only an extension
-  // supplies, in a child the definition denies extensions to.
-  if (childModel.kind === "use") {
-    const pinnedValue = configuredModel(definition.frontmatter);
-    const pinned =
-      pinnedValue !== undefined && pinnedValue.trim() !== ""
-        ? pinnedValue
-        : undefined;
-    const origin = pinned === undefined ? "inherited" : "pinned";
-    const scopes = readConfig().modelScopes;
-    const agentAllow = scopes.agents?.[definition.name]?.allow;
-    const violation = modelPolicyError({
-      agent: definition.name,
-      model: childModel.model,
-      origin,
-      ...(scopes.allow === undefined ? {} : { globalAllow: scopes.allow }),
-      ...(agentAllow === undefined ? {} : { agentAllow }),
+    const preloadedSkillPromptPaths = skillResolution.preloaded.map(
+      (_skill, index) => promptPaths[(definition.body ? 1 : 0) + index]!,
+    );
+    const sharedPromptPath = promptPaths[promptPaths.length - 1]!;
+    const env = [
+      `PI_HERDSMAN_MAILBOX=${inputs.mailbox}`,
+      `PI_HERDSMAN_RUN_ID=${inputs.runId}`,
+      `PI_HERDSMAN_OWNER_SESSION_ID=${inputs.ownerSessionId}`,
+      `PI_SUBAGENT_PARENT_SESSION=${inputs.forwardingSession}`,
+      `PI_HERDSMAN_LABEL=${inputs.label}`,
+      `PI_HERDSMAN_WORKSPACE_ID=${inputs.workspaceId}`,
+      `PI_HERDSMAN_AGENT_DEFINITION=${definition.name}`,
+      `PI_HERDSMAN_BRIEF_PROFILE=${inputs.briefProfile}`,
+      `PI_HERDSMAN_ALLOWED_AGENT_DEFINITIONS=${JSON.stringify(
+        inputs.allowedAgentDefinitions,
+      )}`,
+      ...(process.env.PI_CODING_AGENT_DIR
+        ? [`PI_CODING_AGENT_DIR=${process.env.PI_CODING_AGENT_DIR}`]
+        : []),
+      "PI_OFFLINE=1",
+      "PI_OTEL_RUN_KIND=child",
+      "MAGIC_CONTEXT_PROFILE=subagent",
+      ...(childCommand.kind === "resolved"
+        ? [`${CHILD_COMMAND_ENV}=${childCommand.command}`]
+        : []),
+    ];
+    // Virtual models need discovery too, but registering one does not add
+    // its provider to getRegisteredProviderIds().
+    // Optional registry reads retain compatibility with older hosts/test doubles.
+    const registeredProviderIds = new Set(
+      ctx.modelRegistry?.getRegisteredProviderIds?.() ?? [],
+    );
+    const requestedModel =
+      configuredModel(definition.frontmatter)?.trim() ||
+      (!inputs.resumed && ctx.model ? modelToken(ctx.model) : undefined);
+    const requestedVirtual = (ctx.modelRegistry?.getAll?.() ?? []).find(
+      (model) =>
+        model.api === "pi-virtual" &&
+        (requestedModel === modelToken(model) ||
+          requestedModel?.startsWith(`${modelToken(model)}:`)),
+    );
+    if (requestedVirtual) registeredProviderIds.add(requestedVirtual.provider);
+    const childModel = resolveChildModel({
+      configured: configuredModel(definition.frontmatter),
+      inherited:
+        !inputs.resumed && ctx.model
+          ? { provider: ctx.model.provider, token: modelToken(ctx.model) }
+          : undefined,
+      isForeignProvider: (providerId) => registeredProviderIds.has(providerId),
     });
-    if (violation !== undefined) throw new Error(violation);
-    if (origin === "pinned") {
-      const denied = deniedDiscoveryModelError({
+    // The operator's model policy, then the one contradiction the policy
+    // exists to surface: a pinned model whose provider only an extension
+    // supplies, in a child the definition denies extensions to.
+    if (childModel.kind === "use") {
+      const pinnedValue = configuredModel(definition.frontmatter);
+      const pinned =
+        pinnedValue !== undefined && pinnedValue.trim() !== ""
+          ? pinnedValue
+          : undefined;
+      const origin = pinned === undefined ? "inherited" : "pinned";
+      const scopes = readConfig().modelScopes;
+      const agentAllow = scopes.agents?.[definition.name]?.allow;
+      const violation = modelPolicyError({
         agent: definition.name,
         model: childModel.model,
-        noExtensions: definition.frontmatter.noExtensions === true,
-        extensions: definition.frontmatter.extensions,
-        isForeignProvider: (providerId) => registeredProviderIds.has(providerId),
+        origin,
+        ...(scopes.allow === undefined ? {} : { globalAllow: scopes.allow }),
+        ...(agentAllow === undefined ? {} : { agentAllow }),
       });
-      if (denied !== undefined) throw new Error(denied);
+      if (violation !== undefined) throw new Error(violation);
+      if (origin === "pinned") {
+        const denied = deniedDiscoveryModelError({
+          agent: definition.name,
+          model: childModel.model,
+          noExtensions: definition.frontmatter.noExtensions === true,
+          extensions: definition.frontmatter.extensions,
+          isForeignProvider: (providerId) =>
+            registeredProviderIds.has(providerId),
+        });
+        if (denied !== undefined) throw new Error(denied);
+      }
     }
-  }
     const launchArgs = agentLaunchArgs(definition, {
       ...(bodyPromptPath !== undefined ? { bodyPromptPath } : {}),
       ...(preloadedSkillPromptPaths.length
@@ -5138,7 +5155,13 @@ async function resolveRuntime(
   runtimes.set(runtime.label, runtime);
   validateIdentity(runtime, state, agent);
   await validateIntegration(pi, runtime, ctx, { signal });
-  return { runtime, agent, state, controlState: agent.state, presence: matches[0].presence };
+  return {
+    runtime,
+    agent,
+    state,
+    controlState: agent.state,
+    presence: matches[0].presence,
+  };
 }
 function runtimeForListedAgent(
   agent: any,
@@ -5370,7 +5393,12 @@ async function closeManagedSnapshot(
       unprovablePresenceMessage(snapshot.presence),
       "close",
       snapshot.presence.aliasUnclaimed === true
-        ? { ids: { label: snapshot.state.agentLabel, paneId: snapshot.state.paneId } }
+        ? {
+            ids: {
+              label: snapshot.state.agentLabel,
+              paneId: snapshot.state.paneId,
+            },
+          }
         : {},
     );
   // A control request resolves its target before the shared close runs, so the
@@ -5502,11 +5530,7 @@ async function closeAgentByIdentity(
   const owner = ctx.sessionManager.getSessionId();
   const directOwner = state.ownerSessionId === owner;
   if (!directOwner)
-    fail(
-      "target_not_found",
-      "Agent belongs to another owner session",
-      "close",
-    );
+    fail("target_not_found", "Agent belongs to another owner session", "close");
   const cleanupWarnings = new Map<string, string>();
   const stopReport: StopReportCallbacks = {
     onClosed: (label, paneClosed) => {
@@ -5785,9 +5809,14 @@ async function restartIdleManagedWorker(
   const label = state.agentLabel;
   const ids = { label, paneId: state.paneId };
   if (snapshot.presence.kind === "lost")
-    fail("agent_busy", `${label} is lost; a lost target is close-only.`, "restart", {
-      ids,
-    });
+    fail(
+      "agent_busy",
+      `${label} is lost; a lost target is close-only.`,
+      "restart",
+      {
+        ids,
+      },
+    );
   if (listed.state !== "idle")
     fail(
       "agent_busy",
@@ -5822,9 +5851,14 @@ async function restartIdleManagedWorker(
   try {
     const current = readAgentState(mailbox);
     if (!current || !sameManagedAgentIdentity(current, state))
-      fail("target_ambiguous", "Managed agent changed before restart", "restart", {
-        ids,
-      });
+      fail(
+        "target_ambiguous",
+        "Managed agent changed before restart",
+        "restart",
+        {
+          ids,
+        },
+      );
     if (hasDurableResult(mailbox, current))
       fail(
         "agent_busy",
@@ -5923,11 +5957,7 @@ async function restartIdleManagedWorker(
         label,
         runId: state.runId,
         extensionPath: HERDSMAN_EXTENSION_PATH,
-        agentArgs: [
-          ...launchPlan.launchArgs,
-          "--session",
-          state.piSessionFile,
-        ],
+        agentArgs: [...launchPlan.launchArgs, "--session", state.piSessionFile],
         signal,
       });
       if (
@@ -6839,16 +6869,23 @@ function validateAcceptedContextSnapshots(
     const path = realpathSync(snapshot.snapshotPath);
     const withinRoot = relative(promptRoot, path);
     if (!withinRoot || withinRoot.startsWith("..") || isAbsolute(withinRoot))
-      throw new Error(`accepted context snapshot ${index} is outside private storage`);
+      throw new Error(
+        `accepted context snapshot ${index} is outside private storage`,
+      );
     const info = statSync(path);
     if (!info.isFile() || (info.mode & 0o077) !== 0)
-      throw new Error(`accepted context snapshot ${index} is not a private regular file`);
+      throw new Error(
+        `accepted context snapshot ${index} is not a private regular file`,
+      );
     const text = readFileSync(path, "utf8");
     if (
       Buffer.byteLength(text, "utf8") !== snapshot.bytes ||
-      createHash("sha256").update(text, "utf8").digest("hex") !== snapshot.sha256
+      createHash("sha256").update(text, "utf8").digest("hex") !==
+        snapshot.sha256
     )
-      throw new Error(`accepted context snapshot ${index} changed after acceptance`);
+      throw new Error(
+        `accepted context snapshot ${index} changed after acceptance`,
+      );
   }
 }
 
@@ -6892,7 +6929,9 @@ function formatAcceptedAssignmentPrompt(
           "Questions:",
           ...brief.investigation.questions.map((question) => `- ${question}`),
           "Target locations:",
-          ...brief.investigation.targetLocations.map((location) => `- ${location}`),
+          ...brief.investigation.targetLocations.map(
+            (location) => `- ${location}`,
+          ),
         ]
       : []),
     ...(brief.research
@@ -6902,7 +6941,9 @@ function formatAcceptedAssignmentPrompt(
           "Questions:",
           ...brief.research.questions.map((question) => `- ${question}`),
           "Source constraints:",
-          ...brief.research.sourceConstraints.map((constraint) => `- ${constraint}`),
+          ...brief.research.sourceConstraints.map(
+            (constraint) => `- ${constraint}`,
+          ),
         ]
       : []),
     ...(brief.execution
@@ -6911,7 +6952,9 @@ function formatAcceptedAssignmentPrompt(
           "## Execution",
           `Affected area: ${brief.execution.affectedArea}`,
           "Validation expectations:",
-          ...brief.execution.validationExpectations.map((expectation) => `- ${expectation}`),
+          ...brief.execution.validationExpectations.map(
+            (expectation) => `- ${expectation}`,
+          ),
         ]
       : []),
     ...(brief.review
@@ -7245,7 +7288,8 @@ async function actionUnsafe(
         `Agent definition ${agentDefinition} is not allowed for this delegating agent`,
         p.action,
       );
-    p.task = "Use the validated assignment brief and attached context snapshots.";
+    p.task =
+      "Use the validated assignment brief and attached context snapshots.";
     if (definition.projectSource && !sameCwd(agentCwd, ctx.cwd))
       fail(
         "invalid_request",
@@ -7969,7 +8013,12 @@ async function actionUnsafe(
             cleanup: cleanupCause,
             ids,
           });
-          appendDurableError(pi, ctx, "pi_herdsman_cleanup_error", cleanupDetail);
+          appendDurableError(
+            pi,
+            ctx,
+            "pi_herdsman_cleanup_error",
+            cleanupDetail,
+          );
         }
         if (rollbackError) {
           requestStatusRefresh?.();
@@ -7992,7 +8041,8 @@ async function actionUnsafe(
                 : startupFailure
                   ? { details: { stage: startupFailure.stage } }
                   : {}),
-              nextAction: "Resolve the reported cleanup failure before retrying.",
+              nextAction:
+                "Resolve the reported cleanup failure before retrying.",
             },
           );
         }
@@ -8003,11 +8053,17 @@ async function actionUnsafe(
             cleanup: embeddedDetails.cleanup,
             ids,
           });
-          appendDurableError(pi, ctx, "pi_herdsman_cleanup_error", durableDetail);
+          appendDurableError(
+            pi,
+            ctx,
+            "pi_herdsman_cleanup_error",
+            durableDetail,
+          );
         }
         if (error instanceof OperationError) {
           error.detail.rollbackOccurred = true;
-          if (startupFailure?.retryAttempted) error.detail.retryAttempted = true;
+          if (startupFailure?.retryAttempted)
+            error.detail.retryAttempted = true;
           error.detail.ids = ids;
           throw error;
         }
@@ -8019,7 +8075,9 @@ async function actionUnsafe(
             ...(started?.paneId ? { paneId: started.paneId } : {}),
             ...(started?.tabId ? { tabId: started.tabId } : {}),
           },
-          ...(startupFailure ? { details: { stage: startupFailure.stage } } : {}),
+          ...(startupFailure
+            ? { details: { stage: startupFailure.stage } }
+            : {}),
         });
       } finally {
         if (!accepted && pendingStarts?.get(label) === pendingStart) {
@@ -8809,7 +8867,8 @@ export default function (pi: ExtensionAPI): void {
               pattern: "\\S",
             }),
       task: Type.String({
-        description: "Complete versioned Markdown delegation brief; plain task sentences are rejected.",
+        description:
+          "Complete versioned Markdown delegation brief; plain task sentences are rejected.",
         pattern: "\\S",
       }),
       label: Type.Optional(
@@ -8830,7 +8889,8 @@ export default function (pi: ExtensionAPI): void {
         pattern: "\\S",
       }),
       task: Type.String({
-        description: "Complete versioned Markdown delegation brief; plain task sentences are rejected.",
+        description:
+          "Complete versioned Markdown delegation brief; plain task sentences are rejected.",
         pattern: "\\S",
       }),
       files: FILES_SCHEMA,
@@ -15870,8 +15930,18 @@ export default function (pi: ExtensionAPI): void {
             id: String(dueEntries[0]?.requestId ?? ownerSessionId),
             sessionId: ownerSessionId,
             metadata: { count: dueEntries.length },
-            isCurrent: () => !signal.aborted && generation === healthGeneration && ctx.isIdle() && dueEntries.every((entry) => softWindows.has(String(entry.requestId))),
-            onError: (reason) => managerDiagnostic("advisory wake", { source: "soft-deadline", reason: reason.slice(0, 160) }),
+            isCurrent: () =>
+              !signal.aborted &&
+              generation === healthGeneration &&
+              ctx.isIdle() &&
+              dueEntries.every((entry) =>
+                softWindows.has(String(entry.requestId)),
+              ),
+            onError: (reason) =>
+              managerDiagnostic("advisory wake", {
+                source: "soft-deadline",
+                reason: reason.slice(0, 160),
+              }),
           },
         );
       } catch {
@@ -17125,8 +17195,7 @@ export default function (pi: ExtensionAPI): void {
   // only the final delivery read, or the request is never delivered at all.
   const legacyRequestFloor = () => ({
     legacyProfileFallback: process.env.PI_HERDSMAN_BRIEF_PROFILE as
-      | BriefProfile
-      | undefined,
+      BriefProfile | undefined,
   });
   const pumpRequest = (ctx: ExtensionContext): void => {
     if (!initialized || !state) return;
@@ -17553,8 +17622,8 @@ export default function (pi: ExtensionAPI): void {
       request = readRequest(process.env.PI_HERDSMAN_MAILBOX!, id, {
         // A request from an owner running an older build carries no profile;
         // this worker's own launch profile is the floor in that case.
-        legacyProfileFallback: process.env
-          .PI_HERDSMAN_BRIEF_PROFILE as BriefProfile | undefined,
+        legacyProfileFallback: process.env.PI_HERDSMAN_BRIEF_PROFILE as
+          BriefProfile | undefined,
       });
     } catch (error) {
       acknowledgeAndDiscard(
@@ -18053,7 +18122,10 @@ export default function (pi: ExtensionAPI): void {
   pi.on("turn_start", () => {
     touchActivity();
     if (backgroundFinalResponse && !backgroundFinalResponse.runStarted)
-      backgroundFinalResponse = { ...backgroundFinalResponse, runStarted: true };
+      backgroundFinalResponse = {
+        ...backgroundFinalResponse,
+        runStarted: true,
+      };
   });
   for (const event of [
     "message_update",
@@ -18238,8 +18310,7 @@ export default function (pi: ExtensionAPI): void {
   // run it prompted has started. `agent_settled` is the only caller that settles
   // a run, so only there can the worker be known to have stopped answering.
   let backgroundFinalResponse:
-    | { requestId: string; runStarted: boolean }
-    | undefined;
+    { requestId: string; runStarted: boolean } | undefined;
   const settleCurrentAgent = (
     ctx: ExtensionContext,
     runSettled = false,
@@ -18563,10 +18634,11 @@ export default function (pi: ExtensionAPI): void {
     if (resultError && providerFailure)
       resultError = {
         code: resultError.code,
-        message: `Provider error: ${providerFailure}. ${resultError.message}`.slice(
-          0,
-          512,
-        ),
+        message:
+          `Provider error: ${providerFailure}. ${resultError.message}`.slice(
+            0,
+            512,
+          ),
       };
     const result: ResultRecord = {
       version: 5,

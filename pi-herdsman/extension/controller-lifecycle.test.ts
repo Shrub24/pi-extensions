@@ -104,161 +104,192 @@ const ownedSessionContext = (id: string, label: string) =>
     },
   ]);
 
-test("parent delegates two same-definition children with exact ownership", async () => {
-  setAgentEnvironment("multiplicity-parent", ["child"]);
-  const previousForwardingSession = process.env.PI_SUBAGENT_PARENT_SESSION;
-  process.env.PI_SUBAGENT_PARENT_SESSION = LEAD_SESSION_ID;
-  process.env.PI_HERDSMAN_AGENT_DEFINITION = "parent";
-  const parent = managedState("multiplicity-parent");
-  const parentMailbox = agentMailboxPath(WORKSPACE, parent.agentLabel);
-  resetAgentMailbox(parentMailbox);
-  writeAgentState(parentMailbox, parent);
-  const files = [
-    ["parent.md", '---\nname: parent\nagents: ["child"]\n---\nparent\n'],
-    ["child.md", "---\nname: child\n---\nchild\n"],
-  ];
-  for (const [name, content] of files)
-    realFs.writeFileSync(join(PI_AGENTS_DIR, name), content, "utf8");
-  const lifecycle = delegatedLifecycleExecutor(parent);
-  const starts: string[][] = [];
-  const pi = fakePi({
-    thinkingLevel: "high",
-    exec: (command, args) => {
-      if (command === "herdr" && args[0] === "agent" && args[1] === "start")
-        starts.push([...args]);
-      return lifecycle.exec(command, args);
-    },
-  });
-  registerExtension!(pi.pi as never);
-  const context = fakeAgentContext([
-    {
-      type: "custom",
-      customType: "pi-herdsman-agent-definition",
-      data: {
-        sessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-        definition: "parent",
-        label: process.env.PI_HERDSMAN_LABEL ?? "parent",
+for (const virtual of [false, true])
+  test(`parent delegates two same-definition children with exact ownership (${virtual ? "virtual" : "physical"} model)`, async () => {
+    setAgentEnvironment("multiplicity-parent", ["child"]);
+    const previousForwardingSession = process.env.PI_SUBAGENT_PARENT_SESSION;
+    process.env.PI_SUBAGENT_PARENT_SESSION = LEAD_SESSION_ID;
+    process.env.PI_HERDSMAN_AGENT_DEFINITION = "parent";
+    const parent = managedState("multiplicity-parent");
+    const parentMailbox = agentMailboxPath(WORKSPACE, parent.agentLabel);
+    resetAgentMailbox(parentMailbox);
+    writeAgentState(parentMailbox, parent);
+    const files = [
+      ["parent.md", '---\nname: parent\nagents: ["child"]\n---\nparent\n'],
+      ["child.md", "---\nname: child\nnoExtensions: true\n---\nchild\n"],
+    ];
+    for (const [name, content] of files)
+      realFs.writeFileSync(join(PI_AGENTS_DIR, name), content, "utf8");
+    const lifecycle = delegatedLifecycleExecutor(parent);
+    const starts: string[][] = [];
+    const pi = fakePi({
+      thinkingLevel: "high",
+      exec: (command, args) => {
+        if (command === "herdr" && args[0] === "agent" && args[1] === "start")
+          starts.push([...args]);
+        return lifecycle.exec(command, args);
       },
-    },
-  ]);
-  (context as any).model = {
-    provider: "parent-provider",
-    id: "parent-model",
-  };
-  (context as any).thinkingLevel = "high";
-  const mailboxes: string[] = [];
-  try {
-    for (const handler of pi.events.get("session_start") ?? [])
-      await handler(undefined, context);
-    for (const task of ["first child", "second child"]) {
-      const started = await registeredAgentTool(pi, "delegate").execute(
+    });
+    registerExtension!(pi.pi as never);
+    const context = fakeAgentContext([
+      {
+        type: "custom",
+        customType: "pi-herdsman-agent-definition",
+        data: {
+          sessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+          definition: "parent",
+          label: process.env.PI_HERDSMAN_LABEL ?? "parent",
+        },
+      },
+    ]);
+    (context as any).model = {
+      provider: "parent-provider",
+      id: "parent-model",
+    };
+    if (virtual)
+      (context as any).model = {
+        provider: "route",
+        id: "worker",
+        api: "pi-virtual",
+      };
+    (context as any).modelRegistry = {
+      getRegisteredProviderIds: () => [],
+      getAll: () =>
+        virtual
+          ? [(context as any).model]
+          : [
+              {
+                provider: "parent-provider",
+                id: "unselected-auto",
+                api: "pi-virtual",
+              },
+            ],
+    };
+    (context as any).thinkingLevel = "high";
+    const mailboxes: string[] = [];
+    try {
+      for (const handler of pi.events.get("session_start") ?? [])
+        await handler(undefined, context);
+      for (const task of ["first child", "second child"]) {
+        const started = await registeredAgentTool(pi, "delegate").execute(
           "start",
           { definition: "child", task },
           undefined,
           undefined,
           context,
         );
-      assert.equal(started.details.ok, true, JSON.stringify(started.details));
-      mailboxes.push(
-        agentMailboxPath(WORKSPACE, started.details.agent as string),
+        assert.equal(started.details.ok, true, JSON.stringify(started.details));
+        mailboxes.push(
+          agentMailboxPath(WORKSPACE, started.details.agent as string),
+        );
+      }
+      const guidance = pi.sentMessageCalls.filter(
+        ({ message }) =>
+          (message as any).customType === "pi-herdsman-delegation-guidance",
       );
-    }
-    const guidance = pi.sentMessageCalls.filter(
-      ({ message }) =>
-        (message as any).customType === "pi-herdsman-delegation-guidance",
-    );
-    assert.equal(guidance.length, 1);
-    const content = String((guidance[0].message as any).content);
-    for (const phrase of [
-      "Each unresolved unit of work has one executor.",
-      "agent_steer queues a cooperative correction",
-      "it does not preempt the current operation",
-      "A repeated reminder for the same stale episode is additional recovery evidence",
-      "A steer queued during that unchanged episode cannot have taken effect yet",
-      "otherwise use agent_interrupt",
-      "do not take over unresolved delegated work locally",
-    ])
-      assert.ok(content.includes(phrase), phrase);
-    const sharedGuidance = pi.tools
-      .find((tool) => tool.name === "agent_list")!
-      .promptGuidelines!.join(" ");
-    for (const phrase of [
-      "Use agent_delegate to start a fresh bounded assignment from a definition; use agent_continue to resume an exact historical managed-Agent Pi session with a new bounded assignment.",
-      "Each live Agent generation exists for one assignment. A delivered worker is retained by default: its pane, process and Pi session stay alive as idle, and a fresh agent is created only for work no live worker holds.",
-      "Prefer agent_continue for a follow-on, a revision, or the same kind of work against a scope a retained worker already holds: the worker keeps its Pi session, its in-memory context, its artifacts and its pane, and a fresh agent would reconstruct all of that from the brief.",
-      "Agent labels identify the current live generation; exact Pi sessions identify historical context and continuation.",
-      "`files` carries relevant assignment evidence, not runtime capability.",
-      "Do not attach or mention agent instruction files such as AGENTS.md, CLAUDE.md, GEMINI.md, or equivalents merely because they exist.",
-      "A proven lost Agent remains unresolved; physical disappearance is not completion. Unknown or conflicting identity remains fail-closed. Use agent_continue with the exact saved session to replace a lost generation, or agent_close to abandon it; do not take over unresolved delegated work locally.",
-    ])
-      assert.ok(sharedGuidance.includes(phrase), phrase);
-    const labels = mailboxes.map(
-      (mailbox) => readAgentState(mailbox)!.agentLabel,
-    );
-    assert.equal(new Set(labels).size, 2);
-    assert.equal(starts.length, 2);
-    for (const args of starts) {
+      assert.equal(guidance.length, 1);
+      const content = String((guidance[0].message as any).content);
+      for (const phrase of [
+        "Each unresolved unit of work has one executor.",
+        "agent_steer queues a cooperative correction",
+        "it does not preempt the current operation",
+        "A repeated reminder for the same stale episode is additional recovery evidence",
+        "A steer queued during that unchanged episode cannot have taken effect yet",
+        "otherwise use agent_interrupt",
+        "do not take over unresolved delegated work locally",
+      ])
+        assert.ok(content.includes(phrase), phrase);
+      const sharedGuidance = pi.tools
+        .find((tool) => tool.name === "agent_list")!
+        .promptGuidelines!.join(" ");
+      for (const phrase of [
+        "Use agent_delegate to start a fresh bounded assignment from a definition; use agent_continue to resume an exact historical managed-Agent Pi session with a new bounded assignment.",
+        "Each live Agent generation exists for one assignment. A delivered worker is retained by default: its pane, process and Pi session stay alive as idle, and a fresh agent is created only for work no live worker holds.",
+        "Prefer agent_continue for a follow-on, a revision, or the same kind of work against a scope a retained worker already holds: the worker keeps its Pi session, its in-memory context, its artifacts and its pane, and a fresh agent would reconstruct all of that from the brief.",
+        "Agent labels identify the current live generation; exact Pi sessions identify historical context and continuation.",
+        "`files` carries relevant assignment evidence, not runtime capability.",
+        "Do not attach or mention agent instruction files such as AGENTS.md, CLAUDE.md, GEMINI.md, or equivalents merely because they exist.",
+        "A proven lost Agent remains unresolved; physical disappearance is not completion. Unknown or conflicting identity remains fail-closed. Use agent_continue with the exact saved session to replace a lost generation, or agent_close to abandon it; do not take over unresolved delegated work locally.",
+      ])
+        assert.ok(sharedGuidance.includes(phrase), phrase);
+      const labels = mailboxes.map(
+        (mailbox) => readAgentState(mailbox)!.agentLabel,
+      );
+      assert.equal(new Set(labels).size, 2);
+      assert.equal(starts.length, 2);
+      for (const args of starts) {
+        assert.equal(
+          args[args.indexOf("--model") + 1],
+          virtual ? "route/worker" : "parent-provider/parent-model",
+        );
+        assert.equal(args.includes("--no-extensions"), !virtual);
+        assert.equal(args[args.indexOf("--thinking") + 1], "high");
+      }
+      const states = mailboxes.map((mailbox) => readAgentState(mailbox)!);
+      assert.deepEqual(
+        states.map((state) => state.ownerSessionId),
+        [parent.piSessionId, parent.piSessionId],
+      );
+      assert.equal(new Set(states.map((state) => state.paneId)).size, 2);
       assert.equal(
-        args[args.indexOf("--model") + 1],
-        "parent-provider/parent-model",
+        lifecycle.environmentCommands.filter((command) =>
+          command.includes("PI_HERDSMAN_ALLOWED_AGENT_DEFINITIONS=[]"),
+        ).length,
+        2,
       );
-      assert.equal(args[args.indexOf("--thinking") + 1], "high");
-    }
-    const states = mailboxes.map((mailbox) => readAgentState(mailbox)!);
-    assert.deepEqual(
-      states.map((state) => state.ownerSessionId),
-      [parent.piSessionId, parent.piSessionId],
-    );
-    assert.equal(new Set(states.map((state) => state.paneId)).size, 2);
-    assert.equal(
-      lifecycle.environmentCommands.filter((command) =>
-        command.includes("PI_HERDSMAN_ALLOWED_AGENT_DEFINITIONS=[]"),
-      ).length,
-      2,
-    );
-    assert.equal(
-      lifecycle.environmentCommands.filter(
-        (command) =>
-          command ===
-          `PI_HERDSMAN_OWNER_SESSION_ID=${context.sessionManager.getSessionId()}`,
-      ).length,
-      2,
-    );
-    assert.equal(
-      lifecycle.environmentCommands.filter(
-        (command) =>
-          command === `PI_SUBAGENT_PARENT_SESSION=${LEAD_SESSION_ID}`,
-      ).length,
-      2,
-    );
-    assert.equal(lifecycle.createdTabs(), 0);
-    for (const label of labels) {
-      const closed = await pi.tools
-        .find((tool) => tool.name === "agent_close")!
-        .execute("close", { agent: label }, undefined, undefined, context);
-      assert.equal(closed.details.ok, true, JSON.stringify(closed.details));
       assert.equal(
-        readAgentState(agentMailboxPath(WORKSPACE, label)),
-        undefined,
+        lifecycle.environmentCommands.filter(
+          (command) =>
+            command ===
+            `PI_HERDSMAN_OWNER_SESSION_ID=${context.sessionManager.getSessionId()}`,
+        ).length,
+        2,
       );
+      assert.equal(
+        lifecycle.environmentCommands.filter(
+          (command) =>
+            command === `PI_SUBAGENT_PARENT_SESSION=${LEAD_SESSION_ID}`,
+        ).length,
+        2,
+      );
+      for (const command of [
+        "PI_OTEL_RUN_KIND=child",
+        "MAGIC_CONTEXT_PROFILE=subagent",
+      ])
+        assert.equal(
+          lifecycle.environmentCommands.filter((entry) => entry === command)
+            .length,
+          2,
+          `${command} is set on both children`,
+        );
+      assert.equal(lifecycle.createdTabs(), 0);
+      for (const label of labels) {
+        const closed = await pi.tools
+          .find((tool) => tool.name === "agent_close")!
+          .execute("close", { agent: label }, undefined, undefined, context);
+        assert.equal(closed.details.ok, true, JSON.stringify(closed.details));
+        assert.equal(
+          readAgentState(agentMailboxPath(WORKSPACE, label)),
+          undefined,
+        );
+      }
+      assert.equal(
+        pi.entries.filter(
+          (entry: any) => entry.customType === "pi-herdsman-herd-run",
+        ).length,
+        0,
+      );
+      assert.deepEqual(lifecycle.closeOrder, labels);
+    } finally {
+      if (previousForwardingSession === undefined)
+        delete process.env.PI_SUBAGENT_PARENT_SESSION;
+      else process.env.PI_SUBAGENT_PARENT_SESSION = previousForwardingSession;
+      for (const handler of pi.events.get("session_shutdown") ?? []) handler();
+      resetAgentMailbox(parentMailbox);
+      for (const mailbox of mailboxes) resetAgentMailbox(mailbox);
+      for (const [name] of files) realFs.unlinkSync(join(PI_AGENTS_DIR, name));
     }
-    assert.equal(
-      pi.entries.filter(
-        (entry: any) => entry.customType === "pi-herdsman-herd-run",
-      ).length,
-      0,
-    );
-    assert.deepEqual(lifecycle.closeOrder, labels);
-  } finally {
-    if (previousForwardingSession === undefined)
-      delete process.env.PI_SUBAGENT_PARENT_SESSION;
-    else process.env.PI_SUBAGENT_PARENT_SESSION = previousForwardingSession;
-    for (const handler of pi.events.get("session_shutdown") ?? []) handler();
-    resetAgentMailbox(parentMailbox);
-    for (const mailbox of mailboxes) resetAgentMailbox(mailbox);
-    for (const [name] of files) realFs.unlinkSync(join(PI_AGENTS_DIR, name));
-  }
-});
+  });
 
 function writePlacementSetting(placement: "tab" | "subtree" | "split") {
   realFs.mkdirSync(join(PI_AGENT_ROOT, "pi-herdsman"), { recursive: true });
@@ -300,7 +331,9 @@ const registeredAgentTool = (
   pi: ReturnType<typeof fakePi>,
   operation: string,
 ) => {
-  const tool = pi.tools.find((candidate) => candidate.name === `agent_${operation}`)!;
+  const tool = pi.tools.find(
+    (candidate) => candidate.name === `agent_${operation}`,
+  )!;
   if (operation !== "delegate" && operation !== "continue") return tool;
   return {
     ...tool,
@@ -3069,24 +3102,24 @@ test("historical session with its inherited label rejects an active managed repr
     const controllerContext = fakeContext();
     controllerContext.sessionManager.getSessionId = () => session.id;
     const ownSession = await registeredAgentTool(pi, "continue").execute(
-        "controller-session",
-        {
-          session: session.id,
-          task: "must not self-delegate",
-        },
-        undefined,
-        undefined,
-        controllerContext,
-      );
+      "controller-session",
+      {
+        session: session.id,
+        task: "must not self-delegate",
+      },
+      undefined,
+      undefined,
+      controllerContext,
+    );
     assert.equal(ownSession.details.error.category, "invalid_request");
     const before = pi.calls.length;
     const result = await registeredAgentTool(pi, "continue").execute(
-        "id",
-        { session: session.path, task: "must wait" },
-        undefined,
-        undefined,
-        ownedSessionContext(session.id, label),
-      );
+      "id",
+      { session: session.path, task: "must wait" },
+      undefined,
+      undefined,
+      ownedSessionContext(session.id, label),
+    );
     assert.equal(result.details.error.category, "agent_busy");
     assert.match(result.details.error.message, /exact Pi session|represented/i);
     assert.equal(
@@ -3752,7 +3785,10 @@ test("a fresh delegation stores the child session under the operator cwd", async
     `---\nname: ${name}\n---\ndefinition body\n`,
     "utf8",
   );
-  const targetCwd = join(tmpdir(), `pi-herdsman-target-${randomUUID().slice(0, 8)}`);
+  const targetCwd = join(
+    tmpdir(),
+    `pi-herdsman-target-${randomUUID().slice(0, 8)}`,
+  );
   const launched: string[][] = [];
   const startup = startupExecutor(
     label,
@@ -3778,7 +3814,10 @@ test("a fresh delegation stores the child session under the operator cwd", async
     assert.equal(result.details.ok, true, JSON.stringify(result.details));
     assert.equal(launched.length, 1);
     assert.deepEqual(
-      launched[0]!.slice(launched[0]!.indexOf("--session-dir"), launched[0]!.indexOf("--session-dir") + 2),
+      launched[0]!.slice(
+        launched[0]!.indexOf("--session-dir"),
+        launched[0]!.indexOf("--session-dir") + 2,
+      ),
       ["--session-dir", resolve(targetCwd, ".pi", "sessions", "children")],
     );
     assert.equal(
@@ -4627,7 +4666,11 @@ test("fabricated session metadata cannot authorize continuation", async () => {
       {
         type: "custom",
         customType: "pi-herdsman-agent-definition",
-        data: { sessionId: DEFAULT_PI_SESSION_ID, definition: name, label: name },
+        data: {
+          sessionId: DEFAULT_PI_SESSION_ID,
+          definition: name,
+          label: name,
+        },
       },
       // The file advertises the caller as its direct owner, but ownership is
       // decided by result provenance, never by this record.
@@ -4659,10 +4702,7 @@ test("fabricated session metadata cannot authorize continuation", async () => {
     );
     assert.equal(result.details.ok, false);
     assert.equal(result.details.error.category, "invalid_request");
-    assert.match(
-      result.details.error.message,
-      /proven session ownership tree/,
-    );
+    assert.match(result.details.error.message, /proven session ownership tree/);
     assert.equal(
       pi.calls.some((args) => args[0] === "agent" && args[1] === "start"),
       false,
@@ -5302,8 +5342,15 @@ test("rejects an oversized assignment brief before lifecycle mutation", async ()
       fakeContext(),
     );
     assert.equal(result.details.error.category, "invalid_request");
-    assert.match(result.details.error.message, /exceeds the 65536-byte brief limit/);
-    assert.equal(startup.getCount(), 0, "oversized brief must fail before launch");
+    assert.match(
+      result.details.error.message,
+      /exceeds the 65536-byte brief limit/,
+    );
+    assert.equal(
+      startup.getCount(),
+      0,
+      "oversized brief must fail before launch",
+    );
     assert.equal(realFs.existsSync(startup.mailbox), false);
   } finally {
     pi.events.get("session_shutdown")?.[0]();
@@ -5361,7 +5408,10 @@ test("plain task text and unavailable brief context are rejected before lifecycl
   try {
     for (const [task, expected] of [
       ["Just do the work", /schema/],
-      [unavailableContext, new RegExp(missing.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))],
+      [
+        unavailableContext,
+        new RegExp(missing.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+      ],
     ] as const) {
       const result = await delegate.execute(
         "id",
