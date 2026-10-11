@@ -17,9 +17,9 @@
  * `replayCasesFrom` is where labels are attached, which keeps the runtime
  * record free of assumptions about when a label shows up.
  *
- * No raw state is stored unless `stateRetention` is `full`. The hash alone is
- * enough to tell that two asks shared a state, and enough to join records; a
- * calibration run that needs to re-score states opts into storing them.
+ * The state text is never stored: the hash is enough to tell that two asks shared
+ * a state, and enough to join records. What a question read survives only as the
+ * bounded objection excerpt below.
  */
 
 import type { JevUsage } from "./types.js";
@@ -74,7 +74,7 @@ export interface WatcherRecord {
 	source: string;
 	/** The advisory kind within that producer, e.g. `soft-timeout`. */
 	kind: string;
-	/** The watcher mode in force; `off` records nothing at all. */
+	/** The watcher mode in force; `off` records nothing at all, and `shadow` never claims the offer. */
 	mode: "shadow" | "advisory";
 	/** Whether the ask carried an instruction of its own or the default one. */
 	guidance: "default" | "dispatch";
@@ -91,6 +91,10 @@ export interface AskRecord {
 	requestId: string;
 	/** The core request this record came from (action:group:chunk). */
 	requestKey: string;
+	/**
+	 * The permission posture in force. A wake record was not decided by it: the
+	 * watcher's own mode is in `watcher.mode`.
+	 */
 	mode: "shadow" | "advisory" | "live";
 	judge: {
 		model: string | null;
@@ -122,9 +126,15 @@ export interface AskRecord {
 	/** The question ids this request carried, in the order they were sent. */
 	questions: string[];
 	/** What the judge would have decided, in either mode. */
-	would: "allow" | "deny" | "defer";
-	/** What it actually returned to the permission chain. */
-	verdict: "allow" | "deny" | "defer";
+	would: "allow" | "deny" | "defer" | "skip" | "release";
+	/**
+	 * What actually happened: the permission resolution, or, for an advisory wake,
+	 * whether the watcher suppressed it (`skip`) or left it to the producer
+	 * (`release`). A `shadow` watcher claims nothing, so its record says `native`:
+	 * the producer's own path delivered the wake and the reading is a
+	 * counterfactual.
+	 */
+	verdict: "allow" | "deny" | "defer" | "skip" | "release" | "native";
 	reason?: string;
 	latencyMs: number;
 	usage: JevUsage | null;
@@ -210,8 +220,8 @@ export function objectionEvidence(state: unknown, blocks: readonly { id: string 
 export function askRecordFromCore(context: CoreRecordContext, options: AskRecordOptions): AskRecord {
 	const interpreted = (context.interpreted ?? {}) as {
 		bands?: unknown;
-		would?: string;
-		verdict?: string;
+		would?: AskRecord["would"];
+		verdict?: AskRecord["verdict"];
 		decidedBy?: string | null;
 		signals?: string[];
 		watcher?: unknown;

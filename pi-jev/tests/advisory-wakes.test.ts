@@ -97,7 +97,12 @@ test("claims soft reminders and sends the full command plus default and dispatch
 	expect(state).toContain("Only wake me if this is blocked.");
 	expect(request.questions[ADVISORY_WAKE_QUESTION]?.type).toBe("noul");
 	expect(log.records).toHaveLength(1);
-	expect(log.records[0]).toMatchObject({ would: "skip", verdict: "skip", questions: [ADVISORY_WAKE_QUESTION] });
+	expect(log.records[0]).toMatchObject({
+		// Claimed and suppressed: the verdict is the decision itself.
+		would: "skip",
+		verdict: "skip",
+		questions: [ADVISORY_WAKE_QUESTION],
+	});
 	expect(JSON.stringify(log.records)).not.toContain(command);
 	dispose();
 });
@@ -197,8 +202,10 @@ test("shadow classifies and records without claiming the offer", async () => {
 	const record = await waitFor(() => log.records[0]);
 	expect(record).toMatchObject({
 		record: "ask",
+		// A counterfactual reading, and a wake the producer delivered on its own
+		// path: nothing here was acted on, so the verdict cannot read as a skip.
 		would: "skip",
-		verdict: "skip",
+		verdict: "native",
 		watcher: {
 			source: "pi-background-tasks",
 			kind: "soft-timeout",

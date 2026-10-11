@@ -699,6 +699,11 @@ type Params =
       session: string;
       task: string;
       files?: string[];
+      /**
+       * Instruction for the fresh assignment's advisory offer. Omitting it arms
+       * the new window with none; the previous assignment's is not carried over.
+       */
+      watcherGuidance?: string;
     }
   | {
       action: "steer" | "interrupt";
@@ -7592,9 +7597,9 @@ async function actionUnsafe(
           p.action,
           acceptedAssignment,
           roleLaunchInputs.briefProfile,
-          // A continued assignment keeps its window's instruction; only a
-          // fresh delegate supplies one.
-          p.action === "delegate" ? p.watcherGuidance : undefined,
+          // Every assignment takes the instruction its own call supplies; a
+          // continued assignment never inherits the previous one's.
+          p.watcherGuidance,
         );
         requestStatusRefresh?.();
         return {
@@ -7956,9 +7961,9 @@ async function actionUnsafe(
           p.action,
           acceptedAssignment,
           roleLaunchInputs.briefProfile,
-          // A continued assignment keeps its window's instruction; only a
-          // fresh delegate supplies one.
-          p.action === "delegate" ? p.watcherGuidance : undefined,
+          // Every assignment takes the instruction its own call supplies; a
+          // continued assignment never inherits the previous one's.
+          p.watcherGuidance,
         );
         pendingStart.requestId = requestId;
         accepted = true;
@@ -8951,6 +8956,14 @@ export default function (pi: ExtensionAPI): void {
         pattern: "\\S",
       }),
       files: FILES_SCHEMA,
+      watcherGuidance: Type.Optional(
+        Type.String({
+          maxLength: 240,
+          pattern: "\\S",
+          description:
+            "Optional instruction for the fresh assignment's advisory soft-deadline offer. A wake consumer may read it when deciding whether a checkpoint is worth delivering now; it is data for that consumer, never a command the Agent is given. Omitting it arms the new assignment with none: the previous assignment's instruction is not carried over.",
+        }),
+      ),
     },
     { additionalProperties: false },
   );

@@ -4669,6 +4669,76 @@ test("session continuation inherits the saved label without an override", async 
   assert.equal(reused.details.agent, label);
 });
 
+test("a continued assignment takes its own watcher instruction and inherits none", async () => {
+  for (const item of [
+    {
+      label: "continued-guided",
+      instruction: "Only wake me if the migration stalls.",
+    },
+    { label: "continued-plain", instruction: undefined },
+  ] as const) {
+    setLeadEnvironment();
+    nativeSessions.clear();
+    const mailbox = agentMailboxPath(WORKSPACE, item.label);
+    resetAgentMailbox(mailbox);
+    const sourceId = randomUUID();
+    const source = {
+      id: sourceId,
+      path: join(tmpdir(), `session-${item.label}-${randomUUID()}.jsonl`),
+      cwd: "/tmp",
+      entries: [
+        {
+          type: "custom",
+          customType: "pi-herdsman-agent-definition",
+          data: { sessionId: sourceId, definition: "agent", label: item.label },
+        },
+      ],
+    };
+    realFs.writeFileSync(source.path, "{}", "utf8");
+    nativeSessions.set(source.id, source);
+    const startup = startupExecutor(item.label, () => DEFAULT_PI_SESSION_ID);
+    const pi = fakePi({ exec: startup.exec });
+    registerExtension!(pi.pi as never);
+    try {
+      const result = await agentTool(pi, "continue").execute(
+        "id",
+        {
+          session: source.path,
+          task: "continue the migration",
+          ...(item.instruction === undefined
+            ? {}
+            : { watcherGuidance: item.instruction }),
+        },
+        undefined,
+        undefined,
+        fakeContext([
+          ownershipResult(sourceId, LEAD_SESSION_ID, {
+            path: source.path,
+            label: item.label,
+          }),
+        ]),
+      );
+      assert.equal(result.details.ok, true, JSON.stringify(result.details));
+      // The continued assignment is a new one, so its window carries what this
+      // call supplied and nothing when it supplied nothing.
+      const recorded = (pi.entries as any[])
+        .filter(
+          (entry) =>
+            entry.customType === "pi-herdsman-soft-window" &&
+            entry.data.requestId === result.details.request_id,
+        )
+        .at(-1)?.data.watcherGuidance;
+      assert.equal(recorded, item.instruction);
+    } finally {
+      pi.events.get("session_shutdown")?.[0]();
+      startup.stopMailboxConsumer();
+      nativeSessions.clear();
+      resetAgentMailbox(mailbox);
+      realFs.rmSync(source.path, { force: true });
+    }
+  }
+});
+
 const idleRetainedWorkerFixture = async (
   definition: string,
   options: {

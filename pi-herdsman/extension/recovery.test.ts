@@ -7622,6 +7622,78 @@ test("a checkpoint covering several Agents offers no single instruction", async 
   for (const fixture of fixtures) resetAgentMailbox(fixture.mailbox);
 });
 
+test("a delegate records its watcher instruction, and extend replaces or keeps it", async () => {
+  setLeadEnvironment();
+  const label = "guided-delegate";
+  const startup = startupExecutor(label, () => DEFAULT_PI_SESSION_ID);
+  const pi = fakePi({ exec: startup.exec });
+  registerExtension!(pi.pi as never);
+  // The instruction a consumer would receive is the one recorded on the
+  // assignment's window, so the recording is where the plumbing is checked.
+  const recorded = (requestId: string) =>
+    (pi.entries as any[])
+      .filter(
+        (entry) =>
+          entry.customType === "pi-herdsman-soft-window" &&
+          entry.data.requestId === requestId,
+      )
+      .at(-1)?.data.watcherGuidance;
+  try {
+    const delegated = await agentTool(pi, "delegate").execute(
+      "id",
+      {
+        definition: "agent",
+        label,
+        task: "water the migration",
+        watcherGuidance: "Only wake me if the migration stalls.",
+      },
+      undefined,
+      undefined,
+      fakeContext(),
+    );
+    assert.equal(delegated.details.ok, true, JSON.stringify(delegated.details));
+    const requestId = delegated.details.request_id;
+    assert.equal(
+      recorded(requestId),
+      "Only wake me if the migration stalls.",
+    );
+    const kept = await agentTool(pi, "extend").execute(
+      "id",
+      { agent: label, windowMs: 60_000 },
+      undefined,
+      undefined,
+      fakeContext(),
+    );
+    assert.equal(kept.details.ok, true, JSON.stringify(kept.details));
+    assert.equal(
+      recorded(requestId),
+      "Only wake me if the migration stalls.",
+      "an extend without an instruction keeps the assignment's",
+    );
+    const replaced = await agentTool(pi, "extend").execute(
+      "id",
+      {
+        agent: label,
+        windowMs: 60_000,
+        watcherGuidance: "Only wake me if the review is refused.",
+      },
+      undefined,
+      undefined,
+      fakeContext(),
+    );
+    assert.equal(
+      replaced.details.ok,
+      true,
+      JSON.stringify(replaced.details),
+    );
+    assert.equal(recorded(requestId), "Only wake me if the review is refused.");
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    startup.stopMailboxConsumer();
+    resetAgentMailbox(startup.mailbox);
+  }
+});
+
 test("background-waiting workers keep digest/extend eligibility but reject interrupt", async (t) => {
   let now = Date.now();
   t.mock.method(Date, "now", () => now);

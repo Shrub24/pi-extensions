@@ -164,10 +164,10 @@ The `tool-intent` entry also listens for the shared `pi-wake-consumer/v1` offer.
 `watcherMode` (default `off`) is this consumer's own switch, independent of `mode`. Judging an advisory spends a request per offer and, when it decides, the owner's attention, so the permission posture does not turn it on:
 
 - `off` — no listener at all. Every advisory wake stays exactly as its producer sent it.
-- `shadow` — Jev asks `wake.attention` for every offer and records the reading, and never claims the offer. With no claim the producer takes its original synchronous path, so the wake is delivered at once and the reading is what the mode would have done; the record's `watcher.mode` says that is what it is.
+- `shadow` — Jev asks `wake.attention` for every offer and records the reading, and never claims the offer. With no claim the producer takes its original synchronous path, so the wake is delivered at once and the reading is what the mode would have done. The record keeps the two apart: `watcher.mode` is `shadow`, `would` holds the reading, and `verdict` is `native` — the producer's own path delivered the wake — rather than a decision the watcher acted on.
 - `advisory` — Jev claims the offer and skips the reminder only when the probability that the owner needs to act now is at or below `1 - advisoryThreshold`. Ambiguous readings, classifier failures, and timeouts release the original wake.
 
-For a background-task reminder the classifier receives the complete command string, event metadata, the default attention guidance, and the task's `watcherGuidance` when the spawn or a later `extend` set one. A Herdsman checkpoint covering exactly one Agent carries that assignment's `watcherGuidance`; one covering several carries none, because one instruction describes one assignment. Captured task output and working directory are not included. The command reaches the configured model, but this question's decision record keeps the reading, the edge it was read against, the watcher block, and the state hash and size — not the command or the guidance text, and an objection records no state excerpt either. Only an explicit `stateRetention: "full"` stores the state, for every consumer. Treat commands as potentially sensitive when turning the consumer on.
+For a background-task reminder the classifier receives the complete command string, event metadata, the default attention guidance, and the task's `watcherGuidance` when the spawn or a later `extend` set one. A Herdsman checkpoint covering exactly one Agent carries that assignment's `watcherGuidance`; one covering several carries none, because one instruction describes one assignment. Captured task output and working directory are not included. The command reaches the configured model, but this question's decision record keeps the reading, the edge it was read against, the watcher block, and the state hash and size — never the command or the guidance text, and no state excerpt either. No consumer's record keeps the state text; sizes and hashes are all the log holds. Treat commands as potentially sensitive when turning the consumer on.
 
 The consumer uses Jev's existing client, threshold, bounded decision core, and decision-log path. It has a 4.5-second decision ceiling inside the producer's 5-second fallback window; in `shadow` nothing is waiting on that ceiling, so it bounds the request, not a wake. This first pass uses a deliberately conservative default question; the context and threshold should be calibrated from actual decisions before changing them.
 
@@ -187,7 +187,7 @@ When a question objects, the record keeps a bounded excerpt of the state the jud
 bun scripts/report.ts --objections 3
 ```
 
-Move a question's threshold only after its samples say where the edge belongs, and keep `stateRetention: "hash"` while measuring — the probabilities and the labels are enough for the decision-level numbers, and a state kept is conversation content kept. Switch to `full` only when you want to replay states through a reworded question.
+Move a question's threshold only after its samples say where the edge belongs: the probabilities and the labels carry the decision-level numbers.
 
 ## Limits, stated plainly
 

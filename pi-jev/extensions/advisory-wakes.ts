@@ -120,9 +120,10 @@ function decisionFor(result: DecisionResult, threshold: number): WakeConsumerDec
 
 /**
  * What one ask leaves in the log: the reading in the pack's band shape, the
- * decision it produced, and which watcher produced it. The guidance text itself
- * stays out — the record keeps its origin and a hash of it, and the state only
- * under an explicitly configured `full` retention.
+ * decision that reading produced, what became of the wake, and which watcher
+ * produced it. The guidance text itself stays out — the record keeps its origin
+ * and a hash of it — and the state is never logged, so no command or instruction
+ * reaches the file.
  */
 function interpretWake(readings: readonly Reading[], offer: WakeConsumerOffer, mode: WatcherRecord["mode"], threshold: number): unknown {
 	const reading = readings.find((item) => item.question === ADVISORY_WAKE_QUESTION);
@@ -146,7 +147,10 @@ function interpretWake(readings: readonly Reading[], offer: WakeConsumerOffer, m
 		guidanceHash: createHash("sha256").update(offer.dispatchGuidance ?? ADVISORY_WAKE_DEFAULT_GUIDANCE).digest("hex").slice(0, 16),
 		promptVersion: ADVISORY_WAKE_PROMPT_VERSION,
 	};
-	return { bands, would: decision, verdict: decision, watcher };
+	// `would` is the reading; `verdict` is what became of the wake. Shadow never
+	// claims the offer, so the producer's own delivery stands whatever the reading
+	// said, and `native` keeps that apart from a decision we acted on.
+	return { bands, would: decision, verdict: mode === "shadow" ? "native" : decision, watcher };
 }
 
 /**

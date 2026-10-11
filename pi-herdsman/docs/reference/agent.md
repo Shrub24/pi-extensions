@@ -71,13 +71,17 @@ saved definition for other workers.
 ```
 
 Call `agent_continue` with an exact `session`, a fresh complete versioned
-Markdown brief in `task`, and optional `files`. Continuation never inherits the
-previous assignment's scope or response override; the new brief must satisfy the
-saved definition's role profile. The exact saved session path or full UUID
-supplies its cwd, definition identity, and historical Pi context. Continuation
-hands one more assignment to the session's
-agent, creating a new agent generation (a new process) when no retained worker
-can take the work; it never assigns work to a working or settling
+Markdown brief in `task`, and optional `files` and `watcherGuidance` (at most
+240 characters). Continuation never inherits the previous assignment's scope or
+response override, and the new brief must satisfy the saved definition's role
+profile. A continuation is a new assignment, so it starts with no advisory
+instruction either: a `watcherGuidance` here arms the continued assignment's
+window with that instruction, and omitting one arms the window with none rather
+than carrying the previous assignment's over. The exact saved session path or
+full UUID supplies its cwd, definition identity, and historical Pi context.
+Continuation hands one more assignment to the session's agent, creating a new
+agent generation (a new process) when no retained worker can take the work; it
+never assigns work to a working or settling
 agent. The cwd comes from the saved session. The saved definition is resolved again
 from current configuration and must currently be enabled and authorized; its
 current effective configuration
