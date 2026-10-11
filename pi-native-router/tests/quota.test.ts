@@ -208,3 +208,25 @@ test("regenerating CodexBar config merges router providers and keeps providers i
   expect(byId.get("opencodego")?.source).toBe("api");
   expect(byId.get("opencodego")?.tokenAccounts?.accounts).toHaveLength(1);
 });
+
+test("commandcode takes its key as a provider-level apiKey and drops stale token accounts", () => {
+  const existing = { version: 1, providers: [{ id: "commandcode", enabled: true, source: "api", tokenAccounts: { version: 1, activeIndex: 0, accounts: [{ id: "old", label: "old", token: "old" }] } }] };
+  const accounts = {
+    "commandcode-a": { provider: "commandcode", apiKeyFile: "/run/secrets/cc", quota: { source: "codexbar", provider: "commandcode", enforce: true } },
+  } as Record<string, Account>;
+  const generated = generateCodexbarConfig(accounts, {}, () => "cc-key", 1760000000, existing);
+  const entry = (generated.document.providers as Array<Record<string, unknown>>).find(p => p.id === "commandcode") as Record<string, unknown>;
+  expect(entry).toEqual({ id: "commandcode", enabled: true, source: "api", apiKey: "cc-key" } as never);
+  expect(generated.included).toEqual(["commandcode-a"]);
+});
+
+test("a second commandcode account is skipped rather than written as an unsupported token account", () => {
+  const accounts = {
+    "cc-a": { provider: "commandcode", apiKeyEnv: "A", quota: { source: "codexbar", provider: "commandcode", enforce: false } },
+    "cc-b": { provider: "commandcode", apiKeyEnv: "B", quota: { source: "codexbar", provider: "commandcode", enforce: false } },
+  } as Record<string, Account>;
+  const generated = generateCodexbarConfig(accounts, {}, () => "k", 1760000000);
+  expect(generated.included).toEqual([]);
+  expect(generated.skipped.map(s => s.account).sort()).toEqual(["cc-a", "cc-b"]);
+  expect(generated.document.providers).toEqual([]);
+});

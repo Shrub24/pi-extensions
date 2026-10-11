@@ -18,6 +18,12 @@ export interface GeneratedConfig {
 type ProviderEntry = Record<string, unknown> & { id: string };
 type Document = Record<string, unknown> & { providers?: ProviderEntry[] };
 
+/**
+ * Providers CodexBar takes as one provider-level `apiKey` rather than `tokenAccounts`
+ * (`codexbar config validate` reports token accounts as unused for these).
+ */
+const PROVIDER_KEY_ONLY = new Set(["commandcode"]);
+
 /** Stable token-account id derived from the router account id, so regeneration does not churn ids. */
 export function stableUuid(seed: string): string {
   const bytes = createHash("sha256").update(`pi-native-router:${seed}`).digest().subarray(0, 16);
@@ -39,7 +45,7 @@ export function generateCodexbarConfig(
   addedAt: number,
   existing?: Document,
 ): GeneratedConfig {
-  const byProvider = new Map<string, Array<Record<string, unknown>>>();
+  const byProvider = new Map<string, Array<{ accountId: string; entry: Record<string, unknown> }>>();
   const included: string[] = [];
   const skipped: GeneratedConfig["skipped"] = [];
   for (const [id, account] of Object.entries(accounts)) {
@@ -49,17 +55,29 @@ export function generateCodexbarConfig(
     if (!token) { skipped.push({ account: id, reason: `${source} is not available` }); continue; }
     const label = account.quota.account ?? id;
     const entries = byProvider.get(account.quota.provider) ?? [];
-    if (entries.some(entry => entry.label === label)) { skipped.push({ account: id, reason: `duplicate CodexBar label ${label}` }); continue; }
-    entries.push({ id: stableUuid(id), label, token, addedAt });
+    if (entries.some(member => member.entry.label === label)) { skipped.push({ account: id, reason: `duplicate CodexBar label ${label}` }); continue; }
+    entries.push({ accountId: id, entry: { id: stableUuid(id), label, token, addedAt } });
     byProvider.set(account.quota.provider, entries);
-    included.push(id);
   }
 
   const existingById = new Map((existing?.providers ?? []).map(entry => [entry.id, entry]));
   const owned = new Map<string, ProviderEntry>();
-  for (const [provider, entries] of byProvider) {
+  for (const [provider, members] of byProvider) {
+    const { tokenAccounts: _staleAccounts, apiKey: _staleKey, ...kept }: Partial<ProviderEntry> = existingById.get(provider) ?? {};
+    if (PROVIDER_KEY_ONLY.has(provider)) {
+      // CodexBar takes these as one provider-level key; token accounts are reported as unused.
+      if (members.length !== 1) {
+        for (const member of members) skipped.push({ account: member.accountId, reason: `${provider} takes one key; keep a single account for it` });
+        continue;
+      }
+      const [only] = members;
+      included.push(only.accountId);
+      owned.set(provider, { ...kept, id: provider, enabled: true, source: "api", apiKey: only.entry.token });
+      continue;
+    }
+    included.push(...members.map(member => member.accountId));
     // Authoritative account meters: `auto` can return device-local estimates instead.
-    owned.set(provider, { ...existingById.get(provider), id: provider, enabled: true, source: "api", tokenAccounts: { version: 1, activeIndex: 0, accounts: entries } });
+    owned.set(provider, { ...kept, id: provider, enabled: true, source: "api", tokenAccounts: { version: 1, activeIndex: 0, accounts: members.map(member => member.entry) } });
   }
   for (const quota of Object.values(quotas)) {
     if (owned.has(quota.provider)) continue;
