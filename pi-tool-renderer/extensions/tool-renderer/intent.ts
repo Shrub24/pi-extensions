@@ -78,7 +78,7 @@ export function withIntentParameter<T extends TSchema>(parameters: T): T {
 	const source = parameters as unknown as Record<string, unknown>;
 	const next = { ...source } as Record<string, unknown>;
 	const properties = { ...((source.properties as Record<string, unknown>) ?? {}) };
-	properties[INTENT_FIELD] = { type: "string", description: intentDescription(), minLength: 4, maxLength: 120 };
+	properties[INTENT_FIELD] = { type: "string", description: intentDescription(), minLength: INTENT_MIN_LENGTH, maxLength: INTENT_MAX_LENGTH };
 	next.properties = properties;
 	const required = Array.isArray(source.required) ? (source.required as string[]).filter((entry) => entry !== INTENT_FIELD) : [];
 	next.required = required;
@@ -177,9 +177,9 @@ const CODEMODE_OPTIONS_LINE = /^\/\/\s*@options\s*:/;
 /** One leading purpose comment. Case-insensitive so `// Intent:` also counts. */
 const CODEMODE_PURPOSE_LINE = /^\/\/\s*intent\s*:\s*(.*)$/i;
 
-/** Length bounds of a meaningful purpose, matching the intent argument schema. */
-const PURPOSE_MIN_LENGTH = 4;
-const PURPOSE_MAX_LENGTH = 120;
+/** Length bounds of a meaningful intent. The schema and the codemode purpose parser share them. */
+export const INTENT_MIN_LENGTH = 4;
+export const INTENT_MAX_LENGTH = 200;
 
 /**
  * The root codemode purpose: exactly one meaningful leading `// intent: ...`
@@ -211,7 +211,7 @@ export function parseCodemodePurpose(code: unknown): string | undefined {
 		// rather than silently pick one.
 		if (purpose !== undefined) return undefined;
 		const text = (match[1] ?? "").trim();
-		if (text.length < PURPOSE_MIN_LENGTH || text.length > PURPOSE_MAX_LENGTH) return undefined;
+		if (text.length < INTENT_MIN_LENGTH || text.length > INTENT_MAX_LENGTH) return undefined;
 		purpose = text;
 	}
 	return purpose;
@@ -252,7 +252,7 @@ export function isToolIssuedCall(event: { parentToolCallId?: string }): boolean 
 
 /** Guidance returned for a model-issued call that omitted a required intent. */
 export function missingIntentReason(toolName: string): string {
-	return `The ${toolName} call is missing its required "intent". Add one short sentence stating what this specific call is for, for example { "intent": "read the failing test's expectations" } (at least ${PURPOSE_MIN_LENGTH} characters, at most ${PURPOSE_MAX_LENGTH}), and issue the call again. Calls a codemode script or another tool makes are exempt and need no intent.`;
+	return `The ${toolName} call is missing its required "intent". Add one short sentence stating what this specific call is for, for example { "intent": "read the failing test's expectations" } (at least ${INTENT_MIN_LENGTH} characters, at most ${INTENT_MAX_LENGTH}), and issue the call again. Calls a codemode script or another tool makes are exempt and need no intent.`;
 }
 
 /** Guidance returned for a root codemode call without a leading purpose. */

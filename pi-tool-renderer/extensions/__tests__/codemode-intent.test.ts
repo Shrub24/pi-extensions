@@ -8,6 +8,7 @@
 // policy is enforced per call by the `tool_call` guard this package installs.
 
 import { expect, test } from "bun:test";
+import { INTENT_MAX_LENGTH, withIntentParameter } from "../tool-renderer/intent";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Container, Text } from "@earendil-works/pi-tui";
@@ -196,4 +197,12 @@ test("the wrapped native codemode renderer is the one that builds the row", () =
 	expect(calls).toEqual([{ code: "// intent: inspect the log\nreturn 1" }]);
 	expect(component.render(80).join("\n")).toContain("codemode — inspect the log");
 	expect(component.render(80).join("\n")).toContain("// intent: inspect the log");
+});
+
+test("the intent schema and the codemode purpose share one length bound", () => {
+	const schema = withIntentParameter({ type: "object", properties: {} } as never) as unknown as { properties: { intent: { maxLength: number; minLength: number } } };
+	expect(schema.properties.intent.maxLength).toBe(INTENT_MAX_LENGTH);
+	const atLimit = "a".repeat(INTENT_MAX_LENGTH);
+	expect(parseCodemodePurpose(`// intent: ${atLimit}\nreturn 1`)).toBe(atLimit);
+	expect(parseCodemodePurpose(`// intent: ${"a".repeat(INTENT_MAX_LENGTH + 1)}\nreturn 1`)).toBeUndefined();
 });
