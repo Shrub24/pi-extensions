@@ -177,6 +177,8 @@ export const ATTR_PI_CONTEXT_PERCENT = "pi.context.percent";
 export const ATTR_PI_CACHE_EPOCH = "pi.cache.epoch";
 export const ATTR_PI_ROUTE_PREVIOUS_MODEL = "pi.route.previous_model";
 export const ATTR_PI_ROUTE_VIRTUAL_MODEL = "pi.route.virtual_model";
+/** User-configured account key that authenticated the physical dispatch (never a secret or derived fingerprint). */
+export const ATTR_PI_ROUTE_ACCOUNT_ID = "pi.route.account_id";
 export const ATTR_PI_ROUTE_TRANSITION_REASON = "pi.route.transition_reason";
 /** Remote parent this process inherited through TRACEPARENT (a spawning pi). */
 export const ATTR_PI_PARENT_TRACE_ID = "pi.parent.trace_id";

@@ -1,0 +1,17 @@
+{
+  "name": "@vanillagreen/pi-native-router",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Sticky native Pi virtual routes with bounded provider recovery",
+  "pi": { "extensions": ["./src/index.ts"] },
+  "files": ["src", "README.md"],
+  "scripts": { "test": "bun test tests", "typecheck": "tsc --noEmit" },
+  "peerDependencies": { "@earendil-works/pi-coding-agent": ">=1.1.0" },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.1.0",
+    "@earendil-works/pi-agent-core": "1.1.0",
+    "@earendil-works/pi-ai": "1.1.0",
+    "@types/bun": "^1.3.0",
+    "typescript": "^5.9.0"
+  }
+}

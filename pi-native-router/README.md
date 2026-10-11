@@ -1,0 +1,116 @@
+# pi-native-router (v0.1)
+
+Opt-in native Pi virtual models: `route/<role>` selects an ordered physical registry candidate while Pi owns credentials, transport, streaming, reasoning, retries and physical usage accounting. Requires Pi **1.1.0+**; validated against 1.1.0. No routes or paid requests are enabled by default.
+
+## Configuration
+
+Load this package through Pi package/extension discovery in **both parent and worker runtimes**. Set user-owned `$PI_CODING_AGENT_DIR/settings.json` (default `~/.pi/agent/settings.json`):
+
+```json
+{
+  "compaction": { "enabled": false },
+  "kendex": {
+    "extensionManager": {
+      "config": {
+        "@vanillagreen/pi-native-router": {
+          "flushTimeoutMs": 5000,
+          "routes": {
+            "worker": {
+              "contextWindow": 200000,
+              "outputReserve": 8192,
+              "stayRetries": 1,
+              "maxTransitions": 3,
+              "maxRecoveries": 2,
+              "candidates": [
+                { "provider": "anthropic", "id": "YOUR-MODEL-ID", "thinkingLevel": "high", "cacheTtlMs": 1800000 },
+                { "provider": "openai-codex", "id": "YOUR-MODEL-ID", "thinkingLevel": "medium" }
+              ]
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+IDs must resolve to physical models with configured credentials in the native registry. Missing/unconfigured candidates are skipped; malformed definitions, duplicate candidates, nested routes and unknown settings fail loading. No network probing is performed by the router. Project settings do not override routing: a checkout must not silently redirect paid requests. Reload the extension after configuration edits. Candidate thinking levels are fixed per candidate; Pi clamps them to supported levels. Optional positive integer `cacheTtlMs` opts that physical model into request-driven estimated expiry handling; it is not a provider guarantee and is disabled when omitted.
+
+Defaults per route: `contextWindow:200000`, `outputReserve:8192`, `stayRetries:1`, `maxTransitions:3`, `maxRecoveries:2`. Transition/recovery limits may be zero. Timeout is 1–60000ms; routes have 1–32 unique candidates. Disable **native Pi** automatic compaction separately as shown; the router does not invoke it. Magic Context must remain loaded with its own compaction/materialization enabled (its `compaction-off` flush refusal blocks transitions).
+
+## Named API-key accounts
+
+Optional `accounts` map (user settings only) binds an opaque ID to a provider and the **environment variable** holding its key. One key is one account. Candidates may name an account; a provider with named accounts must name one on every candidate, so no candidate can fall through to a different credential.
+
+```json
+{
+  "accounts": {
+    "go-a": { "provider": "opencode-go", "apiKeyEnv": "OPENCODE_GO_KEY_A" },
+    "go-b": { "provider": "opencode-go", "apiKeyEnv": "OPENCODE_GO_KEY_B" }
+  },
+  "routes": {
+    "worker": {
+      "candidates": [
+        { "provider": "opencode-go", "id": "YOUR-MODEL-ID", "account": "go-a" },
+        { "provider": "opencode-go", "id": "YOUR-MODEL-ID", "account": "go-b" }
+      ]
+    }
+  }
+}
+```
+
+Activation uses Pi's runtime key operation (`ModelRuntime.setRuntimeApiKey`, reached through the same private facade as `pi-accounts`) before the selected candidate's request is prepared, and verifies the effective key. **This is provider-global within one Pi runtime**: one active key per provider serves all requests in that process, including overlapping or direct calls. Concurrent isolation requires separate Pi runtimes. Parent and worker processes each keep their own active key. A missing environment variable makes that candidate unavailable, never a silent fallback. A host without the runtime operation fails the named-account candidate before dispatch; default-auth candidates are unaffected. Literal keys are rejected. Cooldowns are per account and provider-scoped failures apply to that account only.
+
+## Stickiness and capacity
+
+JSON branch state persists the last dispatched identity, non-decreasing context-window floor and bounded turn-recovery bookkeeping. Restore, fork and compaction retain it. Healthy user turns and tool continuations stay on the physical model; successful failover stays there rather than automatically returning to the first candidate. Candidate/config/catalog changes reconcile against the current registry while retaining the floor. Per-turn counters reset when a new real user transcript entry appears, not at native `agent_start` retry boundaries.
+
+Direct registry requests select deterministically from current candidates/health without reading or writing session state, triggering flushes or consuming session recovery budgets. Local health can exclude candidates for direct calls, but direct calls do not update it.
+
+**v0.1 never automatically falls back to a smaller context window.** Initial selection honors configured logical capacity and conservative canonical/latest-successful-usage estimates. Subsequent selection also honors the stored physical capacity floor, including after restore/config changes. Reserve is the greater of configured output reserve and the candidate's maximum output; a candidate must support the configured output reserve. Pi routes *before* extension context preparation, so final effective tokens (including refreshed Magic Context additions) are unavailable. These estimates are not a hard final-token guarantee; preserving capacity prevents failover itself from shrinking the window. No host patch is required for this conservative rule.
+
+## Failure policy
+
+- Safe transient transport/server errors stay for `stayRetries` native retry callbacks, then cool down that model and advance.
+- Rate limits cool down the model by default. Quota/billing exhaustion and authentication failures cool down the provider. Structured JSON error text can specify `status`, `scope:"provider"`, `retryAfterSeconds` or epoch-millisecond `resetAt`.
+- Default cooldowns: transient 30s, rate 60s, quota/auth 300s; available hints clamp to 1s–900s. Health is process-local and expires on restart. Provider scope is coarse (all configured accounts behind that provider), not cross-process shared health. Pi's public assistant error exposes strings, not reliable raw HTTP headers; no header parsing is promised.
+- Aborts, invalid requests, context overflow, unknown/non-provider errors, tool/deferred content and nonempty partial text/thinking do not migrate. Native Pi may independently retry errors under its own policy; the router refuses unsafe migration.
+- Safe terminal errors recover only at `agent_before_settle`, when another candidate and both budgets remain. A `context_edit:null` omits only the empty failed assistant from projected context; raw history is retained. The existing user/tool-result context continues without synthetic instructions or replaying completed tools. Partial output is never omitted by this extension.
+- No candidate or budget remaining means settlement. Recovery uses native scheduling only; no custom execution/retry loop exists.
+
+## Transition handshake
+
+A real session physical change (not initial, same-model or direct dispatch) awaits `magic-context:flush` → matching-session `magic-context:flush-result`. For an opted-in model, an expired successful-activity epoch also flushes before the next dispatch even when the physical model is unchanged; that emits `native-router:estimated-cache-invalidation`, not transition events. Switch plus expiry shares the one transition flush. Only `status:"success"` succeeds. Skips, failures, missing extension/timeouts and aborts prevent replacement dispatch; state/observation is committed only after pre-dispatch work succeeds. Handshakes serialize within the session. The protocol lacks correlation IDs: an unrelated emitter for the **same session** can still produce an ambiguous result; do not issue concurrent external flush requests during routing.
+
+The flush result signals pending work, **not completion of provider-context materialization**. Pi 1.1.0 subsequently runs `context` handlers before physical streaming, on retries and terminal continuations too. Magic Context consumes pending-op/history flags there. Its system adjunct refresh is different: it waits until the next `before_agent_start`, which native retries and settlement continuations do not invoke. Flush is not wrapup or unconditional compression.
+
+Local integrations can synchronously register work:
+
+```ts
+pi.events.on("native-router:before-transition", (event: any) => {
+  event.waitUntil(myPreDispatchWork(event));
+});
+pi.events.on("native-router:transition", (event: any) => {
+  // observation: sessionId, logical, from, to
+});
+```
+
+`waitUntil` must be called during event delivery; its promise is awaited under the same timeout/abort boundary. `installRouter(pi, config, { transition })` exposes a replaceable local transition hook for an owning integration/test; the default is the Magic Context bridge. Observations do not change logical model selection.
+
+## Parent / Herdsman workers
+
+Select `--model route/worker`. Inherited virtual models must allow extension discovery; the narrow Herdsman compatibility change recognizes registry virtual models even though their providers do not appear in `getRegisteredProviderIds()`. Pinned virtual models with `noExtensions:true` still need explicit extension paths or a definition that allows discovery. A wrapper using `--no-extensions` must explicitly load this package **and the full Magic Context entry**; the lean MC subagent entry does not register the flush bridge. Parent and worker must read the same route config and use matching Pi APIs; each has independent local health. Bundle loading and activation remain deployment-owner work.
+
+Magic Context's Pi-only idle-TTL disablement and preserved **200000** pressure threshold are peer-owned. This package neither edits external repositories nor changes shared OpenCode TTL policy. Do not deploy until those settings and full-entry worker loading are verified.
+
+## Validation / limits
+
+```sh
+cd pi-native-router
+bun run typecheck
+bun test tests
+```
+
+Tests use actual Pi 1.1.0 AgentSession/ModelRuntime with deterministic fake providers, including terminal quota recovery, native transient retry, tool continuation/no replay, flush failure/timeout/abort, capacity floors, JSON branch restore/fork/compaction, direct isolation and package entry loading. The host materialization fixture models MC's public pending-flag protocol and asserts provider-visible transformed messages, not merely event ordering. Complementary peer-owned actual `executeCtxFlush`/registered context-handler tests pass (154 tests in MC's context-handler.test.ts), proving pending drop/history materialization independently. Together these establish the scoped flush claim; **they are not a single-process deployed-plugin end-to-end smoke**. Deployment/live credentials have not been activated or tested.
+
+Deferred: final-effective-context late preparation/re-route host seam, correlated MC requests, provider/account-specific health granularity. Rollback: unload this package and select a physical model directly; credentials are unchanged.

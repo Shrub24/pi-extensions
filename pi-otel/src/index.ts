@@ -186,6 +186,16 @@ export default function (pi: ExtensionAPI): void {
     );
   });
 
+  // native-router:account-active: the router announces the account it just
+  // activated for a provider; generations on that provider carry it as
+  // pi.route.account_id. Identifiers are user-chosen keys, validated like config.
+  pi.events.on("native-router:account-active", (data: unknown) => {
+    const event = data as { provider?: unknown; account?: unknown } | null;
+    if (typeof event?.provider !== "string" || typeof event.account !== "string") return;
+    if (!/^[a-z][a-z0-9_-]{0,31}$/.test(event.account)) return;
+    tracker?.noteRouteAccount(event.provider, event.account);
+  });
+
   // Keep ctx around for handlers that don't receive it.
   let lastCtx: ExtensionContext | undefined;
 

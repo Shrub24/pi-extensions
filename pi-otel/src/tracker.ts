@@ -116,6 +116,7 @@ import {
   ATTR_PI_PARENT_TRACE_ID,
   ATTR_PI_PROMPT_LENGTH,
   ATTR_PI_ROUTE_PREVIOUS_MODEL,
+  ATTR_PI_ROUTE_ACCOUNT_ID,
   ATTR_PI_ROUTE_VIRTUAL_MODEL,
   ATTR_PI_ROUTE_TRANSITION_REASON,
   ATTR_PI_SESSION_FILE,
@@ -302,6 +303,8 @@ function categorizeThrownError(combined: string, errName: string): string {
 export type SessionReason = "startup" | "reload" | "new" | "resume" | "fork";
 
 export class SpanTracker {
+  /** Active named account per provider, announced by the router before dispatch. */
+  private readonly routeAccounts = new Map<string, string>();
   private opts: TrackerOptions;
   private readonly semconv: SemconvDialect;
   /** Session correlation state; the session itself is not a span. */
@@ -784,6 +787,8 @@ export class SpanTracker {
     attrs[ATTR_GEN_AI_AGENT_NAME] = GEN_AI_SYSTEM;
     if (providerSystem) {
       attrs[this.providerNameKey()] = providerSystem;
+      const account = this.accountFor(providerSystem);
+      if (account) attrs[ATTR_PI_ROUTE_ACCOUNT_ID] = account;
     }
     if (requestModel) attrs[ATTR_GEN_AI_REQUEST_MODEL] = requestModel;
     if (pending?.virtualModel) attrs[ATTR_PI_ROUTE_VIRTUAL_MODEL] = pending.virtualModel;
@@ -839,6 +844,7 @@ export class SpanTracker {
     const elapsedSec = Number(process.hrtime.bigint() - this.llm.startNs) / 1e9;
     const base: Attributes = this.commonAttrs();
     if (this.llm.requestModel) base[ATTR_GEN_AI_REQUEST_MODEL] = this.llm.requestModel;
+    this.applyAccount(base);
     if (this.llm.providerSystem) base[this.providerNameKey()] = this.llm.providerSystem;
     try {
       this.opts.metrics()?.timeToFirstToken.record(elapsedSec, base);
@@ -861,6 +867,7 @@ export class SpanTracker {
     const elapsedSec = Number(process.hrtime.bigint() - this.llm.startNs) / 1e9;
     const base: Attributes = this.commonAttrs();
     if (this.llm.requestModel) base[ATTR_GEN_AI_REQUEST_MODEL] = this.llm.requestModel;
+    this.applyAccount(base);
     if (this.llm.providerSystem) base[this.providerNameKey()] = this.llm.providerSystem;
     try {
       this.opts.metrics()?.timeToCompletion.record(elapsedSec, base);
@@ -997,6 +1004,7 @@ export class SpanTracker {
       try {
         const attrs: Attributes = this.commonAttrs();
         if (this.llm.requestModel) attrs[ATTR_GEN_AI_REQUEST_MODEL] = this.llm.requestModel;
+        this.applyAccount(attrs);
         attrs[ATTR_HTTP_STATUS_CODE] = status;
         this.opts.metrics()?.providerRetries.add(1, attrs);
       } catch { /* noop */ }
@@ -1034,11 +1042,28 @@ export class SpanTracker {
     });
   }
 
+  /** Records the account the router just activated for a provider (provider-global per Pi runtime). */
+  noteRouteAccount(provider: string, account: string): void {
+    this.routeAccounts.set(provider, account);
+  }
+
+  private accountFor(provider: string | undefined): string | undefined {
+    return provider ? this.routeAccounts.get(provider) : undefined;
+  }
+
+  /** Adds the account beside the physical model on a metric attribute set. */
+  private applyAccount(attrs: Attributes): void {
+    const account = this.accountFor(this.llm?.providerSystem);
+    if (account) attrs[ATTR_PI_ROUTE_ACCOUNT_ID] = account;
+  }
+
   private resolveLlmIdentity(message: { model?: string; provider?: string }): void {
     if (!this.llm) return;
     if (message.provider) {
       this.llm.providerSystem = message.provider;
       this.llm.span.setAttribute(this.providerNameKey(), message.provider);
+      const account = this.accountFor(message.provider);
+      if (account) this.llm.span.setAttribute(ATTR_PI_ROUTE_ACCOUNT_ID, account);
     }
     if (message.model && (message.provider || !this.llm.requestModel)) {
       this.llm.requestModel = message.model;
@@ -1170,6 +1195,7 @@ export class SpanTracker {
     const elapsedSec = Number(process.hrtime.bigint() - this.llm.startNs) / 1e9;
     const base: Attributes = this.commonAttrs();
     if (this.llm.requestModel) base[ATTR_GEN_AI_REQUEST_MODEL] = this.llm.requestModel;
+    this.applyAccount(base);
     if (this.llm.providerSystem) base[this.providerNameKey()] = this.llm.providerSystem;
     if (this.llm.responseModel) base[ATTR_GEN_AI_RESPONSE_MODEL] = this.llm.responseModel;
     try {

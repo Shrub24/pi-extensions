@@ -1,0 +1,178 @@
+import {
+  estimateTokens, VIRTUAL_MODEL_STATE_ENTRY,
+  type ExtensionAPI, type ExtensionContext, type ModelRouteRequest, type ModelRoute,
+} from "@earendil-works/pi-coding-agent";
+import type { Api, Message, Model } from "@earendil-works/pi-ai";
+import { readConfig, type Config, type RouteConfig } from "./config";
+import { accountActive, accountSecret, useAccount } from "./accounts";
+import { accountOf, cacheExpiry, choose, classify, Health, identity, physicalOf, restore, type Resolved, type State } from "./policy";
+import { beforeTransition, flushBridge, type FlushHook, type TransitionHook } from "./transition";
+
+function tokens(messages: readonly Message[]): number {
+  const canonical = messages.reduce((n, m) => n + estimateTokens(m), 0);
+  const latest = messages.findLast(m => m.role === "assistant" && m.stopReason !== "error" && m.stopReason !== "aborted");
+  if (!latest || latest.role !== "assistant") return canonical;
+  const u = latest.usage;
+  return Math.max(canonical, u.input + u.output + u.cacheRead + u.cacheWrite);
+}
+function turnKey(ctx: ExtensionContext): string {
+  const user = ctx.sessionManager.getBranch().findLast(e => e.type === "message" && e.message.role === "user");
+  return user?.id ?? "no-user";
+}
+function available(route: RouteConfig, ctx: ExtensionContext, accounts: Config["accounts"]): Resolved[] {
+  return route.candidates.flatMap(candidate => {
+    const model = ctx.modelRegistry.find(candidate.provider, candidate.id);
+    if (!model || model.api === "pi-virtual") return [];
+    if (candidate.account !== undefined) {
+      const account = accounts[candidate.account];
+      return account && accountSecret(account) !== undefined ? [{ candidate, model }] : [];
+    }
+    return ctx.modelRegistry.hasConfiguredAuth(model) ? [{ candidate, model }] : [];
+  });
+}
+// Direct calls never change the runtime key; they may only use named accounts already active.
+async function activeOnly(candidates: Resolved[], ctx: ExtensionContext, accounts: Config["accounts"]): Promise<Resolved[]> {
+  const kept: Resolved[] = [];
+  for (const c of candidates) {
+    const account = c.candidate.account === undefined ? undefined : accounts[c.candidate.account];
+    if (!account || (await accountActive(ctx, account, c.candidate.provider))) kept.push(c);
+  }
+  return kept;
+}
+const CACHE_ACTIVITY_ENTRY = "@vanillagreen/pi-native-router/cache-activity";
+function branchState(ctx: ExtensionContext, role: string): State | undefined {
+  const branch = ctx.sessionManager.getBranch();
+  const entry = branch.findLast(e => e.type === "custom" && e.customType === VIRTUAL_MODEL_STATE_ENTRY && (e.data as { provider?: string; modelId?: string })?.provider === "route" && (e.data as { modelId?: string })?.modelId === role);
+  const state = entry?.type === "custom" ? restore((entry.data as { state?: unknown }).state) : undefined;
+  if (!state) return undefined;
+  const activity = branch.findLast(e => e.type === "custom" && e.customType === CACHE_ACTIVITY_ENTRY && (e.data as { logical?: string })?.logical === `route/${role}`);
+  if (activity?.type === "custom") {
+    const fact = activity.data as State["cacheActivity"];
+    if (fact && fact.physical === state.physical && Number.isSafeInteger(fact.at) && fact.at >= 0 && (fact.consumedAt === undefined || (Number.isSafeInteger(fact.consumedAt) && fact.consumedAt >= fact.at))) state.cacheActivity = fact;
+  }
+  return state;
+}
+export function installRouter(pi: ExtensionAPI, config: Config, options: { transition?: TransitionHook; now?: () => number } = {}) {
+  const health = new Health(options.now);
+  const hook = options.transition ?? flushBridge(pi, config.flushTimeoutMs);
+  const flush = flushBridge(pi, config.flushTimeoutMs);
+  const queues = new Map<string, Promise<unknown>>();
+  const activities = new Map<string, State["cacheActivity"]>();
+  async function serialized<T>(sessionId: string, run: () => Promise<T>): Promise<T> {
+    const previous = queues.get(sessionId) ?? Promise.resolve();
+    const current = previous.catch(() => {}).then(run);
+    queues.set(sessionId, current);
+    try { return await current; }
+    finally { if (queues.get(sessionId) === current) queues.delete(sessionId); }
+  }
+  for (const [role, route] of Object.entries(config.routes)) {
+    const resolve = async (request: ModelRouteRequest<State>, ctx: ExtensionContext): Promise<ModelRoute<State>> => {
+      request.signal?.throwIfAborted();
+      const candidates = available(route, ctx, config.accounts);
+      const estimate = Math.max(tokens(request.messages), request.reason === "direct" ? 0 : ctx.getContextUsage()?.tokens ?? 0);
+      if (request.reason === "direct") {
+        const selected = choose(route, await activeOnly(candidates, ctx, config.accounts), health, estimate, route.contextWindow);
+        if (!selected) throw new Error(`Native route/${role} exhausted: no compatible authenticated candidate`);
+        return { model: selected.model, thinkingLevel: selected.candidate.thinkingLevel };
+      }
+      const old = restore(request.state);
+      const persisted = branchState(ctx, role);
+      const activityKey = `${ctx.sessionManager.getSessionId()}:${role}`;
+      const activity = activities.get(activityKey) ?? persisted?.cacheActivity ?? old?.cacheActivity;
+      if (old && activity) old.cacheActivity = activity;
+      const turn = turnKey(ctx);
+      const state: State = old ? { ...old } : { version: 1, physical: "", floor: route.contextWindow, turn, retries: 0, transitions: 0, recoveries: 0 };
+      if (activity) state.cacheActivity = activity;
+      if (state.turn !== turn) Object.assign(state, { turn, retries: 0, transitions: 0, recoveries: 0, next: undefined });
+      state.floor = Math.max(state.floor, request.previous?.model.contextWindow ?? 0);
+      let exclude: string | undefined;
+      if (request.failed) {
+        const failure = classify(request.failed.message, options.now?.());
+        if (failure.kind === "unsafe") throw new Error(`Native route/${role} refuses unsafe retry migration`);
+        state.retries++;
+        const stay = failure.kind === "transient" && state.retries <= route.stayRetries;
+        const failedAccount = old?.physical !== undefined && physicalOf(old.physical) === identity(request.failed.model) ? accountOf(old.physical) : undefined;
+        if (!stay) { health.mark(request.failed.model, failure, failedAccount); exclude = identity(request.failed.model, failedAccount); }
+      }
+      const selected = choose(route, candidates, health, estimate, state.floor, state.next ?? state.physical, exclude);
+      if (!selected) throw new Error(`Native route/${role} exhausted: no compatible authenticated candidate outside cooldown`);
+      const physical = identity(selected.model, selected.candidate.account);
+      const account = selected.candidate.account === undefined ? undefined : config.accounts[selected.candidate.account];
+      if (account) await useAccount(ctx, selected.candidate.provider, account);
+      if (account) pi.events.emit("native-router:account-active", { provider: selected.candidate.provider, account: selected.candidate.account });
+      const now = options.now?.() ?? Date.now();
+      const logical = `route/${role}`;
+      const ttl = route.candidates.find(c => identity(c, c.account) === state.physical)?.cacheTtlMs;
+      const expired = cacheExpiry(state.cacheActivity, logical, state.physical, ttl, now);
+      const switching = Boolean(state.physical && physical !== state.physical);
+      if (switching) {
+        if (state.transitions >= route.maxTransitions) throw new Error(`Native route/${role} transition budget exhausted`);
+        const transition = { sessionId: ctx.sessionManager.getSessionId(), logical: `route/${role}`, from: state.physical, to: physical };
+        await beforeTransition(pi, hook, transition, config.flushTimeoutMs, request.signal);
+        state.transitions++;
+        state.retries = 0;
+        pi.events.emit("native-router:transition", transition);
+        if (expired) {
+          state.cacheActivity = { ...state.cacheActivity!, consumedAt: state.cacheActivity!.at };
+          activities.set(activityKey, state.cacheActivity);
+          pi.appendEntry(CACHE_ACTIVITY_ENTRY, state.cacheActivity);
+          pi.events.emit("native-router:estimated-cache-invalidation", { ...transition, physical, reason: "estimated-expiry" });
+        }
+      } else if (expired) {
+        const session = { sessionId: ctx.sessionManager.getSessionId() };
+        await flush(session, request.signal);
+        state.cacheActivity = { ...state.cacheActivity!, consumedAt: state.cacheActivity!.at };
+        activities.set(activityKey, state.cacheActivity);
+        pi.appendEntry(CACHE_ACTIVITY_ENTRY, state.cacheActivity);
+        pi.events.emit("native-router:estimated-cache-invalidation", { ...session, logical, physical, reason: "estimated-expiry" });
+      }
+      state.physical = physical;
+      state.floor = Math.max(state.floor, selected.model.contextWindow);
+      delete state.next;
+      const unchanged = old && JSON.stringify(old) === JSON.stringify(state);
+      return { model: selected.model, thinkingLevel: selected.candidate.thinkingLevel, state: unchanged ? request.state : state };
+    };
+    pi.on("message_end", (event, ctx) => {
+      if (event.message.role !== "assistant" || event.message.stopReason === "error" || event.message.stopReason === "aborted") return;
+      const role = ctx.model?.provider === "route" ? ctx.model.id : undefined;
+      if (!role || !config.routes[role]) return;
+      const state = branchState(ctx, role);
+      const physical = `${event.message.provider}/${event.message.model}`;
+      if (!state || physicalOf(state.physical) !== physical) return;
+      const activity = { logical: `route/${role}`, physical: state.physical, at: options.now?.() ?? Date.now() };
+      activities.set(`${ctx.sessionManager.getSessionId()}:${role}`, activity);
+      pi.appendEntry(CACHE_ACTIVITY_ENTRY, activity);
+    });
+    pi.registerVirtualModel<State>({
+      provider: "route", id: role, name: `Route: ${role}`, contextWindow: route.contextWindow, maxTokens: route.outputReserve,
+      route: (request, ctx) => request.reason === "direct" ? resolve(request, ctx) : serialized(ctx.sessionManager.getSessionId(), () => resolve(request, ctx)),
+    });
+  }
+  pi.on("agent_before_settle", (event, ctx) => {
+    if (event.outcome !== "error" || ctx.signal?.aborted || ctx.model?.provider !== "route" || ctx.hasPendingMessages()) return;
+    const role = ctx.model.id;
+    const route = config.routes[role];
+    const state = branchState(ctx, role);
+    if (!route || !state || state.next || state.recoveries >= route.maxRecoveries || state.transitions >= route.maxTransitions) return;
+    const last = event.context.contextEntries.findLast(e => e.messages.length > 0);
+    const message = last?.messages.at(-1);
+    if (!message || message.role !== "assistant" || message.stopReason !== "error") return;
+    const failure = classify(message, options.now?.());
+    if (failure.kind === "unsafe") return;
+    const failed: Pick<Model<Api>, "provider" | "id"> = { provider: message.provider, id: message.model };
+    if (physicalOf(state.physical) !== identity(failed)) return;
+    health.mark(failed, failure, accountOf(state.physical));
+    const selected = choose(route, available(route, ctx, config.accounts), health, Math.max(tokens(event.context.llmMessages), ctx.getContextUsage()?.tokens ?? 0), state.floor, undefined, state.physical);
+    if (!selected) return;
+    const before = event.context.contextMessages.slice(0, -1);
+    if (!before.some(m => m.role !== "system") || before.at(-1)?.role === "assistant") return;
+    return {
+      entries: [
+        { type: "context_edit", targetId: last!.sourceEntry.id, replacement: null },
+        { type: "custom", customType: VIRTUAL_MODEL_STATE_ENTRY, data: { provider: "route", modelId: role, state: { ...state, next: identity(selected.model, selected.candidate.account), recoveries: state.recoveries + 1 } } },
+      ],
+      continue: true,
+    };
+  });
+}
+export default function nativeRouter(pi: ExtensionAPI) { installRouter(pi, readConfig()); }
