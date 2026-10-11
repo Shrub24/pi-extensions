@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Account } from "./config";
 
@@ -10,8 +11,20 @@ function runtimeKeys(ctx: ExtensionContext): RuntimeKeys | undefined {
   return runtime && typeof (runtime as RuntimeKeys).setRuntimeApiKey === "function" ? (runtime as RuntimeKeys) : undefined;
 }
 
+/**
+ * Reads an account's key at use time, from its environment variable or its key file (e.g. a sops-nix
+ * secret path). A missing, unreadable or empty source is unavailable, never a silent fallback.
+ */
+export function readAccountKey(account: Account, env: NodeJS.ProcessEnv = process.env): string | undefined {
+  if (account.apiKeyFile !== undefined) {
+    try { return readFileSync(account.apiKeyFile, "utf8").trim() || undefined; }
+    catch { return undefined; }
+  }
+  return env[account.apiKeyEnv] || undefined;
+}
+
 export function accountSecret(account: Account): string | undefined {
-  return process.env[account.apiKeyEnv] || undefined;
+  return readAccountKey(account);
 }
 
 export async function accountActive(ctx: ExtensionContext, account: Account, provider: string): Promise<boolean> {

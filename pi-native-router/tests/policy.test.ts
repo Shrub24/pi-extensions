@@ -93,7 +93,17 @@ test("named accounts are validated and cooldowns isolate accounts of the same pr
   const accounts = { "go-a": { provider: "opencode-go", apiKeyEnv: "GO_A" }, "go-b": { provider: "opencode-go", apiKeyEnv: "GO_B" } };
   const parsed = parseConfig({ accounts, routes: { work: { candidates: [{ provider: "opencode-go", id: "m", account: "go-a" }, { provider: "opencode-go", id: "m", account: "go-b" }] } } });
   expect(parsed.routes.work.candidates.map(c => c.account)).toEqual(["go-a", "go-b"]);
-  expect(() => parseConfig({ accounts, routes: { work: { candidates: [{ provider: "opencode-go", id: "m" }] } } })).toThrow(/must name an account/);
+  // A bare candidate for a provider with named accounts expands to its pool, in configured order.
+  const pooled = parseConfig({ accounts, routes: { work: { candidates: [{ provider: "opencode-go", id: "m", thinkingLevel: "low" }] } } });
+  expect(pooled.routes.work.candidates).toEqual([
+    { provider: "opencode-go", id: "m", thinkingLevel: "low", account: "go-a" },
+    { provider: "opencode-go", id: "m", thinkingLevel: "low", account: "go-b" },
+  ]);
+  // An explicit account is kept and not expanded.
+  const explicit = parseConfig({ accounts, routes: { work: { candidates: [{ provider: "opencode-go", id: "m", account: "go-b" }] } } });
+  expect(explicit.routes.work.candidates.map(c => c.account)).toEqual(["go-b"]);
+  // A pool and an explicit entry that repeat the same account are duplicates.
+  expect(() => parseConfig({ accounts, routes: { work: { candidates: [{ provider: "opencode-go", id: "m" }, { provider: "opencode-go", id: "m", account: "go-a" }] } } })).toThrow(/Duplicate/);
   expect(() => parseConfig({ accounts, routes: { work: { candidates: [{ provider: "other", id: "m", account: "go-a" }] } } })).toThrow(/configured other account/);
   expect(() => parseConfig({ accounts: { "bad id": { provider: "p", apiKeyEnv: "K" } } })).toThrow(/Invalid account id/);
   expect(() => parseConfig({ accounts: { a: { provider: "p", apiKeyEnv: "literal key value" } } })).toThrow(/Invalid account a/);

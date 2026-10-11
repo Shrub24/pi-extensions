@@ -59,7 +59,7 @@ Optional `accounts` map (user settings only) binds an opaque ID to a provider an
 }
 ```
 
-Activation uses Pi's runtime key operation (`ModelRuntime.setRuntimeApiKey`, reached through the same private facade as `pi-accounts`) before the selected candidate's request is prepared, and verifies the effective key. **This is provider-global within one Pi runtime**: one active key per provider serves all requests in that process, including overlapping or direct calls. Concurrent isolation requires separate Pi runtimes. Parent and worker processes each keep their own active key. A missing environment variable makes that candidate unavailable, never a silent fallback. A host without the runtime operation fails the named-account candidate before dispatch; default-auth candidates are unaffected. Literal keys are rejected. Cooldowns are per account and provider-scoped failures apply to that account only.
+Activation uses Pi's runtime key operation (`ModelRuntime.setRuntimeApiKey`, reached through the same private facade as `pi-accounts`) before the selected candidate's request is prepared, and verifies the effective key. **This is provider-global within one Pi runtime**: one active key per provider serves all requests in that process, including overlapping or direct calls. Concurrent isolation requires separate Pi runtimes. Parent and worker processes each keep their own active key. A candidate with no `account` on a provider that has named accounts expands to one candidate per account, in configured order, so a bare `opencode-go` candidate is a pool; each expansion keeps its own health, stickiness and cache epoch. A missing environment variable makes that candidate unavailable, never a silent fallback. A host without the runtime operation fails the named-account candidate before dispatch; default-auth candidates are unaffected. Literal keys are rejected. Cooldowns are per account and provider-scoped failures apply to that account only.
 
 ## Shared health
 
@@ -82,17 +82,27 @@ An account may map to a CodexBar provider so `/quotas` can show its windows:
   "go-a": {
     "provider": "opencode-go",
     "apiKeyEnv": "OPENCODE_GO_KEY_A",
-    "quota": { "source": "codexbar", "provider": "opencodego", "account": "go-a", "enforce": false }
+    "quota": { "source": "codexbar", "provider": "opencodego", "account": "go-a", "enforce": true }
   }
 }
 ```
 
 - `/quotas` runs `codexbar usage --provider <provider> [--account <label>] --format json` with a 15 s deadline and a 64 KiB output cap, under a per-account refresh lease, and prints each window with its usage, reset and observation age. Missing binary, timeout or unrecognised output is shown as unknown and never counts as capacity or as a generation failure.
-- `enforce: true` writes a tracker-sourced cause that skips the account until its exhausted window resets. It is **off by default**: enforcement stays disabled until CodexBar's OpenCode Go source is confirmed to reflect account-wide usage rather than a local estimate.
+- `enforce: true` writes a tracker-sourced cause that skips the account until its exhausted window resets. It is **off by default**; enable it per account once the account's CodexBar source is authoritative (`api`, `web` or `oauth`).
 - A healthy snapshot clears only tracker-sourced causes. Auth, rate, outage and error-derived quota causes are unaffected.
 - `/quotas-config [--replace] [path]` writes CodexBar's config from the quota-mapped accounts: each becomes a token account labelled with its quota account (or router id) and its key read from the same environment variable. Providers are set to `source: "api"` so their meters are account-authoritative rather than device-local. The file is written 0600 via a temporary file and rename, and an existing file is refused unless `--replace` is given. Accounts whose key variable is unset are reported and skipped.
-- Dispatch never waits for CodexBar. Refresh currently happens only through `/quotas`; automatic refresh at session start is not built yet.
+- Refresh runs on session start and every five minutes (leased, so concurrent Pi processes do not duplicate it), and `/quotas` refreshes on demand. Dispatch never waits for CodexBar.
 - Snapshots are authoritative only when the tracker reports server meters (`source` api, web or oauth, or an explicit authoritative confidence). A `local+api` blend or estimate never enforces a block.
+
+## Model pricing (estimates)
+
+`/pricing refresh` downloads models.dev (provider-specific records) and LiteLLM's price map, validates them, and keeps the last valid snapshot at `$PI_CODING_AGENT_DIR/pi-native-router/pricing.json` (`0600`). Refresh runs only on demand; nothing is fetched during dispatch. Redirects and non-200 responses are refused.
+
+- `/pricing show <provider>/<model>` prints the rates in USD per million tokens, labelled as a **list-price estimate**, with its source.
+- Lookup is exact on provider and model. models.dev wins; LiteLLM fills only a physical model models.dev lacks, under the same provider and id.
+- Unknown components stay unknown. A model without a cache-write rate is reported as partial, not free. Context-tiered pricing is reported as partial, because the base rates alone do not price long contexts.
+- Local overrides go under `pricing.overrides` as exact `provider/model` keys with optional `input`, `output`, `cacheRead` and `cacheWrite` rates. Overrides are labelled `override`.
+- Prices are **not yet applied to Pi's usage cost or OTel**. Pi's model registry has no supported price-update seam in the inspected release, so the runtime application stays disabled until that exists.
 
 ## Stickiness and capacity
 

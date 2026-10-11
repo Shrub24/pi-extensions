@@ -5,7 +5,8 @@ import type { QuotaSource } from "./quota";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 
 export const PACKAGE_ID = "@vanillagreen/pi-native-router";
-export interface Account { provider: string; apiKeyEnv: string; quota?: QuotaSource }
+/** Exactly one key source: an environment variable name or an absolute file path (e.g. a sops-nix secret). */
+export type Account = { provider: string; quota?: QuotaSource } & ({ apiKeyEnv: string; apiKeyFile?: undefined } | { apiKeyFile: string; apiKeyEnv?: undefined });
 export interface Candidate { provider: string; id: string; thinkingLevel: ModelThinkingLevel; cacheTtlMs?: number; account?: string }
 export interface RouteConfig {
   candidates: Candidate[];
@@ -15,7 +16,7 @@ export interface RouteConfig {
   maxTransitions: number;
   maxRecoveries: number;
 }
-export interface Config { routes: Record<string, RouteConfig>; accounts: Record<string, Account>; flushTimeoutMs: number; sharedHealth: boolean }
+export interface Config { routes: Record<string, RouteConfig>; accounts: Record<string, Account>; flushTimeoutMs: number; sharedHealth: boolean; pricingOverrides: Record<string, { input?: number; output?: number; cacheRead?: number; cacheWrite?: number }> }
 const levels = ["off", "minimal", "low", "medium", "high", "xhigh"];
 function record(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Router config must be an object");
@@ -31,14 +32,33 @@ function integer(value: unknown, fallback: number, min: number, max: number): nu
 }
 export function parseConfig(raw: unknown): Config {
   const config = record(raw);
-  keys(config, ["routes", "accounts", "flushTimeoutMs", "sharedHealth"]);
+  keys(config, ["routes", "accounts", "flushTimeoutMs", "sharedHealth", "pricing"]);
+  const pricingOverrides: Record<string, { input?: number; output?: number; cacheRead?: number; cacheWrite?: number }> = {};
+  for (const [id, value] of Object.entries(record(record(config.pricing ?? {}).overrides ?? {}))) {
+    const parts = id.split("/");
+    if (parts.length < 2 || !parts[0] || !parts.slice(1).join("/")) throw new Error(`Invalid pricing override key ${id}: use provider/model`);
+    const o = record(value);
+    keys(o, ["input", "output", "cacheRead", "cacheWrite"]);
+    const rates: Record<string, number> = {};
+    for (const field of ["input", "output", "cacheRead", "cacheWrite"] as const) {
+      if (o[field] === undefined) continue;
+      if (typeof o[field] !== "number" || !Number.isFinite(o[field]) || (o[field] as number) < 0) throw new Error(`Pricing override ${id}.${field} must be a finite non-negative number`);
+      rates[field] = o[field] as number;
+    }
+    pricingOverrides[id] = rates;
+  }
   if (config.sharedHealth !== undefined && typeof config.sharedHealth !== "boolean") throw new Error("sharedHealth must be a boolean");
   const accounts: Record<string, Account> = {};
   for (const [id, value] of Object.entries(record(config.accounts ?? {}))) {
     if (!/^[a-z][a-z0-9_-]{0,31}$/.test(id)) throw new Error(`Invalid account id: ${id}`);
     const account = record(value);
-    keys(account, ["provider", "apiKeyEnv", "quota"]);
-    if (typeof account.provider !== "string" || !account.provider || account.provider === "route" || typeof account.apiKeyEnv !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(account.apiKeyEnv)) throw new Error(`Invalid account ${id}: provider and API-key environment variable are required`);
+    keys(account, ["provider", "apiKeyEnv", "apiKeyFile", "quota"]);
+    const hasEnv = account.apiKeyEnv !== undefined;
+    const hasFile = account.apiKeyFile !== undefined;
+    if (hasEnv === hasFile) throw new Error(`Invalid account ${id}: set exactly one of apiKeyEnv or apiKeyFile`);
+    if (hasFile && (typeof account.apiKeyFile !== "string" || !account.apiKeyFile.startsWith("/"))) throw new Error(`Invalid account ${id}: apiKeyFile must be an absolute path`);
+    if (typeof account.provider !== "string" || !account.provider || account.provider === "route") throw new Error(`Invalid account ${id}: a provider is required`);
+    if (hasEnv && (typeof account.apiKeyEnv !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(account.apiKeyEnv))) throw new Error(`Invalid account ${id}: apiKeyEnv must be an environment variable name, not a key`);
     let quota: QuotaSource | undefined;
     if (account.quota !== undefined) {
       const q = record(account.quota);
@@ -50,7 +70,8 @@ export function parseConfig(raw: unknown): Config {
       // Enforcement is opt-in until the source is verified to reflect account-wide usage.
       quota = { source: "codexbar", provider: q.provider, ...(q.account === undefined ? {} : { account: q.account }), enforce: q.enforce === true };
     }
-    accounts[id] = { provider: account.provider, apiKeyEnv: account.apiKeyEnv, ...(quota ? { quota } : {}) };
+    const source = hasFile ? { apiKeyFile: account.apiKeyFile as string } : { apiKeyEnv: account.apiKeyEnv as string };
+    accounts[id] = { provider: account.provider, ...source, ...(quota ? { quota } : {}) };
   }
   const routes: Record<string, RouteConfig> = {};
   for (const [role, value] of Object.entries(record(config.routes ?? {}))) {
@@ -58,7 +79,9 @@ export function parseConfig(raw: unknown): Config {
     const r = record(value);
     keys(r, ["candidates", "contextWindow", "outputReserve", "stayRetries", "maxTransitions", "maxRecoveries"]);
     if (!Array.isArray(r.candidates) || r.candidates.length === 0 || r.candidates.length > 32) throw new Error(`Route ${role} needs 1..32 candidates`);
-    const candidates = r.candidates.map((value): Candidate => {
+    // A candidate without an account on a provider with named accounts expands to one candidate per
+    // account, in configured order. Each expansion keeps its own health, stickiness and cache epoch.
+    const candidates = r.candidates.flatMap((value): Candidate[] => {
       const c = record(value);
       keys(c, ["provider", "id", "thinkingLevel", "cacheTtlMs", "account"]);
       if (typeof c.provider !== "string" || !c.provider || c.provider === "route" || c.provider.includes("#") || typeof c.id !== "string" || !c.id || c.id.includes("#")) throw new Error("Candidate needs physical provider and id");
@@ -66,8 +89,12 @@ export function parseConfig(raw: unknown): Config {
       const thinkingLevel = c.thinkingLevel ?? "off";
       if (typeof thinkingLevel !== "string" || !levels.includes(thinkingLevel)) throw new Error("Invalid thinkingLevel");
       const cacheTtlMs = c.cacheTtlMs === undefined ? undefined : integer(c.cacheTtlMs, 0, 1, Number.MAX_SAFE_INTEGER);
-      return { provider: c.provider, id: c.id, thinkingLevel: thinkingLevel as ModelThinkingLevel, ...(cacheTtlMs === undefined ? {} : { cacheTtlMs }), ...(typeof c.account === "string" ? { account: c.account } : {}) };
+      const base = { provider: c.provider, id: c.id, thinkingLevel: thinkingLevel as ModelThinkingLevel, ...(cacheTtlMs === undefined ? {} : { cacheTtlMs }) };
+      if (typeof c.account === "string") return [{ ...base, account: c.account }];
+      const pool = Object.entries(accounts).filter(([, account]) => account.provider === c.provider).map(([id]) => id);
+      return pool.length === 0 ? [base] : pool.map(account => ({ ...base, account }));
     });
+    if (candidates.length > 32) throw new Error(`Route ${role} expands to more than 32 candidates`);
     if (new Set(candidates.map(c => JSON.stringify([c.provider, c.id, c.account ?? null]))).size !== candidates.length) throw new Error(`Duplicate candidates in ${role}`);
     routes[role] = {
       candidates,
@@ -79,11 +106,7 @@ export function parseConfig(raw: unknown): Config {
     };
     if (routes[role].outputReserve >= routes[role].contextWindow) throw new Error("outputReserve must be below contextWindow");
   }
-  const namedProviders = new Set(Object.values(accounts).map(account => account.provider));
-  for (const [role, route] of Object.entries(routes)) for (const candidate of route.candidates) {
-    if (namedProviders.has(candidate.provider) && !candidate.account) throw new Error(`Route ${role} must name an account for ${candidate.provider}; runtime credentials are provider-global`);
-  }
-  return { routes, accounts, flushTimeoutMs: integer(config.flushTimeoutMs, 5000, 1, 60_000), sharedHealth: config.sharedHealth !== false };
+  return { routes, accounts, flushTimeoutMs: integer(config.flushTimeoutMs, 5000, 1, 60_000), sharedHealth: config.sharedHealth !== false, pricingOverrides };
 }
 
 // User-owned settings only: project config must not silently redirect paid requests.

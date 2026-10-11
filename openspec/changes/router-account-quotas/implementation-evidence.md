@@ -9,15 +9,18 @@
 
 ## Verification
 - `bun run typecheck`: passes.
-- `bun test tests`: 59 pass, 0 fail, 224 expect calls.
+- `bun test tests`: 69 pass (with pricing), 0 fail, 254 expect calls.
 - End to end: the generator output for one account was written and accepted by `codexbar config validate`; `codexbar usage --provider opencodego --account go-a` resolved the labelled account (the synthetic token then failed at the provider, as expected).
 - The parser test uses the real `codexbar usage --provider opencodego --format json` output (CodexBar 0.73.0) with identity fields removed. It shows Go's monthly window at 100% with a reset on 2026-10-22.
 
 ## Not yet verified or built
 - Enforcement is off by default; the Go source check (does `local+api` reflect account-wide usage?) is open (task 3.1).
-- Session-start and stale-triggered background refresh are not wired; refresh happens only through `/quotas`.
+- Periodic (5 min) and session-start refresh are wired in `index.ts` with a timer cleared on shutdown; no test exercises the timer itself.
 - A two-process test of the quota lease is not written; the lease is covered by a store-level test.
 - A `/quotas` command test is not written; its output is only checked by typecheck.
 
 ## Source finding
 - CodexBar's OpenCode Go `auto` source can return a device-local estimate (`dataConfidence: estimated`). The captured `local+api` sample is not authoritative and is not enforced. Generated config uses `source: "api"`; the Go source check (task 3.1) still needs a live authenticated response to confirm account-wide meters.
+
+## Enforcement
+- Enforcement is enabled per account by `"enforce": true` in router settings. The live setting lives in the owner's Nix-managed settings, which this change does not edit.

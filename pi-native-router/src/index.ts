@@ -7,10 +7,12 @@ import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { readConfig, type Config, type RouteConfig } from "./config";
-import { accountActive, accountSecret, useAccount } from "./accounts";
+import { accountActive, accountSecret, readAccountKey, useAccount } from "./accounts";
 import { HealthStore } from "./health-store";
 import { codexbarRunner, QUOTA_FRESH_MS, refreshQuota, type QuotaSnapshot } from "./quota";
 import { codexbarConfigPath, generateCodexbarConfig, writeCodexbarConfig } from "./codexbar-config";
+import { defaultPricingPath, loadSnapshot, refreshSnapshot, saveSnapshot } from "./pricing/cache";
+import { lookup } from "./pricing/catalog";
 import { accountOf, admissionKeys, cacheExpiry, choose, classify, Health, identity, observe, partialOutput, physicalOf, restore, type Resolved, type State } from "./policy";
 import { beforeTransition, flushBridge, type FlushHook, type TransitionHook } from "./transition";
 
@@ -225,6 +227,48 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     }
     return lines;
   };
+  // Tracker quota refreshes on launch and periodically, never on the dispatch path. Leases keep
+  // concurrent processes from refreshing the same account twice.
+  let quotaTimer: ReturnType<typeof setInterval> | undefined;
+  const refreshQuotaQuietly = () => { void refreshQuotas().catch(degrade); };
+  pi.on("session_start", () => {
+    if (quotaAccounts.length === 0 || !store) return;
+    refreshQuotaQuietly();
+    if (quotaTimer) clearInterval(quotaTimer);
+    quotaTimer = setInterval(refreshQuotaQuietly, QUOTA_FRESH_MS);
+    quotaTimer.unref?.();
+  });
+  pi.on("session_shutdown", () => {
+    if (quotaTimer) clearInterval(quotaTimer);
+    quotaTimer = undefined;
+  });
+  pi.registerCommand("pricing", {
+    description: "Refresh catalog prices or show one physical model: /pricing refresh | /pricing show <provider>/<model>",
+    handler: async (args, ctx) => {
+      const [verb, target] = args.trim().split(/\s+/);
+      const pricingPath = defaultPricingPath();
+      if (verb === "refresh") {
+        const result = await refreshSnapshot(options.now?.() ?? Date.now());
+        if (!result.snapshot) { ctx.ui.notify(`native-router pricing: refresh failed (${result.failures.join("; ")}); keeping the last valid snapshot`, "warning"); return; }
+        saveSnapshot(pricingPath, result.snapshot);
+        const count = Object.keys(result.snapshot.records).length;
+        ctx.ui.notify(`native-router pricing: ${count} physical-model records saved${result.failures.length ? `; skipped ${result.failures.join("; ")}` : ""}`, "info");
+        return;
+      }
+      if (verb === "show" && target && target.includes("/")) {
+        const slash = target.indexOf("/");
+        const estimate = lookup(loadSnapshot(pricingPath), target.slice(0, slash), target.slice(slash + 1), config.pricingOverrides);
+        if (estimate.status === "unpriced") { ctx.ui.notify(`native-router pricing: ${target} has no catalog entry (unpriced, never free)`, "info"); return; }
+        const r = estimate.record;
+        const rate = (v: number | undefined) => (v === undefined ? "unknown" : `$${v}`);
+        const lines = [`${target}: ${estimate.status} list-price estimate (USD per 1M tokens, source ${r.provenance})`, `  input ${rate(r.input)}, output ${rate(r.output)}, cache read ${rate(r.cacheRead)}, cache write ${rate(r.cacheWrite)}`];
+        if (estimate.status === "partial") lines.push(`  incomplete: missing ${estimate.missing.join(", ")}`);
+        ctx.ui.notify(lines.join("\n"), "info");
+        return;
+      }
+      ctx.ui.notify("usage: /pricing refresh | /pricing show <provider>/<model>", "error");
+    },
+  });
   pi.registerCommand("quotas-config", {
     description: "Generate CodexBar's config from quota-mapped router accounts: /quotas-config [--replace] [path]",
     handler: async (args, ctx) => {
@@ -233,7 +277,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       const pathArg = tokens.filter(t => t !== "--replace");
       if (pathArg.length > 1) { ctx.ui.notify("usage: /quotas-config [--replace] [path]", "error"); return; }
       const path = pathArg[0] ?? codexbarConfigPath();
-      const generated = generateCodexbarConfig(config.accounts, process.env, Math.floor((options.now?.() ?? Date.now()) / 1000));
+      const generated = generateCodexbarConfig(config.accounts, readAccountKey, Math.floor((options.now?.() ?? Date.now()) / 1000));
       if (generated.included.length === 0) { ctx.ui.notify(`native-router: no quota-mapped accounts with keys set (${generated.skipped.map(s => `${s.account}: ${s.reason}`).join("; ") || "none mapped"})`, "warning"); return; }
       try { writeCodexbarConfig(path, generated.document, replace); }
       catch (error) { ctx.ui.notify(`native-router: ${error instanceof Error ? error.message : String(error)}`, "error"); return; }

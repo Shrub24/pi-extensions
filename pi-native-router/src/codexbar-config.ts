@@ -21,7 +21,7 @@ export function stableUuid(seed: string): string {
 
 export function generateCodexbarConfig(
   accounts: Record<string, Account>,
-  env: NodeJS.ProcessEnv,
+  readKey: (account: Account) => string | undefined,
   addedAt: number,
 ): GeneratedConfig {
   const byProvider = new Map<string, Array<Record<string, unknown>>>();
@@ -29,8 +29,9 @@ export function generateCodexbarConfig(
   const skipped: GeneratedConfig["skipped"] = [];
   for (const [id, account] of Object.entries(accounts)) {
     if (account.quota === undefined) continue;
-    const token = env[account.apiKeyEnv];
-    if (!token) { skipped.push({ account: id, reason: `${account.apiKeyEnv} is not set` }); continue; }
+    const token = readKey(account);
+    const source = account.apiKeyFile !== undefined ? account.apiKeyFile : account.apiKeyEnv;
+    if (!token) { skipped.push({ account: id, reason: `${source} is not available` }); continue; }
     const label = account.quota.account ?? id;
     const entries = byProvider.get(account.quota.provider) ?? [];
     if (entries.some(entry => entry.label === label)) { skipped.push({ account: id, reason: `duplicate CodexBar label ${label}` }); continue; }

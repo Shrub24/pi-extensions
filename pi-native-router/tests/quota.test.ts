@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { HealthStore } from "../src/health-store";
 import { exhaustedUntil, parseCodexbar, refreshQuota, type QuotaSource } from "../src/quota";
 import { generateCodexbarConfig, stableUuid } from "../src/codexbar-config";
+import { readAccountKey } from "../src/accounts";
 import type { Account } from "../src/config";
 
 // Shape captured from `codexbar usage --provider opencodego --format json` (CodexBar 0.73.0), identity fields removed.
@@ -115,13 +116,14 @@ test("generated CodexBar config maps each quota-mapped account to a labelled tok
     "go-c": { provider: "opencode-go", apiKeyEnv: "KEY_C", quota: { source: "codexbar", provider: "opencodego", enforce: false } },
     "plain": { provider: "other", apiKeyEnv: "KEY_D" },
   };
-  const generated = generateCodexbarConfig(accounts, { KEY_A: "synthetic-a", KEY_B: "synthetic-b" }, 1760000000);
+  const env: Record<string, string> = { KEY_A: "synthetic-a", KEY_B: "synthetic-b" };
+  const generated = generateCodexbarConfig(accounts, account => readAccountKey(account, env), 1760000000);
   const [provider] = generated.document.providers as Array<Record<string, any>>;
   expect(provider.id).toBe("opencodego");
   expect(provider.source).toBe("api");
   expect(provider.tokenAccounts.accounts.map((a: { label: string }) => a.label)).toEqual(["go-a", "go-b"]);
   expect(generated.included).toEqual(["go-a", "go-b"]);
-  expect(generated.skipped).toEqual([{ account: "go-c", reason: "KEY_C is not set" }]);
+  expect(generated.skipped).toEqual([{ account: "go-c", reason: "KEY_C is not available" }]);
   expect(stableUuid("go-a")).toBe(stableUuid("go-a"));
   expect(stableUuid("go-a")).not.toBe(stableUuid("go-b"));
   expect(stableUuid("go-a")).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);

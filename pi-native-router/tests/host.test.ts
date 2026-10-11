@@ -80,7 +80,10 @@ async function host(outcomes: Outcome[], opts: { retry?: boolean; flush?: "faile
   });
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   if (opts.packaged) {
-    writeFileSync(join(dir, "settings.json"), JSON.stringify({ kendex: { extensionManager: { config: { "@vanillagreen/pi-native-router": config } } } }));
+    const { pricingOverrides, ...parsedRest } = config;
+    // Settings hold the raw user shape: pricing overrides live under `pricing.overrides`.
+    const raw = { ...parsedRest, ...(Object.keys(pricingOverrides).length ? { pricing: { overrides: pricingOverrides } } : {}) };
+    writeFileSync(join(dir, "settings.json"), JSON.stringify({ kendex: { extensionManager: { config: { "@vanillagreen/pi-native-router": raw } } } }));
     process.env.PI_CODING_AGENT_DIR = dir;
   }
   try { await loader.reload(); }
