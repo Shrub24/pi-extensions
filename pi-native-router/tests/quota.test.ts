@@ -119,7 +119,7 @@ test("generated CodexBar config maps each quota-mapped account to a labelled tok
     "plain": { provider: "other", apiKeyEnv: "KEY_D" },
   };
   const env: Record<string, string> = { KEY_A: "synthetic-a", KEY_B: "synthetic-b" };
-  const generated = generateCodexbarConfig(accounts, account => readAccountKey(account, env), 1760000000);
+  const generated = generateCodexbarConfig(accounts, {}, account => readAccountKey(account, env), 1760000000);
   const [provider] = generated.document.providers as Array<Record<string, any>>;
   expect(provider.id).toBe("opencodego");
   expect(provider.source).toBe("api");
@@ -184,4 +184,27 @@ test("provider-level quotas parse strictly and cannot overlap named accounts of 
   expect(parsed.quotas.anthropic.enforce).toBe(false);
   expect(() => parseConfig({ accounts: { "go-a": { provider: "opencode-go", apiKeyEnv: "K", quota: { source: "codexbar", provider: "opencodego" } } }, quotas: { "opencode-go": { source: "codexbar", provider: "opencodego" } } })).toThrow(/conflicts with named accounts/);
   expect(() => parseConfig({ quotas: { codex: { source: "other", provider: "codex" } } })).toThrow(/quota source must be codexbar/);
+});
+
+test("regenerating CodexBar config merges router providers and keeps providers it does not own", () => {
+  const existing = {
+    version: 1,
+    providers: [
+      { id: "codex", enabled: true, source: "oauth" },
+      { id: "claude", enabled: true, source: "oauth" },
+      { id: "opencodego", enabled: true, source: "api", tokenAccounts: { version: 1, activeIndex: 0, accounts: [{ id: "old", label: "stale", token: "old" }] } },
+    ],
+  };
+  const accounts = {
+    "go-a": { provider: "opencode-go", apiKeyEnv: "GO_A", quota: { source: "codexbar", provider: "opencodego", enforce: true } },
+  } as Record<string, Account>;
+  const quotas = { "openai-codex": { source: "codexbar", provider: "codex", enforce: true } } as Record<string, QuotaSource>;
+  const generated = generateCodexbarConfig(accounts, quotas, () => "k-go", 1760000000, existing);
+  const byId = new Map((generated.document.providers as Array<{ id: string; source: string; tokenAccounts?: { accounts: unknown[] } }>).map(p => [p.id, p]));
+  expect([...byId.keys()].sort()).toEqual(["claude", "codex", "opencodego"]);
+  expect(byId.get("claude")).toEqual({ id: "claude", enabled: true, source: "oauth" } as never);
+  expect(byId.get("codex")?.source).toBe("oauth");
+  expect(byId.get("codex")?.tokenAccounts).toBeUndefined();
+  expect(byId.get("opencodego")?.source).toBe("api");
+  expect(byId.get("opencodego")?.tokenAccounts?.accounts).toHaveLength(1);
 });

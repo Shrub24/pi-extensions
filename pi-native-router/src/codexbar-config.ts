@@ -1,14 +1,22 @@
 import { createHash } from "node:crypto";
-import { chmodSync, mkdirSync, renameSync, writeFileSync, existsSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import type { Account } from "./config";
+import type { QuotaSource } from "./quota";
 
 /**
  * Generates CodexBar's config from router accounts so each key is defined once. Keys come from the
  * same environment references the router uses; the document contains secrets and is written 0600.
  */
-export interface GeneratedConfig { document: Record<string, unknown>; included: string[]; skipped: Array<{ account: string; reason: string }> }
+export interface GeneratedConfig {
+  document: Record<string, unknown>;
+  included: string[];
+  skipped: Array<{ account: string; reason: string }>;
+}
+
+type ProviderEntry = Record<string, unknown> & { id: string };
+type Document = Record<string, unknown> & { providers?: ProviderEntry[] };
 
 /** Stable token-account id derived from the router account id, so regeneration does not churn ids. */
 export function stableUuid(seed: string): string {
@@ -19,10 +27,17 @@ export function stableUuid(seed: string): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
+/**
+ * Merges router quota scopes into CodexBar's document. Providers the router owns are replaced
+ * (named accounts get token accounts; default-auth providers get a login-backed entry with no tokens).
+ * Every other provider and top-level key in `existing` is kept exactly as it was.
+ */
 export function generateCodexbarConfig(
   accounts: Record<string, Account>,
+  quotas: Record<string, QuotaSource>,
   readKey: (account: Account) => string | undefined,
   addedAt: number,
+  existing?: Document,
 ): GeneratedConfig {
   const byProvider = new Map<string, Array<Record<string, unknown>>>();
   const included: string[] = [];
@@ -39,14 +54,32 @@ export function generateCodexbarConfig(
     byProvider.set(account.quota.provider, entries);
     included.push(id);
   }
-  const providers = [...byProvider.entries()].map(([provider, entries]) => ({
-    id: provider,
-    enabled: true,
+
+  const existingById = new Map((existing?.providers ?? []).map(entry => [entry.id, entry]));
+  const owned = new Map<string, ProviderEntry>();
+  for (const [provider, entries] of byProvider) {
     // Authoritative account meters: `auto` can return device-local estimates instead.
-    source: "api",
-    tokenAccounts: { version: 1, activeIndex: 0, accounts: entries },
-  }));
-  return { document: { version: 1, providers }, included, skipped };
+    owned.set(provider, { ...existingById.get(provider), id: provider, enabled: true, source: "api", tokenAccounts: { version: 1, activeIndex: 0, accounts: entries } });
+  }
+  for (const quota of Object.values(quotas)) {
+    if (owned.has(quota.provider)) continue;
+    // Default-auth provider: CodexBar reads its own logged-in account. OAuth is the source verified
+    // for these providers; an existing entry keeps whatever source the operator chose.
+    const current = existingById.get(quota.provider);
+    owned.set(quota.provider, { ...current, id: quota.provider, enabled: true, source: current?.source ?? "oauth" });
+  }
+
+  const kept = (existing?.providers ?? []).filter(entry => !owned.has(entry.id));
+  const providers = [...kept, ...owned.values()];
+  return { document: { ...existing, version: 1, providers }, included, skipped };
+}
+
+/** Reads an existing CodexBar document. Throws when the file exists but is not a parseable document. */
+export function readCodexbarConfig(path: string): Document | undefined {
+  if (!existsSync(path)) return undefined;
+  const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error(`${path} is not a CodexBar config object; refusing to overwrite it`);
+  return parsed as Document;
 }
 
 /** Default CodexBar config location, honouring the same overrides CodexBar reads. */

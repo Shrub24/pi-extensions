@@ -11,7 +11,7 @@ import { accountActive, accountSecret, readAccountKey, useAccount } from "./acco
 import { HealthStore } from "./health-store";
 import { defaultDecisionLogPath, recordDecision, type DecisionReason } from "./decision-log";
 import { codexbarRunner, QUOTA_FRESH_MS, quotaScopeKey, refreshQuota, type QuotaSnapshot, type QuotaSource } from "./quota";
-import { codexbarConfigPath, generateCodexbarConfig, writeCodexbarConfig } from "./codexbar-config";
+import { codexbarConfigPath, generateCodexbarConfig, readCodexbarConfig, writeCodexbarConfig } from "./codexbar-config";
 import { defaultPricingPath, loadSnapshot, refreshSnapshot, saveSnapshot } from "./pricing/cache";
 import { lookup } from "./pricing/catalog";
 import { applyPeak, backfillCost, type CostUsage } from "./pricing/reconcile";
@@ -316,19 +316,25 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     },
   });
   pi.registerCommand("quotas-config", {
-    description: "Generate CodexBar's config from quota-mapped router accounts: /quotas-config [--replace] [path]",
+    description: "Merge quota-mapped router accounts and providers into CodexBar's config: /quotas-config [--replace] [path]",
     handler: async (args, ctx) => {
       const tokens = args.trim().split(/\s+/).filter(Boolean);
       const replace = tokens.includes("--replace");
       const pathArg = tokens.filter(t => t !== "--replace");
       if (pathArg.length > 1) { ctx.ui.notify("usage: /quotas-config [--replace] [path]", "error"); return; }
       const path = pathArg[0] ?? codexbarConfigPath();
-      const generated = generateCodexbarConfig(config.accounts, readAccountKey, Math.floor((options.now?.() ?? Date.now()) / 1000));
-      if (generated.included.length === 0) { ctx.ui.notify(`native-router: no quota-mapped accounts with keys set (${generated.skipped.map(s => `${s.account}: ${s.reason}`).join("; ") || "none mapped"})`, "warning"); return; }
-      try { writeCodexbarConfig(path, generated.document, replace); }
+      let existing: ReturnType<typeof readCodexbarConfig>;
+      try {
+        existing = readCodexbarConfig(path);
+        if (existing !== undefined && !replace) throw new Error(`${path} exists; rerun with --replace to merge router providers into it`);
+      } catch (error) { ctx.ui.notify(`native-router: ${error instanceof Error ? error.message : String(error)}`, "error"); return; }
+      const generated = generateCodexbarConfig(config.accounts, config.quotas, readAccountKey, Math.floor((options.now?.() ?? Date.now()) / 1000), existing);
+      if (generated.included.length === 0 && Object.keys(config.quotas).length === 0) { ctx.ui.notify(`native-router: no quota-mapped accounts with keys set (${generated.skipped.map(s => `${s.account}: ${s.reason}`).join("; ") || "none mapped"})`, "warning"); return; }
+      try { writeCodexbarConfig(path, generated.document, true); }
       catch (error) { ctx.ui.notify(`native-router: ${error instanceof Error ? error.message : String(error)}`, "error"); return; }
+      const providers = (generated.document.providers as Array<{ id: string }>).map(entry => entry.id).join(", ");
       const skipped = generated.skipped.length ? `; skipped ${generated.skipped.map(s => `${s.account} (${s.reason})`).join(", ")}` : "";
-      ctx.ui.notify(`native-router: wrote CodexBar config to ${path} for ${generated.included.join(", ")} (keys written; file is 0600)${skipped}`, "info");
+      ctx.ui.notify(`native-router: wrote CodexBar config to ${path}; router providers: ${providers} (accounts with keys: ${generated.included.join(", ") || "none"}; other providers kept; file is 0600)${skipped}`, "info");
     },
   });
   pi.registerCommand("quotas", {
