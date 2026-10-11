@@ -328,6 +328,35 @@ describe("llm usage attribution", () => {
     assert.equal(a[ATTR_GEN_AI_COST_USD], 0.012);
   });
 
+  test("exports the peak multiplier only when time-of-day pricing applied", async () => {
+    h.tracker.startSession();
+    h.tracker.startInteraction("p");
+    h.tracker.startTurn(0);
+    h.tracker.startLlm("deepseek-v4-flash", "opencode-go");
+    const peak = asstMsg({ input: 100, output: 50, cost: 0.0024, peakMultiplier: 2, stopReason: "stop", provider: "opencode-go", model: "deepseek-v4-flash" });
+    h.tracker.completeLlm(peak);
+    h.tracker.endTurn();
+    h.tracker.endInteraction();
+    h.tracker.endSession();
+    await h.flush();
+    const a = h.span(SPAN_LLM_REQUEST).attributes;
+    assert.equal(a[ATTR_GEN_AI_COST_USD], 0.0024, "the adjusted cost is the cost exported");
+    assert.equal(a["pi.pricing.peak_multiplier"], 2);
+  });
+
+  test("off-peak messages carry no peak multiplier attribute", async () => {
+    h.tracker.startSession();
+    h.tracker.startInteraction("p");
+    h.tracker.startTurn(0);
+    h.tracker.startLlm("deepseek-v4-flash", "opencode-go");
+    h.tracker.completeLlm(asstMsg({ input: 100, output: 50, cost: 0.0012, stopReason: "stop", provider: "opencode-go", model: "deepseek-v4-flash" }));
+    h.tracker.endTurn();
+    h.tracker.endInteraction();
+    h.tracker.endSession();
+    await h.flush();
+    assert.equal(h.span(SPAN_LLM_REQUEST).attributes["pi.pricing.peak_multiplier"], undefined);
+  });
+
   test("omits cache_write_1h attribute when not reported", async () => {
     h.tracker.startSession();
     h.tracker.startInteraction("p");

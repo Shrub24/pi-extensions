@@ -12,9 +12,10 @@ import { createHash } from "node:crypto";
  *   - Exceptions: https://opentelemetry.io/docs/specs/semconv/exceptions/
  *
  * `pi.*` attributes are extension-specific and documented in the README.
- * `gen_ai.usage.cost_usd` and `gen_ai.usage.cache_write_1h_input_tokens` are
- * extension-specific values in the gen_ai namespace: no registry release
- * defines a cost attribute, and none splits Anthropic's 1-hour cache writes.
+ * `gen_ai.usage.cache_write_1h_input_tokens` is an extension-specific value in
+ * the gen_ai namespace: no registry release splits Anthropic's 1-hour cache
+ * writes. `gen_ai.usage.cost` is the cost total in USD, the key Latitude and
+ * Langfuse read as the standard cost field.
  */
 
 // ---------------------------------------------------------------------------
@@ -71,8 +72,8 @@ export const ATTR_GEN_AI_REASONING_TOKENS = "gen_ai.usage.reasoning_tokens";
 export const ATTR_GEN_AI_CACHE_READ_INPUT_TOKENS = "gen_ai.usage.cache_read.input_tokens";
 export const ATTR_GEN_AI_CACHE_CREATION_INPUT_TOKENS = "gen_ai.usage.cache_creation.input_tokens";
 export const ATTR_GEN_AI_REASONING_OUTPUT_TOKENS = "gen_ai.usage.reasoning.output_tokens";
-// No registry release defines a cost attribute; extension-specific, all dialects.
-export const ATTR_GEN_AI_COST_USD = "gen_ai.usage.cost_usd";
+// Cost total in USD. Read as the standard cost field by Latitude and Langfuse.
+export const ATTR_GEN_AI_COST_USD = "gen_ai.usage.cost";
 // Total tokens as pi reports them. Ingest uses it to resolve inclusive-vs-additive
 // input-token arithmetic instead of guessing from the provider name.
 export const ATTR_GEN_AI_TOTAL_TOKENS = "gen_ai.usage.total_tokens";
@@ -179,6 +180,8 @@ export const ATTR_PI_ROUTE_PREVIOUS_MODEL = "pi.route.previous_model";
 export const ATTR_PI_ROUTE_VIRTUAL_MODEL = "pi.route.virtual_model";
 /** User-configured account key that authenticated the physical dispatch (never a secret or derived fingerprint). */
 export const ATTR_PI_ROUTE_ACCOUNT_ID = "pi.route.account_id";
+/** Multiplier applied to the recorded cost for time-of-day pricing (2 during DeepSeek peak hours). Absent when no adjustment applied. */
+export const ATTR_PI_PRICING_PEAK_MULTIPLIER = "pi.pricing.peak_multiplier";
 export const ATTR_PI_ROUTE_TRANSITION_REASON = "pi.route.transition_reason";
 /** Remote parent this process inherited through TRACEPARENT (a spawning pi). */
 export const ATTR_PI_PARENT_TRACE_ID = "pi.parent.trace_id";

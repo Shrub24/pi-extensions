@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented in this file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- `pi.pricing.peak_multiplier` is exported when the native router applied time-of-day pricing to a message, and the exported cost already includes it.
+- Cost is exported as `gen_ai.usage.cost` (USD total) instead of `gen_ai.usage.cost_usd`, the key Latitude and Langfuse read as the standard cost field. Dashboards that read the old extension key need updating.
+
 ## [0.3.1] - 2026-09-10
 
 ### Fixed

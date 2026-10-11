@@ -13,6 +13,7 @@ import { codexbarRunner, QUOTA_FRESH_MS, refreshQuota, type QuotaSnapshot } from
 import { codexbarConfigPath, generateCodexbarConfig, writeCodexbarConfig } from "./codexbar-config";
 import { defaultPricingPath, loadSnapshot, refreshSnapshot, saveSnapshot } from "./pricing/cache";
 import { lookup } from "./pricing/catalog";
+import { applyPeak, backfillCost, type CostUsage } from "./pricing/reconcile";
 import { accountOf, admissionKeys, cacheExpiry, choose, classify, Health, identity, observe, partialOutput, physicalOf, restore, type Resolved, type State } from "./policy";
 import { beforeTransition, flushBridge, type FlushHook, type TransitionHook } from "./transition";
 
@@ -328,6 +329,24 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       if (state.causes.length === 0 && state.leases.length === 0) lines.push("  no active causes");
       ctx.ui.notify(lines.join("\n"), "info");
     },
+  });
+  // Cost reconciliation for finished assistant messages, before pi-otel reads usage on turn_end.
+  // Pi's recorded cost stays the source; peak pricing and catalog backup adjust it only as defined in reconcile.ts.
+  pi.on("message_end", (event, ctx) => {
+    const message = event.message as { role?: string; provider?: string; model?: string; timestamp?: number; usage?: CostUsage };
+    if (message.role !== "assistant" || !message.provider || !message.model || !message.usage?.cost) return;
+    const at = typeof message.timestamp === "number" ? message.timestamp : (options.now?.() ?? Date.now());
+    const usage = message.usage;
+    const piModel = ctx.modelRegistry.find(message.provider, message.model);
+    const piHasPrice = piModel?.cost !== undefined;
+    let changed = false;
+    if (!piHasPrice) {
+      try { changed = backfillCost(usage, false, loadSnapshot(defaultPricingPath())?.records[`${message.provider}/${message.model}`]) || changed; }
+      catch (error) { degrade(error); }
+    }
+    changed = applyPeak(usage, message.provider, message.model, at) || changed;
+    if (!changed) return;
+    return { message: { ...message, usage } as typeof event.message };
   });
   pi.on("agent_before_settle", (event, ctx) => {
     if (event.outcome !== "error" || ctx.signal?.aborted || ctx.model?.provider !== "route" || ctx.hasPendingMessages()) return;

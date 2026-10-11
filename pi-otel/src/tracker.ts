@@ -116,6 +116,7 @@ import {
   ATTR_PI_PARENT_TRACE_ID,
   ATTR_PI_PROMPT_LENGTH,
   ATTR_PI_ROUTE_PREVIOUS_MODEL,
+  ATTR_PI_PRICING_PEAK_MULTIPLIER,
   ATTR_PI_ROUTE_ACCOUNT_ID,
   ATTR_PI_ROUTE_VIRTUAL_MODEL,
   ATTR_PI_ROUTE_TRANSITION_REASON,
@@ -1186,6 +1187,9 @@ export class SpanTracker {
     if (typeof u.cost?.total === "number") {
       set(ATTR_GEN_AI_COST_USD, u.cost.total);
     }
+    // Set by the native router when it applied time-of-day pricing to this message's cost.
+    const peak = (u as { peakMultiplier?: unknown }).peakMultiplier;
+    if (typeof peak === "number" && Number.isFinite(peak) && peak !== 1) set(ATTR_PI_PRICING_PEAK_MULTIPLIER, peak);
   }
 
   private recordLlmMetrics(): void {

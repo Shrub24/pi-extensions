@@ -338,7 +338,7 @@ describe("end-to-end over real HTTP OTLP (JSON protocol)", () => {
     );
     const sessionEndAttrs = attrsToRecord(sessionEnd?.attributes);
     assert.equal(sessionEndAttrs["gen_ai.usage.input_tokens"], 30, "session sums input tokens");
-    assert.equal(sessionEndAttrs["gen_ai.usage.cost_usd"] as number, 0.003, "session sums cost");
+    assert.equal(sessionEndAttrs["gen_ai.usage.cost"] as number, 0.003, "session sums cost");
     assert.equal(sessionEndAttrs["pi.turn_count"], 2, "session sums turns");
 
     // Logs carry the lifecycle event with an event.name attribute.

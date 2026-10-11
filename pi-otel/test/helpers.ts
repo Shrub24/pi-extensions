@@ -185,6 +185,7 @@ export function asstMsg(opts: {
   reasoning?: number;
   totalTokens?: number;
   cost?: number;
+  peakMultiplier?: number;
   stopReason?: string;
   responseModel?: string;
   model?: string;
@@ -213,6 +214,7 @@ export function asstMsg(opts: {
       reasoning: opts.reasoning,
       totalTokens: opts.totalTokens,
       cost: { total: opts.cost },
+      ...(opts.peakMultiplier === undefined ? {} : { peakMultiplier: opts.peakMultiplier }),
     },
     stopReason: opts.stopReason ?? "stop",
     errorMessage: opts.errorMessage,
