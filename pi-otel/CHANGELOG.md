@@ -6,6 +6,7 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Changed
 
+- No captured attribute is truncated any more. The 64 KiB ceiling and its `…[truncated]` suffix are gone from every payload: prompts, message content and details, tool arguments and results, span-event content, and `pi-otel:log` bodies now reach the backend whole. The ceiling was applied after serialization, so an object payload above it was cut mid-token and arrived as invalid JSON — exactly the tool arguments and results a debugging session needs — and a cut plain-text payload hid content without saying how much. Sizing is now the collector's and the backend's concern. The `http.response.header.<name>` allowlist keeps its 1 KiB cut, which bounds credentials rather than payload size.
 - `pi.pricing.peak_multiplier` is exported when the native router applied time-of-day pricing to a message, and the exported cost already includes it.
 - Cost is exported as `gen_ai.usage.cost` (USD total) instead of `gen_ai.usage.cost_usd`, the key Latitude and Langfuse read as the standard cost field. Dashboards that read the old extension key need updating.
 

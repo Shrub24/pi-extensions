@@ -1,6 +1,6 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { clampAttr, fingerprint, GEN_AI_SYSTEM } from "../src/attrs.ts";
+import { textAttr, fingerprint, GEN_AI_SYSTEM } from "../src/attrs.ts";
 
 describe("GEN_AI_SYSTEM", () => {
   test("is 'pi'", () => {
@@ -8,21 +8,21 @@ describe("GEN_AI_SYSTEM", () => {
   });
 });
 
-describe("clampAttr", () => {
+describe("textAttr", () => {
   test("passes through short strings unchanged", () => {
-    assert.equal(clampAttr("hello"), "hello");
+    assert.equal(textAttr("hello"), "hello");
   });
 
   test("serializes objects to JSON", () => {
-    assert.equal(clampAttr({ a: 1 }), '{"a":1}');
+    assert.equal(textAttr({ a: 1 }), '{"a":1}');
   });
 
   test("serializes arrays to JSON", () => {
-    assert.equal(clampAttr([1, "two", true]), '[1,"two",true]');
+    assert.equal(textAttr([1, "two", true]), '[1,"two",true]');
   });
 
   test("serializes Error to a stack-bearing string", () => {
-    const s = clampAttr(new Error("boom"));
+    const s = textAttr(new Error("boom"));
     assert.match(s, /Error: boom/);
   });
 
@@ -30,74 +30,37 @@ describe("clampAttr", () => {
     // JSON.stringify(null) === "null" (the 4-char string). For undefined,
     // JSON.stringify returns undefined, which our `?? "null"` fallback turns
     // into the same "null" string.
-    assert.equal(clampAttr(null), "null");
-    assert.equal(clampAttr(undefined), "null");
+    assert.equal(textAttr(null), "null");
+    assert.equal(textAttr(undefined), "null");
   });
 
   test("handles bigint", () => {
     // bigint: the replacer turns 42n into the string "42", then JSON.stringify
     // wraps that returned string in quotes -> the literal sequence "42".
-    assert.equal(clampAttr(42n), '"42"');
+    assert.equal(textAttr(42n), '"42"');
   });
 
   test("handles functions", () => {
-    const s = clampAttr(function named() { return 1; });
+    const s = textAttr(function named() { return 1; });
     // replacer returns '[function named]' (a string) -> JSON re-quotes it.
     assert.equal(s, '"[function named]"');
   });
 
-  test("truncates strings exceeding 64 KiB and keeps total under the limit", () => {
-    const big = "x".repeat(70_000);
-    const out = clampAttr(big);
-    assert.ok(Buffer.byteLength(out, "utf8") <= 64 * 1024, "output must fit under 64 KiB");
-    assert.ok(out.endsWith("…[truncated]"), "must end with truncation marker");
-    // original content preserved up to the cut point
-    assert.ok(out.startsWith("x".repeat(1000)));
-  });
-
-  test("truncation is byte-safe (never splits a multi-byte UTF-8 sequence)", () => {
-    // '⚡' is 3 bytes in UTF-8. Build a string whose byte length straddles the
-    // limit in the middle of a character.
-    const char = "⚡";
-    const charBytes = Buffer.byteLength(char, "utf8");
-    const fill = "a".repeat(64 * 1024 - Math.floor(charBytes / 2));
-    const big = fill + char.repeat(100);
-    const out = clampAttr(big);
-    // The output, decoded as UTF-8, must be valid (no replacement chars from a
-    // split sequence). Round-trip through Buffer to validate.
-    const decoded = Buffer.from(out, "utf8").toString("utf8");
-    assert.ok(decoded.length > 0);
-    assert.ok(!decoded.includes("\uFFFD"), "no U+FFFD replacement chars from split multibyte");
-  });
-
-  test("truncation lands on a UTF-8 character boundary for 4-byte chars", () => {
-    // The truncation point is computed in byte space against the UTF-8 buffer,
-    // so it must never cut in the middle of a multi-byte sequence. 𝄞 (U+1D11E)
-    // is a 4-byte UTF-8 char encoded as a surrogate pair in JS. An earlier
-    // implementation walked back using UTF-16 charCodeAt against UTF-8 byte
-    // masks, which never matched for code points above U+00FF and could leave
-    // the cut mid-character. Repeat across many offsets to cover the boundary.
-    const ch = "𝄞"; // 4 bytes in UTF-8, 2 UTF-16 code units
-    const chBytes = Buffer.byteLength(ch, "utf8");
-    assert.equal(chBytes, 4);
-    // Fill so the limit falls inside a run of 4-byte chars at various offsets.
-    for (const offset of [0, 1, 2, 3, 4, 5]) {
-      const fill = "a".repeat(64 * 1024 - offset);
-      const big = fill + ch.repeat(1000);
-      const out = clampAttr(big);
-      const buf = Buffer.from(out, "utf8");
-      assert.ok(buf.length <= 64 * 1024, `fits under 64 KiB at offset ${offset}`);
-      // No U+FFFD when decoded means no sequence was split.
-      const decoded = buf.toString("utf8");
-      assert.ok(!decoded.includes("\uFFFD"), `no replacement char at offset ${offset}`);
-      assert.ok(out.endsWith("…[truncated]"), `marker present at offset ${offset}`);
-    }
+  test("keeps a string above the former 64 KiB ceiling in full", () => {
+    // Truncation was removed: what the model or a tool produced is exported
+    // whole, so a backend never renders a silently shortened prompt, tool
+    // argument or tool result. Multi-byte content survives because nothing is
+    // ever cut in byte space.
+    const big = `${ "x".repeat(70_000) }⚡𝄞`;
+    const out = textAttr(big);
+    assert.equal(out, big);
+    assert.ok(Buffer.byteLength(out, "utf8") > 64 * 1024, "payload stays above the old ceiling");
   });
 
   test("handles circular references without throwing", () => {
     const a: Record<string, unknown> = {};
     a.self = a;
-    const s = clampAttr(a);
+    const s = textAttr(a);
     assert.match(s, /circular/);
   });
 
@@ -105,20 +68,20 @@ describe("clampAttr", () => {
     // A DAG: the same object in two places is not a cycle. Tool arguments
     // commonly repeat references; degrading them to [circular] lost content.
     const shared = { x: 1 };
-    const s = clampAttr({ a: shared, b: shared });
+    const s = textAttr({ a: shared, b: shared });
     assert.deepEqual(JSON.parse(s), { a: { x: 1 }, b: { x: 1 } });
   });
 
   test("a root that sits on a cycle still serializes its other fields", () => {
     const a: Record<string, unknown> = { name: "root" };
     a.self = a;
-    const s = clampAttr(a);
+    const s = textAttr(a);
     assert.deepEqual(JSON.parse(s), { name: "root", self: "[circular]" });
   });
 
   test("repeated Error instances serialize at every occurrence", () => {
     const e = new Error("boom");
-    const s = clampAttr({ first: e, second: e });
+    const s = textAttr({ first: e, second: e });
     assert.ok(s.includes("boom"), "content present");
     const parsed = JSON.parse(s) as { first: unknown; second: unknown };
     assert.ok(parsed.first && parsed.second, "both occurrences serialized");
@@ -129,17 +92,16 @@ describe("clampAttr", () => {
     const b: Record<string, unknown> = { name: "b" };
     a.peer = b;
     b.peer = a;
-    const s = clampAttr({ outer: a });
+    const s = textAttr({ outer: a });
     assert.ok(s.includes('"outer"'));
     // Should not have thrown; output contains a serialization marker.
     assert.ok(s.length > 0);
   });
 
-  test("truncates large objects too", () => {
+  test("keeps an object above the former 64 KiB ceiling in full", () => {
     const big = { data: "x".repeat(70_000) };
-    const out = clampAttr(big);
-    assert.ok(Buffer.byteLength(out, "utf8") <= 64 * 1024);
-    assert.ok(out.endsWith("…[truncated]"));
+    const out = textAttr(big);
+    assert.deepEqual(JSON.parse(out), big);
   });
 });
 

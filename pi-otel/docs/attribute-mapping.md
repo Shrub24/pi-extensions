@@ -139,8 +139,6 @@ destination reads and drops the other.
   committed and verified against both backends. Removing them first would strip
   Latitude tags and metadata and Langfuse observation input and output before the
   collector provides them.
-- **Tool payloads are still clamped.** `gen_ai.tool.call.arguments`,
-  `gen_ai.tool.call.result`, and the tool spans' `langfuse.observation.input` and
-  `output` pass through `clampAttr`. Object payloads are serialized and then cut at
-  64 KiB, so a truncated tool payload is invalid JSON. Structured fields on LLM and
-  interaction spans are never truncated.
+- **Nothing is truncated for size.** Every captured payload — prompts, messages,
+  tool arguments and results, span-event content, and log bodies — is exported
+  whole. The destinations own their own size limits.

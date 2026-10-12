@@ -135,7 +135,7 @@ import {
   OP_NAME_CHAT,
   OP_NAME_EXECUTE_TOOL,
   OP_NAME_INVOKE_AGENT,
-  clampAttr,
+  textAttr,
   jsonAttr,
   EVENT_GEN_AI_ASSISTANT_MESSAGE,
   EVENT_GEN_AI_CHOICE,
@@ -546,7 +546,7 @@ export class SpanTracker {
     if (typeof prompt === "string") {
       attrs[ATTR_PI_PROMPT_LENGTH] = prompt.length;
       if (this.shouldCapturePrompt()) {
-        attrs[ATTR_PI_USER_PROMPT] = clampAttr(prompt);
+        attrs[ATTR_PI_USER_PROMPT] = textAttr(prompt);
         if (prompt.length > 0) {
           attrs[ATTR_LANGFUSE_OBSERVATION_INPUT] = jsonAttr({
             messages: [{ role: "user", parts: [{ type: "text", content: prompt }] }],
@@ -940,11 +940,11 @@ export class SpanTracker {
       const index = this.llm.inputMessageCount++;
       if (m.source) {
         const attrs: Attributes = {
-          "pi.message.source": clampAttr(m.source),
+          "pi.message.source": textAttr(m.source),
           "pi.message.index": index,
         };
         if (this.shouldCapturePrompt() && m.details !== undefined) {
-          attrs["pi.message.details"] = clampAttr(m.details);
+          attrs["pi.message.details"] = textAttr(m.details);
         }
         this.llm.span.addEvent(EVENT_PI_MESSAGE, attrs);
       }
@@ -952,7 +952,7 @@ export class SpanTracker {
         if (!this.shouldCapturePrompt()) continue;
         if (emitEvents) {
           const attrs: Record<string, unknown> = { role: "user", ...this.llmEventGenAiSystem() };
-          attrs.content = clampAttr(m.text);
+          attrs.content = textAttr(m.text);
           this.llm.span.addEvent(EVENT_GEN_AI_USER_MESSAGE, attrs as Attributes);
         }
         this.llm.inputMessages.push({ role: "user", parts: [{ type: "text", content: m.text }] });
@@ -963,7 +963,7 @@ export class SpanTracker {
             ...this.llmEventGenAiSystem(),
             [ATTR_GEN_AI_TOOL_CALL_ID]: m.toolCallId ?? "",
             ...(m.toolName ? { [ATTR_GEN_AI_TOOL_NAME]: m.toolName } : {}),
-            content: clampAttr(m.text),
+            content: textAttr(m.text),
           };
           this.llm.span.addEvent(EVENT_GEN_AI_TOOL_MESSAGE, attrs as Attributes);
         }
@@ -1247,8 +1247,8 @@ export class SpanTracker {
       // ships once, in the attributes current backends read.
       if (this.semconv === "1.36") {
         const asstAttrs: Record<string, unknown> = { role: "assistant", ...this.llmEventGenAiSystem() };
-        if (text) asstAttrs.content = clampAttr(text);
-        if (toolCalls.length) asstAttrs["tool_calls"] = clampAttr(toolCalls);
+        if (text) asstAttrs.content = textAttr(text);
+        if (toolCalls.length) asstAttrs["tool_calls"] = textAttr(toolCalls);
         this.llm.span.addEvent(EVENT_GEN_AI_ASSISTANT_MESSAGE, asstAttrs as Attributes);
         const finish = m.stopReason ?? "stop";
         // The choice event keeps only the decision metadata. An earlier
@@ -1397,7 +1397,7 @@ export class SpanTracker {
     attrs[ATTR_GEN_AI_TOOL_NAME] = toolName;
     attrs[ATTR_GEN_AI_TOOL_CALL_ID] = toolCallId;
     if (this.shouldCaptureToolContent() && input !== undefined) {
-      const capturedInput = clampAttr(input);
+      const capturedInput = textAttr(input);
       attrs[ATTR_GEN_AI_TOOL_CALL_ARGUMENTS] = capturedInput;
       attrs[ATTR_LANGFUSE_OBSERVATION_INPUT] = capturedInput;
     }
@@ -1430,14 +1430,14 @@ export class SpanTracker {
     this.tools.delete(toolCallId);
     slot.span.setAttribute(ATTR_PI_TOOL_IS_ERROR, isError);
     if (this.shouldCaptureToolContent() && result !== undefined) {
-      const capturedOutput = clampAttr(result);
+      const capturedOutput = textAttr(result);
       slot.span.setAttribute(ATTR_GEN_AI_TOOL_CALL_RESULT, capturedOutput);
       slot.span.setAttribute(ATTR_LANGFUSE_OBSERVATION_OUTPUT, capturedOutput);
     }
     const errorMessage = isError && this.shouldCaptureToolContent()
       ? this.toolErrorMessage(result)
       : undefined;
-    const capturedError = errorMessage ? clampAttr(errorMessage) : undefined;
+    const capturedError = errorMessage ? textAttr(errorMessage) : undefined;
     const elapsedMs = Number(process.hrtime.bigint() - slot.startNs) / 1e6;
     slot.span.setAttribute("pi.tool.duration_ms", elapsedMs);
     if (isError) {
@@ -1697,7 +1697,7 @@ function extractToolCalls(
     const tc = p;
     const fn: { name: string; arguments?: string } = { name: tc.name };
     if (captureToolArgs) {
-      fn.arguments = typeof tc.arguments === "string" ? tc.arguments : clampAttr(tc.arguments);
+      fn.arguments = typeof tc.arguments === "string" ? tc.arguments : textAttr(tc.arguments);
     }
     out.push({ id: tc.id, type: "function", function: fn });
   }

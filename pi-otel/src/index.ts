@@ -38,7 +38,6 @@ import { resolveConfig } from "./config.js";
 import { registerCommands } from "./commands.js";
 import { emitLog } from "./logging.js";
 import { type TelemetryRuntime, piAtLeast, startRuntime } from "./sdk.js";
-import { clampAttr } from "./attrs.js";
 import {
   ATTR_GEN_AI_COST_USD,
   ATTR_GEN_AI_INPUT_TOKENS,
@@ -76,24 +75,23 @@ const ALLOWED_SEVERITIES = new Set(["trace", "debug", "info", "warn", "warning",
  * Validate and normalize a pi-otel:log payload from an untrusted extension.
  * Returns null when the payload is not usable. Primitive attribute values are
  * kept; nested objects and arrays are dropped (the OTLP log model only
- * accepts scalar attribute values). Strings are clamped to the attribute
- * ceiling so a misbehaving extension cannot push oversized records.
+ * accepts scalar attribute values). String values pass through unchanged.
  */
 export function normalizeLogPayload(data: unknown): LogChannelPayload | null {
   if (!data || typeof data !== "object") return null;
   const d = data as Record<string, unknown>;
-  const eventName = typeof d.eventName === "string" ? clampAttr(d.eventName) : null;
+  const eventName = typeof d.eventName === "string" ? d.eventName : null;
   if (!eventName) return null;
   const severity =
     typeof d.severity === "string" && ALLOWED_SEVERITIES.has(d.severity.toLowerCase())
       ? d.severity.toLowerCase()
       : "info";
-  const body = typeof d.body === "string" ? clampAttr(d.body) : "";
+  const body = typeof d.body === "string" ? d.body : "";
   const rawAttrs = (d.attributes ?? null) as unknown;
   const attributes: Record<string, string | number | boolean> = {};
   if (rawAttrs && typeof rawAttrs === "object" && !Array.isArray(rawAttrs)) {
     for (const [k, v] of Object.entries(rawAttrs as Record<string, unknown>)) {
-      if (typeof v === "string") attributes[k] = clampAttr(v);
+      if (typeof v === "string") attributes[k] = v;
       else if (typeof v === "number" || typeof v === "boolean") attributes[k] = v;
       // objects, arrays, null, undefined, etc. are dropped
     }

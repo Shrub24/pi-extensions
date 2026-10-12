@@ -256,43 +256,25 @@ export const METRIC_COMPACTION_COUNT = "pi.compaction.count";
  */
 export type ContentCapture = "metadata_only" | "no_tool_content" | "full";
 
-// OTel collectors typically reject attributes larger than 64 KiB. Claude Code
-// uses the same ceiling. Larger payloads are truncated with a suffix marker.
-const MAX_ATTR_BYTES = 64 * 1024;
-const TRUNC_SUFFIX = "…[truncated]";
-
 /**
- * Clamp a value to a byte-safe string attribute. Objects are JSON-serialized
- * with a circular-reference guard. Truncation works in UTF-8 byte space so
- * it never splits a multi-byte sequence and never trusts UTF-16 code-unit
- * indices as byte offsets.
- */
-/**
- * Serialize a structured GenAI payload without the byte ceiling. Clamping its
- * JSON text would cut mid-token and leave the value unparseable.
+ * Serialize a structured GenAI payload as JSON. Always JSON, so a plain string
+ * becomes a quoted JSON string; use `textAttr` where the raw text is wanted.
  */
 export function jsonAttr(value: unknown): string {
   return safeStringify(value);
 }
 
-export function clampAttr(value: unknown): string {
-  let s: string;
-  if (typeof value === "string") {
-    s = value;
-  } else if (value instanceof Error) {
-    s = value.stack ?? `${value.name}: ${value.message}`;
-  } else {
-    s = safeStringify(value);
-  }
-  const bytes = Buffer.byteLength(s, "utf8");
-  if (bytes <= MAX_ATTR_BYTES) return s;
-  // Work in byte space. Leave room for the truncation suffix, then shrink to
-  // the largest byte offset at or below the budget that lands on a UTF-8
-  // character boundary (a byte that is not a continuation byte, 0x80-0xBF).
-  const buf = Buffer.from(s, "utf8");
-  let end = MAX_ATTR_BYTES - Buffer.byteLength(TRUNC_SUFFIX, "utf8");
-  while (end > 0 && ((buf[end] ?? 0) & 0xc0) === 0x80) end--; // back over continuations
-  return `${buf.subarray(0, end).toString("utf8")}${TRUNC_SUFFIX}`;
+/**
+ * Serialize a value as a text attribute: strings pass through unchanged, an
+ * Error becomes its stack, and anything else is JSON-serialized with a
+ * circular-reference guard. Nothing is truncated: a payload the model or a
+ * tool produced is exported in full, so what the backend shows is what the
+ * model saw.
+ */
+export function textAttr(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value instanceof Error) return value.stack ?? `${value.name}: ${value.message}`;
+  return safeStringify(value);
 }
 
 const SAFE_STRINGIFY_REPLACER = (_k: string, v: unknown): unknown => {
