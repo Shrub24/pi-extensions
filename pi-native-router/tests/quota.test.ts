@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HealthStore } from "../src/health-store";
-import { exhaustedUntil, formatRemaining, parseCodexbar, quotaScopeKey, refreshQuota, type QuotaSource } from "../src/quota";
+import { exhaustedUntil, formatRemaining, formatUsed, parseCodexbar, QUOTA_REFRESH_GATE_MS, quotaScopeKey, refreshQuota, type QuotaSource, usageBar } from "../src/quota";
 import { parseConfig } from "../src/config";
 import { Health } from "../src/policy";
 import { generateCodexbarConfig, stableUuid } from "../src/codexbar-config";
@@ -64,7 +64,7 @@ test("enforced exhaustion blocks the account until its reset; unenforced exhaust
     const run = async () => goOutput.replace('"source":"local+api"', '"source":"api"');
     await refreshQuota(store, { provider: "opencode-go", account: "go-a" }, source(false), run, () => NOW, "h1");
     expect(store.blocked(["opencode-go#go-a"])).toBeUndefined();
-    await refreshQuota(store, { provider: "opencode-go", account: "go-a" }, source(true), run, () => NOW, "h1");
+    await refreshQuota(store, { provider: "opencode-go", account: "go-a" }, source(true), run, () => NOW, "h1", { force: true });
     expect(store.blocked(["opencode-go#go-a"])?.kind).toBe("tracker-quota");
     expect(store.blocked(["opencode-go#go-b"])).toBeUndefined();
     store.close();
@@ -263,4 +263,48 @@ test("exact server meters from the OAuth or API source are authoritative; estima
   expect(parse("oauth", "exact")).toMatchObject({ snapshot: { authoritative: true } });
   expect(parse("oauth", "estimated")).toMatchObject({ snapshot: { authoritative: false } });
   expect(parse("local+api", "exact")).toMatchObject({ snapshot: { authoritative: false } });
+});
+
+test("a recent shared fetch is reused by every process; only a forced or stale refresh runs CodexBar", async () => {
+  const root = dir();
+  try {
+    const store = new HealthStore(join(root, "h.sqlite"), () => NOW);
+    let runs = 0;
+    const run = async () => { runs++; return goOutput.replace('"source":"local+api"', '"source":"api"'); };
+    const scope = { provider: "opencode-go", account: "go-a" };
+    const first = await refreshQuota(store, scope, source(false), run, () => NOW, "a");
+    expect(first.status).toBe("refreshed");
+    const reused = await refreshQuota(store, scope, source(false), run, () => NOW + 60_000, "b");
+    expect(reused.status).toBe("cached");
+    expect(runs).toBe(1);
+    await refreshQuota(store, scope, source(false), run, () => NOW + 60_000, "b", { force: true });
+    expect(runs).toBe(2);
+    await refreshQuota(store, scope, source(false), run, () => NOW + 60_000 + QUOTA_REFRESH_GATE_MS, "b");
+    expect(runs).toBe(3);
+    store.close();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("a failed CodexBar run also waits out the gate instead of retrying every tick", async () => {
+  const root = dir();
+  try {
+    const store = new HealthStore(join(root, "h.sqlite"), () => NOW);
+    let runs = 0;
+    const run = async () => { runs++; throw new Error("codexbar exited 1"); };
+    const scope = { provider: "opencode-go", account: "go-a" };
+    await refreshQuota(store, scope, source(false), run, () => NOW, "a");
+    const again = await refreshQuota(store, scope, source(false), run, () => NOW + 60_000, "a");
+    expect(again.status).toBe("cached");
+    expect(runs).toBe(1);
+    store.close();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("usage shows two decimals and a fill bar that matches the percentage", () => {
+  expect(formatUsed(57.1234)).toBe("57.12%");
+  expect(formatUsed(0)).toBe("0.00%");
+  expect(usageBar(0, 10)).toBe("[░░░░░░░░░░]");
+  expect(usageBar(100, 10)).toBe("[██████████]");
+  expect(usageBar(57.1234, 10)).toBe("[██████░░░░]");
+  expect(usageBar(150, 4)).toBe("[████]");
 });

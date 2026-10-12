@@ -12,6 +12,11 @@ export interface QuotaSource { source: "codexbar"; provider: string; account?: s
 export type Runner = (args: string[], timeoutMs: number) => Promise<string>;
 
 export const QUOTA_FRESH_MS = 5 * 60_000;
+/**
+ * Minimum gap between CodexBar runs for one account, across every Pi process on the machine. Shorter than the
+ * five-minute refresh timer so a timer tick is never skipped by its own previous fetch; a failed run also waits.
+ */
+export const QUOTA_REFRESH_GATE_MS = 4 * 60_000;
 export const QUOTA_TIMEOUT_MS = 15_000;
 export const QUOTA_MAX_OUTPUT = 64 * 1024;
 /** Backoff when a window is exhausted but its reset is unusable. */
@@ -81,12 +86,14 @@ export const codexbarRunner: Runner = (args, timeoutMs) => new Promise((resolve,
 export type RefreshOutcome =
   | { status: "refreshed"; snapshot: QuotaSnapshot }
   | { status: "unavailable"; reason: string }
-  | { status: "leased" };
+  | { status: "leased" }
+  | { status: "cached"; observedAt: number };
 
 /**
- * Refreshes one account's quota under a shared lease. Enforced accounts get a tracker-sourced
- * cause for exhausted windows; a fresh, complete healthy snapshot clears only causes that were
- * already present when this fetch started.
+ * Refreshes one account's quota under a shared lease. The shared store is the single source: a last attempt
+ * (success or failure) newer than the gate is reused, so concurrent processes run CodexBar at most once per gate
+ * unless `force` is set. Enforced accounts get a tracker-sourced cause for exhausted windows; a fresh, complete
+ * healthy snapshot clears only causes that were already present when this fetch started.
  */
 /**
  * Scope key for quota state: a named account (`provider#account`), or a default-auth provider
@@ -103,11 +110,15 @@ export async function refreshQuota(
   run: Runner,
   now: () => number,
   holder: string,
+  options: { force?: boolean } = {},
 ): Promise<RefreshOutcome> {
   const key = quotaScopeKey(scope.provider, scope.account);
   const leaseKey = `quota:${key}`;
   if (!store.acquireLease(leaseKey, holder, QUOTA_TIMEOUT_MS + 5_000)) return { status: "leased" };
   try {
+    // Re-read under the lease: another process may have just fetched, which is why the gate is checked here.
+    const last = store.getSnapshot(key);
+    if (!options.force && last && now() - last.observedAt < QUOTA_REFRESH_GATE_MS) return { status: "cached", observedAt: last.observedAt };
     const started = store.revision();
     const args = ["usage", "--provider", source.provider, "--format", "json"];
     // Named accounts are labelled in the generated CodexBar config (router id by default). Default-auth
@@ -151,4 +162,13 @@ export function formatRemaining(resetsAt: number, now: number): string {
   if (days > 0) return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
   if (hours > 0) return `${hours}h ${mins}m`;
   return `${mins}m`;
+}
+
+/** Used percentage to two decimals, e.g. `57.12%`. Display only: blocking compares the raw value. */
+export const formatUsed = (usedPercent: number) => `${usedPercent.toFixed(2)}%`;
+
+/** Fixed-width fill bar for used capacity, e.g. `[██████░░░░]`. Values outside 0-100 are clamped. */
+export function usageBar(usedPercent: number, width = 20): string {
+  const filled = Math.round(Math.min(100, Math.max(0, usedPercent)) / 100 * width);
+  return `[${"█".repeat(filled)}${"░".repeat(width - filled)}]`;
 }

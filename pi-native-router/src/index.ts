@@ -10,7 +10,7 @@ import { readConfig, type Config, type RouteConfig } from "./config";
 import { accountActive, accountSecret, readAccountKey, useAccount } from "./accounts";
 import { HealthStore } from "./health-store";
 import { defaultDecisionLogPath, recordDecision, type DecisionReason } from "./decision-log";
-import { codexbarRunner, formatRemaining, QUOTA_FRESH_MS, quotaScopeKey, refreshQuota, type QuotaSnapshot, type QuotaSource } from "./quota";
+import { codexbarRunner, formatRemaining, formatUsed, QUOTA_FRESH_MS, quotaScopeKey, refreshQuota, type QuotaSnapshot, type QuotaSource, usageBar } from "./quota";
 import { codexbarConfigPath, generateCodexbarConfig, readCodexbarConfig, writeCodexbarConfig } from "./codexbar-config";
 import { defaultPricingPath, loadSnapshot, refreshSnapshot, saveSnapshot } from "./pricing/cache";
 import { lookup } from "./pricing/catalog";
@@ -246,17 +246,21 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     })),
     ...Object.entries(config.quotas).map(([provider, quota]) => ({ label: provider, key: quotaScopeKey(provider), scope: { provider }, quota })),
   ];
-  const refreshQuotas = async (): Promise<string[]> => {
+  const refreshQuotas = async (force = false): Promise<string[]> => {
     if (!store || quotaScopes.length === 0) return [];
     const lines: string[] = [];
+    const now = options.now ?? Date.now;
     for (const { label, scope, quota } of quotaScopes) {
-      const outcome = await refreshQuota(store, scope, quota, codexbarRunner, options.now ?? Date.now, quotaHolder);
-      lines.push(outcome.status === "unavailable" ? `  ${label}: unknown (${outcome.reason})` : outcome.status === "leased" ? `  ${label}: refresh already in progress elsewhere` : `  ${label}: refreshed`);
+      const outcome = await refreshQuota(store, scope, quota, codexbarRunner, now, quotaHolder, { force });
+      lines.push(outcome.status === "unavailable" ? `  ${label}: unknown (${outcome.reason})`
+        : outcome.status === "leased" ? `  ${label}: refresh already in progress elsewhere`
+        : outcome.status === "cached" ? `  ${label}: reused a fetch ${Math.round((now() - outcome.observedAt) / 1000)}s old`
+        : `  ${label}: refreshed`);
     }
     return lines;
   };
-  // Tracker quota refreshes on launch and periodically, never on the dispatch path. Leases keep
-  // concurrent processes from refreshing the same account twice.
+  // Tracker quota refreshes on launch and periodically, never on the dispatch path. The shared store gates
+  // CodexBar runs across processes; leases only stop overlapping runs.
   let quotaTimer: ReturnType<typeof setInterval> | undefined;
   const refreshQuotaQuietly = () => { void refreshQuotas().catch(degrade); };
   // The model that was active before the latest switch. Pi applies the thinking level for a switch before
@@ -338,11 +342,11 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     },
   });
   pi.registerCommand("quotas", {
-    description: "Show tracker quota windows per account and refresh them",
-    handler: async (_args, ctx) => {
+    description: "Show tracker quota windows per account; reuses recent fetches unless `refresh` is given",
+    handler: async (args, ctx) => {
       if (quotaScopes.length === 0) { ctx.ui.notify("native-router: no account or provider has a quota mapping", "info"); return; }
       if (!store) { ctx.ui.notify("native-router: quotas need shared health; set sharedHealth to true", "warning"); return; }
-      const refreshed = await refreshQuotas();
+      const refreshed = await refreshQuotas(args.trim() === "refresh");
       const now = options.now?.() ?? Date.now();
       const lines = [`native-router quotas (${new Date(now).toISOString()})`, ...refreshed];
       for (const { label, key, quota } of quotaScopes) {
@@ -354,7 +358,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
         lines.push(`  ${label} (${quota.provider}${quota.account ? `/${quota.account}` : ""}) observed ${age}s ago${now - snapshot.observedAt > QUOTA_FRESH_MS ? " [stale]" : ""}, enforcement ${quota.enforce ? "on" : "off"}`);
         for (const w of snapshot.windows) {
           const reset = w.resetsAt === undefined ? "reset unknown" : `resets in ${formatRemaining(w.resetsAt, now)}`;
-          lines.push(`    ${w.label}: ${w.usedPercent}% used, ${reset}`);
+          lines.push(`    ${w.label} ${usageBar(w.usedPercent)} ${formatUsed(w.usedPercent)} used, ${reset}`);
         }
         if (blocked?.kind === "tracker-quota") lines.push(`    blocking routing until ${new Date(blocked.until).toISOString()}`);
       }

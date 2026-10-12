@@ -107,7 +107,7 @@ An account may map to a CodexBar provider so `/quotas` can show its windows:
 }
 ```
 
-- `/quotas` runs `codexbar usage --provider <provider> [--account <label>] --format json` with a 15 s deadline and a 64 KiB output cap, under a per-account refresh lease, and prints each window with its usage, reset and observation age. Missing binary, timeout or unrecognised output is shown as unknown and never counts as capacity or as a generation failure.
+- `/quotas` runs `codexbar usage --provider <provider> [--account <label>] --format json` with a 15 s deadline and a 64 KiB output cap, under a per-account refresh lease, and prints each window with a fill bar, its usage to two decimals, reset and observation age. Missing binary, timeout or unrecognised output is shown as unknown and never counts as capacity or as a generation failure.
 - `enforce: true` writes a tracker-sourced cause that skips the account until its exhausted window resets. It is **off by default**; enable it per account once the account's CodexBar source is authoritative (`api`, `web` or `oauth`).
 - **Default-auth providers** (Pi's own login, such as `openai-codex` and `anthropic`) have no named account. Map them under a top-level `quotas` key by Pi provider id:
 
@@ -121,7 +121,7 @@ An account may map to a CodexBar provider so `/quotas` can show its windows:
   CodexBar reads the logged-in account for these, so no label is passed. An exhausted window blocks every model on that provider until its reset. A provider with named accounts must put its quota on those accounts instead; the two cannot overlap.
 - A healthy snapshot clears only tracker-sourced causes. Auth, rate, outage and error-derived quota causes are unaffected.
 - `/quotas-config [--replace] [path]` writes CodexBar's config from the quota-mapped accounts: each becomes a token account labelled with its quota account (or router id) and its key read from the same environment variable. Providers are set to `source: "api"` so their meters are account-authoritative rather than device-local. The file is written 0600 via a temporary file and rename, and an existing file is refused unless `--replace` is given. Accounts whose key variable is unset are reported and skipped.
-- Refresh runs on session start and every five minutes (leased, so concurrent Pi processes do not duplicate it), and `/quotas` refreshes on demand. Dispatch never waits for CodexBar.
+- Refresh runs on session start and every five minutes. The shared store is the gate: any process reuses an account's last CodexBar attempt (success or failure) if it is under four minutes old, so all Pi processes on the machine run CodexBar at most once per gate per account. `/quotas` reuses that fetch; `/quotas refresh` forces a new one. Dispatch never waits for CodexBar.
 - Snapshots are authoritative only when the tracker reports server meters (`source` api, web or oauth, or an explicit authoritative confidence). A `local+api` blend or estimate never enforces a block.
 
 ## Model pricing (estimates)
