@@ -17,7 +17,9 @@ export interface RouteConfig {
   maxRecoveries: number;
 }
 export interface Display { providers: Record<string, string>; models: Record<string, string> }
-export interface Config { display?: Display; routes: Record<string, RouteConfig>; accounts: Record<string, Account>; quotas: Record<string, QuotaSource>; flushTimeoutMs: number; sharedHealth: boolean; pricingOverrides: Record<string, { input?: number; output?: number; cacheRead?: number; cacheWrite?: number }> }
+/** Pi leaves ctrl+shift+m unbound; ctrl+shift+p is app.model.cycleBackward. */
+export const DEFAULT_CYCLE_PIN = "ctrl+shift+m";
+export interface Config { shortcuts: { cyclePin: string }; display?: Display; routes: Record<string, RouteConfig>; accounts: Record<string, Account>; quotas: Record<string, QuotaSource>; flushTimeoutMs: number; sharedHealth: boolean; pricingOverrides: Record<string, { input?: number; output?: number; cacheRead?: number; cacheWrite?: number }> }
 const levels = ["off", "minimal", "low", "medium", "high", "xhigh"];
 function record(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Router config must be an object");
@@ -44,7 +46,11 @@ function parseQuota(where: string, value: unknown): QuotaSource {
 
 export function parseConfig(raw: unknown): Config {
   const config = record(raw);
-  keys(config, ["routes", "accounts", "quotas", "flushTimeoutMs", "sharedHealth", "pricing", "display"]);
+  keys(config, ["routes", "accounts", "quotas", "flushTimeoutMs", "sharedHealth", "pricing", "display", "shortcuts"]);
+  const shortcutsRaw = record(config.shortcuts ?? {});
+  keys(shortcutsRaw, ["cyclePin"]);
+  const cyclePin = shortcutsRaw.cyclePin ?? DEFAULT_CYCLE_PIN;
+  if (typeof cyclePin !== "string" || !cyclePin.trim()) throw new Error("shortcuts.cyclePin must be a non-empty key id");
   // Footer labels only: they never change routing, keys or telemetry. Models are keyed provider/id.
   const displayRaw = record(config.display ?? {});
   keys(displayRaw, ["providers", "models"]);
@@ -128,7 +134,7 @@ export function parseConfig(raw: unknown): Config {
     };
     if (routes[role].outputReserve >= routes[role].contextWindow) throw new Error("outputReserve must be below contextWindow");
   }
-  return { routes, accounts, quotas, flushTimeoutMs: integer(config.flushTimeoutMs, 5000, 1, 60_000), sharedHealth: config.sharedHealth !== false, pricingOverrides, display };
+  return { routes, accounts, quotas, flushTimeoutMs: integer(config.flushTimeoutMs, 5000, 1, 60_000), sharedHealth: config.sharedHealth !== false, pricingOverrides, display, shortcuts: { cyclePin: cyclePin.trim() } };
 }
 
 // User-owned settings only: project config must not silently redirect paid requests.

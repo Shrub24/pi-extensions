@@ -13,7 +13,7 @@ test("a DeepSeek opencode-go message at peak returns doubled cost with the peak 
     const handlers: Record<string, Array<(event: unknown, ctx: unknown) => unknown>> = {};
     const pi = {
       on(name: string, handler: (event: unknown, ctx: unknown) => unknown) { (handlers[name] ??= []).push(handler); },
-      registerCommand() {}, registerVirtualModel() {}, registerProvider() {}, appendEntry() {},
+      registerCommand() {}, registerShortcut() {}, registerVirtualModel() {}, registerProvider() {}, appendEntry() {},
       setActiveTools() {}, getActiveTools: () => [], getAllTools: () => [],
       events: { on() {}, emit() {} },
     };
@@ -44,7 +44,7 @@ test("a Command Code DeepSeek message at peak keeps its recorded cost and carrie
     const handlers: Array<(event: unknown, ctx: unknown) => unknown> = [];
     const pi = {
       on(name: string, handler: (event: unknown, ctx: unknown) => unknown) { if (name === "message_end") handlers.push(handler); },
-      registerCommand() {}, registerVirtualModel() {}, registerProvider() {}, appendEntry() {},
+      registerCommand() {}, registerShortcut() {}, registerVirtualModel() {}, registerProvider() {}, appendEntry() {},
       setActiveTools() {}, getActiveTools: () => [], getAllTools: () => [],
       events: { on() {}, emit() {} },
     };
@@ -74,7 +74,7 @@ test("an off-peak message is returned unchanged and without the marker", () => {
     const handlers: Array<(event: unknown, ctx: unknown) => unknown> = [];
     const pi = {
       on(name: string, handler: (event: unknown, ctx: unknown) => unknown) { if (name === "message_end") handlers.push(handler); },
-      registerCommand() {}, registerVirtualModel() {}, registerProvider() {}, appendEntry() {},
+      registerCommand() {}, registerShortcut() {}, registerVirtualModel() {}, registerProvider() {}, appendEntry() {},
       setActiveTools() {}, getActiveTools: () => [], getAllTools: () => [],
       events: { on() {}, emit() {} },
     };

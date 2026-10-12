@@ -167,6 +167,17 @@ Labels are configurable under `display`. They change only what the footer shows,
 
 Provider labels replace the provider part of `provider/model`. Model labels are keyed by `provider/id` and replace the model id.
 
+## Physical pin
+
+`/route-pin` chooses which candidate a route tries first. With no argument it opens a picker of `auto` and the route's candidates; `/route-pin <candidate>` (for example `opencode-go/deepseek-v4.1-flash#go-c`) or `/route-pin auto` sets it directly, and completion offers the labels. The hotkey cycles the pin to the next eligible candidate in route order and wraps; set it under `shortcuts.cyclePin` (default `ctrl+shift+m`, which Pi leaves unbound; `ctrl+shift+p` is taken by `app.model.cycleBackward`).
+
+- The pin is stored per route on the session branch, so resume and fork restore it. It is never shared across sessions.
+- A pinned candidate is tried first when it is healthy and fits the request. Recovery targets still take priority.
+- A pin that cannot serve (cooldown, exhausted quota, or too small for the request) is dormant: that request uses route order, and the pin applies again once the candidate is eligible.
+- `auto` clears the pin.
+- The physical footer item shows `⚑` while a pin is set. Each manual change is logged with reason `manual`.
+- Every manual change notifies that the route's cache rebuilds on the next request.
+
 ## Decision log
 
 Each change of physical target is appended to `$PI_CODING_AGENT_DIR/pi-native-router/decisions.jsonl` (default `~/.pi/agent/...`, mode `0600`), one JSON object per line:

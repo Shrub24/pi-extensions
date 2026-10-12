@@ -139,10 +139,27 @@ export interface Resolved { candidate: Candidate; model: Model<Api> }
 export function requiredContext(route: RouteConfig, model: { maxTokens: number }, tokens: number): number {
   return Math.max(route.contextWindow, tokens + Math.max(route.outputReserve, model.maxTokens));
 }
+/** Candidates that are healthy and fit this request, in route order. */
+export function eligibleCandidates(route: RouteConfig, available: Resolved[], health: Health, tokens: number): Resolved[] {
+  return available.filter(({ model, candidate }) => health.eligible(model, candidate.account) && model.contextWindow >= requiredContext(route, model, tokens) && model.maxTokens >= route.outputReserve);
+}
 export function choose(route: RouteConfig, available: Resolved[], health: Health, tokens: number, preferred?: string, exclude?: string | ReadonlySet<string>): Resolved | undefined {
   const excluded = (id: string) => typeof exclude === "string" ? exclude === id : exclude?.has(id) ?? false;
-  const usable = available.filter(({ model, candidate }) => !excluded(identity(model, candidate.account)) && health.eligible(model, candidate.account) && model.contextWindow >= requiredContext(route, model, tokens) && model.maxTokens >= route.outputReserve);
+  const usable = eligibleCandidates(route, available.filter(({ model, candidate }) => !excluded(identity(model, candidate.account))), health, tokens);
   return usable.find(c => identity(c.model, c.candidate.account) === preferred) ?? usable[0];
+}
+/**
+ * The next eligible candidate after `current` in route order, wrapping once; `current` itself is tried last. With no
+ * current candidate in the list, the search starts at the first one.
+ */
+export function cycleTarget(route: RouteConfig, available: Resolved[], health: Health, tokens: number, current: string | undefined): Resolved | undefined {
+  const eligible = new Set(eligibleCandidates(route, available, health, tokens).map(c => identity(c.model, c.candidate.account)));
+  const start = available.findIndex(c => identity(c.model, c.candidate.account) === current);
+  for (let step = 1; step <= available.length; step++) {
+    const next = available[(start + step + available.length) % available.length];
+    if (eligible.has(identity(next.model, next.candidate.account))) return next;
+  }
+  return undefined;
 }
 
 // Pi's thinking levels in increasing order, and the clamp Pi applies to a model's supported set (pi-ai).

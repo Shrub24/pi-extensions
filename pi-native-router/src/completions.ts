@@ -24,16 +24,21 @@ export function completeArguments(prefix: string, slots: ArgumentSlots): Argumen
 }
 
 /** Completions for the four router commands, keyed by command name. */
-export function commandSlots(config: Config): Record<"pricing" | "quotas" | "quotas-config" | "native-router-health" | "route-thinking", ArgumentSlots> {
+export function commandSlots(config: Config): Record<"pricing" | "quotas" | "quotas-config" | "native-router-health" | "route-thinking" | "route-pin", ArgumentSlots> {
   // Price targets are the physical models the routes can select, so the list stays short and needs no catalog load.
   const targets = [...new Set(Object.values(config.routes).flatMap(route => route.candidates.map(c => `${c.provider}/${c.id}`)))];
   const accounts = Object.keys(config.accounts);
+  // The current route is not known while completing, so pin labels cover every route; the command validates against its own route.
+  const pinLabels = [...new Set(Object.values(config.routes).flatMap(route => route.candidates.map(c => `${c.provider}/${c.id}${c.account ? `#${c.account}` : ""}`)))];
   return {
     pricing: done => done.length === 0
       ? [{ value: "refresh", description: "download and save catalog prices" }, { value: "show", description: "show one physical model's rates" }]
       : done[0] === "show" && done.length === 1 ? targets.map(value => ({ value, description: "physical model" })) : [],
     quotas: done => done.length === 0 ? [{ value: "refresh", description: "fetch tracker quota now, ignoring the reuse gate" }] : [],
     "quotas-config": () => [{ value: "--replace", description: "replace an existing CodexBar config file" }],
+    "route-pin": done => done.length === 0
+      ? [{ value: "auto", description: "follow route order again" }, ...pinLabels.map(value => ({ value, description: "candidate" }))]
+      : [],
     "route-thinking": done => done.length === 0 ? [{ value: "default", description: "use candidate thinking defaults again" }] : [],
     "native-router-health": done => done.length === 0
       ? [{ value: "reset", description: "clear one account's health causes" }]

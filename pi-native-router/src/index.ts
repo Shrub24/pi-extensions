@@ -11,6 +11,7 @@ import { commandSlots, completeArguments } from "./completions";
 import { accountActive, accountSecret, readAccountKey, runtimeKeysAvailable, useAccount } from "./accounts";
 import { HealthStore } from "./health-store";
 import { FOOTER_KEYS, peakText, physicalText, thinkingText } from "./footer";
+import { DEFAULT_CYCLE_PIN } from "./config";
 import { healthReport, type HealthMode } from "./health-report";
 import { defaultDecisionLogPath, recordDecision, type DecisionReason } from "./decision-log";
 import { codexbarRunner, formatRemaining, formatUsed, QUOTA_FRESH_MS, quotaScopeKey, refreshQuota, type QuotaSnapshot, type QuotaSource, usageBar } from "./quota";
@@ -18,7 +19,7 @@ import { codexbarConfigPath, generateCodexbarConfig, readCodexbarConfig, writeCo
 import { defaultPricingPath, loadSnapshot, refreshSnapshot, saveSnapshot } from "./pricing/cache";
 import { lookup } from "./pricing/catalog";
 import { applyPeak, backfillCost, labelRecordedPeak, type CostUsage } from "./pricing/reconcile";
-import { accountOf, admissionKeys, cacheExpiry, choose, classify, clampLevel, Health, identity, observe, partialOutput, physicalOf, requiredContext, restore, THINKING_ORDER, type Resolved, type State } from "./policy";
+import { accountOf, admissionKeys, cacheExpiry, choose, cycleTarget, classify, clampLevel, Health, identity, observe, partialOutput, physicalOf, requiredContext, restore, THINKING_ORDER, type Resolved, type State } from "./policy";
 import { beforeTransition, flushBridge, type FlushHook, type TransitionHook } from "./transition";
 
 function tokens(messages: readonly Message[]): number {
@@ -65,6 +66,18 @@ const CACHE_ACTIVITY_ENTRY = "@vanillagreen/pi-native-router/cache-activity";
 /** The user's explicit thinking level while on a route, per role. Persisted so resumed branches keep it. */
 const THINKING_CHOICE_ENTRY = "@vanillagreen/pi-native-router/thinking-choice";
 const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+/** The user's physical pin per route, persisted on the branch: a candidate identity, or null for auto. Last entry wins. */
+const PIN_ENTRY = "@vanillagreen/pi-native-router/physical-pin";
+type ShortcutKey = Parameters<ExtensionAPI["registerShortcut"]>[0];
+function pinOf(ctx: ExtensionContext, role: string): string | null | undefined {
+  const entry = ctx.sessionManager.getBranch().findLast(e => e.type === "custom" && e.customType === PIN_ENTRY && (e.data as { role?: string })?.role === role);
+  if (entry?.type !== "custom") return undefined;
+  const pinned = (entry.data as { identity?: unknown }).identity;
+  return typeof pinned === "string" ? pinned : null;
+}
+function isPinned(ctx: ExtensionContext, role: string): boolean {
+  return typeof pinOf(ctx, role) === "string";
+}
 
 /** The latest explicit route thinking choice on this branch, if the user made one. */
 function userThinking(ctx: ExtensionContext, role: string): ModelThinkingLevel | undefined {
@@ -135,7 +148,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       if (request.reason === "direct") {
         const selected = choose(route, await activeOnly(candidates, ctx, config.accounts), health, estimate);
         if (!selected) throw exhausted(role, route, ctx);
-        publishRoute(ctx, selected.model, selected.candidate.account, selected.candidate.thinkingLevel, undefined);
+        publishRoute(ctx, selected.model, selected.candidate.account, selected.candidate.thinkingLevel, undefined, isPinned(ctx, role));
         return { model: selected.model, thinkingLevel: selected.candidate.thinkingLevel };
       }
       const old = restore(request.state);
@@ -167,9 +180,12 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       }
       // Admit one recovery probe per expired scope on the chosen target, or move to the next target.
       const skipped = new Set<string>(exclude ? [exclude] : []);
+      // A pin is preferred after recovery and ahead of the current physical model; a dormant pin falls back to route order.
+      const pin = pinOf(ctx, role);
+      const preferred = state.next ?? (typeof pin === "string" ? pin : state.physical);
       let selected: Resolved | undefined;
       for (;;) {
-        selected = choose(route, candidates, health, estimate, state.next ?? state.physical, skipped);
+        selected = choose(route, candidates, health, estimate, preferred, skipped);
         if (!selected) break;
         const target = identity(selected.model, selected.candidate.account);
         if (!store) break;
@@ -254,7 +270,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       // An explicit user choice on this route overrides the candidate default; reasoning-less models keep theirs.
       const explicit = userThinking(ctx, role);
       const thinkingLevel = (explicit === undefined ? selected.candidate.thinkingLevel : clampLevel(selected.model, explicit)) as ModelThinkingLevel;
-      publishRoute(ctx, selected.model, selected.candidate.account, thinkingLevel, explicit);
+      publishRoute(ctx, selected.model, selected.candidate.account, thinkingLevel, explicit, isPinned(ctx, role));
       return { model: selected.model, thinkingLevel, state: unchanged ? request.state : state };
     };
     pi.on("message_end", (event, ctx) => {
@@ -320,9 +336,9 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     ctx.ui.setStatus(FOOTER_KEYS.thinking, model !== undefined && model.provider !== "route" && model.reasoning && ctx.thinkingLevel ? thinkingText(ctx.thinkingLevel, undefined) : undefined);
   };
   // The physical model, peak and effective thinking level of a request this route has just resolved.
-  const publishRoute = (ctx: ExtensionContext, model: Model<Api>, account: string | undefined, effective: string, requested: string | undefined) => {
+  const publishRoute = (ctx: ExtensionContext, model: Model<Api>, account: string | undefined, effective: string, requested: string | undefined, pinned: boolean) => {
     if (!ctx.hasUI) return;
-    ctx.ui.setStatus(FOOTER_KEYS.physical, physicalText(model.provider, model.id, account, config.display));
+    ctx.ui.setStatus(FOOTER_KEYS.physical, physicalText(model.provider, model.id, account, config.display, pinned));
     ctx.ui.setStatus(FOOTER_KEYS.peak, peakText(model.provider, model.id, options.now?.() ?? Date.now()));
     ctx.ui.setStatus(FOOTER_KEYS.thinking, model.reasoning ? thinkingText(effective, requested) : undefined);
   };
@@ -431,6 +447,57 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       }
       ctx.ui.notify(lines.join("\n"), "info");
     },
+  });
+  // Re-renders the physical item from the last served model so a pin change shows at once; nothing is shown before a request.
+  const refreshPin = (ctx: ExtensionContext, role: string) => {
+    if (!ctx.hasUI) return;
+    const served = branchState(ctx, role)?.physical;
+    if (!served) return;
+    const model = physicalOf(served);
+    const slash = model.indexOf("/");
+    ctx.ui.setStatus(FOOTER_KEYS.physical, physicalText(model.slice(0, slash), model.slice(slash + 1), accountOf(served), config.display, isPinned(ctx, role)));
+  };
+  const pinRoute = (ctx: ExtensionContext, role: string, choice: string | null) => {
+    pi.appendEntry(PIN_ENTRY, { role, identity: choice });
+    recordDecision(decisionLogPath, { at: new Date(options.now?.() ?? Date.now()).toISOString(), session: ctx.sessionManager.getSessionId(), logical: `route/${role}`, physical: choice === null ? "auto" : physicalOf(choice), ...(choice && accountOf(choice) ? { account: accountOf(choice) } : {}), reason: "manual" }, degrade);
+    refreshPin(ctx, role);
+    const note = choice === null ? `native-router: ${role} follows route order` : `native-router: ${role} pinned to ${choice}`;
+    ctx.ui.notify(`${note}; the route's cache rebuilds on the next request`, "info");
+  };
+  const cyclePin = (ctx: ExtensionContext) => {
+    const model = ctx.model;
+    if (!model || model.provider !== "route" || !config.routes[model.id]) { ctx.ui.notify("native-router: select a route first", "warning"); return; }
+    const role = model.id;
+    const pin = pinOf(ctx, role);
+    const current = typeof pin === "string" ? pin : branchState(ctx, role)?.physical;
+    const target = cycleTarget(config.routes[role], available(config.routes[role], ctx, config.accounts), health, ctx.getContextUsage()?.tokens ?? 0, current);
+    if (!target) { ctx.ui.notify(`native-router: no eligible candidate for ${role}; pin unchanged`, "warning"); return; }
+    pinRoute(ctx, role, identity(target.model, target.candidate.account));
+  };
+  pi.registerCommand("route-pin", {
+    description: "Pin this route to one candidate, or auto: /route-pin [candidate|auto]",
+    getArgumentCompletions: prefix => completeArguments(prefix, slots["route-pin"]),
+    handler: async (args, ctx) => {
+      const model = ctx.model;
+      if (!model || model.provider !== "route" || !config.routes[model.id]) { ctx.ui.notify("native-router: select a route first", "warning"); return; }
+      const role = model.id;
+      const labels = config.routes[role].candidates.map(c => identity(c, c.account));
+      const requested = args.trim();
+      let choice: string | null;
+      if (requested === "") {
+        if (!ctx.hasUI) { ctx.ui.notify(`native-router: ${role} candidates: ${labels.join(", ")}`, "info"); return; }
+        const picked = await ctx.ui.select(`Pin ${role} to`, ["auto", ...labels]);
+        if (picked === undefined) return;
+        choice = picked === "auto" ? null : picked;
+      } else if (requested === "auto") choice = null;
+      else if (labels.includes(requested)) choice = requested;
+      else { ctx.ui.notify(`native-router: ${requested} is not a candidate of ${role}; use auto or one of: ${labels.join(", ")}`, "error"); return; }
+      pinRoute(ctx, role, choice);
+    },
+  });
+  pi.registerShortcut((config.shortcuts?.cyclePin ?? DEFAULT_CYCLE_PIN) as ShortcutKey, {
+    description: "Cycle this route's physical pin to the next eligible candidate",
+    handler: ctx => cyclePin(ctx),
   });
   pi.registerCommand("route-thinking", {
     description: "Clear this route's thinking choice so candidate defaults apply again: /route-thinking default",

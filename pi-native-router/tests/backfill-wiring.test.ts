@@ -20,7 +20,7 @@ test("message_end backfills a zero Pi cost from the exact catalog record, and le
     const handlers: Array<(event: unknown, ctx: unknown) => unknown> = [];
     const pi = {
       on(name: string, handler: (event: unknown, ctx: unknown) => unknown) { if (name === "message_end") handlers.push(handler); },
-      registerCommand() {}, registerVirtualModel() {}, registerProvider() {}, appendEntry() {},
+      registerCommand() {}, registerShortcut() {}, registerVirtualModel() {}, registerProvider() {}, appendEntry() {},
       setActiveTools() {}, getActiveTools: () => [], getAllTools: () => [],
       events: { on() {}, emit() {} },
     };
@@ -58,7 +58,7 @@ test("message_end labels a placeholder backfilled from a configured override as 
     const handlers: Array<(event: unknown, ctx: unknown) => unknown> = [];
     const pi = {
       on(name: string, handler: (event: unknown, ctx: unknown) => unknown) { if (name === "message_end") handlers.push(handler); },
-      registerCommand() {}, registerVirtualModel() {}, registerProvider() {}, appendEntry() {},
+      registerCommand() {}, registerShortcut() {}, registerVirtualModel() {}, registerProvider() {}, appendEntry() {},
       setActiveTools() {}, getActiveTools: () => [], getAllTools: () => [],
       events: { on() {}, emit() {} },
     };

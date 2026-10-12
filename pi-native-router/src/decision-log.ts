@@ -6,7 +6,8 @@ import { homedir } from "node:os";
  * Append-only JSONL record of routing decisions, for debugging. One line per physical selection.
  * Holds identities and reasons only: never keys, accounts' secrets, prompts or responses.
  */
-export type DecisionReason = "initial" | "direct" | "sticky" | "failover" | "recovery" | "cache-expiry" | "probe";
+/** `manual` records a user pin change; its `physical` is the pinned candidate, or `auto` when the pin is cleared. */
+export type DecisionReason = "initial" | "direct" | "sticky" | "failover" | "recovery" | "cache-expiry" | "probe" | "manual";
 
 export interface DecisionEntry {
   at: string;
