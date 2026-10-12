@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { parseConfig } from "../src/config";
-import { physicalText } from "../src/footer";
+import { modelText, providerText } from "../src/footer";
 import { choose, classify, cycleTarget, Health, identity, type Resolved } from "../src/policy";
 
 const config = parseConfig({ routes: { work: { candidates: [{ provider: "a", id: "one" }, { provider: "a", id: "two" }, { provider: "b", id: "one" }] } } }).routes.work;
@@ -46,6 +46,8 @@ test("the cycle hotkey defaults to ctrl+shift+m and accepts a configured key", (
 });
 
 test("the footer marks a pinned physical model without words", () => {
-  expect(physicalText("a", "One", "go-a", undefined, true)).toBe("a/One · go-a ⚑");
-  expect(physicalText("a", "One", undefined)).toBe("a/One");
+  expect(providerText("a", "go-a")).toBe("a · go-a");
+  expect(providerText("a", undefined)).toBe("a");
+  expect(modelText("One", true)).toBe("One ⚑");
+  expect(modelText("One")).toBe("One");
 });

@@ -10,7 +10,7 @@ import { readConfig, type Candidate, type Config, type KeySource, type RouteConf
 import { commandSlots, completeArguments } from "./completions";
 import { keyActive, readKey, runtimeKeysAvailable, useKey } from "./accounts";
 import { HealthStore } from "./health-store";
-import { FOOTER_KEYS, peakText, physicalText, thinkingText } from "./footer";
+import { FOOTER_KEYS, modelText, peakText, providerText, thinkingText } from "./footer";
 import { DEFAULT_CYCLE_PIN } from "./config";
 import { healthReport, type HealthMode } from "./health-report";
 import { defaultDecisionLogPath, recordDecision, type DecisionReason } from "./decision-log";
@@ -355,8 +355,12 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     const preferred = typeof pin === "string" ? pin : branchState(ctx, role)?.physical;
     return choose(route, available(route, ctx, config), health, ctx.getContextUsage()?.tokens ?? 0, preferred);
   };
+  const setPhysical = (ctx: ExtensionContext, model: Model<Api> | undefined, account: string | undefined, pinned: boolean) => {
+    ctx.ui.setStatus(FOOTER_KEYS.provider, model === undefined ? undefined : providerText(model.provider, account, config.display));
+    ctx.ui.setStatus(FOOTER_KEYS.model, model === undefined ? undefined : modelText(model.name, pinned));
+  };
   const clearRoute = (ctx: ExtensionContext) => {
-    ctx.ui.setStatus(FOOTER_KEYS.physical, undefined);
+    setPhysical(ctx, undefined, undefined, false);
     ctx.ui.setStatus(FOOTER_KEYS.peak, undefined);
     ctx.ui.setStatus(FOOTER_KEYS.thinking, undefined);
   };
@@ -366,7 +370,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     const shown = displayed(ctx, role);
     if (!shown) { clearRoute(ctx); return; }
     const { model, candidate } = shown;
-    ctx.ui.setStatus(FOOTER_KEYS.physical, physicalText(model.provider, model.name, candidate.account, config.display, isPinned(ctx, role)));
+    setPhysical(ctx, model, candidate.account, isPinned(ctx, role));
     ctx.ui.setStatus(FOOTER_KEYS.peak, peakText(model.provider, model.id, options.now?.() ?? Date.now()));
     const explicit = choice ?? undefined;
     const level = routeLevel(model, candidate.thinkingLevel, explicit);
@@ -375,14 +379,14 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
   const publishSelection = (ctx: ExtensionContext, model: Model<Api> | undefined) => {
     if (!ctx.hasUI) return;
     if (model?.provider === "route" && config.routes[model.id]) { previewRoute(ctx, model.id); return; }
-    ctx.ui.setStatus(FOOTER_KEYS.physical, undefined);
+    setPhysical(ctx, undefined, undefined, false);
     ctx.ui.setStatus(FOOTER_KEYS.peak, undefined);
     ctx.ui.setStatus(FOOTER_KEYS.thinking, model?.reasoning && ctx.thinkingLevel ? thinkingText(ctx.thinkingLevel, undefined) : undefined);
   };
   // The physical model, peak and effective thinking level of a request this route has just resolved.
   const publishRoute = (ctx: ExtensionContext, model: Model<Api>, account: string | undefined, effective: string, requested: string | undefined, pinned: boolean) => {
     if (!ctx.hasUI) return;
-    ctx.ui.setStatus(FOOTER_KEYS.physical, physicalText(model.provider, model.name, account, config.display, pinned));
+    setPhysical(ctx, model, account, pinned);
     ctx.ui.setStatus(FOOTER_KEYS.peak, peakText(model.provider, model.id, options.now?.() ?? Date.now()));
     ctx.ui.setStatus(FOOTER_KEYS.thinking, model.reasoning ? thinkingText(effective, requested) : undefined);
   };

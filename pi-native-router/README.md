@@ -149,9 +149,10 @@ Switching model does not count as a choice: a physical model's own thinking leve
 
 ### Footer status
 
-The router publishes three status items for powerline's `customItems` (`native-router-physical`, `native-router-peak`, `native-router-thinking`):
+The router publishes four status items for powerline's `customItems` (`native-router-provider`, `native-router-model`, `native-router-peak`, `native-router-thinking`):
 
-- **Physical model:** `provider/model · account` for the candidate serving the current request. Before the first request on a route, it shows the candidate the next request will try.
+- **Provider:** the provider serving the current request, with its account after `·` (e.g. `OpenCode Go · go-a`). Before the first request on a route, it shows the candidate the next request will try.
+- **Model:** Pi's model name for that candidate, with `⚑` while a route pin is set.
 - **Peak:** a `▲` while the physical model is in a peak window.
 - **Thinking:** the one thinking state shown, for direct and route models alike: the level name that will run (e.g. `high`). A Nerd Font pencil (`\uF040`, `nf-fa-pencil`) follows, after a space, when you chose the level on the route. Keep Pi's built-in thinking segment out of the powerline layout so the level is shown once.
 
