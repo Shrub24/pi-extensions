@@ -18,13 +18,17 @@ The unarchived native-router and TTL specs remain the baseline. Herdsman's main 
 
 ### Named account configuration is user-owned and reference-only
 
-Add a strict accounts map to the existing router user-settings namespace. Each entry binds a stable opaque ID to a canonical provider and an environment-variable key reference; candidate `account` is optional. This is proposed configuration, not an API already supported by Pi 1.1.0:
+Add a strict providers map to the existing router user-settings namespace. Each provider carries its shared settings, and its optional `accounts` map binds a stable opaque ID to one key reference of that provider; candidate `account` is optional. This is proposed configuration, not an API already supported by Pi 1.1.0:
 
 ```json
 {
-  "accounts": {
-    "go-a": { "provider": "opencode-go", "apiKeyEnv": "OPENCODE_GO_A_KEY" },
-    "go-b": { "provider": "opencode-go", "apiKeyEnv": "OPENCODE_GO_B_KEY" }
+  "providers": {
+    "opencode-go": {
+      "accounts": {
+        "go-a": { "apiKeyEnv": "OPENCODE_GO_A_KEY" },
+        "go-b": { "apiKeyEnv": "OPENCODE_GO_B_KEY" }
+      }
+    }
   },
   "routes": {
     "worker": {

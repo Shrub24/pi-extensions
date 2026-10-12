@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
-import type { Account, KeySource } from "./config";
+import type { KeySource, ProviderConfig } from "./config";
 import type { QuotaSource } from "./quota";
 
 /**
@@ -35,13 +35,11 @@ export function stableUuid(seed: string): string {
 
 /**
  * Merges router quota scopes into CodexBar's document. Providers the router owns are replaced
- * (named accounts get token accounts; default-auth providers get a login-backed entry with no tokens).
+ * (accounts get token accounts; a single key goes on the provider; default-auth providers get a login-backed entry).
  * Every other provider and top-level key in `existing` is kept exactly as it was.
  */
 export function generateCodexbarConfig(
-  accounts: Record<string, Account>,
-  providerKeys: Record<string, KeySource>,
-  quotas: Record<string, QuotaSource>,
+  providers: Record<string, ProviderConfig>,
   readKey: (source: KeySource) => string | undefined,
   addedAt: number,
   existing?: Document,
@@ -49,26 +47,26 @@ export function generateCodexbarConfig(
   const byProvider = new Map<string, Array<{ accountId: string; entry: Record<string, unknown> }>>();
   const included: string[] = [];
   const skipped: GeneratedConfig["skipped"] = [];
-  for (const [id, account] of Object.entries(accounts)) {
-    if (account.quota === undefined) continue;
-    const token = readKey(account);
-    const source = account.apiKeyFile !== undefined ? account.apiKeyFile : account.apiKeyEnv;
-    if (!token) { skipped.push({ account: id, reason: `${source} is not available` }); continue; }
-    const label = account.quota.account ?? id;
-    const entries = byProvider.get(account.quota.provider) ?? [];
-    if (entries.some(member => member.entry.label === label)) { skipped.push({ account: id, reason: `duplicate CodexBar label ${label}` }); continue; }
-    entries.push({ accountId: id, entry: { id: stableUuid(id), label, token, addedAt } });
-    byProvider.set(account.quota.provider, entries);
-  }
-  // A single-key provider contributes its one key under its own quota mapping; it has no account label.
-  for (const [provider, source] of Object.entries(providerKeys)) {
-    const quota = quotas[provider];
-    if (!quota) continue;
-    const token = readKey(source);
-    if (!token) { skipped.push({ account: provider, reason: `${source.apiKeyFile ?? source.apiKeyEnv} is not available` }); continue; }
-    const entries = byProvider.get(quota.provider) ?? [];
-    entries.push({ accountId: provider, entry: { id: stableUuid(`provider:${provider}`), label: provider, token, addedAt } });
-    byProvider.set(quota.provider, entries);
+  for (const [id, provider] of Object.entries(providers)) {
+    for (const [accountId, account] of Object.entries(provider.accounts)) {
+      if (account.quota === undefined) continue;
+      const token = readKey(account);
+      const source = account.apiKeyFile ?? account.apiKeyEnv;
+      if (!token) { skipped.push({ account: accountId, reason: `${source} is not available` }); continue; }
+      const label = account.quota.account ?? accountId;
+      const entries = byProvider.get(account.quota.provider) ?? [];
+      if (entries.some(member => member.entry.label === label)) { skipped.push({ account: accountId, reason: `duplicate CodexBar label ${label}` }); continue; }
+      entries.push({ accountId, entry: { id: stableUuid(accountId), label, token, addedAt } });
+      byProvider.set(account.quota.provider, entries);
+    }
+    // A single-key provider contributes its one key under its own quota mapping; it has no account label.
+    if (provider.key !== undefined && provider.quota !== undefined) {
+      const token = readKey(provider.key);
+      if (!token) { skipped.push({ account: id, reason: `${provider.key.apiKeyFile ?? provider.key.apiKeyEnv} is not available` }); continue; }
+      const entries = byProvider.get(provider.quota.provider) ?? [];
+      entries.push({ accountId: id, entry: { id: stableUuid(`provider:${id}`), label: id, token, addedAt } });
+      byProvider.set(provider.quota.provider, entries);
+    }
   }
 
   const existingById = new Map((existing?.providers ?? []).map(entry => [entry.id, entry]));
@@ -90,8 +88,10 @@ export function generateCodexbarConfig(
     // Authoritative account meters: `auto` can return device-local estimates instead.
     owned.set(provider, { ...kept, id: provider, enabled: true, source: "api", tokenAccounts: { version: 1, activeIndex: 0, accounts: members.map(member => member.entry) } });
   }
-  for (const quota of Object.values(quotas)) {
-    if (owned.has(quota.provider)) continue;
+  for (const provider of Object.values(providers)) {
+    // Default-auth: a quota-mapped provider with no key of its own uses Pi's login, which CodexBar reads.
+    const quota = provider.quota;
+    if (quota === undefined || provider.key !== undefined || owned.has(quota.provider)) continue;
     // Default-auth provider: CodexBar reads its own logged-in account. OAuth is the source verified
     // for these providers; an existing entry keeps whatever source the operator chose.
     const current = existingById.get(quota.provider);
@@ -99,8 +99,8 @@ export function generateCodexbarConfig(
   }
 
   const kept = (existing?.providers ?? []).filter(entry => !owned.has(entry.id));
-  const providers = [...kept, ...owned.values()];
-  return { document: { ...existing, version: 1, providers }, included, skipped };
+  const merged = [...kept, ...owned.values()];
+  return { document: { ...existing, version: 1, providers: merged }, included, skipped };
 }
 
 /** Reads an existing CodexBar document. Throws when the file exists but is not a parseable document. */

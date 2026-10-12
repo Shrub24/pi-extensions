@@ -12,14 +12,12 @@ export const FOOTER_KEYS = {
 } as const;
 
 /**
- * The physical model that will serve the request, as `provider/model`, with its account when one is bound.
- * Configured display labels replace the provider and model names on screen only.
+ * The physical model that will serve the request, as `provider/name`, with its account when one is bound.
+ * `name` is Pi's model name; a configured provider label replaces the provider id on screen only.
  */
-export function physicalText(provider: string, id: string, account: string | undefined, display?: Display, pinned = false): string {
-  const shownProvider = display?.providers[provider] ?? provider;
-  const shownModel = display?.models[`${provider}/${id}`] ?? id;
-  const name = `${shownProvider}/${shownModel}`;
-  const label = account === undefined ? name : `${name} · ${account}`;
+export function physicalText(provider: string, name: string, account: string | undefined, display?: Display, pinned = false): string {
+  const shown = `${display?.providers[provider] ?? provider}/${name}`;
+  const label = account === undefined ? shown : `${shown} · ${account}`;
   return pinned ? `${label} ⚑` : label;
 }
 

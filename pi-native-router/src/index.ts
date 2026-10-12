@@ -35,7 +35,8 @@ function turnKey(ctx: ExtensionContext): string {
 }
 /** The key a candidate authenticates with: its named account, its provider's single key, or none (Pi's own login). */
 function keyOf(candidate: Candidate, config: Config): KeySource | undefined {
-  return candidate.account !== undefined ? config.accounts[candidate.account] : config.providerKeys[candidate.provider];
+  const provider = config.providers[candidate.provider];
+  return candidate.account !== undefined ? provider?.accounts[candidate.account] : provider?.key;
 }
 function available(route: RouteConfig, ctx: ExtensionContext, config: Config): Resolved[] {
   // A host without runtime key activation cannot serve keyed candidates; default-auth candidates stay usable.
@@ -309,10 +310,10 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
   const quotaHolder = randomUUID();
   // Every tracker-quota scope: named accounts, plus default-auth providers (Pi's own login).
   const quotaScopes: Array<{ label: string; key: string; scope: { provider: string; account?: string }; quota: QuotaSource }> = [
-    ...Object.entries(config.accounts).filter(([, account]) => account.quota !== undefined).map(([id, account]) => ({
-      label: id, key: quotaScopeKey(account.provider, id), scope: { provider: account.provider, account: id }, quota: account.quota!,
-    })),
-    ...Object.entries(config.quotas).map(([provider, quota]) => ({ label: provider, key: quotaScopeKey(provider), scope: { provider }, quota })),
+    ...Object.entries(config.providers).flatMap(([provider, p]) => Object.entries(p.accounts).filter(([, account]) => account.quota !== undefined).map(([id, account]) => ({
+      label: id, key: quotaScopeKey(provider, id), scope: { provider, account: id }, quota: account.quota!,
+    }))),
+    ...Object.entries(config.providers).filter(([, p]) => p.quota !== undefined).map(([provider, p]) => ({ label: provider, key: quotaScopeKey(provider), scope: { provider }, quota: p.quota! })),
   ];
   const refreshQuotas = async (force = false): Promise<string[]> => {
     if (!store || quotaScopes.length === 0) return [];
@@ -353,7 +354,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     const shown = displayed(ctx, role);
     if (!shown) { ctx.ui.setStatus(FOOTER_KEYS.physical, undefined); ctx.ui.setStatus(FOOTER_KEYS.peak, undefined); return; }
     const { model, candidate } = shown;
-    ctx.ui.setStatus(FOOTER_KEYS.physical, physicalText(model.provider, model.id, candidate.account, config.display, isPinned(ctx, role)));
+    ctx.ui.setStatus(FOOTER_KEYS.physical, physicalText(model.provider, model.name, candidate.account, config.display, isPinned(ctx, role)));
     ctx.ui.setStatus(FOOTER_KEYS.peak, peakText(model.provider, model.id, options.now?.() ?? Date.now()));
   };
   const publishSelection = (ctx: ExtensionContext, model: Model<Api> | undefined) => {
@@ -365,7 +366,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
   // The physical model, peak and effective thinking level of a request this route has just resolved.
   const publishRoute = (ctx: ExtensionContext, model: Model<Api>, account: string | undefined, effective: string, requested: string | undefined, pinned: boolean) => {
     if (!ctx.hasUI) return;
-    ctx.ui.setStatus(FOOTER_KEYS.physical, physicalText(model.provider, model.id, account, config.display, pinned));
+    ctx.ui.setStatus(FOOTER_KEYS.physical, physicalText(model.provider, model.name, account, config.display, pinned));
     ctx.ui.setStatus(FOOTER_KEYS.peak, peakText(model.provider, model.id, options.now?.() ?? Date.now()));
     ctx.ui.setStatus(FOOTER_KEYS.thinking, model.reasoning ? thinkingText(effective, requested) : undefined);
   };
@@ -441,8 +442,8 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
         existing = readCodexbarConfig(path);
         if (existing !== undefined && !replace) throw new Error(`${path} exists; rerun with --replace to merge router providers into it`);
       } catch (error) { ctx.ui.notify(`native-router: ${error instanceof Error ? error.message : String(error)}`, "error"); return; }
-      const generated = generateCodexbarConfig(config.accounts, config.providerKeys, config.quotas, readKey, Math.floor((options.now?.() ?? Date.now()) / 1000), existing);
-      if (generated.included.length === 0 && Object.keys(config.quotas).length === 0) { ctx.ui.notify(`native-router: no quota-mapped accounts with keys set (${generated.skipped.map(s => `${s.account}: ${s.reason}`).join("; ") || "none mapped"})`, "warning"); return; }
+      const generated = generateCodexbarConfig(config.providers, readKey, Math.floor((options.now?.() ?? Date.now()) / 1000), existing);
+      if (generated.included.length === 0 && quotaScopes.length === 0) { ctx.ui.notify(`native-router: no quota-mapped accounts with keys set (${generated.skipped.map(s => `${s.account}: ${s.reason}`).join("; ") || "none mapped"})`, "warning"); return; }
       try { writeCodexbarConfig(path, generated.document, true); }
       catch (error) { ctx.ui.notify(`native-router: ${error instanceof Error ? error.message : String(error)}`, "error"); return; }
       const providers = (generated.document.providers as Array<{ id: string }>).map(entry => entry.id).join(", ");

@@ -26,8 +26,8 @@ export function completeArguments(prefix: string, slots: ArgumentSlots): Argumen
 /** Completions for the four router commands, keyed by command name. */
 export function commandSlots(config: Config): Record<"pricing" | "quotas" | "quotas-config" | "native-router-health" | "route-thinking" | "route-pin", ArgumentSlots> {
   // Price targets are the physical models the routes can select, so the list stays short and needs no catalog load.
+  const accounts = Object.values(config.providers).flatMap(provider => Object.keys(provider.accounts));
   const targets = [...new Set(Object.values(config.routes).flatMap(route => route.candidates.map(c => `${c.provider}/${c.id}`)))];
-  const accounts = Object.keys(config.accounts);
   // The current route is not known while completing, so pin labels cover every route; the command validates against its own route.
   const pinLabels = [...new Set(Object.values(config.routes).flatMap(route => route.candidates.map(c => `${c.provider}/${c.id}${c.account ? `#${c.account}` : ""}`)))];
   return {

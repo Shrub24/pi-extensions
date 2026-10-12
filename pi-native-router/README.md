@@ -38,28 +38,50 @@ IDs must resolve to physical models with configured credentials in the native re
 
 Defaults per route: `contextWindow:200000`, `outputReserve:8192`, `stayRetries:1`, `maxTransitions:3`, `maxRecoveries:2`. Transition/recovery limits may be zero. Timeout is 1–60000ms; routes have 1–32 unique candidates. Disable **native Pi** automatic compaction separately as shown; the router does not invoke it. Magic Context must remain loaded with its own compaction/materialization enabled (its `compaction-off` flush refusal blocks transitions).
 
-## Named API-key accounts
+## Providers
 
-Optional `accounts` map (user settings only) binds an opaque ID to a provider and exactly one key source (single-key providers use `providerKeys`, see below): an **`apiKeyFile`** (absolute path, e.g. a sops-nix secret; read and trimmed at use time, so rotation takes effect without a restart) or an `apiKeyEnv` variable name. Prefer `apiKeyFile`. Literal keys are rejected. One key is one account. Candidates may name an account; a provider with named accounts must name one on every candidate, so no candidate can fall through to a different credential.
+One `providers` map (user settings only) holds everything the router knows about a provider. Shared settings sit on the provider: an optional `name` (footer label) and a single key or quota. The optional `accounts` map is for multi-account providers only: each account has its own key and quota and is named in routes as `account`.
+
+A key is one of **`apiKeyFile`** (absolute path, e.g. a sops-nix secret; read and trimmed at use time, so rotation takes effect without a restart; preferred) or `apiKeyEnv` (a variable name). Literal keys are rejected. A provider takes either a single key or `accounts`, never both.
 
 ```json
 {
-  "accounts": {
-    "go-a": { "provider": "opencode-go", "apiKeyEnv": "OPENCODE_GO_KEY_A" },
-    "go-b": { "provider": "opencode-go", "apiKeyEnv": "OPENCODE_GO_KEY_B" }
+  "providers": {
+    "opencode-go": {
+      "name": "OpenCode Go",
+      "accounts": {
+        "go-a": { "apiKeyFile": "/run/secrets/OPENCODE_GO_KEY_A", "quota": { "source": "codexbar", "provider": "opencodego", "account": "go-a", "enforce": true } },
+        "go-b": { "apiKeyFile": "/run/secrets/OPENCODE_GO_KEY_B", "quota": { "source": "codexbar", "provider": "opencodego", "account": "go-b", "enforce": true } }
+      }
+    },
+    "commandcode": {
+      "name": "Command Code",
+      "apiKeyFile": "/run/secrets/COMMANDCODE_API_KEY",
+      "quota": { "source": "codexbar", "provider": "commandcode", "enforce": true }
+    },
+    "openai-codex": {
+      "name": "Codex",
+      "quota": { "source": "codexbar", "provider": "codex", "enforce": true }
+    }
   },
   "routes": {
     "worker": {
       "candidates": [
         { "provider": "opencode-go", "id": "YOUR-MODEL-ID", "account": "go-a" },
-        { "provider": "opencode-go", "id": "YOUR-MODEL-ID", "account": "go-b" }
+        { "provider": "opencode-go", "id": "YOUR-MODEL-ID", "account": "go-b" },
+        { "provider": "commandcode", "id": "YOUR-MODEL-ID" }
       ]
     }
   }
 }
 ```
 
-Activation uses Pi's runtime key operation (`ModelRuntime.setRuntimeApiKey`, reached through the same private facade as `pi-accounts`). It runs after any pre-dispatch Magic Context flush and before the replacement request. Mutations are serialized per runtime, and the effective key is read back to verify activation. Any failure fails the route closed before dispatch and emits `native-router:account-unavailable`; it never falls back to another key once the account has been selected. **This is provider-global within one Pi runtime**: one active key per provider serves all requests in that process, including overlapping or direct calls. Concurrent isolation requires separate Pi runtimes. Parent and worker processes each keep their own active key. A candidate with no `account` on a provider that has named accounts expands to one candidate per account, in configured order, so a bare `opencode-go` candidate is a pool; each expansion keeps its own health, stickiness and cache epoch. A missing or empty key source makes that candidate unavailable, never a silent fallback. A host without the runtime operation drops named-account candidates from selection, so default-auth candidates keep working; a route whose only candidates are named reports that the host lacks runtime key activation. This depends on Pi 1.1.0's private `ModelRuntime` facade and is not a public API: re-validate it on every Pi upgrade. Cooldowns are per account and provider-scoped failures apply to that account only.
+- A provider with a single key has no account id: its candidates name no account, and routes, the footer and telemetry show the provider alone. Its key is activated for its candidates like an account's key.
+- A provider with `accounts` must name an account on every candidate, so no candidate can fall through to a different credential. A bare candidate for such a provider expands to one candidate per account, in configured order, so it is a pool; each expansion keeps its own health, stickiness and cache epoch. Account ids are unique across providers.
+- A provider with neither a key nor accounts uses Pi's own login (default-auth). Its `quota`, when set, is read by CodexBar's logged-in account for that provider.
+- A missing or empty key source makes that candidate unavailable, never a silent fallback.
+
+Activation uses Pi's runtime key operation (`ModelRuntime.setRuntimeApiKey`, reached through the same private facade as `pi-accounts`). It runs after any pre-dispatch Magic Context flush and before the replacement request. Mutations are serialized per runtime, and the effective key is read back to verify activation. Any failure fails the route closed before dispatch and emits `native-router:account-unavailable`; it never falls back to another key once the account has been selected. **This is provider-global within one Pi runtime**: one active key per provider serves all requests in that process, including overlapping or direct calls. Concurrent isolation requires separate Pi runtimes. Parent and worker processes each keep their own active key. A host without the runtime operation drops keyed candidates from selection, so default-auth candidates keep working; a route whose only candidates are keyed reports that the host lacks runtime key activation. This depends on Pi 1.1.0's private `ModelRuntime` facade and is not a public API: re-validate it on every Pi upgrade. Cooldowns are per account, and provider-scoped failures apply to the provider.
 
 ## Per-model cache TTL
 
@@ -77,12 +99,6 @@ Activation uses Pi's runtime key operation (`ModelRuntime.setRuntimeApiKey`, rea
 - Successful assistant responses refresh the age; aborted, errored and direct calls do not.
 - Routing stays sticky. Expiry alone never switches a healthy route.
 
-## Provider keys
-
-A provider with a single key is configured under `providerKeys` instead of a named account. It takes the same key sources (`apiKeyFile` preferred, or `apiKeyEnv`), but has no account id: candidates for that provider name no account, and routes, the footer and telemetry show the provider alone. A provider cannot have both `providerKeys` and named `accounts`; use accounts when there are several keys.
-
-Command Code is configured this way. Its key is activated for its candidates like a named account and fails closed when the key is missing. Its quota is read from CodexBar's `commandcode` provider when `quotas.commandcode` maps it; the generated CodexBar entry carries the key as a provider-level `apiKey`. Without a `providerKeys` entry, `commandcode` candidates use Pi's own `/login` credential.
-
 ## Shared health
 
 Account and provider causes are shared across Pi processes of the same user on one machine, in a private SQLite store at `$PI_CODING_AGENT_DIR/pi-native-router/health.sqlite` (default `~/.pi/agent/...`; directory `0700`, file `0600`). It holds only secret-free records: scope key (provider, account, or provider/model with account), cause kind, deadline, revision and probe lease. Keys, headers and response bodies are never stored.
@@ -97,32 +113,13 @@ Account and provider causes are shared across Pi processes of the same user on o
 
 ## Account quotas (CodexBar)
 
-An account may map to a CodexBar provider so `/quotas` can show its windows:
-
-```json
-"accounts": {
-  "go-a": {
-    "provider": "opencode-go",
-    "apiKeyEnv": "OPENCODE_GO_KEY_A",
-    "quota": { "source": "codexbar", "provider": "opencodego", "account": "go-a", "enforce": true }
-  }
-}
-```
+A provider or account may map to a CodexBar provider so `/quotas` can show its windows; the mapping sits beside its key (see Providers):
 
 - `/quotas` runs `codexbar usage --provider <provider> [--account <label>] --format json` with a 15 s deadline and a 64 KiB output cap, under a per-account refresh lease, and prints each window with a fill bar, its usage to two decimals, reset and observation age. Missing binary, timeout or unrecognised output is shown as unknown and never counts as capacity or as a generation failure.
 - `enforce: true` writes a tracker-sourced cause that skips the account until its exhausted window resets. It is **off by default**; enable it per account once the account's CodexBar source is authoritative (`api`, `web` or `oauth`).
-- **Default-auth providers** (Pi's own login, such as `openai-codex` and `anthropic`) have no named account. Map them under a top-level `quotas` key by Pi provider id:
-
-```json
-"quotas": {
-  "openai-codex": { "source": "codexbar", "provider": "codex", "enforce": true },
-  "anthropic": { "source": "codexbar", "provider": "claude", "enforce": true }
-}
-```
-
-  CodexBar reads the logged-in account for these, so no label is passed. An exhausted window blocks every model on that provider until its reset. A provider with named accounts must put its quota on those accounts instead; the two cannot overlap.
+- **Default-auth providers** (Pi's own login, such as `openai-codex` and `anthropic`) have no key or accounts; their quota sits on the provider. CodexBar reads the logged-in account for these, so no label is passed. An exhausted window blocks every model on that provider until its reset. A provider with `accounts` puts its quota on each account instead.
 - A healthy snapshot clears only tracker-sourced causes. Auth, rate, outage and error-derived quota causes are unaffected.
-- `/quotas-config [--replace] [path]` writes CodexBar's config from the quota-mapped accounts: each becomes a token account labelled with its quota account (or router id) and its key read from the same environment variable. Providers are set to `source: "api"` so their meters are account-authoritative rather than device-local. The file is written 0600 via a temporary file and rename, and an existing file is refused unless `--replace` is given. Accounts whose key variable is unset are reported and skipped.
+- `/quotas-config [--replace] [path]` writes CodexBar's config from the quota mappings: each account becomes a token account labelled with its quota account (or router id); a single-key provider's key goes on the provider as `apiKey`, as CodexBar requires. Providers are set to `source: "api"` so their meters are account-authoritative rather than device-local. The file is written 0600 via a temporary file and rename, and an existing file is refused unless `--replace` is given. Accounts whose key variable is unset are reported and skipped.
 - Refresh runs on session start and every five minutes. The shared store is the gate: any process reuses an account's last CodexBar attempt (success or failure) if it is under four minutes old, so all Pi processes on the machine run CodexBar at most once per gate per account. `/quotas` reuses that fetch; `/quotas refresh` forces a new one. Dispatch never waits for CodexBar.
 - Snapshots are authoritative only when the tracker reports server meters (`source` api, web or oauth, or an explicit authoritative confidence). A `local+api` blend or estimate never enforces a block.
 - **No ranking.** Quota snapshots only block an exhausted account until its window resets. The router never ranks candidates by remaining headroom, so an account with more quota is not preferred over an account with less; candidate order and health decide.
@@ -158,16 +155,7 @@ The router publishes three status items for powerline's `customItems` (`native-r
 - **Peak:** a `▲` while the physical model is in a peak window.
 - **Thinking:** the level name that will run (e.g. `high`). A `✎` follows when you chose the level on the route.
 
-Labels are configurable under `display`. They change only what the footer shows, never routing, keys or telemetry:
-
-```json
-"display": {
-  "providers": { "opencode-go": "go" },
-  "models": { "opencode-go/deepseek-v4.1-flash": "ds-v4.1-flash" }
-}
-```
-
-Provider labels replace the provider part of `provider/model`. Model labels are keyed by `provider/id` and replace the model id.
+The model part of `provider/model` is Pi's own model name, so model labels come from Pi's catalog and need no config. A provider's `name` replaces its id in the footer. Labels change only what the footer shows, never routing, keys or telemetry.
 
 ## Physical pin
 

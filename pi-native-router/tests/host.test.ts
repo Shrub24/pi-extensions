@@ -63,8 +63,16 @@ async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateT
     });
   }
   const routed = opts.routing;
-  const providerKeys = opts.providerKeys ? Object.fromEntries(["fake-a", "fake-b", "fake-c"].map(provider => [provider, { apiKeyEnv: accountEnv(provider) }])) : undefined;
-  const config = parseConfig({ flushTimeoutMs: 10, ...(providerKeys ? { providerKeys } : {}), ...(routed ? { accounts: Object.fromEntries(routed.accounts.map(id => [id, { provider: routed.candidates.find(c => c.account === id)!.provider, apiKeyEnv: accountEnv(id) }])) } : opts.accounts ? { accounts: Object.fromEntries(["fake-a", "fake-b", "fake-c"].map(provider => [`acct-${provider}`, { provider, apiKeyEnv: `NATIVE_ROUTER_TEST_KEY_${provider.replace("-", "_").toUpperCase()}` }])) } : {}), routes: { worker: { candidates: routed ? routed.candidates.map(c => ({ provider: c.provider, id: "model", thinkingLevel: opts.candidateThinking ?? "off", ...(opts.ttl ? { cacheTtlMs: opts.ttl } : {}), ...(c.account ? { account: c.account } : {}) })) : ["fake-a", "fake-b", "fake-c"].map(provider => ({ provider, id: "model", thinkingLevel: opts.candidateThinking ?? "off", ...(opts.ttl ? { cacheTtlMs: opts.ttl } : {}), ...(opts.accounts ? { account: `acct-${provider}` } : {}) })), maxRecoveries: opts.maxRecoveries ?? 2, maxTransitions: opts.maxTransitions ?? 3 } } });
+  // Shared provider settings: one key per provider, or named accounts when the host routes several keys.
+  const sharedProviders: Record<string, { apiKeyEnv?: string; accounts?: Record<string, { apiKeyEnv: string }> }> = {};
+  if (opts.providerKeys) for (const provider of ["fake-a", "fake-b", "fake-c"]) sharedProviders[provider] = { apiKeyEnv: accountEnv(provider) };
+  if (routed) for (const id of routed.accounts) {
+    const provider = routed.candidates.find(c => c.account === id)!.provider;
+    sharedProviders[provider] = { accounts: { ...sharedProviders[provider]?.accounts, [id]: { apiKeyEnv: accountEnv(id) } } };
+  }
+  else if (opts.accounts) for (const provider of ["fake-a", "fake-b", "fake-c"]) sharedProviders[provider] = { accounts: { [`acct-${provider}`]: { apiKeyEnv: `NATIVE_ROUTER_TEST_KEY_${provider.replace("-", "_").toUpperCase()}` } } };
+  const raw = { flushTimeoutMs: 10, providers: sharedProviders, routes: { worker: { candidates: routed ? routed.candidates.map(c => ({ provider: c.provider, id: "model", thinkingLevel: opts.candidateThinking ?? "off", ...(opts.ttl ? { cacheTtlMs: opts.ttl } : {}), ...(c.account ? { account: c.account } : {}) })) : ["fake-a", "fake-b", "fake-c"].map(provider => ({ provider, id: "model", thinkingLevel: opts.candidateThinking ?? "off", ...(opts.ttl ? { cacheTtlMs: opts.ttl } : {}), ...(opts.accounts ? { account: `acct-${provider}` } : {}) })), maxRecoveries: opts.maxRecoveries ?? 2, maxTransitions: opts.maxTransitions ?? 3 } } };
+  const config = parseConfig(raw);
   runtime.registerVirtualModel({ provider: "route", id: "worker", name: "placeholder", route: () => { throw new Error("Adapter not installed"); } });
   const loader = new DefaultResourceLoader({
     cwd: dir, agentDir: dir, settingsManager: settings, noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
@@ -90,9 +98,7 @@ async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateT
   });
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   if (opts.packaged) {
-    const { pricingOverrides, ...parsedRest } = config;
-    // Settings hold the raw user shape: pricing overrides live under `pricing.overrides`.
-    const raw = { ...parsedRest, ...(Object.keys(pricingOverrides).length ? { pricing: { overrides: pricingOverrides } } : {}) };
+    // Settings hold the raw user shape, exactly as the packaged entry will read it.
     writeFileSync(join(dir, "settings.json"), JSON.stringify({ kendex: { extensionManager: { config: { "@vanillagreen/pi-native-router": raw } } } }));
     process.env.PI_CODING_AGENT_DIR = dir;
   }

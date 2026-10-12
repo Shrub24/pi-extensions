@@ -95,23 +95,23 @@ test("branch state is JSON-serializable, malformed versions are not trusted, and
 });
 
 test("named accounts are validated and cooldowns isolate accounts of the same provider", () => {
-  const accounts = { "go-a": { provider: "opencode-go", apiKeyEnv: "GO_A" }, "go-b": { provider: "opencode-go", apiKeyEnv: "GO_B" } };
-  const parsed = parseConfig({ accounts, routes: { work: { candidates: [{ provider: "opencode-go", id: "m", account: "go-a" }, { provider: "opencode-go", id: "m", account: "go-b" }] } } });
+  const providers = { "opencode-go": { accounts: { "go-a": { apiKeyEnv: "GO_A" }, "go-b": { apiKeyEnv: "GO_B" } } } };
+  const parsed = parseConfig({ providers, routes: { work: { candidates: [{ provider: "opencode-go", id: "m", account: "go-a" }, { provider: "opencode-go", id: "m", account: "go-b" }] } } });
   expect(parsed.routes.work.candidates.map(c => c.account)).toEqual(["go-a", "go-b"]);
   // A bare candidate for a provider with named accounts expands to its pool, in configured order.
-  const pooled = parseConfig({ accounts, routes: { work: { candidates: [{ provider: "opencode-go", id: "m", thinkingLevel: "low" }] } } });
+  const pooled = parseConfig({ providers, routes: { work: { candidates: [{ provider: "opencode-go", id: "m", thinkingLevel: "low" }] } } });
   expect(pooled.routes.work.candidates).toEqual([
     { provider: "opencode-go", id: "m", thinkingLevel: "low", account: "go-a" },
     { provider: "opencode-go", id: "m", thinkingLevel: "low", account: "go-b" },
   ]);
   // An explicit account is kept and not expanded.
-  const explicit = parseConfig({ accounts, routes: { work: { candidates: [{ provider: "opencode-go", id: "m", account: "go-b" }] } } });
+  const explicit = parseConfig({ providers, routes: { work: { candidates: [{ provider: "opencode-go", id: "m", account: "go-b" }] } } });
   expect(explicit.routes.work.candidates.map(c => c.account)).toEqual(["go-b"]);
   // A pool and an explicit entry that repeat the same account are duplicates.
-  expect(() => parseConfig({ accounts, routes: { work: { candidates: [{ provider: "opencode-go", id: "m" }, { provider: "opencode-go", id: "m", account: "go-a" }] } } })).toThrow(/Duplicate/);
-  expect(() => parseConfig({ accounts, routes: { work: { candidates: [{ provider: "other", id: "m", account: "go-a" }] } } })).toThrow(/configured other account/);
-  expect(() => parseConfig({ accounts: { "bad id": { provider: "p", apiKeyEnv: "K" } } })).toThrow(/Invalid account id/);
-  expect(() => parseConfig({ accounts: { a: { provider: "p", apiKeyEnv: "literal key value" } } })).toThrow(/Invalid account a/);
+  expect(() => parseConfig({ providers, routes: { work: { candidates: [{ provider: "opencode-go", id: "m" }, { provider: "opencode-go", id: "m", account: "go-a" }] } } })).toThrow(/Duplicate/);
+  expect(() => parseConfig({ providers, routes: { work: { candidates: [{ provider: "other", id: "m", account: "go-a" }] } } })).toThrow(/account of provider other/);
+  expect(() => parseConfig({ providers: { p: { accounts: { "bad id": { apiKeyEnv: "K" } } } } })).toThrow(/Invalid account id/);
+  expect(() => parseConfig({ providers: { p: { accounts: { a: { apiKeyEnv: "literal key value" } } } } })).toThrow(/Invalid account a/);
   const health = new Health(() => 1000);
   const model = { provider: "opencode-go", id: "m" };
   health.mark(model, { kind: "quota", scope: "provider", delayMs: 60_000 }, "go-a");

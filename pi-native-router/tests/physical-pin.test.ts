@@ -46,6 +46,6 @@ test("the cycle hotkey defaults to ctrl+shift+m and accepts a configured key", (
 });
 
 test("the footer marks a pinned physical model without words", () => {
-  expect(physicalText("a", "one", "go-a", undefined, true)).toBe("a/one · go-a ⚑");
-  expect(physicalText("a", "one", undefined)).toBe("a/one");
+  expect(physicalText("a", "One", "go-a", undefined, true)).toBe("a/One · go-a ⚑");
+  expect(physicalText("a", "One", undefined)).toBe("a/One");
 });

@@ -8,7 +8,6 @@ import { parseConfig } from "../src/config";
 import { Health } from "../src/policy";
 import { generateCodexbarConfig, stableUuid } from "../src/codexbar-config";
 import { readKey } from "../src/accounts";
-import type { Account } from "../src/config";
 
 // Shape captured from `codexbar usage --provider opencodego --format json` (CodexBar 0.73.0), identity fields removed.
 const NOW = Date.parse("2026-10-11T08:30:00Z");
@@ -112,14 +111,13 @@ test("a concurrent refresh is refused while another holder has the lease", () =>
 });
 
 test("generated CodexBar config maps each quota-mapped account to a labelled token and skips unset keys", () => {
-  const accounts: Record<string, Account> = {
-    "go-a": { provider: "opencode-go", apiKeyEnv: "KEY_A", quota: { source: "codexbar", provider: "opencodego", account: "go-a", enforce: false } },
-    "go-b": { provider: "opencode-go", apiKeyEnv: "KEY_B", quota: { source: "codexbar", provider: "opencodego", enforce: false } },
-    "go-c": { provider: "opencode-go", apiKeyEnv: "KEY_C", quota: { source: "codexbar", provider: "opencodego", enforce: false } },
-    "plain": { provider: "other", apiKeyEnv: "KEY_D" },
-  };
+  const providers = parseConfig({ providers: { "opencode-go": { accounts: {
+    "go-a": { apiKeyEnv: "KEY_A", quota: { source: "codexbar", provider: "opencodego", account: "go-a", enforce: false } },
+    "go-b": { apiKeyEnv: "KEY_B", quota: { source: "codexbar", provider: "opencodego", enforce: false } },
+    "go-c": { apiKeyEnv: "KEY_C", quota: { source: "codexbar", provider: "opencodego", enforce: false } },
+  } }, other: { apiKeyEnv: "KEY_D" } } }).providers;
   const env: Record<string, string> = { KEY_A: "synthetic-a", KEY_B: "synthetic-b" };
-  const generated = generateCodexbarConfig(accounts, {}, {}, source => readKey(source, env), 1760000000);
+  const generated = generateCodexbarConfig(providers, source => readKey(source, env), 1760000000);
   const [provider] = generated.document.providers as Array<Record<string, any>>;
   expect(provider.id).toBe("opencodego");
   expect(provider.source).toBe("api");
@@ -178,12 +176,11 @@ test("a default-auth provider quota queries CodexBar's own account and blocks ev
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test("provider-level quotas parse strictly and cannot overlap named accounts of the same provider", () => {
-  const parsed = parseConfig({ quotas: { "openai-codex": { source: "codexbar", provider: "codex", enforce: true }, anthropic: { source: "codexbar", provider: "claude" } } });
-  expect(parsed.quotas["openai-codex"]).toEqual({ source: "codexbar", provider: "codex", enforce: true });
-  expect(parsed.quotas.anthropic.enforce).toBe(false);
-  expect(() => parseConfig({ accounts: { "go-a": { provider: "opencode-go", apiKeyEnv: "K", quota: { source: "codexbar", provider: "opencodego" } } }, quotas: { "opencode-go": { source: "codexbar", provider: "opencodego" } } })).toThrow(/conflicts with named accounts/);
-  expect(() => parseConfig({ quotas: { codex: { source: "other", provider: "codex" } } })).toThrow(/quota source must be codexbar/);
+test("provider-level quotas parse strictly on the provider; accounts carry their own quota", () => {
+  const parsed = parseConfig({ providers: { "openai-codex": { quota: { source: "codexbar", provider: "codex", enforce: true } }, anthropic: { quota: { source: "codexbar", provider: "claude" } } } });
+  expect(parsed.providers["openai-codex"].quota).toEqual({ source: "codexbar", provider: "codex", enforce: true });
+  expect(parsed.providers.anthropic.quota?.enforce).toBe(false);
+  expect(() => parseConfig({ providers: { codex: { quota: { source: "other", provider: "codex" } } } })).toThrow(/quota source must be codexbar/);
 });
 
 test("regenerating CodexBar config merges router providers and keeps providers it does not own", () => {
@@ -195,11 +192,11 @@ test("regenerating CodexBar config merges router providers and keeps providers i
       { id: "opencodego", enabled: true, source: "api", tokenAccounts: { version: 1, activeIndex: 0, accounts: [{ id: "old", label: "stale", token: "old" }] } },
     ],
   };
-  const accounts = {
-    "go-a": { provider: "opencode-go", apiKeyEnv: "GO_A", quota: { source: "codexbar", provider: "opencodego", enforce: true } },
-  } as Record<string, Account>;
-  const quotas = { "openai-codex": { source: "codexbar", provider: "codex", enforce: true } } as Record<string, QuotaSource>;
-  const generated = generateCodexbarConfig(accounts, {}, quotas, () => "k-go", 1760000000, existing);
+  const providers = parseConfig({ providers: {
+    "opencode-go": { accounts: { "go-a": { apiKeyEnv: "GO_A", quota: { source: "codexbar", provider: "opencodego", enforce: true } } } },
+    "openai-codex": { quota: { source: "codexbar", provider: "codex", enforce: true } },
+  } }).providers;
+  const generated = generateCodexbarConfig(providers, () => "k-go", 1760000000, existing);
   const byId = new Map((generated.document.providers as Array<{ id: string; source: string; tokenAccounts?: { accounts: unknown[] } }>).map(p => [p.id, p]));
   expect([...byId.keys()].sort()).toEqual(["claude", "codex", "opencodego"]);
   expect(byId.get("claude")).toEqual({ id: "claude", enabled: true, source: "oauth" } as never);
@@ -211,25 +208,25 @@ test("regenerating CodexBar config merges router providers and keeps providers i
 
 test("a single-key provider is written as a provider-level apiKey and drops stale token accounts", () => {
   const existing = { version: 1, providers: [{ id: "commandcode", enabled: true, source: "api", tokenAccounts: { version: 1, activeIndex: 0, accounts: [{ id: "old", label: "old", token: "old" }] } }] };
-  const quotas = { commandcode: { source: "codexbar", provider: "commandcode", enforce: true } } as Record<string, QuotaSource>;
-  const generated = generateCodexbarConfig({}, { commandcode: { apiKeyFile: "/run/secrets/cc" } }, quotas, () => "cc-key", 1760000000, existing);
+  const providers = parseConfig({ providers: { commandcode: { apiKeyFile: "/run/secrets/cc", quota: { source: "codexbar", provider: "commandcode", enforce: true } } } }).providers;
+  const generated = generateCodexbarConfig(providers, () => "cc-key", 1760000000, existing);
   const entry = (generated.document.providers as Array<Record<string, unknown>>).find(p => p.id === "commandcode") as Record<string, unknown>;
   expect(entry).toEqual({ id: "commandcode", enabled: true, source: "api", apiKey: "cc-key" } as never);
   expect(generated.included).toEqual(["commandcode"]);
 });
 
 test("a provider key without a quota mapping is not written to CodexBar", () => {
-  const generated = generateCodexbarConfig({}, { commandcode: { apiKeyEnv: "CC" } }, {}, () => "cc-key", 1760000000);
+  const generated = generateCodexbarConfig(parseConfig({ providers: { commandcode: { apiKeyEnv: "CC" } } }).providers, () => "cc-key", 1760000000);
   expect(generated.document.providers).toEqual([]);
   expect(generated.included).toEqual([]);
 });
 
 test("a second commandcode account is skipped rather than written as an unsupported token account", () => {
-  const accounts = {
-    "cc-a": { provider: "commandcode", apiKeyEnv: "A", quota: { source: "codexbar", provider: "commandcode", enforce: false } },
-    "cc-b": { provider: "commandcode", apiKeyEnv: "B", quota: { source: "codexbar", provider: "commandcode", enforce: false } },
-  } as Record<string, Account>;
-  const generated = generateCodexbarConfig(accounts, {}, {}, () => "k", 1760000000);
+  const providers = parseConfig({ providers: { commandcode: { accounts: {
+    "cc-a": { apiKeyEnv: "A", quota: { source: "codexbar", provider: "commandcode", enforce: false } },
+    "cc-b": { apiKeyEnv: "B", quota: { source: "codexbar", provider: "commandcode", enforce: false } },
+  } } } }).providers;
+  const generated = generateCodexbarConfig(providers, () => "k", 1760000000);
   expect(generated.included).toEqual([]);
   expect(generated.skipped.map(s => s.account).sort()).toEqual(["cc-a", "cc-b"]);
   expect(generated.document.providers).toEqual([]);
