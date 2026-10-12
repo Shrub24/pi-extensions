@@ -14,11 +14,16 @@ import { cacheExpiry } from "../src/policy";
 import { parseConfig } from "../src/config";
 import { nativeHttpError } from "./native-error";
 
+type Routing = { accounts: string[]; candidates: Array<{ provider: string; account?: string }> };
+/** Synthetic env name for a test account; keys are set by each test and never printed. */
+const accountEnv = (id: string) => `NATIVE_ROUTER_TEST_KEY_${id.replace(/-/g, "_").toUpperCase()}`;
 type Outcome = "ok" | "quota" | "transient" | "partial" | "abort" | "tool" | "bad" | 401 | 403 | 429;
-async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateThinking?: "off" | "low" | "medium" | "high"; retry?: boolean; flush?: "failed" | "absent"; maxRecoveries?: number; maxTransitions?: number; smaller?: boolean; manager?: SessionManager; packaged?: boolean; unauthedFirst?: boolean; ttl?: number; startTime?: number; clock?: { value: number }; accounts?: boolean; healthPath?: string } = {}) {
+async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateThinking?: "off" | "low" | "medium" | "high"; retry?: boolean; flush?: "failed" | "absent"; maxRecoveries?: number; maxTransitions?: number; smaller?: boolean; manager?: SessionManager; packaged?: boolean; unauthedFirst?: boolean; ttl?: number; startTime?: number; clock?: { value: number }; accounts?: boolean; healthPath?: string; routing?: Routing; runtimeKeys?: "absent" | "inert" } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "native-router-"));
   const settings = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: opts.retry ?? false, maxRetries: 3, baseDelayMs: 1 }, cacheWarming: "off" });
   const runtime = await ModelRuntime.create({ authPath: join(dir, "auth.json"), modelsPath: null, refreshOnCreate: false });
+  // Simulates a host without runtime key activation ("absent") or one whose activation does not take effect ("inert").
+  if (opts.runtimeKeys) Object.defineProperty(runtime, "setRuntimeApiKey", { value: opts.runtimeKeys === "absent" ? undefined : () => {}, configurable: true });
   const dispatches: { physical: string; context: string; thinking?: string }[] = [];
   const order: string[] = [];
   let pending = false;
@@ -30,7 +35,7 @@ async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateT
   const usage = { input: 10, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 11, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
   for (const [provider, window] of [["fake-a", 300_000], ["fake-b", opts.smaller ? 200_000 : 300_000], ["fake-c", 300_000]] as const) {
     runtime.registerProvider(provider, {
-      api: "openai-completions", baseUrl: "https://unused.invalid", apiKey: opts.accounts ? undefined : opts.unauthedFirst && provider === "fake-a" ? undefined : "fake-test-key",
+      api: "openai-completions", baseUrl: "https://unused.invalid", apiKey: opts.routing ? (opts.routing.candidates.some(c => c.provider === provider && c.account === undefined) ? "fake-test-key" : undefined) : opts.accounts ? undefined : opts.unauthedFirst && provider === "fake-a" ? undefined : "fake-test-key",
       models: [{ id: "model", name: provider, reasoning: opts.reasoning ?? false, input: ["text"], contextWindow: window, maxTokens: 16_384, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
       streamSimple(model, context, streamOptions) {
         const stream = createAssistantMessageEventStream();
@@ -55,7 +60,8 @@ async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateT
       },
     });
   }
-  const config = parseConfig({ flushTimeoutMs: 10, ...(opts.accounts ? { accounts: Object.fromEntries(["fake-a", "fake-b", "fake-c"].map(provider => [`acct-${provider}`, { provider, apiKeyEnv: `NATIVE_ROUTER_TEST_KEY_${provider.replace("-", "_").toUpperCase()}` }])) } : {}), routes: { worker: { candidates: ["fake-a", "fake-b", "fake-c"].map(provider => ({ provider, id: "model", thinkingLevel: opts.candidateThinking ?? "off", ...(opts.ttl ? { cacheTtlMs: opts.ttl } : {}), ...(opts.accounts ? { account: `acct-${provider}` } : {}) })), maxRecoveries: opts.maxRecoveries ?? 2, maxTransitions: opts.maxTransitions ?? 3 } } });
+  const routed = opts.routing;
+  const config = parseConfig({ flushTimeoutMs: 10, ...(routed ? { accounts: Object.fromEntries(routed.accounts.map(id => [id, { provider: routed.candidates.find(c => c.account === id)!.provider, apiKeyEnv: accountEnv(id) }])) } : opts.accounts ? { accounts: Object.fromEntries(["fake-a", "fake-b", "fake-c"].map(provider => [`acct-${provider}`, { provider, apiKeyEnv: `NATIVE_ROUTER_TEST_KEY_${provider.replace("-", "_").toUpperCase()}` }])) } : {}), routes: { worker: { candidates: routed ? routed.candidates.map(c => ({ provider: c.provider, id: "model", thinkingLevel: opts.candidateThinking ?? "off", ...(opts.ttl ? { cacheTtlMs: opts.ttl } : {}), ...(c.account ? { account: c.account } : {}) })) : ["fake-a", "fake-b", "fake-c"].map(provider => ({ provider, id: "model", thinkingLevel: opts.candidateThinking ?? "off", ...(opts.ttl ? { cacheTtlMs: opts.ttl } : {}), ...(opts.accounts ? { account: `acct-${provider}` } : {}) })), maxRecoveries: opts.maxRecoveries ?? 2, maxTransitions: opts.maxTransitions ?? 3 } } });
   runtime.registerVirtualModel({ provider: "route", id: "worker", name: "placeholder", route: () => { throw new Error("Adapter not installed"); } });
   const loader = new DefaultResourceLoader({
     cwd: dir, agentDir: dir, settingsManager: settings, noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
@@ -344,6 +350,76 @@ test("abort during transition handshake prevents replacement and settles the nat
   h.api.events.on("magic-context:flush", () => { void h.session.abort(); });
   try { await h.session.prompt("abort flush"); expect(h.dispatches).toHaveLength(1); expect(h.order).not.toContain("transition"); expect(h.session.isStreaming).toBe(false); }
   finally { h.close(); }
+});
+
+test("rotating between two accounts of one provider is a same-model account change: one flush, one counted transition, and cache activity for the account that answered", async () => {
+  process.env.NATIVE_ROUTER_TEST_KEY_POOL_ONE = "synthetic-pool-one";
+  process.env.NATIVE_ROUTER_TEST_KEY_POOL_TWO = "synthetic-pool-two";
+  const routing = { accounts: ["pool-one", "pool-two"], candidates: [{ provider: "fake-a", account: "pool-one" }, { provider: "fake-a", account: "pool-two" }] };
+  const h = await host(["quota", "ok"], { routing });
+  const transitions: unknown[] = [];
+  h.api.events.on("native-router:transition", event => transitions.push(event));
+  try {
+    await h.session.prompt("account rotation");
+    expect(h.dispatches.map(d => d.physical)).toEqual(["fake-a", "fake-a"]);
+    expect(h.order.filter(step => step === "flush")).toHaveLength(1);
+    expect(transitions).toEqual([expect.objectContaining({ from: "fake-a/model#pool-one", to: "fake-a/model#pool-two" })]);
+    expect((await h.runtime.getAuth("fake-a"))?.auth.apiKey).toBe("synthetic-pool-two");
+    const model = h.runtime.getModel("fake-a", "model")!;
+    expect(model).toMatchObject({ api: "openai-completions", baseUrl: "https://unused.invalid" });
+    const activity = h.manager.getBranch().filter(e => e.type === "custom" && e.customType === "@vanillagreen/pi-native-router/cache-activity").map(e => (e as { data: { physical: string } }).data.physical);
+    expect(activity.at(-1)).toBe("fake-a/model#pool-two");
+  } finally { h.close(); delete process.env.NATIVE_ROUTER_TEST_KEY_POOL_ONE; delete process.env.NATIVE_ROUTER_TEST_KEY_POOL_TWO; }
+});
+
+test("a failed flush blocks the same-model account change: the second account never dispatches", async () => {
+  process.env.NATIVE_ROUTER_TEST_KEY_POOL_ONE = "synthetic-pool-one";
+  process.env.NATIVE_ROUTER_TEST_KEY_POOL_TWO = "synthetic-pool-two";
+  const routing = { accounts: ["pool-one", "pool-two"], candidates: [{ provider: "fake-a", account: "pool-one" }, { provider: "fake-a", account: "pool-two" }] };
+  const h = await host(["quota", "ok"], { routing, flush: "failed" });
+  try {
+    await h.session.prompt("blocked rotation");
+    expect(h.dispatches.map(d => d.physical)).toEqual(["fake-a"]);
+    expect((await h.runtime.getAuth("fake-a"))?.auth.apiKey).toBe("synthetic-pool-one");
+  } finally { h.close(); delete process.env.NATIVE_ROUTER_TEST_KEY_POOL_ONE; delete process.env.NATIVE_ROUTER_TEST_KEY_POOL_TWO; }
+});
+
+test("a host without runtime key activation never dispatches a named account and keeps the default-auth candidate usable", async () => {
+  process.env.NATIVE_ROUTER_TEST_KEY_NAMED = "synthetic-named";
+  const routing = { accounts: ["named"], candidates: [{ provider: "fake-a", account: "named" }, { provider: "fake-b" }] };
+  const h = await host(["ok"], { routing, runtimeKeys: "absent" });
+  const unavailable: unknown[] = [];
+  h.api.events.on("native-router:account-unavailable", event => unavailable.push(event));
+  try {
+    await h.session.prompt("default fallback");
+    expect(h.dispatches.map(d => d.physical)).toEqual(["fake-b"]);
+    expect(unavailable).toEqual([]);
+  } finally { h.close(); delete process.env.NATIVE_ROUTER_TEST_KEY_NAMED; }
+});
+
+test("when activation cannot be verified the route fails closed before any dispatch with the account unavailable", async () => {
+  process.env.NATIVE_ROUTER_TEST_KEY_NAMED = "synthetic-named";
+  const routing = { accounts: ["named"], candidates: [{ provider: "fake-a", account: "named" }] };
+  const h = await host(["ok"], { routing, runtimeKeys: "inert" });
+  const unavailable: unknown[] = [];
+  h.api.events.on("native-router:account-unavailable", event => unavailable.push(event));
+  try {
+    await h.session.prompt("verification failure");
+    expect(h.dispatches).toEqual([]);
+    expect(unavailable).toEqual([expect.objectContaining({ provider: "fake-a", account: "named" })]);
+    expect((h.session.messages.at(-1) as { errorMessage?: string }).errorMessage).toContain("could not be verified");
+  } finally { h.close(); delete process.env.NATIVE_ROUTER_TEST_KEY_NAMED; }
+});
+
+test("a named-only route on a host without key activation fails with an actionable error and no dispatch", async () => {
+  process.env.NATIVE_ROUTER_TEST_KEY_NAMED = "synthetic-named";
+  const routing = { accounts: ["named"], candidates: [{ provider: "fake-a", account: "named" }] };
+  const h = await host(["ok"], { routing, runtimeKeys: "absent" });
+  try {
+    await h.session.prompt("named only");
+    expect(h.dispatches).toEqual([]);
+    expect((h.session.messages.at(-1) as { errorMessage?: string }).errorMessage).toMatch(/does not expose runtime key activation/);
+  } finally { h.close(); delete process.env.NATIVE_ROUTER_TEST_KEY_NAMED; }
 });
 
 test("a quota block recorded by one session steers another on the shared store, survives a restart, and then admits one recovery probe", async () => {

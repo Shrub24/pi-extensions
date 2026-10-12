@@ -7,7 +7,7 @@ import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { readConfig, type Config, type RouteConfig } from "./config";
-import { accountActive, accountSecret, readAccountKey, useAccount } from "./accounts";
+import { accountActive, accountSecret, readAccountKey, runtimeKeysAvailable, useAccount } from "./accounts";
 import { HealthStore } from "./health-store";
 import { healthReport, type HealthMode } from "./health-report";
 import { defaultDecisionLogPath, recordDecision, type DecisionReason } from "./decision-log";
@@ -31,15 +31,24 @@ function turnKey(ctx: ExtensionContext): string {
   return user?.id ?? "no-user";
 }
 function available(route: RouteConfig, ctx: ExtensionContext, accounts: Config["accounts"]): Resolved[] {
+  // A host without runtime key activation cannot serve named accounts; default-auth candidates stay usable.
+  const keys = runtimeKeysAvailable(ctx);
   return route.candidates.flatMap(candidate => {
     const model = ctx.modelRegistry.find(candidate.provider, candidate.id);
     if (!model || model.api === "pi-virtual") return [];
     if (candidate.account !== undefined) {
       const account = accounts[candidate.account];
-      return account && accountSecret(account) !== undefined ? [{ candidate, model }] : [];
+      return keys && account && accountSecret(account) !== undefined ? [{ candidate, model }] : [];
     }
     return ctx.modelRegistry.hasConfiguredAuth(model) ? [{ candidate, model }] : [];
   });
+}
+/** The error for a route with no dispatchable target; names the host gap when named accounts are the cause. */
+function exhausted(role: string, route: RouteConfig, ctx: ExtensionContext): Error {
+  if (route.candidates.some(c => c.account !== undefined) && !runtimeKeysAvailable(ctx)) {
+    return new Error(`Native route/${role} has named accounts, but this Pi host does not expose runtime key activation; use default-auth candidates or a Pi version that exposes it`);
+  }
+  return new Error(`Native route/${role} exhausted: no compatible authenticated candidate outside cooldown`);
 }
 // Direct calls never change the runtime key; they may only use named accounts already active.
 async function activeOnly(candidates: Resolved[], ctx: ExtensionContext, accounts: Config["accounts"]): Promise<Resolved[]> {
@@ -123,7 +132,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       const estimate = Math.max(tokens(request.messages), request.reason === "direct" ? 0 : ctx.getContextUsage()?.tokens ?? 0);
       if (request.reason === "direct") {
         const selected = choose(route, await activeOnly(candidates, ctx, config.accounts), health, estimate, route.contextWindow);
-        if (!selected) throw new Error(`Native route/${role} exhausted: no compatible authenticated candidate`);
+        if (!selected) throw exhausted(role, route, ctx);
         return { model: selected.model, thinkingLevel: selected.candidate.thinkingLevel };
       }
       const old = restore(request.state);
@@ -173,15 +182,13 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
         if (granted) break;
         skipped.add(target);
       }
-      if (!selected) throw new Error(`Native route/${role} exhausted: no compatible authenticated candidate outside cooldown`);
+      if (!selected) throw exhausted(role, route, ctx);
       const physical = identity(selected.model, selected.candidate.account);
       const account = selected.candidate.account === undefined ? undefined : config.accounts[selected.candidate.account];
       if (state.physical !== physical) {
         const reason: DecisionReason = !old || !state.physical ? "initial" : request.failed ? "failover" : "sticky";
         recordDecision(decisionLogPath, { at: new Date(options.now?.() ?? Date.now()).toISOString(), session: ctx.sessionManager.getSessionId(), logical: `route/${role}`, ...(state.physical ? { previous: state.physical } : {}), physical, ...(selected.candidate.account ? { account: selected.candidate.account } : {}), reason, contextTokens: estimate, floor: state.floor }, degrade);
       }
-      if (account) await useAccount(ctx, selected.candidate.provider, account);
-      if (account) pi.events.emit("native-router:account-active", { provider: selected.candidate.provider, account: selected.candidate.account });
       const now = options.now?.() ?? Date.now();
       const logical = `route/${role}`;
       const ttl = route.candidates.find(c => identity(c, c.account) === state.physical)?.cacheTtlMs;
@@ -207,6 +214,17 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
         activities.set(activityKey, state.cacheActivity);
         pi.appendEntry(CACHE_ACTIVITY_ENTRY, state.cacheActivity);
         pi.events.emit("native-router:estimated-cache-invalidation", { ...session, logical, physical, reason: "estimated-expiry" });
+      }
+      // The account's key is activated after any pre-dispatch flush, so a blocked replacement leaves the runtime key alone.
+      if (account) {
+        try { await useAccount(ctx, selected.candidate.provider, account); }
+        catch (error) {
+          settleAdmission(activityKey, { recovered: false });
+          const reason = error instanceof Error ? error.message : String(error);
+          pi.events.emit("native-router:account-unavailable", { provider: selected.candidate.provider, account: selected.candidate.account, reason });
+          throw new Error(`Native route/${role} failed closed before dispatch: ${reason}`);
+        }
+        pi.events.emit("native-router:account-active", { provider: selected.candidate.provider, account: selected.candidate.account });
       }
       state.physical = physical;
       state.floor = Math.max(state.floor, selected.model.contextWindow);
