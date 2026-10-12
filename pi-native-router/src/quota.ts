@@ -35,8 +35,9 @@ export function parseCodexbar(raw: string, account: string, provider: string, no
   const labels = (typeof entry.rateWindowLabels === "object" && entry.rateWindowLabels !== null ? entry.rateWindowLabels : {}) as Record<string, unknown>;
   const windows: QuotaWindow[] = [];
   for (const slot of SLOTS) {
-    const window = usage[slot] as Record<string, unknown> | undefined;
-    if (window === undefined) continue;
+    const window = usage[slot] as Record<string, unknown> | null | undefined;
+    // CodexBar reports an unused optional slot as null (Codex has no tertiary window).
+    if (window === undefined || window === null) continue;
     if (typeof window !== "object" || window === null) return { error: `window ${slot} is malformed` };
     const usedPercent = window.usedPercent;
     if (typeof usedPercent !== "number" || !Number.isFinite(usedPercent) || usedPercent < 0 || usedPercent > 100) return { error: `window ${slot} has an invalid usedPercent` };
@@ -53,8 +54,9 @@ export function parseCodexbar(raw: string, account: string, provider: string, no
   if (windows.length === 0) return { error: "tracker entry has no windows" };
   const sourceLabel = typeof entry.source === "string" ? entry.source : "unknown";
   // `local+api` and `local` mix or replace server meters with device history, so only pure server sources qualify.
-  const authoritative = usage.dataConfidence === "authoritative" || (usage.dataConfidence === undefined && ["api", "web", "oauth"].includes(sourceLabel));
-  return { snapshot: { provider, account, source: sourceLabel, authoritative: authoritative && usage.dataConfidence !== "estimated", observedAt, windows } };
+  // CodexBar marks complete server meters `exact` and partial ones `estimated`; only server sources qualify.
+  const authoritative = ["api", "web", "oauth"].includes(sourceLabel) && usage.dataConfidence !== "estimated";
+  return { snapshot: { provider, account, source: sourceLabel, authoritative, observedAt, windows } };
 }
 
 /** Exhaustion from a fresh snapshot: the blocking deadline, or undefined when every window has capacity. */
@@ -136,4 +138,16 @@ export async function refreshQuota(
   } finally {
     store.releaseLease(leaseKey, holder);
   }
+}
+
+/** Human time until a reset, e.g. `2h 14m`, `3d 4h`; `due` once passed. */
+export function formatRemaining(resetsAt: number, now: number): string {
+  const minutes = Math.floor((resetsAt - now) / 60_000);
+  if (minutes <= 0) return "due";
+  const days = Math.floor(minutes / 1440);
+  const hours = Math.floor((minutes % 1440) / 60);
+  const mins = minutes % 60;
+  if (days > 0) return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
+  if (hours > 0) return `${hours}h ${mins}m`;
+  return `${mins}m`;
 }

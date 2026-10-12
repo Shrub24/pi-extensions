@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HealthStore } from "../src/health-store";
-import { exhaustedUntil, parseCodexbar, quotaScopeKey, refreshQuota, type QuotaSource } from "../src/quota";
+import { exhaustedUntil, formatRemaining, parseCodexbar, quotaScopeKey, refreshQuota, type QuotaSource } from "../src/quota";
 import { parseConfig } from "../src/config";
 import { Health } from "../src/policy";
 import { generateCodexbarConfig, stableUuid } from "../src/codexbar-config";
@@ -229,4 +229,38 @@ test("a second commandcode account is skipped rather than written as an unsuppor
   expect(generated.included).toEqual([]);
   expect(generated.skipped.map(s => s.account).sort()).toEqual(["cc-a", "cc-b"]);
   expect(generated.document.providers).toEqual([]);
+});
+
+test("an optional window reported as null is absent, not malformed", () => {
+  const raw = JSON.stringify([{
+    provider: "codex",
+    source: "oauth",
+    rateWindowLabels: { primary: "Session", secondary: "Weekly" },
+    usage: {
+      updatedAt: "2026-10-11T13:58:57Z",
+      primary: { usedPercent: 57, resetsAt: "2026-10-12T04:58:40Z", windowMinutes: 300 },
+      secondary: { usedPercent: 41, resetsAt: "2026-10-18T03:56:59Z", windowMinutes: 10080 },
+      tertiary: null,
+    },
+  }]);
+  const parsed = parseCodexbar(raw, "codex", "codex", Date.parse("2026-10-11T14:00:00Z"));
+  expect("error" in parsed).toBe(false);
+  if ("snapshot" in parsed) expect(parsed.snapshot.windows.map(w => w.slot)).toEqual(["primary", "secondary"]);
+});
+
+test("reset times render as remaining time", () => {
+  const now = Date.parse("2026-10-11T14:00:00Z");
+  expect(formatRemaining(now + 134 * 60_000, now)).toBe("2h 14m");
+  expect(formatRemaining(now + 45 * 60_000, now)).toBe("45m");
+  expect(formatRemaining(now + (3 * 24 + 4) * 3600_000, now)).toBe("3d 4h");
+  expect(formatRemaining(now - 1, now)).toBe("due");
+});
+
+test("exact server meters from the OAuth or API source are authoritative; estimated and local blends are not", () => {
+  const base = { rateWindowLabels: {}, usage: { updatedAt: "2026-10-11T13:58:57Z", primary: { usedPercent: 10 } } };
+  const now = Date.parse("2026-10-11T14:00:00Z");
+  const parse = (source: string, dataConfidence?: string) => parseCodexbar(JSON.stringify([{ ...base, provider: "codex", source, usage: { ...base.usage, ...(dataConfidence ? { dataConfidence } : {}) } }]), "codex", "codex", now);
+  expect(parse("oauth", "exact")).toMatchObject({ snapshot: { authoritative: true } });
+  expect(parse("oauth", "estimated")).toMatchObject({ snapshot: { authoritative: false } });
+  expect(parse("local+api", "exact")).toMatchObject({ snapshot: { authoritative: false } });
 });

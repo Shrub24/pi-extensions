@@ -10,7 +10,7 @@ import { readConfig, type Config, type RouteConfig } from "./config";
 import { accountActive, accountSecret, readAccountKey, useAccount } from "./accounts";
 import { HealthStore } from "./health-store";
 import { defaultDecisionLogPath, recordDecision, type DecisionReason } from "./decision-log";
-import { codexbarRunner, QUOTA_FRESH_MS, quotaScopeKey, refreshQuota, type QuotaSnapshot, type QuotaSource } from "./quota";
+import { codexbarRunner, formatRemaining, QUOTA_FRESH_MS, quotaScopeKey, refreshQuota, type QuotaSnapshot, type QuotaSource } from "./quota";
 import { codexbarConfigPath, generateCodexbarConfig, readCodexbarConfig, writeCodexbarConfig } from "./codexbar-config";
 import { defaultPricingPath, loadSnapshot, refreshSnapshot, saveSnapshot } from "./pricing/cache";
 import { lookup } from "./pricing/catalog";
@@ -353,7 +353,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
         const blocked = store.blocked([key]);
         lines.push(`  ${label} (${quota.provider}${quota.account ? `/${quota.account}` : ""}) observed ${age}s ago${now - snapshot.observedAt > QUOTA_FRESH_MS ? " [stale]" : ""}, enforcement ${quota.enforce ? "on" : "off"}`);
         for (const w of snapshot.windows) {
-          const reset = w.resetsAt === undefined ? "reset unknown" : `resets ${new Date(w.resetsAt).toISOString()}`;
+          const reset = w.resetsAt === undefined ? "reset unknown" : `resets in ${formatRemaining(w.resetsAt, now)}`;
           lines.push(`    ${w.label}: ${w.usedPercent}% used, ${reset}`);
         }
         if (blocked?.kind === "tracker-quota") lines.push(`    blocking routing until ${new Date(blocked.until).toISOString()}`);
