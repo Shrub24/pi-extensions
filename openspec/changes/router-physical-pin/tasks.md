@@ -13,7 +13,7 @@
 
 ## 3. Cycle hotkey
 
-- [ ] 3.1 Register the configurable `shortcuts.cyclePin` hotkey; verify the default binding and that a config value overrides it.
+- [ ] 3.1 Register the configurable `shortcuts.cyclePin` hotkey; verify the default `ctrl+shift+m` binding and that a config value overrides it.
 - [ ] 3.2 Implement next-eligible cycling with wrap; verify wrap, and that no eligible candidate notifies without changing the pin.
 
 ## 4. Footer and log

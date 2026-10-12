@@ -20,7 +20,7 @@ The cycle target is computed from the candidate list in route order. Starting af
 
 - `/route-pin` with no argument opens `ctx.ui.select` with `auto` and each candidate label. Without a UI it lists the candidates and the current pin.
 - `/route-pin <label>` and `/route-pin auto` set the pin directly; argument completion lists the labels.
-- The hotkey is registered with `pi.registerShortcut` and is configurable under the router config (`shortcuts.cyclePin`). It is registered at load, so a change takes effect on restart.
+- The hotkey is registered with `pi.registerShortcut` and is configurable under the router config (`shortcuts.cyclePin`). The default is `ctrl+shift+m`, which Pi leaves unbound; `ctrl+shift+p` is taken by `app.model.cycleBackward`. It is registered at load, so a change takes effect on restart.
 
 ## Footer and telemetry
 
