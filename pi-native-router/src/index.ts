@@ -10,6 +10,7 @@ import { readConfig, type Config, type RouteConfig } from "./config";
 import { commandSlots, completeArguments } from "./completions";
 import { accountActive, accountSecret, readAccountKey, runtimeKeysAvailable, useAccount } from "./accounts";
 import { HealthStore } from "./health-store";
+import { FOOTER_KEYS, peakText, physicalText, thinkingText } from "./footer";
 import { healthReport, type HealthMode } from "./health-report";
 import { defaultDecisionLogPath, recordDecision, type DecisionReason } from "./decision-log";
 import { codexbarRunner, formatRemaining, formatUsed, QUOTA_FRESH_MS, quotaScopeKey, refreshQuota, type QuotaSnapshot, type QuotaSource, usageBar } from "./quota";
@@ -134,6 +135,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       if (request.reason === "direct") {
         const selected = choose(route, await activeOnly(candidates, ctx, config.accounts), health, estimate);
         if (!selected) throw exhausted(role, route, ctx);
+        publishRoute(ctx, selected.model, selected.candidate.account, selected.candidate.thinkingLevel, undefined);
         return { model: selected.model, thinkingLevel: selected.candidate.thinkingLevel };
       }
       const old = restore(request.state);
@@ -252,6 +254,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       // An explicit user choice on this route overrides the candidate default; reasoning-less models keep theirs.
       const explicit = userThinking(ctx, role);
       const thinkingLevel = (explicit === undefined ? selected.candidate.thinkingLevel : clampLevel(selected.model, explicit)) as ModelThinkingLevel;
+      publishRoute(ctx, selected.model, selected.candidate.account, thinkingLevel, explicit);
       return { model: selected.model, thinkingLevel, state: unchanged ? request.state : state };
     };
     pi.on("message_end", (event, ctx) => {
@@ -306,18 +309,40 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
   const activeModel = new Map<string, string>();
   pi.on("session_start", (_event, ctx) => {
     if (ctx.model) activeModel.set(ctx.sessionManager.getSessionId(), `${ctx.model.provider}/${ctx.model.id}`);
+    publishSelection(ctx, ctx.model);
   });
+  // Footer items for the selected model. A route's physical model and peak are only known when a request resolves,
+  // so a route clears them until then; a direct model shows its session thinking level.
+  const publishSelection = (ctx: ExtensionContext, model: Model<Api> | undefined) => {
+    if (!ctx.hasUI) return;
+    ctx.ui.setStatus(FOOTER_KEYS.physical, undefined);
+    ctx.ui.setStatus(FOOTER_KEYS.peak, undefined);
+    ctx.ui.setStatus(FOOTER_KEYS.thinking, model !== undefined && model.provider !== "route" && model.reasoning ? ctx.thinkingLevel : undefined);
+  };
+  // The physical model, peak and effective thinking level of a request this route has just resolved.
+  const publishRoute = (ctx: ExtensionContext, model: Model<Api>, account: string | undefined, effective: string, requested: string | undefined) => {
+    if (!ctx.hasUI) return;
+    ctx.ui.setStatus(FOOTER_KEYS.physical, physicalText(model.provider, model.id, account));
+    ctx.ui.setStatus(FOOTER_KEYS.peak, peakText(model.provider, model.id, options.now?.() ?? Date.now()));
+    ctx.ui.setStatus(FOOTER_KEYS.thinking, model.reasoning ? thinkingText(effective, requested) : undefined);
+  };
   pi.on("model_select", (event, ctx) => {
     activeModel.set(ctx.sessionManager.getSessionId(), `${event.model.provider}/${event.model.id}`);
+    publishSelection(ctx, event.model);
   });
   pi.on("thinking_level_select", (event, ctx) => {
     const model = ctx.model;
-    if (!model || model.provider !== "route" || !config.routes[model.id]) return;
+    if (!model || model.provider !== "route" || !config.routes[model.id]) {
+      if (ctx.hasUI) ctx.ui.setStatus(FOOTER_KEYS.thinking, model?.reasoning ? event.level : undefined);
+      return;
+    }
     // A switch emits model_select before its thinking change is applied to the new model, so the
     // current model is the route only when the last switch (or the session's initial model) was the route.
     const known = activeModel.get(ctx.sessionManager.getSessionId());
     if (known !== undefined && known !== `route/${model.id}`) return;
     pi.appendEntry(THINKING_CHOICE_ENTRY, { role: model.id, level: event.level });
+    // The next request resolves the physical candidate and clamps this choice; until then it is shown as pending.
+    if (ctx.hasUI) ctx.ui.setStatus(FOOTER_KEYS.thinking, thinkingText(event.level, event.level));
   });
   pi.on("session_start", () => {
     if (quotaScopes.length === 0 || !store) return;
@@ -405,6 +430,18 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
         if (blocked?.kind === "tracker-quota") lines.push(`    blocking routing until ${new Date(blocked.until).toISOString()}`);
       }
       ctx.ui.notify(lines.join("\n"), "info");
+    },
+  });
+  pi.registerCommand("route-thinking", {
+    description: "Clear this route's thinking choice so candidate defaults apply again: /route-thinking default",
+    getArgumentCompletions: prefix => completeArguments(prefix, slots["route-thinking"]),
+    handler: async (args, ctx) => {
+      if (args.trim() !== "default") { ctx.ui.notify("usage: /route-thinking default", "error"); return; }
+      const model = ctx.model;
+      if (!model || model.provider !== "route" || !config.routes[model.id]) { ctx.ui.notify("native-router: select a route first", "warning"); return; }
+      pi.appendEntry(THINKING_CHOICE_ENTRY, { role: model.id, level: null });
+      if (ctx.hasUI) ctx.ui.setStatus(FOOTER_KEYS.thinking, undefined);
+      ctx.ui.notify(`native-router: ${model.id} thinking choice cleared; candidate defaults apply from the next request`, "info");
     },
   });
   pi.registerCommand("native-router-health", {
