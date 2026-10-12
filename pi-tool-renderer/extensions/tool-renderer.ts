@@ -22,8 +22,7 @@ import { settingBoolean } from "./tool-renderer/settings.js";
 import { registerStackEvents } from "./tool-renderer/stack.js";
 import { installIntentGuard } from "./tool-renderer/intent.js";
 import { registerBashOnSessionStart, registerEdit, registerRead, registerReadOnly, registerWrite } from "./tool-renderer/tools.js";
-import { installFffRenderers } from "./tool-renderer/fff-patch.js";
-import { installCbmRenderers } from "./tool-renderer/cbm-patch.js";
+import { installRowRenderers } from "./tool-renderer/row-renderers.js";
 import { installRenderDebugOnSessionStart, registerRenderDebugCommand } from "./tool-renderer/render-debug.js";
 
 const INSTALL_SYMBOL = Symbol.for("kendex.pi-tool-renderer.installed");
@@ -39,8 +38,7 @@ export default async function toolRenderer(pi: ExtensionAPI): Promise<void> {
 	registerStackEvents(pi);
 	registerRenderDebugCommand(pi);
 	installRenderDebugOnSessionStart(pi);
-	installFffRenderers(pi);
-	installCbmRenderers(pi);
+	installRowRenderers(pi);
 	installToolExecutionRendererPatch(pi);
 	installLiveSettingsRefresh(pi);
 	installToolChromePatch();

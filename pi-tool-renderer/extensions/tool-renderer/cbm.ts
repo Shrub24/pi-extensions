@@ -6,9 +6,9 @@
  * and result rows parsed from the CLI's actual text contract (the adapter
  * returns the raw `cli --json` stdout text, so the parser reads that).
  *
- * Adopted through the same registerTool intercept as fff (see fff-patch.ts),
- * so nothing inside the generated adapter file is edited and regeneration is
- * safe. Gated by the `cbmRenderers` setting (default on).
+ * Adopted through the renderer resolver (see row-renderers.ts), so nothing
+ * inside the generated adapter file is edited and regeneration is safe. Gated
+ * by the `cbmRenderers` setting (default on).
  */
 import { Text } from "@earendil-works/pi-tui";
 

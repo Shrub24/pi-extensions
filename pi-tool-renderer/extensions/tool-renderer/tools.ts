@@ -309,11 +309,23 @@ export function registerWrite(pi: ExtensionAPI, agent: any, cwd: string): boolea
 	return true;
 }
 
+/**
+ * Row definitions of the tools this package draws itself, by name. Pi resolves a
+ * row's renderers by name, and another extension can own that name (fff's
+ * override mode registers its own `grep` and `find`), so the renderer resolver
+ * draws these rows from here whichever definition is registered.
+ */
+export const readOnlyRowDefinitions = new Map<string, any>();
+
+function registerRowTool(pi: ExtensionAPI, toolName: string, definition: any): void {
+	readOnlyRowDefinitions.set(toolName, definition);
+	pi.registerTool(definition);
+}
+
 export function registerReadOnly(pi: ExtensionAPI, agent: any, cwd: string, toolName: "grep" | "find" | "ls"): boolean {
 	const original = getBuiltInTool(agent, cwd, toolName);
 	if (!original) return false;
-	pi.registerTool({
-		rrenderKendexOwned: true,
+	registerRowTool(pi, toolName, {
 		renderShell: "self",
 		name: toolName,
 		label: toolName,
