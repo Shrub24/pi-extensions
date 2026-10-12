@@ -176,7 +176,13 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
         state.retries++;
         const stay = failure.kind === "transient" && state.retries <= route.stayRetries;
         const failedAccount = old?.physical !== undefined && physicalOf(old.physical) === identity(request.failed.model) ? accountOf(old.physical) : undefined;
-        if (!stay) { health.mark(request.failed.model, failure, failedAccount); exclude = identity(request.failed.model, failedAccount); }
+        const failedTarget = identity(request.failed.model, failedAccount);
+        if (!stay) {
+          health.mark(request.failed.model, failure, failedAccount);
+          exclude = failedTarget;
+          const blocked = health.blockedReason(request.failed.model, failedAccount);
+          if (ctx.hasUI) ctx.ui.notify(`native-router: ${failedTarget} ${failure.kind} failure${blocked ? `; cooling down until ${new Date(blocked.until).toISOString()}` : ""}`, "warning");
+        } else if (ctx.hasUI) ctx.ui.notify(`native-router: ${failedTarget} transient failure; retrying (${state.retries}/${route.stayRetries})`, "info");
       }
       // Admit one recovery probe per expired scope on the chosen target, or move to the next target.
       const skipped = new Set<string>(exclude ? [exclude] : []);
@@ -239,6 +245,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
         state.transitions++;
         state.retries = 0;
         pi.events.emit("native-router:transition", transition);
+        if (request.failed && ctx.hasUI) ctx.ui.notify(`native-router: ${logical} failed over from ${transition.from} to ${physical}; the route's cache rebuilds on the next request`, "warning");
         if (expired) {
           state.cacheActivity = { ...state.cacheActivity!, consumedAt: state.cacheActivity!.at };
           activities.set(activityKey, state.cacheActivity);
@@ -329,10 +336,26 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
   });
   // Footer items for the selected model. A route's physical model and peak are only known when a request resolves,
   // so a route clears them until then; a direct model shows its session thinking level.
+  // The candidate the next request will try: the pin, else the last served physical, else route order. Shown before any
+  // request, so the footer and /route-pin cycling start from what the route will actually do.
+  const displayed = (ctx: ExtensionContext, role: string): Resolved | undefined => {
+    const route = config.routes[role];
+    const pin = pinOf(ctx, role);
+    const preferred = typeof pin === "string" ? pin : branchState(ctx, role)?.physical;
+    return choose(route, available(route, ctx, config.accounts), health, ctx.getContextUsage()?.tokens ?? 0, preferred);
+  };
+  const previewRoute = (ctx: ExtensionContext, role: string) => {
+    if (!ctx.hasUI) return;
+    const shown = displayed(ctx, role);
+    if (!shown) { ctx.ui.setStatus(FOOTER_KEYS.physical, undefined); ctx.ui.setStatus(FOOTER_KEYS.peak, undefined); return; }
+    const { model, candidate } = shown;
+    ctx.ui.setStatus(FOOTER_KEYS.physical, physicalText(model.provider, model.id, candidate.account, config.display, isPinned(ctx, role)));
+    ctx.ui.setStatus(FOOTER_KEYS.peak, peakText(model.provider, model.id, options.now?.() ?? Date.now()));
+  };
   const publishSelection = (ctx: ExtensionContext, model: Model<Api> | undefined) => {
     if (!ctx.hasUI) return;
-    ctx.ui.setStatus(FOOTER_KEYS.physical, undefined);
-    ctx.ui.setStatus(FOOTER_KEYS.peak, undefined);
+    if (model?.provider === "route" && config.routes[model.id]) previewRoute(ctx, model.id);
+    else { ctx.ui.setStatus(FOOTER_KEYS.physical, undefined); ctx.ui.setStatus(FOOTER_KEYS.peak, undefined); }
     ctx.ui.setStatus(FOOTER_KEYS.thinking, model !== undefined && model.provider !== "route" && model.reasoning && ctx.thinkingLevel ? thinkingText(ctx.thinkingLevel, undefined) : undefined);
   };
   // The physical model, peak and effective thinking level of a request this route has just resolved.
@@ -448,19 +471,10 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       ctx.ui.notify(lines.join("\n"), "info");
     },
   });
-  // Re-renders the physical item from the last served model so a pin change shows at once; nothing is shown before a request.
-  const refreshPin = (ctx: ExtensionContext, role: string) => {
-    if (!ctx.hasUI) return;
-    const served = branchState(ctx, role)?.physical;
-    if (!served) return;
-    const model = physicalOf(served);
-    const slash = model.indexOf("/");
-    ctx.ui.setStatus(FOOTER_KEYS.physical, physicalText(model.slice(0, slash), model.slice(slash + 1), accountOf(served), config.display, isPinned(ctx, role)));
-  };
   const pinRoute = (ctx: ExtensionContext, role: string, choice: string | null) => {
     pi.appendEntry(PIN_ENTRY, { role, identity: choice });
     recordDecision(decisionLogPath, { at: new Date(options.now?.() ?? Date.now()).toISOString(), session: ctx.sessionManager.getSessionId(), logical: `route/${role}`, physical: choice === null ? "auto" : physicalOf(choice), ...(choice && accountOf(choice) ? { account: accountOf(choice) } : {}), reason: "manual" }, degrade);
-    refreshPin(ctx, role);
+    previewRoute(ctx, role);
     const note = choice === null ? `native-router: ${role} follows route order` : `native-router: ${role} pinned to ${choice}`;
     ctx.ui.notify(`${note}; the route's cache rebuilds on the next request`, "info");
   };
@@ -468,9 +482,8 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     const model = ctx.model;
     if (!model || model.provider !== "route" || !config.routes[model.id]) { ctx.ui.notify("native-router: select a route first", "warning"); return; }
     const role = model.id;
-    const pin = pinOf(ctx, role);
-    const current = typeof pin === "string" ? pin : branchState(ctx, role)?.physical;
-    const target = cycleTarget(config.routes[role], available(config.routes[role], ctx, config.accounts), health, ctx.getContextUsage()?.tokens ?? 0, current);
+    const shown = displayed(ctx, role);
+    const target = cycleTarget(config.routes[role], available(config.routes[role], ctx, config.accounts), health, ctx.getContextUsage()?.tokens ?? 0, shown && identity(shown.model, shown.candidate.account));
     if (!target) { ctx.ui.notify(`native-router: no eligible candidate for ${role}; pin unchanged`, "warning"); return; }
     pinRoute(ctx, role, identity(target.model, target.candidate.account));
   };

@@ -178,6 +178,8 @@ Provider labels replace the provider part of `provider/model`. Model labels are 
 - The physical footer item shows `⚑` while a pin is set. Each manual change is logged with reason `manual`.
 - Every manual change notifies that the route's cache rebuilds on the next request.
 
+Selecting a route shows the candidate its next request would try (the pin, else the last served model, else route order), so cycling starts from what the route will do. Failures surface as notices: a candidate that fails with a quota, auth, or rate error warns with its cooldown deadline, and a failover warns with the old and new candidates. Transient errors retried on the same candidate are shown as info.
+
 ## Decision log
 
 Each change of physical target is appended to `$PI_CODING_AGENT_DIR/pi-native-router/decisions.jsonl` (default `~/.pi/agent/...`, mode `0600`), one JSON object per line:
