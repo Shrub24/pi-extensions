@@ -6,7 +6,9 @@ import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 
 export const PACKAGE_ID = "@vanillagreen/pi-native-router";
 /** Exactly one key source: an environment variable name or an absolute file path (e.g. a sops-nix secret). */
-export type Account = { provider: string; quota?: QuotaSource } & ({ apiKeyEnv: string; apiKeyFile?: undefined } | { apiKeyFile: string; apiKeyEnv?: undefined });
+export type KeySource = { apiKeyEnv: string; apiKeyFile?: undefined } | { apiKeyFile: string; apiKeyEnv?: undefined };
+/** A named account: one of several keys for a provider. Its id is shown in routes, the footer and telemetry. */
+export type Account = { provider: string; quota?: QuotaSource } & KeySource;
 export interface Candidate { provider: string; id: string; thinkingLevel: ModelThinkingLevel; cacheTtlMs?: number; account?: string }
 export interface RouteConfig {
   candidates: Candidate[];
@@ -19,11 +21,20 @@ export interface RouteConfig {
 export interface Display { providers: Record<string, string>; models: Record<string, string> }
 /** Pi leaves ctrl+shift+m unbound; ctrl+shift+p is app.model.cycleBackward. */
 export const DEFAULT_CYCLE_PIN = "ctrl+shift+m";
-export interface Config { shortcuts: { cyclePin: string }; display?: Display; routes: Record<string, RouteConfig>; accounts: Record<string, Account>; quotas: Record<string, QuotaSource>; flushTimeoutMs: number; sharedHealth: boolean; pricingOverrides: Record<string, { input?: number; output?: number; cacheRead?: number; cacheWrite?: number }> }
+export interface Config { shortcuts: { cyclePin: string }; display?: Display; routes: Record<string, RouteConfig>; accounts: Record<string, Account>; providerKeys: Record<string, KeySource>; quotas: Record<string, QuotaSource>; flushTimeoutMs: number; sharedHealth: boolean; pricingOverrides: Record<string, { input?: number; output?: number; cacheRead?: number; cacheWrite?: number }> }
 const levels = ["off", "minimal", "low", "medium", "high", "xhigh"];
 function record(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Router config must be an object");
   return value as Record<string, unknown>;
+}
+/** Parses exactly one key source from `value`; `label` names the setting in errors. */
+function parseKeySource(label: string, value: Record<string, unknown>): KeySource {
+  const hasEnv = value.apiKeyEnv !== undefined;
+  const hasFile = value.apiKeyFile !== undefined;
+  if (hasEnv === hasFile) throw new Error(`Invalid ${label}: set exactly one of apiKeyEnv or apiKeyFile`);
+  if (hasFile && (typeof value.apiKeyFile !== "string" || !value.apiKeyFile.startsWith("/"))) throw new Error(`Invalid ${label}: apiKeyFile must be an absolute path`);
+  if (hasEnv && (typeof value.apiKeyEnv !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(value.apiKeyEnv))) throw new Error(`Invalid ${label}: apiKeyEnv must be an environment variable name, not a key`);
+  return hasFile ? { apiKeyFile: value.apiKeyFile as string } : { apiKeyEnv: value.apiKeyEnv as string };
 }
 function keys(value: Record<string, unknown>, allowed: string[]) {
   for (const key of Object.keys(value)) if (!allowed.includes(key)) throw new Error(`Unknown router setting: ${key}`);
@@ -46,7 +57,7 @@ function parseQuota(where: string, value: unknown): QuotaSource {
 
 export function parseConfig(raw: unknown): Config {
   const config = record(raw);
-  keys(config, ["routes", "accounts", "quotas", "flushTimeoutMs", "sharedHealth", "pricing", "display", "shortcuts"]);
+  keys(config, ["routes", "accounts", "providerKeys", "quotas", "flushTimeoutMs", "sharedHealth", "pricing", "display", "shortcuts"]);
   const shortcutsRaw = record(config.shortcuts ?? {});
   keys(shortcutsRaw, ["cyclePin"]);
   const cyclePin = shortcutsRaw.cyclePin ?? DEFAULT_CYCLE_PIN;
@@ -84,15 +95,17 @@ export function parseConfig(raw: unknown): Config {
     if (!/^[a-z][a-z0-9_-]{0,31}$/.test(id)) throw new Error(`Invalid account id: ${id}`);
     const account = record(value);
     keys(account, ["provider", "apiKeyEnv", "apiKeyFile", "quota"]);
-    const hasEnv = account.apiKeyEnv !== undefined;
-    const hasFile = account.apiKeyFile !== undefined;
-    if (hasEnv === hasFile) throw new Error(`Invalid account ${id}: set exactly one of apiKeyEnv or apiKeyFile`);
-    if (hasFile && (typeof account.apiKeyFile !== "string" || !account.apiKeyFile.startsWith("/"))) throw new Error(`Invalid account ${id}: apiKeyFile must be an absolute path`);
+    const source = parseKeySource(`account ${id}`, account);
     if (typeof account.provider !== "string" || !account.provider || account.provider === "route") throw new Error(`Invalid account ${id}: a provider is required`);
-    if (hasEnv && (typeof account.apiKeyEnv !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(account.apiKeyEnv))) throw new Error(`Invalid account ${id}: apiKeyEnv must be an environment variable name, not a key`);
     const quota = account.quota === undefined ? undefined : parseQuota(`account ${id}`, account.quota);
-    const source = hasFile ? { apiKeyFile: account.apiKeyFile as string } : { apiKeyEnv: account.apiKeyEnv as string };
     accounts[id] = { provider: account.provider, ...source, ...(quota ? { quota } : {}) };
+  }
+  // One key for a provider with a single credential. It has no account id, so routes, the footer and telemetry show the provider only.
+  const providerKeys: Record<string, KeySource> = {};
+  for (const [provider, value] of Object.entries(record(config.providerKeys ?? {}))) {
+    if (!provider || provider === "route") throw new Error(`Invalid providerKeys provider: ${provider}`);
+    if (Object.values(accounts).some(account => account.provider === provider)) throw new Error(`providerKeys.${provider} conflicts with named accounts for ${provider}; use accounts for several keys`);
+    providerKeys[provider] = parseKeySource(`providerKeys.${provider}`, record(value));
   }
   // Provider-level quota for default-auth providers (Pi's own login), with no named accounts.
   const quotas: Record<string, QuotaSource> = {};
@@ -134,7 +147,7 @@ export function parseConfig(raw: unknown): Config {
     };
     if (routes[role].outputReserve >= routes[role].contextWindow) throw new Error("outputReserve must be below contextWindow");
   }
-  return { routes, accounts, quotas, flushTimeoutMs: integer(config.flushTimeoutMs, 5000, 1, 60_000), sharedHealth: config.sharedHealth !== false, pricingOverrides, display, shortcuts: { cyclePin: cyclePin.trim() } };
+  return { routes, accounts, providerKeys, quotas, flushTimeoutMs: integer(config.flushTimeoutMs, 5000, 1, 60_000), sharedHealth: config.sharedHealth !== false, pricingOverrides, display, shortcuts: { cyclePin: cyclePin.trim() } };
 }
 
 // User-owned settings only: project config must not silently redirect paid requests.

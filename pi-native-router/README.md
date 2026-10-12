@@ -40,7 +40,7 @@ Defaults per route: `contextWindow:200000`, `outputReserve:8192`, `stayRetries:1
 
 ## Named API-key accounts
 
-Optional `accounts` map (user settings only) binds an opaque ID to a provider and exactly one key source: an **`apiKeyFile`** (absolute path, e.g. a sops-nix secret; read and trimmed at use time, so rotation takes effect without a restart) or an `apiKeyEnv` variable name. Prefer `apiKeyFile`. Literal keys are rejected. One key is one account. Candidates may name an account; a provider with named accounts must name one on every candidate, so no candidate can fall through to a different credential.
+Optional `accounts` map (user settings only) binds an opaque ID to a provider and exactly one key source (single-key providers use `providerKeys`, see below): an **`apiKeyFile`** (absolute path, e.g. a sops-nix secret; read and trimmed at use time, so rotation takes effect without a restart) or an `apiKeyEnv` variable name. Prefer `apiKeyFile`. Literal keys are rejected. One key is one account. Candidates may name an account; a provider with named accounts must name one on every candidate, so no candidate can fall through to a different credential.
 
 ```json
 {
@@ -77,9 +77,11 @@ Activation uses Pi's runtime key operation (`ModelRuntime.setRuntimeApiKey`, rea
 - Successful assistant responses refresh the age; aborted, errored and direct calls do not.
 - Routing stays sticky. Expiry alone never switches a healthy route.
 
-## Command Code
+## Provider keys
 
-`commandcode` candidates use the `COMMANDCODE_API_KEY` account above (`commandcode-a`). Because the provider now has a named account, a bare `commandcode` candidate expands to that account and no longer uses Pi's `/login` credential. Without `COMMANDCODE_API_KEY` in the environment the account is unavailable, and its candidates are skipped. Its quota is read from CodexBar's `commandcode` provider under the same key.
+A provider with a single key is configured under `providerKeys` instead of a named account. It takes the same key sources (`apiKeyFile` preferred, or `apiKeyEnv`), but has no account id: candidates for that provider name no account, and routes, the footer and telemetry show the provider alone. A provider cannot have both `providerKeys` and named `accounts`; use accounts when there are several keys.
+
+Command Code is configured this way. Its key is activated for its candidates like a named account and fails closed when the key is missing. Its quota is read from CodexBar's `commandcode` provider when `quotas.commandcode` maps it; the generated CodexBar entry carries the key as a provider-level `apiKey`. Without a `providerKeys` entry, `commandcode` candidates use Pi's own `/login` credential.
 
 ## Shared health
 

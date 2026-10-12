@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
-import type { Account } from "./config";
+import type { Account, KeySource } from "./config";
 import type { QuotaSource } from "./quota";
 
 /**
@@ -40,8 +40,9 @@ export function stableUuid(seed: string): string {
  */
 export function generateCodexbarConfig(
   accounts: Record<string, Account>,
+  providerKeys: Record<string, KeySource>,
   quotas: Record<string, QuotaSource>,
-  readKey: (account: Account) => string | undefined,
+  readKey: (source: KeySource) => string | undefined,
   addedAt: number,
   existing?: Document,
 ): GeneratedConfig {
@@ -58,6 +59,16 @@ export function generateCodexbarConfig(
     if (entries.some(member => member.entry.label === label)) { skipped.push({ account: id, reason: `duplicate CodexBar label ${label}` }); continue; }
     entries.push({ accountId: id, entry: { id: stableUuid(id), label, token, addedAt } });
     byProvider.set(account.quota.provider, entries);
+  }
+  // A single-key provider contributes its one key under its own quota mapping; it has no account label.
+  for (const [provider, source] of Object.entries(providerKeys)) {
+    const quota = quotas[provider];
+    if (!quota) continue;
+    const token = readKey(source);
+    if (!token) { skipped.push({ account: provider, reason: `${source.apiKeyFile ?? source.apiKeyEnv} is not available` }); continue; }
+    const entries = byProvider.get(quota.provider) ?? [];
+    entries.push({ accountId: provider, entry: { id: stableUuid(`provider:${provider}`), label: provider, token, addedAt } });
+    byProvider.set(quota.provider, entries);
   }
 
   const existingById = new Map((existing?.providers ?? []).map(entry => [entry.id, entry]));

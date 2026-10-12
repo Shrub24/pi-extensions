@@ -7,7 +7,7 @@ import { exhaustedUntil, formatRemaining, formatUsed, parseCodexbar, QUOTA_REFRE
 import { parseConfig } from "../src/config";
 import { Health } from "../src/policy";
 import { generateCodexbarConfig, stableUuid } from "../src/codexbar-config";
-import { readAccountKey } from "../src/accounts";
+import { readKey } from "../src/accounts";
 import type { Account } from "../src/config";
 
 // Shape captured from `codexbar usage --provider opencodego --format json` (CodexBar 0.73.0), identity fields removed.
@@ -119,7 +119,7 @@ test("generated CodexBar config maps each quota-mapped account to a labelled tok
     "plain": { provider: "other", apiKeyEnv: "KEY_D" },
   };
   const env: Record<string, string> = { KEY_A: "synthetic-a", KEY_B: "synthetic-b" };
-  const generated = generateCodexbarConfig(accounts, {}, account => readAccountKey(account, env), 1760000000);
+  const generated = generateCodexbarConfig(accounts, {}, {}, source => readKey(source, env), 1760000000);
   const [provider] = generated.document.providers as Array<Record<string, any>>;
   expect(provider.id).toBe("opencodego");
   expect(provider.source).toBe("api");
@@ -152,7 +152,7 @@ test("refresh selects the mapped CodexBar account for multi-account providers; k
     const store = new HealthStore(join(root, "h.sqlite"), () => NOW);
     const seen: string[][] = [];
     const run = async (args: string[]) => { seen.push(args); return goOutput.replace('"source":"local+api"', '"source":"api"'); };
-    await refreshQuota(store, { provider: "commandcode", account: "commandcode-a" }, { source: "codexbar", provider: "commandcode", enforce: false }, run, () => NOW, "h1");
+    await refreshQuota(store, { provider: "commandcode" }, { source: "codexbar", provider: "commandcode", enforce: false }, run, () => NOW, "h1");
     await refreshQuota(store, { provider: "opencode-go", account: "go-a" }, { source: "codexbar", provider: "opencodego", account: "go-a", enforce: false }, run, () => NOW, "h1");
     expect(seen[0]).not.toContain("--account");
     expect(seen[1]).toEqual(expect.arrayContaining(["--provider", "opencodego", "--account", "go-a"]));
@@ -199,7 +199,7 @@ test("regenerating CodexBar config merges router providers and keeps providers i
     "go-a": { provider: "opencode-go", apiKeyEnv: "GO_A", quota: { source: "codexbar", provider: "opencodego", enforce: true } },
   } as Record<string, Account>;
   const quotas = { "openai-codex": { source: "codexbar", provider: "codex", enforce: true } } as Record<string, QuotaSource>;
-  const generated = generateCodexbarConfig(accounts, quotas, () => "k-go", 1760000000, existing);
+  const generated = generateCodexbarConfig(accounts, {}, quotas, () => "k-go", 1760000000, existing);
   const byId = new Map((generated.document.providers as Array<{ id: string; source: string; tokenAccounts?: { accounts: unknown[] } }>).map(p => [p.id, p]));
   expect([...byId.keys()].sort()).toEqual(["claude", "codex", "opencodego"]);
   expect(byId.get("claude")).toEqual({ id: "claude", enabled: true, source: "oauth" } as never);
@@ -209,15 +209,19 @@ test("regenerating CodexBar config merges router providers and keeps providers i
   expect(byId.get("opencodego")?.tokenAccounts?.accounts).toHaveLength(1);
 });
 
-test("commandcode takes its key as a provider-level apiKey and drops stale token accounts", () => {
+test("a single-key provider is written as a provider-level apiKey and drops stale token accounts", () => {
   const existing = { version: 1, providers: [{ id: "commandcode", enabled: true, source: "api", tokenAccounts: { version: 1, activeIndex: 0, accounts: [{ id: "old", label: "old", token: "old" }] } }] };
-  const accounts = {
-    "commandcode-a": { provider: "commandcode", apiKeyFile: "/run/secrets/cc", quota: { source: "codexbar", provider: "commandcode", enforce: true } },
-  } as Record<string, Account>;
-  const generated = generateCodexbarConfig(accounts, {}, () => "cc-key", 1760000000, existing);
+  const quotas = { commandcode: { source: "codexbar", provider: "commandcode", enforce: true } } as Record<string, QuotaSource>;
+  const generated = generateCodexbarConfig({}, { commandcode: { apiKeyFile: "/run/secrets/cc" } }, quotas, () => "cc-key", 1760000000, existing);
   const entry = (generated.document.providers as Array<Record<string, unknown>>).find(p => p.id === "commandcode") as Record<string, unknown>;
   expect(entry).toEqual({ id: "commandcode", enabled: true, source: "api", apiKey: "cc-key" } as never);
-  expect(generated.included).toEqual(["commandcode-a"]);
+  expect(generated.included).toEqual(["commandcode"]);
+});
+
+test("a provider key without a quota mapping is not written to CodexBar", () => {
+  const generated = generateCodexbarConfig({}, { commandcode: { apiKeyEnv: "CC" } }, {}, () => "cc-key", 1760000000);
+  expect(generated.document.providers).toEqual([]);
+  expect(generated.included).toEqual([]);
 });
 
 test("a second commandcode account is skipped rather than written as an unsupported token account", () => {
@@ -225,7 +229,7 @@ test("a second commandcode account is skipped rather than written as an unsuppor
     "cc-a": { provider: "commandcode", apiKeyEnv: "A", quota: { source: "codexbar", provider: "commandcode", enforce: false } },
     "cc-b": { provider: "commandcode", apiKeyEnv: "B", quota: { source: "codexbar", provider: "commandcode", enforce: false } },
   } as Record<string, Account>;
-  const generated = generateCodexbarConfig(accounts, {}, () => "k", 1760000000);
+  const generated = generateCodexbarConfig(accounts, {}, {}, () => "k", 1760000000);
   expect(generated.included).toEqual([]);
   expect(generated.skipped.map(s => s.account).sort()).toEqual(["cc-a", "cc-b"]);
   expect(generated.document.providers).toEqual([]);

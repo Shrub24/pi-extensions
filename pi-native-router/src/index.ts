@@ -6,9 +6,9 @@ import type { Api, Message, Model, ThinkingLevel as ModelThinkingLevel } from "@
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { readConfig, type Config, type RouteConfig } from "./config";
+import { readConfig, type Candidate, type Config, type KeySource, type RouteConfig } from "./config";
 import { commandSlots, completeArguments } from "./completions";
-import { accountActive, accountSecret, readAccountKey, runtimeKeysAvailable, useAccount } from "./accounts";
+import { keyActive, readKey, runtimeKeysAvailable, useKey } from "./accounts";
 import { HealthStore } from "./health-store";
 import { FOOTER_KEYS, peakText, physicalText, thinkingText } from "./footer";
 import { DEFAULT_CYCLE_PIN } from "./config";
@@ -33,32 +33,36 @@ function turnKey(ctx: ExtensionContext): string {
   const user = ctx.sessionManager.getBranch().findLast(e => e.type === "message" && e.message.role === "user");
   return user?.id ?? "no-user";
 }
-function available(route: RouteConfig, ctx: ExtensionContext, accounts: Config["accounts"]): Resolved[] {
-  // A host without runtime key activation cannot serve named accounts; default-auth candidates stay usable.
+/** The key a candidate authenticates with: its named account, its provider's single key, or none (Pi's own login). */
+function keyOf(candidate: Candidate, config: Config): KeySource | undefined {
+  return candidate.account !== undefined ? config.accounts[candidate.account] : config.providerKeys[candidate.provider];
+}
+function available(route: RouteConfig, ctx: ExtensionContext, config: Config): Resolved[] {
+  // A host without runtime key activation cannot serve keyed candidates; default-auth candidates stay usable.
   const keys = runtimeKeysAvailable(ctx);
   return route.candidates.flatMap(candidate => {
     const model = ctx.modelRegistry.find(candidate.provider, candidate.id);
     if (!model || model.api === "pi-virtual") return [];
-    if (candidate.account !== undefined) {
-      const account = accounts[candidate.account];
-      return keys && account && accountSecret(account) !== undefined ? [{ candidate, model }] : [];
+    const source = keyOf(candidate, config);
+    if (candidate.account !== undefined || source !== undefined) {
+      return keys && source && readKey(source) !== undefined ? [{ candidate, model }] : [];
     }
     return ctx.modelRegistry.hasConfiguredAuth(model) ? [{ candidate, model }] : [];
   });
 }
 /** The error for a route with no dispatchable target; names the host gap when named accounts are the cause. */
-function exhausted(role: string, route: RouteConfig, ctx: ExtensionContext): Error {
-  if (route.candidates.some(c => c.account !== undefined) && !runtimeKeysAvailable(ctx)) {
-    return new Error(`Native route/${role} has named accounts, but this Pi host does not expose runtime key activation; use default-auth candidates or a Pi version that exposes it`);
+function exhausted(role: string, route: RouteConfig, ctx: ExtensionContext, config: Config): Error {
+  if (route.candidates.some(c => keyOf(c, config) !== undefined) && !runtimeKeysAvailable(ctx)) {
+    return new Error(`Native route/${role} has keyed candidates (named accounts or a provider key), but this Pi host does not expose runtime key activation; use default-auth candidates or a Pi version that exposes it`);
   }
   return new Error(`Native route/${role} exhausted: no compatible authenticated candidate outside cooldown`);
 }
 // Direct calls never change the runtime key; they may only use named accounts already active.
-async function activeOnly(candidates: Resolved[], ctx: ExtensionContext, accounts: Config["accounts"]): Promise<Resolved[]> {
+async function activeOnly(candidates: Resolved[], ctx: ExtensionContext, config: Config): Promise<Resolved[]> {
   const kept: Resolved[] = [];
   for (const c of candidates) {
-    const account = c.candidate.account === undefined ? undefined : accounts[c.candidate.account];
-    if (!account || (await accountActive(ctx, account, c.candidate.provider))) kept.push(c);
+    const source = keyOf(c.candidate, config);
+    if (!source || (await keyActive(ctx, source, c.candidate.provider))) kept.push(c);
   }
   return kept;
 }
@@ -143,11 +147,11 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
   for (const [role, route] of Object.entries(config.routes)) {
     const resolve = async (request: ModelRouteRequest<State>, ctx: ExtensionContext): Promise<ModelRoute<State>> => {
       request.signal?.throwIfAborted();
-      const candidates = available(route, ctx, config.accounts);
+      const candidates = available(route, ctx, config);
       const estimate = Math.max(tokens(request.messages), request.reason === "direct" ? 0 : ctx.getContextUsage()?.tokens ?? 0);
       if (request.reason === "direct") {
-        const selected = choose(route, await activeOnly(candidates, ctx, config.accounts), health, estimate);
-        if (!selected) throw exhausted(role, route, ctx);
+        const selected = choose(route, await activeOnly(candidates, ctx, config), health, estimate);
+        if (!selected) throw exhausted(role, route, ctx, config);
         publishRoute(ctx, selected.model, selected.candidate.account, selected.candidate.thinkingLevel, undefined, isPinned(ctx, role));
         return { model: selected.model, thinkingLevel: selected.candidate.thinkingLevel };
       }
@@ -212,11 +216,11 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
           const target = `${candidate.provider}/${candidate.id}${candidate.account ? `#${candidate.account}` : ""}`;
           const model = ctx.modelRegistry.find(candidate.provider, candidate.id);
           if (!model || model.api === "pi-virtual") return `${target}: not registered`;
-          if (candidate.account !== undefined) {
-            const named = config.accounts[candidate.account];
-            if (!named) return `${target}: unknown account`;
+          const source = keyOf(candidate, config);
+          if (candidate.account !== undefined && !source) return `${target}: unknown account`;
+          if (source) {
             if (!runtimeKeysAvailable(ctx)) return `${target}: this Pi host does not expose runtime key activation`;
-            if (accountSecret(named) === undefined) return `${target}: key source missing or empty`;
+            if (readKey(source) === undefined) return `${target}: key source missing or empty`;
           } else if (!ctx.modelRegistry.hasConfiguredAuth(model)) return `${target}: no configured auth`;
           if (exclude === target) return `${target}: excluded after this request's failure`;
           if (skipped.has(target)) return `${target}: skipped after a refused probe lease or a failed activation`;
@@ -228,7 +232,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
         throw new Error(`Native route/${role} exhausted: no dispatchable candidate. ${detail.join("; ")}`);
       }
       const physical = identity(selected.model, selected.candidate.account);
-      const account = selected.candidate.account === undefined ? undefined : config.accounts[selected.candidate.account];
+      const key = keyOf(selected.candidate, config);
       if (state.physical !== physical) {
         const reason: DecisionReason = !old || !state.physical ? "initial" : request.failed ? "failover" : "sticky";
         recordDecision(decisionLogPath, { at: new Date(options.now?.() ?? Date.now()).toISOString(), session: ctx.sessionManager.getSessionId(), logical: `route/${role}`, ...(state.physical ? { previous: state.physical } : {}), physical, ...(selected.candidate.account ? { account: selected.candidate.account } : {}), reason, contextTokens: estimate, requiredContext: requiredContext(route, selected.model, estimate) }, degrade);
@@ -261,8 +265,8 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
         pi.events.emit("native-router:estimated-cache-invalidation", { ...session, logical, physical, reason: "estimated-expiry" });
       }
       // The account's key is activated after any pre-dispatch flush, so a blocked replacement leaves the runtime key alone.
-      if (account) {
-        try { await useAccount(ctx, selected.candidate.provider, account); }
+      if (key) {
+        try { await useKey(ctx, selected.candidate.provider, key); }
         catch (error) {
           settleAdmission(activityKey, { recovered: false });
           const reason = error instanceof Error ? error.message : String(error);
@@ -342,7 +346,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     const route = config.routes[role];
     const pin = pinOf(ctx, role);
     const preferred = typeof pin === "string" ? pin : branchState(ctx, role)?.physical;
-    return choose(route, available(route, ctx, config.accounts), health, ctx.getContextUsage()?.tokens ?? 0, preferred);
+    return choose(route, available(route, ctx, config), health, ctx.getContextUsage()?.tokens ?? 0, preferred);
   };
   const previewRoute = (ctx: ExtensionContext, role: string) => {
     if (!ctx.hasUI) return;
@@ -437,7 +441,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
         existing = readCodexbarConfig(path);
         if (existing !== undefined && !replace) throw new Error(`${path} exists; rerun with --replace to merge router providers into it`);
       } catch (error) { ctx.ui.notify(`native-router: ${error instanceof Error ? error.message : String(error)}`, "error"); return; }
-      const generated = generateCodexbarConfig(config.accounts, config.quotas, readAccountKey, Math.floor((options.now?.() ?? Date.now()) / 1000), existing);
+      const generated = generateCodexbarConfig(config.accounts, config.providerKeys, config.quotas, readKey, Math.floor((options.now?.() ?? Date.now()) / 1000), existing);
       if (generated.included.length === 0 && Object.keys(config.quotas).length === 0) { ctx.ui.notify(`native-router: no quota-mapped accounts with keys set (${generated.skipped.map(s => `${s.account}: ${s.reason}`).join("; ") || "none mapped"})`, "warning"); return; }
       try { writeCodexbarConfig(path, generated.document, true); }
       catch (error) { ctx.ui.notify(`native-router: ${error instanceof Error ? error.message : String(error)}`, "error"); return; }
@@ -483,7 +487,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     if (!model || model.provider !== "route" || !config.routes[model.id]) { ctx.ui.notify("native-router: select a route first", "warning"); return; }
     const role = model.id;
     const shown = displayed(ctx, role);
-    const target = cycleTarget(config.routes[role], available(config.routes[role], ctx, config.accounts), health, ctx.getContextUsage()?.tokens ?? 0, shown && identity(shown.model, shown.candidate.account));
+    const target = cycleTarget(config.routes[role], available(config.routes[role], ctx, config), health, ctx.getContextUsage()?.tokens ?? 0, shown && identity(shown.model, shown.candidate.account));
     if (!target) { ctx.ui.notify(`native-router: no eligible candidate for ${role}; pin unchanged`, "warning"); return; }
     pinRoute(ctx, role, identity(target.model, target.candidate.account));
   };
@@ -588,7 +592,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     settleAdmission(`${ctx.sessionManager.getSessionId()}:${role}`, { recovered: false });
     if (observed.kind !== "unsafe") health.mark(failed, observed, accountOf(state.physical));
     if (failure.kind === "unsafe") return;
-    const selected = choose(route, available(route, ctx, config.accounts), health, Math.max(tokens(event.context.llmMessages), ctx.getContextUsage()?.tokens ?? 0), undefined, state.physical);
+    const selected = choose(route, available(route, ctx, config), health, Math.max(tokens(event.context.llmMessages), ctx.getContextUsage()?.tokens ?? 0), undefined, state.physical);
     if (!selected) return;
     const before = event.context.contextMessages.slice(0, -1);
     if (!before.some(m => m.role !== "system") || before.at(-1)?.role === "assistant") return;

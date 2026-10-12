@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { Account } from "./config";
+import type { KeySource } from "./config";
 
 type RuntimeKeys = { setRuntimeApiKey(provider: string, apiKey: string): Promise<void> | void };
 
@@ -11,7 +11,7 @@ function runtimeKeys(ctx: ExtensionContext): (RuntimeKeys & object) | undefined 
   return runtime && typeof (runtime as RuntimeKeys).setRuntimeApiKey === "function" ? (runtime as RuntimeKeys & object) : undefined;
 }
 
-/** Whether this Pi host exposes the runtime key operation that named accounts need. */
+/** Whether this Pi host exposes the runtime key operation that named or provider keys need. */
 export function runtimeKeysAvailable(ctx: ExtensionContext): boolean {
   return runtimeKeys(ctx) !== undefined;
 }
@@ -20,41 +20,37 @@ export function runtimeKeysAvailable(ctx: ExtensionContext): boolean {
 const mutations = new WeakMap<object, Promise<unknown>>();
 
 /**
- * Reads an account's key at use time, from its environment variable or its key file (e.g. a sops-nix
- * secret path). A missing, unreadable or empty source is unavailable, never a silent fallback.
+ * Reads a key at use time, from its environment variable or its key file (e.g. a sops-nix secret path).
+ * A missing, unreadable or empty source is unavailable, never a silent fallback.
  */
-export function readAccountKey(account: Account, env: NodeJS.ProcessEnv = process.env): string | undefined {
-  if (account.apiKeyFile !== undefined) {
-    try { return readFileSync(account.apiKeyFile, "utf8").trim() || undefined; }
+export function readKey(source: KeySource, env: NodeJS.ProcessEnv = process.env): string | undefined {
+  if (source.apiKeyFile !== undefined) {
+    try { return readFileSync(source.apiKeyFile, "utf8").trim() || undefined; }
     catch { return undefined; }
   }
-  return env[account.apiKeyEnv] || undefined;
+  return env[source.apiKeyEnv] || undefined;
 }
 
-export function accountSecret(account: Account): string | undefined {
-  return readAccountKey(account);
-}
-
-export async function accountActive(ctx: ExtensionContext, account: Account, provider: string): Promise<boolean> {
-  const secret = accountSecret(account);
+export async function keyActive(ctx: ExtensionContext, source: KeySource, provider: string): Promise<boolean> {
+  const secret = readKey(source);
   return secret !== undefined && (await ctx.modelRegistry.getApiKeyForProvider(provider)) === secret;
 }
 
 /**
- * Makes the account's key the effective key for `provider` in this Pi runtime. Provider-global: the active key
+ * Makes the key the effective key for `provider` in this Pi runtime. Provider-global: the active key
  * serves every request in this runtime for the provider. Mutations are serialized per runtime, and an
  * activation is confirmed by reading the effective key back; any failure rejects before dispatch.
  */
-export async function useAccount(ctx: ExtensionContext, provider: string, account: Account): Promise<void> {
-  const secret = accountSecret(account);
-  if (secret === undefined) throw new Error(`Named account for ${provider} has no API key: its key file is missing or empty, or its environment variable is unset`);
+export async function useKey(ctx: ExtensionContext, provider: string, source: KeySource): Promise<void> {
+  const secret = readKey(source);
+  if (secret === undefined) throw new Error(`Key for ${provider} is missing: its key file is missing or empty, or its environment variable is unset`);
   const keys = runtimeKeys(ctx);
-  if (!keys) throw new Error(`Named account for ${provider} requires Pi runtime key activation, which this Pi host does not expose`);
+  if (!keys) throw new Error(`Key for ${provider} requires Pi runtime key activation, which this Pi host does not expose`);
   const previous = mutations.get(keys) ?? Promise.resolve();
   const run = previous.catch(() => {}).then(async () => {
-    if (await accountActive(ctx, account, provider)) return;
+    if (await keyActive(ctx, source, provider)) return;
     await keys.setRuntimeApiKey(provider, secret);
-    if (!(await accountActive(ctx, account, provider))) throw new Error(`Named account activation for ${provider} could not be verified`);
+    if (!(await keyActive(ctx, source, provider))) throw new Error(`Key activation for ${provider} could not be verified`);
   });
   mutations.set(keys, run);
   await run;
