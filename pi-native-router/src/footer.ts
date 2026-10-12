@@ -27,14 +27,10 @@ export function peakText(provider: string, id: string, atMs: number): string | u
   return isPeakPriced(provider, id, atMs) || isPeakRecorded(provider, id, atMs) ? "▲" : undefined;
 }
 
-/** One bar per thinking level, rising from off to max. */
-const THINKING_BARS: Record<string, string> = { off: "▁", minimal: "▂", low: "▃", medium: "▄", high: "▅", xhigh: "▆", max: "█" };
-
 /**
- * The thinking level that will run, as a bar. A level the user chose on the route adds a pencil mark;
- * otherwise the candidate's default applies and the bar stands alone.
+ * The thinking level that will run, by its raw name. A level the user chose on the route adds a pencil
+ * mark; otherwise the candidate's default applies and the name stands alone.
  */
 export function thinkingText(effective: string, requested: string | undefined): string {
-  const bar = THINKING_BARS[effective] ?? effective;
-  return requested === undefined ? bar : `${bar}✎`;
+  return requested === undefined ? effective : `${effective}✎`;
 }

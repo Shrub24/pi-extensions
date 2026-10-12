@@ -154,7 +154,7 @@ The router publishes three status items for powerline's `customItems` (`native-r
 
 - **Physical model:** `provider/model · account` for the candidate serving the current request. Before the first request on a route, the item is hidden.
 - **Peak:** a `▲` while the physical model is in a peak window.
-- **Thinking:** one bar per level, rising from `▁` (off) to `█` (max). A `✎` follows when you chose the level on the route.
+- **Thinking:** the level name that will run (e.g. `high`). A `✎` follows when you chose the level on the route.
 
 Labels are configurable under `display`. They change only what the footer shows, never routing, keys or telemetry:
 
