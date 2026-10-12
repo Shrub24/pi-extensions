@@ -117,6 +117,7 @@ import {
   ATTR_PI_PROMPT_LENGTH,
   ATTR_PI_ROUTE_PREVIOUS_MODEL,
   ATTR_PI_PRICING_PEAK_MULTIPLIER,
+  ATTR_PI_PRICING_SOURCE,
   ATTR_PI_ROUTE_ACCOUNT_ID,
   ATTR_PI_ROUTE_VIRTUAL_MODEL,
   ATTR_PI_ROUTE_TRANSITION_REASON,
@@ -1190,6 +1191,9 @@ export class SpanTracker {
     // Set by the native router when it applied time-of-day pricing to this message's cost.
     const peak = (u as { peakMultiplier?: unknown }).peakMultiplier;
     if (typeof peak === "number" && Number.isFinite(peak) && peak !== 1) set(ATTR_PI_PRICING_PEAK_MULTIPLIER, peak);
+    // Set by the native router when the cost is a catalog or override estimate, not Pi's recorded price.
+    const source = (u as { pricingSource?: unknown }).pricingSource;
+    if (source === "catalog" || source === "override") span.setAttribute(ATTR_PI_PRICING_SOURCE, source);
   }
 
   private recordLlmMetrics(): void {

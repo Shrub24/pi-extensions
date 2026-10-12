@@ -19,7 +19,7 @@
 
 ## 4. Telemetry provenance and integration
 
-- [ ] 4.1 Attach catalog and override provenance (`pi.pricing.source`) to backfilled usage in the router, and export it in pi-otel next to `gen_ai.usage.cost` without recalculating cost. Tests: catalog estimate is tagged; recorded and peak-only cost carry no catalog tag; the peak multiplier still exports.
+- [x] 4.1 Attach catalog and override provenance (`pi.pricing.source`) to backfilled usage in the router, and export it in pi-otel next to `gen_ai.usage.cost` without recalculating cost. The backfill now resolves through exact lookup with `pricing.overrides`. Tests: `reconcile.test.ts` and `backfill-wiring.test.ts` (router); `tracker.test.ts` 'exports the pricing source only for catalog or override estimates' (pi-otel).
 - [ ] 4.2 Integration test with one frozen snapshot: the native total and the exported total match, and no exported estimate is labelled as invoice, actual charge or subscription cost.
 - [ ] 4.3 Confirm disabled or unmapped configurations preserve current costs. Document rollback: delete the snapshot or disable the handler.
 

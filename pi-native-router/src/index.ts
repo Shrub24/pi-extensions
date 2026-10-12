@@ -396,7 +396,10 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     const piHasPrice = piModel?.cost !== undefined;
     let changed = false;
     if (!piHasPrice || usage.cost.total === 0) {
-      try { changed = backfillCost(usage, piHasPrice, loadSnapshot(defaultPricingPath())?.records[`${message.provider}/${message.model}`]) || changed; }
+      try {
+        const estimate = lookup(loadSnapshot(defaultPricingPath()), message.provider, message.model, config.pricingOverrides);
+        changed = backfillCost(usage, piHasPrice, estimate.status === "unpriced" ? undefined : estimate.record) || changed;
+      }
       catch (error) { degrade(error); }
     }
     changed = applyPeak(usage, message.provider, message.model, at) || changed;

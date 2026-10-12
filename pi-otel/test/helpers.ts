@@ -186,6 +186,7 @@ export function asstMsg(opts: {
   totalTokens?: number;
   cost?: number;
   peakMultiplier?: number;
+  pricingSource?: "catalog" | "override";
   stopReason?: string;
   responseModel?: string;
   model?: string;
@@ -215,6 +216,7 @@ export function asstMsg(opts: {
       totalTokens: opts.totalTokens,
       cost: { total: opts.cost },
       ...(opts.peakMultiplier === undefined ? {} : { peakMultiplier: opts.peakMultiplier }),
+      ...(opts.pricingSource === undefined ? {} : { pricingSource: opts.pricingSource }),
     },
     stopReason: opts.stopReason ?? "stop",
     errorMessage: opts.errorMessage,

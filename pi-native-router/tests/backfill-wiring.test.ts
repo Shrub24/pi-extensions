@@ -33,15 +33,52 @@ test("message_end backfills a zero Pi cost from the exact catalog record, and le
         role: "assistant", provider, model, timestamp: Date.parse("2026-10-12T12:00:00Z"),
         usage: { input: 1_000_000, output: 1_000_000, cacheRead: 0, cacheWrite: 0, totalTokens: 2_000_000, cost: { ...zeroCost } },
       };
-      let replaced: { usage: { cost: { total: number } } } | undefined;
+      let replaced: { usage: { cost: { total: number }; pricingSource?: string } } | undefined;
       for (const handler of handlers) {
         const result = handler({ type: "message_end", message }, ctx) as { message?: typeof replaced } | undefined;
         if (result?.message) replaced = result.message;
       }
       return replaced;
     };
-    expect(run("anthropic", "claude-haiku-4-5")?.usage.cost.total).toBeCloseTo(6);
+    const backfilled = run("anthropic", "claude-haiku-4-5");
+    expect(backfilled?.usage.cost.total).toBeCloseTo(6);
+    expect(backfilled?.usage.pricingSource).toBe("catalog");
     expect(run("opencode-go", "longcat-2.5-preview-free")).toBeUndefined();
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("message_end labels a placeholder backfilled from a configured override as override, without any snapshot", () => {
+  const dir = mkdtempSync(join(tmpdir(), "native-router-override-"));
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  try {
+    process.env.PI_CODING_AGENT_DIR = dir;
+    const handlers: Array<(event: unknown, ctx: unknown) => unknown> = [];
+    const pi = {
+      on(name: string, handler: (event: unknown, ctx: unknown) => unknown) { if (name === "message_end") handlers.push(handler); },
+      registerCommand() {}, registerVirtualModel() {}, registerProvider() {}, appendEntry() {},
+      setActiveTools() {}, getActiveTools: () => [], getAllTools: () => [],
+      events: { on() {}, emit() {} },
+    };
+    const config = parseConfig({
+      routes: { worker: { candidates: [{ provider: "fake-a", id: "model" }] } },
+      pricing: { overrides: { "anthropic/claude-haiku-4-5": { input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1.25 } } },
+    });
+    installRouter(pi as never, config, { healthPath: join(dir, "h.sqlite") });
+    const zeroCost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
+    const message = {
+      role: "assistant", provider: "anthropic", model: "claude-haiku-4-5", timestamp: Date.parse("2026-10-12T12:00:00Z"),
+      usage: { input: 1_000_000, output: 1_000_000, cacheRead: 0, cacheWrite: 0, totalTokens: 2_000_000, cost: { ...zeroCost } },
+    };
+    let replaced: { usage: { cost: { total: number }; pricingSource?: string } } | undefined;
+    for (const handler of handlers) {
+      const result = handler({ type: "message_end", message }, { modelRegistry: { find: () => ({ cost: zeroCost }) } }) as { message?: typeof replaced } | undefined;
+      if (result?.message) replaced = result.message;
+    }
+    expect(replaced?.usage.cost.total).toBeCloseTo(6);
+    expect(replaced?.usage.pricingSource).toBe("override");
   } finally {
     if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous;
     rmSync(dir, { recursive: true, force: true });

@@ -50,6 +50,8 @@ test("backup fills a missing price and never overwrites a nonzero Pi cost", () =
   const unpriced = usage(0);
   expect(backfillCost(unpriced, false, record)).toBe(true);
   expect(unpriced.cost.total).toBeGreaterThan(0);
+  expect(unpriced.pricingSource).toBe("catalog");
+  expect(piPriced.pricingSource).toBeUndefined();
   const none = usage(0);
   expect(backfillCost(none, false, undefined)).toBe(false);
 });
@@ -60,6 +62,14 @@ test("a placeholder zero from Pi is replaced by a complete nonzero exact record"
   expect(backfillCost(placeholder, true, record)).toBe(true);
   expect(placeholder.cost.input).toBeCloseTo(0.14);
   expect(placeholder.cost.total).toBeGreaterThan(0);
+  expect(placeholder.pricingSource).toBe("catalog");
+});
+
+test("a local override backfill is labelled override, not catalog", () => {
+  const override: PriceRecord = { provider: "p", model: "m", provenance: "override", input: 1, output: 2, cacheRead: 0, cacheWrite: 0, tiered: false };
+  const placeholder = usage(0);
+  expect(backfillCost(placeholder, true, override)).toBe(true);
+  expect(placeholder.pricingSource).toBe("override");
 });
 
 test("a genuinely free model stays free, and a partial placeholder stays unknown", () => {
@@ -67,6 +77,7 @@ test("a genuinely free model stays free, and a partial placeholder stays unknown
   const zero = usage(0);
   expect(backfillCost(zero, true, free)).toBe(false);
   expect(zero.cost.total).toBe(0);
+  expect(zero.pricingSource).toBeUndefined();
   const partial: PriceRecord = { provider: "opencode-go", model: "mimo-v2.5", provenance: "models.dev", input: 0.14, output: 0.28, cacheRead: 0.0028, tiered: false };
   const unknown = usage(0);
   expect(backfillCost(unknown, true, partial)).toBe(false);

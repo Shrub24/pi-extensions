@@ -182,6 +182,8 @@ export const ATTR_PI_ROUTE_VIRTUAL_MODEL = "pi.route.virtual_model";
 export const ATTR_PI_ROUTE_ACCOUNT_ID = "pi.route.account_id";
 /** Multiplier applied to the recorded cost for time-of-day pricing (2 during DeepSeek peak hours). Absent when no adjustment applied. */
 export const ATTR_PI_PRICING_PEAK_MULTIPLIER = "pi.pricing.peak_multiplier";
+/** Present only when the cost is a router estimate from the pricing catalog ("catalog") or a local override ("override"). */
+export const ATTR_PI_PRICING_SOURCE = "pi.pricing.source";
 export const ATTR_PI_ROUTE_TRANSITION_REASON = "pi.route.transition_reason";
 /** Remote parent this process inherited through TRACEPARENT (a spawning pi). */
 export const ATTR_PI_PARENT_TRACE_ID = "pi.parent.trace_id";

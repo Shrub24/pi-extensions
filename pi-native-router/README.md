@@ -133,7 +133,7 @@ An account may map to a CodexBar provider so `/quotas` can show its windows:
 - Unknown components stay unknown. A model without a cache-write rate is reported as partial, not free. Context-tiered pricing is reported as partial, because the base rates alone do not price long contexts.
 - Local overrides go under `pricing.overrides` as exact `provider/model` keys with optional `input`, `output`, `cacheRead` and `cacheWrite` rates. Overrides are labelled `override`.
 - **Cost source of truth is Pi's own `usage.cost`**, which Pi derives from its bundled model catalog and pi-otel exports as `gen_ai.usage.cost`. The snapshot is a backup only:
-  - When Pi's model registry has no price for a physical model and the snapshot has a complete record, the message cost is priced from the snapshot. Partial or tiered records leave cost unknown rather than zero.
+  - **Catalog backfill:** the message cost is priced from the exact snapshot record (or a complete local override) when Pi has no price for the model, or when Pi recorded zero cost for a message with tokens. A nonzero Pi cost is never overwritten, a genuinely free model stays zero, and partial or tiered records leave cost unknown rather than zero. The estimate is exported with `pi.pricing.source` (`catalog` or `override`) in pi-otel.
   - **DeepSeek peak pricing:** OpenCode Go bills DeepSeek models (`deepseek-v4-flash`, `deepseek-v4-pro`, `deepseek-v4.1-flash`) at DeepSeek's peak rate, which is twice the off-peak rate Pi records. On weekdays 01:00–04:00 and 06:00–10:00 UTC, the router doubles each recorded cost component on the finished message before pi-otel reads it. Weekends are off-peak.
 
 ## Thinking level

@@ -19,6 +19,8 @@ export interface CostUsage {
   cost: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
   /** Set when time-of-day pricing scaled the cost; pi-otel exports it as pi.pricing.peak_multiplier. */
   peakMultiplier?: number;
+  /** Set when the catalog or a local override supplied the cost; pi-otel exports it as pi.pricing.source. */
+  pricingSource?: "catalog" | "override";
 }
 
 export const PEAK_MULTIPLIER = 2;
@@ -75,5 +77,6 @@ export function backfillCost(usage: CostUsage, piHasPrice: boolean, record: Pric
   const cost = priceFromCatalog(usage, record);
   if (!cost || cost.total === 0) return false;
   usage.cost = cost;
+  usage.pricingSource = record.provenance === "override" ? "override" : "catalog";
   return true;
 }

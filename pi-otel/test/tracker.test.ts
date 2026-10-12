@@ -357,6 +357,31 @@ describe("llm usage attribution", () => {
     assert.equal(h.span(SPAN_LLM_REQUEST).attributes["pi.pricing.peak_multiplier"], undefined);
   });
 
+  test("exports the pricing source only for catalog or override estimates", async () => {
+    for (const source of ["catalog", "override"] as const) {
+      h.tracker.startSession();
+      h.tracker.startInteraction("p");
+      h.tracker.startTurn(0);
+      h.tracker.startLlm("deepseek-v4-flash", "opencode-go");
+      h.tracker.completeLlm(asstMsg({ input: 100, output: 50, cost: 0.0012, pricingSource: source, stopReason: "stop", provider: "opencode-go", model: "deepseek-v4-flash" }));
+      h.tracker.endTurn();
+      h.tracker.endInteraction();
+      h.tracker.endSession();
+      await h.flush();
+      assert.equal(h.span(SPAN_LLM_REQUEST).attributes["pi.pricing.source"], source);
+    }
+    h.tracker.startSession();
+    h.tracker.startInteraction("p");
+    h.tracker.startTurn(0);
+    h.tracker.startLlm("deepseek-v4-flash", "opencode-go");
+    h.tracker.completeLlm(asstMsg({ input: 100, output: 50, cost: 0.0012, stopReason: "stop", provider: "opencode-go", model: "deepseek-v4-flash" }));
+    h.tracker.endTurn();
+    h.tracker.endInteraction();
+    h.tracker.endSession();
+    await h.flush();
+    assert.equal(h.span(SPAN_LLM_REQUEST).attributes["pi.pricing.source"], undefined, "Pi-recorded cost carries no estimate label");
+  });
+
   test("omits cache_write_1h attribute when not reported", async () => {
     h.tracker.startSession();
     h.tracker.startInteraction("p");
