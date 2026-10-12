@@ -72,12 +72,20 @@ Routing SHALL preserve Magic Context's 200k-token pressure threshold and disable
 - **THEN** the owning Magic Context configuration disables Pi idle-TTL execution while retaining the 200k pressure threshold
 - **AND** flush applies pending transformations without requesting unconditional wrapup
 
-### Requirement: Conservative v0.1 capacity compatibility
+### Requirement: Route capacity compatibility
 
-Selection SHALL use canonical/latest-successful-usage estimates plus output reserve and initial logical capacity. A persisted, non-decreasing physical capacity floor SHALL prohibit smaller-window automatic fallback. This SHALL NOT be represented as a hard final-token guarantee: Pi 1.1.0 does not expose final extension-prepared context at route time.
+Selection SHALL require each candidate to provide at least the route's configured logical capacity and to fit the conservative usage estimate plus the reserve (the greater of the configured output reserve and the candidate's maximum output). Capacity SHALL NOT be persisted or derived from a previously selected model, so a fallback MAY use a smaller window than the model it replaces.
 
-#### Scenario: Smaller fallback
-- **WHEN** a fallback is below the persisted physical capacity floor, configured logical capacity, or conservative context estimate plus required output reserve
-- **THEN** the router skips it or stops with a clear exhaustion error
-- **AND** a smaller physical window is rejected even when a small request appears to fit
+#### Scenario: Fallback to a smaller window
+- **WHEN** a fallback candidate provides at least the route's configured capacity and the request fits its window
+- **THEN** the router selects it
 - **AND** it does not invoke native Pi compaction
+
+#### Scenario: Candidate below the required capacity
+- **WHEN** a candidate's window is below the route's configured capacity, cannot hold the estimate plus reserve, or cannot produce the configured output reserve
+- **THEN** the router skips it or stops with an exhaustion error that names the reason
+
+#### Scenario: Capacity is not carried across a switch
+- **WHEN** a session switches roles, or a route's large-window candidate is replaced by a smaller one
+- **THEN** the new selection is judged only on the route's configured capacity and the current request
+- **AND** no earlier model's window raises the requirement

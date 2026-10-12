@@ -49,11 +49,11 @@ test("model cooldown isolates siblings; provider cooldown suppresses siblings; e
   let now = 1000;
   const health = new Health(() => now);
   health.mark(models[0].model, classify(error('{"status":503,"retryAfterSeconds":2}'), now));
-  expect(choose(config, models, health, 10, 200_000)?.model.id).toBe("two");
+  expect(choose(config, models, health, 10)?.model.id).toBe("two");
   now += 2001;
-  expect(choose(config, models, health, 10, 200_000)?.model.id).toBe("one");
+  expect(choose(config, models, health, 10)?.model.id).toBe("one");
   health.mark(models[0].model, classify(error("insufficient_quota"), now));
-  expect(choose(config, models, health, 10, 200_000)?.model.provider).toBe("b");
+  expect(choose(config, models, health, 10)?.model.provider).toBe("b");
   expect(classify(error('{"status":429,"scope":"provider","resetAt":2000000000000}'), now)).toMatchObject({ scope: "provider", delayMs: 900_000 });
   expect(classify(error('{"status":429,"resetAt":999999999999}'), now).delayMs).toBe(60_000);
   expect(classify(error('{"status":429,"retryAfterSeconds":-1}'), now).delayMs).toBe(1000);
@@ -61,13 +61,16 @@ test("model cooldown isolates siblings; provider cooldown suppresses siblings; e
   expect(health.eligible(models[0].model)).toBe(true);
 });
 
-test("configured and persisted capacity floors plus output reserve exclude undersized models", () => {
+test("the route's declared capacity and this request's need exclude undersized models", () => {
   const health = new Health();
-  expect(choose(config, models, health, 10, 400_000)).toBeUndefined();
-  expect(choose(config, models, health, 299_999, 200_000)).toBeUndefined();
-  expect(choose(config, models, health, 10, 200_000, "b/one")?.model.provider).toBe("b");
+  // A route declaring more capacity than its candidates provide has no dispatchable target.
+  const wide = parseConfig({ routes: { work: { contextWindow: 400_000, candidates: [{ provider: "a", id: "one" }] } } }).routes.work;
+  expect(choose(wide, models, health, 10)).toBeUndefined();
+  // This request alone needs more room than a 300k window with a 16k output reserve leaves.
+  expect(choose(config, models, health, 299_999)).toBeUndefined();
+  expect(choose(config, models, health, 10, "b/one")?.model.provider).toBe("b");
   const changed = models.filter(c => c.model.provider !== "b");
-  expect(choose(config, changed, health, 10, 200_000, "b/one")?.model.provider).toBe("a");
+  expect(choose(config, changed, health, 10, "b/one")?.model.provider).toBe("a");
 });
 
 test("cache TTL uses successful activity epoch, exact threshold, consumption, identity and rollback", () => {
@@ -82,11 +85,13 @@ test("cache TTL uses successful activity epoch, exact threshold, consumption, id
   expect(cacheExpiry(activity, "route/work", "a/one", 100, 999)).toBe(false);
 });
 
-test("branch state is JSON-serializable and malformed versions are not trusted", () => {
-  const state = { version: 1 as const, physical: "a/one", floor: 300_000, turn: "turn", retries: 1, transitions: 2, recoveries: 1 };
+test("branch state is JSON-serializable, malformed versions are not trusted, and a legacy floor is ignored", () => {
+  const state = { version: 1 as const, physical: "a/one", turn: "turn", retries: 1, transitions: 2, recoveries: 1 };
   expect(restore(JSON.parse(JSON.stringify(state)))).toEqual(state);
   expect(restore({ ...state, version: 2 })).toBeUndefined();
-  expect(restore({ ...state, floor: undefined })).toBeUndefined();
+  expect(restore({ ...state, retries: -1 })).toBeUndefined();
+  // State written before the capacity floor was removed still decodes; the extra field is ignored.
+  expect(restore({ ...state, floor: 300_000 })).toMatchObject(state);
 });
 
 test("named accounts are validated and cooldowns isolate accounts of the same provider", () => {

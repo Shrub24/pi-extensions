@@ -24,7 +24,7 @@ The adapter refuses aborts, partial text/thinking, tool/deferred content, malfor
 
 Routing sees canonical projection **before** Magic Context/other extension transformations. Final effective messages do not exist at route time. Late context/provider hooks swallow exceptions (`extensions/runner.js:1052-1060`, `1081+`), so a throwing guard there cannot reliably prevent dispatch. There is no public re-route-after-transform return field.
 
-Owner explicitly approved proceeding **without a host patch**: use conservative canonical/latest-successful-usage estimates plus output reserve and initial logical capacity; persist a non-decreasing capacity floor at least as large as each dispatched physical window. Reject smaller-window automatic fallback even when an estimate says it fits. Reserve uses the greater of configured reserve and candidate maximum output. This is capacity preservation, **not a hard final-token guarantee**. Design/spec/README record the approved limitation. A late-preparation/re-route seam is deferred.
+Owner explicitly approved proceeding **without a host patch**: use conservative canonical/latest-successful-usage estimates plus output reserve and initial logical capacity. Superseded revision: the original v0.1 rule persisted a non-decreasing capacity floor at least as large as each dispatched physical window and rejected smaller-window automatic fallback. Live testing showed that floor prevented failover entirely whenever a route's first candidate had the largest window, and that it leaked another route's window into a route being switched to. The floor is removed: candidates must now honour the route's configured capacity and fit this request, and no capacity is carried across a model switch. Reserve uses the greater of configured reserve and candidate maximum output. This is capacity preservation, **not a hard final-token guarantee**. Design/spec/README record the approved limitation. A late-preparation/re-route seam is deferred.
 
 ## Flush proof and its limits
 
@@ -64,7 +64,7 @@ Tasks 3.2/4.2 are closed for the owner-accepted **scoped pending-transform claim
 
 ## Decisions to record (owner lands durable why)
 
-1. Approved conservative v0.1 capacity floor rather than shrinking models or patching host late preparation: route precedes final context; revisit when a supported late preparation/re-route API exists.
+1. Approved conservative v0.1 capacity floor rather than shrinking models or patching host late preparation: route precedes final context; revisit when a supported late preparation/re-route API exists. Revisited during live verification: the persisted floor was removed in favour of route-declared capacity plus this request's fit, because it blocked failover and leaked across routes.
 2. User-only extension-manager configuration rather than project override: project checkouts must not silently redirect paid requests. Revisit with an independently reusable trusted-project settings surface.
 3. Pending drop/history flush visibility is separated from next-turn system adjunct refresh; no synthetic user message or manual before_agent_start is injected to force adjunct rereads on retries.
 

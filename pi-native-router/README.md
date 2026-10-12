@@ -146,17 +146,19 @@ Switching model does not count as a choice: a physical model's own thinking leve
 
 Each change of physical target is appended to `$PI_CODING_AGENT_DIR/pi-native-router/decisions.jsonl` (default `~/.pi/agent/...`, mode `0600`), one JSON object per line:
 
-`{"at","session","logical","previous?","physical","account?","reason","contextTokens?","floor?"}`
+`{"at","session","logical","previous?","physical","account?","reason","contextTokens?","requiredContext?"}` (`requiredContext` is the minimum window a candidate had to provide: the route's capacity or this request's need)
 
 `reason` is `initial` (first selection), `failover` (after a failed request), or `sticky` (any other change). The log holds identities and reasons only, never keys, prompts or responses. Logging is best-effort and never affects dispatch. Read it with `jq`, for example `jq -c 'select(.reason=="failover")' decisions.jsonl`.
 
 ## Stickiness and capacity
 
-JSON branch state persists the last dispatched identity, non-decreasing context-window floor and bounded turn-recovery bookkeeping. Restore, fork and compaction retain it. Healthy user turns and tool continuations stay on the physical model; successful failover stays there rather than automatically returning to the first candidate. Candidate/config/catalog changes reconcile against the current registry while retaining the floor. Per-turn counters reset when a new real user transcript entry appears, not at native `agent_start` retry boundaries.
+JSON branch state persists the last dispatched identity and bounded turn-recovery bookkeeping. Restore, fork and compaction retain it. Healthy user turns and tool continuations stay on the physical model; successful failover stays there rather than automatically returning to the first candidate. Candidate/config/catalog changes reconcile against the current registry. Per-turn counters reset when a new real user transcript entry appears, not at native `agent_start` retry boundaries.
 
 Direct registry requests select deterministically from current candidates/health without reading or writing session state, triggering flushes or consuming session recovery budgets. Local health can exclude candidates for direct calls, but direct calls do not update it.
 
-**v0.1 never automatically falls back to a smaller context window.** Initial selection honors configured logical capacity and conservative canonical/latest-successful-usage estimates. Subsequent selection also honors the stored physical capacity floor, including after restore/config changes. Reserve is the greater of configured output reserve and the candidate's maximum output; a candidate must support the configured output reserve. Pi routes *before* extension context preparation, so final effective tokens (including refreshed Magic Context additions) are unavailable. These estimates are not a hard final-token guarantee; preserving capacity prevents failover itself from shrinking the window. No host patch is required for this conservative rule.
+**A candidate must honour the route's declared capacity, and this request must fit.** The route's configured `contextWindow` is the capacity it advertises to Pi, so every candidate needs at least that window. The request additionally has to fit the conservative canonical/latest-successful-usage estimate plus the reserve, where the reserve is the greater of the configured output reserve and the candidate's maximum output, and the candidate must support the configured output reserve.
+
+Nothing is carried across a model switch: switching roles or candidates never raises or lowers the requirement, so a fallback may use a smaller window than the model it replaces whenever the conversation fits and the route's capacity is honoured. Capacity therefore never becomes a reason a route cannot fail over, and one large candidate cannot pin a route to itself. Pi routes *before* extension context preparation, so final effective tokens (including refreshed Magic Context additions) are unavailable; these estimates are not a hard final-token guarantee.
 
 ## Failure policy
 
@@ -200,6 +202,6 @@ bun run typecheck
 bun test tests
 ```
 
-Tests use actual Pi 1.1.0 AgentSession/ModelRuntime with deterministic fake providers, including terminal quota recovery, native transient retry, tool continuation/no replay, flush failure/timeout/abort, capacity floors, JSON branch restore/fork/compaction, direct isolation and package entry loading. The host materialization fixture models MC's public pending-flag protocol and asserts provider-visible transformed messages, not merely event ordering. Complementary peer-owned actual `executeCtxFlush`/registered context-handler tests pass (154 tests in MC's context-handler.test.ts), proving pending drop/history materialization independently. Together these establish the scoped flush claim; **they are not a single-process deployed-plugin end-to-end smoke**. Deployment/live credentials have not been activated or tested.
+Tests use actual Pi 1.1.0 AgentSession/ModelRuntime with deterministic fake providers, including terminal quota recovery, native transient retry, tool continuation/no replay, flush failure/timeout/abort, capacity requirements, JSON branch restore/fork/compaction, direct isolation and package entry loading. The host materialization fixture models MC's public pending-flag protocol and asserts provider-visible transformed messages, not merely event ordering. Complementary peer-owned actual `executeCtxFlush`/registered context-handler tests pass (154 tests in MC's context-handler.test.ts), proving pending drop/history materialization independently. Together these establish the scoped flush claim; **they are not a single-process deployed-plugin end-to-end smoke**. Deployment/live credentials have not been activated or tested.
 
 Deferred: final-effective-context late preparation/re-route host seam, correlated MC requests, provider/account-specific health granularity. Rollback: unload this package and select a physical model directly; credentials are unchanged.

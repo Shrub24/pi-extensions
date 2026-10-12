@@ -17,7 +17,8 @@ export interface DecisionEntry {
   account?: string;
   reason: DecisionReason;
   contextTokens?: number;
-  floor?: number;
+  /** Minimum context window a candidate had to provide for this dispatch: the route's capacity or this request's need. */
+  requiredContext?: number;
 }
 
 export function defaultDecisionLogPath(): string {

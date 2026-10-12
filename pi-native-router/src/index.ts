@@ -16,7 +16,7 @@ import { codexbarConfigPath, generateCodexbarConfig, readCodexbarConfig, writeCo
 import { defaultPricingPath, loadSnapshot, refreshSnapshot, saveSnapshot } from "./pricing/cache";
 import { lookup } from "./pricing/catalog";
 import { applyPeak, backfillCost, type CostUsage } from "./pricing/reconcile";
-import { accountOf, admissionKeys, cacheExpiry, choose, classify, clampLevel, Health, identity, observe, partialOutput, physicalOf, restore, THINKING_ORDER, type Resolved, type State } from "./policy";
+import { accountOf, admissionKeys, cacheExpiry, choose, classify, clampLevel, Health, identity, observe, partialOutput, physicalOf, requiredContext, restore, THINKING_ORDER, type Resolved, type State } from "./policy";
 import { beforeTransition, flushBridge, type FlushHook, type TransitionHook } from "./transition";
 
 function tokens(messages: readonly Message[]): number {
@@ -131,7 +131,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       const candidates = available(route, ctx, config.accounts);
       const estimate = Math.max(tokens(request.messages), request.reason === "direct" ? 0 : ctx.getContextUsage()?.tokens ?? 0);
       if (request.reason === "direct") {
-        const selected = choose(route, await activeOnly(candidates, ctx, config.accounts), health, estimate, route.contextWindow);
+        const selected = choose(route, await activeOnly(candidates, ctx, config.accounts), health, estimate);
         if (!selected) throw exhausted(role, route, ctx);
         return { model: selected.model, thinkingLevel: selected.candidate.thinkingLevel };
       }
@@ -141,14 +141,9 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       const activity = activities.get(activityKey) ?? persisted?.cacheActivity ?? old?.cacheActivity;
       if (old && activity) old.cacheActivity = activity;
       const turn = turnKey(ctx);
-      const state: State = old ? { ...old } : { version: 1, physical: "", floor: route.contextWindow, turn, retries: 0, transitions: 0, recoveries: 0 };
+      const state: State = old ? { ...old } : { version: 1, physical: "", turn, retries: 0, transitions: 0, recoveries: 0 };
       if (activity) state.cacheActivity = activity;
       if (state.turn !== turn) Object.assign(state, { turn, retries: 0, transitions: 0, recoveries: 0, next: undefined });
-      // `request.previous` is the conversation's latest response, whichever route produced it. Only a model this
-      // route could itself select may raise the floor: a switch from another route must not impose its window.
-      const previousInRoute = request.previous !== undefined
-        && route.candidates.some(c => c.provider === request.previous!.model.provider && c.id === request.previous!.model.id);
-      state.floor = Math.max(state.floor, previousInRoute ? request.previous!.model.contextWindow : 0);
       let exclude: string | undefined;
       if (admissions.has(activityKey)) settleAdmission(activityKey, { recovered: false });
       if (request.failed) {
@@ -171,7 +166,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       const skipped = new Set<string>(exclude ? [exclude] : []);
       let selected: Resolved | undefined;
       for (;;) {
-        selected = choose(route, candidates, health, estimate, state.floor, state.next ?? state.physical, skipped);
+        selected = choose(route, candidates, health, estimate, state.next ?? state.physical, skipped);
         if (!selected) break;
         const target = identity(selected.model, selected.candidate.account);
         if (!store) break;
@@ -202,7 +197,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
           if (skipped.has(target)) return `${target}: skipped after a refused probe lease or a failed activation`;
           const blocked = health.blockedReason(model, candidate.account);
           if (blocked) return `${target}: ${blocked.kind} cooldown until ${new Date(blocked.until).toISOString()}`;
-          const needed = Math.max(route.contextWindow, state.floor, estimate + Math.max(route.outputReserve, model.maxTokens));
+          const needed = requiredContext(route, model, estimate);
           return `${target}: needs ${needed} context tokens (window ${model.contextWindow}, max output ${model.maxTokens})`;
         });
         throw new Error(`Native route/${role} exhausted: no dispatchable candidate. ${detail.join("; ")}`);
@@ -211,7 +206,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       const account = selected.candidate.account === undefined ? undefined : config.accounts[selected.candidate.account];
       if (state.physical !== physical) {
         const reason: DecisionReason = !old || !state.physical ? "initial" : request.failed ? "failover" : "sticky";
-        recordDecision(decisionLogPath, { at: new Date(options.now?.() ?? Date.now()).toISOString(), session: ctx.sessionManager.getSessionId(), logical: `route/${role}`, ...(state.physical ? { previous: state.physical } : {}), physical, ...(selected.candidate.account ? { account: selected.candidate.account } : {}), reason, contextTokens: estimate, floor: state.floor }, degrade);
+        recordDecision(decisionLogPath, { at: new Date(options.now?.() ?? Date.now()).toISOString(), session: ctx.sessionManager.getSessionId(), logical: `route/${role}`, ...(state.physical ? { previous: state.physical } : {}), physical, ...(selected.candidate.account ? { account: selected.candidate.account } : {}), reason, contextTokens: estimate, requiredContext: requiredContext(route, selected.model, estimate) }, degrade);
       }
       const now = options.now?.() ?? Date.now();
       const logical = `route/${role}`;
@@ -251,7 +246,6 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
         pi.events.emit("native-router:account-active", { provider: selected.candidate.provider, account: selected.candidate.account });
       }
       state.physical = physical;
-      state.floor = Math.max(state.floor, selected.model.contextWindow);
       delete state.next;
       const unchanged = old && JSON.stringify(old) === JSON.stringify(state);
       // An explicit user choice on this route overrides the candidate default; reasoning-less models keep theirs.
@@ -471,7 +465,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     settleAdmission(`${ctx.sessionManager.getSessionId()}:${role}`, { recovered: false });
     if (observed.kind !== "unsafe") health.mark(failed, observed, accountOf(state.physical));
     if (failure.kind === "unsafe") return;
-    const selected = choose(route, available(route, ctx, config.accounts), health, Math.max(tokens(event.context.llmMessages), ctx.getContextUsage()?.tokens ?? 0), state.floor, undefined, state.physical);
+    const selected = choose(route, available(route, ctx, config.accounts), health, Math.max(tokens(event.context.llmMessages), ctx.getContextUsage()?.tokens ?? 0), undefined, state.physical);
     if (!selected) return;
     const before = event.context.contextMessages.slice(0, -1);
     if (!before.some(m => m.role !== "system") || before.at(-1)?.role === "assistant") return;

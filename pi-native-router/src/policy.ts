@@ -108,7 +108,6 @@ export interface CacheActivity { logical: string; physical: string; at: number; 
 export interface State {
   version: 1;
   physical: string;
-  floor: number;
   turn: string;
   retries: number;
   transitions: number;
@@ -120,7 +119,8 @@ export function restore(raw: unknown): State | undefined {
   if (!raw || typeof raw !== "object") return;
   const s = raw as State;
   if (s.version !== 1 || typeof s.physical !== "string" || typeof s.turn !== "string" || (s.next !== undefined && typeof s.next !== "string")) return;
-  if (![s.floor, s.retries, s.transitions, s.recoveries].every(n => Number.isSafeInteger(n) && n >= 0) || s.floor < 1) return;
+  // Entries written before the capacity floor was removed still carry it; unknown fields are ignored.
+  if (![s.retries, s.transitions, s.recoveries].every(n => Number.isSafeInteger(n) && n >= 0)) return;
   if (s.cacheActivity !== undefined) {
     const activity = s.cacheActivity;
     if (!activity || typeof activity.logical !== "string" || !activity.logical || typeof activity.physical !== "string" || !activity.physical || !Number.isSafeInteger(activity.at) || activity.at < 0 || (activity.consumedAt !== undefined && (!Number.isSafeInteger(activity.consumedAt) || activity.consumedAt < activity.at))) return;
@@ -131,9 +131,17 @@ export function cacheExpiry(activity: CacheActivity | undefined, logical: string
   return ttl !== undefined && activity?.logical === logical && activity.physical === physical && activity.consumedAt !== activity.at && now >= activity.at && now - activity.at >= ttl;
 }
 export interface Resolved { candidate: Candidate; model: Model<Api> }
-export function choose(route: RouteConfig, available: Resolved[], health: Health, tokens: number, floor: number, preferred?: string, exclude?: string | ReadonlySet<string>): Resolved | undefined {
+/**
+ * The minimum context window a candidate must provide for this dispatch: the route's declared capacity, or
+ * this request's needs. The route's own `contextWindow` is the capacity it advertises, so every candidate
+ * must be able to honour it. Nothing here is carried across a virtual-model switch.
+ */
+export function requiredContext(route: RouteConfig, model: { maxTokens: number }, tokens: number): number {
+  return Math.max(route.contextWindow, tokens + Math.max(route.outputReserve, model.maxTokens));
+}
+export function choose(route: RouteConfig, available: Resolved[], health: Health, tokens: number, preferred?: string, exclude?: string | ReadonlySet<string>): Resolved | undefined {
   const excluded = (id: string) => typeof exclude === "string" ? exclude === id : exclude?.has(id) ?? false;
-  const usable = available.filter(({ model, candidate }) => !excluded(identity(model, candidate.account)) && health.eligible(model, candidate.account) && model.contextWindow >= Math.max(route.contextWindow, floor, tokens + Math.max(route.outputReserve, model.maxTokens)) && model.maxTokens >= route.outputReserve);
+  const usable = available.filter(({ model, candidate }) => !excluded(identity(model, candidate.account)) && health.eligible(model, candidate.account) && model.contextWindow >= requiredContext(route, model, tokens) && model.maxTokens >= route.outputReserve);
   return usable.find(c => identity(c.model, c.candidate.account) === preferred) ?? usable[0];
 }
 

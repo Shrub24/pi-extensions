@@ -18,7 +18,7 @@ type Routing = { accounts: string[]; candidates: Array<{ provider: string; accou
 /** Synthetic env name for a test account; keys are set by each test and never printed. */
 const accountEnv = (id: string) => `NATIVE_ROUTER_TEST_KEY_${id.replace(/-/g, "_").toUpperCase()}`;
 type Outcome = "ok" | "quota" | "transient" | "partial" | "abort" | "tool" | "bad" | 401 | 403 | 429;
-async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateThinking?: "off" | "low" | "medium" | "high"; retry?: boolean; flush?: "failed" | "absent"; maxRecoveries?: number; maxTransitions?: number; smaller?: boolean; manager?: SessionManager; packaged?: boolean; unauthedFirst?: boolean; ttl?: number; startTime?: number; clock?: { value: number }; accounts?: boolean; healthPath?: string; routing?: Routing; runtimeKeys?: "absent" | "inert"; wide?: boolean } = {}) {
+async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateThinking?: "off" | "low" | "medium" | "high"; retry?: boolean; flush?: "failed" | "absent"; maxRecoveries?: number; maxTransitions?: number; smaller?: number; manager?: SessionManager; packaged?: boolean; unauthedFirst?: boolean; ttl?: number; startTime?: number; clock?: { value: number }; accounts?: boolean; healthPath?: string; routing?: Routing; runtimeKeys?: "absent" | "inert"; wide?: boolean } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "native-router-"));
   const settings = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: opts.retry ?? false, maxRetries: 3, baseDelayMs: 1 }, cacheWarming: "off" });
   const runtime = await ModelRuntime.create({ authPath: join(dir, "auth.json"), modelsPath: null, refreshOnCreate: false });
@@ -34,7 +34,7 @@ async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateT
   let api: ExtensionAPI;
   const usage = { input: 10, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 11, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
   // `fake-d/wide` is registered but belongs to no route: it stands in for a model from another route.
-  const providers = [["fake-a", 300_000], ["fake-b", opts.smaller ? 200_000 : 300_000], ["fake-c", 300_000], ...(opts.wide ? [["fake-d", 1_000_000] as const] : [])] as const;
+  const providers = [["fake-a", 300_000], ["fake-b", opts.smaller ?? 300_000], ["fake-c", 300_000], ...(opts.wide ? [["fake-d", 1_000_000] as const] : [])] as const;
   for (const [provider, window] of providers) {
     runtime.registerProvider(provider, {
       api: "openai-completions", baseUrl: "https://unused.invalid", apiKey: opts.routing ? (opts.routing.candidates.some(c => c.provider === provider && c.account === undefined) ? "fake-test-key" : undefined) : opts.accounts ? undefined : opts.unauthedFirst && provider === "fake-a" ? undefined : "fake-test-key",
@@ -259,7 +259,7 @@ for (const flush of ["failed", "absent"] as const) test(`flush ${flush} blocks r
   } finally { h.close(); }
 });
 
-test("a model from another route does not raise this route's capacity floor", async () => {
+test("a model from another route does not change this route's capacity requirement", async () => {
   const h = await host(["ok"], { wide: true });
   try {
     // The conversation's latest successful response came from a 1M-window model that is not a worker candidate.
@@ -273,8 +273,14 @@ test("a model from another route does not raise this route's capacity floor", as
   } finally { h.close(); }
 });
 
-test("smaller fallback is skipped even when small request would fit", async () => {
-  const h = await host(["quota", "ok"], { smaller: true });
+test("a fallback that still honours the route's declared capacity is used", async () => {
+  const h = await host(["quota", "ok"], { smaller: 200_000 });
+  try { await h.session.prompt("tiny"); expect(h.dispatches.map(d => d.physical)).toEqual(["fake-a", "fake-b"]); }
+  finally { h.close(); }
+});
+
+test("a candidate below the route's declared capacity is never selected", async () => {
+  const h = await host(["quota", "ok"], { smaller: 100_000 });
   try { await h.session.prompt("tiny"); expect(h.dispatches.map(d => d.physical)).toEqual(["fake-a", "fake-c"]); }
   finally { h.close(); }
 });
@@ -297,7 +303,7 @@ test("restored branch retains expired cache age and consumed epoch", async () =>
   } finally { first.close(); }
 });
 
-test("branch restore/fork retains fallback and capacity floor in a fresh adapter process", async () => {
+test("branch restore/fork retains the fallback selection in a fresh adapter process", async () => {
   const first = await host(["quota", "ok"]);
   try {
     await first.session.prompt("parent");
@@ -322,12 +328,12 @@ test("native direct routing does not change branch state or trigger session flus
   } finally { h.close(); }
 });
 
-test("compaction and changed physical limits preserve the branch capacity floor", async () => {
+test("compaction and a changed provider window keep the route capacity requirement", async () => {
   const first = await host(["quota", "ok"]);
   try {
     await first.session.prompt("parent");
     first.manager.appendCompaction("summary", null, 10);
-    const second = await host(["ok"], { manager: SessionManager.inMemory(process.cwd(), undefined, JSON.parse(JSON.stringify([first.manager.getHeader(), ...first.manager.getBranch()]))), smaller: true });
+    const second = await host(["ok"], { manager: SessionManager.inMemory(process.cwd(), undefined, JSON.parse(JSON.stringify([first.manager.getHeader(), ...first.manager.getBranch()]))), smaller: 100_000 });
     try { await second.session.prompt("after compaction and catalog change"); expect(second.dispatches.map(d => d.physical)).toEqual(["fake-a"]); }
     finally { second.close(); }
   } finally { first.close(); }
