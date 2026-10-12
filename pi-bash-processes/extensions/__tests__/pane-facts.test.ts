@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import {
 	MAX_LISTED_TASKS,
+	blockingTaskCount,
 	createPaneFactsPublisher,
 	emptyPaneFacts,
 	factValue,
@@ -140,4 +141,21 @@ test("an announced, unassociated result is history, not outstanding work", () =>
 	expect(paneFacts([{ ...done, exitNotified: false }]).pi_bg_tasks).toBe("bg-1:review");
 	expect(paneFacts([{ ...done, assignmentRequestId: "req-1" }]).pi_bg_tasks).toBe("bg-1:review");
 	expect(paneFacts([{ ...done, assignmentRequestId: "req-1", resultResolution: "delivered" }])).toEqual(emptyPaneFacts());
+});
+
+test("an exit-notified, unassigned capture still blocks unless its result is certified", () => {
+	const notified = { ...task("bg-1", 1_000, "completed"), exitNotified: true };
+	expect(paneFacts([notified]), "unresolvedTasks still excludes it: the listing is unchanged").toEqual(emptyPaneFacts());
+	expect(blockingTaskCount([{ ...notified, restored: true }])).toBe(1);
+	expect(blockingTaskCount([{ ...notified, resultReady: true }])).toBe(0);
+});
+
+test("a certified unread result is advisory; unfinished or uncertified captures block", () => {
+	const completed = { ...task("bg-1", 1_000, "completed"), exitNotified: false };
+	expect(blockingTaskCount([task("bg-1", 1_000)])).toBe(1);
+	expect(blockingTaskCount([completed])).toBe(1);
+	expect(blockingTaskCount([{ ...completed, resultReady: true }])).toBe(0);
+	expect(blockingTaskCount([{ ...completed, restored: true }])).toBe(1);
+	expect(blockingTaskCount([{ ...completed, resultReady: true, resultResolution: "delivered" }])).toBe(0);
+	expect(blockingTaskCount([task("bg-2", 2_000), { ...completed, resultReady: true }])).toBe(1);
 });

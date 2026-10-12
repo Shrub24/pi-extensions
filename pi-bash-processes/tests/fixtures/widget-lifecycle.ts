@@ -2,7 +2,7 @@ import { mock } from "bun:test";
 import assert from "node:assert/strict";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import { createEventBus, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
 import type { BackgroundTaskSnapshot } from "../../extensions/types.js";
 import type { TUI } from "@earendil-works/pi-tui";
 import type { MiniDashboardComponent, MiniDashboardFactory } from "../../extensions/stacked-widget.js";
@@ -67,6 +67,7 @@ function createSession(completed: boolean) {
 	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => unknown>();
 	const shortcuts = new Map<string, { handler: (ctx: ExtensionContext) => unknown }>();
 	const pi = {
+		events: createEventBus(),
 		on: (event: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) => handlers.set(event, handler),
 		registerShortcut: (key: string, definition: { handler: (ctx: ExtensionContext) => unknown }) => shortcuts.set(key, definition),
 		registerTool() {}, registerCommand() {}, registerMessageRenderer() {}, appendEntry() {},

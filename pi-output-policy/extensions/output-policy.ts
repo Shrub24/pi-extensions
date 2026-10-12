@@ -2,13 +2,14 @@ import type { ExtensionAPI, ExtensionContext, ToolResultEventResult } from "@ear
 import { randomUUID } from "node:crypto";
 import { type FileHandle, open, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { openLaneDir, pruneLanes } from "../scripts/lane-retention.js";
-import { installSettingsCacheRefresh, piUserDir, readPackageConfig, recordProjectTrust } from "./package-config.js";
+import { expandHome, installSettingsCacheRefresh, piUserDir, readPackageConfig, recordProjectTrust } from "./package-config.js";
 
 const INSTALL_SYMBOL = Symbol.for("kendex.pi-output-policy.installed");
 const CONFIG_ID = "@vanillagreen/pi-output-policy";
+const BACKGROUND_TASKS_CONFIG_ID = "@vanillagreen/pi-background-tasks";
 const DEFAULT_MINIMIZER_MAX_CAPTURE_BYTES = 1024 * 1024;
 const DEFAULT_SHELL_MINIMIZER_ENABLED = true;
 const DEFAULT_MODEL_OUTPUT_MAX_CHARS = 96_000;
@@ -360,6 +361,29 @@ function formatSize(bytes: number): string {
 function isReadTool(toolName: string): boolean {
 	const name = toolName.toLowerCase();
 	return name === "read" || name.endsWith(".read");
+}
+
+// Reads of loaded skills and of full output the model must see whole are never
+// truncated again: skill files, this policy's artifacts, and background-task lanes.
+function isProtectedRead(event: any, ctx: ExtensionContext, skillDirs: readonly string[]): boolean {
+	const filePath = event.input?.path;
+	if (typeof filePath !== "string") return false;
+	const absolutePath = resolve(ctx.cwd, filePath);
+	const session = safeFileName(sessionIdForContext(ctx));
+	const protectedDirs = [...skillDirs, artifactDir(ctx), join(tmpdir(), "pi-output-policy", session), backgroundTaskLanesRoot(ctx.cwd)];
+	return protectedDirs.some((dir) => isWithin(dir, absolutePath));
+}
+
+function isWithin(dir: string, path: string): boolean {
+	const fromDir = relative(resolve(dir), path);
+	return fromDir === "" || (fromDir !== ".." && !fromDir.startsWith(`..${sep}`) && !isAbsolute(fromDir));
+}
+
+// Mirrors pi-bash-processes' taskDir() resolution so its lanes can be recognised.
+function backgroundTaskLanesRoot(cwd: string): string {
+	const configured = configString(readPackageConfig(BACKGROUND_TASKS_CONFIG_ID, cwd) as kendexConfig, "taskDir", "");
+	const taskDir = process.env.PI_BG_TASK_DIR?.trim() || (configured ? resolve(expandHome(configured)) : join(tmpdir(), "kendex-pi-bg"));
+	return join(taskDir, "lanes");
 }
 
 function isMutationTool(toolName: string): boolean {
@@ -968,6 +992,8 @@ export default function outputPolicy(pi: ExtensionAPI): void {
 	// replacement ExtensionAPI/factory closure, so this state cannot cross session runtimes.
 	let modelOutputState = createModelOutputGuardState();
 	let modelOutputConfig: ModelOutputGuardConfigSnapshot | undefined;
+	// Skill base directories Pi loaded for the current run, from systemPromptOptions.
+	let loadedSkillDirs: string[] = [];
 
 	const resetModelOutputState = () => {
 		modelOutputState = createModelOutputGuardState();
@@ -983,6 +1009,7 @@ export default function outputPolicy(pi: ExtensionAPI): void {
 	installSettingsCacheRefresh(pi);
 	pi.on("session_start", async (_event, ctx: ExtensionContext) => {
 		resetModelOutputState();
+		loadedSkillDirs = [];
 		recordProjectTrust(ctx);
 		SESSION_COUNTERS.delete(sessionIdForContext(ctx));
 		for (const [root, below] of [
@@ -994,6 +1021,11 @@ export default function outputPolicy(pi: ExtensionAPI): void {
 				console.warn(policyNotice("artifact-prune-error", failure.path, failure.error));
 			}
 		}
+	});
+
+	pi.on("before_agent_start", (event: any) => {
+		const skills: unknown[] = event?.systemPromptOptions?.skills ?? [];
+		loadedSkillDirs = skills.flatMap((skill: any) => (typeof skill?.baseDir === "string" ? [resolve(skill.baseDir)] : []));
 	});
 
 	pi.on("turn_start", async (_event, ctx: ExtensionContext) => {
@@ -1043,6 +1075,7 @@ export default function outputPolicy(pi: ExtensionAPI): void {
 		if (!configBoolean(config, "enabled", true)) return undefined;
 		const toolName = String(event.toolName ?? "tool");
 		if (shouldBypassTool(toolName, config)) return undefined;
+		if (isReadTool(toolName) && isProtectedRead(event, ctx, loadedSkillDirs)) return undefined;
 		const processed = await processContent(event, ctx, event.content ?? [], config);
 		const mode = policyModeFrom(config);
 		const sanitizeOn = configBoolean(config, "sanitizeDetails", MODE_DEFAULTS[mode].sanitizeDetails);

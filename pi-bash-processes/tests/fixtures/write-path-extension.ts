@@ -1,5 +1,5 @@
 import { mock } from "bun:test";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { createEventBus, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fixturePid, interceptNativeEffects } from "./spawn-native.js";
@@ -90,6 +90,7 @@ const ctx = {
 	},
 } as unknown as ExtensionContext;
 const pi = {
+	events: createEventBus(),
 	registerTool(tool: Tool) { tools.set(tool.name, tool); },
 	registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {},
 	on(event: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) { events.set(event, handler); },

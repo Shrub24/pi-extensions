@@ -74,6 +74,15 @@ export function unresolvedTasks<T extends PaneFactTask>(tasks: readonly T[]): T[
 	);
 }
 
+/**
+ * How many of this session's tasks it is blocked on. A certified terminal
+ * result is advisory until it is retrieved, so it does not count; running,
+ * finalizing and uncertified captures do.
+ */
+export function blockingTaskCount(tasks: readonly PaneFactTask[]): number {
+	return tasks.filter((task) => !resultIsResolved(task) && taskReadiness(task) !== "terminal").length;
+}
+
 /** The three-word vocabulary shared by `pi_bg_tasks` and the Radar bus. */
 export function taskPhase(task: PaneFactTask): TaskPhase {
 	const readiness = taskReadiness(task);

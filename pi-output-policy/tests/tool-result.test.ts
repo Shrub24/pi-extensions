@@ -1,4 +1,5 @@
 import { expect, test, beforeEach } from "bun:test";
+import { join } from "node:path";
 import outputPolicy, { __resetSessionCountersForTests, minimizeShellOutput } from "../extensions/output-policy.ts";
 import { withConfigAsync, fakeCtx, createFakePi } from "./fixtures.ts";
 
@@ -31,6 +32,36 @@ test("tool-result detail sanitization", async () => {
 			}
 		});
 	}
+});
+
+test("loaded skill, policy artifact and background-task reads bypass read truncation", async () => {
+	await withConfigAsync({ truncateReadOutputs: true }, async (cwd) => {
+		const previousTaskDir = process.env.PI_BG_TASK_DIR;
+		process.env.PI_BG_TASK_DIR = join(cwd, "bg");
+		try {
+			const fake = createFakePi();
+			outputPolicy(fake.pi);
+			const ctx = fakeCtx(cwd);
+			const skillDir = join(cwd, "skills", "loaded");
+			await fake.fire("before_agent_start", { systemPromptOptions: { skills: [{ name: "loaded", description: "d", filePath: join(skillDir, "SKILL.md"), baseDir: skillDir }] } }, ctx);
+			const huge = "full output ".repeat(8_000);
+			const truncated = await fake.fire("tool_result", { toolName: "grep", toolCallId: "source", input: {}, content: [{ type: "text", text: huge }], details: {}, isError: false }, ctx);
+			const artifactPath = truncated!.details.kendexOutputPolicy[0].artifactPath;
+			expect(artifactPath).toBeString();
+
+			for (const path of [artifactPath, join(skillDir, "SKILL.md"), join(skillDir, "references", "forms.md"), join(cwd, "bg", "lanes", "task.log")]) {
+				const result = await fake.fire("tool_result", { toolName: "read", toolCallId: "read-protected", input: { path }, content: [{ type: "text", text: huge }], details: {}, isError: false }, ctx);
+				expect(result, path).toBeUndefined();
+			}
+
+			const unloaded = join(cwd, "skills", "unloaded", "SKILL.md");
+			const result = await fake.fire("tool_result", { toolName: "read", toolCallId: "read-unloaded", input: { path: unloaded }, content: [{ type: "text", text: huge }], details: {}, isError: false }, ctx);
+			expect(result?.details.kendexOutputPolicy?.[0].truncated, "a skill Pi did not load is still truncated").toBe(true);
+		} finally {
+			if (previousTaskDir === undefined) delete process.env.PI_BG_TASK_DIR;
+			else process.env.PI_BG_TASK_DIR = previousTaskDir;
+		}
+	});
 });
 
 test("truncated tool text carries metadata and its artifact path", async () => {

@@ -1,5 +1,5 @@
 import { mock } from "bun:test";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { createEventBus, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { join } from "node:path";
 
 // Runtime-degradation fixture: the optional managed-bash presentation module is
@@ -29,6 +29,7 @@ interface BashTool {
 
 const tools = new Map<string, unknown>();
 const pi = {
+	events: createEventBus(),
 	appendEntry() {}, registerCommand() {}, registerMessageRenderer() {}, registerShortcut() {},
 	registerTool(tool: unknown) { tools.set((tool as { name: string }).name, tool); },
 	on() {}, sendMessage() {},

@@ -37,6 +37,14 @@ export const BACKGROUND_WORK_REPLY_CHANNEL = "pi-background-work:v1:reply";
 /** Carries `changed` metadata: identity/revision scope only, never task data. */
 export const BACKGROUND_WORK_CHANGED_CHANNEL = "pi-background-work:v1:changed";
 
+/**
+ * Session-wide read of how many tasks this session is blocked on, for a status
+ * footer. The payload is `{ respond(count) }`, answered synchronously and never
+ * a mutation; a session with no answer (not yet restored, or no session) is
+ * unknown to the caller, not zero.
+ */
+export const SESSION_OUTSTANDING_CHANNEL = "pi-bash-processes:v1:session-outstanding";
+
 /** Upper bound for provider-supplied reason/message strings carried through results. */
 export const BACKGROUND_WORK_MAX_REASON_CHARS = 512;
 /** Upper bound on the outstanding-task list in one snapshot; beyond it the snapshot is rejected, never truncated. */

@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "skills": {
+    "latitude-artifacts": {
+      "source": "latitude-dev/skills",
+      "sourceType": "github",
+      "skillPath": "skills/latitude-artifacts/SKILL.md",
+      "computedHash": "7d3854d0ecbb4cf5591db8d00354ad4b44802ba52813d2454e7f89d6f7fcdc68"
+    },
+    "latitude-cli": {
+      "source": "latitude-dev/skills",
+      "sourceType": "github",
+      "skillPath": "skills/latitude-cli/SKILL.md",
+      "computedHash": "573d50cb2901e361b96fd531b98ef8d4f51adcc4baed5d537f1f3425eb0cc39f"
+    },
+    "latitude-telemetry": {
+      "source": "latitude-dev/skills",
+      "sourceType": "github",
+      "skillPath": "skills/latitude-telemetry/SKILL.md",
+      "computedHash": "2fe96e2b1b16870d6a06ecabd7300856c51c04aaf4b64677e68eadf6f3bc8982"
+    }
+  }
+}

@@ -1,0 +1,478 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Artifact title</title>
+    <link rel="preconnect" href="https://rsms.me/" />
+    <link rel="stylesheet" href="https://rsms.me/inter/inter.css" />
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+    <style>
+      /* Latitude design tokens (packages/ui/src/styles/globals.css). Keep the values; theme by toggling html.dark. */
+      :root {
+        --background: 0 0% 100%;
+        --foreground: 224 71.5% 4%;
+        --card: 0 0% 100%;
+        --card-foreground: 223 70% 4%;
+        --popover: 0 0% 100%;
+        --muted: 220 14% 96%;
+        --muted-foreground: 211 11% 45%;
+        --border: 0 0% 89.8%;
+        --primary: 210 100% 50%;
+        --primary-foreground: 210 20% 98%;
+        --primary-muted: 210 100% 96%;
+        --accent: 210 100% 97%;
+        --accent-foreground: 211 97% 35%;
+        --destructive: 0 72% 51%;
+        --destructive-muted: 0 93% 94%;
+        --destructive-muted-foreground: 0 74% 42%;
+        --success: 142 72% 29%;
+        --success-muted: 141 84% 93%;
+        --success-muted-foreground: 142 72% 29%;
+        --warning-muted: 48 96% 89%;
+        --warning-muted-foreground: 26 90% 37%;
+        --background-code: 0 0% 98%;
+        --radius: 0.5rem;
+        --shadow-card: 0px 1px 3px 0px hsl(0 0% 0% / 0.1), 0px 1px 2px -1px hsl(0 0% 0% / 0.1);
+        --series-1: oklch(70.7% 0.165 254.624);
+        --series-2: oklch(70.2% 0.183 293.541);
+        --series-3: oklch(74% 0.238 322.16);
+        --series-4: oklch(77.7% 0.152 181.912);
+        --series-5: oklch(82.8% 0.189 84.429);
+        --series-6: oklch(70.4% 0.191 22.216);
+        --series-7: oklch(74.6% 0.16 232.661);
+        --series-8: oklch(84.1% 0.238 128.85);
+        --series-positive: oklch(79.2% 0.209 151.711);
+        --series-negative: oklch(70.4% 0.191 22.216);
+        --series-other: oklch(70.7% 0.022 261.325);
+      }
+      html.dark {
+        --background: 0 0% 7%;
+        --foreground: 0 0% 98%;
+        --card: 0 0% 3.9%;
+        --card-foreground: 0 0% 98%;
+        --popover: 0 0% 13%;
+        --muted: 0 0% 14.9%;
+        --muted-foreground: 0 0% 63.9%;
+        --border: 231 9% 12.9%;
+        --primary: 211 94% 43%;
+        --primary-foreground: 210 20% 98%;
+        --primary-muted: 210 100% 12%;
+        --accent: 211 88% 10%;
+        --accent-foreground: 211 94% 65%;
+        --destructive: 0 72% 51%;
+        --destructive-muted: 0 75% 15%;
+        --destructive-muted-foreground: 0 75% 56%;
+        --success: 142 76% 36%;
+        --success-muted: 141 84% 10%;
+        --success-muted-foreground: 142 76% 36%;
+        --warning-muted: 48 100% 10%;
+        --warning-muted-foreground: 49 100% 36%;
+        --background-code: 0 0% 11%;
+        --shadow-card: 0px 2px 4px 0px hsl(0 0% 100% / 0.06), 0px 1px 3px -1px hsl(0 0% 100% / 0.04);
+        --series-1: oklch(54.6% 0.245 262.881);
+        --series-2: oklch(54.1% 0.281 293.009);
+        --series-3: oklch(59.1% 0.293 322.896);
+        --series-4: oklch(60% 0.118 184.704);
+        --series-5: oklch(66.6% 0.179 58.318);
+        --series-6: oklch(57.7% 0.245 27.325);
+        --series-7: oklch(58.8% 0.158 241.966);
+        --series-8: oklch(64.8% 0.2 131.684);
+        --series-positive: oklch(62.7% 0.194 149.214);
+        --series-negative: oklch(57.7% 0.245 27.325);
+        --series-other: oklch(44.6% 0.03 256.802);
+      }
+
+      * { box-sizing: border-box; border-color: hsl(var(--border)); }
+      html { font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; font-feature-settings: "rlig" 1, "calt" 1; }
+      body { margin: 0; background: hsl(var(--background)); color: hsl(var(--foreground)); font-size: 14px; line-height: 1.5; -webkit-font-smoothing: antialiased; }
+      code, .mono { font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 0.9em; }
+      a { color: hsl(var(--accent-foreground)); text-decoration: none; }
+      a:hover { text-decoration: underline; }
+
+      .page { max-width: 1200px; margin: 0 auto; padding: 32px 24px 64px; }
+      .header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 24px; }
+      .header h1 { font-size: 24px; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 4px; }
+      .header .subtitle { color: hsl(var(--muted-foreground)); margin: 0; }
+      .meta { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 10px; color: hsl(var(--muted-foreground)); font-size: 12px; }
+      .meta b { color: hsl(var(--foreground)); font-weight: 500; }
+
+      .theme-toggle { flex: none; display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 12px; border: 1px solid hsl(var(--border)); border-radius: calc(var(--radius) - 2px); background: hsl(var(--card)); color: hsl(var(--foreground)); font: inherit; font-size: 12px; cursor: pointer; }
+      .theme-toggle:hover { background: hsl(var(--muted)); }
+
+      .section { margin-top: 32px; }
+      .section > h2 { font-size: 16px; font-weight: 600; margin: 0 0 4px; }
+      .section > p.lead { margin: 0 0 16px; color: hsl(var(--muted-foreground)); }
+
+      .grid { display: grid; gap: 16px; grid-template-columns: repeat(12, minmax(0, 1fr)); }
+      .col-3 { grid-column: span 3; } .col-4 { grid-column: span 4; } .col-6 { grid-column: span 6; } .col-8 { grid-column: span 8; } .col-12 { grid-column: span 12; }
+      @media (max-width: 900px) { .col-3, .col-4 { grid-column: span 6; } .col-8 { grid-column: span 12; } }
+      @media (max-width: 600px) { .col-3, .col-4, .col-6 { grid-column: span 12; } }
+
+      .card { background: hsl(var(--card)); color: hsl(var(--card-foreground)); border: 1px solid hsl(var(--border)); border-radius: var(--radius); box-shadow: var(--shadow-card); padding: 16px; min-width: 0; }
+      .card > h3 { font-size: 13px; font-weight: 500; color: hsl(var(--muted-foreground)); margin: 0 0 12px; }
+
+      .kpi .value { font-size: 28px; font-weight: 600; letter-spacing: -0.02em; line-height: 1.1; font-variant-numeric: tabular-nums; }
+      .kpi .delta { display: inline-flex; align-items: center; gap: 4px; margin-top: 8px; padding: 2px 8px; border-radius: 999px; font-size: 12px; font-weight: 500; font-variant-numeric: tabular-nums; }
+      .kpi .delta.good { background: hsl(var(--success-muted)); color: hsl(var(--success-muted-foreground)); }
+      .kpi .delta.bad { background: hsl(var(--destructive-muted)); color: hsl(var(--destructive-muted-foreground)); }
+      .kpi .delta.neutral { background: hsl(var(--muted)); color: hsl(var(--muted-foreground)); }
+      .kpi .hint { margin-top: 6px; color: hsl(var(--muted-foreground)); font-size: 12px; }
+
+      .chart { height: 260px; width: 100%; }
+      .chart.tall { height: 340px; }
+
+      table { width: 100%; border-collapse: collapse; font-size: 13px; }
+      th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid hsl(var(--border)); vertical-align: top; }
+      th { color: hsl(var(--muted-foreground)); font-weight: 500; font-size: 12px; }
+      td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+      tr:last-child td { border-bottom: 0; }
+      .bar { position: relative; height: 6px; border-radius: 3px; background: hsl(var(--muted)); overflow: hidden; }
+      .bar > span { position: absolute; inset: 0 auto 0 0; background: var(--series-1); border-radius: 3px; }
+
+      .badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 500; border: 1px solid transparent; }
+      .badge.ok { background: hsl(var(--success-muted)); color: hsl(var(--success-muted-foreground)); }
+      .badge.warn { background: hsl(var(--warning-muted)); color: hsl(var(--warning-muted-foreground)); }
+      .badge.error { background: hsl(var(--destructive-muted)); color: hsl(var(--destructive-muted-foreground)); }
+      .badge.info { background: hsl(var(--primary-muted)); color: hsl(var(--accent-foreground)); }
+
+      .callout { border: 1px solid hsl(var(--border)); border-left: 3px solid hsl(var(--primary)); border-radius: var(--radius); padding: 12px 16px; background: hsl(var(--accent)); }
+      .callout.warn { border-left-color: hsl(var(--warning-muted-foreground)); background: hsl(var(--warning-muted)); }
+      .callout.error { border-left-color: hsl(var(--destructive)); background: hsl(var(--destructive-muted)); }
+      .findings { margin: 0; padding-left: 18px; }
+      .findings li { margin: 6px 0; }
+      .findings li::marker { color: hsl(var(--muted-foreground)); }
+
+      .footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid hsl(var(--border)); color: hsl(var(--muted-foreground)); font-size: 12px; }
+      .footer code { background: hsl(var(--background-code)); padding: 1px 5px; border-radius: 4px; }
+      .empty { color: hsl(var(--muted-foreground)); font-size: 13px; padding: 24px 0; text-align: center; }
+
+      @media print {
+        body { background: #fff; color: #000; }
+        .theme-toggle { display: none; }
+        .card { box-shadow: none; break-inside: avoid; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <header class="header">
+        <div>
+          <h1 id="title"></h1>
+          <p class="subtitle" id="subtitle"></p>
+          <div class="meta" id="meta"></div>
+        </div>
+        <button class="theme-toggle" id="theme-toggle" type="button" aria-label="Toggle color theme"></button>
+      </header>
+
+      <main id="root"></main>
+
+      <footer class="footer" id="footer"></footer>
+    </div>
+
+    <!-- Data blob: the only part a refresh script needs to rewrite. Keep it valid JSON and keep the id. -->
+    <script id="artifact-data" type="application/json">
+      {
+        "meta": {
+          "title": "Reliability and cost",
+          "subtitle": "Example artifact. Replace this blob with real data from Latitude.",
+          "project": "example-project",
+          "range": { "from": "2026-08-31T00:00:00Z", "to": "2026-09-07T00:00:00Z" },
+          "generatedAt": "2026-09-07T08:00:00Z",
+          "sources": ["queryAnalytics", "querySpans"]
+        },
+        "kpis": [
+          { "label": "Traces", "value": 18234, "format": "count", "delta": 0.12, "deltaGood": "up", "hint": "vs previous 7 days" },
+          { "label": "Error rate", "value": 0.031, "format": "rate", "delta": -0.004, "deltaGood": "down", "hint": "vs previous 7 days" },
+          { "label": "p95 latency", "value": 4.2, "format": "duration", "delta": 0.3, "deltaGood": "down", "hint": "vs previous 7 days" },
+          { "label": "Spend", "value": 412.5, "format": "cost", "delta": 0.08, "deltaGood": "down", "hint": "vs previous 7 days" }
+        ],
+        "charts": {
+          "errorRateByModel": {
+            "categories": ["2026-08-31", "2026-09-01", "2026-09-02", "2026-09-03", "2026-09-04", "2026-09-05", "2026-09-06"],
+            "series": [
+              { "name": "gpt-4.1", "values": [0.02, 0.021, 0.03, 0.045, 0.028, 0.024, 0.022] },
+              { "name": "claude-sonnet-4", "values": [0.012, 0.011, 0.014, 0.013, 0.012, 0.01, 0.011] }
+            ],
+            "format": "rate",
+            "kind": "line"
+          },
+          "costByProvider": {
+            "categories": ["openai", "anthropic", "google"],
+            "series": [{ "name": "Spend", "values": [240.1, 152.4, 20.0] }],
+            "format": "cost",
+            "kind": "bar"
+          }
+        },
+        "tables": {
+          "slowestTools": {
+            "columns": [
+              { "key": "tool", "label": "Tool" },
+              { "key": "calls", "label": "Calls", "format": "count" },
+              { "key": "p95", "label": "p95", "format": "duration" },
+              { "key": "errorRate", "label": "Error rate", "format": "rate", "bar": true }
+            ],
+            "rows": [
+              { "tool": "search_docs", "calls": 4210, "p95": 6.1, "errorRate": 0.09 },
+              { "tool": "get_order", "calls": 1980, "p95": 2.4, "errorRate": 0.02 },
+              { "tool": "send_email", "calls": 640, "p95": 1.1, "errorRate": 0.005 }
+            ]
+          }
+        },
+        "findings": [
+          "Error rate peaked on Sep 3 (4.5% on gpt-4.1) and is back to baseline. The spike is concentrated in search_docs timeouts.",
+          "Spend is up 8% week over week, driven by longer conversations rather than more of them."
+        ]
+      }
+    </script>
+
+    <script>
+      // ---------- Theme ----------
+      const root = document.documentElement
+      const THEME_KEY = "latitude-artifact-theme"
+      function applyTheme(theme) {
+        root.classList.toggle("dark", theme === "dark")
+        const button = document.getElementById("theme-toggle")
+        if (button) button.textContent = theme === "dark" ? "☾ Dark" : "☀ Light"
+      }
+      function currentTheme() {
+        return root.classList.contains("dark") ? "dark" : "light"
+      }
+      ;(function initTheme() {
+        const stored = localStorage.getItem(THEME_KEY)
+        const preferred = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"
+        applyTheme(stored || preferred)
+      })()
+      let themeBeforePrint = null
+      window.addEventListener("beforeprint", () => {
+        themeBeforePrint = currentTheme()
+        if (themeBeforePrint === "dark") {
+          applyTheme("light")
+          renderCharts()
+        }
+      })
+      window.addEventListener("afterprint", () => {
+        if (themeBeforePrint === "dark") {
+          applyTheme("dark")
+          renderCharts()
+        }
+        themeBeforePrint = null
+      })
+      document.getElementById("theme-toggle").addEventListener("click", () => {
+        const next = currentTheme() === "dark" ? "light" : "dark"
+        localStorage.setItem(THEME_KEY, next)
+        applyTheme(next)
+        renderCharts()
+      })
+
+      // ---------- Tokens read from CSS so charts always match the active theme ----------
+      function cssVar(name) {
+        return getComputedStyle(root).getPropertyValue(name).trim()
+      }
+      function hsl(name) {
+        return `hsl(${cssVar(name)})`
+      }
+      function seriesColor(index) {
+        return cssVar(`--series-${(index % 8) + 1}`)
+      }
+      function tokens() {
+        return {
+          isDark: currentTheme() === "dark",
+          foreground: hsl("--foreground"),
+          mutedForeground: hsl("--muted-foreground"),
+          border: hsl("--border"),
+          primary: hsl("--primary"),
+          popover: hsl("--popover"),
+          fontFamily: getComputedStyle(document.body).fontFamily,
+        }
+      }
+
+      // ---------- Formatting (Latitude units: seconds, dollars, 0-1 rates) ----------
+      const fmt = {
+        count: (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e4 ? `${(n / 1e3).toFixed(1)}k` : Math.round(n).toLocaleString("en-US")),
+        rate: (n) => `${(n * 100).toFixed(n * 100 < 10 ? 1 : 0)}%`,
+        cost: (n) => (n === 0 ? "$0" : n >= 1000 ? `$${(n / 1000).toFixed(1)}k` : n >= 1 ? `$${n.toFixed(2)}` : `$${n.toFixed(4)}`),
+        duration: (s) => {
+          const a = Math.abs(s)
+          const sign = s < 0 ? "-" : ""
+          return a >= 3600 ? `${sign}${(a / 3600).toFixed(1)}h` : a >= 60 ? `${sign}${(a / 60).toFixed(1)}m` : a >= 1 ? `${sign}${a.toFixed(1)}s` : `${sign}${Math.round(a * 1000)}ms`
+        },
+        tokens: (n) => fmt.count(n),
+        number: (n) => Number(n).toLocaleString("en-US", { maximumFractionDigits: 2 }),
+        text: (v) => (v == null ? "" : String(v)),
+        date: (iso) => new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric", timeZone: "UTC" }),
+        datetime: (iso) => `${new Date(iso).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "UTC" })} UTC`,
+      }
+      function format(value, kind) {
+        if (value == null || value === "") return "—"
+        return (fmt[kind] || fmt.text)(value)
+      }
+      function formatAxis(value, kind) {
+        if (kind === "cost" && value >= 10) return `$${fmt.count(value)}`
+        if (kind === "count" || kind === "tokens") return fmt.count(value)
+        return format(value, kind)
+      }
+      function esc(value) {
+        return String(value ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c])
+      }
+
+      // ---------- Building blocks ----------
+      function kpiCard(kpi, span = "col-3") {
+        const pct = (d) => `${(d * 100).toFixed(Math.abs(d) < 0.1 ? 1 : 0)}%`
+        const deltaText = kpi.delta == null ? "" : `${kpi.delta > 0 ? "+" : ""}${kpi.format === "rate" ? `${(kpi.delta * 100).toFixed(1)} pts` : kpi.format === "count" || kpi.format === "cost" || kpi.format === "tokens" ? pct(kpi.delta) : format(kpi.delta, kpi.format)}`
+        const goodWhenUp = kpi.deltaGood !== "down"
+        const tone = kpi.delta == null || kpi.delta === 0 ? "neutral" : (kpi.delta > 0) === goodWhenUp ? "good" : "bad"
+        return `<div class="card kpi ${span}"><h3>${esc(kpi.label)}</h3><div class="value">${format(kpi.value, kpi.format)}</div>${deltaText ? `<span class="delta ${tone}">${esc(deltaText)}</span>` : ""}${kpi.hint ? `<div class="hint">${esc(kpi.hint)}</div>` : ""}</div>`
+      }
+
+      function kpiRow(kpis) {
+        if (!kpis || !kpis.length) return ""
+        const span = kpis.length === 2 ? "col-6" : kpis.length % 3 === 0 ? "col-4" : "col-3"
+        return kpis.map((kpi) => kpiCard(kpi, span)).join("")
+      }
+
+      function chartCard(id, title, options = {}) {
+        return `<div class="card ${options.span || "col-6"}"><h3>${esc(title)}</h3><div class="chart ${options.tall ? "tall" : ""}" id="chart-${id}" data-chart="${id}"></div></div>`
+      }
+
+      function tableCard(table, title, options = {}) {
+        if (!table || !table.rows || !table.rows.length) return `<div class="card ${options.span || "col-12"}"><h3>${esc(title)}</h3><div class="empty">No rows in this window.</div></div>`
+        const numeric = new Set(["count", "rate", "cost", "duration", "tokens", "number"])
+        const barMax = Object.fromEntries(table.columns.filter((c) => c.bar).map((c) => [c.key, Math.max(...table.rows.map((r) => Number(r[c.key]) || 0), 0)]))
+        const head = table.columns.map((c) => `<th class="${numeric.has(c.format) ? "num" : ""}">${esc(c.label)}</th>`).join("")
+        const body = table.rows
+          .map((row) => `<tr>${table.columns.map((c) => {
+            const cell = c.badge ? `<span class="badge ${esc(c.badge[row[c.key]] || "info")}">${esc(row[c.key])}</span>` : esc(format(row[c.key], c.format || "text"))
+            const bar = c.bar && barMax[c.key] > 0 ? `<div class="bar" style="margin-top:4px"><span style="width:${((Number(row[c.key]) || 0) / barMax[c.key]) * 100}%"></span></div>` : ""
+            return `<td class="${numeric.has(c.format) ? "num" : ""}">${cell}${bar}</td>`
+          }).join("")}</tr>`)
+          .join("")
+        return `<div class="card ${options.span || "col-12"}"><h3>${esc(title)}</h3><div style="overflow:auto"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div></div>`
+      }
+
+      function findingsCard(findings, title = "What stands out") {
+        if (!findings || !findings.length) return ""
+        return `<div class="card col-12"><h3>${esc(title)}</h3><ul class="findings">${findings.map((f) => `<li>${esc(f)}</li>`).join("")}</ul></div>`
+      }
+
+      function section(title, lead, inner) {
+        if (!inner) return ""
+        return `<section class="section"><h2>${esc(title)}</h2>${lead ? `<p class="lead">${esc(lead)}</p>` : ""}<div class="grid">${inner}</div></section>`
+      }
+
+      // ---------- Charts (ECharts, themed from the CSS tokens) ----------
+      const chartInstances = new Map()
+      function chartOption(chart) {
+        const t = tokens()
+        const formatValue = (v) => format(v, chart.format || "number")
+        const isPie = chart.kind === "pie"
+        const base = {
+          animation: false,
+          color: chart.series.map((_, i) => seriesColor(i)),
+          textStyle: { fontFamily: t.fontFamily, color: t.foreground },
+          tooltip: {
+            trigger: isPie ? "item" : "axis",
+            backgroundColor: t.popover,
+            borderColor: t.border,
+            textStyle: { color: t.foreground, fontSize: 12 },
+            valueFormatter: formatValue,
+          },
+          legend: chart.series.length > 1 && !isPie ? { bottom: 0, icon: "circle", itemWidth: 8, itemHeight: 8, textStyle: { color: t.mutedForeground, fontSize: 11 } } : { show: false },
+        }
+        if (isPie) {
+          return {
+            ...base,
+            series: [{
+              type: "pie",
+              radius: ["45%", "72%"],
+              data: chart.categories.map((name, i) => ({ name, value: chart.series[0].values[i] })),
+              label: { color: t.mutedForeground, fontSize: 11, formatter: (p) => `${p.name} ${formatValue(p.value)}` },
+              itemStyle: { borderColor: t.popover, borderWidth: 2 },
+            }],
+            color: chart.categories.map((_, i) => seriesColor(i)),
+          }
+        }
+        const horizontal = chart.kind === "bar" && chart.horizontal
+        const categoryAxis = { type: "category", data: chart.categories, axisTick: { show: false }, axisLine: { lineStyle: { color: t.border } }, axisLabel: { color: t.mutedForeground, fontSize: 11 } }
+        const valueAxis = {
+          type: "value",
+          minInterval: chart.format === "count" ? 1 : 0,
+          splitLine: { lineStyle: { type: "dashed", color: t.isDark ? t.mutedForeground : t.border, opacity: t.isDark ? 0.3 : 0.6 } },
+          axisLine: { show: false },
+          axisLabel: { color: t.mutedForeground, fontSize: 11, formatter: (v) => formatAxis(v, chart.format || "number") },
+        }
+        return {
+          ...base,
+          grid: { left: 8, right: 16, top: 16, bottom: chart.series.length > 1 ? 36 : 8, containLabel: true },
+          xAxis: horizontal ? valueAxis : categoryAxis,
+          yAxis: horizontal ? { ...categoryAxis, inverse: true } : valueAxis,
+          series: chart.series.map((s, i) => ({
+            name: s.name,
+            type: chart.kind === "bar" ? "bar" : "line",
+            data: s.values,
+            stack: chart.stacked ? "total" : undefined,
+            smooth: false,
+            symbol: "circle",
+            symbolSize: 5,
+            showSymbol: chart.categories.length <= 31,
+            lineStyle: { width: 2 },
+            areaStyle: chart.kind === "area" ? { opacity: 0.18 } : undefined,
+            barMaxWidth: 40,
+            itemStyle: { borderRadius: chart.kind === "bar" && !chart.stacked ? [3, 3, 0, 0] : 0, color: s.color ? cssVar(s.color) || s.color : seriesColor(i) },
+          })),
+        }
+      }
+      function renderCharts() {
+        const hasEcharts = typeof echarts !== "undefined"
+        document.querySelectorAll("[data-chart]").forEach((el) => {
+          if (!hasEcharts) {
+            el.innerHTML = '<div class="empty">Charts need a network connection once to load the chart library.</div>'
+            return
+          }
+          const chart = DATA.charts?.[el.dataset.chart]
+          if (!chart || !chart.series?.length || !chart.categories?.length) {
+            el.innerHTML = '<div class="empty">No data in this window.</div>'
+            return
+          }
+          let instance = chartInstances.get(el)
+          if (!instance) {
+            instance = echarts.init(el, null, { renderer: "canvas" })
+            chartInstances.set(el, instance)
+          }
+          instance.setOption(chartOption(chart), true)
+        })
+      }
+      window.addEventListener("resize", () => chartInstances.forEach((c) => c.resize()))
+
+      // ---------- Compose the page ----------
+      const DATA = JSON.parse(document.getElementById("artifact-data").textContent)
+
+      function renderHeader() {
+        const m = DATA.meta
+        document.title = m.title
+        document.getElementById("title").textContent = m.title
+        document.getElementById("subtitle").textContent = m.subtitle || ""
+        document.getElementById("meta").innerHTML = [
+          m.project ? `Project <b>${esc(m.project)}</b>` : "",
+          m.range ? `Window <b>${fmt.date(m.range.from)} → ${fmt.date(m.range.to)}</b>` : "",
+          m.generatedAt ? `Generated <b>${fmt.datetime(m.generatedAt)}</b>` : "",
+        ].filter(Boolean).join("<span aria-hidden='true'>·</span>")
+        document.getElementById("footer").innerHTML = `Built from Latitude data${m.sources?.length ? ` via ${m.sources.map((s) => `<code>${esc(s)}</code>`).join(", ")}` : ""}. Durations in seconds, cost in USD, rates as percentages.`
+      }
+
+      // Edit this function per artifact. Keep the building blocks; change the composition.
+      function render() {
+        renderHeader()
+        document.getElementById("root").innerHTML = [
+          section("Overview", "Headline numbers for the window.", kpiRow(DATA.kpis)),
+          section("Reliability and cost", null, chartCard("errorRateByModel", "Error rate by model, daily") + chartCard("costByProvider", "Spend by provider")),
+          section("Tools", null, tableCard(DATA.tables?.slowestTools, "Slowest tools by p95")),
+          section("Findings", null, findingsCard(DATA.findings)),
+        ].join("")
+        renderCharts()
+      }
+      render()
+    </script>
+  </body>
+</html>

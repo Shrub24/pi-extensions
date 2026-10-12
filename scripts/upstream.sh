@@ -3,7 +3,7 @@
 # Upstream status and mirrors for the packages that fork somebody else's work.
 #
 #   scripts/upstream.sh                # refresh every fork, then report
-#   scripts/upstream.sh pi-subagents   # one (or several)
+#   scripts/upstream.sh pi-herdsman    # one (or several)
 #
 # A fork needs two repositories, and neither belongs inside this working tree: a
 # pristine mirror of upstream, and that mirror with every path rewritten to
@@ -12,7 +12,7 @@
 # (PI_EXT_MIRRORS overrides it) and reach this repo through the
 # upstream-<package> remotes:
 #
-#   git diff upstream-pi-subagents/main HEAD -- pi-subagents   # files differing
+#   git diff upstream-pi-herdsman/main HEAD -- pi-herdsman     # files differing
 #   git cherry-pick -n <sha>                                   # take one commit
 #
 # FORKS below is the table. "path" is where the package sits in upstream — "."
@@ -26,16 +26,15 @@
 # state we extracted from, and the rewrite's pivot is that path's last commit at
 # or before it.
 #
-# Ids are not portable between the mirrors: the same upstream commit is a
-# different object in each rewrite (different graph roots), so #2350 is
-# 868e45be2 in import-pi-subagents and 528029351 in the mirror. Pivots are
-# therefore resolved per space here — never copied between them.
+# Rewritten mirrors have different graph roots, so pivot hashes are not
+# interchangeable between an import branch and a mirror. Resolve pivots in the
+# specific mirror being reported.
 #
 # Rebasing a fork's delta onto upstream is a scratch-clone job:
 #
 #   git clone --shared . /tmp/rebase && cd /tmp/rebase
-#   git checkout import-pi-subagents
-#   git rebase --onto upstream-pi-subagents/main <pivot>   # pivot = that branch's last upstream commit
+#   git checkout import-pi-tool-renderer
+#   git rebase --onto upstream-pi-tool-renderer/main <pivot>  # branch's last upstream commit
 #
 # That replays only what the import branch carries. Whether that is also what
 # this tree differs by is a separate question, and usually not: a take that came
@@ -45,14 +44,13 @@
 # jj names the same commits its own way — a remote branch is <branch>@<remote>,
 # a local one is its bookmark — so the delta reads
 #
-#   jj diff --from 'main@upstream-pi-subagents' --to @ -- pi-subagents
+#   jj diff --from 'main@upstream-pi-tool-renderer' --to @ -- pi-tool-renderer
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
 
 MIRRORS="${PI_EXT_MIRRORS:-$HOME/Projects/dev/custom/.pi-ext-mirrors}"
 FORKS=(
-  "pi-subagents|pi-subagents|https://github.com/nicobailon/pi-subagents.git|.|964481f4ea5fac2cb8dceaa7ce60547d6c6ffd60 0958598823920997f9a9241c4b2ac367297c95e3 b6bda32f03b7f549623bc404c9be14dca298ddc4"
   "pi-herdsman|pi-herdsman|https://github.com/boadij/pi-herdsman.git|.|156b1c661a2e147d6bb2ef415abe44dd6b11af2f"
   "pi-otel|pi-otel|https://github.com/stnly/pi-otel.git|.|398d40a72a1ba3a599e8596f26c3f148df1e7296"
   "pi-bash-processes|kendex|https://github.com/vanillagreencom/kendex.git|pi-extensions/pi-background-tasks|8d17265bff800665d97dd41ee6146bcfa5865a5a"
@@ -145,7 +143,7 @@ report() {
 }
 
 wanted=("$@")
-[ ${#wanted[@]} -gt 0 ] || wanted=(pi-subagents pi-herdsman pi-otel pi-bash-processes pi-tool-renderer pi-output-policy)
+[ ${#wanted[@]} -gt 0 ] || wanted=(pi-herdsman pi-otel pi-bash-processes pi-tool-renderer pi-output-policy)
 
 for entry in "${FORKS[@]}"; do
   IFS='|' read -r pkg mirror url path takes <<<"$entry"

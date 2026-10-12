@@ -1,5 +1,5 @@
 import { mock } from "bun:test";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { createEventBus, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { DEFAULT_SOFT_TIMEOUT_MS } from "../../extensions/constants.js";
@@ -31,6 +31,7 @@ const ctx = {
 	ui: { notify: (...args: unknown[]) => notifications.push(args), setWidget() {} },
 } as unknown as ExtensionContext;
 const pi = {
+	events: createEventBus(),
 	registerTool(tool: Tool) { tools.set(tool.name, tool); },
 	registerCommand(name: string, command: { handler(args: string, ctx: ExtensionContext): unknown }) { commands.set(name, command); }, registerShortcut() {}, registerMessageRenderer() {},
 	on(event: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) { events.set(event, handler); },

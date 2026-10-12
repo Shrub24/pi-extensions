@@ -86,6 +86,7 @@ import {
 import { logBackgroundDiagnostic } from "./diagnostics.js";
 import {
 	BACKGROUND_WORK_MAX_OUTSTANDING,
+	SESSION_OUTSTANDING_CHANNEL,
 	registerBackgroundWorkProvider,
 	type BackgroundWorkOutstandingTask,
 	type BackgroundWorkProvider,
@@ -111,7 +112,7 @@ async function loadManagedBashPresentation(): Promise<void> {
 }
 void loadManagedBashPresentation();
 import { createOrphanWatcher, type OrphanWatcher } from "./orphan-watcher.js";
-import { createPaneFactsPublisher, paneFacts } from "./pane-facts.js";
+import { blockingTaskCount, createPaneFactsPublisher, paneFacts } from "./pane-facts.js";
 import { busTasks, createRadarBusPublisher } from "./radar-bus.js";
 import { applyCustomEntryWithBarrier, createPersistence, sessionIdForContext, sidecarStatePath } from "./persistence.js";
 import { mapWithConcurrency, PROBE_CONCURRENCY } from "./probes.js";
@@ -298,6 +299,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 	let settlementRestore: { state: "pending" } | { state: "done" } | { state: "failed"; reason: string } = { state: "pending" };
 	let settlementRevision = 0;
 	let settlementRegistration: BackgroundWorkRegistration | null = null;
+	let sessionOutstandingOff: (() => void) | undefined;
 	/** The accepted assignment request currently bound for spawn association; null before the first bind (or after a session restart). */
 	let boundAssignment: string | null = null;
 	/** The bound assignment marked settlement-waiting; only its tasks' exit wakes are mandatory. */
@@ -3129,6 +3131,13 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		settlementRestore = { state: "pending" };
 		settlementRegistration?.dispose();
 		settlementRegistration = null;
+		sessionOutstandingOff?.();
+		sessionOutstandingOff = pi.events.on(SESSION_OUTSTANDING_CHANNEL, (raw) => {
+			const query = raw as { respond?: (count: number) => void } | null;
+			// No answer until the task map is restored: an empty map would read as zero.
+			if (typeof query?.respond !== "function" || activeSessionId == null || settlementRestore.state !== "done") return;
+			query.respond(blockingTaskCount([...tasks.values()]));
+		});
 		try {
 			settlementRegistration = registerBackgroundWorkProvider(pi.events, settlementProvider);
 		} catch (error) {
@@ -3198,6 +3207,8 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		// half-torn-down snapshot from a stale registration.
 		settlementRegistration?.dispose();
 		settlementRegistration = null;
+		sessionOutstandingOff?.();
+		sessionOutstandingOff = undefined;
 		// A script cannot outlive its session, so neither can its provenance.
 		codemodeCallIds.clear();
 		deferredExitWakes.clear();

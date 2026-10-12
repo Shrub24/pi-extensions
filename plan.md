@@ -186,11 +186,8 @@ refusals, plus carried-background-result settlement contract tests. No live reco
     change, because it moves every type assertion in the suites at once. The session-header surface the
     fork ownership check reads is stable across both tags (`parentSession`, `getSessionId`, `getHeader`),
     so that check does not depend on the bump.
-14. The same abort migration applies to `pi-subagents`. Its `src/runs/shared/abort-recovery.ts` infers a
-    terminal abort from the terminal assistant message's `stopReason` (plus a provider-abort error text)
-    and feeds it into `planAbortRecovery`, to decide whether a compaction-induced child abort may be
-    resumed. `agent_settled.aborted` is the direct fact for that question. Check first whether the path
-    receives settled events in this deployment. Not started; no owner assigned.
+14. `pi-subagents` was retired from this workspace. Its abort-recovery follow-up is no longer in scope
+    unless the package is reintroduced.
 
 15. Radar daemon publication adoption (landed, live adoption unverified):
     Herdsman publishes Pi execution facts and owner assignment facts to Radar's control-socket
