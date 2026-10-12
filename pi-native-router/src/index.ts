@@ -7,6 +7,7 @@ import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { readConfig, type Config, type RouteConfig } from "./config";
+import { commandSlots, completeArguments } from "./completions";
 import { accountActive, accountSecret, readAccountKey, runtimeKeysAvailable, useAccount } from "./accounts";
 import { HealthStore } from "./health-store";
 import { healthReport, type HealthMode } from "./health-report";
@@ -329,7 +330,9 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     if (quotaTimer) clearInterval(quotaTimer);
     quotaTimer = undefined;
   });
+  const slots = commandSlots(config);
   pi.registerCommand("pricing", {
+    getArgumentCompletions: prefix => completeArguments(prefix, slots.pricing),
     description: "Refresh catalog prices or show one physical model: /pricing refresh | /pricing show <provider>/<model>",
     handler: async (args, ctx) => {
       const [verb, target] = args.trim().split(/\s+/);
@@ -357,6 +360,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     },
   });
   pi.registerCommand("quotas-config", {
+    getArgumentCompletions: prefix => completeArguments(prefix, slots["quotas-config"]),
     description: "Merge quota-mapped router accounts and providers into CodexBar's config: /quotas-config [--replace] [path]",
     handler: async (args, ctx) => {
       const tokens = args.trim().split(/\s+/).filter(Boolean);
@@ -379,6 +383,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     },
   });
   pi.registerCommand("quotas", {
+    getArgumentCompletions: prefix => completeArguments(prefix, slots.quotas),
     description: "Show tracker quota windows per account; reuses recent fetches unless `refresh` is given",
     handler: async (args, ctx) => {
       if (quotaScopes.length === 0) { ctx.ui.notify("native-router: no account or provider has a quota mapping", "info"); return; }
@@ -403,6 +408,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     },
   });
   pi.registerCommand("native-router-health", {
+    getArgumentCompletions: prefix => completeArguments(prefix, slots["native-router-health"]),
     description: "Inspect native-router health, or reset one account: /native-router-health [reset <account>]",
     handler: async (args, ctx) => {
       const mode: HealthMode = store ? "shared" : config.sharedHealth ? "degraded-local" : "local-only";
