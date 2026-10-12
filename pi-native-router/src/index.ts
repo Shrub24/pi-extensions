@@ -144,7 +144,11 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       const state: State = old ? { ...old } : { version: 1, physical: "", floor: route.contextWindow, turn, retries: 0, transitions: 0, recoveries: 0 };
       if (activity) state.cacheActivity = activity;
       if (state.turn !== turn) Object.assign(state, { turn, retries: 0, transitions: 0, recoveries: 0, next: undefined });
-      state.floor = Math.max(state.floor, request.previous?.model.contextWindow ?? 0);
+      // `request.previous` is the conversation's latest response, whichever route produced it. Only a model this
+      // route could itself select may raise the floor: a switch from another route must not impose its window.
+      const previousInRoute = request.previous !== undefined
+        && route.candidates.some(c => c.provider === request.previous!.model.provider && c.id === request.previous!.model.id);
+      state.floor = Math.max(state.floor, previousInRoute ? request.previous!.model.contextWindow : 0);
       let exclude: string | undefined;
       if (admissions.has(activityKey)) settleAdmission(activityKey, { recovered: false });
       if (request.failed) {
@@ -182,7 +186,27 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
         if (granted) break;
         skipped.add(target);
       }
-      if (!selected) throw exhausted(role, route, ctx);
+      if (!selected) {
+        // Every rejection is secret-free and names the reason, so a live exhaustion is diagnosable from the error.
+        const detail = route.candidates.map(candidate => {
+          const target = `${candidate.provider}/${candidate.id}${candidate.account ? `#${candidate.account}` : ""}`;
+          const model = ctx.modelRegistry.find(candidate.provider, candidate.id);
+          if (!model || model.api === "pi-virtual") return `${target}: not registered`;
+          if (candidate.account !== undefined) {
+            const named = config.accounts[candidate.account];
+            if (!named) return `${target}: unknown account`;
+            if (!runtimeKeysAvailable(ctx)) return `${target}: this Pi host does not expose runtime key activation`;
+            if (accountSecret(named) === undefined) return `${target}: key source missing or empty`;
+          } else if (!ctx.modelRegistry.hasConfiguredAuth(model)) return `${target}: no configured auth`;
+          if (exclude === target) return `${target}: excluded after this request's failure`;
+          if (skipped.has(target)) return `${target}: skipped after a refused probe lease or a failed activation`;
+          const blocked = health.blockedReason(model, candidate.account);
+          if (blocked) return `${target}: ${blocked.kind} cooldown until ${new Date(blocked.until).toISOString()}`;
+          const needed = Math.max(route.contextWindow, state.floor, estimate + Math.max(route.outputReserve, model.maxTokens));
+          return `${target}: needs ${needed} context tokens (window ${model.contextWindow}, max output ${model.maxTokens})`;
+        });
+        throw new Error(`Native route/${role} exhausted: no dispatchable candidate. ${detail.join("; ")}`);
+      }
       const physical = identity(selected.model, selected.candidate.account);
       const account = selected.candidate.account === undefined ? undefined : config.accounts[selected.candidate.account];
       if (state.physical !== physical) {

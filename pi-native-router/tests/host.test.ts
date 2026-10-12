@@ -18,7 +18,7 @@ type Routing = { accounts: string[]; candidates: Array<{ provider: string; accou
 /** Synthetic env name for a test account; keys are set by each test and never printed. */
 const accountEnv = (id: string) => `NATIVE_ROUTER_TEST_KEY_${id.replace(/-/g, "_").toUpperCase()}`;
 type Outcome = "ok" | "quota" | "transient" | "partial" | "abort" | "tool" | "bad" | 401 | 403 | 429;
-async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateThinking?: "off" | "low" | "medium" | "high"; retry?: boolean; flush?: "failed" | "absent"; maxRecoveries?: number; maxTransitions?: number; smaller?: boolean; manager?: SessionManager; packaged?: boolean; unauthedFirst?: boolean; ttl?: number; startTime?: number; clock?: { value: number }; accounts?: boolean; healthPath?: string; routing?: Routing; runtimeKeys?: "absent" | "inert" } = {}) {
+async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateThinking?: "off" | "low" | "medium" | "high"; retry?: boolean; flush?: "failed" | "absent"; maxRecoveries?: number; maxTransitions?: number; smaller?: boolean; manager?: SessionManager; packaged?: boolean; unauthedFirst?: boolean; ttl?: number; startTime?: number; clock?: { value: number }; accounts?: boolean; healthPath?: string; routing?: Routing; runtimeKeys?: "absent" | "inert"; wide?: boolean } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "native-router-"));
   const settings = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: opts.retry ?? false, maxRetries: 3, baseDelayMs: 1 }, cacheWarming: "off" });
   const runtime = await ModelRuntime.create({ authPath: join(dir, "auth.json"), modelsPath: null, refreshOnCreate: false });
@@ -33,10 +33,12 @@ async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateT
   const now = () => clock.value;
   let api: ExtensionAPI;
   const usage = { input: 10, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 11, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
-  for (const [provider, window] of [["fake-a", 300_000], ["fake-b", opts.smaller ? 200_000 : 300_000], ["fake-c", 300_000]] as const) {
+  // `fake-d/wide` is registered but belongs to no route: it stands in for a model from another route.
+  const providers = [["fake-a", 300_000], ["fake-b", opts.smaller ? 200_000 : 300_000], ["fake-c", 300_000], ...(opts.wide ? [["fake-d", 1_000_000] as const] : [])] as const;
+  for (const [provider, window] of providers) {
     runtime.registerProvider(provider, {
       api: "openai-completions", baseUrl: "https://unused.invalid", apiKey: opts.routing ? (opts.routing.candidates.some(c => c.provider === provider && c.account === undefined) ? "fake-test-key" : undefined) : opts.accounts ? undefined : opts.unauthedFirst && provider === "fake-a" ? undefined : "fake-test-key",
-      models: [{ id: "model", name: provider, reasoning: opts.reasoning ?? false, input: ["text"], contextWindow: window, maxTokens: 16_384, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
+      models: [{ id: opts.wide && provider === "fake-d" ? "wide" : "model", name: provider, reasoning: opts.reasoning ?? false, input: ["text"], contextWindow: window, maxTokens: 16_384, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
       streamSimple(model, context, streamOptions) {
         const stream = createAssistantMessageEventStream();
         const outcome = outcomes.shift() ?? "ok";
@@ -254,6 +256,20 @@ for (const flush of ["failed", "absent"] as const) test(`flush ${flush} blocks r
     expect(h.dispatches).toHaveLength(1);
     expect(h.session.messages.at(-1)).toMatchObject({ stopReason: "error" });
     expect(h.order).not.toContain("transition");
+  } finally { h.close(); }
+});
+
+test("a model from another route does not raise this route's capacity floor", async () => {
+  const h = await host(["ok"], { wide: true });
+  try {
+    // The conversation's latest successful response came from a 1M-window model that is not a worker candidate.
+    h.manager.appendMessage({
+      role: "assistant", api: "openai-completions", provider: "fake-d", model: "wide", timestamp: 2,
+      content: [{ type: "text", text: "answer from the other route" }], stopReason: "stop",
+      usage: { input: 10, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 11, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    } as never);
+    await h.session.prompt("switched back to the worker route");
+    expect(h.dispatches.map(d => d.physical)).toEqual(["fake-a"]);
   } finally { h.close(); }
 });
 

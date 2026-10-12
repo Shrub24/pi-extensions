@@ -1,7 +1,7 @@
 import type { Api, AssistantMessage, Model } from "@earendil-works/pi-ai";
 import type { RouteConfig, Candidate } from "./config";
 import type { HealthStore } from "./health-store";
-import type { ErrorCauseKind } from "./health-store";
+import type { CauseKind, ErrorCauseKind } from "./health-store";
 
 export const identity = (model: { provider: string; id: string }, account?: string) => `${model.provider}/${model.id}${account ? `#${account}` : ""}`;
 export const physicalOf = (key: string) => key.split("#")[0];
@@ -60,8 +60,11 @@ export function admissionKeys(model: { provider: string; id: string }, account?:
  * Health used by routing. With a shared store it reads and writes that store; otherwise, or when the
  * store fails, it uses the process-local mirror and reports the degradation once per failure.
  */
+/** The cause binding a target for diagnostics: its scope key, kind and deadline. */
+export interface BlockedReason { key: string; kind: CauseKind; until: number }
+
 export class Health {
-  private local = new Map<string, number>();
+  private local = new Map<string, { until: number; kind: ErrorCauseKind }>();
   constructor(
     private now: () => number = Date.now,
     private store?: HealthStore,
@@ -71,18 +74,28 @@ export class Health {
     if (failure.kind === "unsafe") return;
     const key = scopeKeys(model, failure, account);
     const until = this.now() + failure.delayMs;
-    this.local.set(key, Math.max(this.local.get(key) ?? 0, until));
+    const current = this.local.get(key);
+    if (!current || until >= current.until) this.local.set(key, { until, kind: failure.kind });
     const kind: ErrorCauseKind = failure.kind;
     this.attempt(() => this.store?.mark(key, kind, until, kind));
   }
   eligible(model: { provider: string; id: string }, account?: string) {
     const keys = admissionKeys(model, account);
     for (const key of keys) {
-      const until = this.local.get(key);
-      if (until !== undefined && until > this.now()) return false;
+      const entry = this.local.get(key);
+      if (entry !== undefined && entry.until > this.now()) return false;
     }
     if (!this.store) return true;
     return this.attempt(() => this.store!.blocked(keys) === undefined, true) ?? true;
+  }
+  /** The cause currently binding a target, for diagnostics. Reads local health first, then the shared store. */
+  blockedReason(model: { provider: string; id: string }, account?: string): BlockedReason | undefined {
+    const keys = admissionKeys(model, account);
+    for (const key of keys) {
+      const entry = this.local.get(key);
+      if (entry !== undefined && entry.until > this.now()) return { key, kind: entry.kind, until: entry.until };
+    }
+    return this.attempt(() => this.store?.blocked(keys)) ?? undefined;
   }
   /** Runs a store operation, degrading to local health on failure instead of stalling dispatch. */
   attempt<T>(run: () => T): T | undefined;
