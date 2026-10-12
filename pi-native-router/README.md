@@ -164,7 +164,7 @@ The model part of `provider/model` is Pi's own model name, so model labels come 
 - The pin is stored per route on the session branch, so resume and fork restore it. It is never shared across sessions.
 - A pinned candidate is tried first when it is healthy and fits the request. Recovery targets still take priority.
 - A pin that cannot serve (cooldown, exhausted quota, or too small for the request) is dormant: that request uses route order, and the pin applies again once the candidate is eligible.
-- `auto` clears the pin.
+- `auto` clears the pin. So does picking the candidate that auto would already pick now (the last served one, else the first in route order): the pin is stored as auto, because it would change nothing.
 - The physical footer item shows `⚑` while a pin is set. Each manual change is logged with reason `manual`.
 - Every manual change notifies that the route's cache rebuilds on the next request.
 

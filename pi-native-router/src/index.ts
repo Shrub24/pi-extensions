@@ -490,10 +490,20 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       ctx.ui.notify(lines.join("\n"), "info");
     },
   });
-  const pinRoute = (ctx: ExtensionContext, role: string, choice: string | null) => {
+  // The candidate auto would pick now: the last served one, else the first usable in route order.
+  const autoChoice = (ctx: ExtensionContext, role: string): string | undefined => {
+    const route = config.routes[role];
+    const shown = choose(route, available(route, ctx, config), health, ctx.getContextUsage()?.tokens ?? 0, branchState(ctx, role)?.physical);
+    return shown && identity(shown.model, shown.candidate.account);
+  };
+  const pinRoute = (ctx: ExtensionContext, role: string, requested: string | null) => {
+    // A pin on the candidate auto already picks changes nothing, so it is stored as auto instead.
+    const matchesAuto = requested !== null && requested === autoChoice(ctx, role);
+    const choice = matchesAuto ? null : requested;
     pi.appendEntry(PIN_ENTRY, { role, identity: choice });
     recordDecision(decisionLogPath, { at: new Date(options.now?.() ?? Date.now()).toISOString(), session: ctx.sessionManager.getSessionId(), logical: `route/${role}`, physical: choice === null ? "auto" : physicalOf(choice), ...(choice && accountOf(choice) ? { account: accountOf(choice) } : {}), reason: "manual" }, degrade);
     previewRoute(ctx, role);
+    if (matchesAuto) { ctx.ui.notify(`native-router: ${role} already follows auto on ${requested}; pin cleared`, "info"); return; }
     const note = choice === null ? `native-router: ${role} follows route order` : `native-router: ${role} pinned to ${choice}`;
     ctx.ui.notify(`${note}; the route's cache rebuilds on the next request`, "info");
   };
