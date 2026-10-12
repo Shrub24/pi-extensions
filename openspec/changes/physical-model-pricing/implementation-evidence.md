@@ -11,10 +11,10 @@
 
 ## Reconciliation as built
 - `message_end` keeps Pi's recorded cost and applies the peak multiplier for OpenCode Go DeepSeek models in the published windows (`pi-native-router/src/pricing/reconcile.ts`).
-- The catalog backfill runs only when Pi's registry returns no model for the physical key. Pi registers every model it knows with a cost object, so the backfill does not run for models in our routes. No test exercises it with a registered model. The rule is an open decision (design, decision 3).
+- The catalog backfill runs when Pi has no model for the physical key, or when the recorded cost for a message with tokens is zero (design, decision 3). It fills only from a complete, nonzero exact record. A nonzero Pi cost is never overwritten.
+- Verification: `bun run typecheck` passes; `bun test tests` 103 pass (includes `reconcile.test.ts` and `backfill-wiring.test.ts`).
 
 ## Not done
-- The backfill rule is undecided (task 3.1), so its behaviour is not claimed as active.
 - No catalog provenance is exported yet (task 4.1).
 - Peak adjustment has not been checked on live traffic (task 5.1).
 - Registry-level price application was rejected (design, Context). No host seam is used.

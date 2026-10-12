@@ -395,8 +395,8 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     const piModel = ctx.modelRegistry.find(message.provider, message.model);
     const piHasPrice = piModel?.cost !== undefined;
     let changed = false;
-    if (!piHasPrice) {
-      try { changed = backfillCost(usage, false, loadSnapshot(defaultPricingPath())?.records[`${message.provider}/${message.model}`]) || changed; }
+    if (!piHasPrice || usage.cost.total === 0) {
+      try { changed = backfillCost(usage, piHasPrice, loadSnapshot(defaultPricingPath())?.records[`${message.provider}/${message.model}`]) || changed; }
       catch (error) { degrade(error); }
     }
     changed = applyPeak(usage, message.provider, message.model, at) || changed;

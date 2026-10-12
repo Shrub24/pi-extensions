@@ -56,14 +56,22 @@ The system MUST treat Pi's recorded cost for a finalized assistant message as th
 - **THEN** only the finalized message's usage is replaced, and no provider's model list is re-registered
 
 ### Requirement: Catalog backfill
-The system MUST backfill a catalog estimate for a physical model only when the backfill rule in the design (open decision 3) is met and the record is complete for the observed usage. The rule MUST be fixed before this requirement is claimed as active. Until it is, no catalog backfill is reported as in effect.
+The system MUST backfill a catalog estimate for a physical model when Pi has no price for it, or when Pi's recorded cost for a message with tokens is zero. The backfill MUST use only the exact provider/model record, and only when that record is complete for the observed usage and prices the usage above zero.
 
-#### Scenario: Backfill applies
-- **WHEN** the backfill rule is met and a complete exact record exists
+#### Scenario: Missing Pi price
+- **WHEN** Pi's registry has no model for the physical key and a complete exact record exists
 - **THEN** the finalized usage cost is replaced with the catalog estimate and tagged with catalog provenance
 
-#### Scenario: Backfill does not apply
-- **WHEN** the backfill rule is not met or the record is partial
+#### Scenario: Placeholder zero
+- **WHEN** Pi records zero cost for a message with tokens and a complete, nonzero exact record exists
+- **THEN** the finalized usage cost is replaced with the catalog estimate and tagged with catalog provenance
+
+#### Scenario: Nonzero Pi cost
+- **WHEN** Pi records a nonzero cost for the message
+- **THEN** the backfill does not run and the recorded cost is kept
+
+#### Scenario: Free model or partial record
+- **WHEN** the exact record prices the usage at zero, or is partial for the observed usage
 - **THEN** the recorded cost stays as it is and no catalog provenance is attached
 
 ### Requirement: Time-of-day peak adjustment

@@ -13,8 +13,8 @@
 
 ## 3. Reconciliation rules
 
-- [ ] 3.1 Decide the backfill rule (design, open decision 3; option B recommended) and record the decision in the design and the spec before implementing it. Record the choice here with its date.
-- [ ] 3.2 Implement the chosen backfill rule in the `message_end` reconciliation. Tests: a priced registry model is never overwritten; a placeholder zero with a complete nonzero exact record is backfilled (if option B); a genuine zero with a zero record stays zero; a partial or tiered record is not applied; a provider-reported cost is never overwritten.
+- [x] 3.1 Decide the backfill rule: missing or placeholder zero (design, decision 3), recorded in the design and the spec before implementation.
+- [x] 3.2 Implement the backfill rule in the `message_end` reconciliation. Unit tests in `reconcile.test.ts` cover a nonzero Pi cost, a placeholder zero, a genuinely free model, and a partial record. `backfill-wiring.test.ts` drives the installed handler against a saved snapshot.
 - [x] 3.3 Peak adjustment for the listed DeepSeek models in the published windows, with `peakMultiplier` set. Covered by handler-driven tests in `peak-cost.test.ts`. Live confirmation is tracked in 5.1.
 
 ## 4. Telemetry provenance and integration

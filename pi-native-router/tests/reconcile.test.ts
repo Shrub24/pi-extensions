@@ -42,8 +42,8 @@ test("catalog backup prices a complete record and leaves a partial or tiered one
   expect(priceFromCatalog(usage(), { ...complete, tiered: true })).toBeUndefined();
 });
 
-test("backup only applies when Pi has no price for the model, and never overwrites Pi's own cost", () => {
-  const record: PriceRecord = { provider: "p", model: "m", provenance: "litellm", input: 1, output: 2, cacheRead: 0, cacheWrite: 0, tiered: false };
+test("backup fills a missing price and never overwrites a nonzero Pi cost", () => {
+  const record: PriceRecord = { provider: "p", model: "m", provenance: "litellm", input: 1, output: 2, cacheRead: 0.1, cacheWrite: 0.5, tiered: false };
   const piPriced = usage(0.476);
   expect(backfillCost(piPriced, true, record)).toBe(false);
   expect(piPriced.cost.total).toBeCloseTo(0.476);
@@ -52,4 +52,23 @@ test("backup only applies when Pi has no price for the model, and never overwrit
   expect(unpriced.cost.total).toBeGreaterThan(0);
   const none = usage(0);
   expect(backfillCost(none, false, undefined)).toBe(false);
+});
+
+test("a placeholder zero from Pi is replaced by a complete nonzero exact record", () => {
+  const record: PriceRecord = { provider: "opencode-go", model: "deepseek-v4-flash", provenance: "models.dev", input: 0.14, output: 0.28, cacheRead: 0.0028, cacheWrite: 0, tiered: false };
+  const placeholder = usage(0);
+  expect(backfillCost(placeholder, true, record)).toBe(true);
+  expect(placeholder.cost.input).toBeCloseTo(0.14);
+  expect(placeholder.cost.total).toBeGreaterThan(0);
+});
+
+test("a genuinely free model stays free, and a partial placeholder stays unknown", () => {
+  const free: PriceRecord = { provider: "opencode-go", model: "longcat-2.5-preview-free", provenance: "models.dev", input: 0, output: 0, cacheRead: 0, cacheWrite: 0, tiered: false };
+  const zero = usage(0);
+  expect(backfillCost(zero, true, free)).toBe(false);
+  expect(zero.cost.total).toBe(0);
+  const partial: PriceRecord = { provider: "opencode-go", model: "mimo-v2.5", provenance: "models.dev", input: 0.14, output: 0.28, cacheRead: 0.0028, tiered: false };
+  const unknown = usage(0);
+  expect(backfillCost(unknown, true, partial)).toBe(false);
+  expect(unknown.cost.total).toBe(0);
 });
