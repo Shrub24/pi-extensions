@@ -3,8 +3,10 @@ import type { PriceRecord } from "./catalog";
 /**
  * Cost reconciliation for a finalized assistant message. Pi's own cost is the source of truth. Two
  * adjustments exist, and nothing else:
- *   1. Time-of-day pricing: OpenCode Go bills its DeepSeek models at DeepSeek's peak rate, which is
- *      exactly twice the off-peak rate Pi records. Peak is applied to Pi's recorded cost.
+ *   1. Time-of-day pricing. OpenCode Go bills its DeepSeek models at DeepSeek's peak rate, which is
+ *      exactly twice the off-peak rate Pi records, so the router doubles Pi's recorded cost. Command Code
+ *      applies the same peak rate inside its own provider cost calculation, so its recorded cost is already
+ *      at peak and the router only labels the message. Nothing is doubled twice.
  *   2. Backup: the catalog snapshot prices a message only when Pi's cost is missing or a placeholder.
  *      Missing means Pi's registry has no model for it. A placeholder means Pi recorded zero cost for
  *      a message with tokens. A partial or tiered record, or one that prices the usage at zero, leaves
@@ -35,8 +37,23 @@ export function isDeepSeekPeak(atMs: number): boolean {
   return (hour >= 1 && hour < 4) || (hour >= 6 && hour < 10);
 }
 
+/** Command Code's DeepSeek V4 models, as the provider's own calculator names them. Its recorded cost is already at peak. */
+const COMMANDCODE_PEAK_MODELS = new Set(["deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-flash-vision-exp", "deepseek/deepseek-v4.1-flash", "deepseek/deepseek-v4.1-flash-fast"]);
+
 export function isPeakPriced(provider: string, model: string, atMs: number): boolean {
   return provider === "opencode-go" && DEEPSEEK_PEAK_MODELS.has(model) && isDeepSeekPeak(atMs);
+}
+
+/** True when the provider's own recorded cost already reflects the peak rate for this message. */
+export function isPeakRecorded(provider: string, model: string, atMs: number): boolean {
+  return provider === "commandcode" && COMMANDCODE_PEAK_MODELS.has(model) && isDeepSeekPeak(atMs);
+}
+
+/** Labels a message whose recorded cost is already at peak, without changing the cost. */
+export function labelRecordedPeak(usage: CostUsage, provider: string, model: string, atMs: number): boolean {
+  if (!isPeakRecorded(provider, model, atMs) || usage.pricingSource !== undefined) return false;
+  usage.peakMultiplier = PEAK_MULTIPLIER;
+  return true;
 }
 
 /** Multiplies every recorded cost component by the peak factor. Returns true when it changed the cost. */

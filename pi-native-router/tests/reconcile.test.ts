@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { applyPeak, backfillCost, isDeepSeekPeak, priceFromCatalog, type CostUsage } from "../src/pricing/reconcile";
+import { applyPeak, backfillCost, isDeepSeekPeak, labelRecordedPeak, priceFromCatalog, type CostUsage } from "../src/pricing/reconcile";
 import type { PriceRecord } from "../src/pricing/catalog";
 
 const at = (iso: string) => Date.parse(iso);
@@ -30,6 +30,20 @@ test("peak doubles every recorded component for OpenCode Go DeepSeek only", () =
   expect(applyPeak(other, "anthropic", "deepseek-v4-flash", peak)).toBe(false);
   expect(applyPeak(other, "opencode-go", "deepseek-v4-flash", at("2026-10-12T12:00:00Z"))).toBe(false);
   expect(other.cost.total).toBeCloseTo(0.476);
+});
+
+test("Command Code peak is labelled without doubling its already-peak recorded cost", () => {
+  const peak = at("2026-10-12T02:00:00Z");
+  const u = usage(0.9);
+  expect(labelRecordedPeak(u, "commandcode", "deepseek/deepseek-v4.1-flash", peak)).toBe(true);
+  expect(u.peakMultiplier).toBe(2);
+  expect(u.cost.total).toBeCloseTo(0.9);
+  const offPeak = usage(0.9);
+  expect(labelRecordedPeak(offPeak, "commandcode", "deepseek/deepseek-v4.1-flash", at("2026-10-12T12:00:00Z"))).toBe(false);
+  expect(labelRecordedPeak(usage(0.9), "commandcode", "moonshot/kimi", peak)).toBe(false);
+  expect(labelRecordedPeak(usage(0.9), "opencode-go", "deepseek/deepseek-v4.1-flash", peak)).toBe(false);
+  const backfilled = { ...usage(0.9), pricingSource: "catalog" as const };
+  expect(labelRecordedPeak(backfilled, "commandcode", "deepseek/deepseek-v4.1-flash", peak)).toBe(false);
 });
 
 test("catalog backup prices a complete record and leaves a partial or tiered one unknown", () => {

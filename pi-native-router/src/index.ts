@@ -15,7 +15,7 @@ import { codexbarRunner, formatRemaining, formatUsed, QUOTA_FRESH_MS, quotaScope
 import { codexbarConfigPath, generateCodexbarConfig, readCodexbarConfig, writeCodexbarConfig } from "./codexbar-config";
 import { defaultPricingPath, loadSnapshot, refreshSnapshot, saveSnapshot } from "./pricing/cache";
 import { lookup } from "./pricing/catalog";
-import { applyPeak, backfillCost, type CostUsage } from "./pricing/reconcile";
+import { applyPeak, backfillCost, labelRecordedPeak, type CostUsage } from "./pricing/reconcile";
 import { accountOf, admissionKeys, cacheExpiry, choose, classify, clampLevel, Health, identity, observe, partialOutput, physicalOf, requiredContext, restore, THINKING_ORDER, type Resolved, type State } from "./policy";
 import { beforeTransition, flushBridge, type FlushHook, type TransitionHook } from "./transition";
 
@@ -445,7 +445,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       }
       catch (error) { degrade(error); }
     }
-    changed = applyPeak(usage, message.provider, message.model, at) || changed;
+    changed = applyPeak(usage, message.provider, message.model, at) || labelRecordedPeak(usage, message.provider, message.model, at) || changed;
     if (!changed) return;
     return { message: { ...message, usage } as typeof event.message };
   });

@@ -38,6 +38,36 @@ test("a DeepSeek opencode-go message at peak returns doubled cost with the peak 
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test("a Command Code DeepSeek message at peak keeps its recorded cost and carries the peak marker", () => {
+  const dir = mkdtempSync(join(tmpdir(), "native-router-peak-"));
+  try {
+    const handlers: Array<(event: unknown, ctx: unknown) => unknown> = [];
+    const pi = {
+      on(name: string, handler: (event: unknown, ctx: unknown) => unknown) { if (name === "message_end") handlers.push(handler); },
+      registerCommand() {}, registerVirtualModel() {}, registerProvider() {}, appendEntry() {},
+      setActiveTools() {}, getActiveTools: () => [], getAllTools: () => [],
+      events: { on() {}, emit() {} },
+    };
+    installRouter(pi as never, parseConfig({ routes: { worker: { candidates: [{ provider: "fake-a", id: "model" }] } } }), { healthPath: join(dir, "h.sqlite") });
+    // Pi's commandcode cost already reflects peak (0.30 per million input); the router must not double it.
+    const message = {
+      role: "assistant", provider: "commandcode", model: "deepseek/deepseek-v4.1-flash", timestamp: Date.parse("2026-10-12T07:10:00Z"),
+      usage: { input: 70_312, output: 1945, cacheRead: 3456, cacheWrite: 0, totalTokens: 75_713,
+        cost: { input: 0.0210936, output: 0.001167, cacheRead: 0.0000104, cacheWrite: 0, total: 0.0222710 } },
+    };
+    const ctx = { modelRegistry: { find: () => ({ cost: { input: 0.3, output: 1.2, cacheRead: 0.006, cacheWrite: 0 } }) } };
+    let replaced: { usage: { cost: { total: number; input: number }; peakMultiplier?: number } } | undefined;
+    for (const handler of handlers) {
+      const result = handler({ type: "message_end", message }, ctx) as { message?: typeof replaced } | undefined;
+      if (result?.message) replaced = result.message;
+    }
+    expect(replaced).toBeDefined();
+    expect(replaced!.usage.cost.input).toBeCloseTo(0.0210936);
+    expect(replaced!.usage.cost.total).toBeCloseTo(0.022271);
+    expect(replaced!.usage.peakMultiplier).toBe(2);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("an off-peak message is returned unchanged and without the marker", () => {
   const dir = mkdtempSync(join(tmpdir(), "native-router-peak-"));
   try {
