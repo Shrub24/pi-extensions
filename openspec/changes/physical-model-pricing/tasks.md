@@ -1,24 +1,28 @@
 # Tasks
 
-## 1. Establish the supported pricing seam
+## 1. Pricing model and host decision
 
-- [ ] 1.1 Verify the exact supported Pi host's public physical-model registry API can update cost metadata before provider usage accounting; add a focused host-level test proving a resolved physical model receives rates before `Usage.cost` is computed, or document the blocking API gap and keep runtime application disabled.
-- [x] 1.2 Define and test a typed pricing snapshot containing exact physical `(provider, model)` identity, nullable rate components, USD-per-million units, source/provenance, catalog version, and retrieval time; assert absent cache rates remain unknown while explicit zero remains known.
+- [x] 1.1 Record that Pi 1.1.0 has no public single-model cost update; `registerProvider(name, {models})` replaces a provider's whole model list, so the router does not mutate the registry (design, Context and Decision 1).
+- [x] 1.2 Define and test a typed pricing snapshot with exact `(provider, model)` identity, nullable rate components, USD-per-million units, source, catalog version and retrieval time; absent cache rates stay unknown and explicit zero stays known.
 
-## 2. Bounded source refresh and mapping
+## 2. Bounded source refresh and lookup
 
-- [x] 2.1 Implement opt-in bounded fetch/cache of provider-specific models.dev API pricing records, strict input validation, version/retrieval metadata, and last-valid-snapshot retention; verify with deterministic fixtures for valid, malformed, oversized, and unavailable responses.
-- [x] 2.2 Implement exact provider/model mapping and exact-key local override precedence, preserving source provenance; test same-name/different-provider models do not cross-map and unknown model records remain untouched.
-- [x] 2.3 Document source semantics, units, mapping/override configuration, cache bounds, opt-in refresh, and the fact catalog estimates are not billed cost; verify examples use provider-specific identities and distinguish missing from explicit zero.
+- [x] 2.1 Implement opt-in bounded fetch of models.dev provider records and LiteLLM's map (20 s, 12 MB, redirects refused), strict validation, and last-valid snapshot retention; verify with fixtures for valid, malformed, oversized and unavailable responses.
+- [x] 2.2 Implement exact provider/model lookup and exact-key `pricing.overrides` precedence with provenance; test that same-name models under other providers do not cross-map and unknown records stay untouched.
+- [x] 2.3 Document source semantics, units, override configuration, cache bounds, the `/pricing` commands, and that estimates are not billed cost, with provider-specific examples that distinguish missing from explicit zero.
 
-## 3. Apply native physical rates and verify accounting
+## 3. Reconciliation rules
 
-- [ ] 3.1 On the supported host seam only, apply complete applicable frozen rate sets to the resolved physical model before usage calculation; verify dispatch performs no catalog network access, does not expose credentials, and routing selection is unchanged.
-- [ ] 3.2 Add targeted native accounting tests for input/output/cache-read/cache-write arithmetic in USD per million, including zero, partial/missing cache rates, incomplete totals, and no accidental unknown-as-free behavior; assert provider-reported usage cost is not overwritten.
-- [ ] 3.3 If the public host seam is unavailable, test that the integration reports the feasibility limitation and leaves native model costs unchanged; keep this as an explicit blocker rather than mutating private registry internals.
+- [ ] 3.1 Decide the backfill rule (design, open decision 3; option B recommended) and record the decision in the design and the spec before implementing it. Record the choice here with its date.
+- [ ] 3.2 Implement the chosen backfill rule in the `message_end` reconciliation. Tests: a priced registry model is never overwritten; a placeholder zero with a complete nonzero exact record is backfilled (if option B); a genuine zero with a zero record stays zero; a partial or tiered record is not applied; a provider-reported cost is never overwritten.
+- [x] 3.3 Peak adjustment for the listed DeepSeek models in the published windows, with `peakMultiplier` set. Covered by handler-driven tests in `peak-cost.test.ts`. Live confirmation is tracked in 5.1.
 
 ## 4. Telemetry provenance and integration
 
-- [ ] 4.1 Add targeted pi-otel tests proving it exports the supplied `Usage.cost.total` without independent recalculation and exposes estimated/catalog provenance only through a supported metadata path; verify provider-reported amounts remain distinguishable from estimates.
-- [ ] 4.2 Run focused native-accounting and telemetry integration tests with one frozen mapped price snapshot; verify token components produce the same native total and telemetry total, and assert catalog estimates are not labeled as invoice, actual charge, subscription cost, or provider-billed cost.
-- [ ] 4.3 Verify the pricing component can be enabled/disabled independently of account/shared-health work and without native-router activation; document rollback and confirm disabled/unmapped configurations preserve existing behavior.
+- [ ] 4.1 Attach catalog and override provenance (`pi.pricing.source`) to backfilled usage in the router, and export it in pi-otel next to `gen_ai.usage.cost` without recalculating cost. Tests: catalog estimate is tagged; recorded and peak-only cost carry no catalog tag; the peak multiplier still exports.
+- [ ] 4.2 Integration test with one frozen snapshot: the native total and the exported total match, and no exported estimate is labelled as invoice, actual charge or subscription cost.
+- [ ] 4.3 Confirm disabled or unmapped configurations preserve current costs. Document rollback: delete the snapshot or disable the handler.
+
+## 5. Live confirmation
+
+- [ ] 5.1 On live OpenCode Go DeepSeek traffic, confirm a weekday peak-window request carries `peakMultiplier` 2 and the doubled cost, and an off-peak request does not.

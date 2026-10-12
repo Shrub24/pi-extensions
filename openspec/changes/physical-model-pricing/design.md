@@ -2,38 +2,41 @@
 
 ## Context
 
-See proposal.md - Why. Pi's provider/model registry resolves physical models before request dispatch. The inspected Pi 1.1.0 `ModelRegistry` facade exposes synchronous physical `find(provider, modelId)` and refresh/auth/virtual-model APIs, but no public price mutation method. In the installed pi-ai runtime, usage cost is calculated from `model.cost` rates per million tokens (including cache read/write); the model shape has numeric rates and cannot by itself encode an unknown component. pi-otel's `SpanTracker` accumulates and exports `Usage.cost.total` from the assistant message; its tracker is not an independent calculator. Thus a supported safe seam to update physical model rates is a feasibility gate, not an established host capability.
+See proposal.md. Pi 1.1.0 computes `Usage.cost` on each assistant message from the physical model's `cost` rates per million tokens (input, output, cache read, cache write), and pi-otel exports the reported total. Its public `ModelRegistry` exposes `find`, but no method updates one model's cost. The only registration seam, `registerProvider(name, {models})`, replaces every model of the provider, cost included, so using it to change one price means re-registering the provider's whole list. The router therefore reconciles cost after the fact, on the finalized message, and leaves the registry alone.
 
-The models.dev API provides provider-specific model records and pricing fields; its model-only `models.json` is not a substitute for provider-specific pricing. Catalog records do not establish what a provider billed an account. Existing Pi host types and internal registry implementation should be rechecked against the supported exact Pi release when implementing; no undocumented internals are assumed here.
+The catalog sources are estimates of list price. They do not establish what a provider billed an account.
 
 ## Goals / Non-Goals
 
-**Goals:** Define an independently deployable, opt-in price metadata source, mapping, snapshot, and application contract; maintain consistent native `Usage.cost` and OTel visibility when a supported application seam exists; preserve source and estimate semantics.
+**Goals:** Keep Pi's recorded cost primary. Apply catalog backfill and peak adjustment as explicit, tagged adjustments on the finalized message. Keep refresh bounded and off the dispatch path. Keep unknown prices unknown.
 
-**Non-Goals:** Price-aware routing, choosing among models, provider/account invoice reconciliation, subscriptions, broad capability metadata overrides, OTel-side cost arithmetic, secrets/auth transport, cache warming, or changing router-cache lifecycle.
+**Non-Goals:** Changing the registry or any model's cost through it, price-aware routing, invoice or subscription reconciliation, a second cost calculator in pi-otel, caching or warming requests, and credentials.
 
 ## Decisions
 
-1. **Separate refresh from dispatch.** A pricing component loads and validates a bounded catalog snapshot outside request dispatch; callers use the last valid frozen snapshot. This avoids network activity in route callbacks and keeps dispatch behavior deterministic. Reject on-demand dispatch-time catalog fetching and background polling as unnecessary complexity; refresh cadence and storage remain bounded configuration choices.
+1. **Pi's recorded cost is primary.** `message_end` may replace `usage` only for the documented adjustments below. Provider-reported or Pi-computed cost is never overwritten by a catalog estimate that Pi's registry already prices.
 
-2. **Provider-specific source and exact mappings.** Use the models.dev provider API records, not model-only `models.json`, and require explicit exact `(provider, model)` mapping to a catalog record. Local overrides are exact-keyed and take precedence with explicit provenance. Do not guess aliases by name similarity: provider namespaces and model variants may have different rates.
+2. **Refresh is separate from dispatch.** `/pricing refresh` fetches models.dev provider records (bounded: 20 s, 12 MB, redirects refused) and LiteLLM's map, validates them, and keeps the last valid snapshot at `$PI_CODING_AGENT_DIR/pi-native-router/pricing.json` with mode `0600`. Dispatch reads only that file. No background polling.
 
-3. **Normalize to USD per million tokens without losing unknowns.** Preserve distinct input, output, cache-read, and cache-write components. Validate finite nonnegative numbers but represent absent components as unknown in the pricing domain model. Since Pi's current cost-rate shape expects numeric values and computes a total, never coerce unknown to zero for an advertised complete estimate. Apply a rate set only when all components needed for the requested accounting semantics are known, or mark the resulting amount incomplete/unknown through a supported explicit path. An explicit source zero remains a valid known zero.
+3. **Open decision: when does a catalog price fill in for Pi's recorded price?** The current code calls the backfill only when `ctx.modelRegistry.find` returns no model (`piModel?.cost !== undefined` is false). Pi registers every model it knows with a cost object, so for every model in our routes the backfill never runs. The intended rule is unresolved. Two options:
+   - **A. Missing model only (current effective behaviour).** The backfill fills in only for models absent from Pi's registry. Simple, and it matches the code, but it leaves the backfill with no effective case for our routes.
+   - **B. Missing or placeholder price.** The backfill also applies when Pi's registry cost is all zero and the snapshot holds a complete, nonzero record for the exact provider/model. An explicit zero from a complete catalog record that is also zero stays zero, so genuinely free models such as `opencode-go/longcat-2.5-preview-free` are not repriced.
+   Recommendation: B, because it is the only option that backfills a placeholder. The choice must be made before tasks 3.1 and 3.2 are implemented. Until then the spec states the requirement without picking an option.
 
-4. **Prefer a supported physical-model update seam; do not mutate hidden registry state.** Investigate and use a public host API that can update cost metadata on the actual resolved physical model before native usage accounting. Registry `find` returns a model, but mutating that object is not established as safe or stable by its public API. A virtual model wrapper or price-sensitive router policy is not an equivalent substitute. If no safe supported seam exists, keep runtime application disabled pending host support rather than patching private runtime internals or claiming price agreement.
+4. **Exact mapping and overrides.** Lookup is by exact `provider/model` key in the snapshot, with `pricing.overrides` taking precedence and recording its own provenance. Name similarity never maps a model. Tiered records are reported partial and are not applied.
 
-5. **Reuse native cost production, not a second calculator.** Once supported metadata application is proven, Pi remains the sole calculator of `Usage.cost`; pi-otel continues exporting that supplied cost and token usage. Attach snapshot provenance/estimated status through a supported metadata/telemetry path, without presenting catalog rates as a provider-reported bill. A separate OTel calculator is rejected because it can diverge from provider-specific usage arithmetic and duplicate cost.
+5. **Peak adjustment.** OpenCode Go's `deepseek-v4-flash`, `deepseek-v4-pro`, `deepseek-v4.1-flash` (and the vision and `deepseek-flash` aliases) are doubled on weekdays 01:00–04:00 and 06:00–10:00 UTC, using the published DeepSeek windows. Weekends are off-peak. The adjustment sets `peakMultiplier: 2`, which pi-otel exports as `pi.pricing.peak_multiplier`. The schedule has been tested by driving handlers, not against live traffic.
 
-6. **Independent packaging and rollout.** Prefer an independently usable pricing extension/component with explicit opt-in and local settings, not a hard dependency on the native router. Router integration may be optional only if it can consume the physical metadata without owning catalog refresh or changing selection. This change has no account/shared-health prerequisite.
+6. **Tag catalog-derived cost.** A catalog backfill is marked with a provenance value such as `pi.pricing.source = "catalog"` (and `"override"` for local overrides). Pi-recorded cost and peak-adjusted Pi cost are left without a catalog tag. pi-otel exports the tag next to `gen_ai.usage.cost`. It does not recalculate cost.
 
 ## Risks / Trade-offs
 
-- [Catalog prices may be stale or differ from an account's negotiated billing] → label all catalog-derived values as estimates and expose source revision/retrieval time; never claim billed cost.
-- [Current Pi host may not expose a safe physical cost update API] → feasibility gate is a release blocker for runtime application; do not use hidden mutation as a workaround.
-- [Pi's numeric cost structure may force absent rates into zero] → do not apply incomplete price sets as complete estimates; preserve unknown/incomplete status outside that numeric structure or defer runtime application.
-- [Models.dev schema changes or omits cache prices] → validate source fields strictly, bound cache size, retain last valid snapshot, surface source failure, and leave missing rates unknown.
-- [A catalog rate might overwrite provider-reported semantics] → only update model metadata before usage calculation and retain provenance; never overwrite a provider-supplied usage result in telemetry.
+- [Catalog price differs from the account's real rate] → Catalog-derived values are labelled as estimates with the snapshot's retrieval time. They are never presented as billed cost.
+- [Option A leaves the backfill inert] → Decision 3 must be resolved explicitly; the spec does not claim the backfill is active until it is.
+- [Peak schedule changes or is wrong] → Schedule is hard-coded from published DeepSeek windows; verify on live traffic before relying on its totals.
+- [Model that Pi prices at zero really is free] → Option B only fills a zero from a complete, nonzero catalog record for the exact key.
+- [Source schema changes] → Validate strictly, retain the last valid snapshot, and surface failures.
 
 ## Migration Plan
 
-No default behavior changes: without explicit enablement/mapping, model metadata and current native/OTel usage costs remain untouched. Roll out first with validation/preview of a bounded snapshot, then enable only after targeted accounting tests and host seam verification. Rollback disables the pricing component and restores ordinary registry metadata/configuration; do not persistently rewrite provider catalogs or activate deployments as part of this plan. This rollout is independent of account/shared-health work.
+Without a snapshot, without overrides and outside peak windows, the router changes no cost. `/pricing refresh` only writes the snapshot file. Rollback deletes the snapshot or disables the pricing handler; Pi's native cost then applies unchanged. Nothing rewrites provider catalogs or activates a deployment as part of this change.

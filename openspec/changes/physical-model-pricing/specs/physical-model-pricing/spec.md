@@ -2,71 +2,92 @@
 
 ## Purpose
 
-Define how explicit physical-model price metadata is sourced, mapped, applied, and surfaced consistently for native usage accounting and telemetry without treating estimates as provider-billed cost.
+Define how price data is sourced and applied as documented adjustments to native physical-model usage cost, and how that cost is labelled in telemetry. Catalog and peak-derived values are estimates and are never presented as provider-billed cost.
 
 ## ADDED Requirements
 
-### Requirement: Bounded catalog pricing snapshots
-The system MUST refresh pricing only from an explicitly configured, provider-specific catalog source using a bounded cached snapshot. Refresh MUST be separate from route selection and provider dispatch. Catalog data MUST retain its source identity/version and retrieval time. The system MUST NOT treat models.dev data as billed provider cost.
+### Requirement: Bounded catalog snapshots
+The system MUST refresh catalog prices only through an explicit `/pricing refresh`, from provider-specific catalog records, using a bounded fetch. Refresh MUST be separate from route selection and provider dispatch. Each stored snapshot MUST retain its source identity and retrieval time. Catalog data MUST NOT be treated as billed provider cost.
 
-#### Scenario: Catalog snapshot is available
-- **WHEN** an enabled refresh obtains valid pricing records from the configured models.dev provider API
-- **THEN** the system stores a bounded snapshot with source, catalog version or equivalent source revision, and retrieval timestamp
-- **AND** the refresh does not initiate model traffic or affect candidate selection
+#### Scenario: Snapshot is available
+- **WHEN** a refresh obtains valid records from the configured catalog source within its bounds
+- **THEN** the system stores a snapshot with the source and retrieval time
+- **AND** the refresh initiates no model traffic and does not affect candidate selection
 
 #### Scenario: Refresh is unavailable or invalid
-- **WHEN** the source is unavailable, malformed, or exceeds the configured bound
-- **THEN** the system retains the last valid snapshot if present, reports the refresh failure, and does not replace prices with zero
+- **WHEN** the source is unavailable, malformed or larger than its bound
+- **THEN** the system keeps the last valid snapshot, reports the failure, and does not replace prices with zero
 
-### Requirement: Exact physical model mapping and overrides
-The system MUST apply catalog rates only through explicit exact provider-and-model mappings or explicit local overrides. It MUST NOT match by model name alone, fuzzy aliases, virtual-model identity, or a broad capability catalog. A local override MUST take precedence for the exact mapped physical model and MUST retain its own provenance.
+### Requirement: Exact physical model lookup and overrides
+The system MUST look up catalog prices only by exact `provider/model` key, with explicit local overrides taking precedence for that key. It MUST NOT match by model name alone, fuzzy alias, virtual route identity or broad capability catalog. An override MUST retain its own provenance.
 
-#### Scenario: Exact provider/model mapping
-- **WHEN** a physical provider/model pair has an explicit mapping to a valid catalog record
-- **THEN** only that physical model may receive the mapped rates
-- **AND** a similarly named model under another provider remains unchanged
+#### Scenario: Same name under another provider
+- **WHEN** a model name exists under two providers in the catalog
+- **THEN** only the exact provider's record applies to a request for that provider
 
 #### Scenario: Local override
-- **WHEN** a valid local override exists for an exact physical provider/model pair
-- **THEN** its rates are used instead of catalog rates and provenance identifies the override source
+- **WHEN** a valid override exists for an exact provider/model key
+- **THEN** its rates are used instead of catalog rates and provenance identifies the override
 
-### Requirement: Explicit units and cache-price completeness
-The system MUST represent rates as USD per one million tokens, independently for input, output, cache read, and cache write. The system MUST distinguish an explicitly supplied numeric zero from an absent or unknown rate. It MUST treat missing required rates as unknown, not free, and MUST NOT calculate a complete total from incomplete rates as though missing components were zero.
+### Requirement: Units and price completeness
+The system MUST represent rates as USD per one million tokens, separately for input, output, cache read and cache write. It MUST distinguish an explicit numeric zero from an absent rate. A missing rate MUST make the affected amount unknown or partial, never free. A tiered record without a supported tier MUST NOT be applied as complete.
 
-#### Scenario: Complete prices
-- **WHEN** all applicable rate components are known and usage is available
-- **THEN** native Pi cost calculation uses USD-per-million rates with the matching input, output, cache-read, and cache-write usage components
-- **AND** the result is explicitly identified as estimated catalog-derived cost
+#### Scenario: Complete record
+- **WHEN** all rate components needed by the observed usage are known
+- **THEN** the catalog estimate is computed from the matching usage components in USD per million tokens
 
-#### Scenario: Missing or partial cache rates
-- **WHEN** the catalog provides ordinary input/output rates but omits a cache-read or cache-write rate required by observed usage
-- **THEN** the affected estimated total is unknown or explicitly incomplete, never silently priced as zero
+#### Scenario: Missing cache rate
+- **WHEN** a record omits a cache-read or cache-write rate and the observed usage includes that component
+- **THEN** the estimate is reported as partial or unknown, not priced as zero
 
-#### Scenario: Explicit zero rate
-- **WHEN** the source explicitly supplies a zero rate for a component
-- **THEN** that component is distinguishable from a component whose rate is absent
+#### Scenario: Explicit zero
+- **WHEN** the source explicitly supplies a zero rate
+- **THEN** the component is treated as a known zero, distinct from an absent rate
 
-### Requirement: Safe physical metadata application
-The system MUST apply one frozen price snapshot to the supported physical model metadata before native usage cost calculation, without exposing credentials or changing routing behavior. If the supported Pi host cannot safely apply an updated snapshot before usage calculation, runtime application MUST remain disabled and the limitation MUST be reported rather than claiming native and telemetry agreement.
+### Requirement: Recorded cost stays primary
+The system MUST treat Pi's recorded cost for a finalized assistant message as the primary cost. A catalog price MUST fill in only where the requirement for backfill is met (see the backfill requirement below). The system MUST NOT modify the physical model registry to change a model's price.
 
-#### Scenario: Snapshot applied before usage
-- **WHEN** a mapped physical model is resolved for a request and host feasibility is established
-- **THEN** native Pi usage accounting receives the snapshot's model cost rates before calculating Usage.cost
-- **AND** virtual routing selection remains independent of price
+#### Scenario: Pi prices the model
+- **WHEN** Pi's registry supplies a price for the physical model
+- **THEN** the catalog snapshot does not replace Pi's recorded cost
 
-#### Scenario: Host cannot safely apply snapshot
-- **WHEN** supported host APIs cannot update physical model rates before usage accounting
-- **THEN** the pricing integration does not mutate routing or claim that native costs use catalog rates
-- **AND** the host feasibility limitation remains visible
+#### Scenario: Registry is not mutated
+- **WHEN** a price adjustment is applied
+- **THEN** only the finalized message's usage is replaced, and no provider's model list is re-registered
 
-### Requirement: Provenance and estimated-cost semantics
-Every catalog-derived or locally overridden price MUST carry provenance and version/retrieval information sufficient to identify the basis of its estimate. Catalog-derived estimated cost MUST remain distinguishable from provider-reported usage cost and subscription/account billing amounts. The system MUST NOT describe an estimate as an invoice, actual charge, or subscription cost.
+### Requirement: Catalog backfill
+The system MUST backfill a catalog estimate for a physical model only when the backfill rule in the design (open decision 3) is met and the record is complete for the observed usage. The rule MUST be fixed before this requirement is claimed as active. Until it is, no catalog backfill is reported as in effect.
 
-#### Scenario: Estimated cost is exported
-- **WHEN** Pi reports usage cost derived from applied catalog pricing
-- **THEN** telemetry may export Pi's existing Usage.cost fields without independently recalculating cost
-- **AND** the associated price provenance and estimated-versus-reported distinction remain available to consumers
+#### Scenario: Backfill applies
+- **WHEN** the backfill rule is met and a complete exact record exists
+- **THEN** the finalized usage cost is replaced with the catalog estimate and tagged with catalog provenance
 
-#### Scenario: Provider-reported amount exists
-- **WHEN** a provider integration supplies its own usage cost
-- **THEN** that amount is not silently overwritten or relabeled as catalog-derived billing evidence
+#### Scenario: Backfill does not apply
+- **WHEN** the backfill rule is not met or the record is partial
+- **THEN** the recorded cost stays as it is and no catalog provenance is attached
+
+### Requirement: Time-of-day peak adjustment
+The system MUST double the recorded cost of OpenCode Go's DeepSeek models during the published weekday peak windows (01:00–04:00 and 06:00–10:00 UTC), set the usage's peak multiplier to 2, and leave every other model and every weekend unchanged.
+
+#### Scenario: Peak window
+- **WHEN** a DeepSeek model finishes a message on a weekday between 01:00 and 04:00 UTC
+- **THEN** each recorded cost component is doubled and the peak multiplier is 2
+
+#### Scenario: Off-peak or other model
+- **WHEN** the model is not a listed DeepSeek model, or the time is a weekend or outside the windows
+- **THEN** the recorded cost is unchanged and no peak multiplier is set
+
+### Requirement: Provenance and estimate semantics in telemetry
+Telemetry MUST export Pi's reported `gen_ai.usage.cost` without independent recalculation. A catalog or override estimate MUST carry a provenance attribute so consumers can tell it from Pi-recorded cost. The system MUST NOT describe any estimate as an invoice, actual charge, or subscription cost.
+
+#### Scenario: Catalog estimate exported
+- **WHEN** a finalized message carries catalog backfill
+- **THEN** pi-otel exports the cost with the catalog provenance attribute set
+
+#### Scenario: Recorded or peak cost exported
+- **WHEN** the cost is Pi-recorded, with or without a peak multiplier
+- **THEN** no catalog provenance is attached, and the peak multiplier is exported when set
+
+#### Scenario: Provider-reported amount
+- **WHEN** a provider supplies its own usage cost
+- **THEN** the amount is not overwritten or relabelled as catalog-derived

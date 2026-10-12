@@ -9,6 +9,12 @@
 - `bun run typecheck` passes; `bun test tests` 69 pass.
 - Live refresh against models.dev and LiteLLM: 11,236 records, no failures. `anthropic/claude-haiku-4-5` complete; `opencode-go/mimo-v2.5` partial (no cache-write rate); `opencode-go/claude-haiku-4-5` unpriced.
 
-## Not done (blocked on host seam, task 1.1)
-- Prices are not applied to Pi's native `Usage.cost` or to OTel. The inspected Pi 1.1.0 registry exposes no public price-update API, so runtime application stays disabled. No private mutation was used.
-- Tiered pricing is reported as partial and is not applied.
+## Reconciliation as built
+- `message_end` keeps Pi's recorded cost and applies the peak multiplier for OpenCode Go DeepSeek models in the published windows (`pi-native-router/src/pricing/reconcile.ts`).
+- The catalog backfill runs only when Pi's registry returns no model for the physical key. Pi registers every model it knows with a cost object, so the backfill does not run for models in our routes. No test exercises it with a registered model. The rule is an open decision (design, decision 3).
+
+## Not done
+- The backfill rule is undecided (task 3.1), so its behaviour is not claimed as active.
+- No catalog provenance is exported yet (task 4.1).
+- Peak adjustment has not been checked on live traffic (task 5.1).
+- Registry-level price application was rejected (design, Context). No host seam is used.

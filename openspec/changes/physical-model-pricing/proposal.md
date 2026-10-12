@@ -2,24 +2,27 @@
 
 ## Why
 
-Native Pi computes `Usage.cost` from the selected physical model's `cost` rates, while pi-otel exports the reported `usage.cost.total`; incomplete or zero placeholder rates therefore make native usage accounting and telemetry misleading. Add an optional, auditable catalog-derived price snapshot that updates physical model metadata before use, while keeping unknown prices unknown and preserving provider-reported usage as authoritative telemetry.
+Pi computes `Usage.cost` for each assistant message from the selected physical model's own cost rates, and pi-otel exports that reported total. Pi's own rates are the primary source and stay so. Two cases still need pricing from outside Pi: a model whose recorded price is missing, and a provider whose time-of-day pricing Pi does not model (OpenCode Go's DeepSeek peak windows). The router already handles the second with a fixed multiplier. The first is handled by a catalog backfill that does not yet run for models Pi knows (see design, Decision 3).
+
+Pi 1.1.0 offers no public API that updates one model's cost. Replacing a provider's model list to change a price would risk the provider's other models, so this change does not mutate Pi's registry.
 
 ## What Changes
 
-- Add opt-in, bounded refresh of provider-specific pricing data from models.dev, with explicit exact provider/model mappings and local overrides.
-- Apply a frozen price snapshot to supported physical model cost metadata so Pi's existing native accounting and pi-otel observe the same `Usage.cost` result.
-- Represent USD per-million-token input, output, cache-read, and cache-write rates with provenance/version and retrieval time; do not infer zero/free prices from missing data.
-- Keep refresh separate from routing/dispatch and avoid credential transport or price-based route selection.
-- Gate activation on verifying that the supported Pi host can safely update pricing metadata before usage calculation; otherwise retain a documented host-feasibility gate and do not promise runtime application.
+- Keep Pi's recorded `Usage.cost` as the primary cost for every physical model. Pricing is applied to a finalized message only as a documented adjustment, and the router never edits the model registry.
+- Keep the existing opt-in, bounded refresh of provider-specific catalog records (models.dev, with LiteLLM as a fallback for exact provider/model keys it holds), stored as a last-valid snapshot. Refresh runs only on `/pricing refresh`, never on dispatch.
+- Decide and implement when a catalog price may fill in for Pi's recorded price, then test it (see design, open decision).
+- Keep the time-of-day peak multiplier for OpenCode Go DeepSeek models, exported through `pi.pricing.peak_multiplier`.
+- Tag catalog-derived cost so telemetry distinguishes it from Pi-recorded and peak-adjusted cost.
+- Keep unknown and partial prices unknown rather than free.
 
 ## Capabilities
 
 ### New Capabilities
-- `physical-model-pricing`: Maintain and apply explicit, provenance-bearing catalog price metadata for native physical models and downstream usage telemetry.
+- `physical-model-pricing`: Maintain explicit, provenance-bearing price data and apply it as documented adjustments to native physical-model usage cost, without treating any estimate as billed cost.
 
 ### Modified Capabilities
-- None. The existing capability inventory has no pricing capability.
+- None.
 
 ## Impact
 
-Planning affects a prospective pricing extension/integration, Pi 1.1.0 physical model registry and usage cost calculation, and pi-otel's existing `Usage.cost` export. The models.dev API is an external catalog source, not provider billing evidence. No router selection policy, subscription accounting, credentials, deployment activation, or external account/quota design changes are included. This work can roll out independently and has no account/shared-health prerequisite.
+Affects `pi-native-router` (pricing catalog, reconciliation in the `message_end` handler, `/pricing` commands) and pi-otel's export of the reconciled cost and its provenance attribute. No change to route selection, credentials, shared health, quota tracking or deployment activation. Pricing has no account or shared-health prerequisite and can be disabled without affecting routing.
