@@ -9,12 +9,13 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream, type AssistantMessage } from "@earendil-works/pi-ai";
 import { installRouter } from "../src/index";
+import { HealthStore } from "../src/health-store";
 import { cacheExpiry } from "../src/policy";
 import { parseConfig } from "../src/config";
 import { nativeHttpError } from "./native-error";
 
 type Outcome = "ok" | "quota" | "transient" | "partial" | "abort" | "tool" | "bad" | 401 | 403 | 429;
-async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateThinking?: "off" | "low" | "medium" | "high"; retry?: boolean; flush?: "failed" | "absent"; maxRecoveries?: number; maxTransitions?: number; smaller?: boolean; manager?: SessionManager; packaged?: boolean; unauthedFirst?: boolean; ttl?: number; startTime?: number; clock?: { value: number }; accounts?: boolean } = {}) {
+async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateThinking?: "off" | "low" | "medium" | "high"; retry?: boolean; flush?: "failed" | "absent"; maxRecoveries?: number; maxTransitions?: number; smaller?: boolean; manager?: SessionManager; packaged?: boolean; unauthedFirst?: boolean; ttl?: number; startTime?: number; clock?: { value: number }; accounts?: boolean; healthPath?: string } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "native-router-"));
   const settings = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: opts.retry ?? false, maxRetries: 3, baseDelayMs: 1 }, cacheWarming: "off" });
   const runtime = await ModelRuntime.create({ authPath: join(dir, "auth.json"), modelsPath: null, refreshOnCreate: false });
@@ -74,7 +75,7 @@ async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateT
         if (pending) { pending = false; materialized = true; order.push("materialized"); }
         return materialized ? { messages: [...event.messages, { role: "user", content: "MATERIALIZED DROP RESULT", timestamp: 1 }] } : undefined;
       });
-      if (!opts.packaged) installRouter(pi, config, { now, healthPath: join(dir, "health.sqlite") });
+      if (!opts.packaged) installRouter(pi, config, { now, healthPath: opts.healthPath ?? join(dir, "health.sqlite") });
       pi.events.on("native-router:transition", () => order.push("transition"));
     }],
   });
@@ -343,6 +344,42 @@ test("abort during transition handshake prevents replacement and settles the nat
   h.api.events.on("magic-context:flush", () => { void h.session.abort(); });
   try { await h.session.prompt("abort flush"); expect(h.dispatches).toHaveLength(1); expect(h.order).not.toContain("transition"); expect(h.session.isStreaming).toBe(false); }
   finally { h.close(); }
+});
+
+test("a quota block recorded by one session steers another on the shared store, survives a restart, and then admits one recovery probe", async () => {
+  const shared = mkdtempSync(join(tmpdir(), "native-router-shared-"));
+  const healthPath = join(shared, "health.sqlite");
+  const clock = { value: 1000 };
+  try {
+    const first = await host(["quota", "ok"], { healthPath, clock });
+    try {
+      await first.session.prompt("first session discovers the quota block");
+      expect(first.dispatches.map(d => d.physical)).toEqual(["fake-a", "fake-b"]);
+    } finally { first.close(); }
+
+    const second = await host(["ok"], { healthPath, clock });
+    try {
+      await second.session.prompt("second session skips the blocked account");
+      expect(second.dispatches.map(d => d.physical)).toEqual(["fake-b"]);
+    } finally { second.close(); }
+
+    clock.value += 60_000;
+    const restarted = await host(["ok"], { healthPath, clock });
+    try {
+      await restarted.session.prompt("restarted session still skips it before the reset deadline");
+      expect(restarted.dispatches.map(d => d.physical)).toEqual(["fake-b"]);
+    } finally { restarted.close(); }
+
+    clock.value += 300_000;
+    const probing = await host(["ok"], { healthPath, clock });
+    try {
+      await probing.session.prompt("after the deadline one session probes the recovered account");
+      expect(probing.dispatches.map(d => d.physical)).toEqual(["fake-a"]);
+    } finally { probing.close(); }
+    const store = new HealthStore(healthPath, () => clock.value);
+    expect(store.blocked(["fake-a"])).toBeUndefined();
+    store.close();
+  } finally { rmSync(shared, { recursive: true, force: true }); }
 });
 
 test("named accounts activate their own key on fallback and the native provider still dispatches", async () => {

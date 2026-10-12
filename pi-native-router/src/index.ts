@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { readConfig, type Config, type RouteConfig } from "./config";
 import { accountActive, accountSecret, readAccountKey, useAccount } from "./accounts";
 import { HealthStore } from "./health-store";
+import { healthReport, type HealthMode } from "./health-report";
 import { defaultDecisionLogPath, recordDecision, type DecisionReason } from "./decision-log";
 import { codexbarRunner, formatRemaining, formatUsed, QUOTA_FRESH_MS, quotaScopeKey, refreshQuota, type QuotaSnapshot, type QuotaSource, usageBar } from "./quota";
 import { codexbarConfigPath, generateCodexbarConfig, readCodexbarConfig, writeCodexbarConfig } from "./codexbar-config";
@@ -366,23 +367,29 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     },
   });
   pi.registerCommand("native-router-health", {
-    description: "Inspect shared native-router health, or reset one account: /native-router-health [reset <account>]",
+    description: "Inspect native-router health, or reset one account: /native-router-health [reset <account>]",
     handler: async (args, ctx) => {
-      if (!store) { ctx.ui.notify("native-router: shared health is disabled or unavailable; only process-local health applies", "warning"); return; }
+      const mode: HealthMode = store ? "shared" : config.sharedHealth ? "degraded-local" : "local-only";
       const reset = args.trim().match(/^reset\s+([a-z][a-z0-9_-]{0,31})$/);
       if (args.trim() && !reset) { ctx.ui.notify("usage: /native-router-health [reset <account>]", "error"); return; }
-      if (reset) {
-        const changed = store.resetAccount(reset[1]);
-        ctx.ui.notify(`native-router: reset account ${reset[1]} (${changed} cause record${changed === 1 ? "" : "s"} cleared; other accounts and provider outages unchanged)`, "info");
+      if (!store) {
+        const message = mode === "local-only"
+          ? "native-router: sharedHealth is disabled; only process-local health applies, nothing is shared"
+          : "native-router: shared health store is unavailable; only process-local health applies, nothing is shared";
+        ctx.ui.notify(message, reset ? "error" : "warning");
         return;
       }
-      const state = store.inspect();
-      const now = options.now?.() ?? Date.now();
-      const lines = [`native-router shared health (revision ${state.revision}, shared)`];
-      for (const cause of state.causes) lines.push(`  ${cause.key}: ${cause.kind} until ${new Date(cause.until).toISOString()}${cause.until <= now ? " (expired, probe eligible)" : ""}`);
-      for (const lease of state.leases) lines.push(`  probe ${lease.key}: held until ${new Date(lease.expires).toISOString()}`);
-      if (state.causes.length === 0 && state.leases.length === 0) lines.push("  no active causes");
-      ctx.ui.notify(lines.join("\n"), "info");
+      try {
+        if (reset) {
+          const changed = store.resetAccount(reset[1]);
+          ctx.ui.notify(`native-router: reset account ${reset[1]} (${changed} cause record${changed === 1 ? "" : "s"} cleared; other accounts and provider outages unchanged; in-flight probes fenced)`, "info");
+          return;
+        }
+        ctx.ui.notify(healthReport(store.inspect(), options.now?.() ?? Date.now(), mode).join("\n"), "info");
+      } catch (error) {
+        degrade(error);
+        ctx.ui.notify(`native-router: shared health store failed (${error instanceof Error ? error.message : String(error)}); only process-local health applies`, "error");
+      }
     },
   });
   // Cost reconciliation for finished assistant messages, before pi-otel reads usage on turn_end.

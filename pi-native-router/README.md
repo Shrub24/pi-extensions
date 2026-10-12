@@ -90,7 +90,7 @@ Account and provider causes are shared across Pi processes of the same user on o
 - **Recovery** after a deadline admits exactly one probe per scope through an atomic lease (60 s, expiring if its holder crashes). Success clears only the causes the probe proved recovered; a newer failure, an operator reset or a late result cannot be erased by an older one.
 - **Partial output** from a quota or auth failure still records health, but the request is never replayed.
 - **Degradation:** if the store cannot be opened or accessed, routing keeps the process-local mirror and emits one `native-router:health-degraded` event per distinct error. Dispatch is not stalled by coordination.
-- **Inspect and reset:** `/native-router-health` lists causes and probe leases; `/native-router-health reset <account>` clears that account's causes and fences its in-flight probes.
+- **Inspect and reset:** `/native-router-health` lists causes with their reason and expiry, and probe leases. The header states the coordination mode: `shared`, `DEGRADED` (the store failed, so only process-local health applies), or `local-only` (`sharedHealth` is off). `/native-router-health reset <account>` clears that account's causes, leaves other accounts and provider-wide outages in place, and fences its in-flight probes.
 - **Rollback:** set `"sharedHealth": false` at the top level of the router configuration to return to process-local health. Parent and worker processes need the same setting to share state.
 
 ## Account quotas (CodexBar)

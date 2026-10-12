@@ -33,6 +33,24 @@ test("a quota cause written in one store is seen after reopening, and an account
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("an operator reset of one account leaves other accounts and provider outages intact", () => {
+  const root = dir();
+  try {
+    let now = 1000;
+    const store = new HealthStore(join(root, "health.sqlite"), () => now);
+    store.mark("opencode-go#go-a", "quota", now + 60_000, "quota");
+    store.mark("opencode-go/m#go-a", "rate", now + 60_000, "rate");
+    store.mark("opencode-go#go-b", "quota", now + 60_000, "quota");
+    store.mark("opencode-go", "transient", now + 60_000, "transient");
+    store.resetAccount("go-a");
+    expect(store.blocked(["opencode-go#go-a"])).toBeUndefined();
+    expect(store.blocked(["opencode-go/m#go-a"])).toBeUndefined();
+    expect(store.blocked(["opencode-go#go-b"])?.key).toBe("opencode-go#go-b");
+    expect(store.blocked(["opencode-go"])?.key).toBe("opencode-go");
+    store.close();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("a successful request admitted before a newer block cannot clear it", () => {
   const root = dir();
   try {

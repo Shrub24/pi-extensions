@@ -12,9 +12,23 @@
 - Real cross-process checks: two child processes share a block; three simultaneous probes after expiry yield exactly one grant.
 - `node:sqlite` probed under Node v24.21.0 and Bun; both read and write WAL correctly.
 
+## Completion round
+- `pi-native-router/src/health-report.ts`: pure, secret-free report with an explicit coordination mode (`shared`, `degraded-local`, `local-only`); causes show their reason and expiry; lease holders are never printed.
+- `pi-native-router/src/index.ts`: `/native-router-health` uses that report, labels a store that fails at runtime as degraded, and reports reset scope and probe fencing. `native-router-health` errors are caught and degrade rather than throw.
+- Dispatch integration (task 3.1): retry and failover selection (`resolve`), terminal recovery (`agent_before_settle`) and direct selection (`choose` over `activeOnly` candidates) all consult shared eligibility through `Health.eligible`, using the candidate's account. Direct requests take no probe admission and record no observations, by design.
+- Deployed runtime (task 2.1): the installed `pi-bolt` 0.8.4 binary reports runtime `bun v26.3.0`; a probe extension loaded through `-e` executed `node:sqlite` `DatabaseSync`, set WAL, created a table, inserted and read back a row (`ok rows=1`). The probe process exited 1 afterwards only because the global `tool-renderer` extension conflicts with the probe's environment; that is unrelated to the store.
+
+## Verification (completion round)
+- `bun test tests` in `pi-native-router`: 110 pass, 0 fail, Bun 1.4.2 under Node v24.21.0 host modules (5 new tests: report labels and reasons, lease-holder privacy, store reset leaves another account and a provider outage intact, and a router-level cross-session test).
+- `bun run typecheck`: clean.
+- `openspec validate router-shared-health --strict`: valid.
+
+## Coverage boundaries (be explicit when citing)
+- Router-level cross-session test (`host.test.ts`) runs separate Pi sessions and separate SQLite connections in one Bun process; it proves the shared store steers dispatch, survives reopening, and admits one probe after expiry.
+- True OS-process concurrency is covered at store level by `shared-health.test.ts` (child processes mark, block, and race admission: one grant out of three).
+- The `/native-router-health` handler itself is not driven through Pi's command runner; its output is covered through `healthReport` and its reset through `HealthStore.resetAccount`.
+- No live OpenCode Go traffic and no parent/worker smoke on the deployed install have been run.
+
 ## Not yet verified
-- Router-level two-process smoke (parent plus worker sessions sharing a block through dispatch) and a deployed Pi runtime check of `node:sqlite` (task 2.1, 4.1, 4.2).
-- Operator command output and reset are not covered by an automated test; store-level reset is.
-- Typed quota-observation boundary (task 3.3) is not built; `router-account-quotas` will add it.
-- Direct routing reads shared eligibility but takes no probe admission; that is deliberate.
-- Process-local fallback is covered only by the degradation unit test.
+- Parent and worker processes running the deployed package against one shared store (live smoke).
+- Live provider wording for quota and auth errors.
