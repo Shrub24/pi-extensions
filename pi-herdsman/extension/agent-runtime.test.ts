@@ -3768,6 +3768,7 @@ test("parent settlement waits for agent delivery and ignores result cleanup lag"
     ownerSessionId: parent.piSessionId,
     piSessionId: CHILD_SESSION_ID,
     piSessionFile: "/tmp/child-one.jsonl",
+    runId: randomUUID(),
   };
   const secondRequestId = randomUUID();
   const childTwo = {
@@ -3779,6 +3780,7 @@ test("parent settlement waits for agent delivery and ignores result cleanup lag"
     ownerSessionId: parent.piSessionId,
     piSessionId: "11111111-1111-4111-8111-111111111111",
     piSessionFile: "/tmp/child-two.jsonl",
+    runId: randomUUID(),
   };
   const thirdRequestId = randomUUID();
   const childThree = {
@@ -3790,6 +3792,7 @@ test("parent settlement waits for agent delivery and ignores result cleanup lag"
     ownerSessionId: parent.piSessionId,
     piSessionId: "22222222-2222-4222-8222-222222222222",
     piSessionFile: "/tmp/child-three.jsonl",
+    runId: randomUUID(),
   };
   const foreignChild = {
     ...managedState(
@@ -3801,6 +3804,7 @@ test("parent settlement waits for agent delivery and ignores result cleanup lag"
     ownerSessionId: parent.piSessionId,
     piSessionId: "33333333-3333-4333-8333-333333333333",
     piSessionFile: "/tmp/foreign-child.jsonl",
+    runId: randomUUID(),
   };
   const parentMailbox = agentMailboxPath(WORKSPACE, parent.agentLabel);
   const childOneMailbox = agentMailboxPath(WORKSPACE, childOne.agentLabel);
@@ -4612,12 +4616,7 @@ test("a stray agent variable does not suppress the active Lead tool surface", as
     "peer_list",
     "peer_message",
   ]);
-  assert.deepEqual(lead.commands, [
-    "manager",
-    "chief",
-    "agents",
-    "herdsman",
-  ]);
+  assert.deepEqual(lead.commands, ["chief", "agents", "herdsman"]);
   fireShutdown(lead);
 });
 

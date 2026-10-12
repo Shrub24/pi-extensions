@@ -71,6 +71,8 @@ import support, {
   ensureRadarDaemon,
   delegateRadarChild,
   listAgentStates,
+  drainRadarObserves,
+  settleRadarObserves,
   startRadarSession,
   startupExecutor,
   testChildCommand,
@@ -7490,9 +7492,9 @@ test("a digest entry for a worker awaiting an answer lists reply, not interrupt"
   });
   registerExtension!(pi.pi as never);
   t.mock.timers.enable({ apis: ["setTimeout"] });
+  const observed = await drainRadarObserves();
   await pi.events.get("session_start")![0](undefined, fakeContext(entries));
-  for (let index = 0; index < 4; index++)
-    await new Promise<void>((resolve) => setImmediate(resolve));
+  await settleRadarObserves(observed + 2);
   const digests = softDigests(pi);
   assert.equal(
     digests.length,
@@ -7784,9 +7786,9 @@ test("a resolved assignment is never included in a later digest", async (t) => {
     const pi = fakePi({});
     registerExtension!(pi.pi as never);
     t.mock.timers.enable({ apis: ["setTimeout"] });
+    const observed = await drainRadarObserves();
     await startRadarSession(pi, fakeContext());
-    for (let index = 0; index < 4; index++)
-      await new Promise<void>((resolve) => setImmediate(resolve));
+    await settleRadarObserves(observed + 3);
     assert.equal(
       pi.sent.filter(
         (message: any) => message.customType === "pi-herdsman-agent-lost",
@@ -7796,8 +7798,7 @@ test("a resolved assignment is never included in a later digest", async (t) => {
     );
     now += 30_000;
     t.mock.timers.tick(30_000);
-    for (let index = 0; index < 4; index++)
-      await new Promise<void>((resolve) => setImmediate(resolve));
+    await settleRadarObserves(observed + 4);
     assert.equal(
       softDigests(pi).length,
       0,

@@ -352,6 +352,26 @@ const DEFAULTS: RadarFakeOptions = {
  * to appear in the Herdr calls that started its pane; it now appears here, once
  * per launch, which is the same evidence in the transport that replaced it.
  */
+let observesStarted = 0;
+let observesCompleted = 0;
+
+/**
+ * Observe calls the daemon has received. A test that drains in-flight scans reads
+ * this against `radarObservesCompleted` to know none is still running.
+ */
+export function radarObservesStarted(): number {
+  return observesStarted;
+}
+
+/**
+ * Observe calls whose connection the client has closed. The client closes its socket
+ * only after it has read the reply, so a count that reaches a target names one scan
+ * the daemon answered and the client took in, across every daemon this process started.
+ */
+export function radarObservesCompleted(): number {
+  return observesCompleted;
+}
+
 export function spawnedArgvs(daemon: FakeRadarDaemon): string[][] {
   return daemon.spawns.map((spawn) => [...spawn.argv]);
 }
@@ -1111,6 +1131,10 @@ export async function startFakeRadarDaemon(
 
   const server: Server = createServer((socket) => {
     let buffer = "";
+    let servedObserve = false;
+    socket.on("close", () => {
+      if (servedObserve) observesCompleted++;
+    });
     socket.on("data", (chunk) => {
       buffer += chunk.toString("utf8");
       let end = buffer.indexOf("\n");
@@ -1128,6 +1152,8 @@ export async function startFakeRadarDaemon(
             params?: unknown;
           };
           if (envelope.method === "mux.observe") {
+            servedObserve = true;
+            observesStarted++;
             gate = observeGate;
             hold = observeHold;
             observeGate = undefined;

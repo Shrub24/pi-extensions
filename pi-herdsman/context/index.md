@@ -66,6 +66,8 @@ One entry per topic file; a topic sits under the heading of its first character.
 
 ## U
 
+- [unacknowledged-launch-holds-no-brief.md](unacknowledged-launch-holds-no-brief.md) — why an unacknowledged launch holds no brief and releases no reservation, and the missing Radar retirement contract
+
 ## V
 
 ## W

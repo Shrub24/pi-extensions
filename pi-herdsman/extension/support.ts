@@ -18,6 +18,8 @@ import {
   type BriefProfile,
 } from "./briefs.ts";
 import {
+  radarObservesCompleted,
+  radarObservesStarted,
   spawnedArgvs,
   spawnedEnvironmentAssignments,
   spawnedLabels,
@@ -330,6 +332,26 @@ export function radarObservedFleet(): {
     tabs: [...tabs.values()],
     panes,
     agents,
+  };
+}
+
+/**
+ * Makes the daemon's observation of one child carry the lifecycle status a test
+ * sets, as a live backend reports it. The fleet otherwise derives status from the
+ * mailbox alone. An unrecognised word is the contract's `other` variant.
+ */
+export function observeRowStatus(
+  label: string,
+  status: string | { other: string } | undefined,
+): void {
+  radarDaemon.observeInventory = () => {
+    const fleet = radarObservedFleet();
+    return {
+      ...fleet,
+      agents: fleet.agents.map((row: any) =>
+        row.facts?.label === label ? { ...row, status } : row,
+      ),
+    };
   };
 }
 
@@ -1242,6 +1264,37 @@ export function radarSpawnRecords(pi: ReturnType<typeof fakePi>): unknown[] {
  * extension registers during session start, so a fixture that delegates has to
  * start a session too.
  */
+/**
+ * Waits until every observe the daemon received has completed. A scan left running by
+ * an earlier test can finish during the next one, so a test drains first and takes its
+ * count only once the daemon has nothing in flight.
+ */
+export { radarObservesCompleted };
+
+export async function drainRadarObserves(): Promise<number> {
+  for (let turn = 0; turn < 1000; turn++) {
+    if (radarObservesStarted() === radarObservesCompleted())
+      return radarObservesCompleted();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  throw new Error("Radar observes never drained");
+}
+
+/**
+ * Waits until the fake daemon has completed `target` observes. After
+ * `drainRadarObserves`, `target` is the drained count plus the observes the trigger
+ * starts, so only that trigger's own scans can satisfy it.
+ */
+export async function settleRadarObserves(target: number): Promise<void> {
+  for (let turn = 0; turn < 1000; turn++) {
+    if (radarObservesCompleted() >= target) return;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  throw new Error(
+    `Radar scan did not complete: ${radarObservesCompleted()} of ${target} observes`,
+  );
+}
+
 export async function startRadarSession(
   pi: ReturnType<typeof fakePi>,
   context: ReturnType<typeof fakeContext> = fakeContext(),
@@ -1635,17 +1688,22 @@ export function agentFromState(
 export function agentControllerExecutor(
   parent: ManagedAgentState,
   children: ManagedAgentState[] = [],
-): ExecHandler {
-  for (const child of [parent, ...children])
-    consumeMailboxRequest(
-      agentMailboxPath(child.workspaceId, child.agentLabel),
-      (request) =>
-        acceptMailboxRequest(
-          agentMailboxPath(child.workspaceId, child.agentLabel),
-          request,
-        ),
+): ExecHandler & { pauseMailboxConsumers(): void; resumeMailboxConsumers(): void } {
+  let stops: (() => void)[] = [];
+  const resume = () => {
+    stops = [parent, ...children].map((child) =>
+      consumeMailboxRequest(
+        agentMailboxPath(child.workspaceId, child.agentLabel),
+        (request) =>
+          acceptMailboxRequest(
+            agentMailboxPath(child.workspaceId, child.agentLabel),
+            request,
+          ),
+      ),
     );
-  return (command, args) => {
+  };
+  resume();
+  const exec: ExecHandler = (command, args) => {
     if (command !== "herdr") return { stdout: "{}", stderr: "", code: 0 };
     if (args[0] === "status" && args[1] === "--json")
       return herdrStatusResult();
@@ -1744,6 +1802,10 @@ export function agentControllerExecutor(
     }
     return { stdout: "{}", stderr: "", code: 0 };
   };
+  return Object.assign(exec, {
+    pauseMailboxConsumers: () => stops.forEach((stop) => stop()),
+    resumeMailboxConsumers: resume,
+  });
 }
 
 export function delegatedLifecycleExecutor(

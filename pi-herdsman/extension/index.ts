@@ -3388,6 +3388,16 @@ type ManagedAgentPresence =
        */
       processGone?: ProcessGone;
     };
+
+/**
+ * Presence this process has verified: a mux record for the child, or a Radar child
+ * whose launch edge the daemon still observes. Attention and digest gates use this
+ * one predicate so a Radar child is not dark to them.
+ */
+function hasVerifiedPresence(presence: ManagedAgentPresence): boolean {
+  return presence.kind === "live" || presence.kind === "radar";
+}
+
 function durableIdentityKey(state: ManagedAgentState): string {
   return `${state.workspaceId}\0${state.piSessionId}`;
 }
@@ -14622,7 +14632,7 @@ export default function (pi: ExtensionAPI): void {
           continue;
         }
         if (
-          agent.presence.kind === "live" &&
+          hasVerifiedPresence(agent.presence) &&
           agent.lifecycleState === "blocked" &&
           state.activeRequestId
         ) {
@@ -14743,7 +14753,7 @@ export default function (pi: ExtensionAPI): void {
           continue;
         }
         if (
-          agent.presence.kind !== "live" ||
+          !hasVerifiedPresence(agent.presence) ||
           listed.state !== "working" ||
           !state.activeRequestId ||
           state.lastActivityAt === undefined ||
@@ -14810,7 +14820,7 @@ export default function (pi: ExtensionAPI): void {
           const refreshedAgent = refreshed.agents.find(
             (candidate) =>
               sameManagedAgentIdentity(candidate.state, current) &&
-              candidate.presence.kind === "live",
+              hasVerifiedPresence(candidate.presence),
           );
           if (!refreshedAgent || refreshedAgent.listed.state !== "working")
             continue;
@@ -14982,7 +14992,7 @@ export default function (pi: ExtensionAPI): void {
         // Delivered, settling, lost and idle projections are excluded by the
         // same lifecycle the owner sees.
         if (
-          agent.presence.kind !== "live" ||
+          !hasVerifiedPresence(agent.presence) ||
           (agent.listed.state !== "working" &&
             agent.listed.state !== "waiting" &&
             agent.listed.state !== "blocked")

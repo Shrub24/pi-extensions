@@ -66,8 +66,11 @@ import support, {
   leadExec,
   setLeadEnvironment,
   setAgentEnvironment,
+  observeRowStatus,
   radarDaemon,
   radarObservedFleet,
+  drainRadarObserves,
+  settleRadarObserves,
   spawnedArgvs,
   startRadarSession,
   startupExecutor,
@@ -1351,16 +1354,7 @@ test("parent list omits unrelated unknown mailbox diagnostics", async () => {
   ];
   for (const [name, content] of files)
     realFs.writeFileSync(join(PI_AGENTS_DIR, name), content, "utf8");
-  const getTargets: string[] = [];
-  const base = agentControllerExecutor(parent, [child]);
-  const pi = fakePi({
-    exec: (command, args, options) => {
-      const result = base(command, args, options);
-      if (command === "herdr" && args[0] === "agent" && args[1] === "get")
-        getTargets.push(args[2]!);
-      return result;
-    },
-  });
+  const pi = fakePi({ exec: agentControllerExecutor(parent, [child]) });
   registerExtension!(pi.pi as never);
   const context = fakeAgentContext([
     {
@@ -1378,7 +1372,6 @@ test("parent list omits unrelated unknown mailbox diagnostics", async () => {
     for (const handler of pi.events.get("session_start") ?? [])
       await handler(undefined, context);
 
-    assert.deepEqual(getTargets, [child.paneId]);
     const listed = await agentTool(pi, "list").execute(
       "list",
       {},
@@ -1478,6 +1471,7 @@ test("parent controls only direct children and enforces session allowlists", asy
     ownerSessionId: parent.piSessionId,
     piSessionId: CHILD_SESSION_ID,
     piSessionFile: join(testTmpRoot, "ownership-child.jsonl"),
+    runId: randomUUID(),
   };
   const activeRequestId = randomUUID();
   const workingChild = {
@@ -1489,6 +1483,7 @@ test("parent controls only direct children and enforces session allowlists", asy
     ownerSessionId: parent.piSessionId,
     piSessionId: "11111111-1111-4111-8111-111111111111",
     piSessionFile: join(testTmpRoot, "ownership-working-child.jsonl"),
+    runId: randomUUID(),
   };
   const sibling = {
     ...managedState(
@@ -1499,6 +1494,7 @@ test("parent controls only direct children and enforces session allowlists", asy
     ownerSessionId: LEAD_SESSION_ID,
     piSessionId: "22222222-2222-4222-8222-222222222222",
     piSessionFile: join(testTmpRoot, "ownership-sibling.jsonl"),
+    runId: randomUUID(),
   };
   const mailboxes = [parent, child, workingChild, sibling].map((state) =>
     agentMailboxPath(WORKSPACE, state.agentLabel),
@@ -3900,38 +3896,67 @@ test("request-only mailbox remnants reserve their labels", async () => {
   resetAgentMailbox(automaticStartup.mailbox);
   resetAgentMailbox(automaticMailbox);
 });
-
-test("assignment retains its request when acknowledgement never arrives", async () => {
+// Under Radar the launch is verified before the brief is written, so an unacknowledged
+// launch never hands a brief to an unproved child. The launch is then a retained
+// reservation: nothing releases it, even when the daemon reports its pane gone and its
+// exit observed, because that evidence is not proof the process ended, and the pinned
+// contract has no sanctioned retirement for a spawn edge that never bound a child.
+// See context/unacknowledged-launch-holds-no-brief.md.
+test("an unacknowledged launch is a retained reservation that nothing releases", async () => {
   setLeadEnvironment();
+  radarDaemon.reset();
   const label = "agent";
   const startup = startupExecutor(label, () => DEFAULT_PI_SESSION_ID);
-  startup.stopMailboxConsumer();
-  const controller = new AbortController();
-  setTimeout(() => controller.abort(), 10).unref();
-  const pi = fakePi({
-    exec: startup.exec,
-  });
+  radarDaemon.options.acknowledge = false;
+  process.env.PI_HERDSMAN_RADAR_LAUNCH_TIMEOUT_MS = "500";
+  const pi = fakePi({ exec: startup.exec });
   registerExtension!(pi.pi as never);
-  const result = await agentTool(pi, "delegate").execute(
-    "id",
-    {
-      definition: "agent",
-      task: "retain on timeout",
-    },
-    controller.signal,
-    undefined,
-    fakeContext(),
-  );
-  assert.equal(result.details.ok, false);
-  assert.equal(
-    realFs
-      .readdirSync(startup.mailbox)
-      .filter((name) => name.startsWith("request-") && name.endsWith(".json"))
-      .length,
-    1,
-  );
-  pi.events.get("session_shutdown")?.[0]();
-  resetAgentMailbox(startup.mailbox);
+  const context = fakeContext(pi.entries);
+  try {
+    await startRadarSession(pi, context);
+    const abandoned = await agentTool(pi, "delegate").execute(
+      "id",
+      { definition: "agent", label, task: "unacknowledged" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(
+      abandoned.details.error.category,
+      "pane_not_ready",
+      JSON.stringify(abandoned.details),
+    );
+    assert.equal(readAgentState(startup.mailbox)?.activeRequestId, undefined);
+    assert.equal(
+      realFs.existsSync(startup.mailbox)
+        ? realFs.readdirSync(startup.mailbox).filter((name) => name.startsWith("request-")).length
+        : 0,
+      0,
+    );
+    assert.equal(radarDaemon.spawns.length, 1);
+
+    // The daemon now reports the pane gone and its exit observed. The reservation
+    // must still hold: a second delegate is refused and no close or second spawn occurs.
+    radarDaemon.options.locationEvidence = "absent";
+    radarDaemon.options.exitObservation = "exited";
+    radarDaemon.options.acknowledge = true;
+    const retried = await agentTool(pi, "delegate").execute(
+      "id",
+      { definition: "agent", label, task: "retry" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(retried.details.error.category, "agent_label_exists");
+    assert.equal(radarDaemon.spawns.length, 1);
+    assert.equal(radarDaemon.closes.size, 0, "nothing is closed or released");
+  } finally {
+    delete process.env.PI_HERDSMAN_RADAR_LAUNCH_TIMEOUT_MS;
+    radarDaemon.options.acknowledge = true;
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(startup.mailbox);
+    radarDaemon.reset();
+  }
 });
 
 test("registered lead exposes only explicit live controls", async () => {
@@ -4242,6 +4267,7 @@ test("lead steers a blocked parent waiting for direct-child work", async () => {
     ),
     piSessionId: PARENT_SESSION_ID,
     piSessionFile: "/tmp/steerable-parent.jsonl",
+    runId: randomUUID(),
   };
   const child = {
     ...managedState(
@@ -4252,6 +4278,7 @@ test("lead steers a blocked parent waiting for direct-child work", async () => {
     ownerSessionId: parent.piSessionId,
     piSessionId: CHILD_SESSION_ID,
     piSessionFile: "/tmp/steerable-child.jsonl",
+    runId: randomUUID(),
   };
   const parentMailbox = agentMailboxPath(WORKSPACE, parent.agentLabel);
   const childMailbox = agentMailboxPath(WORKSPACE, child.agentLabel);
@@ -4268,6 +4295,7 @@ test("lead steers a blocked parent waiting for direct-child work", async () => {
   const observedParent = { ...parent, activeRequestId: undefined };
   let parentStatus: "idle" | "working" = "idle";
   const base = agentControllerExecutor(observedParent, [child]);
+  observeRowStatus(parent.agentLabel, parentStatus);
   const pi = fakePi({
     exec: (command, args, options) => {
       if (command === "herdr" && (isAgentList(args) || isApiSnapshot(args))) {
@@ -4356,6 +4384,7 @@ test("lead steers a blocked parent waiting for direct-child work", async () => {
     assert.deepEqual(listedChild?.available_tools, []);
 
     parentStatus = "working";
+    observeRowStatus(parent.agentLabel, parentStatus);
     const workingParent = await agentTool(pi, "list").execute(
       "list",
       {},
@@ -4421,6 +4450,7 @@ assert.match(
 );
 writeAgentState(parentMailbox, parent);
 parentStatus = "idle";
+observeRowStatus(parent.agentLabel, parentStatus);
     writeAgentState(childMailbox, {
       ...child,
       activeRequestId: undefined,
@@ -4495,6 +4525,9 @@ parentStatus = "idle";
     );
     writeAgentState(parentMailbox, parent);
 
+    // The handoff below must stay unacknowledged while it is listed. A running
+    // consumer would accept it on its own poll, so the consumers pause for that window.
+    base.pauseMailboxConsumers();
     const handoffRequestId = randomUUID();
     writeRequest(parentMailbox, { version: 5, runId: parent.runId,
     requestId: handoffRequestId,
@@ -4517,6 +4550,7 @@ parentStatus = "idle";
       !handoffPending.details.agents[0].available_tools.includes("agent_steer"),
     );
     removeRequest(parentMailbox, handoffRequestId);
+    base.resumeMailboxConsumers();
 
     const steered = await agentTool(pi, "steer").execute(
       "steer",
@@ -4876,6 +4910,14 @@ test("assignment status normalization fails closed safely", async () => {
     resetAgentMailbox(mailbox);
     const state = managedState(label, undefined, identity);
     writeAgentState(mailbox, state);
+    observeRowStatus(
+      label,
+      scenario.agentStatus === null
+        ? undefined
+        : scenario.agentStatus === "interactive"
+          ? { other: scenario.agentStatus }
+          : scenario.status,
+    );
     if (scenario.result) {
       state.completedRequestId = REQUEST_ID;
       writeAgentState(mailbox, state);
@@ -4934,6 +4976,7 @@ test("assignment status normalization fails closed safely", async () => {
     const mailbox = agentMailboxPath(WORKSPACE, label);
     const state = managedState(label, undefined, identity);
     writeAgentState(mailbox, state);
+    observeRowStatus(label, "idle");
     const pi = fakePi({
       exec: leadExec(
         label,
@@ -5480,12 +5523,13 @@ test("agent_extend defers one worker's next digest and later windows revert", as
       fakeContext(),
     );
     assert.equal(result.details.ok, true, JSON.stringify(result.details));
+    // A session start runs three observes; the window is not due, so no digest.
+    const observed = await drainRadarObserves();
     await pi.events.get("session_start")![0](
       undefined,
       fakeContext(pi.entries),
     );
-    for (let index = 0; index < 4; index++)
-      await new Promise<void>((resolve) => setImmediate(resolve));
+    await settleRadarObserves(observed + 3);
     assert.equal(digests().length, 0, "a fresh window is not due");
 
     const extend = pi.tools.find(
@@ -5505,8 +5549,7 @@ test("agent_extend defers one worker's next digest and later windows revert", as
 
     now += 600_000;
     t.mock.timers.tick(30_000);
-    for (let index = 0; index < 4; index++)
-      await new Promise<void>((resolve) => setImmediate(resolve));
+    await settleRadarObserves(observed + 5);
     assert.equal(
       digests().length,
       0,
@@ -5515,14 +5558,12 @@ test("agent_extend defers one worker's next digest and later windows revert", as
 
     now += 299_999;
     t.mock.timers.tick(30_000);
-    for (let index = 0; index < 4; index++)
-      await new Promise<void>((resolve) => setImmediate(resolve));
+    await settleRadarObserves(observed + 6);
     assert.equal(digests().length, 0, "the extended window has not elapsed");
 
     now += 1;
     t.mock.timers.tick(30_000);
-    for (let index = 0; index < 4; index++)
-      await new Promise<void>((resolve) => setImmediate(resolve));
+    await settleRadarObserves(observed + 7);
     assert.equal(digests().length, 1, "the extended window delivers one digest");
     assert.equal(
       (digests()[0] as any).details.entries[0].windowMs,
@@ -5532,8 +5573,7 @@ test("agent_extend defers one worker's next digest and later windows revert", as
 
     now += 300_000;
     t.mock.timers.tick(30_000);
-    for (let index = 0; index < 4; index++)
-      await new Promise<void>((resolve) => setImmediate(resolve));
+    await settleRadarObserves(observed + 8);
     assert.equal(digests().length, 2, "later windows revert to softTimeoutMs");
     assert.equal(
       (digests()[1] as any).details.entries[0].windowMs,
