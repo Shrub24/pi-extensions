@@ -269,7 +269,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       pi.appendEntry(CACHE_ACTIVITY_ENTRY, activity);
     });
     pi.registerVirtualModel<State>({
-      provider: "route", id: role, name: `Route: ${role}`, contextWindow: route.contextWindow, maxTokens: route.outputReserve,
+      provider: "route", id: role, name: role, contextWindow: route.contextWindow, maxTokens: route.outputReserve,
       // Every level is offered so Shift+Tab can change it; each physical candidate clamps the choice to what it supports.
       thinkingLevels: [...THINKING_ORDER],
       route: (request, ctx) => request.reason === "direct" ? resolve(request, ctx) : serialized(ctx.sessionManager.getSessionId(), () => resolve(request, ctx)),
