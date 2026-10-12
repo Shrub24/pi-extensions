@@ -4,6 +4,7 @@
 
 ### Unreleased
 
+- With the compact renderers on, the system prompt lists `read`, `bash`, `grep`, `find` and `ls` under Available tools again and keeps Pi's guidelines for them, such as using `read` instead of `cat`. With `renderMutationTools` on, `edit` and `write` keep their entries and guidelines too.
 - `/renderdebug memory` reports process memory and the live sizes of the renderer's strong stores; `/renderdebug memory gc` also runs a forced collection and prints the reclaimed JavaScript heap. The existing `/renderdebug` output is unchanged.
 
 ### 2.0.9

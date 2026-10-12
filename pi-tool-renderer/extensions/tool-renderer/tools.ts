@@ -98,14 +98,21 @@ export function builtInToolCacheStats(): { cwds: number } {
  * without it the shapes Pi's own tool accepts fail before `execute` delegates.
  * `outputSchema` lets codemode read the unchanged result's `structuredContent`;
  * on Pi below 0.99.0 the wrapped tool leaves it undefined.
+ * `promptSnippet` and `promptGuidelines` come from Pi's ToolDefinition, which
+ * the AgentTool drops: Pi lists a tool under Available tools in the system
+ * prompt only when it has a snippet, and adds its guidelines beside it.
  */
-function piToolContract(original: any) {
+function piToolContract(agent: any, cwd: string, toolName: BuiltInToolName, original: any) {
+	const factory = `create${toolName[0]!.toUpperCase()}${toolName.slice(1)}ToolDefinition`;
+	const definition = agent[factory]?.(normalizedCwd(cwd)) ?? original;
 	return {
 		description: original.description,
 		parameters: original.parameters,
 		constrainedSampling: original.constrainedSampling,
 		prepareArguments: original.prepareArguments,
 		outputSchema: original.outputSchema,
+		promptSnippet: definition.promptSnippet,
+		promptGuidelines: definition.promptGuidelines,
 	};
 }
 
@@ -120,7 +127,7 @@ export function registerRead(pi: ExtensionAPI, agent: any, cwd: string): boolean
 		renderShell: "self",
 		name: "read",
 		label: "read",
-		...piToolContract(original),
+		...piToolContract(agent, cwd, "read", original),
 		parameters: intentParameters("read", original.parameters, cwd),
 		prepareArguments: intentPrepare("read", "Reading the file", cwd),
 		async execute(id: string, params: any, signal: AbortSignal | undefined, onUpdate: unknown, context: any) {
@@ -165,7 +172,7 @@ export function registerBash(pi: ExtensionAPI, agent: any, cwd: string): void {
 		renderShell: "self",
 		name: "bash",
 		label: "bash",
-		...piToolContract(original),
+		...piToolContract(agent, cwd, "bash", original),
 		async execute(id: string, params: any, signal: AbortSignal | undefined, onUpdate: unknown, context: any) {
 			return getBuiltInTool(agent, contextCwd(context, cwd), "bash").execute(id, params, signal, onUpdate, context);
 		},
@@ -194,7 +201,7 @@ export function registerEdit(pi: ExtensionAPI, agent: any, cwd: string): boolean
 		renderShell: "self",
 		name: "edit",
 		label: "edit",
-		...piToolContract(original),
+		...piToolContract(agent, cwd, "edit", original),
 		parameters: intentParameters("edit", original.parameters, cwd),
 		// Pi's agent loop prepares arguments before schema validation; the
 		// replacement definition has to carry the hook or the shapes Pi's own
@@ -253,7 +260,7 @@ export function registerWrite(pi: ExtensionAPI, agent: any, cwd: string): boolea
 		renderShell: "self",
 		name: "write",
 		label: "write",
-		...piToolContract(original),
+		...piToolContract(agent, cwd, "write", original),
 		parameters: intentParameters("write", original.parameters, cwd),
 		prepareArguments: intentPrepare("write", "Writing the file", cwd),
 		async execute(id: string, params: any, signal: AbortSignal | undefined, onUpdate: unknown, context: any) {
@@ -310,7 +317,7 @@ export function registerReadOnly(pi: ExtensionAPI, agent: any, cwd: string, tool
 		renderShell: "self",
 		name: toolName,
 		label: toolName,
-		...piToolContract(original),
+		...piToolContract(agent, cwd, toolName, original),
 		description: toolName === "find"
 			? "Fuzzy path and glob search. Use when the target is fundamentally a path or filename, or as a scoped fallback after indexed/semantic code discovery. Do not use as the first tool for conceptual, behavioral, symbol, caller, or architecture discovery."
 			: original.description,
