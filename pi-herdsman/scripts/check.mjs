@@ -1,6 +1,7 @@
 import { execFile, spawn } from "node:child_process";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { unitTestFiles } from "./test-selection.mjs";
 
 export const CHECK_TIMEOUT_MS = 120_000;
 const TERM_GRACE_MS = 1_000;
@@ -13,6 +14,7 @@ const testRunnerArgs = [
   "--experimental-test-module-mocks",
   "--import=./scripts/test-env.mjs",
   "--test",
+  ...unitTestFiles(),
 ];
 
 function processTreeExists(pid) {

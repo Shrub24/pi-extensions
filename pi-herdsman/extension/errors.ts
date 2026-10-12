@@ -1,5 +1,5 @@
 export type ErrorCategory =
-  | "not_running_inside_herdr"
+  | "not_running_in_radar_pane"
   | "agent_label_exists"
   | "pane_not_ready"
   | "target_not_found"

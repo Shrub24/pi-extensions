@@ -21,6 +21,7 @@ import {
   type ProcessLockClaim,
 } from "./lock.ts";
 import { herdsmanDataRoot } from "./storage.ts";
+import { isUuid, radarControlSocketPath } from "./radar-client.ts";
 
 // Authority edges: Chief -> Lead -> Agent. Only Lead sessions may be peers.
 export type SessionRole = "lead" | "chief";
@@ -118,6 +119,11 @@ export type ChiefDescriptor = {
   paneId: string;
   tabId?: string;
   workspaceId: string;
+  /**
+   * This lead's own Radar subject. Peers prove the Chief through it, so a
+   * descriptor without it is unprovable and refuses.
+   */
+  agentId?: string;
   createdAt: number;
 };
 
@@ -914,13 +920,11 @@ export const removeCoordinationMessage = removeChiefMessage;
 export const coordinationMessageBytes = chiefMessageBytes;
 
 function socketPath(): string {
-  const value = process.env.HERDR_SOCKET_PATH;
-  if (!value) throw new Error("HERDR_SOCKET_PATH is required");
-  return value;
+  return radarControlSocketPath(process.env, process.getuid?.() ?? 0).path;
 }
 
 export function supervisionRuntime(socket = socketPath()): SupervisionRuntime {
-  if (!socket) throw new Error("HERDR_SOCKET_PATH is required");
+  if (!socket) throw new Error("A Radar control socket path is required");
   const runtimeHash = createHash("sha256").update(socket).digest("hex");
   const root = join(
     herdsmanDataRoot(),
@@ -949,6 +953,8 @@ export type PeerRecord = Readonly<{
   paneId: string;
   tabId: string;
   workspaceId: string;
+  /** This lead's own Radar subject; a record without it is unprovable. */
+  agentId?: string;
   name?: string;
   cwd?: string;
   repo?: string;
@@ -1017,6 +1023,7 @@ function validPeerLeadRecord(value: unknown): value is PeerLeadRecord {
         "workspaceId",
         "claim",
         "updatedAt",
+        "agentId",
         ...metadata,
       ].includes(key),
     ) &&
@@ -1038,6 +1045,7 @@ function validPeerLeadRecord(value: unknown): value is PeerLeadRecord {
     metadata.every(
       (key) => !Object.hasOwn(record, key) || validNativeIdentity(record[key]),
     ) &&
+    (record.agentId === undefined || isUuid(record.agentId)) &&
     isProcessLockClaim(record.claim) &&
     Number.isInteger(record.updatedAt) &&
     (record.updatedAt as number) >= 0
@@ -1067,6 +1075,7 @@ export function samePeerLeadRecord(
     actual.repo === expected.repo &&
     actual.branch === expected.branch &&
     actual.workspaceLabel === expected.workspaceLabel &&
+    actual.agentId === expected.agentId &&
     actual.claim.pid === expected.claim.pid &&
     actual.claim.id === expected.claim.id &&
     actual.updatedAt === expected.updatedAt
@@ -1204,11 +1213,12 @@ function validDescriptor(value: unknown): value is ChiefDescriptor {
     "workspaceId",
     "createdAt",
   ];
-  const optional = ["tabId", "piSessionFile"];
+  const optional = ["tabId", "piSessionFile", "agentId"];
   return (
     Object.keys(record).every(
       (key) => keys.includes(key) || optional.includes(key),
     ) &&
+    (record.agentId === undefined || isUuid(record.agentId)) &&
     Object.keys(record).length >= keys.length &&
     keys.every((key) => Object.hasOwn(record, key)) &&
     record.version === 1 &&
@@ -1334,6 +1344,7 @@ export function claimChiefLease(identity: ChiefIdentity): ChiefLease {
     typeof identity.workspaceId !== "string" ||
     !identity.workspaceId ||
     identity.workspaceId.length > 512 ||
+    (identity.agentId !== undefined && !isUuid(identity.agentId)) ||
     (identity.createdAt !== undefined &&
       (typeof identity.createdAt !== "number" ||
         !Number.isInteger(identity.createdAt) ||
@@ -1359,6 +1370,7 @@ export function claimChiefLease(identity: ChiefIdentity): ChiefLease {
     paneId: identity.paneId,
     ...(identity.tabId ? { tabId: identity.tabId } : {}),
     workspaceId: identity.workspaceId,
+    ...(identity.agentId !== undefined ? { agentId: identity.agentId } : {}),
     createdAt: identity.createdAt ?? Date.now(),
   };
   try {
@@ -1455,6 +1467,14 @@ export type CoordinatorState = {
   instanceId: string;
   piSessionId: string;
   updatedAt: number;
+  /**
+   * The lead's own Radar registration. A record without `agentId` cannot prove
+   * the lead's identity and is never reconstructed from observed rows.
+   */
+  agentId?: string;
+  workspaceId?: string;
+  tabId?: string;
+  paneId?: string;
 };
 export type LeadCoordinationState = CoordinatorState;
 
@@ -1464,6 +1484,7 @@ export type SupervisedLead = {
   /** Internal: path to a non-empty persisted session candidate. */
   piSessionFile?: string;
   instanceId?: string;
+  agentId?: string;
   displayName: string;
   workspaceId: string;
   workspaceLabel?: string;
@@ -1507,12 +1528,6 @@ export type LiveAgent = {
   tabLabel?: string;
   runtimeState?: RuntimeState;
 };
-export type WorkspaceProvenance = Readonly<{
-  workspaceLabel?: string;
-  workspaceCwd?: string;
-  repoName?: string;
-  branch?: string;
-}>;
 export type ValidatedManagedAgentEvidence = {
   piSessionId: string;
   ownerSessionId: string;
@@ -1541,12 +1556,15 @@ export function leadCoordinationStatePath(
     createHash("sha256").update(piSessionId).digest("hex") + ".json",
   );
 }
+const LEAD_IDENTITY_KEYS = ["agentId", "workspaceId", "tabId", "paneId"];
 function validLeadState(value: unknown): value is CoordinatorState {
   if (!value || typeof value !== "object") return false;
   const r = value as Record<string, unknown>;
   const keys = ["version", "instanceId", "piSessionId", "updatedAt"];
   if (
-    Object.keys(r).some((k) => !keys.includes(k) && k !== "role") ||
+    Object.keys(r).some(
+      (k) => !keys.includes(k) && !LEAD_IDENTITY_KEYS.includes(k) && k !== "role",
+    ) ||
     keys.some((k) => !Object.hasOwn(r, k))
   )
     return false;
@@ -1556,29 +1574,59 @@ function validLeadState(value: unknown): value is CoordinatorState {
     UUID.test(String(r.instanceId)) &&
     validSession(r.piSessionId) &&
     Number.isInteger(r.updatedAt) &&
-    (r.updatedAt as number) >= 0
+    (r.updatedAt as number) >= 0 &&
+    LEAD_IDENTITY_KEYS.every(
+      (k) => r[k] === undefined || validNativeIdentity(r[k]),
+    )
   );
 }
+function leadStateFromText(text: string): LeadCoordinationState {
+  if (Buffer.byteLength(text, "utf8") > LEAD_STATE_MAX_BYTES)
+    throw new Error("lead state too large");
+  const value: unknown = readsAsLead(JSON.parse(text));
+  const currentState =
+    value && typeof value === "object" && !Array.isArray(value)
+      ? Object.fromEntries(
+          Object.entries(value).filter(([key]) => key !== "pendingAsk"),
+        )
+      : value;
+  if (!validLeadState(currentState)) throw new Error("invalid lead state");
+  return currentState;
+}
+
+/** Every lead record this runtime holds. An unreadable record is an error, never an absence. */
+export function listLeadCoordinationStates(
+  runtime: SupervisionRuntime,
+): LeadCoordinationState[] {
+  let entries: string[];
+  try {
+    entries = readdirSync(runtime.leads);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw new Error("Unable to scan lead coordination state", { cause: error });
+  }
+  return entries
+    .filter((entry) => /^[0-9a-f]{64}\.json$/.test(entry))
+    .sort()
+    .map((entry) => {
+      try {
+        return leadStateFromText(
+          readFileSync(join(runtime.leads, entry), "utf8"),
+        );
+      } catch (e) {
+        throw new Error("Unable to read lead coordination state", { cause: e });
+      }
+    });
+}
+
 export function readLeadCoordinationState(
   runtime: SupervisionRuntime,
   piSessionId: string,
 ): LeadCoordinationState | undefined {
   const path = leadCoordinationStatePath(runtime, piSessionId);
   try {
-    const text = readFileSync(path, "utf8");
-    if (Buffer.byteLength(text, "utf8") > LEAD_STATE_MAX_BYTES)
-      throw new Error("lead state too large");
-    const value: unknown = readsAsLead(JSON.parse(text));
-    const currentState =
-      value && typeof value === "object" && !Array.isArray(value)
-        ? Object.fromEntries(
-            Object.entries(value).filter(([key]) => key !== "pendingAsk"),
-          )
-        : value;
-    if (
-      !validLeadState(currentState) ||
-      currentState.piSessionId !== piSessionId
-    )
+    const currentState = leadStateFromText(readFileSync(path, "utf8"));
+    if (currentState.piSessionId !== piSessionId)
       throw new Error("invalid lead state");
     return currentState;
   } catch (e) {
@@ -1652,22 +1700,11 @@ export const removePeerRecord = removePeerLeadRecord;
 export const samePeerRecord = samePeerLeadRecord;
 export const samePeerGeneration = samePeerLeadGeneration;
 
-export function normalizeHerdrLifecycleState(agent: any): RuntimeState {
-  const state = agent?.agent_status;
-  return state === "idle" ||
-    state === "working" ||
-    state === "blocked" ||
-    state === "done"
-    ? state
-    : "unknown";
-}
-
 /** Projects caller-proven live leads and validated agent evidence; metadata is never authority. */
 export function projectSupervision(options: {
   agents: LiveAgent[];
   managedAgents: ValidatedManagedAgentEvidence[];
   coordinationStates: LeadCoordinationState[];
-  workspaceProvenance?: ReadonlyMap<string, WorkspaceProvenance>;
   chiefSessionId?: string;
   excludedSessionIds?: ReadonlySet<string>;
   managedAgentSessionIds?: Set<string>;
@@ -1720,24 +1757,14 @@ export function projectSupervision(options: {
     )
       continue;
     const runtimeState = agent.runtimeState ?? "unknown";
-    const provenance = options.workspaceProvenance?.get(agent.workspaceId);
-    const workspaceLabel =
-      provenance?.repoName && provenance.branch
-        ? `${provenance.repoName}/${provenance.branch}`
-        : provenance?.workspaceLabel ||
-          (provenance?.workspaceCwd
-            ? basename(provenance.workspaceCwd)
-            : undefined) ||
-          agent.workspaceId;
     const tabLabel = agent.tabLabel?.trim();
     const name = tabLabel || `lead-${agent.sessionId.slice(0, 8)}`;
     leads.push({
       lead: agent.sessionId,
       instanceId: state.instanceId,
-      displayName: `${workspaceLabel || agent.workspaceId}/${name}`,
-      ...(provenance?.branch ? { branch: provenance.branch } : {}),
+      agentId: state.agentId,
+      displayName: `${agent.workspaceId}/${name}`,
       workspaceId: agent.workspaceId,
-      ...(workspaceLabel ? { workspaceLabel } : {}),
       tabId: agent.tabId,
       paneId: agent.paneId,
       runtimeState,

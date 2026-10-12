@@ -1,0 +1,24 @@
+# The image packs this package and imports these sibling runtime modules only.
+*
+!pi-herdsman
+!pi-herdsman/package.json
+!pi-herdsman/package-lock.json
+!pi-herdsman/README.md
+!pi-herdsman/SKILL.md
+!pi-herdsman/LICENSE
+!pi-herdsman/docs
+!pi-herdsman/docs/**
+!pi-herdsman/extension
+!pi-herdsman/extension/**
+!pi-herdsman/docker
+!pi-herdsman/docker/AGENTS.md
+!pi-herdsman/docker/entrypoint.sh
+!pi-herdsman/docker/sshd_config
+!pi-bash-processes
+!pi-bash-processes/package.json
+!pi-bash-processes/extensions
+!pi-bash-processes/extensions/**
+
+# Exclude installed dependencies and tests from the sibling runtime source.
+pi-herdsman/**/node_modules
+pi-bash-processes/extensions/__tests__

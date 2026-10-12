@@ -1,6 +1,6 @@
 # Container deployment
 
-Run Pi Herdsman as a portable SSH-accessible coding-agent environment with Pi, Herdr, developer tools, and persistent state.
+Run Pi Herdsman as a portable SSH-accessible coding-agent environment with Pi, the Radar daemon, tmux, developer tools, and persistent state.
 
 ## Quick start
 
@@ -16,27 +16,31 @@ Connect:
 ssh -p 2222 herdsman@your-host
 ```
 
-Herdr opens automatically. Select a workspace and run:
-
-```sh
-pi
-```
+The login attaches to the Pi pane of the container's tmux server `herdsman`.
+That server and the `radar daemon` serving it are started by the container
+entrypoint, and Pi is already running in the pane.
 
 That's it.
 
-## Add it to Herdr
+## Build from the monorepo checkout
+
+From the repository root, build the image with its sibling runtime modules from
+the same checkout:
 
 ```sh
-herdr machine add ssh://herdsman@your-host:2222 --label my-herd
+docker build -f pi-herdsman/Dockerfile -t pi-herdsman:local .
 ```
 
-With an existing `~/.ssh/config` host:
+The Dockerfile-specific ignore file keeps the context to the package and the
+`pi-bash-processes` runtime inputs it imports.
 
-```sh
-herdr machine add my-herd --label my-herd
-```
+## Connect from another terminal
 
-The remote machine then appears alongside Local in Herdr.
+A second interactive login attaches to the same Pi pane, so several terminals
+share one session instead of starting rival shells.
+
+The container's Radar daemon serves only that tmux server: Agents are launched
+and supervised inside the container.
 
 ## Use Tailscale
 
@@ -55,12 +59,6 @@ Connect:
 
 ```sh
 ssh herdsman@pi-herdsman
-```
-
-Add it to Herdr:
-
-```sh
-herdr machine add ssh://herdsman@pi-herdsman --label my-herd
 ```
 
 Use another hostname:
@@ -151,7 +149,7 @@ Tools installed with mise persist in the home volume.
 
 | Path                    | Contents                                                                          |
 | ----------------------- | --------------------------------------------------------------------------------- |
-| `/home/herdsman`        | Pi and Herdr state, repositories, config, credentials, SSH state, installed tools |
+| `/home/herdsman`        | Pi state, repositories, config, credentials, SSH state, installed tools           |
 | `/var/lib/herdsman/ssh` | SSH server identity                                                               |
 
 Running processes do not survive a container restart.
@@ -169,5 +167,3 @@ Running processes do not survive a container restart.
 `SSH_AUTHORIZED_KEYS` is required only on first start. Existing authorized keys are not overwritten.
 
 Pi sessions automatically receive the container environment context from `/AGENTS.md`.
-
-See the [Herdr machine documentation](https://herdr.dev/docs/connecting-machines/) for machine and SSH configuration.

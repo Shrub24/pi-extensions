@@ -9,8 +9,11 @@ You do not need to call structured coordination tools yourself.
 
 You need:
 
-- [herdr](https://github.com/herdrdev/herdr) `>=0.9.1`
-- Pi `0.99.2` (tested runtime)
+- [Radar](https://github.com/Shrub24/agent-radar), built at the commit the released package records
+  in `piHerdsman.runtime.radar.commit` with `cargo build --release --locked --bin radar`, with
+  `radar` on `PATH`
+- tmux on `PATH`
+- Pi `1.1.0` (tested runtime)
 - Node `>=22.19.0`
 
 On Linux or macOS, install the released, tested stack:
@@ -19,32 +22,32 @@ On Linux or macOS, install the released, tested stack:
 curl -fsSL https://raw.githubusercontent.com/boadij/pi-herdsman/main/install.sh | sh
 ```
 
-If you already manage Pi and herdr yourself:
+The installer checks that `radar` and `tmux` are already on `PATH`; it installs
+neither of them. If you already manage Pi and Radar yourself:
 
 ```sh
 pi install npm:pi-herdsman
-herdr integration install pi
 ```
 
-For an SSH-ready Docker deployment, see
+For an SSH-ready container deployment that ships both, see
 [Container deployment](guides/container-deployment.md).
 
-## 2. Start herdr and Pi
+## 2. Start the Radar daemon and Pi
 
-Start herdr in your project:
+Start the daemon for the tmux server it will serve:
 
 ```sh
-herdr
+RADAR_CONTROL_BACKEND=tmux RADAR_TMUX_SERVER=<server> radar daemon
 ```
 
-Then start Pi inside the herdr pane:
+Then start Pi in a pane of that same server:
 
 ```sh
-pi
+tmux -L <server> new-session pi
 ```
 
 Pi loads the package extension and optional `agents` skill. A Lead started
-outside herdr cannot safely manage herdr-backed Agents.
+outside a pane of the daemon's tmux server cannot safely manage its Agents.
 
 ## 3. Delegate without leaving the conversation
 

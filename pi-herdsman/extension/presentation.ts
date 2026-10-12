@@ -18,6 +18,7 @@ import {
   visibleWidth,
 } from "@earendil-works/pi-tui";
 import type { Box as TuiBox, Component } from "@earendil-works/pi-tui";
+import type { RadarForeground } from "./radar-client.ts";
 import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
@@ -60,6 +61,8 @@ export interface StatusAgent {
   stale?: boolean;
   inactiveMs?: number;
   parentLabel?: string;
+  /** The child has an active request or an unresolved result error, not merely retained output. */
+  unresolvedWork?: boolean;
 }
 export interface StatusSnapshot {
   agents: StatusAgent[];
@@ -941,30 +944,19 @@ export function createSupervisionWidget(
 
 export type SupervisionPeekEvidence = Readonly<{
   recentOutput?: string;
-  process?: Readonly<{
-    shell_pid: number;
-    foreground_process_group_id?: number;
-    foreground_processes?: readonly Readonly<{
-      pid?: number;
-      argv0?: string;
-      cmdline?: string;
-    }>[];
-  }>;
+  foreground?: RadarForeground;
   agents?: readonly string[];
 }>;
 
 function renderProcessEvidence(
-  process: NonNullable<SupervisionPeekEvidence["process"]>,
+  foreground: RadarForeground,
 ): string[] {
-  const lines: string[] = [];
-  for (const foreground of process.foreground_processes?.slice(0, 8) ?? []) {
-    const fields = [
-      collapseDisplayText(foreground.argv0, 80),
-      collapseDisplayText(foreground.cmdline, 120),
-    ].filter(Boolean);
-    if (fields.length) lines.push(`Process: ${fields.join(" ")}`);
-  }
-  return lines;
+  if (foreground.kind !== "non_shell") return [];
+  const fields = [
+    collapseDisplayText(foreground.name, 80),
+    collapseDisplayText(foreground.command, 120),
+  ].filter(Boolean);
+  return fields.length ? [`Process: ${fields.join(" ")}`] : [];
 }
 
 /** Renders supplied inspect evidence only; it performs no inspection itself. */
@@ -1002,8 +994,8 @@ export function renderSupervisionPeek(
   }
   if (evidence.agents?.length && add("agents"))
     for (const agent of evidence.agents) if (!add(agent)) break;
-  if (evidence.process)
-    for (const line of renderProcessEvidence(evidence.process))
+  if (evidence.foreground)
+    for (const line of renderProcessEvidence(evidence.foreground))
       if (!add(line)) break;
   return lines;
 }
@@ -1532,6 +1524,18 @@ export function formatToolModelResult(
       ...cleanup,
     ].join("\n");
   }
+  if (action === "complete") {
+    return [
+      `Completion ${value(v.completion_id)} · ${value(v.agent)} · ${value(v.status)}`,
+      value(v.summary),
+      `Handoff: ${value(v.handoff_path)}`,
+      `Disposition: ${value(v.disposition) || "pending"} · closed: ${v.closed === true}`,
+      ...(v.wrapup ? [`Wrapup: ${JSON.stringify(v.wrapup)}`] : []),
+      ...(v.repeated ? ["Repeated read; no effects repeated."] : []),
+      ...(v.notice ? [String(v.notice)] : []),
+      ...(v.action_error ? [`Lifecycle unresolved: ${v.action_error}`] : []),
+    ].join("\n");
+  }
   if (action === "inspect") {
     const process =
       v.process && typeof v.process === "object"
@@ -1680,6 +1684,10 @@ export function formatToolModelResult(
             ...fallbackAgents.flatMap((agent) => agentLines(agent, "  ", true)),
             "",
           ]
+        : []),
+      ...(Array.isArray(v.completions) && v.completions.length
+        ? ["Completions (retrieve with agent_complete):", ...v.completions.map((completion: any) =>
+            `${completion.completion_id} · ${completion.agent} · ${completion.status}\n  ${completion.summary}`), ""]
         : []),
       ...(savedSessions.length
         ? [

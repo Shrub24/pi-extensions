@@ -144,6 +144,18 @@ test("soft-timeout and retain-workers overlays accept only valid values", () => 
   assert.equal(validWorkerContextBudget(MAX_WORKER_CONTEXT_BUDGET_TOKENS), true);
 });
 
+test("saved-session cap accepts nonnegative integers and rejects invalid limits", () => {
+  assert.equal(readConfig().savedSessionLimit, 10);
+  updateConfig("savedSessionLimit", 0);
+  assert.equal(readConfig().savedSessionLimit, 0);
+  updateConfig("savedSessionLimit", 7);
+  assert.equal(readConfig().savedSessionLimit, 7);
+  for (const invalid of [-1, 1.5, NaN, Infinity, "10"]) {
+    assert.throws(() => updateConfig("savedSessionLimit", invalid as never), /savedSessionLimit/);
+  }
+  updateConfig("savedSessionLimit", undefined);
+});
+
 test("partial and complete valid configs overlay defaults", () => {
   realFs.mkdirSync(herdsmanDataRoot(), { recursive: true });
   realFs.writeFileSync(
@@ -167,6 +179,7 @@ test("partial and complete valid configs overlay defaults", () => {
     spawnPlacement: "tab",
     contextRetirement: false,
     retainWorkers: true,
+    savedSessionLimit: 10,
     softTimeoutMs: DEFAULT_SOFT_TIMEOUT_MS,
     workerContextBudgetTokens: DEFAULT_WORKER_CONTEXT_BUDGET_TOKENS,
     workerCompaction: true,

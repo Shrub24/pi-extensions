@@ -449,6 +449,71 @@ test("focus dispatches one pane target and keeps the caller's operation UUID", a
 	}
 });
 
+test("output and process_info decode the pinned read replies and send the pane target", async () => {
+	const fixture = makeFixture((request) => {
+		if (request.method === "daemon.ping")
+			return reply(request, {
+				protocol: 2,
+				capabilities: ["registry.v1", "mux.output", "mux.process_info"],
+			});
+		if (request.method === "mux.output") {
+			assert.deepEqual(request.params, {
+				pane_id: "tmux:srv:%1",
+				source: "recent_unwrapped",
+				lines: 80,
+			});
+			return reply(request, {
+				output: { text: "line one\n", truncated: true, revision: 7 },
+			});
+		}
+		assert.equal(request.method, "mux.process_info");
+		return reply(request, {
+			evidence: { kind: "non_shell", pid: 42, name: "pi", command: "pi -p" },
+		});
+	});
+	try {
+		await listen(fixture);
+		const client = fixture.client();
+		assert.deepEqual(
+			await client.output({
+				pane_id: "tmux:srv:%1",
+				source: "recent_unwrapped",
+				lines: 80,
+			}),
+			{ ok: true, value: { text: "line one\n", truncated: true, revision: 7 } },
+		);
+		assert.deepEqual(await client.processInfo({ pane_id: "tmux:srv:%1" }), {
+			ok: true,
+			value: { kind: "non_shell", pid: 42, name: "pi", command: "pi -p" },
+		});
+	} finally {
+		cleanup(fixture);
+	}
+});
+
+test("output and process_info without their capabilities dispatch nothing", async () => {
+	const fixture = makeFixture((request) =>
+		reply(request, { protocol: 2, capabilities: ["registry.v1"] }),
+	);
+	try {
+		await listen(fixture);
+		const client = fixture.client();
+		const output = await client.output({
+			pane_id: "tmux:srv:%1",
+			source: "recent_unwrapped",
+		});
+		const process = await client.processInfo({ pane_id: "tmux:srv:%1" });
+		assert.equal(output.ok === true ? "" : output.code, "unsupported");
+		assert.equal(process.ok === true ? "" : process.code, "unsupported");
+		assert.deepEqual(
+			fixture.requests.map((request) => request.method),
+			["daemon.ping"],
+		);
+	} finally {
+		cleanup(fixture);
+	}
+});
+
 test("focus requires a canonical operation UUID and dials nothing without one", async () => {
 	const fixture = makeFixture(() => undefined);
 	try {
@@ -700,6 +765,59 @@ test("agent.get decodes each process verdict exactly as the daemon names it", as
 			});
 			const read = fixture.requests.find((request) => request.method === "agent.get");
 			assert.deepEqual(read.params, { agent_id: UUID_A });
+		} finally { cleanup(fixture); }
+	}
+});
+
+test("agent.get reports the child's activity only while its execution report is fresh", async () => {
+	const cases = [
+		{ snapshot: { freshness: "fresh", snapshot: { activity: "working" } }, activity: "working" },
+		{ snapshot: { freshness: "stale", snapshot: { activity: "working" } }, activity: undefined },
+		{ snapshot: null, activity: undefined },
+	];
+	for (const { snapshot, activity } of cases) {
+		const fixture = makeFixture((request) =>
+			request.method === "daemon.ping"
+				? reply(request, { protocol: 2, capabilities: ["registry.v1"] })
+				: reply(request, {
+						agent: {
+							registration: {},
+							process: { claimed: true, verification: "verified" },
+							execution: { snapshot },
+						},
+					}),
+		);
+		try {
+			await listen(fixture);
+			const read = await fixture.client().agentGet(UUID_A);
+			assert.equal(read.ok === true ? read.value.activity : "refused", activity);
+		} finally { cleanup(fixture); }
+	}
+});
+
+test("agent.get reports the current session only while its context is fresh", async () => {
+	const session = "11111111-2222-4333-8444-555555555555";
+	const cases = [
+		{ context: { freshness: "fresh", session }, contextSession: session },
+		{ context: { freshness: "stale", session }, contextSession: undefined },
+		{ context: { freshness: "fresh", session: null }, contextSession: undefined },
+	];
+	for (const { context, contextSession } of cases) {
+		const fixture = makeFixture((request) =>
+			request.method === "daemon.ping"
+				? reply(request, { protocol: 2, capabilities: ["registry.v1"] })
+				: reply(request, {
+						agent: {
+							registration: {},
+							process: { claimed: true, verification: "verified" },
+							context: { version: 1, agent_id: UUID_A, context },
+						},
+					}),
+		);
+		try {
+			await listen(fixture);
+			const read = await fixture.client().agentGet(UUID_A);
+			assert.equal(read.ok === true ? read.value.contextSession : "refused", contextSession);
 		} finally { cleanup(fixture); }
 	}
 });

@@ -55,7 +55,6 @@ import support, {
   StatusWidget,
   AGENT_ID,
   WORKSPACE,
-  agentFromState,
   buildStatusRows,
   defaultFixtureIdentity,
   discoverAgent,
@@ -64,10 +63,6 @@ import support, {
   visibleAgentDefinitionMetadata,
   fakePi,
   fakeAgentContext,
-  herdrAlias,
-  isApiSnapshot,
-  isAgentList,
-  isPaneList,
   listResponse,
   managedState,
   nativeSessions,
@@ -81,11 +76,9 @@ import support, {
   renderRunningOptions,
   resetAgentMailbox,
   resultEntryDetails,
-  leadExec,
   setLeadEnvironment,
   setAgentEnvironment,
   startRadarSession,
-  startupExecutor,
   stopSummary,
   testGate,
   visibleWidth,
@@ -303,6 +296,7 @@ const leadTools = [
   "agent_steer",
   "agent_interrupt",
   "agent_reply",
+  "agent_complete",
   "agent_close",
   "agent_inspect",
   "agent_transcript",
@@ -386,6 +380,7 @@ function fakeChiefPi(options: Parameters<typeof fakePi>[0] = {}) {
           "agent_steer",
           "agent_interrupt",
           "agent_reply",
+          "agent_complete",
           "agent_close",
           "agent_inspect",
           "agent_transcript",
@@ -841,98 +836,6 @@ test("Chief message persistence failure can recover without withdrawing peer pre
     if (obstruction) rmSync(obstruction, { recursive: true, force: true });
     await pi.events.get("session_shutdown")?.[0]();
     lease.release();
-    delete process.env.HERDR_SOCKET_PATH;
-    delete process.env.HERDR_TAB_ID;
-    delete process.env.HERDR_PANE_ID;
-    setLeadEnvironment();
-  }
-});
-
-test("Chief leave restores minimal peer presence before provenance resolves", async (t) => {
-  setLeadEnvironment();
-  process.env.HERDR_PANE_ID = "lead-pane";
-  process.env.HERDR_TAB_ID = "lead-tab";
-  process.env.HERDR_SOCKET_PATH = join(
-    tmpdir(),
-    `peer-chief-leave-provenance-${randomUUID()}.sock`,
-  );
-  const sessionId = randomUUID();
-  const runtime = peerRuntime();
-  const startupProvenance = testGate<void>();
-  const leaveProvenance = testGate<void>();
-  const releaseProvenance = testGate<void>();
-  let provenanceCalls = 0;
-  const entries: unknown[] = [];
-  const pi = fakeChiefPi({
-    entries,
-    exec: async (_command, args) => {
-      if (args[0] === "workspace" && args[1] === "get") {
-        const call = ++provenanceCalls;
-        if (call === 1) startupProvenance.resolve();
-        if (call === 2) leaveProvenance.resolve();
-        await releaseProvenance.promise;
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              workspace: {
-                label: call === 1 ? "stale-generation" : "fresh-generation",
-              },
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      }
-      return { stdout: "{}", stderr: "", code: 0 };
-    },
-  });
-  const context = fakeContext(entries) as any;
-  context.ui.notify = () => undefined;
-  context.sessionManager = {
-    ...context.sessionManager,
-    getSessionId: () => sessionId,
-  };
-  registerExtension!(pi.pi as never);
-  const sessionStart = pi.events.get("session_start")![0];
-  const sessionShutdown = pi.events.get("session_shutdown")![0];
-  try {
-    const starting = sessionStart(undefined, context);
-    await startupProvenance.promise;
-    await starting;
-
-    const initial = readPeerLeadRecord(runtime, sessionId);
-    assert.ok(initial);
-    assert.equal(initial.repo, undefined);
-    assert.equal(initial.branch, undefined);
-    assert.equal(initial.workspaceLabel, undefined);
-
-    await pi.commandOptions.get("chief").handler("", context);
-    const leaving = pi.commandOptions.get("chief").handler("leave", context);
-    await leaveProvenance.promise;
-    await leaving;
-
-    const restored = readPeerLeadRecord(runtime, sessionId);
-    assert.ok(restored);
-    assert.notEqual(restored.claim.id, initial.claim.id);
-    assert.equal(restored.cwd, context.cwd);
-    assert.equal(restored.repo, undefined);
-    assert.equal(restored.branch, undefined);
-    assert.equal(restored.workspaceLabel, undefined);
-
-    releaseProvenance.resolve();
-    await t.waitFor(() => {
-      const current = readPeerLeadRecord(runtime, sessionId);
-      assert.equal(current?.claim.id, restored.claim.id);
-      assert.equal(current?.workspaceLabel, "fresh-generation");
-    });
-    assert.equal(
-      readPeerLeadRecord(runtime, sessionId)?.workspaceLabel,
-      "fresh-generation",
-    );
-  } finally {
-    releaseProvenance.resolve();
-    await sessionShutdown();
     delete process.env.HERDR_SOCKET_PATH;
     delete process.env.HERDR_TAB_ID;
     delete process.env.HERDR_PANE_ID;
@@ -1672,6 +1575,7 @@ test("lead session-start retries an exact baseline after restoration fails", asy
     "agent_steer",
     "agent_interrupt",
     "agent_reply",
+    "agent_complete",
     "agent_close",
     "agent_inspect",
     "agent_transcript",
@@ -1745,6 +1649,7 @@ test("lead session-start continues when chief lease release fails", async () => 
         "agent_steer",
         "agent_interrupt",
         "agent_reply",
+        "agent_complete",
         "agent_close",
         "agent_inspect",
         "agent_transcript",
@@ -1771,6 +1676,7 @@ test("lead session-start continues when chief lease release fails", async () => 
     "agent_steer",
     "agent_interrupt",
     "agent_reply",
+    "agent_complete",
     "agent_close",
     "agent_inspect",
     "agent_transcript",
@@ -2008,6 +1914,7 @@ test("Chief activation replaces the lead widget and overview selection is intera
   let overviewDone = 0;
   let customCalls = 0;
   context.ui = {
+    setStatus: () => undefined,
     setWidget: (key: string) => widgetKeys.push(key),
     notify: (message: string) => notices.push(message),
     confirm: async () => false,
@@ -2098,6 +2005,7 @@ test("Lead resume repairs stale staff from its durable displaced loadout", async
     "agent_steer",
     "agent_interrupt",
     "agent_reply",
+    "agent_complete",
     "agent_close",
     "agent_inspect",
     "agent_transcript",
@@ -2172,6 +2080,7 @@ test("ordinary branch tool state wins over an older lead checkpoint", async () =
           "agent_steer",
           "agent_interrupt",
           "agent_reply",
+          "agent_complete",
           "agent_close",
           "agent_inspect",
           "agent_transcript",
@@ -2192,6 +2101,7 @@ test("ordinary branch tool state wins over an older lead checkpoint", async () =
     "agent_steer",
     "agent_interrupt",
     "agent_reply",
+    "agent_complete",
     "agent_close",
     "agent_inspect",
     "agent_transcript",
@@ -2253,6 +2163,7 @@ async function openChiefOverview(
   let renderRequests = 0;
   const widgetRegistrations: Array<{ key: string; content: unknown }> = [];
   context.ui = {
+    setStatus: () => undefined,
     setWidget: (key: string, content: unknown) => {
       if (options.failSetWidget && key === "pi-herdsman-staff")
         throw new Error("widget registration failed");
@@ -2936,6 +2847,7 @@ test("persisted chief resume isolates tools and restores its ordinary baseline",
           "agent_steer",
           "agent_interrupt",
           "agent_reply",
+          "agent_complete",
           "agent_close",
           "agent_inspect",
           "agent_transcript",
@@ -2982,6 +2894,7 @@ test("persisted chief resume isolates tools and restores its ordinary baseline",
     "agent_steer",
     "agent_interrupt",
     "agent_reply",
+    "agent_complete",
     "agent_close",
     "agent_inspect",
     "agent_transcript",
@@ -3018,6 +2931,7 @@ test("persisted chief collision is suspended and has no lead authority", async (
           "agent_steer",
           "agent_interrupt",
           "agent_reply",
+          "agent_complete",
           "agent_close",
           "agent_inspect",
           "agent_transcript",
@@ -3043,6 +2957,7 @@ test("persisted chief collision is suspended and has no lead authority", async (
         "agent_steer",
         "agent_interrupt",
         "agent_reply",
+        "agent_complete",
         "agent_close",
         "agent_inspect",
         "agent_transcript",
@@ -3790,9 +3705,7 @@ test("Running uses compact native options and focuses the freshly verified pane"
   const identity = defaultFixtureIdentity;
   const mailbox = agentMailboxPath(WORKSPACE, label);
   writeAgentState(mailbox, managedState(label, REQUEST_ID, identity));
-  const pi = fakePi({
-    exec: leadExec(label, "working", DEFAULT_PI_SESSION_ID),
-  });
+  const pi = fakePi();
   const daemon = await serveFakeRadar([
     observedAgent({
       paneId: identity.paneId,
@@ -4172,7 +4085,6 @@ test("Running keeps colliding display labels distinct and focuses the selected p
               tab: "",
               tabs: [],
               agents: states.map(({ label, identity }) => ({
-                herdr_agent: herdrAlias(label),
                 agent_status: "working",
                 cwd: "/tmp",
                 workspace_id: WORKSPACE,
@@ -4200,7 +4112,6 @@ test("Running keeps colliding display labels distinct and focuses the selected p
                       identity,
                     ),
                   ).agents[0],
-                  name: herdrAlias(label),
                 })),
                 panes: states.map(({ identity }) => ({
                   pane_id: identity.paneId,
@@ -5328,6 +5239,7 @@ test("valid managed leaf agents receive identity-only TUI presentation", async (
   context.hasUI = true;
   let widget: StatusWidget | undefined;
   context.ui = {
+    setStatus: () => undefined,
     setWidget: (_key: string, content: unknown) => {
       if (typeof content === "function")
         widget = content(
@@ -5367,6 +5279,7 @@ test("TUI status widget is registered as a Pi component factory", async (t) => {
   context.mode = "tui";
   context.hasUI = true;
   context.ui = {
+    setStatus: () => undefined,
     setWidget: (_key: string, content: unknown) => {
       factory = content;
     },
@@ -5480,6 +5393,7 @@ test("repeated lead starts replace the widget and ignore old refreshes", async (
       const notices: string[] = [];
       context.ui = {
         notify: (message: string) => notices.push(message),
+        setStatus: () => undefined,
         setWidget: (_key: string, content: unknown) => {
           registrations++;
           if (typeof content === "function")
@@ -5614,6 +5528,7 @@ test("TUI status refresh consumes the daemon's fleet observation", async (t) => 
   context.hasUI = true;
   let widget: StatusWidget | undefined;
   context.ui = {
+    setStatus: () => undefined,
     setWidget: (_key: string, content: unknown) => {
       if (typeof content === "function")
         widget = (content as any)(
@@ -5688,6 +5603,7 @@ test("zero-runtime reconciliation requests one status refresh", async (t) => {
   context.hasUI = true;
   let widget: StatusWidget | undefined;
   context.ui = {
+    setStatus: () => undefined,
     setWidget: (_key: string, content: unknown) => {
       if (typeof content === "function")
         widget = content(
@@ -5762,16 +5678,7 @@ test("fresh assignment refreshes the widget after validation", async (t) => {
   let releaseInitialHandoff: (() => void) | undefined;
   let callsAtHandoff = 0;
   let pi!: ReturnType<typeof fakePi>;
-  const startup = startupExecutor(
-    label,
-    () => DEFAULT_PI_SESSION_ID,
-    undefined,
-    async () => {
-      callsAtHandoff = pi.calls.length;
-      releaseInitialHandoff = () => initialHandoff.resolve();
-      await initialHandoff.promise;
-    },
-  );
+  const startupMailbox = agentMailboxPath(WORKSPACE, label);
   // The child's own startup acknowledgment is this launch's readiness, and the
   // fixture holds it: the daemon has started the child and written its state, so
   // the launch is bound, but nothing in this session may treat it as ready or
@@ -5797,6 +5704,7 @@ test("fresh assignment refreshes the widget after validation", async (t) => {
   const notices: string[] = [];
   context.ui = {
     notify: (message: string) => notices.push(message),
+    setStatus: () => undefined,
     setWidget: (_key: string, content: unknown) => {
       if (typeof content === "function")
         widget = content(
@@ -5891,7 +5799,17 @@ test("fresh assignment refreshes the widget after validation", async (t) => {
     assert.match(rendered, /1 working/);
     assert.match(rendered, /fresh-start-widget-agent/);
 
-    // A second fresh assignment for the same label launches its own child.
+    // A second fresh assignment for the same label launches its own child. The
+    // first child is retired through the lead's close first: its consumer stops
+    // with its pane, so only the new child answers the reset mailbox.
+    const closedFirst = await agentTool(pi, "close").execute(
+      "id",
+      { agent: label },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(closedFirst.details.ok, true, JSON.stringify(closedFirst.details));
     resetAgentMailbox(mailbox);
     const relaunched = await agentTool(pi, "delegate").execute(
       "id",
@@ -5951,7 +5869,6 @@ test("fresh assignment refreshes the widget after validation", async (t) => {
     assert.doesNotMatch(stalledRow!, /working/);
     assert.match(widget!.render(160).join("\n"), /1 working/);
   } finally {
-    startup.stopMailboxConsumer();
     delete process.env.PI_HERDSMAN_RADAR_LAUNCH_TIMEOUT_MS;
     radarDaemon.options.acknowledge = true;
     radarDaemon.onChildState = undefined;
@@ -5989,6 +5906,7 @@ test("lead status refreshes keep one in-flight refresh and one trailing rerun", 
   context.hasUI = true;
   let widget: StatusWidget | undefined;
   context.ui = {
+    setStatus: () => undefined,
     setWidget: (_key: string, content: unknown) => {
       if (typeof content === "function")
         widget = (content as any)(
@@ -6039,4 +5957,177 @@ test("lead status refreshes keep one in-flight refresh and one trailing rerun", 
     await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(snapshots - base, 2, "the status refresh queue kept growing");
   assert.match(widget!.render(160)[0], /herd/);
+});
+
+// Consumer wiring for the footer status entries: the real session and refresh
+// paths publish through ctx.ui.setStatus, and the background count is read
+// through the documented pi-bash-processes session query. Only the status
+// refresh timers are captured, so each test drives a refresh explicitly and
+// waits for its asynchronous publish.
+const STATUS_ENTRY = "pi-herdsman";
+const WORK_ENTRY = "pi-herdsman-waiting";
+const SESSION_OUTSTANDING = "pi-bash-processes:v1:session-outstanding";
+const GLYPH_WAITING = "\u{F051F}";
+const GLYPH_BLOCKED = "\u{F02D7}";
+const GLYPH_TERMINAL = "\u{F018D}";
+const GLYPH_IDLE = "\u{F04B2}";
+const GLYPH_ROBOT = "\u{F06A9}";
+
+function footerUi() {
+  const footer = new Map<string, string | undefined>();
+  return {
+    footer,
+    ui: {
+      setStatus: (key: string, text: string | undefined) =>
+        footer.set(key, text),
+      notify: () => undefined,
+      setWidget: (_key: string, content: unknown) => {
+        if (typeof content === "function")
+          (content as (tui: unknown, theme: unknown) => unknown)(
+            { requestRender: () => undefined },
+            {
+              fg: (_color: string, text: string) => text,
+              bold: (text: string) => text,
+            },
+          );
+      },
+    },
+  };
+}
+
+async function shutDown(pi: ReturnType<typeof fakePi>): Promise<void> {
+  for (const handler of pi.events.get("session_shutdown") ?? [])
+    await handler(undefined, undefined as never);
+}
+
+/** Captures the status refresh timers a start creates, so a test drives them. */
+async function captureRefreshes(start: () => Promise<unknown>): Promise<() => void> {
+  const refreshes: (() => void)[] = [];
+  const originalSetInterval = globalThis.setInterval;
+  globalThis.setInterval = ((callback: () => void) => {
+    refreshes.push(callback);
+    return { unref: () => undefined } as unknown as ReturnType<
+      typeof setInterval
+    >;
+  }) as typeof setInterval;
+  try {
+    await start();
+  } finally {
+    globalThis.setInterval = originalSetInterval;
+  }
+  return () => {
+    for (const refresh of refreshes) refresh();
+  };
+}
+
+async function startSession(
+  pi: ReturnType<typeof fakePi>,
+  context: any,
+): Promise<() => void> {
+  registerExtension!(pi.pi as never);
+  return captureRefreshes(async () => {
+    for (const handler of pi.events.get("session_start") ?? [])
+      await handler(undefined, context);
+  });
+}
+
+test("a lead's footer keeps local facts through an unavailable fleet and clears on shutdown", async (t) => {
+  setLeadEnvironment();
+  const pi = fakePi({ activeTools: ["read", "bash", "ask_owner"] });
+  const { footer, ui } = footerUi();
+  const context = fakeContext() as any;
+  context.mode = "tui";
+  context.hasUI = true;
+  context.ui = ui;
+  let backgroundTasks = 2;
+  pi.pi.events.on(SESSION_OUTSTANDING, (query: any) =>
+    query.respond(backgroundTasks),
+  );
+  t.after(() => shutDown(pi));
+  const refresh = await startSession(pi, context);
+  refresh();
+  await t.waitFor(() => {
+    assert.equal(footer.get(STATUS_ENTRY), GLYPH_WAITING);
+    assert.equal(footer.get(WORK_ENTRY), `${GLYPH_TERMINAL} 2`);
+  });
+
+  radarDaemon.observeInventory = () => undefined as never;
+  t.after(() => {
+    radarDaemon.observeInventory = undefined;
+  });
+  pi.pi.events.emit("rpiv:ask-user:blocked", { active: true });
+  refresh();
+  await t.waitFor(() => assert.equal(footer.get(STATUS_ENTRY), GLYPH_BLOCKED));
+  assert.equal(
+    footer.get(WORK_ENTRY),
+    `${GLYPH_TERMINAL} 2`,
+    "unknown children are omitted, not shown as zero",
+  );
+
+  backgroundTasks = 0;
+  pi.pi.events.emit("rpiv:ask-user:blocked", { active: false });
+  refresh();
+  await t.waitFor(() => {
+    assert.equal(footer.get(STATUS_ENTRY), GLYPH_IDLE);
+    assert.equal(footer.get(WORK_ENTRY), undefined);
+  });
+
+  await shutDown(pi);
+  assert.equal(footer.get(STATUS_ENTRY), undefined);
+  assert.equal(footer.get(WORK_ENTRY), undefined);
+});
+
+test("a managed leaf publishes its footer entries and an open permission prompt blocks it", async (t) => {
+  setAgentEnvironment("leaf-agent");
+  const pi = fakePi({ activeTools: ["read", "bash", "ask_owner"] });
+  const { footer, ui } = footerUi();
+  const context = fakeContext() as any;
+  context.mode = "tui";
+  context.hasUI = true;
+  context.ui = ui;
+  pi.pi.events.on(SESSION_OUTSTANDING, (query: any) => query.respond(1));
+  t.after(() => shutDown(pi));
+  const refresh = await startSession(pi, context);
+  refresh();
+  await t.waitFor(() =>
+    assert.equal(footer.get(WORK_ENTRY), `${GLYPH_TERMINAL} 1`),
+  );
+  assert.doesNotMatch(footer.get(WORK_ENTRY) ?? "", new RegExp(GLYPH_ROBOT));
+
+  pi.pi.events.emit("permissions:ui_prompt", { requestId: "req-a" });
+  refresh();
+  await t.waitFor(() => assert.equal(footer.get(STATUS_ENTRY), GLYPH_BLOCKED));
+  pi.pi.events.emit("permissions:decision", { requestId: "req-a" });
+  refresh();
+  await t.waitFor(() => assert.equal(footer.get(STATUS_ENTRY), GLYPH_WAITING));
+});
+
+test("an active Chief publishes its own footer facts with no owned subagents", async (t) => {
+  setLeadEnvironment();
+  process.env.HERDR_PANE_ID = "chief-pane";
+  process.env.HERDR_TAB_ID = "chief-tab";
+  process.env.HERDR_WORKSPACE_ID = WORKSPACE;
+  process.env.HERDR_SOCKET_PATH = join(tmpdir(), `footer-${randomUUID()}.sock`);
+  const pi = fakeChiefPi({ activeTools: ["read"], autoActivateRegisteredTools: true });
+  const { footer, ui } = footerUi();
+  const context = fakeContext([]) as any;
+  context.hasUI = true;
+  context.mode = "tui";
+  context.ui = ui;
+  pi.pi.events.on(SESSION_OUTSTANDING, (query: any) => query.respond(2));
+  t.after(() => shutDown(pi));
+  const refresh = await captureRefreshes(async () => {
+    await startSession(pi, context);
+    await pi.commandOptions.get("chief").handler("", context);
+  });
+  refresh();
+  await t.waitFor(() => {
+    assert.equal(footer.get(STATUS_ENTRY), GLYPH_WAITING);
+    assert.equal(footer.get(WORK_ENTRY), `${GLYPH_TERMINAL} 2`);
+  });
+  assert.doesNotMatch(footer.get(WORK_ENTRY) ?? "", new RegExp(GLYPH_ROBOT));
+
+  await shutDown(pi);
+  assert.equal(footer.get(STATUS_ENTRY), undefined);
+  assert.equal(footer.get(WORK_ENTRY), undefined);
 });

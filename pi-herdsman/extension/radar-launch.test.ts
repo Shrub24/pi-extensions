@@ -12,10 +12,11 @@ import {
   observeRadarChild,
   type RadarWorkerLaunch,
 } from "./radar-launch.ts";
+import { managedAgentPresence } from "./index.ts";
 import { readAgentState } from "./mailbox.ts";
 import { RADAR_SUBJECT_SOURCE } from "./radar-execution.ts";
 import { WORKSPACE, agentMailboxPath, resetRadarState } from "./support.ts";
-import { startFakeRadarDaemon } from "./support-radar.ts";
+import { FIXTURE_CHILD_PANE, startFakeRadarDaemon } from "./support-radar.ts";
 
 /**
  * One launch's inputs: a mailbox, the identity its child must repeat, and the
@@ -107,10 +108,10 @@ test("a spawn the daemon completes and its child acknowledges is ready", async (
     assert.equal(spawn!.env.PI_HERDSMAN_MAILBOX, launch.mailbox);
     // Readiness is the child's own acknowledgment of this launch, not the pane.
     assert.equal(outcome.value.agent_id, spawn!.agent_id);
-    assert.equal(outcome.value.pane_id, "startup-pane");
+    assert.equal(outcome.value.pane_id, FIXTURE_CHILD_PANE);
     assert.equal(outcome.value.state.agentLabel, "review-map");
     assert.equal(outcome.value.state.startupAck?.generation, launch.generation);
-    assert.equal(outcome.value.state.paneId, "startup-pane");
+    assert.equal(outcome.value.state.paneId, "%2");
   });
 });
 
@@ -148,7 +149,7 @@ test("a bound child that never acknowledges its launch stays unresolved", async 
     assert.equal(daemon.spawns.length, 1);
     const state = readAgentState(launch.mailbox);
     assert.equal(state?.startupAck, undefined);
-    assert.equal(state?.paneId, "startup-pane");
+    assert.equal(state?.paneId, "%2");
   });
 });
 
@@ -280,7 +281,7 @@ test("a child that claims its parent's pane instead of the pane it was created i
     // this launch did not create for it, so readiness never forms.
     assert.equal(readAgentState(launch.mailbox)?.paneId, "lead-pane");
     assert.match(outcome.message, /lead-pane/);
-    assert.match(outcome.message, /startup-pane/);
+    assert.ok(outcome.message.includes(FIXTURE_CHILD_PANE), outcome.message);
     assert.equal(daemon.spawns.length, 1);
   });
 });
@@ -296,7 +297,7 @@ test("a launch whose recorded pane the daemon no longer reports is unresolved", 
     });
     assert.equal(outcome.kind, "unresolved", JSON.stringify(outcome));
     if (outcome.kind !== "unresolved") return;
-    assert.match(outcome.message, /startup-pane/);
+    assert.ok(outcome.message.includes(FIXTURE_CHILD_PANE), outcome.message);
     // The launch leaves the edge and the pane it read back standing: an absent
     // pane is not a closed pane, and one request id is never spawned twice.
     assert.equal(daemon.spawns.length, 1);
@@ -326,7 +327,7 @@ test("child.close carries the caller's own id and replays without a second effec
     const closed = await client.childClose(closeRequest);
     assert.equal(closed.ok, true, JSON.stringify(closed));
     if (!closed.ok) return;
-    assert.deepEqual(closed.value, { outcome: "completed", pane: "startup-pane" });
+    assert.deepEqual(closed.value, { outcome: "completed", pane: FIXTURE_CHILD_PANE });
     // The close-operation UUID is the durable key the daemon recorded, so a lost
     // reply is reconciled by resending this id rather than closing twice.
     assert.deepEqual([...daemon.closes.keys()], [closeRequest.request_id]);
@@ -464,7 +465,12 @@ test("spawn.close without the close contract is refused before any pane effect",
 /** One ready launch, which is what a child to observe always comes from. */
 async function readyLaunch(
   daemon: Parameters<Parameters<typeof withDaemon>[1]>[0],
-): Promise<{ requestId: string; agentId: string; incarnation: string }> {
+): Promise<{
+  requestId: string;
+  agentId: string;
+  incarnation: string;
+  sessionId: string;
+}> {
   const launch = launchInputs();
   const outcome = await launchRadarWorker({
     client: clientFor(daemon),
@@ -474,10 +480,12 @@ async function readyLaunch(
   });
   assert.equal(outcome.kind, "ready", JSON.stringify(outcome));
   if (outcome.kind !== "ready") throw new Error("launch was not ready");
+  const spawn = daemon.spawns[0]!;
   return {
     requestId: launch.request_id,
     agentId: outcome.value.agent_id,
-    incarnation: daemon.spawns[0]!.incarnation,
+    incarnation: spawn.incarnation,
+    sessionId: spawn.session_id!,
   };
 }
 
@@ -486,8 +494,9 @@ test("a live child is proved by the daemon's current read of its own edge", asyn
     const child = await readyLaunch(daemon);
     const observation = await observeRadarChild(clientFor(daemon), {
       request_id: child.requestId,
-      pane_id: "startup-pane",
+      pane_id: FIXTURE_CHILD_PANE,
       agent_id: child.agentId,
+      session_id: child.sessionId,
     });
     assert.equal(observation.kind, "live", JSON.stringify(observation));
     if (observation.kind !== "live") return;
@@ -496,7 +505,7 @@ test("a live child is proved by the daemon's current read of its own edge", asyn
       agent_id: child.agentId,
       source: RADAR_SUBJECT_SOURCE,
       incarnation: child.incarnation,
-      pane_id: "startup-pane",
+      pane_id: FIXTURE_CHILD_PANE,
     });
   });
 });
@@ -514,8 +523,9 @@ test("a closed pane leaves the child unproved, not dead", async () => {
     assert.equal(closed.ok, true, JSON.stringify(closed));
     const observation = await observeRadarChild(clientFor(daemon), {
       request_id: child.requestId,
-      pane_id: "startup-pane",
+      pane_id: FIXTURE_CHILD_PANE,
       agent_id: child.agentId,
+      session_id: child.sessionId,
     });
     assert.equal(observation.kind, "unknown", JSON.stringify(observation));
     if (observation.kind !== "unknown") return;
@@ -538,8 +548,9 @@ test("a child the daemon observed exiting is not live, however present its pane 
     daemon.options.exitObservation = "exited";
     const observation = await observeRadarChild(clientFor(daemon), {
       request_id: child.requestId,
-      pane_id: "startup-pane",
+      pane_id: FIXTURE_CHILD_PANE,
       agent_id: child.agentId,
+      session_id: child.sessionId,
     });
     assert.equal(observation.kind, "unknown", JSON.stringify(observation));
     if (observation.kind !== "unknown") return;
@@ -556,8 +567,9 @@ test("a read that cannot be made proves nothing about the child", async () => {
       }),
       {
         request_id: child.requestId,
-        pane_id: "startup-pane",
+        pane_id: FIXTURE_CHILD_PANE,
         agent_id: child.agentId,
+        session_id: child.sessionId,
       },
     );
     assert.equal(observation.kind, "unknown", JSON.stringify(observation));
@@ -571,8 +583,9 @@ test("an edge bound to another child is not this launch's child", async () => {
     const child = await readyLaunch(daemon);
     const observation = await observeRadarChild(clientFor(daemon), {
       request_id: child.requestId,
-      pane_id: "startup-pane",
+      pane_id: FIXTURE_CHILD_PANE,
       agent_id: randomUUID(),
+      session_id: child.sessionId,
     });
     assert.equal(observation.kind, "unknown", JSON.stringify(observation));
     if (observation.kind !== "unknown") return;
@@ -591,8 +604,9 @@ test("a child whose launch never bound a subject is unproved", async () => {
     });
     const observation = await observeRadarChild(clientFor(daemon), {
       request_id: launch.request_id,
-      pane_id: "startup-pane",
+      pane_id: FIXTURE_CHILD_PANE,
       agent_id: undefined,
+      session_id: undefined,
     });
     assert.equal(observation.kind, "unknown", JSON.stringify(observation));
     if (observation.kind !== "unknown") return;
@@ -607,6 +621,7 @@ test("a launch that recorded no pane is unproved even where its child runs", asy
       request_id: child.requestId,
       pane_id: undefined,
       agent_id: child.agentId,
+      session_id: child.sessionId,
     });
     // The daemon does report a pane for this child. That is the daemon's own
     // statement, and it is not this launch's to make: a launch that recorded no
@@ -618,4 +633,73 @@ test("a launch that recorded no pane is unproved even where its child runs", asy
       /without a pane this launch recorded for it/,
     );
   });
+});
+
+test("another server's pane with the same number is not this launch's child", async () => {
+  await withDaemon({}, async (daemon) => {
+    const child = await readyLaunch(daemon);
+    const observation = await observeRadarChild(clientFor(daemon), {
+      request_id: child.requestId,
+      // The same raw pane number on a different server. The daemon names the
+      // server in its handle, so equal suffixes prove nothing about location.
+      pane_id: "tmux:other-server:%2",
+      agent_id: child.agentId,
+      session_id: child.sessionId,
+    });
+    assert.equal(observation.kind, "unknown", JSON.stringify(observation));
+    if (observation.kind !== "unknown") return;
+    assert.match(
+      observation.diagnostic,
+      /recorded on pane tmux:herdsman-fixture:%2, not on tmux:other-server:%2/,
+    );
+  });
+});
+
+test("a bound child is live only while it publishes the session its mailbox records", async () => {
+  await withDaemon({}, async (daemon) => {
+    const child = await readyLaunch(daemon);
+    const observe = (session_id: string | undefined) =>
+      observeRadarChild(clientFor(daemon), {
+        request_id: child.requestId,
+        pane_id: FIXTURE_CHILD_PANE,
+        agent_id: child.agentId,
+        session_id,
+      });
+    assert.equal(managedAgentPresence(await observe(child.sessionId)).kind, "radar");
+    const other = await observe(randomUUID());
+    assert.equal(other.kind, "unknown", JSON.stringify(other));
+    if (other.kind === "unknown") assert.match(other.diagnostic, /publishing session/);
+    const unrecorded = await observe(undefined);
+    assert.equal(unrecorded.kind, "unknown", JSON.stringify(unrecorded));
+  });
+});
+
+test("managed presence takes only the bound child's Radar verdict", async () => {
+  const observe = (
+    daemon: { socketPath: string },
+    child: { requestId: string; agentId: string; sessionId: string },
+  ) =>
+    observeRadarChild(clientFor(daemon), {
+      request_id: child.requestId,
+      pane_id: FIXTURE_CHILD_PANE,
+      agent_id: child.agentId,
+      session_id: child.sessionId,
+    });
+  await withDaemon({}, async (daemon) => {
+    const child = await readyLaunch(daemon);
+    assert.equal(managedAgentPresence(await observe(daemon, child)).kind, "radar");
+  });
+  await withDaemon({ processVerdict: "absent" }, async (daemon) => {
+    const child = await readyLaunch(daemon);
+    assert.deepEqual(managedAgentPresence(await observe(daemon, child)), {
+      kind: "lost",
+      processGone: "absent",
+    });
+  });
+  await withDaemon({ processVerdict: "unavailable" }, async (daemon) => {
+    const child = await readyLaunch(daemon);
+    assert.equal(managedAgentPresence(await observe(daemon, child)).kind, "unknown");
+  });
+  // Without a launch record this session, agent rows and panes never make a child lost.
+  assert.equal(managedAgentPresence(undefined).kind, "unknown");
 });

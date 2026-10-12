@@ -13,7 +13,10 @@ import type {
   ManagedAgentState,
 } from "./mailbox.ts";
 import { OperationError } from "./errors.ts";
-import { STARTUP_TIMEOUT_MAX } from "./herdr.ts";
+import { createRadarClient } from "./radar-client.ts";
+import { classifySupervisedLead } from "./presentation.ts";
+import { readProcessBirth } from "./radar-publication.ts";
+import { RADAR_SUBJECT_SOURCE } from "./radar-execution.ts";
 import { resultPath, resultRef } from "./storage.ts";
 import {
   listChiefMessagePaths,
@@ -34,22 +37,14 @@ import support, {
   LEAD_SESSION_ID,
   AGENT_ID,
   WORKSPACE,
-  agentFromState,
-  cascadeExecutor,
   controlMarker,
   defaultFixtureIdentity,
-  delegatedLifecycleExecutor,
   discoverAgent,
   fakeContext,
   fakePi,
   fakeAgentContext,
-  herdrAlias,
-  isApiSnapshot,
-  isAgentList,
-  isPaneList,
   managedState,
   nativeSessions,
-  agentControllerExecutor,
   promptLaunchContents,
   promptLaunchPaths,
   readRequest,
@@ -63,17 +58,14 @@ import support, {
   removeResult,
   resetAgentMailbox,
   resolveAssignmentSession,
-  leadExec,
   setLeadEnvironment,
   setAgentEnvironment,
-  observeRowStatus,
   radarDaemon,
   radarObservedFleet,
   drainRadarObserves,
   settleRadarObserves,
   spawnedArgvs,
   startRadarSession,
-  startupExecutor,
   agentMailboxPath,
   writeAsk,
   writePromptDefinition,
@@ -83,7 +75,56 @@ import support, {
   testChildCommand,
   testTmpRoot,
 } from "./support.ts";
-const { writeQuestionWaitEvidence } = await import("./question-waiting.ts");
+async function registerStandaloneRadarAgent(
+  piSessionId: string,
+  pane: string,
+  activity?: { value: string; observedAt?: string },
+): Promise<string> {
+  const client = createRadarClient({ env: process.env });
+  const incarnation = randomUUID();
+  const birth = readProcessBirth();
+  if (birth === undefined) throw new Error("the fixture process identity is unavailable");
+  const registration = await client.register({
+    source: RADAR_SUBJECT_SOURCE,
+    incarnation,
+    session: piSessionId,
+    location: { backend: "tmux", instance: "herdsman-fixture", pane },
+    process: birth,
+  });
+  if (!registration.ok) throw new Error(`standalone registration failed: ${registration.message}`);
+  const proof = await client.agentGet(registration.value.agent_id);
+  if (!proof.ok) throw new Error(`standalone registration proof failed: ${proof.message}`);
+  assert.equal(proof.value.verification, "verified");
+  assert.equal(proof.value.contextSession, piSessionId);
+  assert.equal(proof.value.location?.pane, pane);
+  if (activity !== undefined) {
+    const publisher = { source: RADAR_SUBJECT_SOURCE, incarnation };
+    const writer = await client.acquire({
+      agent_id: registration.value.agent_id,
+      channel: "execution",
+      publisher,
+    });
+    if (!writer.ok) throw new Error(`standalone publisher acquisition failed: ${writer.message}`);
+    const publication = await client.publish({
+      agent_id: registration.value.agent_id,
+      channel: "execution",
+      writer_handle: writer.value.handle,
+      sequence: writer.value.sequence,
+      observed_at: activity.observedAt ?? new Date().toISOString(),
+      snapshot: { activity: activity.value },
+    });
+    if (!publication.ok) throw new Error(`standalone publication failed: ${publication.message}`);
+    const read = await client.agentGet(registration.value.agent_id);
+    if (!read.ok) throw new Error(`standalone publication read failed: ${read.message}`);
+    const expectedActivity = activity.observedAt !== undefined &&
+      Date.now() - Date.parse(activity.observedAt) > 30_000
+      ? undefined
+      : activity.value;
+    assert.equal(read.value.activity, expectedActivity);
+  }
+  return registration.value.agent_id;
+}
+
 function fakeChiefPi(options: Parameters<typeof fakePi>[0] = {}) {
   let fixture: ReturnType<typeof fakePi>;
   const initialTools = Array.isArray(options.activeTools)
@@ -167,57 +208,21 @@ const ownershipResult = (
 
 test("unassigned Lead routes supervisor messages directly to Chief", async () => {
   setLeadEnvironment();
-  const socket = join(tmpdir(), `unassigned-routing-${randomUUID()}.sock`);
-  process.env.HERDR_SOCKET_PATH = socket;
-  process.env.HERDR_WORKSPACE_ID = "linked-workspace";
-  process.env.HERDR_PANE_ID = "lead-pane";
-  process.env.HERDR_TAB_ID = "lead-tab";
   const chiefId = randomUUID();
   const leadId = randomUUID();
+  const chiefAgentId = await registerStandaloneRadarAgent(
+    chiefId,
+    "tmux:herdsman-fixture:%2",
+  );
   const runtime = supervisionRuntime();
   const chief = claimChiefLease({
     piSessionId: chiefId,
-    paneId: "chief-pane",
+    paneId: "tmux:herdsman-fixture:%2",
     tabId: "chief-tab",
     workspaceId: WORKSPACE,
+    agentId: chiefAgentId,
   });
-  const agents = [
-    [chiefId, "chief-pane", "chief-tab", WORKSPACE],
-    [leadId, "lead-pane", "lead-tab", "linked-workspace"],
-  ].map(([id, pane_id, tab_id, workspace_id]) => ({
-    agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: id },
-    pane_id,
-    tab_id,
-    workspace_id,
-  }));
-  const exec = (_command: string, args: string[]) => {
-    let result: unknown = {};
-    if (isApiSnapshot(args)) result = { snapshot: { agents, panes: [] } };
-    else if (isAgentList(args)) result = { agents };
-    else if (args[0] === "agent" && args[1] === "get")
-      result = { agent: agents.find((agent) => agent.pane_id === args[2]) };
-    else if (args[0] === "workspace" && args[1] === "get")
-      result = {
-        workspace: {
-          worktree: { repo_key: "repo-key", is_linked_worktree: true },
-        },
-      };
-    else if (args[0] === "worktree" && args[1] === "list")
-      result = {
-        source: {
-          repo_key: "repo-key",
-          repo_name: "project",
-          source_workspace_id: WORKSPACE,
-        },
-        worktrees: [{ open_workspace_id: "linked-workspace" }],
-      };
-    return {
-      stdout: JSON.stringify({ id: AGENT_ID, result }),
-      stderr: "",
-      code: 0,
-    };
-  };
-  const pi = fakeChiefPi({ exec });
+  const pi = fakeChiefPi();
   registerExtension!(pi.pi as never);
   const ctx = fakeContext() as any;
   ctx.sessionManager = {
@@ -229,187 +234,110 @@ test("unassigned Lead routes supervisor messages directly to Chief", async () =>
     await pi.events.get("session_start")![0](undefined, ctx);
     const result = await pi.tools
       .find((tool) => tool.name === "supervisor_message")!
-      .execute(
-        "message",
-        { message: "UNASSIGNED_DIRECT_TO_CHIEF" },
-        undefined,
-        undefined,
-        ctx,
-      );
+      .execute("message", { message: "UNASSIGNED_DIRECT_TO_CHIEF" }, undefined, undefined, ctx);
     assert.equal(result.details.chiefSessionId, chiefId);
     assert.ok(
       listChiefMessagePaths(runtime, chiefId).some((path) => {
         const record = readChiefMessage(path);
-        return (
-          record.kind === "lead_message" &&
-          record.fromSessionId === leadId &&
-          record.text === "UNASSIGNED_DIRECT_TO_CHIEF"
-        );
+        return record.kind === "lead_message" && record.fromSessionId === leadId &&
+          record.text === "UNASSIGNED_DIRECT_TO_CHIEF";
       }),
     );
   } finally {
     await pi.events.get("session_shutdown")?.[0]();
     chief.release();
-    delete process.env.HERDR_SOCKET_PATH;
     setLeadEnvironment();
   }
 });
 
 test("legacy Lead pendingAsk state is normalized and does not block messaging", async () => {
   setLeadEnvironment();
-  const socket = join(tmpdir(), `legacy-lead-state-${randomUUID()}.sock`);
-  process.env.HERDR_SOCKET_PATH = socket;
-  process.env.HERDR_WORKSPACE_ID = "linked-workspace";
-  process.env.HERDR_PANE_ID = "lead-pane";
-  process.env.HERDR_TAB_ID = "lead-tab";
   const chiefId = randomUUID();
   const leadId = randomUUID();
+  const chiefAgentId = await registerStandaloneRadarAgent(
+    chiefId,
+    "tmux:herdsman-fixture:%2",
+  );
   const runtime = supervisionRuntime();
   const chief = claimChiefLease({
     piSessionId: chiefId,
-    paneId: "chief-pane",
+    paneId: "tmux:herdsman-fixture:%2",
     tabId: "chief-tab",
     workspaceId: WORKSPACE,
+    agentId: chiefAgentId,
   });
-  const agents = [
-    [chiefId, "chief-pane", "chief-tab", WORKSPACE],
-    [leadId, "lead-pane", "lead-tab", "linked-workspace"],
-  ].map(([id, pane_id, tab_id, workspace_id]) => ({
-    agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: id },
-    pane_id,
-    tab_id,
-    workspace_id,
-  }));
-  const exec = (_command: string, args: string[]) => {
-    let result: unknown = {};
-    if (isApiSnapshot(args)) result = { snapshot: { agents, panes: [] } };
-    else if (isAgentList(args)) result = { agents };
-    else if (args[0] === "agent" && args[1] === "get")
-      result = { agent: agents.find((agent) => agent.pane_id === args[2]) };
-    else if (args[0] === "workspace" && args[1] === "get")
-      result = {
-        workspace: {
-          worktree: { repo_key: "repo-key", is_linked_worktree: true },
-        },
-      };
-    else if (args[0] === "worktree" && args[1] === "list")
-      result = {
-        source: {
-          repo_key: "repo-key",
-          repo_name: "project",
-          source_workspace_id: WORKSPACE,
-        },
-        worktrees: [{ open_workspace_id: "linked-workspace" }],
-      };
-    return {
-      stdout: JSON.stringify({ id: AGENT_ID, result }),
-      stderr: "",
-      code: 0,
-    };
-  };
   const pi = fakeChiefPi({
-    entries: [
-      {
-        type: "custom",
-        customType: "pi-herdsman-lead-state",
-        data: {
-          instanceId: randomUUID(),
-          pendingAsk: { question: "retired question", id: randomUUID() },
-        },
-      },
-    ],
-    exec,
+    entries: [{ type: "custom", customType: "pi-herdsman-lead-state", data: {
+      instanceId: randomUUID(), pendingAsk: { question: "retired question", id: randomUUID() },
+    } }],
   });
   registerExtension!(pi.pi as never);
   const ctx = fakeContext(pi.entries) as any;
-  ctx.sessionManager = {
-    ...ctx.sessionManager,
-    getSessionId: () => leadId,
-  };
+  ctx.sessionManager = { ...ctx.sessionManager, getSessionId: () => leadId };
   try {
     await pi.events.get("session_start")![0](undefined, ctx);
     const normalized = pi.entries
       .filter((entry: any) => entry?.customType === "pi-herdsman-lead-state")
       .at(-1) as any;
-    assert.deepEqual(Object.keys(normalized.data).sort(), [
-      "instanceId",
-      "sessionId",
-    ]);
+    assert.deepEqual(Object.keys(normalized.data).sort(), ["instanceId", "sessionId"]);
     assert.equal(normalized.data.sessionId, leadId);
-    assert.notEqual(
-      normalized.data.instanceId,
-      (pi.entries[0] as any).data.instanceId,
-    );
+    assert.notEqual(normalized.data.instanceId, (pi.entries[0] as any).data.instanceId);
 
     const result = await pi.tools
       .find((tool) => tool.name === "supervisor_message")!
-      .execute(
-        "message",
-        { message: "LEGACY_STATE_MESSAGE_OK" },
-        undefined,
-        undefined,
-        ctx,
-      );
+      .execute("message", { message: "LEGACY_STATE_MESSAGE_OK" }, undefined, undefined, ctx);
     assert.equal(result.details.chiefSessionId, chiefId);
     assert.ok(
       listChiefMessagePaths(runtime, chiefId).some((path) => {
         const record = readChiefMessage(path);
-        return (
-          record.kind === "lead_message" &&
-          record.fromSessionId === leadId &&
-          record.text === "LEGACY_STATE_MESSAGE_OK"
-        );
+        return record.kind === "lead_message" && record.fromSessionId === leadId &&
+          record.text === "LEGACY_STATE_MESSAGE_OK";
       }),
     );
   } finally {
     await pi.events.get("session_shutdown")?.[0]();
     chief.release();
-    delete process.env.HERDR_SOCKET_PATH;
     setLeadEnvironment();
   }
 });
 
-test("a Chief's supervision lists a Lead only when the Radar observation proves it", async () => {
+test("a Chief's supervision lists a Lead only when the Radar registry proves it", async () => {
   setLeadEnvironment();
-  process.env.HERDR_SOCKET_PATH = join(tmpdir(), `chief-radar-${randomUUID()}.sock`);
-  process.env.HERDR_PANE_ID = "chief-pane";
-  process.env.HERDR_TAB_ID = "chief-tab";
   const chiefSession = randomUUID();
   const leadSession = randomUUID();
   const unprovenSession = randomUUID();
-  for (const piSessionId of [leadSession, unprovenSession])
-    writeLeadCoordinationState(supervisionRuntime(), {
-      version: 1,
-      role: "lead",
-      instanceId: randomUUID(),
-      piSessionId,
-      updatedAt: Date.now(),
-    });
-  const placed = (pane: string, session: unknown) => ({
-    location: { workspace_id: WORKSPACE, tab_id: `${pane}-tab`, pane_id: pane },
-    session,
+  const leadAgentId = await registerStandaloneRadarAgent(
+    leadSession,
+    "tmux:herdsman-fixture:%2",
+  );
+  const unprovenAgentId = await registerStandaloneRadarAgent(
+    unprovenSession,
+    "tmux:herdsman-fixture:%3",
+  );
+  writeLeadCoordinationState(supervisionRuntime(), {
+    version: 1,
+    role: "lead",
+    instanceId: randomUUID(),
+    piSessionId: leadSession,
+    agentId: leadAgentId,
+    paneId: "tmux:herdsman-fixture:%2",
+    workspaceId: WORKSPACE,
+    tabId: "lead-tab",
+    updatedAt: Date.now(),
   });
-  radarDaemon.observeInventory = () => ({
-    workspaces: [{ workspace_id: WORKSPACE }],
-    tabs: [
-      { tab_id: "lead-pane-tab", workspace_id: WORKSPACE },
-      { tab_id: "unproven-pane-tab", workspace_id: WORKSPACE },
-    ],
-    panes: [
-      { location: { workspace_id: WORKSPACE, tab_id: "lead-pane-tab", pane_id: "lead-pane" } },
-      { location: { workspace_id: WORKSPACE, tab_id: "unproven-pane-tab", pane_id: "unproven-pane" } },
-    ],
-    agents: [
-      placed("lead-pane", { kind: "uuid", value: leadSession }),
-      placed("unproven-pane", {
-        kind: "reported",
-        value: { source: "other-source", value: unprovenSession },
-      }),
-    ],
+  writeLeadCoordinationState(supervisionRuntime(), {
+    version: 1,
+    role: "lead",
+    instanceId: randomUUID(),
+    piSessionId: unprovenSession,
+    agentId: unprovenAgentId,
+    // The registration is real, but this persisted record names another pane.
+    paneId: "tmux:herdsman-fixture:%4",
+    workspaceId: WORKSPACE,
+    tabId: "unproven-tab",
+    updatedAt: Date.now(),
   });
-  const pi = fakeChiefPi({
-    exec: () => ({ stdout: JSON.stringify({ id: AGENT_ID, result: {} }), stderr: "", code: 0 }),
-  });
+  const pi = fakeChiefPi();
   registerExtension!(pi.pi as never);
   const ctx = fakeContext() as any;
   ctx.sessionManager = { ...ctx.sessionManager, getSessionId: () => chiefSession };
@@ -426,130 +354,6 @@ test("a Chief's supervision lists a Lead only when the Radar observation proves 
     assert.equal(supervision.includes(unprovenSession), false);
   } finally {
     await pi.events.get("session_shutdown")?.[0]();
-    radarDaemon.observeInventory = radarObservedFleet;
-    setLeadEnvironment();
-  }
-});
-
-test("Chief preflight defers inbox delivery until agent_start", async (t) => {
-  setLeadEnvironment();
-  const socket = join(tmpdir(), `chief-preflight-${randomUUID()}.sock`);
-  process.env.HERDR_SOCKET_PATH = socket;
-  process.env.HERDR_PANE_ID = "chief-pane";
-  process.env.HERDR_TAB_ID = "chief-tab";
-  const sessionId = randomUUID();
-  const senderId = randomUUID();
-  const agents = [
-    [sessionId, "chief-pane", "chief-tab", WORKSPACE],
-    [senderId, "sender-pane", "sender-tab", WORKSPACE],
-  ].map(([id, pane_id, tab_id, workspace_id]) => ({
-    agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: id },
-    pane_id,
-    tab_id,
-    workspace_id,
-  }));
-  writeLeadCoordinationState(supervisionRuntime(), {
-    version: 1,
-    role: "lead",
-    instanceId: randomUUID(),
-    piSessionId: senderId,
-    updatedAt: Date.now(),
-  });
-  const exec = (_command: string, args: string[]) => {
-    let result: unknown = {};
-    if (isApiSnapshot(args)) result = { snapshot: { agents, panes: [] } };
-    else if (isAgentList(args)) result = { agents };
-    else if (args[0] === "agent" && args[1] === "get")
-      result = { agent: agents.find((agent) => agent.pane_id === args[2]) };
-    else if (args[0] === "workspace" && args[1] === "get")
-      result = {
-        workspace: {
-          worktree: { repo_key: "repo-key", is_linked_worktree: true },
-        },
-      };
-    else if (args[0] === "worktree" && args[1] === "list")
-      result = {
-        source: {
-          repo_key: "repo-key",
-          repo_name: "project",
-          source_workspace_id: WORKSPACE,
-        },
-        worktrees: [{ open_workspace_id: WORKSPACE }],
-      };
-    return {
-      stdout: JSON.stringify({ id: AGENT_ID, result }),
-      stderr: "",
-      code: 0,
-    };
-  };
-  const pi = fakeChiefPi({ exec });
-  registerExtension!(pi.pi as never);
-  const ctx = fakeContext() as any;
-  ctx.sessionManager = {
-    ...ctx.sessionManager,
-    getSessionId: () => sessionId,
-  };
-  ctx.isIdle = () => true;
-  try {
-    await pi.events.get("session_start")![0](undefined, ctx);
-    await pi.commandOptions.get("chief").handler("", ctx);
-    const descriptor = readChiefDescriptor(supervisionRuntime().descriptor);
-    writeChiefMessage(
-      {
-        version: 1,
-        id: randomUUID(),
-        leaseId: descriptor.leaseId,
-        kind: "lead_message",
-        fromSessionId: senderId,
-        toSessionId: sessionId,
-        leadSessionId: senderId,
-        text: "queued until the turn starts",
-        createdAt: Date.now(),
-      },
-      supervisionRuntime(),
-    );
-
-    const beforeAgentStart = pi.events.get("before_agent_start")![0];
-    const preflight = () =>
-      beforeAgentStart(
-        { systemPrompt: "base", systemPromptOptions: { contextFiles: [] } },
-        ctx,
-      );
-    await Promise.all([preflight(), preflight()]);
-    await new Promise((resolve) => setTimeout(resolve, 650));
-    assert.equal(
-      pi.sent.some((message: any) =>
-        String(message?.content ?? "").includes("queued until the turn starts"),
-      ),
-      false,
-    );
-
-    await pi.events.get("agent_start")![0](undefined, ctx);
-    await new Promise((resolve) => setTimeout(resolve, 650));
-    assert.equal(
-      pi.sent.some((message: any) =>
-        String(message?.content ?? "").includes("queued until the turn starts"),
-      ),
-      false,
-    );
-
-    await pi.events.get("agent_start")![0](undefined, ctx);
-    await t.waitFor(() =>
-      assert.ok(
-        pi.sent.some((message: any) =>
-          String(message?.content ?? "").includes(
-            "queued until the turn starts",
-          ),
-        ),
-      ),
-    );
-    assert.equal(
-      listChiefMessagePaths(supervisionRuntime(), sessionId).length,
-      0,
-    );
-  } finally {
-    await pi.events.get("session_shutdown")?.[0]();
-    delete process.env.HERDR_SOCKET_PATH;
     setLeadEnvironment();
   }
 });
@@ -648,15 +452,11 @@ test("semantic result refs attach persisted output and preserve canonical file r
   ];
   const label = "agent";
   let assignedText = "";
-  const startup = startupExecutor(
-    label,
-    () => DEFAULT_PI_SESSION_ID,
-    undefined,
-    (text) => {
-      assignedText = text;
-    },
-  );
-  const pi = fakePi({ entries, exec: startup.exec });
+  // The Radar child the delegate launches receives the assignment itself.
+  radarDaemon.onChildRequest = (_spawn, request) => {
+    assignedText = request.text;
+  };
+  const pi = fakePi({ entries });
   registerExtension!(pi.pi as never);
   try {
     const result = await agentTool(pi, "delegate").execute(
@@ -684,8 +484,7 @@ test("semantic result refs attach persisted output and preserve canonical file r
     );
   } finally {
     pi.events.get("session_shutdown")?.[0]();
-    startup.stopMailboxConsumer();
-    resetAgentMailbox(startup.mailbox);
+    resetAgentMailbox(agentMailboxPath(WORKSPACE, label));
     realFs.rmSync(resultFile, { force: true });
   }
 });
@@ -711,8 +510,7 @@ test("advertised result refs resolve as accepted context inputs", async () => {
     },
   ];
   const label = "agent";
-  const startup = startupExecutor(label, () => DEFAULT_PI_SESSION_ID);
-  const pi = fakePi({ entries, exec: startup.exec });
+  const pi = fakePi({ entries });
   registerExtension!(pi.pi as never);
   const brief = DELEGATION_BRIEF_EXAMPLES.common.replace(
     "  inputs: []",
@@ -745,8 +543,7 @@ test("advertised result refs resolve as accepted context inputs", async () => {
     assert.equal(result.details.ok, true, JSON.stringify(result.details));
   } finally {
     pi.events.get("session_shutdown")?.[0]();
-    startup.stopMailboxConsumer();
-    resetAgentMailbox(startup.mailbox);
+    resetAgentMailbox(agentMailboxPath(WORKSPACE, label));
     realFs.rmSync(resultFile, { force: true });
   }
 });
@@ -903,19 +700,7 @@ test("trusted same-cwd project assignment launches with native approval", async 
     join(project, ".pi", "agents", "project-only.md"),
     "---\nname: project-only\n---\nproject",
   );
-  const startArgs: string[][] = [];
-  const startup = startupExecutor(
-    "project-only",
-    () => DEFAULT_PI_SESSION_ID,
-    undefined,
-    undefined,
-    false,
-    (args) => startArgs.push(args),
-    project,
-    AGENT_ID,
-    true,
-  );
-  const pi = fakePi({ exec: startup.exec });
+  const pi = fakePi({});
   registerExtension!(pi.pi as never);
   const context = fakeContext() as any;
   context.cwd = project;
@@ -935,7 +720,7 @@ test("trusted same-cwd project assignment launches with native approval", async 
       true,
       JSON.stringify({ result: result.details, entries: pi.entries }),
     );
-    assert.ok(startArgs[0]?.includes("--approve"));
+    assert.ok(spawnedArgvs(radarDaemon)[0]?.includes("--approve"));
     const tool = pi.tools.find((candidate) => candidate.name === "agent_steer");
     const rendered = tool.renderCall(
       { agent: result.details.agent, message: "Continue." },
@@ -948,7 +733,7 @@ test("trusted same-cwd project assignment launches with native approval", async 
     assert.match(rendered.render(160).join("\n"), /agent steer\s+project-only/);
   } finally {
     pi.events.get("session_shutdown")?.[0]();
-    resetAgentMailbox(startup.mailbox);
+    resetAgentMailbox(agentMailboxPath(WORKSPACE, "project-only"));
     realFs.rmSync(project, { recursive: true, force: true });
   }
   await (async () => {
@@ -963,19 +748,7 @@ test("trusted same-cwd project assignment launches with native approval", async 
       "---\nname: project-only\n---\nproject",
     );
     realFs.symlinkSync(project, projectLink);
-    const startArgs: string[][] = [];
-    const startup = startupExecutor(
-      "project-only",
-      () => DEFAULT_PI_SESSION_ID,
-      undefined,
-      undefined,
-      false,
-      (args) => startArgs.push(args),
-      project,
-      AGENT_ID,
-      true,
-    );
-    const pi = fakePi({ exec: startup.exec });
+    const pi = fakePi({});
     registerExtension!(pi.pi as never);
     const context = fakeContext() as any;
     context.cwd = projectLink;
@@ -992,10 +765,10 @@ test("trusted same-cwd project assignment launches with native approval", async 
         true,
         JSON.stringify({ result: result.details, entries: pi.entries }),
       );
-      assert.ok(startArgs[0]?.includes("--approve"));
+      assert.ok(spawnedArgvs(radarDaemon)[0]?.includes("--approve"));
     } finally {
       pi.events.get("session_shutdown")?.[0]();
-      resetAgentMailbox(startup.mailbox);
+      resetAgentMailbox(agentMailboxPath(WORKSPACE, "project-only"));
       realFs.rmSync(projectLink, { force: true });
       realFs.rmSync(project, { recursive: true, force: true });
     }
@@ -1008,18 +781,7 @@ test("untrusted assignments omit project approval", async () => {
     join(tmpdir(), "pi-herdsman-approval-untrusted-"),
   );
   realFs.mkdirSync(join(project, ".pi", "agents"), { recursive: true });
-  const startArgs: string[][] = [];
-  const startup = startupExecutor(
-    "agent",
-    () => DEFAULT_PI_SESSION_ID,
-    undefined,
-    undefined,
-    false,
-    (args) => startArgs.push(args),
-    project,
-    AGENT_ID,
-  );
-  const pi = fakePi({ exec: startup.exec });
+  const pi = fakePi({});
   registerExtension!(pi.pi as never);
   const context = fakeContext() as any;
   context.cwd = project;
@@ -1036,10 +798,14 @@ test("untrusted assignments omit project approval", async () => {
       context,
     );
     assert.equal(result.details.ok, true, JSON.stringify(result.details));
-    assert.equal(startArgs[0]?.includes("--approve"), false);
+    assert.equal(
+      spawnedArgvs(radarDaemon)[0]?.includes("--approve"),
+      false,
+      "an untrusted project is launched without approval",
+    );
   } finally {
     pi.events.get("session_shutdown")?.[0]();
-    resetAgentMailbox(startup.mailbox);
+    resetAgentMailbox(agentMailboxPath(WORKSPACE, "agent"));
     realFs.rmSync(project, { recursive: true, force: true });
   }
 });
@@ -1117,8 +883,7 @@ test("same-cwd managed parents resolve project children", async () => {
   const parentMailbox = agentMailboxPath(WORKSPACE, parent.agentLabel);
   resetAgentMailbox(parentMailbox);
   writeAgentState(parentMailbox, parent);
-  const lifecycle = delegatedLifecycleExecutor(parent, [], project);
-  const pi = fakePi({ exec: lifecycle.exec });
+  const pi = fakePi({});
   registerExtension!(pi.pi as never);
   const context = fakeAgentContext([
     {
@@ -1171,6 +936,8 @@ test("parent controller readiness and allowlist fail closed", async () => {
   const parent = managedState("delegating-parent");
   const parentMailbox = agentMailboxPath(WORKSPACE, parent.agentLabel);
   resetAgentMailbox(parentMailbox);
+  // The mailbox pane is the process's own raw pane, which is what its own
+  // environment declares.
   writeAgentState(parentMailbox, parent);
   const files = [
     ["parent.md", '---\nname: parent\nagents: ["child"]\n---\nparent\n'],
@@ -1190,7 +957,7 @@ test("parent controller readiness and allowlist fail closed", async () => {
       },
     },
   ]);
-  const pi = fakePi({ exec: agentControllerExecutor(parent) });
+  const pi = fakePi({});
   registerExtension!(pi.pi as never);
   const tool = agentTool(pi, "delegate");
   try {
@@ -1246,7 +1013,7 @@ test("parent controller readiness and allowlist fail closed", async () => {
   });
   for (const [name, content] of files)
     realFs.writeFileSync(join(PI_AGENTS_DIR, name), content, "utf8");
-  const failing = fakePi({ exec: agentControllerExecutor(conflict) });
+  const failing = fakePi({});
   registerExtension!(failing.pi as never);
   const failingContext = fakeAgentContext([
     {
@@ -1262,6 +1029,7 @@ test("parent controller readiness and allowlist fail closed", async () => {
   try {
     for (const handler of failing.events.get("session_start") ?? [])
       await handler(undefined, failingContext);
+    const launchesBefore = spawnedArgvs(radarDaemon).length;
     const rejected = await agentTool(failing, "delegate").execute(
       "id",
       { definition: "child", task: "conflicting state" },
@@ -1270,10 +1038,7 @@ test("parent controller readiness and allowlist fail closed", async () => {
       failingContext,
     );
     assert.equal(rejected.details.error.category, "target_not_found");
-    assert.equal(
-      failing.calls.some((args) => args[0] === "agent" && args[1] === "start"),
-      false,
-    );
+    assert.equal(spawnedArgvs(radarDaemon).length, launchesBefore);
   } finally {
     for (const handler of failing.events.get("session_shutdown") ?? [])
       handler();
@@ -1293,9 +1058,7 @@ test("parent list hides disabled allowed definitions", async () => {
   ];
   for (const [name, content] of files)
     realFs.writeFileSync(join(PI_AGENTS_DIR, name), content, "utf8");
-  const pi = fakePi({
-    exec: agentControllerExecutor(managedState("listing-parent")),
-  });
+  const pi = fakePi({});
   registerExtension!(pi.pi as never);
   const entries = pi.entries;
   const context = fakeAgentContext(entries);
@@ -1354,21 +1117,24 @@ test("parent list omits unrelated unknown mailbox diagnostics", async () => {
   ];
   for (const [name, content] of files)
     realFs.writeFileSync(join(PI_AGENTS_DIR, name), content, "utf8");
-  const pi = fakePi({ exec: agentControllerExecutor(parent, [child]) });
-  registerExtension!(pi.pi as never);
-  const context = fakeAgentContext([
-    {
-      type: "custom",
-      customType: "pi-herdsman-agent-definition",
-      data: {
-        sessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-        definition: "parent",
-        label: process.env.PI_HERDSMAN_LABEL ?? "parent",
-      },
-    },
-  ]);
-
+  // Every mailbox this subject needs is written above, so the setup below lives
+  // inside the try: a stimulus failure must not leave the malformed record this
+  // test plants for the rest of the file.
+  let pi: ReturnType<typeof fakePi> | undefined;
   try {
+    pi = fakePi({});
+    registerExtension!(pi.pi as never);
+    const context = fakeAgentContext([
+      {
+        type: "custom",
+        customType: "pi-herdsman-agent-definition",
+        data: {
+          sessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+          definition: "parent",
+          label: process.env.PI_HERDSMAN_LABEL ?? "parent",
+        },
+      },
+    ]);
     for (const handler of pi.events.get("session_start") ?? [])
       await handler(undefined, context);
 
@@ -1386,18 +1152,20 @@ test("parent list omits unrelated unknown mailbox diagnostics", async () => {
         .filter((agent): agent is string => agent !== undefined),
       [child.agentLabel],
     );
+    // A mailbox nothing launched is unknown on its own facts; what this subject
+    // holds is that the unrelated workspace's record never reaches the list.
     assert.equal(
-      (listed.details.agents as { state?: string }[]).some(
-        (agent) => agent.state === "unknown",
+      (listed.details.agents as { agent?: string }[]).some(
+        (agent) => agent.agent === "unrelated-agent",
       ),
       false,
     );
-    assert.doesNotMatch(
-      (listed.content[0] as { text: string }).text,
-      /diagnostic:/,
-    );
+    // The listed child names its own absent proof; the unrelated workspace's
+    // record must not appear in this list at all.
+    const shown = (listed.content[0] as { text: string }).text;
+    assert.doesNotMatch(shown, /unrelated-workspace|unrelated-agent/);
   } finally {
-    for (const handler of pi.events.get("session_shutdown") ?? []) handler();
+    for (const handler of pi?.events.get("session_shutdown") ?? []) handler();
     for (const mailbox of mailboxes) resetAgentMailbox(mailbox);
     realFs.rmSync(unknownMailbox, { recursive: true, force: true });
     for (const [name] of files) realFs.unlinkSync(join(PI_AGENTS_DIR, name));
@@ -1422,8 +1190,7 @@ test("foreign-workspace mailbox is ignored by recovery and list", async () => {
   writeAgentState(currentMailbox, current);
   writeAgentState(foreignMailbox, foreign);
   const entries: unknown[] = [];
-  const lifecycle = cascadeExecutor([current]);
-  const pi = fakePi({ entries, exec: lifecycle.exec });
+  const pi = fakePi({ entries });
   registerExtension!(pi.pi as never);
   const context = fakeContext(entries);
 
@@ -1455,173 +1222,6 @@ test("foreign-workspace mailbox is ignored by recovery and list", async () => {
     for (const handler of pi.events.get("session_shutdown") ?? []) handler();
     resetAgentMailbox(currentMailbox);
     resetAgentMailbox(foreignMailbox);
-  }
-});
-
-test("parent controls only direct children and enforces session allowlists", async () => {
-  setAgentEnvironment("ownership-parent", ["child"]);
-  process.env.PI_HERDSMAN_AGENT_DEFINITION = "parent";
-  const parent = managedState("ownership-parent");
-  const child = {
-    ...managedState(
-      "ownership-child",
-      undefined,
-      recoveryIdentity("ownership-child"),
-    ),
-    ownerSessionId: parent.piSessionId,
-    piSessionId: CHILD_SESSION_ID,
-    piSessionFile: join(testTmpRoot, "ownership-child.jsonl"),
-    runId: randomUUID(),
-  };
-  const activeRequestId = randomUUID();
-  const workingChild = {
-    ...managedState(
-      "ownership-working-child",
-      activeRequestId,
-      recoveryIdentity("ownership-working-child"),
-    ),
-    ownerSessionId: parent.piSessionId,
-    piSessionId: "11111111-1111-4111-8111-111111111111",
-    piSessionFile: join(testTmpRoot, "ownership-working-child.jsonl"),
-    runId: randomUUID(),
-  };
-  const sibling = {
-    ...managedState(
-      "ownership-sibling",
-      undefined,
-      recoveryIdentity("ownership-sibling"),
-    ),
-    ownerSessionId: LEAD_SESSION_ID,
-    piSessionId: "22222222-2222-4222-8222-222222222222",
-    piSessionFile: join(testTmpRoot, "ownership-sibling.jsonl"),
-    runId: randomUUID(),
-  };
-  const mailboxes = [parent, child, workingChild, sibling].map((state) =>
-    agentMailboxPath(WORKSPACE, state.agentLabel),
-  );
-  for (const mailbox of mailboxes) resetAgentMailbox(mailbox);
-  writeAgentState(mailboxes[0], parent);
-  writeAgentState(mailboxes[1], child);
-  writeAgentState(mailboxes[2], workingChild);
-  writeAgentState(mailboxes[3], sibling);
-  const files = [
-    ["parent.md", '---\nname: parent\nagents: ["child"]\n---\nparent\n'],
-    ["child.md", "---\nname: child\n---\nchild\n"],
-    ["other.md", "---\nname: other\n---\nother\n"],
-  ];
-  for (const [name, content] of files)
-    realFs.writeFileSync(join(PI_AGENTS_DIR, name), content, "utf8");
-  const entries = [
-    {
-      type: "custom",
-      customType: "pi-herdsman-agent-definition",
-      data: {
-        sessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-        definition: "parent",
-        label: process.env.PI_HERDSMAN_LABEL ?? "parent",
-      },
-    },
-    ownershipResult(
-      "33333333-3333-4333-8333-333333333333",
-      "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-      {
-        path: join(testTmpRoot, "ownership-resume.jsonl"),
-        definition: "other",
-        label: "other",
-      },
-    ),
-  ];
-  const pi = fakePi({
-    exec: agentControllerExecutor(parent, [child, workingChild, sibling]),
-  });
-  registerExtension!(pi.pi as never);
-  const context = fakeAgentContext(entries);
-  const resumePath = join(testTmpRoot, "ownership-resume.jsonl");
-  realFs.writeFileSync(resumePath, "{}", "utf8");
-  nativeSessions.set("ownership-resume", {
-    id: "33333333-3333-4333-8333-333333333333",
-    path: resumePath,
-    cwd: testTmpRoot,
-    entries: [
-      {
-        type: "custom",
-        customType: "pi-herdsman-agent-definition",
-        data: {
-          sessionId: "33333333-3333-4333-8333-333333333333",
-          definition: "other",
-          label: "other",
-        },
-      },
-    ],
-  });
-  try {
-    for (const handler of pi.events.get("session_start") ?? [])
-      await handler(undefined, context);
-    const listed = await agentTool(pi, "list").execute(
-      "list",
-      {},
-      undefined,
-      undefined,
-      context,
-    );
-    assert.deepEqual(
-      (listed.details.agents as { agent: string }[])
-        .map((agent) => agent.agent)
-        .sort(),
-      [child.agentLabel, workingChild.agentLabel],
-    );
-
-    const steered = await agentTool(pi, "steer").execute(
-      "steer",
-      {
-        agent: workingChild.agentLabel,
-        message: "steer direct child",
-      },
-      undefined,
-      undefined,
-      context,
-    );
-    assert.equal(steered.details.ok, true);
-    const siblingResult = await agentTool(pi, "steer").execute(
-      "sibling",
-      { agent: sibling.agentLabel, message: "wrong owner" },
-      undefined,
-      undefined,
-      context,
-    );
-    assert.equal(siblingResult.details.error.category, "target_not_found");
-    assert.equal(
-      pi.calls.some(
-        (args) =>
-          args[0] === "agent" &&
-          args[1] === "prompt" &&
-          args[2] === sibling.paneId,
-      ),
-      false,
-    );
-
-    const resumed = await agentTool(pi, "continue").execute(
-      "resume",
-      {
-        session: resumePath,
-        task: "wrong definition",
-      },
-      undefined,
-      undefined,
-      context,
-    );
-    assert.equal(resumed.details.error.category, "invalid_request");
-    assert.match(resumed.details.error.message, /not allowed/);
-    assert.equal(
-      pi.calls.some((args) => args[0] === "agent" && args[1] === "start"),
-      false,
-    );
-  } finally {
-    nativeSessions.delete("ownership-resume");
-    for (const handler of pi.events.get("session_shutdown") ?? []) handler();
-    for (const mailbox of mailboxes) resetAgentMailbox(mailbox);
-    for (const [name] of files) realFs.unlinkSync(join(PI_AGENTS_DIR, name));
-    realFs.rmSync(resumePath, { force: true });
   }
 });
 
@@ -1682,7 +1282,6 @@ test("list retains durable agents whose physical identity is not exact", async (
                     cwd: "/tmp",
                   },
                   {
-                    name: herdrAlias(invalidLabel),
                     agent_status: "idle",
                     workspace_id: WORKSPACE,
                     pane_id: invalid.paneId,
@@ -1695,7 +1294,6 @@ test("list retains durable agents whose physical identity is not exact", async (
                     },
                   },
                   {
-                    name: herdrAlias(validLabel),
                     agent_status: "idle",
                     workspace_id: WORKSPACE,
                     pane_id: valid.paneId,
@@ -2096,8 +1694,7 @@ test("a continued assignment takes its own watcher instruction and inherits none
     };
     realFs.writeFileSync(source.path, "{}", "utf8");
     nativeSessions.set(source.id, source);
-    const startup = startupExecutor(item.label, () => DEFAULT_PI_SESSION_ID);
-    const pi = fakePi({ exec: startup.exec });
+    const pi = fakePi({});
     registerExtension!(pi.pi as never);
     try {
       const result = await agentTool(pi, "continue").execute(
@@ -2131,7 +1728,6 @@ test("a continued assignment takes its own watcher instruction and inherits none
       assert.equal(recorded, item.instruction);
     } finally {
       pi.events.get("session_shutdown")?.[0]();
-      startup.stopMailboxConsumer();
       nativeSessions.clear();
       resetAgentMailbox(mailbox);
       realFs.rmSync(source.path, { force: true });
@@ -2218,7 +1814,11 @@ const retainedRadarWorker = async (
         ),
       },
     });
-  const pi = fakePi({ entries });
+  // A real Lead registers its tools, so its active-tool baseline is the registered set.
+  const pi: ReturnType<typeof fakePi> = fakePi({
+    entries,
+    allTools: () => pi.tools,
+  });
   registerExtension!(pi.pi as never);
   const context = fakeContext(entries) as any;
   context.model = { provider: "controller-provider", id: "controller-model" };
@@ -2561,10 +2161,19 @@ test("a close outcome decides retirement, never permission on its own", async ()
     );
     Object.assign(
       radarDaemon.options,
-      { closeOutcome: "completed", refuseChildClose: false },
+      { closeOutcome: "completed", refuseChildClose: false, processVerdict: undefined },
       setting,
-      { processVerdict: verdict },
+      // The daemon answers for this child's own process: a verdict of absent is
+      // expressed on the record that process belongs to, never as an override
+      // that would also answer for whatever replaces it.
+      { processVerdict: verdict === "verified" ? "verified" : undefined },
     );
+    if (verdict === "absent")
+      radarDaemon.exitProcess(
+        radarDaemon.spawns.find(
+          (spawn) => spawn.env.PI_HERDSMAN_MAILBOX === fixture.mailbox,
+        )!,
+      );
     try {
       const result = await continueRetainedWorker(fixture);
       if (relaunches) {
@@ -2639,17 +2248,33 @@ test("a stored close never relaunches a child that has an outstanding assignment
 test("a refused close is not authority: an absent process relaunches and the refused pane stays as residue", async () => {
   setLeadEnvironment();
   nativeSessions.clear();
-  const fixture = await retainedRadarWorker(`refused-${randomUUID().slice(0, 8)}`);
+  // A changed definition makes a retained child a relaunch decision, so the close
+  // comes first. The daemon refuses that close while the process is still proved
+  // present, and the absence proof taken after the refusal is what lets the
+  // relaunch proceed: the refusal is no authority in either direction, and the
+  // pane it leaves open must not be silent.
+  const fixture = await retainedRadarWorker(`refused-${randomUUID().slice(0, 8)}`, {
+    launchedModel: "explicit/old",
+  });
+  const close = radarDaemon.holdNextClose();
   try {
-    // The pane stays open on a dead shell whose process has stopped.
     radarDaemon.options.refuseChildClose = true;
+    radarDaemon.options.processVerdict = "verified";
+    const relaunching = continueRetainedWorker(fixture);
+    await close.arrived;
+    // The process of the child this close was refused for is now proved absent on
+    // its own grounds, which is what authorizes the relaunch; the override goes so
+    // the replacement answers for itself.
+    radarDaemon.options.processVerdict = undefined;
     radarDaemon.exitProcess(radarDaemon.spawns[0]!);
-    const relaunched = await continueRetainedWorker(fixture);
+    close.release();
+    const relaunched = await relaunching;
     assert.equal(relaunched.details.ok, true, JSON.stringify(relaunched.details));
     assert.equal(radarDaemon.spawns.length, 2, "the absent process is relaunched");
     assert.notEqual(radarDaemon.spawns[0]!.closed, true, "the refused pane is left as residue");
     assert.match(String(relaunched.details.residue), /Pane .* was left open/, "the relaunch result names the residue");
   } finally {
+    close.release();
     radarDaemon.options.refuseChildClose = false;
     releaseRetainedWorker(fixture);
   }
@@ -2950,128 +2575,6 @@ test("session continuation keeps explicit definition execution overrides", async
   }
 });
 
-test("session continuation rejects label overrides and occupied inherited labels", async () => {
-  setLeadEnvironment();
-  nativeSessions.clear();
-  const invalidPi = fakePi();
-  registerExtension!(invalidPi.pi as never);
-  try {
-    const invalidRequest = {
-      session: "/tmp/session.jsonl",
-      label: "Invalid_Label",
-      task: "reject the label",
-    } as const;
-    assert.equal(
-      Value.Check(agentTool(invalidPi, "continue").parameters, {
-        session: invalidRequest.session,
-        label: invalidRequest.label,
-        task: invalidRequest.task,
-      }),
-      false,
-    );
-    const invalid = await agentTool(invalidPi, "continue").execute(
-      "id",
-      {
-        session: invalidRequest.session,
-        label: invalidRequest.label,
-        task: invalidRequest.task,
-      },
-      undefined,
-      undefined,
-      fakeContext(),
-    );
-    assert.equal(invalid.details.error.category, "invalid_request");
-    assert.equal(invalidPi.calls.length, 0);
-  } finally {
-    invalidPi.events.get("session_shutdown")?.[0]();
-  }
-
-  setLeadEnvironment();
-  const label = "resume-occupied";
-  const mailbox = agentMailboxPath(WORKSPACE, label);
-  resetAgentMailbox(mailbox);
-  writeAgentState(mailbox, managedState(label));
-  nativeSessions.set(DEFAULT_PI_SESSION_ID, {
-    id: DEFAULT_PI_SESSION_ID,
-    path: "/tmp/registered-agent.jsonl",
-    entries: [
-      {
-        type: "custom",
-        customType: "pi-herdsman-agent-definition",
-        data: {
-          sessionId: DEFAULT_PI_SESSION_ID,
-          definition: "agent",
-          label,
-        },
-      },
-    ],
-  });
-  const source = {
-    id: randomUUID(),
-    path: join(tmpdir(), `session-occupied-${randomUUID()}.jsonl`),
-    cwd: "/tmp",
-  };
-  realFs.writeFileSync(source.path, "{}", "utf8");
-  nativeSessions.set(source.id, {
-    ...source,
-    entries: [
-      {
-        type: "custom",
-        customType: "pi-herdsman-agent-definition",
-        data: { sessionId: source.id, definition: "agent", label },
-      },
-    ],
-  });
-  const baseExec = leadExec(label, "idle", DEFAULT_PI_SESSION_ID);
-  const pi = fakePi({
-    exec: (command, args, options) =>
-      command === "herdr" && args[0] === "tab" && args[1] === "create"
-        ? {
-            stdout: JSON.stringify({
-              id: AGENT_ID,
-              result: {
-                tab: { tab_id: "occupied-test-tab" },
-                root_pane: {
-                  pane_id: "occupied-test-pane",
-                  terminal_id: "occupied-test-terminal",
-                },
-              },
-            }),
-            stderr: "",
-            code: 0,
-          }
-        : baseExec(command, args, options),
-  });
-  registerExtension!(pi.pi as never);
-  try {
-    const result = await agentTool(pi, "continue").execute(
-      "id",
-      {
-        session: source.path,
-        task: "must not fall back to another label",
-      },
-      undefined,
-      undefined,
-      fakeContext([
-        ownershipResult(source.id, LEAD_SESSION_ID, {
-          path: source.path,
-          label,
-        }),
-      ]),
-    );
-    assert.equal(result.details.error.category, "agent_label_exists");
-    assert.equal(
-      pi.calls.some((args) => args[0] === "agent" && args[1] === "start"),
-      false,
-    );
-  } finally {
-    pi.events.get("session_shutdown")?.[0]();
-    nativeSessions.clear();
-    resetAgentMailbox(mailbox);
-    realFs.rmSync(source.path, { force: true });
-  }
-});
-
 test("delegate schema accepts a brief string and rejects an empty task", () => {
   setLeadEnvironment();
   const pi = fakePi();
@@ -3364,11 +2867,7 @@ test("managed historical sources require durable owner-side ancestry for continu
     ]) {
       if (proof[0] !== parentProof) nativeSessions.delete(parentId);
       {
-        const startup = startupExecutor(
-          "owned-source",
-          () => DEFAULT_PI_SESSION_ID,
-        );
-        const owner = fakePi({ exec: startup.exec });
+        const owner = fakePi({});
         registerExtension!(owner.pi as never);
         try {
           const result = await agentTool(owner, "continue").execute(
@@ -3381,8 +2880,7 @@ test("managed historical sources require durable owner-side ancestry for continu
           assert.equal(result.details.ok, true, JSON.stringify(result.details));
         } finally {
           owner.events.get("session_shutdown")?.[0]();
-          startup.stopMailboxConsumer();
-          resetAgentMailbox(startup.mailbox);
+          resetAgentMailbox(agentMailboxPath(WORKSPACE, "owned-source"));
         }
       }
     }
@@ -3433,8 +2931,7 @@ test("copied fork result history does not invalidate the original owner edge", a
       },
     ],
   });
-  const startup = startupExecutor("child", () => DEFAULT_PI_SESSION_ID);
-  const pi = fakePi({ exec: startup.exec });
+  const pi = fakePi({});
   registerExtension!(pi.pi as never);
   try {
     const result = await agentTool(pi, "continue").execute(
@@ -3452,112 +2949,7 @@ test("copied fork result history does not invalidate the original owner edge", a
     assert.equal(result.details.ok, true, JSON.stringify(result.details));
   } finally {
     pi.events.get("session_shutdown")?.[0]();
-    startup.stopMailboxConsumer();
-    resetAgentMailbox(startup.mailbox);
-    nativeSessions.clear();
-    realFs.rmSync(childPath, { force: true });
-    realFs.rmSync(parentPath, { force: true });
-  }
-});
-
-test("historical continuation re-parenting preserves every valid ownership path", async () => {
-  setLeadEnvironment();
-  const parentId = randomUUID();
-  const childId = DEFAULT_PI_SESSION_ID;
-  const outsiderId = randomUUID();
-  const childPath = join(testTmpRoot, `reparented-${childId}.jsonl`);
-  const parentPath = join(testTmpRoot, `reparent-owner-${parentId}.jsonl`);
-  realFs.writeFileSync(childPath, "{}", "utf8");
-  realFs.writeFileSync(parentPath, "{}", "utf8");
-  const parentEntries = [
-    {
-      type: "custom",
-      customType: "pi-herdsman-agent-definition",
-      data: { sessionId: parentId, definition: "agent", label: "parent" },
-    },
-    ownershipResult(childId, parentId, { path: childPath, label: "child" }),
-  ];
-  const leadEntries = [
-    ownershipResult(parentId, LEAD_SESSION_ID, {
-      path: parentPath,
-      label: "parent",
-    }),
-  ];
-  nativeSessions.clear();
-  nativeSessions.set(parentId, {
-    id: parentId,
-    path: parentPath,
-    entries: parentEntries,
-  });
-  nativeSessions.set(childId, {
-    id: childId,
-    path: childPath,
-    cwd: "/tmp",
-    entries: [
-      {
-        type: "custom",
-        customType: "pi-herdsman-agent-definition",
-        data: { sessionId: childId, definition: "agent", label: "child" },
-      },
-    ],
-  });
-  const request = async (entries: unknown[], callerId = LEAD_SESSION_ID) => {
-    const startup = startupExecutor("child", () => childId);
-    const pi = fakePi({ exec: startup.exec });
-    registerExtension!(pi.pi as never);
-    try {
-      const context = fakeContext(entries) as any;
-      context.sessionManager.getSessionId = () => callerId;
-      const result = await agentTool(pi, "continue").execute(
-        "id",
-        { session: childId, task: "continue child" },
-        undefined,
-        undefined,
-        context,
-      );
-      if (result.details.ok) assert.equal(result.details.session_id, childId);
-      return result;
-    } finally {
-      pi.events.get("session_shutdown")?.[0]();
-      startup.stopMailboxConsumer();
-      resetAgentMailbox(startup.mailbox);
-    }
-  };
-  try {
-    const first = await request(leadEntries);
-    assert.equal(first.details.ok, true, JSON.stringify(first.details));
-    const fromParent = await request(parentEntries, parentId);
-    assert.equal(
-      fromParent.details.ok,
-      true,
-      JSON.stringify(fromParent.details),
-    );
-    // The completed continuation delivers a new result for the same Pi ID
-    // directly to L, without erasing P's older child result.
-    leadEntries.push(
-      ownershipResult(childId, LEAD_SESSION_ID, {
-        path: childPath,
-        label: "child",
-      }),
-    );
-    const repeated = await request(leadEntries);
-    assert.equal(repeated.details.ok, true, JSON.stringify(repeated.details));
-    const unrelated = await request([], outsiderId);
-    assert.equal(unrelated.details.error.category, "invalid_request");
-    const malformed = ownershipResult(childId, parentId, {
-      path: childPath,
-      label: "child",
-    });
-    (malformed.details as any).status = "unknown";
-    parentEntries.push(malformed);
-    assert.equal((await request(leadEntries)).details.ok, true);
-    parentEntries.pop();
-    const childEntries = nativeSessions.get(childId)!.entries;
-    childEntries.push(
-      ownershipResult(parentId, childId, { path: parentPath, label: "parent" }),
-    );
-    assert.equal((await request(leadEntries)).details.ok, true);
-  } finally {
+    resetAgentMailbox(agentMailboxPath(WORKSPACE, "child"));
     nativeSessions.clear();
     realFs.rmSync(childPath, { force: true });
     realFs.rmSync(parentPath, { force: true });
@@ -3675,16 +3067,7 @@ test("registered agent validates duplicate agents and selectors before lifecycle
   const mailbox = agentMailboxPath(WORKSPACE, label);
   resetAgentMailbox(mailbox);
   writeAgentState(mailbox, managedState(label, undefined, identity));
-  const duplicate = fakePi({
-    exec: leadExec(
-      label,
-      "idle",
-      identity.piSessionId,
-      undefined,
-      identity.piSessionId,
-      identity,
-    ),
-  });
+  const duplicate = fakePi({});
   registerExtension!(duplicate.pi as never);
   await duplicate.events.get("session_start")![0](undefined, fakeContext());
   const tool = duplicate.tools.find(
@@ -3776,8 +3159,7 @@ test("registered delegate protects a live mailbox owned by another owner", async
     `${mailbox}/result-${REQUEST_ID}.json`,
     "utf8",
   );
-  const startup = startupExecutor("agent-2", () => DEFAULT_PI_SESSION_ID);
-  const pi = fakePi({ exec: startup.exec });
+  const pi = fakePi({});
   registerExtension!(pi.pi as never);
   const tool = agentTool(pi, "delegate");
   const result = await tool.execute(
@@ -3802,7 +3184,7 @@ test("registered delegate protects a live mailbox owned by another owner", async
     resultBefore,
   );
   pi.events.get("session_shutdown")?.[0]();
-  resetAgentMailbox(startup.mailbox);
+  resetAgentMailbox(agentMailboxPath(WORKSPACE, "agent-2"));
 });
 
 test("fresh assignments do not reset an unacknowledged stale mailbox", async () => {
@@ -3821,11 +3203,7 @@ test("fresh assignments do not reset an unacknowledged stale mailbox", async () 
   kind: "task",
   text: "preserve automatic handoff",
   createdAt: Date.now(), });
-  const automaticStartup = startupExecutor(
-    automaticLabel + "-2",
-    () => DEFAULT_PI_SESSION_ID,
-  );
-  const automaticPi = fakePi({ exec: automaticStartup.exec });
+  const automaticPi = fakePi({});
   registerExtension!(automaticPi.pi as never);
   const automatic = await agentTool(automaticPi, "delegate").execute(
     "id",
@@ -3841,7 +3219,7 @@ test("fresh assignments do not reset an unacknowledged stale mailbox", async () 
   assert.equal(automatic.details.agent, `${automaticLabel}-2`);
   assert.ok(readRequest(automaticMailbox, automaticRequestId));
   automaticPi.events.get("session_shutdown")?.[0]();
-  resetAgentMailbox(automaticStartup.mailbox);
+  resetAgentMailbox(agentMailboxPath(WORKSPACE, automaticLabel + "-2"));
 });
 
 test("request-only mailbox remnants reserve their labels", async () => {
@@ -3873,11 +3251,7 @@ test("request-only mailbox remnants reserve their labels", async () => {
   kind: "task",
   text: "retain this request-only remnant",
   createdAt: Date.now(), });
-  const automaticStartup = startupExecutor(
-    `${automaticLabel}-2`,
-    () => DEFAULT_PI_SESSION_ID,
-  );
-  const automaticPi = fakePi({ exec: automaticStartup.exec });
+  const automaticPi = fakePi({});
   registerExtension!(automaticPi.pi as never);
   const automatic = await agentTool(automaticPi, "delegate").execute(
     "id",
@@ -3893,7 +3267,7 @@ test("request-only mailbox remnants reserve their labels", async () => {
   assert.equal(automatic.details.agent, `${automaticLabel}-2`);
   assert.ok(readRequest(automaticMailbox, automaticRequestId));
   automaticPi.events.get("session_shutdown")?.[0]();
-  resetAgentMailbox(automaticStartup.mailbox);
+  resetAgentMailbox(agentMailboxPath(WORKSPACE, `${automaticLabel}-2`));
   resetAgentMailbox(automaticMailbox);
 });
 // Under Radar the launch is verified before the brief is written, so an unacknowledged
@@ -3906,10 +3280,9 @@ test("an unacknowledged launch is a retained reservation that nothing releases",
   setLeadEnvironment();
   radarDaemon.reset();
   const label = "agent";
-  const startup = startupExecutor(label, () => DEFAULT_PI_SESSION_ID);
   radarDaemon.options.acknowledge = false;
   process.env.PI_HERDSMAN_RADAR_LAUNCH_TIMEOUT_MS = "500";
-  const pi = fakePi({ exec: startup.exec });
+  const pi = fakePi({});
   registerExtension!(pi.pi as never);
   const context = fakeContext(pi.entries);
   try {
@@ -3926,10 +3299,10 @@ test("an unacknowledged launch is a retained reservation that nothing releases",
       "pane_not_ready",
       JSON.stringify(abandoned.details),
     );
-    assert.equal(readAgentState(startup.mailbox)?.activeRequestId, undefined);
+    assert.equal(readAgentState(agentMailboxPath(WORKSPACE, label))?.activeRequestId, undefined);
     assert.equal(
-      realFs.existsSync(startup.mailbox)
-        ? realFs.readdirSync(startup.mailbox).filter((name) => name.startsWith("request-")).length
+      realFs.existsSync(agentMailboxPath(WORKSPACE, label))
+        ? realFs.readdirSync(agentMailboxPath(WORKSPACE, label)).filter((name) => name.startsWith("request-")).length
         : 0,
       0,
     );
@@ -3954,820 +3327,8 @@ test("an unacknowledged launch is a retained reservation that nothing releases",
     delete process.env.PI_HERDSMAN_RADAR_LAUNCH_TIMEOUT_MS;
     radarDaemon.options.acknowledge = true;
     pi.events.get("session_shutdown")?.[0]();
-    resetAgentMailbox(startup.mailbox);
+    resetAgentMailbox(agentMailboxPath(WORKSPACE, label));
     radarDaemon.reset();
-  }
-});
-
-test("registered lead exposes only explicit live controls", async () => {
-  setLeadEnvironment();
-  process.env.HERDR_PANE_ID = "lead-pane";
-  const label = "action-agent";
-  const identity = recoveryIdentity(label);
-  const mailbox = agentMailboxPath(WORKSPACE, label);
-  resetAgentMailbox(mailbox);
-  writeAgentState(mailbox, {
-    ...managedState(label, REQUEST_ID, identity),
-    agentDefinition: "generalist",
-  });
-  const steerFile = join(testTmpRoot, `${label}-update.md`);
-  realFs.writeFileSync(steerFile, "steer evidence");
-  let steerSubmitted: RequestRecord | undefined;
-  const accepting = fakePi({
-    activeTools: [],
-    allTools: () => accepting.tools,
-    exec: leadExec(
-      label,
-      "working",
-      identity.piSessionId,
-      (requestMailbox, marker) => {
-        const requestId = marker.slice("__PI_HERDSMAN_AGENT_V5__:".length);
-        steerSubmitted = readRequest(requestMailbox, requestId);
-        const current = readAgentState(requestMailbox)!;
-        writeAgentState(requestMailbox, {
-          ...current,
-          lastAck: { requestId, accepted: true, acknowledgedAt: Date.now() },
-          updatedAt: Date.now(),
-        });
-      },
-      identity.piSessionId,
-      identity,
-    ),
-  });
-  registerExtension!(accepting.pi as never);
-  assert.equal(
-    accepting.tools.some((candidate) => candidate.name === "subagent"),
-    false,
-  );
-  const tool = accepting.tools.find(
-    (candidate) => candidate.name === "agent_list",
-  )!;
-  const context = fakeContext(accepting.entries);
-  await accepting.events.get("session_start")![0](
-    undefined,
-    fakeContext(accepting.entries),
-  );
-  assert.deepEqual(accepting.pi.getActiveTools(), [
-    "agent_list",
-    "agent_delegate",
-    "agent_continue",
-    "agent_steer",
-    "agent_interrupt",
-    "agent_reply",
-    "agent_close",
-    "agent_inspect",
-    "agent_transcript",
-    "agent_extend",
-    "supervisor_message",
-    "peer_list",
-    "peer_message",
-  ]);
-  const listed = await tool.execute("id", {}, undefined, undefined, context);
-  assert.deepEqual(listed.details.agents[0].available_tools, [
-    "agent_inspect",
-    "agent_steer",
-    "agent_interrupt",
-    "agent_close",
-  ]);
-  const steer = await accepting.tools
-    .find((candidate) => candidate.name === "agent_steer")!
-    .execute(
-      "id",
-      { agent: label, message: "continue", files: [steerFile] },
-      undefined,
-      undefined,
-      context,
-    );
-  assert.equal(steer.details.ok, true);
-  assert.equal(steer.details.action, "steer");
-  assert.equal(steer.details.agent, label);
-  assert.equal(steer.details.session_id, identity.piSessionId);
-  assert.equal(steer.details.assignment_request_id, REQUEST_ID);
-  assert.equal(steer.details.presentation_agent_definition, "generalist");
-  assert.equal(steer.details.truncated, false);
-  assert.equal(steerSubmitted?.kind, "steer");
-  assert.match(steerSubmitted?.text ?? "", /steer evidence/);
-  assert.equal(steerSubmitted?.requestId, steer.details.request_id);
-  assert.match(
-    (steer.content[0] as { text: string }).text,
-    new RegExp(`Session: ${identity.piSessionId}`),
-  );
-  assert.match(
-    (steer.content[0] as { text: string }).text,
-    /Assignment request: /,
-  );
-  const rendered = accepting.tools
-    .find((candidate) => candidate.name === "agent_steer")!
-    .renderResult(
-      { content: steer.content, details: steer.details },
-      { expanded: true, isPartial: false },
-      { fg: (_color: string, text: string) => text },
-      { args: { agent: label, message: "continue" } },
-    );
-  assert.match(rendered.text, new RegExp(`session: ${identity.piSessionId}`));
-  assert.match(rendered.text, /assignment request: /);
-  let interruptSubmitted: RequestRecord | undefined;
-  const interruptPi = fakePi({
-    exec: leadExec(
-      label,
-      "working",
-      identity.piSessionId,
-      (requestMailbox, marker) => {
-        const requestId = marker.slice("__PI_HERDSMAN_AGENT_V5__:".length);
-        interruptSubmitted = readRequest(requestMailbox, requestId);
-        const current = readAgentState(requestMailbox)!;
-        writeAgentState(requestMailbox, {
-          ...current,
-          lastAck: { requestId, accepted: true, acknowledgedAt: Date.now() },
-          updatedAt: Date.now(),
-        });
-      },
-      identity.piSessionId,
-      identity,
-    ),
-  });
-  registerExtension!(interruptPi.pi as never);
-  const interruptContext = fakeContext(interruptPi.entries);
-  await interruptPi.events.get("session_start")![0](
-    undefined,
-    interruptContext,
-  );
-  const interrupt = await agentTool(interruptPi, "interrupt").execute(
-    "interrupt",
-    {
-      agent: label,
-      message: testBrief("Stop and use the fallback.", "common"),
-    },
-    undefined,
-    undefined,
-    interruptContext,
-  );
-  assert.equal(interrupt.details.ok, true);
-  assert.equal(interrupt.details.action, "interrupt");
-  assert.equal(interrupt.details.assignment_request_id, REQUEST_ID);
-  assert.equal(interruptSubmitted?.kind, "interrupt");
-  assert.match(interruptSubmitted?.text ?? "", /Stop and use the fallback\./);
-  assert.equal(interruptSubmitted?.acceptedAssignment?.requestId, REQUEST_ID);
-  assert.equal(interruptSubmitted?.acceptedAssignment?.brief.profile, "common");
-  interruptPi.events.get("session_shutdown")?.[0]();
-  accepting.events.get("session_shutdown")?.[0]();
-  realFs.rmSync(steerFile, { force: true });
-});
-
-test("successful controls persist their definition before runtime teardown", async () => {
-  for (const action of ["steer", "reply", "inspect"] as const) {
-    setLeadEnvironment();
-    const label = `persisted-${action}`;
-    const identity = recoveryIdentity(label);
-    const requestId = randomUUID();
-    const mailbox = agentMailboxPath(WORKSPACE, label);
-    const state = {
-      ...managedState(
-        label,
-        action === "inspect" ? undefined : requestId,
-        identity,
-      ),
-      agentDefinition: "agent",
-    };
-    resetAgentMailbox(mailbox);
-    writeAgentState(mailbox, state);
-    const askId = randomUUID();
-    if (action === "reply") {
-      writeAgentState(mailbox, { ...state, pendingAskId: askId });
-      writeAsk(mailbox, { version: 5, askId,
-      requestId,
-      runId: state.runId,
-      ownerSessionId: state.ownerSessionId,
-      workspaceId: state.workspaceId,
-      agentLabel: state.agentLabel,
-      paneId: state.paneId,
-      piSessionId: state.piSessionId,
-      question: "Which provider should I use?",
-      createdAt: Date.now(), });
-    }
-    let pi: ReturnType<typeof fakePi>;
-    let context = fakeContext();
-    let tornDown = false;
-    const teardown = () => {
-      if (tornDown) return;
-      tornDown = true;
-      for (const handler of pi.events.get("session_shutdown") ?? [])
-        handler(undefined, context);
-    };
-    const acknowledgeAndTearDown = (requestMailbox: string, marker: string) => {
-      const observedRequestId = marker.slice(
-        "__PI_HERDSMAN_AGENT_V5__:".length,
-      );
-      const current = readAgentState(requestMailbox)!;
-      writeAgentState(requestMailbox, {
-        ...current,
-        lastAck: {
-          requestId: observedRequestId,
-          accepted: true,
-          acknowledgedAt: Date.now(),
-        },
-        updatedAt: Date.now(),
-      });
-      teardown();
-    };
-    const baseExec = leadExec(
-      label,
-      "working",
-      identity.piSessionId,
-      action === "inspect" ? undefined : acknowledgeAndTearDown,
-      identity.piSessionId,
-      identity,
-    );
-    const exec = async (command: string, args: string[], options: any) => {
-      const result = await baseExec(command, args, options);
-      if (
-        action === "inspect" &&
-        command === "herdr" &&
-        args[0] === "agent" &&
-        args[1] === "get"
-      )
-        teardown();
-      return result;
-    };
-    pi = fakePi({ exec });
-    registerExtension!(pi.pi as never);
-    try {
-      await pi.events.get("session_start")![0](undefined, context);
-      const result = await agentTool(pi, action).execute(
-        action,
-        {
-          agent: label,
-          ...(action !== "inspect" ? { message: "Continue." } : {}),
-        },
-        undefined,
-        undefined,
-        context,
-      );
-      assert.equal(result.details.ok, true, JSON.stringify(result.details));
-      assert.equal(result.details.presentation_agent_definition, "agent");
-      assert.doesNotMatch(
-        (result.content[0] as { text: string }).text,
-        /presentation_agent_definition/,
-      );
-    } finally {
-      teardown();
-      resetAgentMailbox(mailbox);
-    }
-  }
-});
-
-test("agent list projects an active user-question wait as blocked without owner reply", async () => {
-  setLeadEnvironment();
-  const state = {
-    ...managedState(
-      "question-waiting-parent",
-      REQUEST_ID,
-      recoveryIdentity("question-waiting-parent"),
-    ),
-    piSessionId: PARENT_SESSION_ID,
-    piSessionFile: "/tmp/question-waiting-parent.jsonl",
-  };
-  const mailbox = agentMailboxPath(WORKSPACE, state.agentLabel);
-  resetAgentMailbox(mailbox);
-  writeAgentState(mailbox, state);
-  const pi = fakePi({ exec: agentControllerExecutor(state) });
-  registerExtension!(pi.pi as never);
-  const context = fakeContext();
-  try {
-    await pi.events.get("session_start")![0](undefined, context);
-    writeQuestionWaitEvidence(mailbox, {
-      runId: state.runId,
-      requestId: REQUEST_ID,
-      piSessionId: state.piSessionId,
-    });
-    const blocked = await agentTool(pi, "list").execute(
-      "list",
-      {},
-      undefined,
-      undefined,
-      context,
-    );
-    const listedAgent = blocked.details.agents[0];
-    assert.equal(listedAgent?.state, "blocked");
-    assert.ok(!listedAgent?.available_tools.includes("agent_reply"));
-    assert.ok(!listedAgent?.available_tools.includes("agent_interrupt"));
-  } finally {
-    for (const handler of pi.events.get("session_shutdown") ?? []) handler();
-    resetAgentMailbox(mailbox);
-  }
-});
-
-test("lead steers a blocked parent waiting for direct-child work", async () => {
-  setLeadEnvironment();
-  const parent = {
-    ...managedState(
-      "steerable-parent",
-      REQUEST_ID,
-      recoveryIdentity("steerable-parent"),
-    ),
-    piSessionId: PARENT_SESSION_ID,
-    piSessionFile: "/tmp/steerable-parent.jsonl",
-    runId: randomUUID(),
-  };
-  const child = {
-    ...managedState(
-      "steerable-child",
-      randomUUID(),
-      recoveryIdentity("steerable-child"),
-    ),
-    ownerSessionId: parent.piSessionId,
-    piSessionId: CHILD_SESSION_ID,
-    piSessionFile: "/tmp/steerable-child.jsonl",
-    runId: randomUUID(),
-  };
-  const parentMailbox = agentMailboxPath(WORKSPACE, parent.agentLabel);
-  const childMailbox = agentMailboxPath(WORKSPACE, child.agentLabel);
-  const foreignChildMailbox = agentMailboxPath(
-    "foreign-steerable-workspace",
-    "foreign-steerable-child",
-  );
-  resetAgentMailbox(parentMailbox);
-  resetAgentMailbox(childMailbox);
-  resetAgentMailbox(foreignChildMailbox);
-  writeAgentState(parentMailbox, parent);
-  writeAgentState(childMailbox, child);
-  const childBefore = readAgentState(childMailbox);
-  const observedParent = { ...parent, activeRequestId: undefined };
-  let parentStatus: "idle" | "working" = "idle";
-  const base = agentControllerExecutor(observedParent, [child]);
-  observeRowStatus(parent.agentLabel, parentStatus);
-  const pi = fakePi({
-    exec: (command, args, options) => {
-      if (command === "herdr" && (isAgentList(args) || isApiSnapshot(args))) {
-        const liveParent = readAgentState(parentMailbox) ?? observedParent;
-        const liveChild = readAgentState(childMailbox) ?? child;
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              agents: [
-                agentFromState(liveParent, parentStatus),
-                agentFromState(
-                  liveChild,
-                  liveChild.activeRequestId ? "working" : "idle",
-                ),
-              ],
-              snapshot: {
-                agents: [
-                  agentFromState(liveParent, parentStatus),
-                  agentFromState(
-                    liveChild,
-                    liveChild.activeRequestId ? "working" : "idle",
-                  ),
-                ],
-                panes: [liveParent, liveChild].map((state) => ({
-                  pane_id: state.paneId,
-                  workspace_id: state.workspaceId,
-                  cwd: state.cwd,
-                  agent_session: {
-                    source: "herdr:pi",
-                    agent: "pi",
-                    kind: "id",
-                    value: state.piSessionId,
-                  },
-                })),
-              },
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      }
-      if (
-        command === "herdr" &&
-        args[0] === "agent" &&
-        args[1] === "get" &&
-        args[2] === parent.paneId
-      )
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              agent: {
-                ...agentFromState(observedParent, parentStatus),
-                session_id: parent.piSessionId,
-                session_path: parent.piSessionFile,
-              },
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      return base(command, args, options);
-    },
-  });
-  registerExtension!(pi.pi as never);
-  const context = fakeContext();
-  try {
-    await pi.events.get("session_start")![0](undefined, context);
-    const listed = await agentTool(pi, "list").execute(
-      "list",
-      {},
-      undefined,
-      undefined,
-      context,
-    );
-    assert.equal(
-      listed.details.agents[0]?.state,
-      "blocked",
-      JSON.stringify(listed.details),
-    );
-    assert.ok(listed.details.agents[0].available_tools.includes("agent_steer"));
-    const listedChild = (listed.details.agents as any[]).find(
-      (agent) => agent.agent === child.agentLabel,
-    );
-    assert.deepEqual(listedChild?.available_tools, []);
-
-    parentStatus = "working";
-    observeRowStatus(parent.agentLabel, parentStatus);
-    const workingParent = await agentTool(pi, "list").execute(
-      "list",
-      {},
-      undefined,
-      undefined,
-      context,
-    );
-    assert.equal(workingParent.details.agents[0].state, "working");
-    assert.ok(
-      workingParent.details.agents[0].available_tools.includes("agent_steer"),
-    );
-    assert.ok(
-      workingParent.details.agents[0].available_tools.includes(
-        "agent_interrupt",
-      ),
-    );
-    assert.equal(
-      listed.details.agents[0].available_tools.includes("agent_interrupt"),
-      false,
-    );
-
-    const provider = { id: "controller-api-waiting-provider", version: 1 };
-writeAgentState(parentMailbox, {
-  ...parent,
-  backgroundWorkProvider: provider,
-  backgroundWaiting: {
-    sessionId: parent.piSessionId,
-    requestId: parent.activeRequestId!,
-    provider,
-    revision: 1,
-    taskIds: ["still-running"],
-  },
-});
-const waitingParent = await agentTool(pi, "list").execute(
-  "list",
-  {},
-  undefined,
-  undefined,
-  context,
-);
-assert.equal(waitingParent.details.agents[0].state, "working");
-assert.ok(
-  waitingParent.details.agents[0].available_tools.includes("agent_steer"),
-);
-assert.ok(
-  !waitingParent.details.agents[0].available_tools.includes("agent_interrupt"),
-);
-const rejectedInterrupt = await agentTool(pi, "interrupt").execute(
-  "interrupt",
-  {
-    agent: parent.agentLabel,
-    message: "interrupt while background work waits",
-  },
-  undefined,
-  undefined,
-  context,
-);
-assert.equal(rejectedInterrupt.details.ok, false);
-assert.equal(rejectedInterrupt.details.error.category, "agent_busy");
-assert.match(
-  rejectedInterrupt.details.error.message,
-  /waiting on background work/,
-);
-writeAgentState(parentMailbox, parent);
-parentStatus = "idle";
-observeRowStatus(parent.agentLabel, parentStatus);
-    writeAgentState(childMailbox, {
-      ...child,
-      activeRequestId: undefined,
-      completedRequestId: undefined,
-    });
-    const noChildWork = await agentTool(pi, "list").execute(
-      "list",
-      {},
-      undefined,
-      undefined,
-      context,
-    );
-    assert.equal(noChildWork.details.agents[0].state, "settling");
-    assert.ok(
-      !noChildWork.details.agents[0].available_tools.includes("agent_steer"),
-    );
-
-    writeAgentState(foreignChildMailbox, {
-      ...child,
-      workspaceId: "foreign-steerable-workspace",
-      agentLabel: "foreign-steerable-child",
-      activeRequestId: randomUUID(),
-    });
-    const foreignWorkspaceChild = await agentTool(pi, "list").execute(
-      "list",
-      {},
-      undefined,
-      undefined,
-      context,
-    );
-    assert.ok(
-      !foreignWorkspaceChild.details.agents[0].available_tools.includes(
-        "agent_steer",
-      ),
-    );
-    resetAgentMailbox(foreignChildMailbox);
-    writeAgentState(childMailbox, child);
-
-    writeAgentState(childMailbox, {
-      ...child,
-      ownerSessionId: "11111111-1111-4111-8111-111111111111",
-    });
-    const otherOwnerChild = await agentTool(pi, "list").execute(
-      "list",
-      {},
-      undefined,
-      undefined,
-      context,
-    );
-    assert.ok(
-      !otherOwnerChild.details.agents[0].available_tools.includes(
-        "agent_steer",
-      ),
-    );
-    writeAgentState(childMailbox, child);
-
-    writeAgentState(parentMailbox, {
-      ...parent,
-      activeRequestId: undefined,
-    });
-    const noParentAssignment = await agentTool(pi, "list").execute(
-      "list",
-      {},
-      undefined,
-      undefined,
-      context,
-    );
-    assert.ok(
-      !noParentAssignment.details.agents[0].available_tools.includes(
-        "agent_steer",
-      ),
-    );
-    writeAgentState(parentMailbox, parent);
-
-    // The handoff below must stay unacknowledged while it is listed. A running
-    // consumer would accept it on its own poll, so the consumers pause for that window.
-    base.pauseMailboxConsumers();
-    const handoffRequestId = randomUUID();
-    writeRequest(parentMailbox, { version: 5, runId: parent.runId,
-    requestId: handoffRequestId,
-    ownerSessionId: parent.ownerSessionId,
-    workspaceId: parent.workspaceId,
-    agentLabel: parent.agentLabel,
-    paneId: parent.paneId,
-    kind: "task",
-    text: "pending handoff",
-    createdAt: Date.now(), });
-    const handoffPending = await agentTool(pi, "list").execute(
-      "list",
-      {},
-      undefined,
-      undefined,
-      context,
-    );
-    assert.equal(handoffPending.details.agents[0].state, "settling");
-    assert.ok(
-      !handoffPending.details.agents[0].available_tools.includes("agent_steer"),
-    );
-    removeRequest(parentMailbox, handoffRequestId);
-    base.resumeMailboxConsumers();
-
-    const steered = await agentTool(pi, "steer").execute(
-      "steer",
-      { agent: parent.agentLabel, message: "continue" },
-      undefined,
-      undefined,
-      context,
-    );
-    assert.equal(steered.details.ok, true, JSON.stringify(steered.details));
-    assert.equal(readAgentState(parentMailbox)?.activeRequestId, REQUEST_ID);
-    assert.deepEqual(readAgentState(childMailbox), childBefore);
-
-    writeAgentState(childMailbox, {
-      ...child,
-      activeRequestId: undefined,
-      completedRequestId: child.activeRequestId,
-    });
-    writeResult(childMailbox, { version: 5, runId: child.runId,
-    requestId: child.activeRequestId!,
-    ownerSessionId: child.ownerSessionId,
-    workspaceId: child.workspaceId,
-    agentLabel: child.agentLabel,
-    paneId: child.paneId,
-    status: "completed",
-    text: "child result",
-    completedAt: Date.now(), });
-    assert.ok(readResult(childMailbox, child.activeRequestId!));
-    const completedChild = await agentTool(pi, "list").execute(
-      "list",
-      {},
-      undefined,
-      undefined,
-      context,
-    );
-    assert.equal(completedChild.details.agents[0].state, "blocked");
-    assert.ok(
-      completedChild.details.agents[0].available_tools.includes("agent_steer"),
-    );
-    assert.equal(
-      readAgentState(childMailbox)?.completedRequestId,
-      child.activeRequestId,
-    );
-
-    const ownerAskId = randomUUID();
-    writeAsk(parentMailbox, { version: 5, askId: ownerAskId,
-    requestId: REQUEST_ID,
-    runId: parent.runId,
-    ownerSessionId: parent.ownerSessionId,
-    workspaceId: parent.workspaceId,
-    agentLabel: parent.agentLabel,
-    paneId: parent.paneId,
-    piSessionId: parent.piSessionId,
-    question: "owner clarification",
-    createdAt: Date.now(), });
-    writeAgentState(parentMailbox, {
-      ...parent,
-      pendingAskId: ownerAskId,
-    });
-    const ownerAsk = await agentTool(pi, "list").execute(
-      "list",
-      {},
-      undefined,
-      undefined,
-      context,
-    );
-    assert.equal(ownerAsk.details.agents[0].state, "blocked");
-    assert.deepEqual(ownerAsk.details.agents[0].available_tools, [
-      "agent_inspect",
-      "agent_reply",
-    ]);
-    removeAsk(parentMailbox, ownerAskId);
-    writeAgentState(parentMailbox, parent);
-
-    writeAgentState(parentMailbox, {
-      ...parent,
-      activeRequestId: undefined,
-      completedRequestId: REQUEST_ID,
-    });
-    writeResult(parentMailbox, { version: 5, runId: parent.runId,
-    requestId: REQUEST_ID,
-    ownerSessionId: parent.ownerSessionId,
-    workspaceId: parent.workspaceId,
-    agentLabel: parent.agentLabel,
-    paneId: parent.paneId,
-    status: "completed",
-    text: "parent result while child result is pending",
-    completedAt: Date.now(), });
-    const completionWithChild = await agentTool(pi, "list").execute(
-      "list",
-      {},
-      undefined,
-      undefined,
-      context,
-    );
-    assert.equal(completionWithChild.details.agents[0].state, "settling");
-    assert.ok(
-      !completionWithChild.details.agents[0].available_tools.includes(
-        "agent_steer",
-      ),
-    );
-    writeAgentState(parentMailbox, parent);
-
-    removeResult(childMailbox, child.activeRequestId!);
-    assert.equal(
-      readAgentState(childMailbox)?.completedRequestId,
-      child.activeRequestId,
-    );
-    const completedChildWithoutResult = await agentTool(pi, "list").execute(
-      "list",
-      {},
-      undefined,
-      undefined,
-      context,
-    );
-    assert.equal(
-      completedChildWithoutResult.details.agents[0].available_tools.includes(
-        "agent_steer",
-      ),
-      false,
-    );
-
-    writeAgentState(parentMailbox, {
-      ...parent,
-      activeRequestId: undefined,
-      completedRequestId: REQUEST_ID,
-    });
-    writeResult(parentMailbox, { version: 5, runId: parent.runId,
-    requestId: REQUEST_ID,
-    ownerSessionId: parent.ownerSessionId,
-    workspaceId: parent.workspaceId,
-    agentLabel: parent.agentLabel,
-    paneId: parent.paneId,
-    status: "completed",
-    text: "parent result",
-    completedAt: Date.now(), });
-    const ownCompletion = await agentTool(pi, "list").execute(
-      "list",
-      {},
-      undefined,
-      undefined,
-      context,
-    );
-    assert.equal(ownCompletion.details.agents[0].state, "settling");
-    assert.ok(
-      !ownCompletion.details.agents[0].available_tools.includes("agent_steer"),
-    );
-    const rejected = await agentTool(pi, "steer").execute(
-      "steer",
-      { agent: parent.agentLabel, message: "late" },
-      undefined,
-      undefined,
-      context,
-    );
-    assert.equal(rejected.details.error.category, "agent_busy");
-    assert.match(
-      rejected.details.error.message,
-      /not currently accepting steering/,
-    );
-
-    pi.events.get("session_shutdown")?.[0]();
-    const restarted = fakePi({
-      exec: (command, args, options) => {
-        if (
-          command === "herdr" &&
-          args[0] === "agent" &&
-          args[1] === "get" &&
-          args[2] === parent.paneId
-        )
-          return {
-            stdout: JSON.stringify({
-              id: AGENT_ID,
-              result: {
-                agent: {
-                  ...agentFromState(observedParent, parentStatus),
-                  session_id: parent.piSessionId,
-                  session_path: parent.piSessionFile,
-                },
-              },
-            }),
-            stderr: "",
-            code: 0,
-          };
-        return base(command, args, options);
-      },
-    });
-    registerExtension!(restarted.pi as never);
-    const restartedList = await agentTool(restarted, "list").execute(
-      "list",
-      {},
-      undefined,
-      undefined,
-      fakeContext(),
-    );
-    assert.ok(
-      !restartedList.details.agents[0].available_tools.includes("agent_steer"),
-    );
-    restarted.events.get("session_shutdown")?.[0]();
-
-    writeAgentState(parentMailbox, parent);
-    writeAgentState(childMailbox, child);
-    const recoveredPositive = fakePi({ exec: base });
-    registerExtension!(recoveredPositive.pi as never);
-    const recoveredPositiveList = await agentTool(
-      recoveredPositive,
-      "list",
-    ).execute("list", {}, undefined, undefined, fakeContext());
-    assert.ok(
-      recoveredPositiveList.details.agents[0].available_tools.includes(
-        "agent_steer",
-      ),
-    );
-    recoveredPositive.events.get("session_shutdown")?.[0]();
-  } finally {
-    pi.events.get("session_shutdown")?.[0]();
-    resetAgentMailbox(parentMailbox);
-    resetAgentMailbox(childMailbox);
-    resetAgentMailbox(foreignChildMailbox);
   }
 });
 
@@ -4868,230 +3429,51 @@ test("acknowledgement state-write failures retain requests for durable retry", (
 });
 
 test("assignment status normalization fails closed safely", async () => {
+  setLeadEnvironment();
+  const client = createRadarClient({ env: process.env });
   const cases = [
+    { suffix: "working", activity: "working", expected: "WORKING" },
+    { suffix: "blocked", activity: "blocked", expected: "BLOCKED" },
+    { suffix: "idle", activity: "idle", expected: "IDLE/DONE" },
+    { suffix: "done", activity: "done", expected: "IDLE/DONE" },
+    { suffix: "unsupported", activity: "interactive", expected: "UNKNOWN" },
     {
-      suffix: "available",
-      status: "done" as const,
-      result: false,
-      expectedState: "settling",
+      suffix: "stale",
+      activity: "working",
+      observedAt: new Date(Date.now() - 60_000).toISOString(),
+      expected: "UNKNOWN",
     },
-    {
-      suffix: "working",
-      status: "working" as const,
-      result: false,
-      expectedState: "unknown",
-    },
-    {
-      suffix: "pending",
-      status: "done" as const,
-      result: true,
-      expectedState: "settling",
-    },
-    {
-      suffix: "null-status",
-      status: "done" as const,
-      agentStatus: null,
-      result: false,
-      expectedState: "unknown",
-    },
-    {
-      suffix: "unsupported-status",
-      status: "done" as const,
-      agentStatus: "interactive",
-      result: false,
-      expectedState: "unknown",
-    },
+    { suffix: "missing", expected: "UNKNOWN" },
   ];
-  for (const scenario of cases) {
-    setLeadEnvironment();
-    const label = `status-${scenario.suffix}`;
-    const identity = recoveryIdentity(label);
-    const mailbox = agentMailboxPath(WORKSPACE, label);
-    resetAgentMailbox(mailbox);
-    const state = managedState(label, undefined, identity);
-    writeAgentState(mailbox, state);
-    observeRowStatus(
-      label,
-      scenario.agentStatus === null
+  for (const [index, scenario] of cases.entries()) {
+    const sessionId = randomUUID();
+    const agentId = await registerStandaloneRadarAgent(
+      sessionId,
+      `tmux:herdsman-fixture:%${index + 2}`,
+      scenario.activity === undefined
         ? undefined
-        : scenario.agentStatus === "interactive"
-          ? { other: scenario.agentStatus }
-          : scenario.status,
+        : {
+            value: scenario.activity,
+            ...(scenario.observedAt !== undefined
+              ? { observedAt: scenario.observedAt }
+              : {}),
+          },
     );
-    if (scenario.result) {
-      state.completedRequestId = REQUEST_ID;
-      writeAgentState(mailbox, state);
-      writeResult(mailbox, { version: 5, runId: AGENT_ID,
-      requestId: REQUEST_ID,
-      ownerSessionId: LEAD_SESSION_ID,
-      workspaceId: WORKSPACE,
-      agentLabel: label,
-      paneId: identity.paneId,
-      status: "completed",
-      text: "pending",
-      completedAt: Date.now(), });
-    }
-    const pi = fakePi({
-      exec: leadExec(
-        label,
-        scenario.status,
-        identity.piSessionId,
-        (requestMailbox, marker) => {
-          const requestId = marker.slice("__PI_HERDSMAN_AGENT_V5__:".length);
-          const current = readAgentState(requestMailbox)!;
-          writeAgentState(requestMailbox, {
-            ...current,
-            lastAck: { requestId, accepted: true, acknowledgedAt: Date.now() },
-            updatedAt: Date.now(),
-          });
-        },
-        identity.piSessionId,
-        identity,
-        true,
-        scenario.agentStatus,
-      ),
+    const read = await client.agentGet(agentId);
+    assert.equal(read.ok, true);
+    if (!read.ok) throw new Error(read.message);
+    const activity = read.value.activity;
+    const runtimeState = activity === "idle" || activity === "working" ||
+      activity === "blocked" || activity === "done"
+      ? activity
+      : "unknown";
+    const group = classifySupervisedLead({
+      lead: sessionId,
+      displayName: scenario.suffix,
+      runtimeState,
     });
-    try {
-      registerExtension!(pi.pi as never);
-      const context = fakeContext();
-      const listed = await agentTool(pi, "list").execute(
-        "list",
-        {},
-        undefined,
-        undefined,
-        context,
-      );
-      const agents = (listed.details as { agents: any[] }).agents;
-      assert.equal(agents.length, 1);
-      assert.equal(agents[0].state, scenario.expectedState);
-    } finally {
-      pi.events.get("session_shutdown")?.[0]();
-      resetAgentMailbox(mailbox);
-    }
+    assert.equal(group, scenario.expected, `${scenario.suffix} publication fails closed`);
   }
-  await (async () => {
-    setLeadEnvironment();
-    const label = "mailbox-eligibility-agent";
-    const identity = recoveryIdentity(label);
-    const mailbox = agentMailboxPath(WORKSPACE, label);
-    const state = managedState(label, undefined, identity);
-    writeAgentState(mailbox, state);
-    observeRowStatus(label, "idle");
-    const pi = fakePi({
-      exec: leadExec(
-        label,
-        "idle",
-        identity.piSessionId,
-        (requestMailbox, marker) => {
-          const requestId = marker.slice("__PI_HERDSMAN_AGENT_V5__:".length);
-          const current = readAgentState(requestMailbox)!;
-          writeAgentState(requestMailbox, {
-            ...current,
-            activeRequestId: requestId,
-            completedRequestId: undefined,
-            lastAck: { requestId, accepted: true, acknowledgedAt: Date.now() },
-            updatedAt: Date.now(),
-          });
-        },
-        identity.piSessionId,
-        identity,
-      ),
-    });
-    registerExtension!(pi.pi as never);
-    const context = fakeContext();
-    try {
-      const handoffRequestId = randomUUID();
-      writeRequest(mailbox, { version: 5, runId: state.runId,
-      requestId: handoffRequestId,
-      ownerSessionId: state.ownerSessionId,
-      workspaceId: state.workspaceId,
-      agentLabel: state.agentLabel,
-      paneId: state.paneId,
-      kind: "task",
-      text: "recover this handoff",
-      createdAt: Date.now(), });
-      await pi.events.get("session_start")![0](undefined, context);
-      const handoffList = await agentTool(pi, "list").execute(
-        "id",
-        {},
-        undefined,
-        undefined,
-        context,
-      );
-      assert.equal(handoffList.details.agents[0].state, "settling");
-      assert.equal(
-        handoffList.details.agents[0].available_tools.includes(
-          "agent_delegate",
-        ),
-        false,
-      );
-      removeRequest(mailbox, handoffRequestId);
-
-      const requestA = randomUUID();
-      writeAgentState(mailbox, {
-        ...state,
-        activeRequestId: requestA,
-      });
-      const activeList = await agentTool(pi, "list").execute(
-        "id",
-        {},
-        undefined,
-        undefined,
-        context,
-      );
-      assert.equal(activeList.details.agents[0].state, "settling");
-      assert.equal(activeList.details.agents[0].active_request_id, requestA);
-      assert.equal(
-        activeList.details.agents[0].available_tools.includes("agent_delegate"),
-        false,
-      );
-
-      writeAgentState(mailbox, {
-        ...state,
-        completedRequestId: requestA,
-      });
-      writeResult(mailbox, { version: 5, runId: state.runId,
-      requestId: requestA,
-      ownerSessionId: state.ownerSessionId,
-      workspaceId: state.workspaceId,
-      agentLabel: state.agentLabel,
-      paneId: state.paneId,
-      status: "completed",
-      text: "done",
-      completedAt: Date.now(), });
-      const completedList = await agentTool(pi, "list").execute(
-        "id",
-        {},
-        undefined,
-        undefined,
-        context,
-      );
-      assert.equal(completedList.details.agents[0].state, "settling");
-      assert.equal(
-        completedList.details.agents[0].available_tools.includes(
-          "agent_delegate",
-        ),
-        false,
-      );
-
-      removeResult(mailbox, requestA);
-      const settledList = await agentTool(pi, "list").execute(
-        "id",
-        {},
-        undefined,
-        undefined,
-        context,
-      );
-      assert.equal(settledList.details.agents[0].state, "idle");
-      assert.deepEqual(settledList.details.agents[0].available_tools, [
-        "agent_inspect",
-        "agent_close",
-      ]);
-    } finally {
-      pi.events.get("session_shutdown")?.[0]();
-      resetAgentMailbox(mailbox);
-    }
-  })();
 });
 
 test("agent list schema rejects unknown fields", () => {
@@ -5104,365 +3486,10 @@ test("agent list schema rejects unknown fields", () => {
   pi.events.get("session_shutdown")?.[0]();
 });
 
-test("transcript projects persisted agent evidence without Herdr terminal reads", async () => {
-  setLeadEnvironment();
-  const label = "transcript-agent";
-  const identity = {
-    ...recoveryIdentity(label),
-    piSessionFile: join(testTmpRoot, `${label}.jsonl`),
-  };
-  const mailbox = agentMailboxPath(WORKSPACE, label);
-  resetAgentMailbox(mailbox);
-  realFs.rmSync(identity.piSessionFile, { force: true });
-  writeAgentState(mailbox, managedState(label, REQUEST_ID, identity));
-  const session = {
-    id: identity.piSessionId,
-    path: identity.piSessionFile,
-    contextEntries: [
-      {
-        type: "custom_message",
-        customType: "private-test",
-        content: "INTERNAL CUSTOM MESSAGE",
-        display: false,
-      },
-      {
-        type: "message",
-        message: { role: "system", content: "INTERNAL SYSTEM MESSAGE" },
-      },
-      {
-        type: "message",
-        message: {
-          role: "user",
-          content: [{ type: "text", text: "Inspect the controller path." }],
-        },
-      },
-      {
-        type: "message",
-        message: {
-          role: "assistant",
-          content: [
-            { type: "thinking", thinking: "PRIVATE REASONING" },
-            { type: "text", text: "I will inspect the implementation." },
-            {
-              type: "toolCall",
-              id: "call-running",
-              name: "read",
-              arguments: { path: "extension/index.ts", limit: 100 },
-            },
-          ],
-          stopReason: "toolUse",
-        },
-      },
-    ],
-  };
-  const writeSession = (): void => {
-    const entries = session.contextEntries.map((entry, index) => ({
-      ...entry,
-      id: `entry-${index}`,
-      ...(index ? { parentId: `entry-${index - 1}` } : {}),
-      timestamp: new Date().toISOString(),
-    }));
-    realFs.writeFileSync(
-      identity.piSessionFile,
-      [
-        JSON.stringify({
-          type: "session",
-          version: 3,
-          id: identity.piSessionId,
-          timestamp: new Date().toISOString(),
-          cwd: "/tmp",
-        }),
-        ...entries.map((entry) => JSON.stringify(entry)),
-      ].join("\n") + "\n",
-    );
-  };
-  nativeSessions.set(identity.piSessionId, session);
-  const pi = fakePi({
-    exec: leadExec(
-      label,
-      "working",
-      identity.piSessionId,
-      undefined,
-      identity.piSessionId,
-      identity,
-    ),
-  });
-  registerExtension!(pi.pi as never);
-  try {
-    const before = await agentTool(pi, "list").execute(
-      "id",
-      {},
-      undefined,
-      undefined,
-      fakeContext(pi.entries),
-    );
-    assert.equal(
-      before.details.agents[0].available_tools.includes("agent_transcript"),
-      false,
-    );
-    const pending = await agentTool(pi, "transcript").execute(
-      "id",
-      { agent: label },
-      undefined,
-      undefined,
-      fakeContext(pi.entries),
-    );
-    assert.equal(pending.details.error.category, "agent_busy");
-    assert.match(
-      pending.details.error.message,
-      /Pi has not persisted this agent's session file/,
-    );
-    assert.equal(realFs.existsSync(identity.piSessionFile), false);
-
-    writeSession();
-    const ready = await agentTool(pi, "list").execute(
-      "id",
-      {},
-      undefined,
-      undefined,
-      fakeContext(pi.entries),
-    );
-    assert.equal(
-      ready.details.agents[0].available_tools.includes("agent_transcript"),
-      true,
-    );
-    const result = await agentTool(pi, "transcript").execute(
-      "id",
-      { agent: label },
-      undefined,
-      undefined,
-      fakeContext(pi.entries),
-    );
-    assert.equal(result.details.ok, true);
-    assert.equal(result.details.action, "transcript");
-    assert.equal(result.details.agent, label);
-    assert.equal(result.details.session_id, identity.piSessionId);
-    assert.match(result.details.transcript, /Inspect the controller path/);
-    assert.match(
-      result.details.transcript,
-      /I will inspect the implementation/,
-    );
-    assert.match(result.details.transcript, /tool read:/);
-    assert.doesNotMatch(result.details.transcript, /PRIVATE REASONING/);
-    assert.doesNotMatch(result.details.transcript, /INTERNAL CUSTOM MESSAGE/);
-    assert.doesNotMatch(result.details.transcript, /INTERNAL SYSTEM MESSAGE/);
-    assert.equal(
-      pi.calls.some((args) => args[0] === "agent" && args[1] === "read"),
-      false,
-    );
-
-    session.contextEntries = [
-      {
-        type: "message",
-        message: {
-          role: "user",
-          content: [{ type: "text", text: "original user evidence" }],
-        },
-      },
-      {
-        type: "message",
-        message: {
-          role: "assistant",
-          content: [{ type: "text", text: "abandoned assistant evidence" }],
-        },
-      },
-      {
-        type: "context_edit",
-        targetId: "entry-0",
-        replacement: {
-          content: [{ type: "text", text: "replacement user evidence" }],
-        },
-      },
-      {
-        type: "context_edit",
-        targetId: "entry-1",
-        replacement: null,
-      },
-    ];
-    writeSession();
-    const edited = await agentTool(pi, "transcript").execute(
-      "id",
-      { agent: label },
-      undefined,
-      undefined,
-      fakeContext(pi.entries),
-    );
-    assert.match(edited.details.transcript, /replacement user evidence/);
-    assert.doesNotMatch(edited.details.transcript, /original user evidence/);
-    assert.doesNotMatch(
-      edited.details.transcript,
-      /abandoned assistant evidence/,
-    );
-
-    session.contextEntries = [
-      ...session.contextEntries,
-      {
-        type: "message",
-        message: {
-          role: "toolResult",
-          toolName: "read",
-          isError: false,
-          content: [{ type: "text", text: "tool completed" }],
-        },
-      },
-    ];
-    writeSession();
-    const completed = await agentTool(pi, "transcript").execute(
-      "id",
-      { agent: label },
-      undefined,
-      undefined,
-      fakeContext(pi.entries),
-    );
-    assert.match(completed.details.transcript, /tool result read:/);
-
-    const hugeToolResult =
-      "TOOL-BEGIN\n" +
-      "🙂".repeat(700) +
-      "MIDDLE-SENTINEL" +
-      "界".repeat(900) +
-      "\nTOOL-END";
-    session.contextEntries = [
-      {
-        type: "message",
-        message: {
-          role: "assistant",
-          content: [{ type: "text", text: "before large tool evidence" }],
-        },
-      },
-      {
-        type: "message",
-        message: {
-          role: "toolResult",
-          toolName: "bash",
-          isError: false,
-          content: [{ type: "text", text: hugeToolResult }],
-        },
-      },
-      {
-        type: "message",
-        message: {
-          role: "assistant",
-          content: [{ type: "text", text: "after large tool evidence" }],
-        },
-      },
-    ];
-    writeSession();
-    const boundedTool = await agentTool(pi, "transcript").execute(
-      "id",
-      { agent: label },
-      undefined,
-      undefined,
-      fakeContext(pi.entries),
-    );
-    assert.equal(boundedTool.details.transcript_truncated, true);
-    assert.match(boundedTool.details.transcript, /TOOL-BEGIN/);
-    assert.match(boundedTool.details.transcript, /TOOL-END/);
-    assert.match(
-      boundedTool.details.transcript,
-      /\[\.\.\. middle of tool result omitted \.\.\.\]/,
-    );
-    assert.doesNotMatch(boundedTool.details.transcript, /MIDDLE-SENTINEL/);
-    assert.doesNotMatch(boundedTool.details.transcript, /�/);
-    assert.match(boundedTool.details.transcript, /before large tool evidence/);
-    assert.match(boundedTool.details.transcript, /after large tool evidence/);
-    assert.ok(
-      Buffer.byteLength(boundedTool.details.transcript, "utf8") <= 16 * 1024,
-    );
-
-    session.contextEntries = [
-      {
-        type: "message",
-        message: {
-          role: "user",
-          content: [{ type: "text", text: "old evidence ".repeat(2000) }],
-        },
-      },
-      {
-        type: "message",
-        message: {
-          role: "assistant",
-          content: [{ type: "text", text: "recent tail evidence" }],
-        },
-      },
-    ];
-    writeSession();
-    const bounded = await agentTool(pi, "transcript").execute(
-      "id",
-      { agent: label },
-      undefined,
-      undefined,
-      fakeContext(pi.entries),
-    );
-    assert.equal(bounded.details.transcript_truncated, true);
-    assert.ok(
-      Buffer.byteLength(bounded.details.transcript, "utf8") <= 16 * 1024,
-    );
-    assert.match(bounded.details.transcript, /recent tail evidence/);
-    assert.doesNotMatch(bounded.details.transcript, /old evidence/);
-
-    realFs.writeFileSync(identity.piSessionFile, "");
-    const emptyList = await agentTool(pi, "list").execute(
-      "id",
-      {},
-      undefined,
-      undefined,
-      fakeContext(pi.entries),
-    );
-    assert.equal(
-      emptyList.details.agents[0].available_tools.includes("agent_transcript"),
-      false,
-    );
-    const emptyBefore = readFileSync(identity.piSessionFile, "utf8");
-    const emptyStatBefore = realFs.statSync(identity.piSessionFile);
-    const rejected = await agentTool(pi, "transcript").execute(
-      "id",
-      { agent: label },
-      undefined,
-      undefined,
-      fakeContext(pi.entries),
-    );
-    assert.equal(rejected.details.ok, false);
-    assert.equal(rejected.details.error.category, "agent_busy");
-    assert.match(
-      rejected.details.error.message,
-      /Pi has not persisted this agent's session file/,
-    );
-    assert.equal(readFileSync(identity.piSessionFile, "utf8"), emptyBefore);
-    const emptyStatAfter = realFs.statSync(identity.piSessionFile);
-    assert.equal(emptyStatAfter.size, emptyStatBefore.size);
-    assert.equal(emptyStatAfter.mtimeMs, emptyStatBefore.mtimeMs);
-    realFs.writeFileSync(
-      identity.piSessionFile,
-      `${JSON.stringify({
-        type: "session",
-        version: 3,
-        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-        timestamp: new Date().toISOString(),
-        cwd: "/tmp",
-      })}\n`,
-    );
-    const mismatched = await agentTool(pi, "transcript").execute(
-      "id",
-      { agent: label },
-      undefined,
-      undefined,
-      fakeContext(pi.entries),
-    );
-    assert.equal(mismatched.details.error.category, "target_not_found");
-  } finally {
-    pi.events.get("session_shutdown")?.[0]();
-    nativeSessions.delete(identity.piSessionId);
-    realFs.rmSync(identity.piSessionFile, { force: true });
-    resetAgentMailbox(mailbox);
-  }
-});
-
 test("accepted assignments arm exactly one durable soft window", async () => {
   setLeadEnvironment();
   const label = "soft-window-agent";
-  const startup = startupExecutor(label, () => DEFAULT_PI_SESSION_ID);
-  const pi = fakePi({ exec: startup.exec });
+  const pi = fakePi({});
   registerExtension!(pi.pi as never);
   try {
     const result = await agentTool(pi, "delegate").execute(
@@ -5482,7 +3509,7 @@ test("accepted assignments arm exactly one durable soft window", async () => {
     assert.equal(window.data.requestId, result.details.request_id);
     assert.equal(window.data.label, label);
     assert.equal(window.data.windowMs, 300_000);
-    const ack = readAgentState(startup.mailbox)!.lastAck!;
+    const ack = readAgentState(agentMailboxPath(WORKSPACE, label))!.lastAck!;
     assert.equal(ack.requestId, result.details.request_id);
     assert.equal(typeof window.data.armedAt, "number");
     assert.ok(
@@ -5492,8 +3519,7 @@ test("accepted assignments arm exactly one durable soft window", async () => {
     );
   } finally {
     pi.events.get("session_shutdown")?.[0]();
-    startup.stopMailboxConsumer();
-    resetAgentMailbox(startup.mailbox);
+    resetAgentMailbox(agentMailboxPath(WORKSPACE, label));
   }
 });
 
@@ -5502,8 +3528,10 @@ test("agent_extend defers one worker's next digest and later windows revert", as
   let now = Date.now();
   t.mock.method(Date, "now", () => now);
   const label = "soft-extend-agent";
-  const startup = startupExecutor(label, () => DEFAULT_PI_SESSION_ID);
-  const pi = fakePi({ exec: startup.exec, persistMessages: true });
+  const pi = fakePi({ persistMessages: true });
+  // The scan trigger below is this same lead session starting again, so it runs
+  // with the session that owns the child, not a fresh one.
+  const context = fakeContext(pi.entries);
   registerExtension!(pi.pi as never);
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const digests = () =>
@@ -5520,16 +3548,17 @@ test("agent_extend defers one worker's next digest and later windows revert", as
       { definition: "agent", label, task: "long assignment" },
       undefined,
       undefined,
-      fakeContext(),
+      context,
     );
     assert.equal(result.details.ok, true, JSON.stringify(result.details));
-    // A session start runs three observes; the window is not due, so no digest.
-    const observed = await drainRadarObserves();
-    await pi.events.get("session_start")![0](
-      undefined,
-      fakeContext(pi.entries),
-    );
-    await settleRadarObserves(observed + 3);
+    for (let index = 0; index < 8; index++)
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    await pi.events.get("session_start")![0](undefined, context);
+    // Each timer step below is followed by the same barrier: every observe the
+    // step started has finished, so a digest that is not due is absent for its
+    // own reason and not because a scan is still running.
+    for (let index = 0; index < 8; index++)
+      await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal(digests().length, 0, "a fresh window is not due");
 
     const extend = pi.tools.find(
@@ -5540,7 +3569,7 @@ test("agent_extend defers one worker's next digest and later windows revert", as
       { agent: label, windowMs: 900_000 },
       undefined,
       undefined,
-      fakeContext(),
+      context,
     );
     assert.equal(extended.details.ok, true, JSON.stringify(extended.details));
     assert.equal(extended.details.window_ms, 900_000);
@@ -5549,7 +3578,8 @@ test("agent_extend defers one worker's next digest and later windows revert", as
 
     now += 600_000;
     t.mock.timers.tick(30_000);
-    await settleRadarObserves(observed + 5);
+    for (let index = 0; index < 8; index++)
+      await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal(
       digests().length,
       0,
@@ -5558,12 +3588,14 @@ test("agent_extend defers one worker's next digest and later windows revert", as
 
     now += 299_999;
     t.mock.timers.tick(30_000);
-    await settleRadarObserves(observed + 6);
+    for (let index = 0; index < 8; index++)
+      await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal(digests().length, 0, "the extended window has not elapsed");
 
     now += 1;
     t.mock.timers.tick(30_000);
-    await settleRadarObserves(observed + 7);
+    for (let index = 0; index < 8; index++)
+      await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal(digests().length, 1, "the extended window delivers one digest");
     assert.equal(
       (digests()[0] as any).details.entries[0].windowMs,
@@ -5573,7 +3605,8 @@ test("agent_extend defers one worker's next digest and later windows revert", as
 
     now += 300_000;
     t.mock.timers.tick(30_000);
-    await settleRadarObserves(observed + 8);
+    for (let index = 0; index < 8; index++)
+      await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal(digests().length, 2, "later windows revert to softTimeoutMs");
     assert.equal(
       (digests()[1] as any).details.entries[0].windowMs,
@@ -5602,8 +3635,7 @@ test("agent_extend defers one worker's next digest and later windows revert", as
     );
   } finally {
     pi.events.get("session_shutdown")?.[0]();
-    startup.stopMailboxConsumer();
-    resetAgentMailbox(startup.mailbox);
+    resetAgentMailbox(agentMailboxPath(WORKSPACE, label));
   }
 });
 
@@ -5627,7 +3659,8 @@ test("agent_extend rejects extra fields and every windowless worker", async () =
       label: "extend-idle",
       state: (label, identity) =>
         managedState(label, undefined, identity),
-      category: "agent_busy",
+      // Idle with no Radar observation: presence is unproven, so the refusal is ambiguity.
+      category: "target_ambiguous",
     },
     {
       label: "extend-resolved",
@@ -5635,7 +3668,7 @@ test("agent_extend rejects extra fields and every windowless worker", async () =
         ...managedState(label, undefined, identity),
         completedRequestId: REQUEST_ID,
       }),
-      category: "agent_busy",
+      category: "target_ambiguous",
     },
   ];
   for (const value of cases) {
@@ -5643,18 +3676,7 @@ test("agent_extend rejects extra fields and every windowless worker", async () =
     const mailbox = agentMailboxPath(WORKSPACE, value.label);
     resetAgentMailbox(mailbox);
     writeAgentState(mailbox, value.state(value.label, identity));
-    const pi = fakePi({
-      exec: leadExec(
-        value.label,
-        value.state(value.label, identity).activeRequestId
-          ? "working"
-          : "idle",
-        identity.piSessionId,
-        undefined,
-        identity.piSessionId,
-        identity,
-      ),
-    });
+    const pi = fakePi({});
     registerExtension!(pi.pi as never);
     try {
       const tool = pi.tools.find(
@@ -5711,8 +3733,7 @@ test("softTimeoutMs of zero arms no window for an accepted assignment", async ()
   setLeadEnvironment();
   updateConfig("softTimeoutMs", 0);
   const label = "soft-window-disabled";
-  const startup = startupExecutor(label, () => DEFAULT_PI_SESSION_ID);
-  const pi = fakePi({ exec: startup.exec });
+  const pi = fakePi({});
   registerExtension!(pi.pi as never);
   try {
     const result = await agentTool(pi, "delegate").execute(
@@ -5723,7 +3744,7 @@ test("softTimeoutMs of zero arms no window for an accepted assignment", async ()
       fakeContext(),
     );
     assert.equal(result.details.ok, true, JSON.stringify(result.details));
-    assert.ok(readAgentState(startup.mailbox)?.activeRequestId);
+    assert.ok(readAgentState(agentMailboxPath(WORKSPACE, label))?.activeRequestId);
     assert.deepEqual(
       pi.entries.filter(
         (entry: any) => entry.customType === "pi-herdsman-soft-window",
@@ -5733,7 +3754,6 @@ test("softTimeoutMs of zero arms no window for an accepted assignment", async ()
   } finally {
     updateConfig("softTimeoutMs", undefined);
     pi.events.get("session_shutdown")?.[0]();
-    startup.stopMailboxConsumer();
-    resetAgentMailbox(startup.mailbox);
+    resetAgentMailbox(agentMailboxPath(WORKSPACE, label));
   }
 });

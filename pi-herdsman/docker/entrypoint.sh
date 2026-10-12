@@ -85,10 +85,54 @@ runuser -u herdsman -- \
   env HOME="$home" USER=herdsman LOGNAME=herdsman \
   /usr/local/bin/pi install /opt/pi-herdsman
 
-runuser -u herdsman -- \
-  env HOME="$home" USER=herdsman LOGNAME=herdsman \
-  /usr/local/bin/herdr integration install pi
-
 /usr/sbin/sshd -t -f /etc/ssh/sshd_config
 
-exec /usr/sbin/sshd -D -e -f /etc/ssh/sshd_config
+runtime=/run/herdsman
+install -d -m 0700 -o herdsman -g herdsman "$runtime"
+
+# The tmux server is named so the daemon qualifies its panes the way Pi reads them.
+as_herdsman() {
+  runuser -u herdsman -- env HOME="$home" USER=herdsman LOGNAME=herdsman \
+    RADAR_CONTROL_BACKEND=tmux RADAR_TMUX_SERVER=herdsman \
+    RADAR_CONTROL_SOCKET="$runtime/control.sock" RADAR_CONTROL_STATE="$runtime/state" \
+    "$@"
+}
+
+as_herdsman tmux -L herdsman new-session -d -s herdsman -c "$home"
+as_herdsman radar daemon &
+daemon_pid=$!
+
+attempts=0
+until [ -S "$runtime/control.sock" ]; do
+  attempts=$((attempts + 1))
+  if [ "$attempts" -gt 100 ]; then
+    echo "Radar control socket did not appear at $runtime/control.sock" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+
+as_herdsman tmux -L herdsman respawn-pane -k -t herdsman:0.0 -c "$home" /usr/local/bin/pi
+
+/usr/sbin/sshd -D -e -f /etc/ssh/sshd_config &
+sshd_pid=$!
+
+stop() {
+  trap - TERM INT
+  pi_pid="$(as_herdsman tmux -L herdsman display-message -p -t herdsman:0.0 '#{pane_pid}' 2>/dev/null || true)"
+  as_herdsman tmux -L herdsman kill-session -t herdsman 2>/dev/null || true
+  attempts=0
+  while [ -n "$pi_pid" ] && kill -0 "$pi_pid" 2>/dev/null && [ "$attempts" -lt 100 ]; do
+    attempts=$((attempts + 1))
+    sleep 0.1
+  done
+  kill "$daemon_pid" 2>/dev/null || true
+  wait "$daemon_pid" 2>/dev/null || true
+  as_herdsman tmux -L herdsman kill-server 2>/dev/null || true
+  kill "$sshd_pid" 2>/dev/null || true
+  wait "$sshd_pid" 2>/dev/null || true
+}
+
+trap 'stop; exit 0' TERM INT
+wait "$sshd_pid" || true
+stop

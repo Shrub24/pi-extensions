@@ -9,6 +9,8 @@ import {
   RADAR_EVENTS_CONTRACT,
   RADAR_FOCUS_CAPABILITY,
   RADAR_OBSERVE_CAPABILITY,
+  RADAR_OUTPUT_CAPABILITY,
+  RADAR_PROCESS_INFO_CAPABILITY,
   RADAR_PROTOCOL_VERSION,
   RADAR_REGISTRY_CONTRACT,
   RADAR_SPAWN_CLOSE_CONTRACT,
@@ -26,6 +28,13 @@ import type {
   RequestRecord,
 } from "./mailbox.ts";
 import { herdsmanDataRoot } from "./storage.ts";
+/** The tmux server the fixture daemon addresses, and the lead's own pane on it. */
+export const FIXTURE_TMUX_SERVER = "herdsman-fixture";
+/** The workspace label this fake daemon reports for its own panes. */
+export const FIXTURE_WORKSPACE = "herdsman-fixture";
+export const FIXTURE_TMUX_ENV = `${FIXTURE_TMUX_SERVER},1,0`;
+export const FIXTURE_LEAD_PANE = "%1";
+
 
 /**
  * The mailbox module is loaded on first use rather than at module scope: the
@@ -62,6 +71,8 @@ export type RadarFakeSpawn = {
   pane: string;
   incarnation: string;
   agent_id?: string;
+  /** The Pi session the simulated child published as its current context. */
+  session_id?: string;
   token: string;
   mailbox?: string;
   /**
@@ -227,7 +238,12 @@ export type FakeRadarDaemon = {
   /** Every registered subject, by agent id. */
   subjects: Map<string, Record<string, unknown>>;
   /** Every accepted channel publish. */
-  published: Array<{ agent_id: string; channel: RadarChannel; snapshot: unknown }>;
+  published: Array<{
+    agent_id: string;
+    channel: RadarChannel;
+    snapshot: unknown;
+    observed_at?: string;
+  }>;
   /**
    * The close outcome this daemon has recorded per close-operation UUID, which
    * is what a replayed `child.close` returns without a second effect.
@@ -331,8 +347,8 @@ const DEFAULTS: RadarFakeOptions = {
   dropCloseReply: false,
   locationEvidence: "present",
   observeUnavailable: false,
-  backend: "herdr",
-  instance: null,
+  backend: "tmux",
+  instance: FIXTURE_TMUX_SERVER,
   exitObservation: "unknown",
   closeOutcome: "completed",
   capabilities: [
@@ -341,6 +357,8 @@ const DEFAULTS: RadarFakeOptions = {
     RADAR_SPAWN_LAUNCH_CONTEXT_CONTRACT,
     RADAR_OBSERVE_CAPABILITY,
     RADAR_FOCUS_CAPABILITY,
+    RADAR_OUTPUT_CAPABILITY,
+    RADAR_PROCESS_INFO_CAPABILITY,
     RADAR_SPAWN_CLOSE_CONTRACT,
     RADAR_EVENTS_CONTRACT,
   ],
@@ -390,10 +408,12 @@ export function spawnedLabels(daemon: FakeRadarDaemon): string[] {
   return daemon.spawns.map((spawn) => spawn.env.PI_HERDSMAN_LABEL ?? "");
 }
 
-/** The pane ids a test sees: the first spawn takes the pane the harness uses. */
+/** The canonical handle of the pane the daemon creates for spawn `count`. */
 function paneFor(count: number): string {
-  return count === 1 ? "startup-pane" : `startup-pane-${count}`;
+  return `tmux:${FIXTURE_TMUX_SERVER}:%${count + 1}`;
 }
+/** The handle of the first spawn's pane, which most tests address. */
+export const FIXTURE_CHILD_PANE = paneFor(1);
 
 export async function startFakeRadarDaemon(
   options: Partial<RadarFakeOptions> = {},
@@ -420,6 +440,7 @@ export async function startFakeRadarDaemon(
     agent_id: string;
     channel: RadarChannel;
     snapshot: unknown;
+    observed_at?: string;
   }> = [];
   const registrations = new Map<string, string>();
   const tokens = new Map<string, RadarFakeSpawn>();
@@ -478,6 +499,12 @@ export async function startFakeRadarDaemon(
     channel,
   });
 
+  // A child's location is the pane the daemon created for it, on the server it runs.
+  const locationOf = (spawn: RadarFakeSpawn) => ({
+    backend: settings.backend,
+    instance: settings.instance ?? undefined,
+    pane: spawn.pane,
+  });
   const edge = (spawn: RadarFakeSpawn): Record<string, unknown> => {
     const isBound = bound.has(spawn.request_id) && spawn.agent_id !== undefined;
     return {
@@ -488,7 +515,7 @@ export async function startFakeRadarDaemon(
       recorded_at: new Date().toISOString(),
       created: "completed",
       launched: "completed",
-      location: { backend: "herdr", workspace: "workspace", pane: spawn.pane },
+      location: locationOf(spawn),
       ...(isBound
         ? {
             bound: {
@@ -550,8 +577,21 @@ export async function startFakeRadarDaemon(
     let seen: string | undefined;
     let processing = false;
     let stopped = false;
+    // This process stops answering for the mailbox on its own retirement, and on
+    // nothing else: the daemon's close confirmed its pane gone (`closed`) or its
+    // process was proved absent (`processGone`). A later launch on the same label
+    // proves nothing about this process, so a replacement that merely exists - or
+    // one still waiting to bind - never retires a consumer that was never
+    // answered for.
+    const retired = (): boolean =>
+      spawn.closed === true || spawn.processGone === true;
     const timer = setInterval(() => {
       if (stopped || processing) return;
+      if (retired()) {
+        stopped = true;
+        clearInterval(timer);
+        return;
+      }
       try {
         const request = readUnacknowledgedRequest(mailbox);
         if (!request || request.requestId === seen) return;
@@ -697,6 +737,14 @@ export async function startFakeRadarDaemon(
       return;
     spawn.mailbox = mailbox;
     spawn.agent_id = subjectId(RADAR_SUBJECT_SOURCE, spawn.incarnation);
+    spawn.session_id = session.id;
+    // The child registers the location its own TMUX_PANE names: this pane, and
+    // publishes the session it runs as its current context.
+    subjects.set(spawn.agent_id, {
+      ...subjects.get(spawn.agent_id),
+      location: locationOf(spawn),
+      contextSession: session.id,
+    });
     bound.add(spawn.request_id);
     const bindings = join(herdsmanDataRoot(), "radar", "bindings");
     // The publication store validates the directory it reads from, so the
@@ -725,7 +773,7 @@ export async function startFakeRadarDaemon(
       ownerSessionId,
       workspaceId,
       agentLabel,
-      paneId: settings.childPane ?? spawn.pane,
+      paneId: settings.childPane ?? spawn.env.TMUX_PANE,
       piSessionId: session.id,
       piSessionFile: session.file,
       agentDefinition: env.PI_HERDSMAN_AGENT_DEFINITION ?? "agent",
@@ -745,7 +793,7 @@ export async function startFakeRadarDaemon(
         ownerSessionId,
         workspaceId,
         agentLabel,
-        paneId: settings.childPane ?? spawn.pane,
+        paneId: settings.childPane ?? spawn.env.TMUX_PANE,
         piSessionId: session.id,
         acknowledgedAt: Date.now(),
       });
@@ -781,6 +829,8 @@ export async function startFakeRadarDaemon(
         PI_HERDSMAN_MAILBOX: options.mailbox,
         PI_HERDSMAN_LAUNCH_GENERATION: generation,
         PI_HERDSMAN_AGENT_DEFINITION: definition,
+        // tmux sets TMUX_PANE in every pane it creates: the child's raw pane.
+        TMUX_PANE: options.pane.slice(options.pane.lastIndexOf(":") + 1),
       },
       pane: options.pane,
       incarnation: randomUUID(),
@@ -827,14 +877,15 @@ export async function startFakeRadarDaemon(
     panes: unknown[];
     agents: unknown[];
   } {
-    const pane = process.env.HERDR_PANE_ID?.trim();
+    const pane = process.env.TMUX_PANE?.trim();
     if (!pane) return { workspaces: [], tabs: [], panes: [], agents: [] };
-    const workspace = process.env.HERDR_WORKSPACE_ID?.trim() ?? "wA";
-    const tab = process.env.HERDR_TAB_ID?.trim() ?? `${workspace}:t1`;
+    const handle = `tmux:${FIXTURE_TMUX_SERVER}:${pane}`;
+    const workspace = FIXTURE_WORKSPACE;
+    const tab = `${FIXTURE_WORKSPACE}:t1`;
     return {
       workspaces: [{ workspace_id: workspace }],
       tabs: [{ tab_id: tab, workspace_id: workspace }],
-      panes: [{ location: { workspace_id: workspace, tab_id: tab, pane_id: pane } }],
+      panes: [{ location: { workspace_id: workspace, tab_id: tab, pane_id: handle } }],
       agents: [],
     };
   }
@@ -862,6 +913,13 @@ export async function startFakeRadarDaemon(
         // A child presents the one-use token its spawn minted; that token is the
         // only thing that binds the edge to this exact registration.
         registerCalls.push({ agent_id: agentId, params: { ...params } });
+        // The registry keeps the location and session a subject registered with;
+        // agent.get answers the registration from them.
+        subjects.set(agentId, {
+          ...subjects.get(agentId),
+          location: params.location,
+          session: params.session,
+        });
         const token = params.spawn_token;
         if (typeof token === "string") {
           const spawn = tokens.get(token);
@@ -892,6 +950,9 @@ export async function startFakeRadarDaemon(
           agent_id: agentId,
           channel: String(params.channel) as RadarChannel,
           snapshot: params.snapshot,
+          ...(typeof params.observed_at === "string"
+            ? { observed_at: params.observed_at }
+            : {}),
         });
         return {
           result: {
@@ -908,6 +969,7 @@ export async function startFakeRadarDaemon(
         const request = params.request as Record<string, unknown>;
         if (settings.refuseSpawn !== undefined)
           return { error: settings.refuseSpawn };
+        const pane = paneFor(spawns.length + 1);
         const spawn: RadarFakeSpawn = {
           // The envelope id is the caller's durable key, exactly as the daemon's
           // own spawn record keeps it.
@@ -917,8 +979,12 @@ export async function startFakeRadarDaemon(
           executable: String(request.executable),
           argv: (request.argv as string[]) ?? [],
           ...(request.cwd !== undefined ? { cwd: String(request.cwd) } : {}),
-          env: (request.env ?? {}) as Record<string, string>,
-          pane: paneFor(spawns.length + 1),
+          pane,
+          // tmux sets TMUX_PANE in every pane it creates: the child's raw pane.
+          env: {
+            ...((request.env ?? {}) as Record<string, string>),
+            TMUX_PANE: pane.slice(pane.lastIndexOf(":") + 1),
+          },
           incarnation: randomUUID(),
           token: randomUUID(),
         };
@@ -951,11 +1017,43 @@ export async function startFakeRadarDaemon(
             (spawn?.closed === true || spawn?.processGone === true
               ? "absent"
               : "verified"));
+        const executionPublication = published
+          .filter((entry) => entry.agent_id === agentId && entry.channel === "execution")
+          .at(-1);
+        const publicationAge = executionPublication?.observed_at === undefined
+          ? undefined
+          : Date.now() - Date.parse(executionPublication.observed_at);
+        const executionFreshness = executionPublication === undefined
+          ? undefined
+          : publicationAge !== undefined && publicationAge >= 0 && publicationAge <= 30_000
+            ? "fresh"
+            : "stale";
         return {
           result: {
             agent: {
               registration,
               process: { claimed: settings.childProcessClaim, verification },
+              context:
+                (registration.contextSession ?? registration.session) === undefined
+                  ? null
+                  : {
+                      version: 1,
+                      agent_id: agentId,
+                      context: {
+                        freshness: "fresh",
+                        session: registration.contextSession ?? registration.session,
+                      },
+                    },
+              ...(executionPublication === undefined
+                ? {}
+                : {
+                    execution: {
+                      snapshot: {
+                        freshness: executionFreshness,
+                        snapshot: executionPublication.snapshot,
+                      },
+                    },
+                  }),
             },
           },
         };
@@ -1122,6 +1220,10 @@ export async function startFakeRadarDaemon(
       case "mux.focus": {
         return { result: { request_id: params.request_id, outcome: "completed" } };
       }
+      case "mux.process_info":
+        return { result: { evidence: { kind: "shell" } } };
+      case "mux.output":
+        return { result: { output: { text: "", truncated: false } } };
       default:
         return {
           error: { code: "not_found", message: `unknown method ${method}` },

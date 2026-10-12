@@ -23,6 +23,9 @@ import {
   spawnedArgvs,
   spawnedEnvironmentAssignments,
   spawnedLabels,
+  FIXTURE_LEAD_PANE,
+  FIXTURE_TMUX_ENV,
+  FIXTURE_TMUX_SERVER,
   startFakeRadarDaemon,
 } from "./support-radar.ts";
 
@@ -176,70 +179,6 @@ export async function ensureRadarDaemon(): Promise<void> {
 
 
 /**
- * A canonical fleet observation built from the rows a fixture reports.
- */
-export function fleetFromRows(
-  rows: Array<{
-    paneId: string;
-    workspaceId?: string;
-    tabId?: string;
-    name?: string;
-    sessionId?: string | null;
-    sessionFile?: string;
-    status?: string;
-  }>,
-): {
-  workspaces: unknown[];
-  tabs: unknown[];
-  panes: unknown[];
-  agents: unknown[];
-} {
-  const workspaces = new Map<string, unknown>();
-  const tabs = new Map<string, unknown>();
-  const panes: unknown[] = [];
-  const agents: unknown[] = [];
-  for (const row of rows) {
-    if (!row.paneId) continue;
-    const workspaceId = row.workspaceId ?? WORKSPACE;
-    const tabId = row.tabId ?? `${row.name ?? row.paneId}-tab`;
-    workspaces.set(workspaceId, { workspace_id: workspaceId });
-    tabs.set(tabId, { tab_id: tabId, workspace_id: workspaceId });
-    panes.push({
-      location: {
-        workspace_id: workspaceId,
-        tab_id: tabId,
-        pane_id: row.paneId,
-      },
-    });
-    agents.push({
-      location: {
-        workspace_id: workspaceId,
-        tab_id: tabId,
-        pane_id: row.paneId,
-      },
-      ...(row.name !== undefined ? { name: row.name } : {}),
-      ...(row.status !== undefined ? { status: row.status } : {}),
-      ...(row.sessionId
-        ? { session: { kind: "uuid", value: row.sessionId } }
-        : row.sessionFile !== undefined
-          ? {
-              session: {
-                kind: "reported",
-                value: { source: "herdr:pi", value: row.sessionFile },
-              },
-            }
-          : {}),
-    });
-  }
-  return {
-    workspaces: [...workspaces.values()],
-    tabs: [...tabs.values()],
-    panes,
-    agents,
-  };
-}
-
-/**
  * The fleet the shared daemon observes for this fixture.
  *
  * A live daemon reports whatever its mux holds: this process's own pane, and one
@@ -250,6 +189,11 @@ export function fleetFromRows(
  * absent, a contradiction, or a backend carrying no agent facts - sets
  * `radarDaemon.options.inventory` instead.
  */
+/** The daemon qualifies the panes it reports; a mailbox pane is raw `%N`. */
+function fixturePaneHandle(pane: string): string {
+  return `tmux:${FIXTURE_TMUX_SERVER}:${pane}`;
+}
+
 export function radarObservedFleet(): {
   workspaces: unknown[];
   tabs: unknown[];
@@ -263,16 +207,16 @@ export function radarObservedFleet(): {
   const add = (
     workspaceId: string,
     tabId: string,
-    paneId: string,
+    rawPane: string,
     agent?: {
-      name?: string;
       label?: string;
       run?: string;
-      session?: { id?: string; file?: string };
+      session?: { id?: string };
       status?: string;
     },
   ): void => {
-    if (!paneId) return;
+    if (!rawPane) return;
+    const paneId = fixturePaneHandle(rawPane);
     workspaces.set(workspaceId, { workspace_id: workspaceId });
     tabs.set(tabId, { tab_id: tabId, workspace_id: workspaceId });
     panes.push({
@@ -281,7 +225,6 @@ export function radarObservedFleet(): {
     if (!agent) return;
     agents.push({
       location: { workspace_id: workspaceId, tab_id: tabId, pane_id: paneId },
-      ...(agent.name !== undefined ? { name: agent.name } : {}),
       ...(agent.status !== undefined ? { status: agent.status } : {}),
       ...(agent.label !== undefined || agent.run !== undefined
         ? {
@@ -293,34 +236,17 @@ export function radarObservedFleet(): {
         : {}),
       ...(agent.session?.id !== undefined
         ? { session: { kind: "uuid", value: agent.session.id } }
-        : agent.session?.file !== undefined
-          ? {
-              session: {
-                kind: "reported",
-                value: { source: "herdr:pi", value: agent.session.file },
-              },
-            }
-          : {}),
+        : {}),
     });
   };
-  const ownPane = process.env.HERDR_PANE_ID?.trim();
-  if (ownPane)
-    add(
-      process.env.HERDR_WORKSPACE_ID?.trim() ?? WORKSPACE,
-      process.env.HERDR_TAB_ID?.trim() ?? `${WORKSPACE}:t1`,
-      ownPane,
-    );
+  const ownPane = process.env.TMUX_PANE?.trim();
+  if (ownPane) add(WORKSPACE, `${WORKSPACE}:t1`, ownPane);
   for (const { state } of listAgentStates()) {
     if (state.paneId === ownPane) continue;
     add(state.workspaceId, `${state.agentLabel}-tab`, state.paneId, {
-      name: runScopedHerdrAlias(
-        state.workspaceId,
-        state.agentLabel,
-        state.runId,
-      ),
       label: state.agentLabel,
       run: state.runId,
-      session: { id: state.piSessionId, file: state.piSessionFile },
+      session: { id: state.piSessionId },
       // A child waiting on background work is not executing a turn; claiming it
       // is working would let the observation overrule the mailbox's projection.
       status:
@@ -465,9 +391,6 @@ export const {
 } = await import("./mailbox.ts");
 const { createAcceptedAssignmentContract } =
   await import("./response-validation.ts");
-
-export const writeRequestRaw = writeMailboxRequest;
-export const writeAgentStateRaw = writeMailboxAgentState;
 
 function fixtureAcceptedAssignment(
   requestId: string,
@@ -841,8 +764,6 @@ export const {
   resolveAssignmentSession,
   visibleAgentDefinitionMetadata,
 } = extension;
-export const { herdrAgentAlias: runScopedHerdrAlias } =
-  await import("./herdr.ts");
 export const {
   StatusWidget,
   formatAgentDefinitions,
@@ -907,6 +828,22 @@ export const defaultFixtureIdentity: FixtureIdentity = {
   piSessionFile: "/tmp/registered-agent.jsonl",
 };
 
+/**
+ * The identity of the managed process a test is itself simulating. Its mailbox
+ * records the raw pane its own environment declares (`TMUX_PANE`, which the
+ * shared environment setup writes), because that is the pane the child's startup
+ * acknowledgment carries and the one production compares against. Read at
+ * construction, not at import: the environment is set per test.
+ * `defaultFixtureIdentity` stays the explicit identity for records that are not
+ * this process's own claim - a daemon listing row, or a historical mailbox.
+ */
+export function ownManagedIdentity(): FixtureIdentity {
+  return {
+    ...defaultFixtureIdentity,
+    paneId: process.env.TMUX_PANE ?? FIXTURE_LEAD_PANE,
+  };
+}
+
 export function recoveryIdentity(label: string): FixtureIdentity {
   return {
     paneId: `${label}-pane`,
@@ -916,38 +853,6 @@ export function recoveryIdentity(label: string): FixtureIdentity {
   };
 }
 
-export function herdrAlias(label: string): string {
-  return runScopedHerdrAlias(WORKSPACE, label, AGENT_ID);
-}
-export function isPreservePaneStop(args: string[]): boolean {
-  return (
-    args[0] === "agent" &&
-    args[1] === "send-keys" &&
-    args.includes("ctrl+c") &&
-    args.includes("ctrl+d")
-  );
-}
-export function isPaneClose(args: string[]): boolean {
-  return args[0] === "pane" && args[1] === "close";
-}
-export function isTabClose(args: string[]): boolean {
-  return args[0] === "tab" && args[1] === "close";
-}
-export function isAgentList(args: string[]): boolean {
-  return args[0] === "agent" && args[1] === "list";
-}
-export function isApiSnapshot(args: readonly string[]): boolean {
-  return args[0] === "api" && args[1] === "snapshot";
-}
-export function isTabList(args: string[]): boolean {
-  return args[0] === "tab" && args[1] === "list";
-}
-export function isPaneList(args: string[]): boolean {
-  return args[0] === "pane" && args[1] === "list";
-}
-export function isHerdrList(args: string[]): boolean {
-  return isAgentList(args) || isTabList(args) || isPaneList(args);
-}
 export function delegationLockPathForTest(
   workspaceId: string,
   parentSessionId: string,
@@ -993,6 +898,7 @@ export function fakeContext(
       notify: () => undefined,
       select: async () => "tab",
       confirm: async () => true,
+      setStatus: () => undefined,
       setWidget: (_key: string, content: WidgetContent) =>
         assertWidgetContent(content),
       custom: async () => undefined,
@@ -1024,14 +930,6 @@ export type ExecHandler = (
   options?: { timeout?: number; signal?: AbortSignal },
 ) => ExecResult | Promise<ExecResult>;
 
-const HERDR_STATUS_RESPONSE = JSON.stringify({
-  client: { version: "0.9.1" },
-  server: { running: true, compatible: true },
-});
-function herdrStatusResult(): ExecResult {
-  return { stdout: HERDR_STATUS_RESPONSE, stderr: "", code: 0 };
-}
-
 export function fakePi(
   options: {
     exec?: ExecHandler;
@@ -1043,7 +941,6 @@ export function fakePi(
     persistMessages?: boolean;
     sessionName?: string;
     thinkingLevel?: string;
-    status?: ExecResult;
     allTools?: unknown[] | (() => unknown[]);
   } = {},
 ) {
@@ -1134,26 +1031,9 @@ export function fakePi(
     ) {
       calls.push(args);
       execOptions.push(execOptionsValue);
-      if (command === "herdr" && args[0] === "status" && args[1] === "--json") {
-        const result = options.status ?? herdrStatusResult();
-        callResults.push({ args, succeeded: true, code: result.code });
-        return result;
-      }
       try {
-        const result = await (options.exec?.(
-          command,
-          args,
-          execOptionsValue,
-        ) ?? {
-          stdout:
-            command === "herdr" && isAgentList(args)
-              ? JSON.stringify({ id: AGENT_ID, result: { agents: [] } })
-              : command === "herdr" && isApiSnapshot(args)
-                ? JSON.stringify({
-                    id: AGENT_ID,
-                    result: { snapshot: { agents: [], panes: [] } },
-                  })
-                : "{}",
+        const result = await (options.exec?.(command, args, execOptionsValue) ?? {
+          stdout: "{}",
           stderr: "",
           code: 0,
         });
@@ -1346,8 +1226,6 @@ export function setLeadEnvironment(): void {
     join(PI_AGENTS_DIR, "child.md"),
     "---\nname: child\n---\nchild\n",
   );
-  process.env.HERDR_ENV = "1";
-  process.env.HERDR_WORKSPACE_ID = WORKSPACE;
   for (const key of [
     "PI_HERDSMAN_MAILBOX",
     "PI_HERDSMAN_RUN_ID",
@@ -1358,6 +1236,8 @@ export function setLeadEnvironment(): void {
     "PI_HERDSMAN_BRIEF_PROFILE",
     "PI_HERDSMAN_ALLOWED_AGENT_DEFINITIONS",
     "HERDR_PANE_ID",
+    "TMUX",
+    "TMUX_PANE",
     "HERDR_TAB_ID",
     "HERDR_SOCKET_PATH",
     "PI_HERDSMAN_CHILD_COMMAND",
@@ -1366,7 +1246,8 @@ export function setLeadEnvironment(): void {
   ])
     delete process.env[key];
   configureSupportedLaunch();
-  process.env.HERDR_PANE_ID = "lead-pane";
+  process.env.TMUX = FIXTURE_TMUX_ENV;
+  process.env.TMUX_PANE = FIXTURE_LEAD_PANE;
 }
 
 export function setAgentEnvironment(
@@ -1387,8 +1268,6 @@ export function setAgentEnvironment(
   );
   const workspace = WORKSPACE;
   const mailbox = agentMailboxPath(workspace, label);
-  process.env.HERDR_ENV = "1";
-  process.env.HERDR_WORKSPACE_ID = workspace;
   process.env.PI_HERDSMAN_MAILBOX = mailbox;
   process.env.PI_HERDSMAN_RUN_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
   process.env.PI_HERDSMAN_OWNER_SESSION_ID =
@@ -1397,11 +1276,8 @@ export function setAgentEnvironment(
   process.env.PI_HERDSMAN_WORKSPACE_ID = workspace;
   process.env.PI_HERDSMAN_AGENT_DEFINITION = "agent";
   process.env.PI_HERDSMAN_BRIEF_PROFILE = "common";
-  process.env.HERDR_PANE_ID = "registered-pane";
-  // The operator's own mux is not this fixture's: an inherited tab would
-  // otherwise reach a registration or a Herdr call as though this process had
-  // been started there.
-  process.env.HERDR_TAB_ID = defaultFixtureIdentity.tabId;
+  process.env.TMUX = FIXTURE_TMUX_ENV;
+  process.env.TMUX_PANE = FIXTURE_LEAD_PANE;
   delete process.env.PI_HERDSMAN_LAUNCH_GENERATION;
   delete process.env.PI_HERDSMAN_PARENT_PANE_ID;
   if (allowedAgentDefinitions === undefined)
@@ -1421,12 +1297,13 @@ function clearTestMailboxes(): void {
   // the next one. This fixture owns the whole store, so it empties it.
   for (const { path } of listAgentStates())
     realFs.rmSync(path, { recursive: true, force: true });
+  realFs.rmSync(join(herdsmanDataRoot(), "completions"), { recursive: true, force: true });
 }
 
 export function managedState(
   label: string,
   activeRequestId?: string,
-  identity: FixtureIdentity = defaultFixtureIdentity,
+  identity: FixtureIdentity = ownManagedIdentity(),
 ): ManagedAgentState {
   return {
     version: 5,
@@ -1478,7 +1355,6 @@ export function listResponse(
   runId = AGENT_ID,
 ): string {
   const agent = {
-    name: runScopedHerdrAlias(WORKSPACE, label, runId),
     agent_status: useAgentStatus ? agentStatus : status,
     ...(useAgentStatus ? { interactive_ready: agentStatus === "done" } : {}),
     cwd: "/tmp",
@@ -1529,834 +1405,6 @@ export function requestRecordBytes(
     }),
     "utf8",
   );
-}
-
-export function leadExec(
-  label: string,
-  status: "idle" | "working" | "done",
-  session: string,
-  onRequest?: (mailbox: string, marker: string) => void,
-  listSession: string | null = DEFAULT_PI_SESSION_ID,
-  identity: FixtureIdentity = defaultFixtureIdentity,
-  useAgentStatus = false,
-  agentStatus: unknown = status,
-): ExecHandler {
-  const mailbox = agentMailboxPath(WORKSPACE, label);
-  consumeMailboxRequest(mailbox, (request) => {
-    if (onRequest) onRequest(mailbox, controlMarker(request.requestId));
-    else acceptMailboxRequest(mailbox, request);
-  });
-  return (command, args) => {
-    if (command === "herdr" && args[0] === "status" && args[1] === "--json")
-      return herdrStatusResult();
-    if (command === "herdr" && args[0] === "agent" && args[1] === "list")
-      return {
-        stdout: JSON.stringify({
-          id: AGENT_ID,
-          result: JSON.parse(
-            listResponse(
-              label,
-              status,
-              listSession,
-              identity,
-              useAgentStatus,
-              agentStatus,
-            ),
-          ),
-        }),
-        stderr: "",
-        code: 0,
-      };
-    if (command === "herdr" && isApiSnapshot(args))
-      return {
-        stdout: JSON.stringify({
-          id: AGENT_ID,
-          result: {
-            snapshot: {
-              agents: JSON.parse(
-                listResponse(
-                  label,
-                  status,
-                  listSession,
-                  identity,
-                  useAgentStatus,
-                  agentStatus,
-                ),
-              ).agents,
-              panes: [
-                {
-                  pane_id: identity.paneId,
-                  workspace_id: WORKSPACE,
-                  cwd: "/tmp",
-                  agent: label,
-                  agent_status: useAgentStatus ? agentStatus : status,
-                  agent_session: listSession
-                    ? {
-                        source: "herdr:pi",
-                        agent: "pi",
-                        kind: "id",
-                        value: listSession,
-                      }
-                    : undefined,
-                },
-              ],
-            },
-          },
-        }),
-        stderr: "",
-        code: 0,
-      };
-    if (command === "herdr" && isPaneList(args))
-      return {
-        stdout: JSON.stringify({
-          id: AGENT_ID,
-          result: {
-            panes: [
-              {
-                pane_id: identity.paneId,
-                workspace_id: WORKSPACE,
-                cwd: "/tmp",
-                agent: label,
-                agent_status: useAgentStatus ? agentStatus : status,
-              },
-            ],
-          },
-        }),
-        stderr: "",
-        code: 0,
-      };
-    if (command === "herdr" && args[0] === "--version")
-      return { stdout: "0.8.0", stderr: "", code: 0 };
-    if (command === "herdr" && args[0] === "agent" && args[1] === "get")
-      return {
-        stdout: JSON.stringify({
-          id: AGENT_ID,
-          result: {
-            agent: {
-              name: herdrAlias(label),
-              pane_id: identity.paneId,
-              workspace_id: WORKSPACE,
-              cwd: "/tmp",
-              agent_session: {
-                source: "herdr:pi",
-                agent: "pi",
-                kind: "id",
-                value: session,
-              },
-              ...(useAgentStatus
-                ? {
-                    agent_status: agentStatus,
-                    interactive_ready: agentStatus === "done",
-                  }
-                : {}),
-            },
-          },
-        }),
-        stderr: "",
-        code: 0,
-      };
-    return { stdout: "{}", stderr: "", code: 0 };
-  };
-}
-
-export function agentFromState(
-  state: ManagedAgentState,
-  status: "idle" | "working" | "blocked" | "done" = "idle",
-): Record<string, unknown> {
-  const alias = runScopedHerdrAlias(
-    state.workspaceId,
-    state.agentLabel,
-    state.runId,
-  );
-  return {
-    name: alias,
-    agent_status: status,
-    cwd: state.cwd,
-    workspace_id: state.workspaceId,
-    pane_id: state.paneId,
-    tab_id: `${state.agentLabel}-tab`,
-    tab_label: "agents",
-    agent_session: {
-      source: "herdr:pi",
-      agent: "pi",
-      kind: "id",
-      value: state.piSessionId,
-    },
-  };
-}
-
-export function agentControllerExecutor(
-  parent: ManagedAgentState,
-  children: ManagedAgentState[] = [],
-): ExecHandler & { pauseMailboxConsumers(): void; resumeMailboxConsumers(): void } {
-  let stops: (() => void)[] = [];
-  const resume = () => {
-    stops = [parent, ...children].map((child) =>
-      consumeMailboxRequest(
-        agentMailboxPath(child.workspaceId, child.agentLabel),
-        (request) =>
-          acceptMailboxRequest(
-            agentMailboxPath(child.workspaceId, child.agentLabel),
-            request,
-          ),
-      ),
-    );
-  };
-  resume();
-  const exec: ExecHandler = (command, args) => {
-    if (command !== "herdr") return { stdout: "{}", stderr: "", code: 0 };
-    if (args[0] === "status" && args[1] === "--json")
-      return herdrStatusResult();
-    if (args[0] === "--version")
-      return { stdout: "0.8.0", stderr: "", code: 0 };
-    if (isAgentList(args))
-      return {
-        stdout: JSON.stringify({
-          id: AGENT_ID,
-          result: {
-            agents: [parent, ...children].map((state) =>
-              agentFromState(state, state.activeRequestId ? "working" : "idle"),
-            ),
-          },
-        }),
-        stderr: "",
-        code: 0,
-      };
-    if (isApiSnapshot(args))
-      return {
-        stdout: JSON.stringify({
-          id: AGENT_ID,
-          result: {
-            snapshot: {
-              agents: [parent, ...children].map((state) =>
-                agentFromState(
-                  state,
-                  state.activeRequestId ? "working" : "idle",
-                ),
-              ),
-              panes: [parent, ...children].map((state) => ({
-                pane_id: state.paneId,
-                workspace_id: state.workspaceId,
-                cwd: state.cwd,
-                agent: state.agentLabel,
-                agent_status: state.activeRequestId ? "working" : "idle",
-                agent_session: {
-                  source: "herdr:pi",
-                  agent: "pi",
-                  kind: "id",
-                  value: state.piSessionId,
-                },
-              })),
-            },
-          },
-        }),
-        stderr: "",
-        code: 0,
-      };
-    if (isPaneList(args))
-      return {
-        stdout: JSON.stringify({
-          id: AGENT_ID,
-          result: {
-            panes: [parent, ...children].map((state) => ({
-              pane_id: state.paneId,
-              workspace_id: state.workspaceId,
-              cwd: state.cwd,
-              agent: state.agentLabel,
-              agent_status: state.activeRequestId ? "working" : "idle",
-            })),
-          },
-        }),
-        stderr: "",
-        code: 0,
-      };
-    if (args[0] === "agent" && args[1] === "get") {
-      const requested = args[2];
-      const state =
-        requested ===
-        runScopedHerdrAlias(parent.workspaceId, parent.agentLabel, parent.runId)
-          ? parent
-          : children.find(
-              (candidate) =>
-                candidate.paneId === requested ||
-                runScopedHerdrAlias(
-                  candidate.workspaceId,
-                  candidate.agentLabel,
-                  candidate.runId,
-                ) === requested,
-            );
-      if (state)
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              agent: agentFromState(
-                state,
-                state.activeRequestId ? "working" : "idle",
-              ),
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-    }
-    return { stdout: "{}", stderr: "", code: 0 };
-  };
-  return Object.assign(exec, {
-    pauseMailboxConsumers: () => stops.forEach((stop) => stop()),
-    resumeMailboxConsumers: resume,
-  });
-}
-
-export function delegatedLifecycleExecutor(
-  parent: ManagedAgentState,
-  initialChildren: ManagedAgentState[] = [],
-  testCwd = "/tmp",
-  callerPane?: { paneId: string; tabId: string },
-): {
-  exec: ExecHandler;
-  live: Map<string, ManagedAgentState>;
-  closeOrder: string[];
-  environmentCommands: string[];
-  paneEnvironment: Record<string, string>;
-  createdTabs: () => number;
-  tabForPane: (paneId: string) => string | undefined;
-} {
-  const live = new Map(
-    [parent, ...initialChildren].map((state) => [state.agentLabel, state]),
-  );
-  const slots = ["delegated-slot-1", "delegated-slot-2", "delegated-slot-3"];
-  const childSessionIds = [
-    CHILD_SESSION_ID,
-    "11111111-1111-4111-8111-111111111111",
-    "22222222-2222-4222-8222-222222222222",
-  ];
-  const closeOrder: string[] = [];
-  const environmentCommands: string[] = [];
-  const closedPanes = new Set<string>();
-  const paneEnvironment: Record<string, string> = {};
-  const tabByPane = new Map(
-    [parent, ...initialChildren].map((state) => [
-      state.paneId,
-      "delegated-tab",
-    ]),
-  );
-  const tabLabels = new Map([["delegated-tab", "agents"]]);
-  if (callerPane) {
-    tabByPane.set(callerPane.paneId, callerPane.tabId);
-    tabLabels.set(callerPane.tabId, "lead");
-  }
-  let createdTabs = 0;
-  let createdChildren = 0;
-  const currentStateForPane = (paneId: string): ManagedAgentState | undefined =>
-    [...live.values()].find((state) => state.paneId === paneId);
-  const agentForState = (
-    state: ManagedAgentState,
-  ): Record<string, unknown> => ({
-    ...agentFromState(state, state.activeRequestId ? "working" : "idle"),
-    tab_id: tabByPane.get(state.paneId),
-    tab_label: tabLabels.get(tabByPane.get(state.paneId) ?? ""),
-  });
-  const panes = (): Record<string, unknown>[] => [
-    ...(callerPane
-      ? [
-          {
-            pane_id: callerPane.paneId,
-            tab_id: callerPane.tabId,
-            workspace_id: WORKSPACE,
-            cwd: testCwd,
-            foreground_cwd: testCwd,
-            agent: "pi",
-            agent_status: "idle",
-          },
-        ]
-      : []),
-    ...[...live.values()].map((state) => ({
-      pane_id: state.paneId,
-      terminal_id: `terminal-${state.paneId}`,
-      tab_id: tabByPane.get(state.paneId),
-      workspace_id: WORKSPACE,
-      cwd: state.cwd,
-      foreground_cwd: state.cwd,
-      agent: state.agentLabel,
-      agent_status: state.activeRequestId ? "working" : "idle",
-    })),
-    ...slots
-      .filter(
-        (paneId) => !closedPanes.has(paneId) && !currentStateForPane(paneId),
-      )
-      .map((paneId) => ({
-        pane_id: paneId,
-        terminal_id: `terminal-${paneId}`,
-        tab_id: tabByPane.get(paneId) ?? "delegated-tab",
-        workspace_id: WORKSPACE,
-        cwd: testCwd,
-        foreground_cwd: testCwd,
-        agent_status: "unknown",
-      })),
-  ];
-  return {
-    live,
-    closeOrder,
-    environmentCommands,
-    paneEnvironment,
-    createdTabs: () => createdTabs,
-    tabForPane: (paneId) => tabByPane.get(paneId),
-    exec: (command, args) => {
-      if (command !== "herdr") return { stdout: "{}", stderr: "", code: 0 };
-      if (args[0] === "--version")
-        return { stdout: "0.8.0", stderr: "", code: 0 };
-      if (isAgentList(args))
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: { agents: [...live.values()].map(agentForState) },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      if (isApiSnapshot(args))
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              snapshot: {
-                agents: [...live.values()].map(agentForState),
-                panes: panes(),
-              },
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      if (args[0] === "agent" && args[1] === "get") {
-        const requested = args[2];
-        const state =
-          currentStateForPane(requested) ??
-          [...live.values()].find(
-            (candidate) =>
-              runScopedHerdrAlias(
-                candidate.workspaceId,
-                candidate.agentLabel,
-                candidate.runId,
-              ) === requested,
-          );
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: { agent: state ? agentForState(state) : null },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      }
-      if (isTabList(args))
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              tabs: [...tabLabels].map(([tab_id, label]) => ({
-                tab_id,
-                label,
-                workspace_id: WORKSPACE,
-              })),
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      if (args[0] === "tab" && args[1] === "create") {
-        for (let i = 0; i < args.length - 1; i++) {
-          if (args[i] !== "--env") continue;
-          const assignment = args[i + 1]!;
-          const separator = assignment.indexOf("=");
-          if (separator > 0) {
-            environmentCommands.push(assignment);
-            paneEnvironment[assignment.slice(0, separator)] = assignment.slice(
-              separator + 1,
-            );
-          }
-        }
-        const createdTabId = `delegated-tab-${++createdTabs}`;
-        const rootPane = slots.find(
-          (paneId) => !closedPanes.has(paneId) && !currentStateForPane(paneId),
-        );
-        if (!rootPane) return { stdout: "{}", stderr: "no pane", code: 1 };
-        tabLabels.set(createdTabId, "agents");
-        tabByPane.set(rootPane, createdTabId);
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              tab: { tab_id: createdTabId },
-              root_pane: {
-                pane_id: rootPane,
-                terminal_id: `terminal-${rootPane}`,
-              },
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      }
-      if (isPaneList(args))
-        return {
-          stdout: JSON.stringify({ id: AGENT_ID, result: { panes: panes() } }),
-          stderr: "",
-          code: 0,
-        };
-      if (args[0] === "pane" && args[1] === "get") {
-        const state = currentStateForPane(args[2]!);
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              pane: state
-                ? {
-                    pane_id: state.paneId,
-                    terminal_id: `terminal-${state.paneId}`,
-                    tab_id: tabByPane.get(state.paneId),
-                    workspace_id: WORKSPACE,
-                    cwd: state.cwd,
-                    agent_session: {
-                      source: "herdr:pi",
-                      agent: "pi",
-                      kind: "id",
-                      value: state.piSessionId,
-                    },
-                  }
-                : undefined,
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      }
-      if (args[0] === "pane" && args[1] === "process-info")
-        return (() => {
-          return {
-            stdout: JSON.stringify({
-              id: AGENT_ID,
-              result: {
-                process_info: currentStateForPane(args.at(-1)!)
-                  ? {
-                      pane_id: args.at(-1),
-                      shell_pid: 123,
-                      foreground_process_group_id: 456,
-                      foreground_processes: [
-                        { pid: 456, argv0: "/usr/bin/pi" },
-                      ],
-                    }
-                  : {
-                      pane_id: args.at(-1),
-                      shell_pid: 123,
-                      foreground_process_group_id: 123,
-                      foreground_processes: [{ pid: 123, argv0: "/bin/zsh" }],
-                    },
-              },
-            }),
-            stderr: "",
-            code: 0,
-          };
-        })();
-      if (args[0] === "pane" && args[1] === "layout")
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              layout: {
-                workspace_id: WORKSPACE,
-                tab_id: tabByPane.get(args.at(-1) ?? "") ?? "delegated-tab",
-                panes: panes().map((pane, index) => ({
-                  pane_id: pane.pane_id,
-                  rect: { width: 100 - index, height: 40 },
-                })),
-              },
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      if (args[0] === "pane" && args[1] === "run") {
-        const commandText = args.at(-1) ?? "";
-        environmentCommands.push(commandText);
-        for (const match of commandText.matchAll(
-          /([A-Z][A-Z0-9_]*)='([^']*)'/g,
-        ))
-          paneEnvironment[match[1]] = match[2];
-        return { stdout: "{}", stderr: "", code: 0 };
-      }
-      if (args[0] === "pane" && args[1] === "wait-output")
-        return { stdout: "{}", stderr: "", code: 0 };
-      if (args[0] === "pane" && args[1] === "split") {
-        for (let i = 0; i < args.length - 1; i++) {
-          if (args[i] !== "--env") continue;
-          const assignment = args[i + 1]!;
-          const separator = assignment.indexOf("=");
-          if (separator > 0) {
-            environmentCommands.push(assignment);
-            paneEnvironment[assignment.slice(0, separator)] = assignment.slice(
-              separator + 1,
-            );
-          }
-        }
-        const paneId = slots.find(
-          (candidate) =>
-            !closedPanes.has(candidate) && !currentStateForPane(candidate),
-        );
-        if (!paneId) return { stdout: "{}", stderr: "no pane", code: 1 };
-        const anchor = args[args.indexOf("--pane") + 1];
-        tabByPane.set(paneId, tabByPane.get(anchor ?? "") ?? "delegated-tab");
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              pane: { pane_id: paneId, terminal_id: `terminal-${paneId}` },
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      }
-      if (args[0] === "agent" && args[1] === "start") {
-        const label = paneEnvironment.PI_HERDSMAN_LABEL;
-        const runId = paneEnvironment.PI_HERDSMAN_RUN_ID;
-        const ownerSessionId = paneEnvironment.PI_HERDSMAN_OWNER_SESSION_ID;
-        const workspaceId = paneEnvironment.PI_HERDSMAN_WORKSPACE_ID;
-        const paneId = args[args.indexOf("--pane") + 1];
-        const tabForPane = tabByPane.get(paneId) ?? "delegated-tab";
-        const state: ManagedAgentState = {
-          version: 5,
-          runId,
-          ownerSessionId,
-          workspaceId,
-          agentLabel: label,
-          paneId,
-          piSessionId: childSessionIds[createdChildren++],
-          piSessionFile: `/tmp/${label}.jsonl`,
-          cwd: testCwd,
-          updatedAt: Date.now(),
-        };
-        live.set(label, state);
-        tabByPane.set(paneId, tabForPane);
-        writeAgentState(agentMailboxPath(workspaceId, label), state);
-        consumeMailboxRequest(agentMailboxPath(workspaceId, label), (request) =>
-          acceptMailboxRequest(agentMailboxPath(workspaceId, label), request),
-        );
-        const agent = agentForState(state);
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              agent,
-              tab_id: tabForPane,
-              tab_label: tabLabels.get(tabForPane),
-              pane_id: paneId,
-              cwd: testCwd,
-              herdr_agent: agent.name,
-              created_tab: false,
-              created_pane: true,
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      }
-      if (args[0] === "pane" && args[1] === "close") {
-        const state = currentStateForPane(args[2]!);
-        if (!state) return { stdout: "{}", stderr: "missing pane", code: 1 };
-        live.delete(state.agentLabel);
-        closedPanes.add(state.paneId);
-        closeOrder.push(state.agentLabel);
-        return { stdout: "{}", stderr: "", code: 0 };
-      }
-      return { stdout: "{}", stderr: "", code: 0 };
-    },
-  };
-}
-
-export function cascadeExecutor(
-  states: ManagedAgentState[],
-  options: {
-    failCloseLabel?: string;
-  } = {},
-): {
-  exec: ExecHandler;
-  closeOrder: string[];
-  live: Map<string, ManagedAgentState>;
-} {
-  const live = new Map(states.map((state) => [state.agentLabel, state]));
-  const closeOrder: string[] = [];
-  const paneFor = (paneId: string) =>
-    [...live.values()].find((state) => state.paneId === paneId);
-  return {
-    closeOrder,
-    live,
-    exec: (command, args) => {
-      if (command !== "herdr") return { stdout: "{}", stderr: "", code: 0 };
-      if (args[0] === "status" && args[1] === "--json")
-        return herdrStatusResult();
-      if (args[0] === "--version")
-        return { stdout: "0.8.0", stderr: "", code: 0 };
-      if (args[0] === "agent" && args[1] === "get") {
-        const requested = args[2];
-        const state =
-          [...live.values()].find(
-            (candidate) =>
-              candidate.paneId === requested ||
-              runScopedHerdrAlias(
-                candidate.workspaceId,
-                candidate.agentLabel,
-                candidate.runId,
-              ) === requested,
-          ) ?? undefined;
-        if (!state)
-          return {
-            stdout: JSON.stringify({ id: AGENT_ID, result: { agent: null } }),
-            stderr: "",
-            code: 0,
-          };
-        const agent = agentFromState(state);
-        return {
-          stdout: JSON.stringify({ id: AGENT_ID, result: { agent } }),
-          stderr: "",
-          code: 0,
-        };
-      }
-      if (args[0] === "pane" && args[1] === "get") {
-        const state = paneFor(args[2]!);
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              pane: state
-                ? {
-                    pane_id: state.paneId,
-                    tab_id: `${state.agentLabel}-tab`,
-                    workspace_id: state.workspaceId,
-                    cwd: state.cwd,
-                    agent_session: {
-                      source: "herdr:pi",
-                      agent: "pi",
-                      kind: "id",
-                      value: state.piSessionId,
-                    },
-                  }
-                : undefined,
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      }
-      if (args[0] === "pane" && args[1] === "process-info")
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              process_info: {
-                pane_id: args.at(-1),
-                shell_pid: 123,
-                foreground_process_group_id: 123,
-                foreground_processes: [{ pid: 123, argv0: "/bin/zsh" }],
-              },
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      if (args[0] === "pane" && args[1] === "close") {
-        const state = paneFor(args[2]!);
-        if (!state) return { stdout: "{}", stderr: "pane not found", code: 1 };
-        if (state.agentLabel === options.failCloseLabel)
-          return { stdout: "{}", stderr: "close failed", code: 1 };
-        live.delete(state.agentLabel);
-        closeOrder.push(state.agentLabel);
-        return { stdout: "{}", stderr: "", code: 0 };
-      }
-      return { stdout: "{}", stderr: "", code: 0 };
-    },
-  };
-}
-
-export async function assertRestrictiveManagedDefinition(
-  name: string,
-  content: string,
-): Promise<void> {
-  const definitionPath = join(PI_AGENTS_DIR, `${name}.md`);
-  setLeadEnvironment();
-  realFs.writeFileSync(definitionPath, content);
-  const environmentCommands: string[] = [];
-  const startup = startupExecutor(name, () => DEFAULT_PI_SESSION_ID);
-  const root = fakePi({
-    exec: (command, args, options) => {
-      if (command === "herdr" && args[0] === "pane" && args[1] === "run")
-        environmentCommands.push(args.at(-1) ?? "");
-      if (command === "herdr" && args[0] === "pane" && args[1] === "split") {
-        const allowed = args.find((arg) =>
-          arg.startsWith("PI_HERDSMAN_ALLOWED_AGENT_DEFINITIONS="),
-        );
-        if (allowed)
-          environmentCommands.push(
-            `PI_HERDSMAN_ALLOWED_AGENT_DEFINITIONS='${allowed.slice("PI_HERDSMAN_ALLOWED_AGENT_DEFINITIONS=".length)}'`,
-          );
-      }
-      return startup.exec(command, args, options);
-    },
-  });
-  let allowedAgentDefinitions: string[] = [];
-  try {
-    registerExtension!(root.pi as never);
-    const result = await root.tools[0].execute(
-      "id",
-      {
-        action: "delegate",
-        definition: name,
-        label: name,
-        task: "restricted task",
-      },
-      undefined,
-      undefined,
-      fakeContext(),
-    );
-    assert.equal(result.details.ok, true, JSON.stringify(result.details));
-    const environment = environmentCommands.find((command) =>
-      command.includes("PI_HERDSMAN_ALLOWED_AGENT_DEFINITIONS="),
-    );
-    assert.ok(environment);
-    const encoded = /PI_HERDSMAN_ALLOWED_AGENT_DEFINITIONS='([^']*)'/.exec(
-      environment,
-    )?.[1];
-    assert.equal(encoded, "[]");
-    allowedAgentDefinitions = JSON.parse(encoded);
-  } catch (error) {
-    realFs.rmSync(definitionPath, { force: true });
-    throw error;
-  } finally {
-    root.events.get("session_shutdown")?.[0]();
-    resetAgentMailbox(startup.mailbox);
-  }
-
-  const mailbox = setAgentEnvironment(name, allowedAgentDefinitions);
-  process.env.PI_HERDSMAN_AGENT_DEFINITION = name;
-  const agent = fakePi();
-  registerExtension!(agent.pi as never);
-  try {
-    assert.equal(agent.tools.filter((tool) => tool.name === "agent").length, 0);
-    assert.equal(
-      agent.tools.filter((tool) => tool.name === "ask_owner").length,
-      1,
-    );
-    await agent.events.get("session_start")![0](
-      undefined,
-      fakeAgentContext(agent.entries),
-    );
-  } finally {
-    agent.events.get("session_shutdown")?.[0]();
-    resetAgentMailbox(mailbox);
-    realFs.rmSync(definitionPath, { force: true });
-    setLeadEnvironment();
-  }
 }
 
 export function testGate<T = void>(): {
@@ -2431,834 +1479,6 @@ function acceptMailboxRequest(mailbox: string, request: RequestRecord): void {
     },
     updatedAt: Date.now(),
   });
-}
-
-export function createStagedAssignmentFixture(
-  label: string,
-  fastCompletion = false,
-) {
-  setLeadEnvironment();
-  const startupMailbox = agentMailboxPath(WORKSPACE, label);
-  const childStart = testGate<void>();
-  const childState = testGate<void>();
-  const handoff = testGate<void>();
-  let holdHandoff = true;
-  let childStateReady = false;
-  let requestId: string | undefined;
-  let acceptedRequestIdWritten: string | undefined;
-  let workingObservations = 0;
-  let renderRequests = 0;
-  let pendingDelegation: Promise<void> | undefined;
-  const startup = startupExecutor(
-    label,
-    () => DEFAULT_PI_SESSION_ID,
-    undefined,
-    async (_text, request) => {
-      requestId = request?.requestId;
-      if (holdHandoff) {
-        holdHandoff = false;
-        await handoff.promise;
-      }
-    },
-    false,
-    undefined,
-    "/tmp",
-    AGENT_ID,
-    false,
-    false,
-    false,
-    (request) => {
-      const state = readAgentState(startupMailbox);
-      assert.ok(state, "staged request must retain mailbox state");
-      acceptedRequestIdWritten = state.activeRequestId;
-      writeAgentState(startupMailbox, {
-        ...state,
-        activeRequestId: undefined,
-        completedRequestId: undefined,
-        updatedAt: Date.now(),
-      });
-    },
-  );
-
-  // A launch's stages are the daemon's now: the child starts, its state exists,
-  // and the assignment reaches it. The fixture holds each stage so a test can
-  // assert what the launch publishes while it waits.
-  radarDaemon.onChildStart = () => childStart.promise;
-  radarDaemon.onChildState = () => {
-    childStateReady = true;
-    return childState.promise;
-  };
-
-  const pi = fakePi({
-    persistMessages: true,
-    exec: async (command, args, options) => {
-      if (command === "herdr" && isAgentList(args)) {
-        const state = readAgentState(startupMailbox);
-        const agents = state
-          ? [
-              {
-                ...JSON.parse(
-                  listResponse(
-                    label,
-                    state.activeRequestId ? "working" : "idle",
-                  ),
-                ).agents[0],
-                name: runScopedHerdrAlias(WORKSPACE, label, state.runId),
-                pane_id: "startup-pane",
-                workspace_id: WORKSPACE,
-                cwd: "/tmp",
-                agent_session: {
-                  source: "herdr:pi",
-                  agent: "pi",
-                  kind: "id",
-                  value: state.piSessionId,
-                },
-              },
-            ]
-          : [];
-        if (agents.some((agent: any) => agent.agent_status === "working"))
-          workingObservations++;
-        return {
-          stdout: JSON.stringify({ id: 1, result: { agents } }),
-          stderr: "",
-          code: 0,
-        };
-      }
-      if (command === "herdr" && isApiSnapshot(args)) {
-        const result = await startup.exec(command, args, options);
-        const payload = JSON.parse(result.stdout);
-        const agents = payload.result?.snapshot?.agents ?? [];
-        if (agents.some((agent: any) => agent.agent_status === "working"))
-          workingObservations++;
-        return result;
-      }
-      return startup.exec(command, args, options);
-    },
-  });
-  const context = fakeContext(pi.entries) as any;
-  context.mode = "tui";
-  context.hasUI = true;
-  let widget: StatusWidget | undefined;
-  context.ui = {
-    notify: () => undefined,
-    setWidget: (_key: string, content: unknown) => {
-      assertWidgetContent(content);
-      if (typeof content === "function")
-        widget = content(
-          { requestRender: () => renderRequests++ },
-          {
-            fg: (_color: string, text: string) => text,
-            bold: (text: string) => text,
-          },
-        );
-    },
-  };
-
-  registerExtension!(pi.pi as never);
-  const sessionStart = pi.events.get("session_start")![0](undefined, context);
-  return {
-    pi,
-    context,
-    startup,
-    sessionStart,
-    mailbox: startup.mailbox,
-    get widgetValue(): StatusWidget {
-      assert.ok(widget, "staged fixture did not create a status widget");
-      return widget;
-    },
-    get requestId(): string {
-      assert.ok(requestId, "staged fixture did not observe a request");
-      return requestId;
-    },
-    get requestObserved(): boolean {
-      return requestId !== undefined;
-    },
-    get childStateReady(): boolean {
-      return childStateReady;
-    },
-    get acceptedRequestIdWritten(): string {
-      assert.ok(
-        acceptedRequestIdWritten,
-        "staged fixture did not write an accepted request",
-      );
-      return acceptedRequestIdWritten;
-    },
-    get workingObservations(): number {
-      return workingObservations;
-    },
-    get renderRequests(): number {
-      return renderRequests;
-    },
-    releaseChildStart: () => childStart.resolve(),
-    releaseStartupAck: () => childState.resolve(),
-    releaseHandoff: () => handoff.resolve(),
-    async list() {
-      return pi.tools[0].execute(
-        "id",
-        { action: "list" },
-        undefined,
-        undefined,
-        context,
-      );
-    },
-    /**
-     * Follow one delegation to its settlement. A teardown that merely drops the
-     * test's reference would leave the launch waiting on a gate forever, so the
-     * shutdown below has to be able to wait for the same promise the test holds.
-     */
-    track<T>(delegation: Promise<T>): Promise<T> {
-      pendingDelegation = delegation.then(
-        () => undefined,
-        () => undefined,
-      );
-      return delegation;
-    },
-    markWorking(requestId: string) {
-      const state = readAgentState(startup.mailbox);
-      assert.ok(state);
-      writeAgentState(startup.mailbox, {
-        ...state,
-        activeRequestId: requestId,
-        completedRequestId: undefined,
-        updatedAt: Date.now(),
-      });
-    },
-    completeFast(requestId: string) {
-      assert.equal(fastCompletion, true);
-      const state = readAgentState(startup.mailbox);
-      assert.ok(state);
-      writeAgentState(startup.mailbox, {
-        ...state,
-        activeRequestId: undefined,
-        completedRequestId: requestId,
-        updatedAt: Date.now(),
-      });
-      writeResult(startup.mailbox, {
-        version: 5,
-        runId: state.runId,
-        requestId,
-        ownerSessionId: state.ownerSessionId,
-        workspaceId: state.workspaceId,
-        agentLabel: state.agentLabel,
-        paneId: state.paneId,
-        status: "completed",
-        text: "completed before working was observed",
-        completedAt: Date.now(),
-      });
-      watchedResultPaths.get(`${startup.mailbox}/result-${requestId}.json`)?.(
-        {},
-        {},
-      );
-    },
-    async shutdown() {
-      // A failed assertion can leave this launch waiting on a gate the test will
-      // never open. Open them and wait for the delegation to settle: the launch
-      // releases its mailbox startup claim on the way out, and a claim left held
-      // makes the next test's label collide with this one's.
-      childStart.resolve();
-      childState.resolve();
-      handoff.resolve();
-      await pendingDelegation;
-      for (const handler of pi.events.get("session_shutdown") ?? [])
-        await handler(undefined, context);
-      resetAgentMailbox(startup.mailbox);
-    },
-  };
-}
-
-export function writeMetadataTask(
-  mailbox: string,
-  text: string,
-  requestId = REQUEST_ID,
-): RequestRecord {
-  const state = readAgentState(mailbox)!;
-  const profile = state.briefProfile ?? "common";
-  const acceptedAssignment = fixtureAcceptedAssignment(requestId, profile);
-  writeAgentState(mailbox, {
-    ...state,
-    briefProfile: profile,
-    activeRequestId: requestId,
-    acceptedAssignment,
-  });
-  const request: RequestRecord = {
-    version: 5,
-    runId: state.runId,
-    requestId,
-    ownerSessionId: state.ownerSessionId,
-    workspaceId: state.workspaceId,
-    agentLabel: state.agentLabel,
-    paneId: state.paneId,
-    kind: "task",
-    acceptedAssignment,
-    text,
-    createdAt: Date.now(),
-  };
-  writeRequest(mailbox, request);
-  return request;
-}
-
-export function startupExecutor(
-  label: string,
-  sessionForGet: (count: number) => string | null,
-  onGet?: (count: number) => void,
-  onRequest?: (text: string, request?: RequestRecord) => void | Promise<void>,
-  reportNullSession = false,
-  onStart?: (args: string[]) => void,
-  testCwd = "/tmp",
-  testRunId = AGENT_ID,
-  includeResult = false,
-  closePaneOnClose = false,
-  countStartup = false,
-  onAccepted?: (request: RequestRecord) => void | Promise<void>,
-  sessionFile = "/tmp/registered-agent.jsonl",
-): {
-  exec: ExecHandler;
-  mailbox: string;
-  getCount: () => number;
-  stopMailboxConsumer: () => void;
-} {
-  const mailbox = agentMailboxPath(WORKSPACE, label);
-  let getCount = 0;
-  let runId = testRunId;
-  let ownerSessionId = testRunId ? LEAD_SESSION_ID : "";
-  let activePaneId = "startup-pane";
-  // A launch reads the pane this process's own Radar registration names, so a
-  // fixture session stands in a pane unless the test names its own.
-  process.env.HERDR_PANE_ID ??= "startup-pane";
-  const paneEnvironment: Record<string, string> = {};
-  let stopped = false;
-  let tabClosed = false;
-  let paneClosed = false;
-  // The child a direct launch (`pane run`) started, as Herdr sees it: it
-  // registers itself, and stays nameless until `agent rename` applies the
-  // Herdsman alias.
-  let childLaunched = false;
-  let childName: string | undefined;
-  const READINESS_MARKER = "echo __PI_HERDSMAN_READY_";
-  const registerChild = () => {
-    // Only a launch makes this fixture's child exist. A child already
-    // registered under another run was launched by the Radar daemon for this
-    // session: the run, owner and acknowledgment in its own state are what the
-    // control path holds it by, and this fixture's stand-in must not rewrite
-    // them for a read that happens to arrive after the launch.
-    const existing = readAgentState(mailbox);
-    if (existing !== undefined && existing.runId !== runId) return;
-    writeAgentState(mailbox, {
-      version: 5,
-      runId,
-      ownerSessionId,
-      workspaceId: WORKSPACE,
-      agentLabel: label,
-      paneId: activePaneId,
-      piSessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-      piSessionFile: sessionFile,
-      agentDefinition: "agent",
-      cwd: testCwd,
-      updatedAt: Date.now(),
-    });
-  };
-  const childAgent = () => ({
-    ...(childName ? { name: childName } : {}),
-    pane_id: activePaneId,
-    tab_id: "startup-tab",
-    workspace_id: WORKSPACE,
-    cwd: testCwd,
-    agent_status: "idle",
-    agent_session: {
-      source: "herdr:pi",
-      agent: "pi",
-      kind: "id",
-      value: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-    },
-  });
-  const emptyList = () => {
-    const value = JSON.parse(listResponse(label));
-    value.agents = [];
-    return JSON.stringify({ id: AGENT_ID, result: value });
-  };
-  // Radar spawn starts the child, so the daemon performs the child's share: it
-  // reports this fixture's session, runs the test's request handler, and accepts
-  // the assignment. The mailbox consumer below stays for the direct-launch paths
-  // that still run a child of their own.
-  radarDaemon.childSession = () => ({
-    id: sessionForGet(0) ?? "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-    file: sessionFile,
-  });
-  if (onStart) radarDaemon.onChildStart = (spawn) => onStart([...spawn.argv]);
-  if (onRequest)
-    radarDaemon.onChildRequest = (_spawn, request) =>
-      onRequest(request.text, request);
-  if (onAccepted)
-    radarDaemon.onChildAccepted = (request) => onAccepted(request);
-  const stopMailboxConsumer = consumeMailboxRequest(
-    mailbox,
-    async (request) => {
-      if (!readAgentState(mailbox)) return;
-      await onRequest?.(request.text, request);
-      acceptMailboxRequest(mailbox, request);
-      await onAccepted?.(request);
-    },
-  );
-  return {
-    mailbox,
-    getCount: () => getCount,
-    stopMailboxConsumer,
-    exec: (command, args) => {
-      if (command === "herdr" && args[0] === "status" && args[1] === "--json")
-        return herdrStatusResult();
-      if (command === "herdr" && args[0] === "--version")
-        return { stdout: "0.8.0", stderr: "", code: 0 };
-      if (command === "herdr" && args[0] === "agent" && args[1] === "get") {
-        if (countStartup && args[2] !== "startup-pane") getCount++;
-        if (args[2] !== "startup-pane")
-          return {
-            stdout: JSON.stringify({
-              id: AGENT_ID,
-              result: {
-                agent: {
-                  name: args[2],
-                  pane_id: "startup-pane",
-                  tab_id: "startup-tab",
-                  workspace_id: WORKSPACE,
-                  cwd: testCwd,
-                  agent_session: {
-                    source: "herdr:pi",
-                    agent: "pi",
-                    kind: "id",
-                    value: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-                  },
-                },
-              },
-            }),
-            stderr: "",
-            code: 0,
-          };
-        getCount++;
-        onGet?.(getCount);
-        const session = sessionForGet(getCount);
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              agent: {
-                name: runScopedHerdrAlias(WORKSPACE, label, runId || AGENT_ID),
-                pane_id: "startup-pane",
-                tab_id: "startup-tab",
-                workspace_id: WORKSPACE,
-                cwd: testCwd,
-                ...(session
-                  ? {
-                      agent_session: {
-                        source: "herdr:pi",
-                        agent: "pi",
-                        kind: "id",
-                        value: session,
-                      },
-                    }
-                  : reportNullSession
-                    ? { agent_session: null }
-                    : {}),
-              },
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      }
-      if (command !== "herdr") return { stdout: "{}", stderr: "", code: 0 };
-      if (isApiSnapshot(args)) {
-        const state = readAgentState(mailbox);
-        const agents =
-          state && runId && !stopped
-            ? [
-                {
-                  ...JSON.parse(
-                    listResponse(
-                      label,
-                      state.activeRequestId ? "working" : "idle",
-                    ),
-                  ).agents[0],
-                  name: runScopedHerdrAlias(WORKSPACE, label, state.runId),
-                  pane_id: activePaneId,
-                  workspace_id: WORKSPACE,
-                  cwd: testCwd,
-                  agent_session: {
-                    source: "herdr:pi",
-                    agent: "pi",
-                    kind: "id",
-                    value: sessionForGet(getCount) ?? DEFAULT_PI_SESSION_ID,
-                  },
-                },
-              ]
-            : [];
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              snapshot: {
-                agents,
-                panes:
-                  closePaneOnClose && (paneClosed || tabClosed)
-                    ? []
-                    : [
-                        {
-                          pane_id: activePaneId,
-                          workspace_id: WORKSPACE,
-                          cwd: testCwd,
-                          agent_session: agents[0]?.agent_session,
-                        },
-                      ],
-              },
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      }
-      if (isTabList(args))
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              tabs:
-                closePaneOnClose && tabClosed
-                  ? []
-                  : [
-                      {
-                        tab_id: "startup-tab",
-                        label: "agents",
-                        workspace_id: WORKSPACE,
-                      },
-                    ],
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      if (args[0] === "tab" && args[1] === "create")
-        return (() => {
-          for (let i = 0; i < args.length - 1; i++) {
-            if (args[i] !== "--env") continue;
-            const assignment = args[i + 1]!;
-            const separator = assignment.indexOf("=");
-            if (separator <= 0) continue;
-            const key = assignment.slice(0, separator);
-            const value = assignment.slice(separator + 1);
-            paneEnvironment[key] = value;
-            if (key === "PI_HERDSMAN_RUN_ID") runId = value;
-            if (key === "PI_HERDSMAN_OWNER_SESSION_ID") ownerSessionId = value;
-          }
-          return {
-            stdout: JSON.stringify({
-              id: AGENT_ID,
-              result: {
-                tab: { tab_id: "startup-tab" },
-                root_pane: {
-                  pane_id: "startup-pane",
-                  terminal_id: "startup-terminal",
-                },
-              },
-            }),
-            stderr: "",
-            code: 0,
-          };
-        })();
-      if (isPaneList(args))
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              panes:
-                closePaneOnClose && (paneClosed || tabClosed)
-                  ? []
-                  : [
-                      {
-                        pane_id: "startup-pane",
-                        tab_id: "startup-tab",
-                        workspace_id: WORKSPACE,
-                        terminal_id: "startup-terminal",
-                        cwd: testCwd,
-                        foreground_cwd: testCwd,
-                        ...(runId && !stopped && readAgentState(mailbox)
-                          ? {
-                              agent: label,
-                              agent_status: "idle",
-                            }
-                          : { agent_status: "unknown" }),
-                      },
-                    ],
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      if (args[0] === "pane" && args[1] === "process-info")
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              process_info: {
-                pane_id: activePaneId,
-                shell_pid: 123,
-                foreground_process_group_id: 123,
-                foreground_processes: [{ pid: 123, argv0: "/bin/zsh" }],
-              },
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      if (args[0] === "pane" && args[1] === "layout")
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              layout: {
-                workspace_id: WORKSPACE,
-                tab_id: "registered-tab",
-                panes: [
-                  { pane_id: activePaneId, rect: { width: 100, height: 40 } },
-                ],
-              },
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      if (args[0] === "pane" && args[1] === "split") {
-        for (let i = 0; i < args.length - 1; i++) {
-          if (args[i] !== "--env") continue;
-          const assignment = args[i + 1]!;
-          const separator = assignment.indexOf("=");
-          if (separator <= 0) continue;
-          const key = assignment.slice(0, separator);
-          const value = assignment.slice(separator + 1);
-          if (key === "PI_HERDSMAN_RUN_ID") runId = value;
-          if (key === "PI_HERDSMAN_OWNER_SESSION_ID") ownerSessionId = value;
-        }
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: { pane: { pane_id: activePaneId } },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      }
-      if (args[0] === "pane" && args[1] === "get")
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              pane: {
-                pane_id: "startup-pane",
-                tab_id: "startup-tab",
-                workspace_id: WORKSPACE,
-                terminal_id: "startup-terminal",
-                cwd: testCwd,
-                agent_session: {
-                  source: "herdr:pi",
-                  agent: "pi",
-                  kind: "id",
-                  value: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-                },
-              },
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      if (args[0] === "pane" && args[1] === "layout")
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              panes: [
-                { pane_id: "startup-pane", rect: { width: 1, height: 1 } },
-              ],
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      if (args[0] === "pane" && args[1] === "split") {
-        for (let i = 0; i < args.length - 1; i++) {
-          if (args[i] !== "--env") continue;
-          const assignment = args[i + 1]!;
-          const separator = assignment.indexOf("=");
-          if (separator > 0)
-            paneEnvironment[assignment.slice(0, separator)] = assignment.slice(
-              separator + 1,
-            );
-          if (assignment.startsWith("PI_HERDSMAN_RUN_ID="))
-            runId = assignment.slice(19);
-          if (assignment.startsWith("PI_HERDSMAN_OWNER_SESSION_ID="))
-            ownerSessionId = assignment.slice(29);
-        }
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              pane: {
-                pane_id: "startup-pane",
-                terminal_id: "startup-terminal",
-              },
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      }
-      if (
-        args[0] === "pane" &&
-        (args[1] === "run" || args[1] === "wait-output")
-      ) {
-        // `waitForShellMarker` types its readiness marker; any other line is a
-        // direct child launch, whose process registers itself with Herdr
-        // (probe P1 in `openspec/changes/herdsman-child-command/probe.md`).
-        if (
-          args[1] === "run" &&
-          !String(args[3] ?? "").startsWith(READINESS_MARKER)
-        ) {
-          childLaunched = true;
-          childName = undefined;
-          registerChild();
-        }
-        return { stdout: "{}", stderr: "", code: 0 };
-      }
-      if (args[0] === "agent" && args[1] === "rename") {
-        // Renaming an unregistered target is Herdr's `agent_not_found`, which
-        // is why the direct launch polls for the record first (probe P2).
-        if (!childLaunched)
-          return {
-            stdout: JSON.stringify({
-              error: {
-                code: "agent_not_found",
-                message: `agent target ${args[2]} not found`,
-              },
-            }),
-            stderr: "",
-            code: 1,
-          };
-        childName = args[3];
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: { agent: childAgent() },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      }
-      if (isAgentList(args))
-        return {
-          stdout:
-            runId && !stopped && readAgentState(mailbox)
-              ? (() => {
-                  const state = readAgentState(mailbox)!;
-                  const value = JSON.parse(
-                    listResponse(
-                      label,
-                      state.activeRequestId ? "working" : "idle",
-                    ),
-                  );
-                  const alias = runScopedHerdrAlias(
-                    WORKSPACE,
-                    label,
-                    state.runId,
-                  );
-                  value.agents[0].herdr_agent = alias;
-                  value.agents[0].name = alias;
-                  value.agents[0].pane_id = "startup-pane";
-                  value.agents[0].tab_id = "startup-tab";
-                  if (reportNullSession) value.agents[0].agent_session = null;
-                  return JSON.stringify({ id: AGENT_ID, result: value });
-                })()
-              : emptyList(),
-          stderr: "",
-          code: 0,
-        };
-      if (isPaneClose(args)) {
-        if (closePaneOnClose) {
-          stopped = true;
-          paneClosed = true;
-        }
-        return { stdout: "{}", stderr: "", code: 0 };
-      }
-      if (isTabClose(args)) {
-        if (closePaneOnClose) {
-          stopped = true;
-          tabClosed = true;
-        }
-        return { stdout: "{}", stderr: "", code: 0 };
-      }
-      if (isPreservePaneStop(args)) {
-        stopped = true;
-        return { stdout: "{}", stderr: "", code: 0 };
-      }
-      if (args[0] === "agent" && args[1] === "start") {
-        onStart?.(args);
-      }
-      // A report or a topology read is not a launch: only a launch makes this
-      // fixture's child exist, and answering a publication with a synthesized
-      // child would hand the next launch a child it never started.
-      if (
-        (args[0] === "pane" && args[1] === "report-metadata") ||
-        (args[0] === "workspace" && args[1] === "get")
-      )
-        return { stdout: "{}", stderr: "", code: 0 };
-      const startedAgent = {
-        name: args[2],
-        pane_id: activePaneId,
-        tab_id: "startup-tab",
-        workspace_id: WORKSPACE,
-        cwd: testCwd,
-        agent_session: {
-          source: "herdr:pi",
-          agent: "pi",
-          kind: "id",
-          value: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-        },
-      };
-      registerChild();
-      return {
-        stdout: JSON.stringify({
-          id: AGENT_ID,
-          result: {
-            tab_id: "startup-tab",
-            tab_label: "agents",
-            pane_id: activePaneId,
-            cwd: testCwd,
-            herdr_agent: runScopedHerdrAlias(
-              WORKSPACE,
-              label,
-              runId || AGENT_ID,
-            ),
-            created_tab: false,
-            created_pane: true,
-            agent: startedAgent,
-            runtime_identity: {
-              herdr_agent: runScopedHerdrAlias(
-                WORKSPACE,
-                label,
-                runId || AGENT_ID,
-              ),
-              herdr_kind: "pi",
-              agent_definition: null,
-              model: null,
-              thinking: null,
-              cwd: testCwd,
-              resumed: false,
-              session_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-              session_name: null,
-            },
-          },
-        }),
-        stderr: "",
-        code: 0,
-      };
-    },
-  };
 }
 
 export function skillBlock(skill: string, name: string): string {

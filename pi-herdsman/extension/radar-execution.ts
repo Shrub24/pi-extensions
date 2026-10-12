@@ -58,9 +58,8 @@ export type RadarExecutionOptions = {
 	managedBinding?: { key: string; run: string; owner: string; label: string };
 	/**
 	 * A second, idempotent blocking signal (`rpiv:ask-user:blocked`): a
-	 * questionnaire is one wait, not a nested dialog, so keeping it on its own flag
-	 * cannot count the same wait twice when the dialog also reports itself on
-	 * `herdr:blocked`. Absent where no such event exists.
+	 * questionnaire is one wait, so its own flag cannot count it twice. Absent
+	 * where no such event exists.
 	 */
 	questionnaireEvent?: string;
 };
@@ -69,6 +68,8 @@ export type RadarExecutionAdapter = {
 	publication: RadarPublication;
 	/** The exact subject a managed child registered, for its owner to correlate. */
 	binding(): RadarChildBinding | undefined;
+	/** Whether this process is blocked on a questionnaire or a permission prompt. */
+	blocked(): boolean;
 	stop(): void;
 };
 
@@ -143,10 +144,9 @@ function unavailablePublication(): RadarPublication {
 /**
  * Generic Pi lifecycle adapter for one process's `execution` channel.
  *
- * It carries over what the native Herdr reporter did usefully — run activity,
- * nested dialog blocking, reload mid-run and a settled outcome kept separate
- * from activity — and none of its transport: nothing here reads or writes Herdr,
- * requires a pane, or restricts itself to TUI mode.
+ * It reports run activity, blocking, reload mid-run and a settled outcome kept
+ * separate from activity. Nothing here reads or writes Herdr, requires a pane,
+ * or restricts itself to TUI mode.
  *
  * Pi session association is deliberately absent from immutable registration: a
  * process can switch, resume or fork sessions without becoming another subject,
@@ -210,19 +210,25 @@ export function createRadarExecutionAdapter(
 	let stopped = false;
 	let rootSession = false;
 	let active = false;
-	/** Innermost dialog label last; a nested dialog restores the one beneath it. */
-	const blockers: string[] = [];
 	/** One questionnaire at a time per process, so a flag is its whole state. */
 	let questionnaire: string | undefined;
+	/** Permission asks Pi has shown and not yet decided, by their request ids. */
+	const permissionPrompts = new Set<string>();
 	let lastOutcome: RadarSnapshot["last_outcome"];
 	let lastPublished: string | undefined;
 
+	function blocked(): boolean {
+		return (
+			questionnaire !== undefined ||
+			permissionPrompts.size > 0
+		);
+	}
+
 	function currentSnapshot(): RadarSnapshot {
-		const dialog = [...blockers].reverse().find((value) => value !== "");
-		const reason = questionnaire ?? dialog;
-		const blocked = questionnaire !== undefined || blockers.length > 0;
+		const reason =
+			questionnaire ?? (permissionPrompts.size > 0 ? "permission" : undefined);
 		return {
-			activity: blocked ? "blocked" : active ? "working" : "idle",
+			activity: blocked() ? "blocked" : active ? "working" : "idle",
 			...(reason !== undefined ? { waiting_reason: reason } : {}),
 			...(lastOutcome !== undefined ? { last_outcome: lastOutcome } : {}),
 		};
@@ -256,13 +262,22 @@ export function createRadarExecutionAdapter(
 		}
 	}
 
+	// Pi's permission bridge: one prompt is open from its ui_prompt until the
+	// decision carrying the same request id. Decisions for prompts this process
+	// never showed match nothing and change nothing.
 	keep(
-		pi.events?.on("herdr:blocked", (event) => {
-			if (!rootSession || typeof event !== "object" || event === null) return;
-			const value = event as { active?: unknown };
-			if (typeof value.active !== "boolean") return;
-			if (value.active) blockers.push(dialogLabel(event));
-			else blockers.pop();
+		pi.events?.on("permissions:ui_prompt", (event) => {
+			const requestId = (event as { requestId?: unknown } | null)?.requestId;
+			if (!rootSession || typeof requestId !== "string") return;
+			permissionPrompts.add(requestId);
+			emit();
+		}),
+	);
+	keep(
+		pi.events?.on("permissions:decision", (event) => {
+			const requestId = (event as { requestId?: unknown } | null)?.requestId;
+			if (typeof requestId !== "string" || !permissionPrompts.delete(requestId))
+				return;
 			emit();
 		}),
 	);
@@ -343,8 +358,8 @@ export function createRadarExecutionAdapter(
 		if (stopped) return;
 		rootSession = false;
 		active = false;
-		blockers.length = 0;
 		questionnaire = undefined;
+		permissionPrompts.clear();
 		lastOutcome = undefined;
 		lastPublished = undefined;
 		// Facts already published stay; only the heartbeat and the retry driver stop.
@@ -363,6 +378,7 @@ export function createRadarExecutionAdapter(
 		publication,
 		binding: () =>
 			managed !== undefined ? publication.binding(managed.key) : undefined,
+		blocked,
 		stop,
 	};
 }

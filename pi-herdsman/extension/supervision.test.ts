@@ -38,7 +38,6 @@ import {
   supervisionRuntime,
   invalidateLeadCoordinationState,
   listChiefMessagePaths,
-  normalizeHerdrLifecycleState,
   projectSupervision,
   quarantineChiefMessage,
   readChiefMessage,
@@ -775,7 +774,7 @@ test("live lead actions advertise transcript for persisted session candidates", 
   }
 });
 
-test("supervision presentation preserves provenance and naming fallbacks", () => {
+test("supervision presentation names leads by workspace id and tab fallbacks", () => {
   const namedSession = "11111111-1111-4111-8111-111111111111";
   const unnamedSessionA = "22222222-2222-4222-8222-222222222222";
   const unnamedSessionB = "33333333-3333-4333-8333-333333333333";
@@ -802,22 +801,11 @@ test("supervision presentation preserves provenance and naming fallbacks", () =>
       state(unnamedSessionA),
       state(unnamedSessionB),
     ],
-    workspaceProvenance: new Map([
-      [
-        "workspace",
-        {
-          repoName: "pi-herdsman",
-          branch: "feat/supervision",
-          workspaceLabel: "wrong-workspace-label",
-        },
-      ],
-    ]),
   });
   assert.equal(
     snapshot.leads.find((lead) => lead.lead === namedSession)!.displayName,
-    "pi-herdsman/feat/supervision/tab label",
+    "workspace/tab label",
   );
-  assert.equal(snapshot.leads[0]!.branch, "feat/supervision");
   assert.equal(
     snapshot.leads.some((lead) =>
       lead.displayName.includes("mac-system-theme"),
@@ -832,46 +820,8 @@ test("supervision presentation preserves provenance and naming fallbacks", () =>
     snapshot.leads
       .filter((lead) => lead.lead !== namedSession)
       .map((lead) => lead.displayName),
-    [
-      "pi-herdsman/feat/supervision/lead-22222222",
-      "pi-herdsman/feat/supervision/lead-33333333",
-    ],
+    ["workspace/lead-22222222", "workspace/lead-33333333"],
   );
-  {
-    const makeAgent = (sessionId: string, workspaceId: string) => ({
-      sessionId,
-      sessionKind: "id" as const,
-      workspaceId,
-      paneId: `${workspaceId}-pane`,
-      tabId: `${workspaceId}-tab`,
-    });
-    const sessions = [
-      "44444444-4444-4444-8444-444444444444",
-      "55555555-5555-4555-8555-555555555555",
-      "66666666-6666-4666-8666-666666666666",
-    ];
-    const snapshot = projectSupervision({
-      agents: [
-        makeAgent(sessions[0]!, "explicit"),
-        makeAgent(sessions[1]!, "cwd"),
-        makeAgent(sessions[2]!, "id"),
-      ],
-      managedAgents: [],
-      coordinationStates: sessions.map((sessionId) => state(sessionId)),
-      workspaceProvenance: new Map([
-        ["explicit", { workspaceLabel: "my-workspace" }],
-        ["cwd", { workspaceCwd: "/tmp/project" }],
-      ]),
-    });
-    assert.deepEqual(
-      new Set(snapshot.leads.map((lead) => lead.displayName)),
-      new Set([
-        "my-workspace/lead-44444444",
-        "project/lead-55555555",
-        "id/lead-66666666",
-      ]),
-    );
-  }
 });
 
 test("supervision fails closed on invalid live identities and coordination records", () => {
@@ -1446,16 +1396,6 @@ test("coordination envelopes identify senders without claiming recipient roles",
       ({ content }) => Buffer.byteLength(content, "utf8") <= 8 * 1024,
     ),
   );
-});
-
-test("lifecycle normalization uses current Herdr fields and fails closed", () => {
-  for (const [fields, expected] of [
-    [{ agent_status: "working", status: "idle" }, "working"],
-    [{ status: "blocked" }, "unknown"],
-    [{ state: "working" }, "unknown"],
-  ] as const) {
-    assert.equal(normalizeHerdrLifecycleState(fields), expected);
-  }
 });
 
 const chiefIdentity = () => ({

@@ -1,8 +1,13 @@
 import {
   createRadarClient,
   radarLifecycleState,
+  RADAR_OBSERVE_CAPABILITY,
+  RADAR_SPAWN_CLOSE_CONTRACT,
+  RADAR_SPAWN_CONTRACT,
+  RADAR_SPAWN_LAUNCH_CONTEXT_CONTRACT,
   watchRadarEvents,
   isUuid,
+  type RadarAgentProcess,
   type RadarClient,
   type RadarInventory,
   type RadarLocation,
@@ -12,6 +17,8 @@ import {
   type RadarSpawnExitObservation,
 } from "./radar-client.ts";
 import {
+  radarLocalPane,
+  radarPaneHandle,
   resolveRadarProcessLocation,
   type RadarLocationResolution,
 } from "./radar-location.ts";
@@ -99,6 +106,12 @@ import {
   resultRef,
 } from "./storage.ts";
 import { Type } from "typebox";
+import {
+  handoffPath, listCompletions, persistCompletion, readCompletion,
+  readPreparationResult, saveCompletion, sessionManuallyRetired,
+  waitForPreparation, wrapupContext, writePreparationResult,
+  type Completion, type Disposition,
+} from "./completions.ts";
 import {
   Container,
   fuzzyFilter,
@@ -222,21 +235,9 @@ import {
   type AcceptedContextSnapshot,
   type ResponseDiagnostic,
 } from "./response-validation.ts";
-import {
-  herdrAgentAlias,
-  listAllHerdrAgents,
-  runHerdr,
-  sessionIdentity,
-  readPiSessionHeaderId,
-  matchesExpectedSession,
-  resolveChildCommand,
-  CHILD_COMMAND_ENV,
-  sameCwd,
-  inspectHerdrAgent,
-  STARTUP_TIMEOUT_MAX,
-  type ExpectedSession,
-  type HerdrStartPlacement,
-} from "./herdr.ts";
+import { CHILD_COMMAND_ENV, resolveChildCommand } from "./child-command.ts";
+import { sameCwd } from "./cwd.ts";
+import { inspectRadarChild, provedRead } from "./radar-inspection.ts";
 import {
   acquireProcessLock,
   claimProcessLock,
@@ -262,7 +263,6 @@ import {
   type ChiefMessageKind,
   type ChiefMessageRecord,
   type PeerLeadRecord,
-  type WorkspaceProvenance,
   projectSupervision,
   readLeadCoordinationState,
   invalidateLeadCoordinationState,
@@ -270,7 +270,6 @@ import {
   writeLeadCoordinationState,
   chiefLeaseIsHeld,
   sameChiefDescriptor,
-  normalizeHerdrLifecycleState,
   peerLeadLockPath,
   peerRuntime,
   readPeerLeadRecord,
@@ -283,6 +282,10 @@ import {
   COORDINATION_MESSAGE_KINDS,
   entryOwnedBySession,
   sessionOwnership,
+  listLeadCoordinationStates,
+  type LeadCoordinationState,
+  type LiveAgent,
+  type RuntimeState,
 } from "./supervision.ts";
 import {
   fail,
@@ -334,6 +337,7 @@ import {
   renderHerdRunEntry,
 } from "./presentation.ts";
 import type { SupervisionContextStatus } from "./presentation.ts";
+import { createStatusEntries } from "./status-entry.ts";
 
 const HERDSMAN_VERSION = packageMetadata.version;
 const RESERVED_PREFIXES = [
@@ -497,7 +501,6 @@ scope.`;
 const SUPERVISION_CONTEXT_TYPE = "pi-herdsman-supervision-context";
 const STALE_AFTER_MS = 10 * 60_000;
 const STALE_SCAN_MS = 30_000;
-const STALE_DIAGNOSTIC_TIMEOUT_MS = 2_000;
 const STALE_DIAGNOSTIC_LINES = 20;
 const ATTENTION_REPEAT_MIN_MS = 60_000;
 const ATTENTION_FIRST_REPEAT_MS = STALE_AFTER_MS / 2;
@@ -550,7 +553,7 @@ const COMPACTION_CONTINUATION_SKIPPED_ENTRY =
 // extension-owned summary.
 const PI_VCC_COMPACT_INSTRUCTION = "__pi_vcc__";
 const AGENT_TOOL_SURFACE_GUIDANCE =
-  "agent_list only reads Agent state and the definition roster. The other agent_* tools act on Agents: agent_delegate, agent_continue, agent_steer, agent_interrupt, agent_reply, agent_close, agent_inspect, agent_transcript and agent_extend. The guidance below covers how to use them.";
+  "agent_list only reads Agent state and the definition roster. The other agent_* tools act on Agents: agent_delegate, agent_continue, agent_steer, agent_interrupt, agent_reply, agent_complete, agent_close, agent_inspect, agent_transcript and agent_extend. The guidance below covers how to use them.";
 const AGENT_DELEGATION_GUIDANCE =
   "Use agent_delegate for genuinely independent or context-heavy work; keep small, tightly coupled work local. " +
   "When a retained worker already holds the relevant context, continue it instead of starting a fresh agent.";
@@ -629,7 +632,7 @@ must itself be validly waiting on an owner answer; ordinary active or
 pending-result agent work still blocks escalation.`;
 const CHIEF_ROLE_CHARTER = `## Chief role
 You are the active chief. You are workspace-neutral and supervise
-the unclaimed top-level Leads across this Herdr runtime. Use
+the unclaimed top-level Leads across this runtime. Use
 staff_list, staff_inspect, staff_transcript, and staff_message to coordinate
 with supervised leads. Chief supervises independent leads and does not
 receive owner controls. Do not perform local implementation work yourself or assume
@@ -783,6 +786,7 @@ type Params =
       message: string;
       files?: string[];
     }
+  | { action: "complete"; completion_id: string; disposition?: Disposition }
   | { action: "close"; agent: string }
   | { action: "inspect"; agent: string }
   | { action: "transcript"; agent: string }
@@ -802,11 +806,9 @@ type PeerParams =
   | { action: "message"; session: string; message: string; files?: string[] };
 type Runtime = {
   label: string;
-  herdrAgent: string;
   /**
    * The exact Radar subject this process's own launch bound to the child, set
-   * by the launch that spawned it. It is the child's primary identity; the
-   * Herdr alias stays the name a retained Herdr read would look for.
+   * by the launch that spawned it. It is the child's primary identity.
    */
   radarAgentId?: string;
   /** The launch generation the bound child acknowledged for this runtime. */
@@ -818,7 +820,20 @@ type Runtime = {
    */
   radarBoundProcess?: { source: string; incarnation: string };
   workspaceId: string;
+  /** The child's own raw local pane, which is also its mailbox pane. */
   paneId: string;
+  /**
+   * The qualified `tmux:<server>:%N` handle the validated Radar spawn record
+   * names for the pane this launch bound. The raw local pane and this handle are
+   * the same pane in two namespaces, so each comparison uses the namespace its
+   * other side speaks: `paneId` against the mailbox and the child's own
+   * acknowledgment, this handle against the daemon's canonical registration
+   * location and every daemon call. A runtime whose bound record is missing or
+   * names no pane keeps this undefined, and a canonical comparison then refuses
+   * instead of falling back to the raw pane, which would erase the server the
+   * launch bound.
+   */
+  radarSpawnPane?: string;
   cwd: string;
   runId: string;
   ownerSessionId: string;
@@ -1009,6 +1024,7 @@ const askWatchRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const askDeliveryInFlight = new Set<string>();
 const askDeliveryRetries = new Map<string, ReturnType<typeof setTimeout>>();
 let radarPublication: RadarPublication | undefined;
+let radarExecution: ReturnType<typeof createRadarExecutionAdapter> | undefined;
 let radarClient: RadarClient | undefined;
 /**
  * This process's own location, resolved on demand.
@@ -1032,13 +1048,8 @@ let radarLocationAttempt:
  */
 function radarLocationKey(): string {
   return [
-    process.env.HERDR_PANE_ID,
     process.env.TMUX_PANE,
     process.env.TMUX,
-    process.env.HERDR_WORKSPACE_ID,
-    process.env.HERDR_TAB_ID,
-    process.env.HERDR_ENV,
-    process.env.HERDR_SOCKET_PATH,
     process.env.PI_HERDSMAN_PARENT_PANE_ID,
     process.env.RADAR_CONTROL_SOCKET,
   ].join("\0");
@@ -1100,7 +1111,7 @@ async function initializeRadarPublication(pi: ExtensionAPI): Promise<void> {
   // known - because a subject that published no pane can never acquire one, and
   // because that is what keeps the negotiated server and this process's own pane
   // the same facts the launch later places a worker beside.
-  radarPublication = createRadarExecutionAdapter(
+  radarExecution = createRadarExecutionAdapter(
     pi as unknown as RadarExecutionEventApi,
     {
       client,
@@ -1123,7 +1134,8 @@ async function initializeRadarPublication(pi: ExtensionAPI): Promise<void> {
           }
         : {}),
     },
-  ).publication;
+  );
+  radarPublication = radarExecution.publication;
 }
 
 /**
@@ -1570,7 +1582,8 @@ function managedAgentEnvironmentError(): string | undefined {
     !BRIEF_PROFILES.includes(e.PI_HERDSMAN_BRIEF_PROFILE as BriefProfile)
   )
     return "PI_HERDSMAN_BRIEF_PROFILE invalid";
-  if (!e.HERDR_PANE_ID?.trim()) return "HERDR_PANE_ID missing";
+  const ownPane = radarLocalPane(e);
+  if (ownPane === undefined) return "TMUX_PANE missing or not a tmux pane";
   // A launched child inherits the environment of the pane it was created in, and
   // the launch cannot remove what that pane already carries. Coordinates that
   // name the pane this launch was created beside are the parent's, not this
@@ -1578,9 +1591,10 @@ function managedAgentEnvironmentError(): string | undefined {
   // pane it is not in.
   if (
     e.PI_HERDSMAN_LAUNCH_GENERATION?.trim() &&
-    e.HERDR_PANE_ID === e.PI_HERDSMAN_PARENT_PANE_ID?.trim()
+    e.PI_HERDSMAN_PARENT_PANE_ID?.trim() &&
+    radarPaneHandle(e.PI_HERDSMAN_PARENT_PANE_ID.trim()) === ownPane
   )
-    return "HERDR_PANE_ID names the pane this launch was created beside";
+    return "TMUX_PANE names the pane this launch was created beside";
   try {
     parseAllowedAgentDefinitions(e.PI_HERDSMAN_ALLOWED_AGENT_DEFINITIONS);
   } catch (error) {
@@ -1591,12 +1605,14 @@ function managedAgentEnvironmentError(): string | undefined {
 function isManagedAgentEnvironment(): boolean {
   return managedAgentEnvironmentError() === undefined;
 }
+// A lead is a session running in a tmux pane. Whether that pane belongs to the
+// daemon's server is proven later, by the Radar location and the preflight.
 const role = (): Role =>
   isManagedAgentEnvironment()
     ? "managed-agent"
     : process.env.PI_HERDSMAN_MAILBOX !== undefined
       ? "unmanaged"
-      : process.env.HERDR_ENV === "1"
+      : radarLocalPane(process.env) !== undefined
         ? "lead"
         : "unmanaged";
 const json = (v: unknown) => JSON.stringify(v, null, 2);
@@ -1750,9 +1766,88 @@ async function placementSettings(
  * reaches here. The pane is therefore this process's own validated one, never a
  * mux lookup for a name, a label or a neighbouring pane.
  */
+async function radarLeadWorkspace(): Promise<string | undefined> {
+  const resolution = await ensureRadarLocalLocation();
+  return resolution.state === "resolved"
+    ? resolution.location.workspace
+    : undefined;
+}
+
+/**
+ * This lead's own proven location and Radar subject, or nothing. A lead is
+ * identified to peers and the Chief by its `agent_id`, so a process whose
+ * registration has none, or names a different pane, has no identity to publish.
+ */
+async function radarLeadIdentity(): Promise<
+  | {
+      agentId: string;
+      location: RadarLocation & { tab: string; workspace: string; pane: string };
+    }
+  | undefined
+> {
+  const resolution = await ensureRadarLocalLocation();
+  if (resolution.state !== "resolved") return undefined;
+  const { location } = resolution;
+  if (!location.tab || !location.workspace || !location.pane) return undefined;
+  const subject = await radarPublication?.subject();
+  if (subject === undefined || subject.location?.pane !== location.pane)
+    return undefined;
+  return {
+    agentId: subject.agent_id,
+    location: { ...location, tab: location.tab, workspace: location.workspace, pane: location.pane },
+  };
+}
+
+/**
+ * The lead coordination records whose own Radar registration still proves them:
+ * the recorded `agent_id` runs on the recorded pane and publishes the record's
+ * session. Absent, mismatched and unavailable reads are not proof, so the lead
+ * is left out. Observed agent rows are never an input: `mux.observe` does not
+ * present registered agents under tmux.
+ */
+async function provedLeads(): Promise<
+  Array<{ state: LeadCoordinationState; agent: LiveAgent }>
+> {
+  const client = radarClient;
+  if (client === undefined) return [];
+  const proved: Array<{ state: LeadCoordinationState; agent: LiveAgent }> = [];
+  for (const state of listLeadCoordinationStates(supervisionRuntime())) {
+    const { agentId, workspaceId, tabId, paneId } = state;
+    if (!agentId || !workspaceId || !tabId || !paneId) continue;
+    const read = await provedRead(client, {
+      agentId,
+      paneId,
+      session: state.piSessionId,
+    });
+    if (read === undefined) continue;
+    proved.push({
+      state,
+      agent: {
+        sessionId: state.piSessionId,
+        sessionKind: "id",
+        workspaceId,
+        tabId,
+        paneId,
+        runtimeState: leadRuntimeState(read.activity),
+      },
+    });
+  }
+  return proved;
+}
+
+/** A lead's published activity when it is fresh; anything else is unknown. */
+function leadRuntimeState(activity: string | undefined): RuntimeState {
+  return activity === "idle" ||
+    activity === "working" ||
+    activity === "blocked" ||
+    activity === "done"
+    ? activity
+    : "unknown";
+}
+
 async function physicalPlacement(
   scope: ControllerScope | undefined,
-): Promise<Extract<HerdrStartPlacement, { kind: "split" }>> {
+): Promise<{ paneId: string }> {
   const resolution = await ensureRadarLocalLocation();
   if (resolution.state !== "resolved")
     fail(
@@ -1764,7 +1859,7 @@ async function physicalPlacement(
           : "Split placement requires this process's own registered pane",
       "delegate",
     );
-  return { kind: "split", paneId: resolution.location.pane };
+  return { paneId: resolution.location.pane };
 }
 
 async function messageLimits(
@@ -2319,6 +2414,15 @@ function ownedAssignmentChildren(
       children.set(`${child.id}\0${child.path}`, child);
     }
   }
+  for (const completion of listCompletions(ownerSessionId)) {
+    if (!completion.piSessionId || !completion.piSessionFile) continue;
+    const child: OwnedAssignmentSession = {
+      id: completion.piSessionId, path: completion.piSessionFile,
+      definition: completion.definition, label: completion.agentLabel,
+    };
+    const path = discoveredSessionPath(child.path);
+    children.set(`${child.id}\0${path}`, { ...child, path });
+  }
   return [...children.values()];
 }
 
@@ -2484,7 +2588,9 @@ export function resolveAssignmentSession(
           `Saved assignment session has no non-empty cwd in its session header: ${path}`,
           "continue",
         );
-      if (readConfig().contextRetirement && retiredManagedSession(manager))
+      if (sessionManuallyRetired(ownerId, child.id))
+          fail("invalid_request", `Managed agent session ${child.id} was explicitly retired`, "continue");
+        if (readConfig().contextRetirement && retiredManagedSession(manager))
         fail(
           "invalid_request",
           `Managed agent session ${child.id} is retired after context pressure. ` +
@@ -2524,214 +2630,39 @@ export function resolveAssignmentSession(
   return resolved;
 }
 
-const HERDR_VERSION_PATTERN =
-  /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-preview(?:\.[0-9A-Za-z-]+)?)?$/;
-export function parseHerdrVersion(value: string): RegExpMatchArray | undefined {
-  const match = value.match(HERDR_VERSION_PATTERN);
-  return match?.[0] === value ? match : undefined;
-}
-async function herdrVersion(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-  signal?: AbortSignal,
-): Promise<void> {
-  const status = await runHerdr(pi, ctx, ["status", "--json"], {
-    signal,
-    timeout: 10_000,
-  });
-  const value = settingRecord(status);
-  const client = settingRecord(value.client);
-  const server = settingRecord(value.server);
-  const clientVersion =
-    typeof client.version === "string" ? client.version : undefined;
-  const clientMatch = clientVersion
-    ? parseHerdrVersion(clientVersion)
-    : undefined;
-  const supported = (match: RegExpMatchArray | undefined): boolean =>
-    !!match &&
-    (Number(match[1]) > 0 ||
-      Number(match[2]) > 9 ||
-      (Number(match[2]) === 9 && Number(match[3]) >= 1));
-  if (
-    !supported(clientMatch) ||
-    server.running !== true ||
-    server.compatible !== true
-  ) {
+/**
+ * Refuse a launch unless the daemon this process registered with is a tmux
+ * daemon that serves every contract a fresh worker needs. It runs before any
+ * physical effect, so an absent or wrong daemon stops the launch here.
+ */
+async function radarPreflight(): Promise<void> {
+  const ready = await radarClient?.ping();
+  if (ready === undefined)
+    fail("invalid_request", "This process has no Radar client", "preflight");
+  if (ready.ok === false)
     fail(
       "invalid_request",
-      "Herdr status is unavailable or incompatible; Herdr >=0.9.1 with a running compatible server is required",
+      `The Radar daemon is unavailable: ${ready.message}`,
       "preflight",
     );
-  }
-}
-function expectedSession(id?: string, path?: string): ExpectedSession {
-  return { id, path };
-}
-function isPiAgent(agent: any): boolean {
-  return sessionIdentity(agent?.agent_session) !== undefined;
-}
-async function workspacePresentationProvenance(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-  workspaceIds: readonly string[],
-  workspaceCwds: ReadonlyMap<string, string>,
-  signal?: AbortSignal,
-): Promise<ReadonlyMap<string, WorkspaceProvenance>> {
-  const entries = await Promise.all(
-    workspaceIds.map(async (workspaceId) => {
-      let workspace: any;
-      try {
-        workspace = (
-          await runHerdr(pi, ctx, ["workspace", "get", workspaceId], {
-            signal,
-          })
-        )?.workspace;
-      } catch {
-        return [
-          workspaceId,
-          workspaceCwds.has(workspaceId)
-            ? { workspaceCwd: workspaceCwds.get(workspaceId) }
-            : {},
-        ] as const;
-      }
-      const worktree =
-        workspace?.worktree &&
-        typeof workspace.worktree === "object" &&
-        (typeof workspace.worktree.checkout_path === "string" ||
-          typeof workspace.worktree.repo_name === "string")
-          ? workspace.worktree
-          : undefined;
-      const fallback = {
-        ...(typeof workspace?.label === "string" && workspace.label
-          ? { workspaceLabel: workspace.label }
-          : {}),
-        ...(typeof worktree?.checkout_path === "string"
-          ? { workspaceCwd: worktree.checkout_path }
-          : workspaceCwds.has(workspaceId)
-            ? { workspaceCwd: workspaceCwds.get(workspaceId) }
-            : {}),
-      } satisfies WorkspaceProvenance;
-      if (!worktree) return [workspaceId, fallback] as const;
-      let worktreeInfo: any;
-      try {
-        worktreeInfo = await runHerdr(
-          pi,
-          ctx,
-          ["worktree", "list", "--workspace", workspaceId],
-          { signal },
-        );
-      } catch {
-        return [workspaceId, fallback] as const;
-      }
-      const worktrees = Array.isArray(worktreeInfo?.worktrees)
-        ? worktreeInfo.worktrees
-        : [];
-      const currentWorktree = worktree
-        ? worktrees.find(
-            (candidate: any) => candidate?.open_workspace_id === workspaceId,
-          )
-        : undefined;
-      const repoName =
-        typeof worktree?.repo_name === "string"
-          ? worktree.repo_name
-          : typeof worktreeInfo?.source?.repo_name === "string"
-            ? worktreeInfo.source.repo_name
-            : undefined;
-      const branch =
-        typeof currentWorktree?.branch === "string"
-          ? currentWorktree.branch
-          : undefined;
-      const workspaceLabel =
-        typeof workspace?.label === "string" ? workspace.label : undefined;
-      const workspaceCwd =
-        typeof worktreeInfo?.source?.source_checkout_path === "string"
-          ? worktreeInfo.source.source_checkout_path
-          : workspaceCwds.get(workspaceId);
-      return [
-        workspaceId,
-        {
-          ...(workspaceLabel ? { workspaceLabel } : {}),
-          ...(workspaceCwd ? { workspaceCwd } : {}),
-          ...(worktree && repoName ? { repoName } : {}),
-          ...(worktree && branch ? { branch } : {}),
-        },
-      ] as const;
-    }),
-  );
-  return new Map(entries);
-}
-function herdrSessionsMatch(
-  agent: any,
-  expected: ExpectedSession | undefined,
-): boolean {
-  return matchesExpectedSession(agent?.agent_session, expected);
-}
-function herdrSessionId(agent: any): string | undefined {
-  const session = sessionIdentity(agent?.agent_session);
-  if (!session) return undefined;
-  if (session.kind === "id") return session.value;
-  try {
-    return readPiSessionHeaderId(session.value);
-  } catch {
-    return undefined;
-  }
-}
-/**
- * The Pi session id a fresh Radar observation claims for a pane.
- *
- * The daemon normalizes the Herdr session record, so this mirrors
- * `herdrSessionId`: an explicit UUID identity is the id, and the
- * source-qualified form is a session file whose header carries it. Only the
- * Herdr Pi source is accepted, because the normalized form keeps no agent kind.
- */
-function observedPiSessionId(agent: RadarObservedAgent): string | undefined {
-  const session = agent.session;
-  if (!session) return undefined;
-  if (session.kind === "uuid") return session.value;
-  if (session.source !== "herdr:pi") return undefined;
-  try {
-    return readPiSessionHeaderId(session.value);
-  } catch {
-    return undefined;
-  }
-}
-/**
- * The session record a fresh Radar observation reports, in the Herdr shape the
- * existing session matcher reads: the daemon keeps a path-like reference as one
- * and never promotes it to a UUID, so this reverses that normalization.
- */
-function observedSessionAsHerdr(agent: RadarObservedAgent): unknown {
-  const session = agent.session;
-  if (session?.kind === "uuid")
-    return { source: "herdr:pi", agent: "pi", kind: "id", value: session.value };
-  if (session?.kind === "reported" && session.source === "herdr:pi")
-    return { source: "herdr:pi", agent: "pi", kind: "path", value: session.value };
-  return undefined;
-}
-/**
- * The transcript file a Radar row reports by path. A uuid identity has no file
- * here: the observation carries no cwd to locate it by.
- */
-function supervisedSessionFile(agent: RadarObservedAgent): string | undefined {
-  if (agent.session?.kind !== "reported" || agent.session.source !== "herdr:pi")
-    return undefined;
-  try {
-    return realpathSync(agent.session.value);
-  } catch {
-    return undefined;
-  }
-}
-function herdrAliasMatchesIfReported(
-  agent: any,
-  expectedAlias: string,
-): boolean {
-  const aliases = [agent?.name].filter(
-    (value): value is string => typeof value === "string" && value.length > 0,
-  );
-
-  return (
-    aliases.length === 0 || aliases.every((alias) => alias === expectedAlias)
-  );
+  if (ready.value.backend !== "tmux")
+    fail(
+      "invalid_request",
+      "The Radar daemon must serve the tmux backend (RADAR_CONTROL_BACKEND=tmux)",
+      "preflight",
+    );
+  const missing = [
+    RADAR_SPAWN_CONTRACT,
+    RADAR_SPAWN_CLOSE_CONTRACT,
+    RADAR_SPAWN_LAUNCH_CONTEXT_CONTRACT,
+    RADAR_OBSERVE_CAPABILITY,
+  ].find((name) => !ready.value.capabilities.includes(name));
+  if (missing !== undefined)
+    fail(
+      "invalid_request",
+      `The Radar daemon does not provide ${missing}`,
+      "preflight",
+    );
 }
 /**
  * Prove a Radar-launched child before it is handed an assignment.
@@ -2786,28 +2717,12 @@ function validateRadarChild(runtime: Runtime, operation: string): void {
     );
 }
 
-/**
- * The presence a child this process did not launch through Radar has, read from
- * the daemon's canonical observation. That observation is the only evidence for
- * such a child: it carries no Herdr record, so nothing else is consulted here.
- */
-async function canonicalPresence(
-  mailboxPath: string,
-  operation: string,
-): Promise<ManagedAgentPresence> {
-  const state = readAgentState(mailboxPath);
-  if (!state)
-    fail("target_not_found", "Agent mailbox state is unavailable", operation);
-  const { inventory, available } = await radarFleetInventory();
-  return managedAgentPresence(state, inventory, undefined, available);
-}
-
-/** Refuses unless the presence is a live canonical observation of the child. */
+/** Refuses unless the child's presence is proved by its Radar observation. */
 function requireLivePresence(
   presence: ManagedAgentPresence,
   operation: string,
 ): void {
-  if (presence.kind === "live") return;
+  if (presence.kind === "radar") return;
   // An identity that cannot be proved is ambiguity, not absence: the record
   // exists and something may be holding it, so the category names the doubt the
   // message states rather than a target that is known to be gone.
@@ -2833,7 +2748,7 @@ function validateManagedAgentIdentity(
       "internal_failure",
       `Agent mailbox state is malformed or oversized: ${String(error)}`,
       "controller",
-      { ids: { label: e.PI_HERDSMAN_LABEL, paneId: e.HERDR_PANE_ID } },
+      { ids: { label: e.PI_HERDSMAN_LABEL, paneId: e.TMUX_PANE } },
     );
   }
   const sessionId = ctx.sessionManager.getSessionId();
@@ -2843,7 +2758,7 @@ function validateManagedAgentIdentity(
     !mailbox ||
     state.workspaceId !== e.PI_HERDSMAN_WORKSPACE_ID ||
     state.agentLabel !== e.PI_HERDSMAN_LABEL ||
-    state.paneId !== e.HERDR_PANE_ID ||
+    state.paneId !== e.TMUX_PANE ||
     state.ownerSessionId !== e.PI_HERDSMAN_OWNER_SESSION_ID ||
     state.piSessionId !== sessionId ||
     !sameSessionPath(state.piSessionFile, sessionFile) ||
@@ -2857,7 +2772,7 @@ function validateManagedAgentIdentity(
       {
         ids: {
           label: e.PI_HERDSMAN_LABEL,
-          paneId: e.HERDR_PANE_ID,
+          paneId: e.TMUX_PANE,
         },
       },
     );
@@ -2980,19 +2895,23 @@ function validateIdentity(
       "identity",
     );
   if (agent) {
-    // A canonical row proves its location and session. The cwd is compared only
-    // when the caller states one: a launch record carries it, a row does not.
+    // The daemon's row speaks qualified handles, so its pane is held to the
+    // bound record's own handle. A runtime with no such record cannot be held to
+    // a location at all, and equal raw suffixes are not the same claim: two
+    // servers can name the same `%N`.
+    if (agent.pane_id !== undefined && runtime.radarSpawnPane === undefined)
+      fail(
+        "target_not_found",
+        `Agent ${runtime.label} has no bound Radar pane record to compare a registration location against`,
+        "identity",
+      );
+    // The cwd is compared only when the caller states one.
     const liveDifferences: [string, unknown, unknown][] = [
       ["workspaceId", agent.workspace_id, runtime.workspaceId],
-      ["paneId", agent.pane_id, runtime.paneId],
+      ["paneId", agent.pane_id, runtime.radarSpawnPane],
     ].filter(([, expected, actual]) => expected !== actual);
     if (agent.cwd !== undefined && !sameCwd(agent.cwd, runtime.cwd))
       liveDifferences.push(["cwd", agent.cwd, runtime.cwd]);
-    if (
-      agent.session !== undefined &&
-      !canonicalSessionMatches(agent.session, state)
-    )
-      liveDifferences.push(["session", agent.session, state.piSessionId]);
     if (liveDifferences.length)
       fail(
         "target_not_found",
@@ -3025,7 +2944,7 @@ function envManagedAgent(ctx: ExtensionContext): ManagedAgentState | undefined {
     ownerSessionId: e.PI_HERDSMAN_OWNER_SESSION_ID,
     workspaceId: e.PI_HERDSMAN_WORKSPACE_ID,
     agentLabel: e.PI_HERDSMAN_LABEL,
-    paneId: e.HERDR_PANE_ID,
+    paneId: e.TMUX_PANE,
     piSessionId: ctx.sessionManager.getSessionId(),
     piSessionFile: ctx.sessionManager.getSessionFile(),
     agentDefinition: e.PI_HERDSMAN_AGENT_DEFINITION,
@@ -3173,7 +3092,7 @@ async function submit(
     validateRadarChild(runtime, operation);
   else
     requireLivePresence(
-      await canonicalPresence(runtime.mailboxPath, operation),
+      managedAgentPresence(),
       operation,
     );
   const release = claimAssignmentLock(runtime.mailboxPath, operation, {
@@ -3362,7 +3281,6 @@ type ManagedAgentSnapshot = {
   presence: ManagedAgentPresence;
 };
 type ManagedAgentPresence =
-  | { kind: "live"; agent: any }
   | {
       /**
        * A child this process launched through Radar. There is no mux agent
@@ -3375,9 +3293,6 @@ type ManagedAgentPresence =
   | {
       kind: "unknown";
       diagnostic: string;
-      relatedAgents: any[];
-      /** The pane holds this record but its agent claims no alias. */
-      aliasUnclaimed?: true;
     }
   | {
       kind: "lost";
@@ -3395,7 +3310,7 @@ type ManagedAgentPresence =
  * one predicate so a Radar child is not dark to them.
  */
 function hasVerifiedPresence(presence: ManagedAgentPresence): boolean {
-  return presence.kind === "live" || presence.kind === "radar";
+  return presence.kind === "radar";
 }
 
 function durableIdentityKey(state: ManagedAgentState): string {
@@ -3481,16 +3396,14 @@ async function managedAgentSnapshots(
   signal?: AbortSignal,
   proveLead = false,
   allWorkspaces = false,
-  suppliedInventory?: PresenceInventory,
   allowTranscriptDefinitionFallback = true,
 ): Promise<{
   agents: ManagedAgentSnapshot[];
   mailboxes: ReturnType<typeof listAgentStates>;
-  liveAgents: any[];
   leadSessionIds: string[];
   entries: readonly unknown[];
 }> {
-  const currentWorkspaceId = process.env.HERDR_WORKSPACE_ID ?? ctx.cwd;
+  const currentWorkspaceId = (await radarLeadWorkspace()) ?? ctx.cwd;
   const allMailboxes = listAgentStates();
   const mailboxes = allWorkspaces
     ? allMailboxes
@@ -3498,44 +3411,30 @@ async function managedAgentSnapshots(
         ({ state }) => state.workspaceId === currentWorkspaceId,
       );
   const radarObservations = await radarChildObservations(ctx, mailboxes);
-  const { inventory, available } =
-    suppliedInventory ?? (await radarFleetInventory());
-
   const agents = mailboxes.flatMap(({ path, state }) => {
     const presence = managedAgentPresence(
-      state,
-      inventory,
       radarObservations.get(`${path}\0${state.runId}`),
-      available,
     );
-    const agent = presence.kind === "live" ? presence.agent : undefined;
     let agentDefinition: string;
     try {
       agentDefinition = agentDefinitionForRuntime(
-        agent,
+        undefined,
         state,
-        runtimes.get(state.agentLabel),
+        undefined,
         allowTranscriptDefinitionFallback,
       );
     } catch {
       agentDefinition = "unknown";
     }
-
-    const session = agent && sessionIdentity(agent.agent_session);
-    const piSessionId =
-      session?.kind === "id" ? session.value : state.piSessionId;
-    const piSessionPath =
-      session?.kind === "path" ? session.value : state.piSessionFile;
-    const lifecycleState = agent
-      ? radarLifecycleState(agent)
-      : "unknown";
+    const piSessionId = state.piSessionId;
+    const piSessionPath = state.piSessionFile;
     const completionPending = pendingResultExists(
       path,
       state.completedRequestId,
     );
     const handoffPending = unacknowledgedRequestExists(path, state);
     const questionWaitEvidence =
-      agent !== undefined || presence.kind === "radar"
+      presence.kind === "radar"
         ? readQuestionWaitEvidence(
           path,
           state.activeRequestId
@@ -3560,7 +3459,7 @@ async function managedAgentSnapshots(
           handoffPending,
           delivered,
           questionWaitEvidence:
-            agent !== undefined || presence.kind === "radar"
+            presence.kind === "radar"
               ? questionWaitEvidence
               : readQuestionWaitEvidence(
                   path,
@@ -3573,21 +3472,8 @@ async function managedAgentSnapshots(
                     : undefined,
                 ),
         });
-    const liveState = agent
-      ? questionWaitEvidence === "invalid"
-        ? "unknown"
-        : agentControlState(
-            lifecycleState,
-            state.activeRequestId,
-            completionPending,
-            handoffPending,
-            !!state.pendingAskId,
-            !!state.resultError,
-            delivered,
-            state.backgroundWaiting?.taskIds ?? [],
-            questionWaitEvidence === "waiting",
-          )
-      : presence.kind === "radar"
+    const liveState =
+      presence.kind === "radar"
         ? radarControlState(state, {
             completionPending,
             handoffPending,
@@ -3613,7 +3499,7 @@ async function managedAgentSnapshots(
             ? "unknown"
             : existingLiveProjection;
     const steerable =
-      (presence.kind === "live" || presence.kind === "radar") &&
+      presence.kind === "radar" &&
       !state.pendingAskId &&
       (projectedState === "working" ||
         projectedState === "waiting" ||
@@ -3625,10 +3511,8 @@ async function managedAgentSnapshots(
       state: projectedState,
       steerable,
       workspace_id: state.workspaceId,
-      pane_id: agent?.pane_id ?? state.paneId,
-      ...(agent?.tab_id ? { tab_id: agent.tab_id } : {}),
-      cwd: agent?.cwd ?? state.cwd,
-      ...(agent?.agent_session ? { agent_session: agent.agent_session } : {}),
+      pane_id: state.paneId,
+      cwd: state.cwd,
       pi_session_id: piSessionId,
       pi_session_path: piSessionPath,
       managed: true,
@@ -3653,13 +3537,12 @@ async function managedAgentSnapshots(
               : {}),
           }
         : {}),
-      ...(agent?.tokens ? { tokens: agent.tokens } : {}),
     };
     return [
       {
         state,
         agentDefinition,
-        lifecycleState,
+        lifecycleState: "unknown" as const,
         listed,
         presence,
         durableState,
@@ -3669,41 +3552,17 @@ async function managedAgentSnapshots(
 
   const leadSessionIds: string[] = [];
   if (proveLead) {
+    // Missing or unprovable lead evidence stays an unknown breadcrumb.
     try {
       const ownerSessionIds = new Set(
         mailboxes.map(({ state }) => state.ownerSessionId),
       );
-      for (const ownerSessionId of ownerSessionIds) {
-        // The daemon reports an agent's session as a UUID identity or as the
-        // reference its source reported; a lead is the one row whose identity is
-        // the owner's own session and whose pane is in this workspace.
-        const ownerAgents = inventory.agents.filter(
-          (agent) =>
-            agent.session?.kind === "uuid" &&
-            agent.session.value === ownerSessionId,
-        );
-        if (ownerAgents.length !== 1) continue;
-        const ownerAgent = ownerAgents[0]!;
-        if (!ownerAgent.pane_id.trim()) continue;
-        const ownerPanes = inventory.panes.filter(
-          (pane) =>
-            pane.workspace_id === currentWorkspaceId &&
-            pane.pane_id === ownerAgent.pane_id,
-        );
-        if (ownerPanes.length !== 1 || ownerAgent.session === undefined) continue;
-        // Recurring lead authority comes from Herdsman's own coordination
-        // state; missing or malformed evidence stays unknown.
-        try {
-          const state = readLeadCoordinationState(
-            supervisionRuntime(),
-            ownerSessionId,
-          );
-          if (state && (state.role ?? "lead") === "lead")
-            leadSessionIds.push(ownerSessionId);
-        } catch {
-          // Missing or invalid Lead authority stays unknown.
-        }
-      }
+      for (const { state } of await provedLeads())
+        if (
+          state.workspaceId === currentWorkspaceId &&
+          ownerSessionIds.has(state.piSessionId)
+        )
+          leadSessionIds.push(state.piSessionId);
     } catch {
       // Missing lead evidence must remain an unknown breadcrumb.
     }
@@ -3712,7 +3571,6 @@ async function managedAgentSnapshots(
   return {
     agents,
     mailboxes,
-    liveAgents: inventory.agents,
     leadSessionIds,
     entries: ctx.sessionManager.getEntries(),
   };
@@ -3723,7 +3581,7 @@ function listedStateIsWorking(
   state: string,
 ): boolean {
   return (
-    (presence.kind === "live" || presence.kind === "radar") && state === "working"
+    presence.kind === "radar" && state === "working"
   );
 }
 
@@ -4088,11 +3946,6 @@ function resolveIdleWorker(
   try {
     const runtime: Runtime = {
       label: state.agentLabel,
-      herdrAgent: herdrAgentAlias(
-        state.workspaceId,
-        state.agentLabel,
-        state.runId,
-      ),
       workspaceId: state.workspaceId,
       paneId: state.paneId,
       cwd,
@@ -4112,7 +3965,7 @@ function resolveIdleWorker(
       if (record.presence.kind !== "radar")
         return {
           kind: "unproved",
-          message: unprovablePresenceMessage(record.presence),
+          message: UNPROVABLE_PRESENCE_MESSAGE,
         };
       if (launch.stage !== "bound" || launch.agentId === undefined)
         return {
@@ -4121,6 +3974,9 @@ function resolveIdleWorker(
         };
       runtime.radarAgentId = launch.agentId;
       runtime.radarLaunchGeneration = launch.generation;
+      // The record's own qualified handle, never reconstructed from the local
+      // environment: the server in it is part of what the record proves.
+      if (launch.paneId !== undefined) runtime.radarSpawnPane = launch.paneId;
       // The daemon's own read names the process this child is. It is the address
       // an assignment to the child is written with, so a replacement occupying
       // the same mailbox cannot answer for the process this launch bound.
@@ -4140,14 +3996,10 @@ function resolveIdleWorker(
       }
       return { kind: "reuse", runtime };
     }
-    validateIdentity(runtime, state, {
-      workspace_id: state.workspaceId,
-      label: state.agentLabel,
-      pane_id: state.paneId,
-      cwd,
-      pi_session_id: state.piSessionId,
-      pi_session_path: state.piSessionFile,
-    });
+    // This runtime was built from the mailbox state above, so its mailbox
+    // comparison is what agrees here; this branch has no daemon row to hold it
+    // to a canonical location.
+    validateIdentity(runtime, state);
     return { kind: "reuse", runtime };
   } catch {
     // Malformed or conflicting evidence cannot authorize reuse.
@@ -4174,29 +4026,7 @@ function isLostWorkerOf(
   );
 }
 
-/**
- * The alias a launch names a managed child with, and the refusal for a pane
- * whose occupant does not claim it.
- */
-function unclaimedAliasDiagnostic(state: ManagedAgentState): string {
-  const alias = herdrAgentAlias(
-    state.workspaceId,
-    state.agentLabel,
-    state.runId,
-  );
-  return `Managed alias ${alias} is not reported in pane ${state.paneId}; a different or unnamed agent occupies it. Inspect the pane, resolve that process, then retry; the assignment and its saved session are preserved.`;
-}
-
-/**
- * The refusal an unprovable presence produces. An unclaimed alias already names
- * its pane and occupant, so its diagnostic is the actionable message; every
- * other ambiguity stays terse.
- */
-function unprovablePresenceMessage(presence: ManagedAgentPresence): string {
-  return presence.kind === "unknown" && presence.aliasUnclaimed === true
-    ? presence.diagnostic
-    : "Managed agent presence cannot be proved safely";
-}
+const UNPROVABLE_PRESENCE_MESSAGE = "Managed agent presence cannot be proved safely";
 /**
  * A Radar-launched child's activity, read from its assignment alone.
  *
@@ -4234,7 +4064,12 @@ function radarControlState(
 function radarChildProvenance(
   spawn: RadarSpawnEntry,
   state: ManagedAgentState | undefined,
-): { request_id: string; pane_id: string | undefined; agent_id: string | undefined } {
+): {
+  request_id: string;
+  pane_id: string | undefined;
+  agent_id: string | undefined;
+  session_id: string | undefined;
+} {
   const binding = radarChildBinding({
     runId: spawn.runId,
     ownerSessionId: spawn.ownerSessionId,
@@ -4247,10 +4082,13 @@ function radarChildProvenance(
     // that never bound has none: the child's mailbox is its own claim about where
     // it runs, and a claim cannot supply the location a launch never recorded. A
     // mailbox naming a different pane still refuses - the two witnesses then
-    // disagree, and neither is evidence.
+    // disagree, and neither is evidence. The mailbox names that pane in the
+    // child's raw namespace, so the claim is compared with the recorded handle's
+    // own raw form, while the value returned stays the qualified handle a
+    // canonical registration location is compared against.
     pane_id:
       spawn.paneId === undefined ||
-      (state !== undefined && state.paneId !== spawn.paneId)
+      (state !== undefined && state.paneId !== radarPaneHandle(spawn.paneId))
         ? undefined
         : spawn.paneId,
     // The child's own binding is the subject; a launch that recorded another one
@@ -4259,6 +4097,9 @@ function radarChildProvenance(
       recorded === undefined || binding?.agent_id === recorded
         ? binding?.agent_id
         : undefined,
+    // The session the mailbox records for this run: the child's own claim, which
+    // the daemon's published context must match before the child is live.
+    session_id: state?.piSessionId,
   };
 }
 
@@ -4327,151 +4168,25 @@ async function radarObservationFor(
 }
 
 /**
- * The presence of one mailbox's child.
+ * The presence of one mailbox's child, decided by its Radar observation alone.
  *
- * `radar` is supplied only for a child this session launched through Radar, and
- * it decides on its own: this process created no mux record for that child, and
- * asking the mux by alias or by pane would be the guess the launch replaced.
+ * A child with no Radar observation this session cannot be proved present or
+ * gone: the daemon's agent rows and panes do not carry it under the tmux
+ * backend, so absence there is not evidence. Only a proved-gone observation is
+ * lost.
  */
-/**
- * Whether one canonical agent row is this mailbox's child.
- *
- * The pane and workspace are the location the child was recorded in, the
- * session is the identity it reports for itself, and the name is what proves
- * *which* managed child is on that pane: a managed worker's own published label
- * and run when the source carries them, otherwise the run-scoped alias the
- * launch named it with.
- */
-function canonicalAgentProves(
-  row: RadarObservedAgent,
-  state: ManagedAgentState,
-  expectedAlias: string,
-): boolean {
-  if (row.workspace_id !== state.workspaceId || row.pane_id !== state.paneId)
-    return false;
-  if (!canonicalSessionMatches(row.session, state)) return false;
-  if (row.managed_label !== undefined || row.managed_run !== undefined)
-    return row.managed_label === state.agentLabel && row.managed_run === state.runId;
-  return row.name === undefined || row.name === expectedAlias;
-}
-
-/** Whether a canonical agent row could be this child under another claim. */
-function canonicalAgentRelated(
-  row: RadarObservedAgent,
-  state: ManagedAgentState,
-  expectedAlias: string,
-): boolean {
-  return (
-    (row.workspace_id === state.workspaceId && row.pane_id === state.paneId) ||
-    canonicalSessionMatches(row.session, state) ||
-    row.name === expectedAlias ||
-    (row.managed_label !== undefined && row.managed_label === state.agentLabel) ||
-    (row.managed_run !== undefined && row.managed_run === state.runId)
-  );
-}
-
-/**
- * Whether a reported session identity is the one this mailbox recorded.
- *
- * The daemon keeps a UUID identity opaque and every other reference exactly as
- * its source reported it, so a Pi session UUID matches the UUID form and a
- * session file matches the reported form - never a value promoted from one to
- * the other.
- */
-function canonicalSessionMatches(
-  session: RadarObservedSession | undefined,
-  state: ManagedAgentState,
-): boolean {
-  if (session === undefined) return false;
-  if (session.kind === "uuid") return session.value === state.piSessionId;
-  return sameSessionPath(session.value, state.piSessionFile);
-}
-
-function managedAgentPresence(
-  state: ManagedAgentState,
-  inventory: RadarInventory,
-  radar?: RadarChildObservation,
-  inventoryAvailable = true,
-): ManagedAgentPresence {
-  if (radar !== undefined)
-    return radar.kind === "live"
-      ? { kind: "radar", evidence: radar.evidence }
-      : radar.kind === "gone"
-        ? { kind: "lost", processGone: radar.verification }
-        : { kind: "unknown", diagnostic: radar.diagnostic, relatedAgents: [] };
-  // Nothing was read, so nothing is claimed: an unreadable inventory proves no
-  // absence, and treating it as one would let a close act on a child this
-  // process never saw leave.
-  if (!inventoryAvailable)
+export function managedAgentPresence(radar?: RadarChildObservation): ManagedAgentPresence {
+  if (radar === undefined)
     return {
       kind: "unknown",
-      relatedAgents: [],
       diagnostic:
-        "The daemon's fleet observation is unavailable, so this child's physical identity cannot be proved",
+        "No Radar observation of this child exists in this session, so the daemon cannot prove its presence",
     };
-  const expectedAlias = herdrAgentAlias(
-    state.workspaceId,
-    state.agentLabel,
-    state.runId,
-  );
-  const expectedPane = inventory.panes.find(
-    (pane) =>
-      pane.workspace_id === state.workspaceId && pane.pane_id === state.paneId,
-  );
-  const exact = inventory.agents.filter((row) =>
-    canonicalAgentProves(row, state, expectedAlias),
-  );
-  const relatedAgents = inventory.agents.filter((row) =>
-    canonicalAgentRelated(row, state, expectedAlias),
-  );
-  const soleExactMatch =
-    exact.length === 1 &&
-    expectedPane !== undefined &&
-    relatedAgents.every((row) => row === exact[0]);
-  if (soleExactMatch) return { kind: "live", agent: exact[0] };
-  const occupants = inventory.agents.filter(
-    (row) =>
-      row.workspace_id === state.workspaceId && row.pane_id === state.paneId,
-  );
-  // The pane exists and someone is in it, but nothing there claims this child:
-  // a different or unnamed occupant holds the pane this mailbox recorded.
-  if (
-    expectedPane !== undefined &&
-    occupants.length > 0 &&
-    exact.length === 0 &&
-    relatedAgents.length === 0
-  )
-    return {
-      kind: "unknown",
-      relatedAgents: occupants,
-      diagnostic: unclaimedAliasDiagnostic(state),
-      aliasUnclaimed: true,
-    };
-  if (!expectedPane && exact.length === 0 && relatedAgents.length === 0)
-    return { kind: "lost" };
-  // A retained pane whose occupant is gone: nothing in the observation claims
-  // this identity on that pane. Every backend presents the registered children
-  // as agent facts, so an absent row is evidence the child is not there. Inside
-  // the startup window that shape is also a child that has not registered yet,
-  // so it stays unknown; past the longest startup the owner would wait, nothing
-  // can still be starting.
-  if (
-    expectedPane &&
-    exact.length === 0 &&
-    relatedAgents.length === 0 &&
-    inventory.agents.every(
-      (row) =>
-        row.workspace_id !== state.workspaceId || row.pane_id !== state.paneId,
-    ) &&
-    Date.now() - Math.max(state.updatedAt, state.lastActivityAt ?? 0) >
-      STARTUP_TIMEOUT_MAX
-  )
-    return { kind: "lost" };
-  return {
-    kind: "unknown",
-    relatedAgents,
-    diagnostic: "Managed physical identity cannot be proved uniquely",
-  };
+  return radar.kind === "live"
+    ? { kind: "radar", evidence: radar.evidence }
+    : radar.kind === "gone"
+      ? { kind: "lost", processGone: radar.verification }
+      : { kind: "unknown", diagnostic: radar.diagnostic };
 }
 
 function visibleAgentSnapshots(
@@ -4531,9 +4246,7 @@ function listedAgentRecord(
   // too: its close needs no pane.
   if (
     direct &&
-    (presence.kind === "live" ||
-      presence.kind === "radar" ||
-      presence.kind === "lost")
+    (presence.kind === "radar" || presence.kind === "lost")
   ) {
     try {
       if (scope?.kind === "lead") {
@@ -4561,7 +4274,7 @@ function listedAgentRecord(
     if (transcriptAvailable) actions.push("transcript");
     if (closeAvailable) actions.push("close");
   } else if (
-    (presence.kind === "live" || presence.kind === "radar") &&
+    presence.kind === "radar" &&
     direct &&
     !listed.recovery_only
   ) {
@@ -4642,7 +4355,6 @@ async function agentSnapshotView(
     signal,
     proveLead,
     false,
-    undefined,
     allowTranscriptDefinitionFallback,
   );
   const view = {
@@ -4794,8 +4506,17 @@ function savedAgentSessions(
           },
     );
   }
+  for (const completion of listCompletions(ownerSessionId)) {
+    if (!completion.piSessionId || !completion.piSessionFile) continue;
+    sessions.set(completion.piSessionId, completion.disposition === "retire" ? undefined : {
+      label: completion.agentLabel, definition: completion.definition,
+      id: completion.piSessionId, path: discoveredSessionPath(completion.piSessionFile),
+      requestId: completion.requestId, status: completion.status,
+    });
+  }
   return [...sessions.values()].filter(
-    (session): session is SavedAgentSession => session !== undefined,
+    (session): session is SavedAgentSession => session !== undefined &&
+      !sessionManuallyRetired(ownerSessionId, session.id),
   );
 }
 
@@ -4822,6 +4543,8 @@ function savedAgentSessionRecords(
               samePersistedSessionPath(state.piSessionFile, session.path)),
         ),
     )
+    .reverse()
+    .slice(0, readConfig().savedSessionLimit)
     .map((session) => ({
       state: "saved",
       agent: session.label,
@@ -4859,6 +4582,13 @@ async function list(
   return {
     ok: true,
     agents,
+    completions: listCompletions(ownerSessionId)
+      .filter((completion) => !completion.providedAt || !completion.closed || !completion.disposition)
+      .map((completion) => ({
+        completion_id: completion.requestId, agent: completion.agentLabel,
+        status: completion.status, summary: completion.summary,
+        disposition: completion.disposition ?? null, available_tools: ["agent_complete"],
+      })),
     saved_sessions: savedAgentSessionRecords(
       ctx.sessionManager.getEntries(),
       ownerSessionId,
@@ -4966,200 +4696,50 @@ function resolveMessageFiles(
   );
 }
 async function deliverResultUnsafe(
-  pi: ExtensionAPI,
-  runtime: Runtime,
-  ctx: ExtensionContext,
-  result: ResultRecord,
-  signal?: AbortSignal,
+  pi: ExtensionAPI, runtime: Runtime, ctx: ExtensionContext,
+  result: ResultRecord, signal?: AbortSignal,
 ): Promise<void> {
-  if (runtimes.get(runtime.label) !== runtime) return;
-  const expectedRequestId =
-    runtime.activeRequestId ?? runtime.completedRequestId;
-  if (
-    result.runId !== runtime.runId ||
-    result.ownerSessionId !== runtime.ownerSessionId ||
-    result.workspaceId !== runtime.workspaceId ||
-    result.agentLabel !== runtime.label ||
-    result.paneId !== runtime.paneId ||
-    result.requestId !== expectedRequestId
-  )
-    return;
-  if (!controllerSessionActive) return;
+  if (runtimes.get(runtime.label) !== runtime || !controllerSessionActive) return;
+  if (result.runId !== runtime.runId || result.ownerSessionId !== runtime.ownerSessionId ||
+      result.workspaceId !== runtime.workspaceId || result.agentLabel !== runtime.label ||
+      result.paneId !== runtime.paneId ||
+      result.requestId !== (runtime.activeRequestId ?? runtime.completedRequestId)) return;
+  const completion = persistCompletion(result, {
+    cwd: runtime.cwd, definition: runtime.agentDefinition,
+    piSessionId: runtime.piSessionId, piSessionFile: runtime.piSessionFile,
+  });
   const entries = ctx.sessionManager.getEntries();
   const evidenceKey = resultDeliveryEvidenceKey(runtime, result.requestId);
-  const expectedDelivery = resultDeliveryExpectation(runtime, result.requestId);
-  if (
-    !hasDeliveredResult(entries, expectedDelivery) &&
-    !resultDeliveryEvidence.has(evidenceKey)
-  ) {
-    const elapsedMs =
-      result.status === "completed" &&
-      Number.isFinite(runtime.startedAt) &&
-      runtime.startedAt !== undefined &&
-      runtime.startedAt >= 0 &&
-      Number.isFinite(result.completedAt) &&
-      result.completedAt >= 0 &&
-      result.completedAt >= runtime.startedAt
-        ? result.completedAt - runtime.startedAt
-        : undefined;
-    const validationDiagnostics = result.responseValidation?.diagnostics;
-    const failureText = [
-      result.error?.message ?? "Agent failed",
-      ...(validationDiagnostics?.length
-        ? [
-            "Validation diagnostics:",
-            ...validationDiagnostics.map(
-              (diagnostic) =>
-                `- ${diagnostic.field}${diagnostic.path ? ` (${diagnostic.path})` : ""}: ${diagnostic.message}`,
-            ),
-          ]
-        : []),
-    ].join("\n");
-    const completion = truncateModelText(
-      result.status === "completed" ? result.text! : failureText,
-      {
-        keep: "head",
-        sessionId: runtime.piSessionId ?? runtime.runId,
-        key: result.requestId,
-        requestId: result.requestId,
-        ...(result.status === "completed"
-          ? {
-              persist: "completion" as const,
-              persistText: [
-                `Agent result source: ${JSON.stringify({
-                  agent: result.agentLabel,
-                  definition: runtime.agentDefinition,
-                  cwd: runtime.cwd,
-                  ...(runtime.piSessionId !== undefined
-                    ? { piSessionId: runtime.piSessionId }
-                    : {}),
-                  responseValidation: result.responseValidation,
-                })}`,
-                result.text!,
-              ].join("\n\n"),
-            }
-          : {}),
+  if (!hasDeliveredResult(entries, resultDeliveryExpectation(runtime, result.requestId)) &&
+      !resultDeliveryEvidence.has(evidenceKey)) {
+    const delegationStatus = delegationStatusForResult(runtime, result.requestId, entries);
+    sendWakeMessage(pi, ctx, {
+      customType: "pi-herdsman-agent-result",
+      content: [
+        `Agent completion available · agent=${result.agentLabel} · status=${result.status}`,
+        completion.summary,
+        `Call agent_complete with completion_id ${result.requestId}. Default park wraps up and closes the worker, keeping its session resumable. Use keep for immediate follow-up or retire to explicitly end resumability.`,
+        ...(delegationStatus ? [delegationStatus.content] : []),
+      ].join("\n\n"),
+      display: true,
+      details: {
+        runId: result.runId, requestId: result.requestId, completionId: result.requestId,
+        ownerSessionId: result.ownerSessionId, workspaceId: result.workspaceId,
+        agentLabel: result.agentLabel, paneId: result.paneId, cwd: runtime.cwd,
+        piSessionId: runtime.piSessionId, piSessionFile: runtime.piSessionFile,
+        agentDefinition: runtime.agentDefinition, status: result.status,
+        summary: completion.summary, contextUsage: result.contextUsage,
+        ...(delegationStatus ? {
+          delegationStatus: delegationStatus.content,
+          activeDirectChildCount: delegationStatus.activeDirectChildCount,
+          pendingDirectResultCount: delegationStatus.pendingDirectResultCount,
+          unresolvedDirectChildCount: delegationStatus.unresolvedDirectChildCount,
+        } : {}),
       },
-    );
-    const resultIndex = completion.resultRef
-      ? nextAgentResultIndex(entries, result.agentLabel)
-      : undefined;
-    const reusableResultRef =
-      resultIndex === undefined
-        ? undefined
-        : `result:${result.agentLabel}#${resultIndex}`;
-    if (completion.persistenceError) {
-      appendDurableError(
-        pi,
-        ctx,
-        "pi_herdsman_result_error",
-        completion.persistenceError,
-      );
-    }
-    const sessionRetired =
-      readConfig().contextRetirement &&
-      runtime.piSessionFile !== undefined &&
-      (() => {
-        try {
-          return retiredManagedSession(
-            SessionManager.open(runtime.piSessionFile!),
-          );
-        } catch {
-          return false;
-        }
-      })();
-    const retirementGuidance = sessionRetired
-      ? "Session retired after context pressure. Do not continue this session. " +
-        "For follow-up, delegate a fresh agent and pass this result/handoff plus the relevant files."
-      : undefined;
-    const delegationStatus = delegationStatusForResult(
-      runtime,
-      result.requestId,
-      entries,
-    );
-    // The decision to keep or close belongs where the lead is already reading
-    // the result. A retired session has no context left worth continuing.
-    const retentionNudge = sessionRetired
-      ? undefined
-      : retainWorkersEnabled()
-        ? `Worker ${result.agentLabel} is retained and idle. Continue it with agent_continue for related work, or close it with agent_close when no follow-up is expected; its Pi session stays resumable either way.`
-        : runtime.piSessionId === undefined
-          ? undefined
-          : `Worker ${result.agentLabel} was closed at delivery; its Pi session stays resumable. Continue it with agent_continue and session ${runtime.piSessionId} for related work.`;
-    const completionHeader = [
-      "Agent result",
-      `agent=${result.agentLabel}`,
-      `definition=${runtime.agentDefinition}`,
-      `session=${runtime.piSessionId ?? "?"}`,
-      `status=${result.status}`,
-    ].join(" · ");
-    sendWakeMessage(
-      pi,
-      ctx,
-      {
-        customType: "pi-herdsman-agent-result",
-        content: [
-          completionHeader,
-          ...(reusableResultRef ? [`Result ref: ${reusableResultRef}`] : []),
-          completion.content,
-          ...(retirementGuidance ? [retirementGuidance] : []),
-          ...(retentionNudge ? [retentionNudge] : []),
-          ...(delegationStatus ? [delegationStatus.content] : []),
-        ].join("\n\n"),
-        display: true,
-        details: {
-          runId: result.runId,
-          requestId: result.requestId,
-          ownerSessionId: result.ownerSessionId,
-          workspaceId: result.workspaceId,
-          agentLabel: result.agentLabel,
-          paneId: result.paneId,
-          cwd: runtime.cwd,
-          ...(runtime.piSessionId !== undefined
-            ? { piSessionId: runtime.piSessionId }
-            : {}),
-          ...(runtime.piSessionFile !== undefined
-            ? { piSessionFile: runtime.piSessionFile }
-            : {}),
-          agentDefinition: runtime.agentDefinition,
-          status: result.status,
-          sessionRetired,
-          ...(elapsedMs !== undefined ? { elapsedMs } : {}),
-          contextUsage: result.contextUsage,
-          truncated: completion.truncated,
-          ...(completion.resultRef
-            ? {
-                resultRef: completion.resultRef,
-                resultIndex,
-              }
-            : {}),
-          ...(completion.fullOutputPath
-            ? { fullOutputPath: completion.fullOutputPath }
-            : {}),
-          ...(completion.persistenceError
-            ? { resultPersistenceError: completion.persistenceError }
-            : {}),
-          ...(delegationStatus
-            ? {
-                delegationStatus: delegationStatus.content,
-                activeDirectChildCount: delegationStatus.activeDirectChildCount,
-                pendingDirectResultCount:
-                  delegationStatus.pendingDirectResultCount,
-                unresolvedDirectChildCount:
-                  delegationStatus.unresolvedDirectChildCount,
-              }
-            : {}),
-          error: result.error,
-          responseValidation: result.responseValidation,
-        },
-      },
-      { triggerTurn: true, deliverAs: "steer" },
-    );
+    }, { triggerTurn: true, deliverAs: "steer" });
     resultDeliveryEvidence.add(evidenceKey);
   }
-  if (runtimes.get(runtime.label) !== runtime || !controllerSessionActive)
-    return;
-  // The assignment resolved by delivery; its advisory windows stop here.
+  if (runtimes.get(runtime.label) !== runtime || !controllerSessionActive) return;
   dropSoftWindow(result.requestId);
   stopResultWatcher(runtime, result.requestId);
   stopAskWatcher(runtime);
@@ -5202,156 +4782,33 @@ function newerMailboxWorkExists(
   );
 }
 async function finalizeDeliveredRoot(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-  state: ManagedAgentState,
-  requestId: string,
-  signal?: AbortSignal,
-  assignmentLockHeld = false,
+  pi: ExtensionAPI, ctx: ExtensionContext, state: ManagedAgentState,
+  requestId: string, signal?: AbortSignal, assignmentLockHeld = false,
 ): Promise<void> {
   const mailbox = agentMailboxPath(state.workspaceId, state.agentLabel);
-  const release = assignmentLockHeld
-    ? undefined
-    : claimAssignmentLock(mailbox, "cleanup", {
-        label: state.agentLabel,
-        paneId: state.paneId,
-      });
+  const release = assignmentLockHeld ? undefined :
+    claimAssignmentLock(mailbox, "cleanup", { label: state.agentLabel, paneId: state.paneId });
   try {
-    let current = readAgentState(mailbox);
-    if (
-      !current ||
-      !sameManagedAgentIdentity(current, state) ||
-      current.activeRequestId ||
-      current.completedRequestId !== requestId ||
-      newerMailboxWorkExists(mailbox, current, requestId)
-    )
+    const current = readAgentState(mailbox);
+    if (!current || !sameManagedAgentIdentity(current, state) || current.activeRequestId ||
+        current.completedRequestId !== requestId || newerMailboxWorkExists(mailbox, current, requestId))
       throw new Error("Managed agent changed before result cleanup");
-    const radarObservation = await radarObservationFor(ctx, mailbox, current);
-    const { inventory, available } = await radarFleetInventory();
-    const presence = managedAgentPresence(
-      current,
-      inventory,
-      radarObservation,
-      available,
-    );
-    // A close this process dispatched and never saw answered is not refuted by a
-    // pane that has since gone: its stored request is replayed, and the mailbox
-    // checks below still have to hold before anything is cleaned up. A close the
-    // daemon already confirmed is not refuted either: it leaves only that same
-    // local cleanup, which runs under the same checks.
-    const entries = ctx.sessionManager.getEntries();
-    const pendingClose = pendingRadarClose(entries, mailbox, current.runId);
-    const confirmedClose = confirmedRadarClose(
-      entries,
-      mailbox,
-      current.runId,
-    );
-    if (
-      presence.kind === "unknown" &&
-      pendingClose === undefined &&
-      confirmedClose === undefined
-    )
-      throw new Error(
-        "Managed agent presence is unresolved during result cleanup",
-      );
-    // A worker whose own supervision proves it is retained instead of closed
-    // when retention is enabled: its process, pane, label and mailbox survive
-    // so a later assignment can reuse it. The resolved result still goes away,
-    // which is the durable fact that marks the assignment delivered.
-    const retain =
-      (presence.kind === "live" || presence.kind === "radar") &&
-      retainWorkersEnabled();
-    if (
-      (presence.kind === "radar" && !retain) ||
-      pendingClose !== undefined ||
-      confirmedClose !== undefined
-    ) {
-      // The delivered assignment's pane is closed through the launch that
-      // created it. Without retention there is nothing left to reuse, so the
-      // child goes as it always did; with a dispatched close already stored, the
-      // pane's current absence is not a reason to leave the operation open, and a
-      // confirmed one - closed, or a retained pane the daemon cleaned up after
-      // its recorded exit - leaves only the cleanup below.
-      await closeRadarChildPane(
-        pi,
-        ctx,
-        presence.kind === "radar" ? presence.evidence : undefined,
-        current,
-        signal,
-      );
-      current = readAgentState(mailbox)!;
-      if (
-        !sameManagedAgentIdentity(current, state) ||
-        current.activeRequestId ||
-        current.completedRequestId !== requestId ||
-        newerMailboxWorkExists(mailbox, current, requestId)
-      )
-        throw new Error("Managed agent changed during result cleanup");
-    }
-    if (presence.kind === "live" && !retain)
-      // A worker this session did not launch through Radar has no Radar record
-      // to close through, and this build no longer reaches the mux it was
-      // launched in. A close that did not happen destroys nothing: the mailbox,
-      // the result and the process are left for the operator to resolve.
-      throw new Error(
-        `Worker ${current.agentLabel} was not launched through Radar, so its pane and mailbox were left alone`,
-      );
-    current = readAgentState(mailbox)!;
-    if (
-      !sameManagedAgentIdentity(current, state) ||
-      current.activeRequestId ||
-      current.completedRequestId !== requestId ||
-      newerMailboxWorkExists(mailbox, current, requestId)
-    )
-      throw new Error("Managed agent changed during result cleanup");
+    const result = readResult(mailbox, requestId);
+    if (result) persistCompletion(result, {
+      cwd: current.cwd, definition: stateAgentDefinition(current),
+      piSessionId: current.piSessionId, piSessionFile: current.piSessionFile,
+    });
     removeResult(mailbox, requestId);
     if (current.legacyAcceptedRequestIds?.includes(requestId)) {
-      try {
-        const legacyAcceptedRequestIds =
-          current.legacyAcceptedRequestIds.filter((id) => id !== requestId);
-        writeAgentState(mailbox, {
-          ...current,
-          legacyAcceptedRequestIds:
-            legacyAcceptedRequestIds.length > 0
-              ? legacyAcceptedRequestIds
-              : undefined,
-          updatedAt: Date.now(),
-        });
-      } catch (error) {
-        appendDurableError(
-          pi,
-          ctx,
-          "pi_herdsman_state_error",
-          `could not clear delivered V4 assignment identity: ${String(error).slice(0, 256)}`,
-        );
-      }
+      writeAgentState(mailbox, { ...current,
+        legacyAcceptedRequestIds: current.legacyAcceptedRequestIds.filter((id) => id !== requestId),
+        updatedAt: Date.now(),
+      });
     }
-    if (retain) {
-      const runtime = runtimes.get(state.agentLabel);
-      if (
-        runtime &&
-        sameManagedAgentIdentity(runtimeIdentityState(runtime), state)
-      )
-        clearRuntimeAssignment(runtime, requestId);
-      return;
-    }
-    const after = readAgentState(mailbox);
-    if (
-      after &&
-      sameManagedAgentIdentity(after, state) &&
-      !after.activeRequestId &&
-      after.completedRequestId === requestId &&
-      !newerMailboxWorkExists(mailbox, after, requestId)
-    ) {
-      // This process owned the assignment channel, so it retires it as the
-      // child's record goes away.
-      retireRadarSubject(state);
-      removeAgentMailbox(mailbox);
-    }
-    invalidateCachedRuntime(state.agentLabel);
-  } finally {
-    release?.();
-  }
+    const runtime = runtimes.get(state.agentLabel);
+    if (runtime && sameManagedAgentIdentity(runtimeIdentityState(runtime), state))
+      clearRuntimeAssignment(runtime, requestId);
+  } finally { release?.(); }
 }
 async function cleanupAfterDeliveredResult(
   pi: ExtensionAPI,
@@ -6001,7 +5458,7 @@ async function resolveRuntime(
   if (matches.length === 0)
     fail(
       "target_not_found",
-      "No exact Herdr agent identity matched",
+      "No exact managed agent identity matched",
       operation,
     );
   if (matches.length > 1)
@@ -6046,7 +5503,6 @@ async function resolveRuntime(
   const agentDefinition = agentDefinitionForRuntime(agent, state, cached);
   const runtime: Runtime = cached ?? {
     label: agent.label,
-    herdrAgent: herdrAgentAlias(agent.workspace_id, agent.label, state.runId),
     workspaceId: agent.workspace_id,
     paneId: agent.pane_id,
     cwd: agent.cwd,
@@ -6060,7 +5516,6 @@ async function resolveRuntime(
     agentDefinition,
   };
   Object.assign(runtime, {
-    herdrAgent: herdrAgentAlias(agent.workspace_id, agent.label, state.runId),
     workspaceId: agent.workspace_id,
     paneId: agent.pane_id,
     cwd: agent.cwd,
@@ -6082,6 +5537,7 @@ async function resolveRuntime(
   if (launch?.agentId !== undefined) {
     runtime.radarAgentId = launch.agentId;
     runtime.radarLaunchGeneration = launch.generation;
+    if (launch.paneId !== undefined) runtime.radarSpawnPane = launch.paneId;
   }
   // A current read of the child is also the daemon's own statement of which
   // process it is, which is what an assignment to it is addressed with.
@@ -6092,11 +5548,7 @@ async function resolveRuntime(
       incarnation: presence.evidence.incarnation,
     };
   runtimes.set(runtime.label, runtime);
-  validateIdentity(
-    runtime,
-    state,
-    presence.kind === "live" ? presence.agent : undefined,
-  );
+  validateIdentity(runtime, state);
   if (runtime.radarAgentId !== undefined)
     validateRadarChild(runtime, operation);
   else requireLivePresence(presence, operation);
@@ -6128,7 +5580,6 @@ function runtimeForListedAgent(
     (useCached ? cached : undefined) ??
     ({
       label: agent.label,
-      herdrAgent: herdrAgentAlias(agent.workspace_id, agent.label, state.runId),
       workspaceId: agent.workspace_id,
       paneId: agent.pane_id,
       cwd: agent.cwd,
@@ -6144,42 +5595,33 @@ function runtimeForListedAgent(
   runtime.agentDefinition = agentDefinition;
   return runtime;
 }
-async function captureManagedInspection(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-  runtime: Runtime,
-  signal?: AbortSignal,
-) {
-  return inspectHerdrAgent(
-    pi,
-    ctx,
-    {
-      workspaceId: runtime.workspaceId,
-      paneId: runtime.paneId,
-      piSessionId: runtime.piSessionId!,
-      piSessionFile: runtime.piSessionFile,
-    },
-    signal,
-    (agent) => {
-      const current = readAgentState(runtime.mailboxPath);
-      if (!current || current.agentLabel !== runtime.label) return false;
-      // A Radar-launched child has no Herdr record of its own, so the pane is
-      // read, and the child occupying it is proved against the launch that bound
-      // it rather than by a name Herdr never gave it.
-      if (runtime.radarAgentId !== undefined) {
-        try {
-          validateRadarChild(runtime, "inspect");
-          return true;
-        } catch {
-          return false;
-        }
-      }
-      return (
-        runtimeIdentityMatches(runtime, current, agent) &&
-        herdrAliasMatchesIfReported(agent, runtime.herdrAgent)
-      );
-    },
-  );
+/** A lead's inspection, proved on its own registration, pane and session. */
+async function inspectLeadRecord(lead: {
+  agentId?: string;
+  lead: string;
+  paneId: string;
+}) {
+  if (radarClient === undefined || lead.agentId === undefined)
+    throw new Error("Lead identity cannot be proved");
+  return inspectRadarChild(radarClient, {
+    agentId: lead.agentId,
+    paneId: lead.paneId,
+    session: lead.lead,
+  });
+}
+async function captureManagedInspection(runtime: Runtime) {
+  const client = radarClient;
+  if (
+    client === undefined ||
+    runtime.radarAgentId === undefined ||
+    runtime.radarSpawnPane === undefined
+  )
+    throw new Error("Inspection target is not a Radar-launched child");
+  validateRadarChild(runtime, "inspect");
+  return inspectRadarChild(client, {
+    agentId: runtime.radarAgentId,
+    paneId: runtime.radarSpawnPane,
+  });
 }
 function normalizeCloseFailure(
   error: unknown,
@@ -6371,7 +5813,7 @@ async function closeRadarChildPane(
   // it looks for the pane again. Nothing here derives an id, a pane or a child
   // from the absence of one.
   if (evidence !== undefined)
-    assertRadarChildCloseable(ctx, mailbox, state, evidence);
+    requireRadarLaunchRecord(ctx, mailbox, state);
   let close: RadarCloseEntry;
   if (previous !== undefined) close = { ...previous, stage: "dispatched" };
   else if (evidence !== undefined)
@@ -6491,6 +5933,15 @@ async function closeManagedAgent(
         "Managed agent has a durable result; close result delivery first",
         "close",
       );
+    // A steer or interrupt not yet accepted by the child is still queued in its
+    // mailbox. Closing now would delete that request unseen, so refuse until the
+    // child takes it at its next boundary.
+    if (unacknowledgedRequestExists(mailbox, current))
+      fail(
+        "agent_busy",
+        `Agent ${state.agentLabel} has a queued request the child has not accepted yet; close after it is delivered`,
+        "close",
+      );
     // A Radar child is closed through the launch that created it, and a daemon
     // that cannot currently evidence it is unresolved rather than a mux child:
     // this process never wrote a mux record for it, so the mux has nothing to
@@ -6527,18 +5978,17 @@ async function closeManagedAgent(
   }
 }
 /**
- * The launch proof a managed close acts on, from durable facts: the record this
- * process wrote before it dialed the daemon, the binding the child wrote for
- * itself, and the acknowledgment it wrote for that generation. No cached runtime
- * is required, because a close after a reload has none.
+ * A managed close needs only this mailbox's own launch record, the edge that
+ * names the child. Whether that edge still names a live child, and in which
+ * pane, is the daemon's to decide: `child.close` refuses an edge that is not
+ * bound to the child or whose pane it cannot prove, so no identity or pane is
+ * compared here.
  */
-function assertRadarChildCloseable(
+function requireRadarLaunchRecord(
   ctx: ExtensionContext,
   mailbox: string,
   state: ManagedAgentState,
-  evidence: RadarChildEvidence,
 ): void {
-  const ids = { label: state.agentLabel, paneId: state.paneId };
   const spawn = radarSpawnFromEntries(ctx.sessionManager.getEntries()).get(
     `${mailbox}\0${state.runId}`,
   );
@@ -6547,41 +5997,9 @@ function assertRadarChildCloseable(
       "target_not_found",
       `Agent ${state.agentLabel} was not launched through Radar`,
       "close",
-      { ids },
-    );
-  if (spawn.agentId !== undefined && spawn.agentId !== evidence.agent_id)
-    fail(
-      "target_ambiguous",
-      `Agent ${state.agentLabel}'s launch no longer names the child the daemon has bound`,
-      "close",
-      { ids },
-    );
-  const binding = radarChildBinding({
-    runId: state.runId,
-    ownerSessionId: state.ownerSessionId,
-    agentLabel: state.agentLabel,
-  });
-  if (binding?.agent_id !== evidence.agent_id)
-    fail(
-      "target_ambiguous",
-      `Agent ${state.agentLabel} does not itself name the child the daemon has bound`,
-      "close",
-      { ids },
-    );
-  const ack = state.startupAck;
-  if (
-    ack === undefined ||
-    ack.generation !== spawn.generation ||
-    (spawn.paneId !== undefined && ack.paneId !== spawn.paneId)
-  )
-    fail(
-      "target_not_found",
-      `Agent ${state.agentLabel} has not acknowledged this launch's startup`,
-      "close",
-      { ids },
+      { ids: { label: state.agentLabel, paneId: state.paneId } },
     );
 }
-
 /**
  * The explicit close of a Radar-launched child: the same authorization, lock,
  * identity and durable-result guards a retained mux child gets, then the one
@@ -6675,6 +6093,24 @@ async function closeRadarChild(
         "Managed agent produced a durable result during close",
         "close",
       );
+    if (current.piSessionId && current.piSessionFile) {
+      const requestId = current.activeRequestId ?? current.completedRequestId;
+      if (requestId) {
+        const completion = readCompletion(current.ownerSessionId, requestId) ?? persistCompletion({
+          version: 5, runId: current.runId, requestId,
+          ownerSessionId: current.ownerSessionId, workspaceId: current.workspaceId,
+          agentLabel: current.agentLabel, paneId: current.paneId,
+          status: "failed", completedAt: Date.now(),
+          error: { code: "empty_result", message: "Worker closed before producing a completion. Its interrupted session remains resumable." },
+        }, {
+          cwd: current.cwd, definition: stateAgentDefinition(current),
+          piSessionId: current.piSessionId, piSessionFile: current.piSessionFile,
+        });
+        completion.closed = true;
+        if (current.activeRequestId) completion.wrapup = { status: "skipped", reason: "interrupted-assignment" };
+        saveCompletion(completion);
+      }
+    }
     try {
       retireRadarSubject(current);
       removeAgentMailbox(mailbox);
@@ -6723,19 +6159,7 @@ async function closeManagedSnapshot(
     snapshot.state,
   );
   if (snapshot.presence.kind === "unknown" && !reconcilable)
-    fail(
-      "target_ambiguous",
-      unprovablePresenceMessage(snapshot.presence),
-      "close",
-      snapshot.presence.aliasUnclaimed === true
-        ? {
-            ids: {
-              label: snapshot.state.agentLabel,
-              paneId: snapshot.state.paneId,
-            },
-          }
-        : {},
-    );
+    fail("target_ambiguous", UNPROVABLE_PRESENCE_MESSAGE, "close");
   // A control request resolves its target before the shared close runs, so the
   // generation it resolved must still be the one under the assignment lock.
   const target = expected ?? snapshot.state;
@@ -6760,23 +6184,10 @@ async function closeManagedSnapshot(
         "close",
       );
     const radarObservation = await radarObservationFor(ctx, mailbox, current);
-    const { inventory, available } = await radarFleetInventory();
-    const presence = managedAgentPresence(
-      current,
-      inventory,
-      radarObservation,
-      available,
-    );
+    const presence = managedAgentPresence(radarObservation);
     if (presence.kind === "unknown") {
       if (!reconcilable)
-        fail(
-          "target_ambiguous",
-          unprovablePresenceMessage(presence),
-          "close",
-          presence.aliasUnclaimed === true
-            ? { ids: { label: current.agentLabel, paneId: current.paneId } }
-            : {},
-        );
+        fail("target_ambiguous", UNPROVABLE_PRESENCE_MESSAGE, "close");
       await closeRadarChild(
         pi,
         ctx,
@@ -6798,10 +6209,6 @@ async function closeManagedSnapshot(
         stopReport,
         true,
       );
-      return;
-    }
-    if (presence.kind === "live") {
-      await closeManagedAgent(pi, ctx, current, signal, stopReport, true);
       return;
     }
     current = readAgentState(mailbox);
@@ -6966,23 +6373,6 @@ type ControlTarget =
   | { kind: "owned"; snapshot: ManagedAgentSnapshot }
   | { kind: "refused"; category: ControlCategory; message: string };
 
-function controlPaneIdentity(agent: any): {
-  label?: string;
-  runId?: string;
-  parent?: string;
-} {
-  const tokens = agent?.tokens;
-  if (!tokens || typeof tokens !== "object") return {};
-  const token = (key: string): string | undefined => {
-    const value = (tokens as Record<string, unknown>)[key];
-    return typeof value === "string" && value !== "" ? value : undefined;
-  };
-  return {
-    label: token("pi_herdsman_label"),
-    runId: token("pi_herdsman_run"),
-    parent: token("pi_herdsman_parent_session"),
-  };
-}
 
 /**
  * A supplied cross-check only corroborates: a missing or differing record
@@ -7035,8 +6425,7 @@ function restartDecidesPresence(
 ): boolean {
   if (
     request.operation !== "restart" ||
-    snapshot.presence.kind !== "unknown" ||
-    snapshot.presence.aliasUnclaimed === true
+    snapshot.presence.kind !== "unknown"
   )
     return false;
   const { state } = snapshot;
@@ -7078,12 +6467,7 @@ async function resolveControlTarget(
       return {
         kind: "refused",
         category: "target_not_found",
-        // An unclaimed alias already names the pane and the occupant, so the
-        // operator gets the same actionable line the direct tools report.
-        message:
-          snapshot.presence.aliasUnclaimed === true
-            ? snapshot.presence.diagnostic
-            : `Presence of ${request.agent} run ${request.runId} cannot be proved.`,
+        message: `Presence of ${request.agent} run ${request.runId} cannot be proved.`,
       };
     // Both operations re-check a supplied cross-check here, before the claim's
     // effect: a disagreement means the operator is looking at a different
@@ -7096,20 +6480,6 @@ async function resolveControlTarget(
       };
     return { kind: "owned", snapshot };
   }
-  const parentless = view.liveAgents.some((agent) => {
-    const identity = controlPaneIdentity(agent);
-    return (
-      identity.label === request.agent &&
-      identity.runId === request.runId &&
-      identity.parent === undefined
-    );
-  });
-  if (parentless)
-    return {
-      kind: "refused",
-      category: "unsupported_target",
-      message: `${request.agent} is not a managed worker and has no owner session.`,
-    };
   return {
     kind: "refused",
     category: "target_not_found",
@@ -7195,7 +6565,7 @@ async function radarFreshPlacement(
   ctx: ExtensionContext,
   scope: ControllerScope | undefined,
   operation: string,
-): Promise<Extract<HerdrStartPlacement, { kind: "split" }>> {
+): Promise<{ paneId: string }> {
   const configuredPlacement = (await placementSettings(ctx)).effective;
   if (scope?.kind !== "managed-agent" && configuredPlacement !== "split")
     fail(
@@ -7744,19 +7114,7 @@ function assertManagedAgentCascadeSafe(
       snapshot.presence.kind === "unknown" &&
       !closeIsReconcilable(entries, snapshot.state)
     )
-      fail(
-        "target_ambiguous",
-        unprovablePresenceMessage(snapshot.presence),
-        "close",
-        snapshot.presence.aliasUnclaimed === true
-          ? {
-              ids: {
-                label: snapshot.state.agentLabel,
-                paneId: snapshot.state.paneId,
-              },
-            }
-          : {},
-      );
+      fail("target_ambiguous", UNPROVABLE_PRESENCE_MESSAGE, "close");
 
     let current: ManagedAgentState | undefined;
     try {
@@ -8460,6 +7818,102 @@ function askRecordBytesFor(
   });
 }
 
+async function completeAgent(
+  pi: ExtensionAPI, ctx: ExtensionContext, id: string,
+  disposition: Disposition, signal?: AbortSignal,
+): Promise<Record<string, unknown>> {
+  if (!isUuid(id) || !["keep", "park", "retire"].includes(disposition))
+    fail("invalid_request", "complete requires an exact completion_id and keep, park or retire disposition", "complete");
+  const owner = ctx.sessionManager.getSessionId();
+  const completion = readCompletion(owner, id);
+  if (!completion) fail("target_not_found", "No owned completion matched", "complete");
+  const response = (extra: Record<string, unknown> = {}) => ({
+    ok: true, action: "complete", completion_id: id, agent: completion.agentLabel,
+    status: completion.status, summary: completion.summary,
+    handoff_path: handoffPath(completion), disposition: completion.disposition ?? null,
+    session: completion.piSessionId, wrapup: completion.wrapup,
+    closed: completion.closed === true, ...extra,
+  });
+  if (completion.disposition === "retire" && disposition !== "retire")
+    fail("invalid_request", "This session is retired and cannot be made resumable", "complete");
+  if (completion.closed && disposition === "keep")
+    fail("invalid_request", "This generation is closed; use agent_continue for its saved session", "complete");
+  if (completion.disposition === disposition)
+    return response({ repeated: true });
+  const represented = listAgentStates().filter(({ state }) =>
+    state.ownerSessionId === owner && (state.agentLabel === completion.agentLabel ||
+      (completion.piSessionId !== undefined && state.piSessionId === completion.piSessionId)));
+  if (represented.some(({ state }) => state.runId !== completion.runId ||
+      state.activeRequestId !== undefined || state.completedRequestId !== id))
+    fail("agent_busy", "This completion no longer names the worker's current assignment; no lifecycle action was applied", "complete");
+  const mailbox = agentMailboxPath(completion.workspaceId, completion.agentLabel);
+  const release = claimAssignmentLock(mailbox, "complete", { label: completion.agentLabel });
+  try {
+    let state = readAgentState(mailbox);
+    if (state && (state.runId !== completion.runId || state.ownerSessionId !== owner ||
+        state.activeRequestId !== undefined || state.completedRequestId !== id))
+      fail("agent_busy", "The worker accepted newer work; completion cannot act on it", "complete");
+    completion.providedAt ??= Date.now();
+    saveCompletion(completion);
+    try {
+      if (!completion.closed) {
+        if (!state) throw new Error("Worker disappearance is unresolved; no close was assumed");
+        if (hasDurableResult(mailbox, state)) {
+          await finalizeDeliveredRoot(pi, ctx, state, id, signal, true);
+        }
+        if (disposition === "keep") {
+          completion.disposition = "keep";
+          saveCompletion(completion);
+          return response();
+        }
+        if (disposition === "park" && !completion.wrapup) {
+          const queued = readUnacknowledgedRequest(mailbox, state);
+          if (queued && queued.requestId !== completion.preparationId)
+            throw new Error("Worker has a queued control request; complete after it is accepted");
+          const observation = await radarObservationFor(ctx, mailbox, state);
+          if (observation?.kind !== "live")
+            throw new Error("Worker preparation identity cannot be proved safely");
+          completion.preparationId ??= randomUUID();
+          saveCompletion(completion);
+          if (!readPreparationResult(owner, completion.preparationId) && !readRequest(mailbox, completion.preparationId)) {
+            writeRequest(mailbox, {
+              version: ADDRESSED_REQUEST_PROTOCOL_VERSION,
+              runId: state.runId, requestId: completion.preparationId,
+              ownerSessionId: owner, workspaceId: state.workspaceId,
+              agentLabel: state.agentLabel, paneId: state.paneId,
+              kind: "wrapup", text: id, createdAt: Date.now(),
+              address: {
+                subject: observation.evidence.agent_id,
+                source: observation.evidence.source, incarnation: observation.evidence.incarnation,
+                generation: radarSpawnFromEntries(ctx.sessionManager.getEntries()).get(`${mailbox}\0${state.runId}`)!.generation,
+              },
+            });
+          }
+          const outcome = await waitForPreparation(owner, completion.preparationId, signal);
+          if (["wrapup-in-progress", "recomp-in-progress"].includes(outcome.reason ?? "")) {
+            completion.preparationId = undefined;
+            saveCompletion(completion);
+            throw new Error("Another context preparation is running; worker kept live, retry completion later");
+          }
+          completion.wrapup = outcome;
+          saveCompletion(completion);
+        }
+        state = readAgentState(mailbox);
+        if (!state || state.runId !== completion.runId || state.activeRequestId || state.completedRequestId !== id)
+          throw new Error("Worker changed during preparation; no close was applied");
+        await closeManagedAgent(pi, ctx, state, signal, undefined, true);
+        completion.closed = true;
+      }
+      const previous = completion.disposition;
+      completion.disposition = disposition;
+      saveCompletion(completion);
+      return response({ ...(previous ? { notice: `Previously ${previous}; now ${disposition}` } : {}) });
+    } catch (error) {
+      return response({ action_outcome: "unresolved", action_error: errorMessage(error), requested_disposition: disposition });
+    }
+  } finally { release(); }
+}
+
 async function actionUnsafe(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -8479,6 +7933,8 @@ async function actionUnsafe(
     if (p.action === "continue" && typeof p.session !== "string")
       fail("invalid_request", "continue requires session", p.action);
   }
+  if (p.action === "complete")
+    return completeAgent(pi, ctx, p.completion_id, p.disposition ?? "park", signal);
   if (p.action === "close")
     return closeAgentByIdentity(pi, ctx, p.agent, { signal, scope });
   if (p.action === "transcript") {
@@ -8522,7 +7978,7 @@ async function actionUnsafe(
           "transcript",
         );
       if (
-        candidate.presence.kind === "live" &&
+        candidate.presence.kind === "radar" &&
         !candidate.listed.recovery_only &&
         state.piSessionId &&
         state.piSessionFile
@@ -8636,7 +8092,7 @@ async function actionUnsafe(
           requestId: randomUUID(),
           runId: randomUUID(),
           ownerSessionId: ctx.sessionManager.getSessionId(),
-          workspaceId: process.env.HERDR_WORKSPACE_ID ?? "",
+          workspaceId: (await radarLeadWorkspace()) ?? "",
         }
       : undefined;
   let assignmentInput: ReturnType<typeof prepareMessageInput> | undefined;
@@ -8645,15 +8101,15 @@ async function actionUnsafe(
   if (p.action === "delegate" || p.action === "continue") {
     if (!scope)
       fail(
-        "not_running_inside_herdr",
-        "Only a Herdr controller may start agent assignments",
+        "not_running_in_radar_pane",
+        "Only a lead running in a Radar tmux pane may start agent assignments",
         p.action,
       );
     const resumed =
       p.action === "continue"
         ? resolveAssignmentSession(ctx, p.session)
         : undefined;
-    await herdrVersion(pi, ctx, signal);
+    await radarPreflight();
     const agentDefinition = resumed ? resumed.definition : p.definition;
     const agentCwd = resumed ? resumed.cwd : ctx.cwd;
     const requestedLabel =
@@ -8773,19 +8229,12 @@ async function actionUnsafe(
         const statePanes = new Set(
           states.map(({ state }) => `${state.workspaceId}\0${state.paneId}`),
         );
-        for (const agent of snapshot.liveAgents)
+        for (const { state: lead } of await provedLeads())
           if (
-            herdrSessionsMatch(
-              agent,
-              expectedSession(resumed.id, resumed.path),
-            ) &&
-            !statePanes.has(
-              `${agent.workspace_id ?? ""}\0${agent.pane_id ?? ""}`,
-            )
+            lead.piSessionId === resumed.id &&
+            !statePanes.has(`${lead.workspaceId}\0${lead.paneId}`)
           )
-            representations.add(
-              `${agent.workspace_id ?? ""}\0${agent.name ?? ""}\0${agent.pane_id ?? ""}`,
-            );
+            representations.add(`${lead.workspaceId}\0lead\0${lead.paneId}`);
         if (representations.size > 1)
           fail(
             "target_ambiguous",
@@ -8806,18 +8255,6 @@ async function actionUnsafe(
           // pane, so the exact generation can be neither reused, relaunched,
           // nor retired. Name the occupant instead of reporting a generic busy
           // state the operator cannot act on.
-          if (
-            record &&
-            single!.state.agentLabel === resumed.label &&
-            record.presence.kind === "unknown" &&
-            record.presence.aliasUnclaimed === true
-          )
-            fail("target_ambiguous", record.presence.diagnostic, p.action, {
-              ids: {
-                label: record.state.agentLabel,
-                paneId: record.state.paneId,
-              },
-            });
           // Only the session's own label may be reused, so the assignment
           // keeps the worker identity its mailbox and session already carry.
           const processGone =
@@ -8962,8 +8399,6 @@ async function actionUnsafe(
               ),
           },
         );
-      // The label is knowable until a mailbox collision changes it; only Herdr's
-      // pane identity remains unknown until startup returns.
       assignmentInput = prepareAssignmentInput(label);
       if (idleReuseRuntime) {
         // The retained worker keeps its process, label, pane, and Pi session; the
@@ -9176,20 +8611,11 @@ async function actionUnsafe(
           radarLaunch,
         );
         const state = launch.state;
-        const expectedHerdrAgent = herdrAgentAlias(
-          workspaceId,
-          label,
-          state.runId,
-        );
         const runtime: Runtime = {
           label,
-          // This launch never adopted a Herdr agent record for the child, so the
-          // alias stays only the deterministic name an owner-side Herdr read would
-          // look for: an absent record must read as absent rather than as a name
-          // this process invented for a record it happened to find.
-          herdrAgent: expectedHerdrAgent,
           workspaceId,
-          paneId: launch.pane_id,
+          paneId: radarPaneHandle(launch.pane_id),
+          radarSpawnPane: launch.pane_id,
           cwd: agentCwd,
           runId: state.runId,
           ownerSessionId: owner,
@@ -9393,7 +8819,7 @@ async function actionUnsafe(
   const runtime = resolved.runtime;
   const presentationAgentDefinition = runtime.agentDefinition;
   if (p.action === "inspect") {
-    const snapshot = await captureManagedInspection(pi, ctx, runtime, signal);
+    const snapshot = await captureManagedInspection(runtime);
     return {
       ok: true,
       action: "inspect",
@@ -9406,7 +8832,7 @@ async function actionUnsafe(
       ...(snapshot.recentOutput
         ? { recent_output: snapshot.recentOutput }
         : {}),
-      ...(snapshot.process ? { process: snapshot.process } : {}),
+      ...(snapshot.foreground ? { foreground: snapshot.foreground } : {}),
     };
   }
   if (p.action === "extend") {
@@ -9416,7 +8842,6 @@ async function actionUnsafe(
     // rather than inferred from the window. This mirrors the digest pass, which
     // only acts on live assignments, and the advertised-controls gate.
     if (
-      resolved.presence.kind !== "live" &&
       resolved.presence.kind !== "radar"
     )
       fail(
@@ -9754,23 +9179,14 @@ export default function (pi: ExtensionAPI): void {
     entries: {
       state: ManagedAgentState;
       projection: unknown;
-      agentSession?: unknown;
     }[],
   ): void => {
     if (!radarPublication) return;
     const owner = ctx.sessionManager.getSessionId();
     // Radar needs no pane, no TUI and no Herdr: an owned assignment is published
     // wherever the owner's projection shows it.
-    for (const { state, projection, agentSession } of entries) {
+    for (const { state, projection } of entries) {
       if (state.ownerSessionId !== owner) continue;
-      if (
-        agentSession !== undefined &&
-        !matchesExpectedSession(agentSession, {
-          id: state.piSessionId,
-          path: state.piSessionFile,
-        })
-      )
-        continue;
       const binding = radarChildBinding(state);
       // The child's own sidecar names its subject, but the owned assignment must
       // still match it before this process writes that subject's channel.
@@ -9881,7 +9297,7 @@ export default function (pi: ExtensionAPI): void {
       handler: async (_args: string, ctx: ExtensionCommandContext) => {
         if (!ctx.hasUI) return;
         ctx.ui.notify(
-          `Pi Herdsman v${HERDSMAN_VERSION} is inactive because this Pi session is not running inside Herdr.\n\nStart Herdr in this project, then run Pi in a Herdr pane:\n  herdr\n  pi\n\nIf needed, install the Pi integration once:\n  herdr integration install pi`,
+          `Pi Herdsman v${HERDSMAN_VERSION} is inactive because this Pi session is not running in a tmux pane.\n\nStart the Radar daemon on a named tmux server, then run Pi in a pane of that server:\n  RADAR_CONTROL_BACKEND=tmux RADAR_TMUX_SERVER=<server> radar daemon\n  tmux -L <server> new-session pi`,
         );
       },
     };
@@ -9952,6 +9368,10 @@ export default function (pi: ExtensionAPI): void {
   );
   const emptyParameters = Type.Object({}, { additionalProperties: false });
   const agentListParameters = emptyParameters;
+  const agentCompleteParameters = Type.Object({
+    completion_id: Type.String({ pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" }),
+    disposition: Type.Optional(StringEnum(["keep", "park", "retire"])),
+  }, { additionalProperties: false });
   const agentDelegateParameters = Type.Object(
     {
       definition:
@@ -10235,6 +9655,38 @@ export default function (pi: ExtensionAPI): void {
   let clearSupervisionUI: ((removeWidget?: boolean) => void) | undefined;
   let requestSupervisionWidgetRender: (() => void) | undefined;
   let startNormalUI: ((ctx: ExtensionContext) => void) | undefined;
+  // pi-bash-processes answers this session's blocking background work on the
+  // shared bus; the channel name is its contract. No answer is unknown, not zero.
+  const SESSION_OUTSTANDING_CHANNEL = "pi-bash-processes:v1:session-outstanding";
+  const sessionBackgroundTasks = (): number | undefined => {
+    let count: number | undefined;
+    pi.events.emit(SESSION_OUTSTANDING_CHANNEL, {
+      respond: (value: number) => {
+        count = value;
+      },
+    });
+    return count;
+  };
+  let statusUi:
+    | { setStatus(key: string, text: string | undefined): unknown }
+    | undefined;
+  const statusEntries = createStatusEntries((key, text) =>
+    statusUi?.setStatus(key, text),
+  );
+  // Local facts need no fleet read. `subagents` is undefined when the owned
+  // child count is unknown, which is never shown or read as zero.
+  const publishStatusEntries = (
+    ctx: ExtensionContext,
+    subagents: number | undefined,
+  ): void => {
+    statusUi = ctx.ui;
+    statusEntries.publish({
+      blocked: radarExecution?.blocked() ?? false,
+      running: !ctx.isIdle(),
+      backgroundTasks: sessionBackgroundTasks(),
+      subagents,
+    });
+  };
   let clearNormalUI: (() => void) | undefined;
   let startSupervisionUI: ((ctx: ExtensionContext) => void) | undefined;
   let focusExistingChief:
@@ -10331,6 +9783,12 @@ export default function (pi: ExtensionAPI): void {
     });
     if (leadContext) recordOperatorSessionMetadata(pi, leadContext, role);
   };
+  // This lead's own registration, written into its coordination record once
+  // publishPeerPresence proves it. Session-scoped: a record for another session
+  // never carries it.
+  let leadRadarRecord:
+    | Pick<LeadCoordinationState, "piSessionId" | "agentId" | "workspaceId" | "tabId" | "paneId">
+    | undefined;
   const persistCoordinatorState = (): boolean => {
     try {
       pi.appendEntry("pi-herdsman-lead-state", {
@@ -10354,12 +9812,16 @@ export default function (pi: ExtensionAPI): void {
       return true;
     const wasHealthy = leadCoordinationHealthy;
     try {
+      const piSessionId = leadContext?.sessionManager.getSessionId() ?? "";
       writeLeadCoordinationState(supervisionRuntime(), {
         version: 1,
         role: "lead",
         instanceId: leadInstanceId,
-        piSessionId: leadContext?.sessionManager.getSessionId() ?? "",
+        piSessionId,
         updatedAt: Date.now(),
+        ...(leadRadarRecord?.piSessionId === piSessionId
+          ? leadRadarRecord
+          : {}),
       });
       leadCoordinationHealthy = true;
       if (!wasHealthy && leadContext) void schedulePeerPresence(leadContext);
@@ -10429,10 +9891,18 @@ export default function (pi: ExtensionAPI): void {
       leadCoordinationHealthy &&
       ctx.sessionManager.getSessionId() === sessionId;
     if (!isCurrent()) return;
-    const paneId = process.env.HERDR_PANE_ID;
-    const tabId = process.env.HERDR_TAB_ID;
-    const workspaceId = process.env.HERDR_WORKSPACE_ID;
-    if (!paneId || !tabId || !workspaceId) return;
+    const identity = await radarLeadIdentity();
+    if (!identity) return;
+    const { agentId, location } = identity;
+    const { pane: paneId, tab: tabId, workspace: workspaceId } = location;
+    leadRadarRecord = {
+      piSessionId: sessionId,
+      agentId,
+      workspaceId,
+      tabId,
+      paneId,
+    };
+    persistLeadCoordination();
     removePeerPresence();
     const name =
       pi.getSessionName()?.trim() ||
@@ -10455,6 +9925,7 @@ export default function (pi: ExtensionAPI): void {
         paneId,
         tabId,
         workspaceId,
+        agentId,
         ...(name ? { name } : {}),
         cwd: ctx.cwd,
         claim: lease.claim,
@@ -10467,49 +9938,6 @@ export default function (pi: ExtensionAPI): void {
       writePeerLeadRecord(runtime, record);
       peerPresenceLease = lease;
       peerPresenceRecord = record;
-      void (async () => {
-        let provenance: WorkspaceProvenance;
-        try {
-          provenance =
-            (
-              await workspacePresentationProvenance(
-                pi,
-                ctx,
-                [workspaceId],
-                new Map([[workspaceId, ctx.cwd]]),
-                ctx.signal,
-              )
-            ).get(workspaceId) ?? {};
-        } catch {
-          return;
-        }
-        if (!isCurrent() || peerPresenceRecord !== record) return;
-        const workspaceLabel =
-          provenance.repoName && provenance.branch
-            ? `${provenance.repoName}/${provenance.branch}`
-            : (provenance.workspaceLabel ??
-              (provenance.workspaceCwd
-                ? basename(provenance.workspaceCwd)
-                : workspaceId));
-        const enriched: PeerLeadRecord = {
-          ...record,
-          ...(provenance.repoName ? { repo: provenance.repoName } : {}),
-          ...(provenance.branch ? { branch: provenance.branch } : {}),
-          workspaceLabel,
-          updatedAt: Date.now(),
-        };
-        if (!isCurrent() || peerPresenceRecord !== record) return;
-        try {
-          const current = readPeerLeadRecord(peerRuntime(), sessionId);
-          if (!current || !samePeerLeadRecord(current, record)) return;
-          if (!isCurrent() || peerPresenceRecord !== record) return;
-          writePeerLeadRecord(peerRuntime(), enriched);
-          peerPresenceRecord = enriched;
-        } catch (error) {
-          if (isCurrent() && peerPresenceRecord === record)
-            appendDurableError(pi, ctx, "pi_herdsman_state_error", error);
-        }
-      })();
     } catch (error) {
       try {
         lease?.release();
@@ -10685,73 +10113,8 @@ export default function (pi: ExtensionAPI): void {
   };
   const currentSupervisor = async (ctx: ExtensionContext) =>
     activeRole() === "lead" ? await currentChiefAuthority(ctx) : undefined;
-  const liveAgent = async (
-    ctx: ExtensionContext,
-    sessionId: string,
-    sessionPath?: string,
-  ) => {
-    const expected = expectedSession(sessionId, sessionPath);
-    return (await listAllHerdrAgents(pi, ctx, ctx.signal)).agents.filter(
-      (agent: any) =>
-        isPiAgent(agent) &&
-        matchesExpectedSession(agent.agent_session, expected) &&
-        typeof agent.pane_id === "string" &&
-        typeof agent.tab_id === "string" &&
-        typeof agent.workspace_id === "string",
-    );
-  };
-  const remoteChiefAgent = async (
-    ctx: ExtensionContext,
-    descriptor: ChiefDescriptor,
-  ): Promise<any | undefined> => {
-    const inventory = (await listAllHerdrAgents(pi, ctx, ctx.signal)).agents;
-    const expected = expectedSession(
-      descriptor.piSessionId,
-      descriptor.piSessionFile,
-    );
-    const matches = inventory.filter(
-      (agent: any) =>
-        isPiAgent(agent) &&
-        matchesExpectedSession(agent.agent_session, expected),
-    );
-    if (
-      matches.length !== 1 ||
-      !matches[0] ||
-      typeof matches[0].pane_id !== "string" ||
-      typeof matches[0].tab_id !== "string" ||
-      typeof matches[0].workspace_id !== "string" ||
-      matches[0].pane_id !== descriptor.paneId ||
-      matches[0].tab_id !== descriptor.tabId ||
-      matches[0].workspace_id !== descriptor.workspaceId
-    )
-      return undefined;
-    const current = matches[0];
-    try {
-      const result = await runHerdr(
-        pi,
-        ctx,
-        ["agent", "get", descriptor.paneId],
-        { signal: ctx.signal },
-      );
-      const alias = result?.agent;
-      if (
-        !isPiAgent(alias) ||
-        !matchesExpectedSession(alias.agent_session, expected)
-      )
-        return undefined;
-    } catch {
-      // A failed alias lookup is not identity proof.
-      return undefined;
-    }
-    return current;
-  };
-  const liveLead = async (
-    ctx: ExtensionContext,
-    sessionId: string,
-    sessionPath?: string,
-  ) => {
-    const expected = expectedSession(sessionId, sessionPath);
-    const matches = await liveAgent(ctx, sessionId, sessionPath);
+  /** The live lead records for a session, each proved by its own registration. */
+  const liveLead = async (ctx: ExtensionContext, sessionId: string) => {
     const agentSnapshot = await managedAgentSnapshots(
       pi,
       ctx,
@@ -10759,15 +10122,23 @@ export default function (pi: ExtensionAPI): void {
       false,
       true,
     );
-    const agents = agentSnapshot.agents.some(
+    if (agentSnapshot.agents.some(({ state }) => state.piSessionId === sessionId))
+      return [];
+    return (await provedLeads()).filter(
       ({ state }) => state.piSessionId === sessionId,
     );
-    return matches.filter(
-      (agent: any) =>
-        !agents &&
-        matchesExpectedSession(agent.agent_session, expected) &&
-        !!readLeadCoordinationState(supervisionRuntime(), sessionId),
-    );
+  };
+  /** The Chief's descriptor agent, proved on its own registered pane and session. */
+  const remoteChiefAgent = async (
+    descriptor: ChiefDescriptor,
+  ): Promise<RadarAgentProcess | undefined> => {
+    if (radarClient === undefined || descriptor.agentId === undefined)
+      return undefined;
+    return provedRead(radarClient, {
+      agentId: descriptor.agentId,
+      paneId: descriptor.paneId,
+      session: descriptor.piSessionId,
+    });
   };
   const livePeerLead = async (
     _ctx: ExtensionContext,
@@ -10888,15 +10259,18 @@ export default function (pi: ExtensionAPI): void {
       } catch {
         return undefined;
       }
+      const identity = await radarLeadIdentity();
       if (
         !chiefLease ||
         !sameChiefDescriptor(onDisk, chiefLease.descriptor) ||
         !chiefLeaseIsHeld(runtime) ||
         descriptor.claim.pid !== process.pid ||
         descriptor.piSessionId !== ctx.sessionManager.getSessionId() ||
-        descriptor.paneId !== process.env.HERDR_PANE_ID ||
-        descriptor.tabId !== process.env.HERDR_TAB_ID ||
-        descriptor.workspaceId !== process.env.HERDR_WORKSPACE_ID
+        identity === undefined ||
+        descriptor.agentId !== identity.agentId ||
+        descriptor.paneId !== identity.location.pane ||
+        descriptor.tabId !== identity.location.tab ||
+        descriptor.workspaceId !== identity.location.workspace
       )
         return undefined;
       return descriptor;
@@ -10905,7 +10279,7 @@ export default function (pi: ExtensionAPI): void {
     if (chiefMode !== "inactive" || !chiefLeaseIsHeld(runtime))
       return undefined;
     try {
-      return (await remoteChiefAgent(ctx, descriptor)) ? descriptor : undefined;
+      return (await remoteChiefAgent(descriptor)) ? descriptor : undefined;
     } catch {
       return undefined;
     }
@@ -11034,9 +10408,7 @@ export default function (pi: ExtensionAPI): void {
   };
   const startChiefInbox = (ctx: ExtensionContext): void => {
     const generation = ++chiefInboxGeneration;
-    const socket = process.env.HERDR_SOCKET_PATH;
-    if (!socket) return;
-    const runtime = supervisionRuntime(socket);
+    const runtime = supervisionRuntime();
     const peerInboxRuntime = peerRuntime();
     const isCurrent = (): boolean =>
       generation === chiefInboxGeneration &&
@@ -11301,19 +10673,21 @@ export default function (pi: ExtensionAPI): void {
     activationGuard(sessionId, "Chief");
     chiefActivationRollback = false;
     const generation = ++chiefModeGeneration;
-    const paneId = process.env.HERDR_PANE_ID;
-    const workspaceId = process.env.HERDR_WORKSPACE_ID;
-    const tabId = process.env.HERDR_TAB_ID;
-    if (!paneId || !tabId || !workspaceId)
-      throw new Error("staff requires a herdr lead identity");
+    const identity = await radarLeadIdentity();
+    if (identity === undefined)
+      throw new Error(
+        "staff requires this lead's Radar registration in its tmux pane",
+      );
+    const { agentId, location } = identity;
     let lease: ChiefLease;
     try {
       lease = claimChiefLease({
         piSessionId: sessionId,
         piSessionFile: ctx.sessionManager.getSessionFile(),
-        paneId,
-        tabId,
-        workspaceId,
+        paneId: location.pane,
+        tabId: location.tab,
+        workspaceId: location.workspace,
+        agentId,
       });
     } catch (error) {
       if (error instanceof ProcessLockOccupiedError) {
@@ -11335,7 +10709,7 @@ export default function (pi: ExtensionAPI): void {
           enterSuspended(ctx);
         } else if (ctx.mode === "tui" && ctx.hasUI)
           await focusExistingChief?.(ctx);
-        return "A chief is already active in this herdr runtime.";
+        return "A chief is already active in this runtime.";
       }
       throw error;
     }
@@ -11427,7 +10801,7 @@ export default function (pi: ExtensionAPI): void {
     clearSupervisionUI?.();
     enterLead(ctx);
     await peerPresencePublication;
-    if (process.env.HERDR_SOCKET_PATH) startChiefInbox(ctx);
+    if (await radarLeadIdentity()) startChiefInbox(ctx);
     startNormalUI?.(ctx);
   };
   const leaveChief = async (ctx?: ExtensionCommandContext): Promise<string> => {
@@ -11644,6 +11018,24 @@ export default function (pi: ExtensionAPI): void {
     let statusRefresh = false;
     let statusInFlight = false;
     let statusContext: ExtensionContext | undefined;
+    const publishStatusEntry = (
+      ctx: ExtensionContext,
+      snapshot: import("./presentation.ts").StatusSnapshot,
+    ): void => {
+      // A stale or unavailable fleet view cannot say which children are live.
+      const childrenKnown = !snapshot.unavailable && !snapshot.stale;
+      publishStatusEntries(
+        ctx,
+        childrenKnown
+          ? snapshot.agents.filter(
+              (agent) =>
+                agent.parentLabel === undefined &&
+                agent.unresolvedWork === true &&
+                agent.state !== "lost",
+            ).length
+          : undefined,
+      );
+    };
     let statusGeneration = 0;
     let statusWidgetGeneration = 0;
     type AttentionReminder = {
@@ -11674,18 +11066,9 @@ export default function (pi: ExtensionAPI): void {
       // snapshot marked stale instead of publishing an empty fleet as fresh.
       if (!observation.available)
         throw new Error("The daemon's fleet observation is unavailable");
-      const { inventory } = observation;
-      const live = inventory.agents;
       const agentSnapshot =
         suppliedAgents ??
-        (await managedAgentSnapshots(
-          pi,
-          ctx,
-          ctx.signal,
-          false,
-          true,
-          observation,
-        ));
+        (await managedAgentSnapshots(pi, ctx, ctx.signal, false, true));
       const agentEvidence = agentSnapshot.agents.map(({ state, listed }) => ({
         piSessionId: state.piSessionId,
         ownerSessionId: state.ownerSessionId,
@@ -11697,70 +11080,17 @@ export default function (pi: ExtensionAPI): void {
       const managedAgentSessionIds = new Set(
         agentEvidence.map((agent) => agent.piSessionId),
       );
-      const agents = live.flatMap((agent) => {
-        const sessionId = observedPiSessionId(agent);
-        if (!sessionId) return [];
-        const candidateSessionFile = supervisedSessionFile(agent);
-        const piSessionFile =
-          candidateSessionFile &&
-          persistedTranscriptReady({
-            piSessionId: sessionId,
-            piSessionFile: candidateSessionFile,
-          })
-            ? candidateSessionFile
-            : undefined;
-        return [
-          {
-            sessionId,
-            sessionKind: "id" as const,
-            workspaceId: agent.workspace_id,
-            paneId: agent.pane_id,
-            tabId: agent.tab_id,
-            ...(piSessionFile ? { piSessionFile } : {}),
-            runtimeState: radarLifecycleState(agent),
-          },
-        ];
-      });
-      const workspaceProvenance = await workspacePresentationProvenance(
-        pi,
-        ctx,
-        [...new Set(agents.map((agent) => agent.workspaceId))],
-        new Map(),
-        ctx.signal,
-      );
-      const diagnostics = live.some(
-        (agent) => agent.name === "pi" && !observedPiSessionId(agent),
-      )
-        ? [
-            "Live Pi agents are present but their session identities are unresolvable",
-          ]
-        : undefined;
-      const coordinationStates = agents.flatMap((agent) => {
-        try {
-          const state = readLeadCoordinationState(
-            supervisionRuntime(),
-            agent.sessionId,
-          );
-          return state ? [state] : [];
-        } catch (error) {
-          // Missing state is a normal pre-publication condition. Any other
-          // failure is an ambiguous lead and must remain observable.
-          appendDurableError(pi, ctx, "pi_herdsman_state_error", error);
-          throw error;
-        }
-      });
+      const leads = await provedLeads();
       return {
         ...projectSupervision({
-          agents,
+          agents: leads.map(({ agent }) => agent),
           managedAgents: agentEvidence,
-          coordinationStates,
-          workspaceProvenance,
+          coordinationStates: leads.map(({ state }) => state),
           excludedSessionIds: new Set(
             currentChief() ? [currentChief()!.piSessionId] : [],
           ),
           managedAgentSessionIds,
         }),
-        ...(diagnostics ? { diagnostics } : {}),
       };
     };
     const directReports = async (
@@ -11795,7 +11125,6 @@ export default function (pi: ExtensionAPI): void {
           ctx.signal,
           false,
           true,
-          observation,
           false,
         );
         const snapshot = await loadSupervisionSnapshot(
@@ -11818,6 +11147,8 @@ export default function (pi: ExtensionAPI): void {
         chiefMode === "active" &&
         ctx.mode === "tui"
       ) {
+        // A Chief owns no child agents; observed Leads are not its subagents.
+        publishStatusEntries(ctx, 0);
         try {
           requestSupervisionWidgetRender?.();
         } catch {
@@ -11928,6 +11259,7 @@ export default function (pi: ExtensionAPI): void {
     clearNormalUI = () => {
       if (statusTimer) clearInterval(statusTimer);
       statusTimer = undefined;
+      statusEntries.clear();
       if (statusContext) statusContext.ui.setWidget("pi-herdsman", undefined);
       statusWidget?.dispose();
       statusWidget = undefined;
@@ -11954,6 +11286,7 @@ export default function (pi: ExtensionAPI): void {
       void refreshSupervision(ctx);
     };
     clearSupervisionUI = (removeWidget = true) => {
+      statusEntries.clear();
       pendingSupervisionRefresh = undefined;
       activeSupervisionRender = undefined;
       requestSupervisionWidgetRender = undefined;
@@ -11980,20 +11313,26 @@ export default function (pi: ExtensionAPI): void {
     const focusProvedLocation = async (request: {
       /** What the notices call the target. */
       subject: string;
-      /** What the operator should do when the observation no longer proves it. */
+      /** What the operator should do when the registration no longer proves it. */
       hint: string;
-      proves: (agent: RadarObservedAgent) => boolean;
+      agentId: string | undefined;
+      paneId: string;
+      session: string;
     }): Promise<string | undefined> => {
       const radar = createRadarClient();
-      const inventory = await radar.observe();
-      if (inventory.ok === false)
-        return `Radar control plane unavailable (${inventory.code}: ${inventory.message}); the ${request.subject} was not focused.`;
-      const observed = inventory.value.agents.filter(request.proves);
-      if (observed.length !== 1)
-        return `Radar could not confirm the ${request.subject} from a fresh observation; ${request.hint}`;
+      const proved =
+        request.agentId === undefined
+          ? undefined
+          : await provedRead(radar, {
+              agentId: request.agentId,
+              paneId: request.paneId,
+              session: request.session,
+            });
+      if (proved === undefined)
+        return `Radar could not confirm the ${request.subject} from its own registration; ${request.hint}`;
       const focused = await radar.focus({
         request_id: randomUUID(),
-        pane_id: observed[0]!.pane_id,
+        pane_id: request.paneId,
       });
       if (focused.ok === true) return undefined;
       return focused.code === "unknown"
@@ -12020,29 +11359,12 @@ export default function (pi: ExtensionAPI): void {
           coordination.instanceId !== lead.instanceId)
       )
         throw new Error("Lead changed; reopen staff.");
-      const verified = await listAllHerdrAgents(pi, ctx, ctx.signal);
-      const matches = verified.agents.filter(
-        (candidate: any) =>
-          candidate?.pane_id === lead.paneId &&
-          candidate?.tab_id === lead.tabId &&
-          candidate?.workspace_id === lead.workspaceId &&
-          isPiAgent(candidate) &&
-          herdrSessionId(candidate) === lead.lead,
-      );
-      if (matches.length !== 1) throw new Error("Lead changed; reopen staff.");
-      // The proof above is Herdr's and stays. Radar only performs the effect, on
-      // the exact location that proof accepted, re-proved from a fresh
-      // observation: a pane that changed occupant or moved in between is
-      // refused rather than focused through an alias or a synthesized id.
-      const proved = matches[0] as any;
       const notice = await focusProvedLocation({
         subject: "lead",
         hint: "reopen staff.",
-        proves: (agent) =>
-          agent.workspace_id === proved.workspace_id &&
-          agent.tab_id === proved.tab_id &&
-          agent.pane_id === proved.pane_id &&
-          observedPiSessionId(agent) === lead.lead,
+        agentId: lead.agentId,
+        paneId: lead.paneId,
+        session: lead.lead,
       });
       if (notice) throw new Error(notice);
     };
@@ -12052,22 +11374,16 @@ export default function (pi: ExtensionAPI): void {
       const choice = await ctx.ui.select("chief", ["Focus chief", "Cancel"]);
       if (choice !== "Focus chief") return;
       const descriptor = readChiefDescriptor(supervisionRuntime().descriptor);
-      const candidate = await remoteChiefAgent(ctx, descriptor);
+      const candidate = await remoteChiefAgent(descriptor);
       const current = readChiefDescriptor(supervisionRuntime().descriptor);
       if (!candidate || !sameChiefDescriptor(current, descriptor))
         throw new Error("Chief changed; reopen the command.");
-      const expected = expectedSession(
-        descriptor.piSessionId,
-        descriptor.piSessionFile,
-      );
       const notice = await focusProvedLocation({
         subject: "chief",
         hint: "reopen the command.",
-        proves: (agent) =>
-          agent.workspace_id === candidate.workspace_id &&
-          agent.tab_id === candidate.tab_id &&
-          agent.pane_id === candidate.pane_id &&
-          matchesExpectedSession(observedSessionAsHerdr(agent), expected),
+        agentId: descriptor.agentId,
+        paneId: descriptor.paneId,
+        session: descriptor.piSessionId,
       });
       if (notice) throw new Error(notice);
     };
@@ -12275,29 +11591,12 @@ export default function (pi: ExtensionAPI): void {
                 mode = "peek";
                 showPeek();
                 tui.requestRender();
-                void inspectHerdrAgent(
-                  pi,
-                  ctx,
-                  {
-                    workspaceId: lead.workspaceId,
-                    paneId: lead.paneId,
-                    piSessionId: lead.lead,
-                  },
-                  ctx.signal,
-                  (agent: any) =>
-                    isPiAgent(agent) &&
-                    agent?.pane_id === lead.paneId &&
-                    agent?.tab_id === lead.tabId &&
-                    herdrSessionId(agent) === lead.lead &&
-                    readLeadCoordinationState(supervisionRuntime(), lead.lead)
-                      ?.piSessionId === lead.lead &&
-                    lead.availableActions.includes("inspect"),
-                )
+                void inspectLeadRecord(lead)
                   .then((inspection) => {
                     if (!isCurrentOverview()) return;
                     peekEvidence = {
                       recentOutput: inspection.recentOutput,
-                      process: inspection.process,
+                      foreground: inspection.foreground,
                       agents: lead.agents.map(
                         (agent) => `${agent.label} · ${agent.state}`,
                       ),
@@ -12416,6 +11715,9 @@ export default function (pi: ExtensionAPI): void {
                 parentLabel: agent.parent_label,
               }
             : {}),
+          ...(agent.active_request_id || agent.result_error
+            ? { unresolvedWork: true }
+            : {}),
         } as any;
       });
       return {
@@ -12502,23 +11804,26 @@ export default function (pi: ExtensionAPI): void {
           generation === statusGeneration &&
           ctx === statusContext &&
           statusWidgetGeneration === generation
-        )
-          statusWidget?.setSnapshot(widgetStatusSnapshot(lastValidStatus));
+        ) {
+          const snapshot = widgetStatusSnapshot(lastValidStatus);
+          statusWidget?.setSnapshot(snapshot);
+          publishStatusEntry(ctx, snapshot);
+        }
       } catch {
         if (generation === statusGeneration && ctx === statusContext) {
-          statusWidget?.setSnapshot(
-            widgetStatusSnapshot({
-              ...(lastValidStatus.unavailable
-                ? {
-                    agents: [],
-                    stale: false,
-                    unavailable: true,
-                    breadcrumb: lastValidStatus.breadcrumb,
-                  }
-                : { ...lastValidStatus, stale: true }),
-              ...ownToolsSnapshot(),
-            }),
-          );
+          const snapshot = widgetStatusSnapshot({
+            ...(lastValidStatus.unavailable
+              ? {
+                  agents: [],
+                  stale: false,
+                  unavailable: true,
+                  breadcrumb: lastValidStatus.breadcrumb,
+                }
+              : { ...lastValidStatus, stale: true }),
+            ...ownToolsSnapshot(),
+          });
+          statusWidget?.setSnapshot(snapshot);
+          publishStatusEntry(ctx, snapshot);
         }
       } finally {
         if (generation === statusGeneration && ctx === statusContext) {
@@ -12583,12 +11888,22 @@ export default function (pi: ExtensionAPI): void {
         ctx.ui.notify("Agent changed; reopen Running.", "warning");
         return;
       }
+      const child = (
+        await managedAgentSnapshots(pi, ctx, ctx.signal)
+      ).agents.find(
+        ({ state }) =>
+          state.paneId === target.paneId &&
+          state.piSessionId === target.sessionId,
+      );
       const notice = await focusProvedLocation({
         subject: "selected agent",
         hint: "reopen Running.",
-        proves: (agent) =>
-          agent.pane_id === target.paneId &&
-          observedPiSessionId(agent) === target.sessionId,
+        agentId:
+          child?.presence.kind === "radar"
+            ? child.presence.evidence.agent_id
+            : undefined,
+        paneId: target.paneId,
+        session: target.sessionId,
       });
       if (notice) {
         ctx.ui.notify(notice, "warning");
@@ -13309,8 +12624,7 @@ export default function (pi: ExtensionAPI): void {
       const idle = snapshot.agents.filter(
         (agent) =>
           agent.state.ownerSessionId === ownerSessionId &&
-          (agent.presence.kind === "live" ||
-            agent.presence.kind === "radar") &&
+          agent.presence.kind === "radar" &&
           agent.listed.state === "idle",
       );
       if (!idle.length) {
@@ -13361,7 +12675,7 @@ export default function (pi: ExtensionAPI): void {
       );
     };
     if (controllerScope.kind === "lead") {
-      if (process.env.HERDR_PANE_ID)
+      if (process.env.TMUX_PANE)
         pi.registerCommand("chief", {
           description:
             "Activate chief mode, or open its overview when already active",
@@ -13712,34 +13026,11 @@ export default function (pi: ExtensionAPI): void {
           if (!lead.availableActions.includes(params.action))
             throw new Error(`Lead does not currently allow ${params.action}`);
           if (params.action === "inspect") {
-            const evidence = await inspectHerdrAgent(
-              pi,
-              ctx,
-              {
-                workspaceId: lead.workspaceId,
-                paneId: lead.paneId,
-                piSessionId: reportSession(lead),
-              },
-              signal,
-              (agent) => {
-                return (
-                  isPiAgent(agent) &&
-                  herdrSessionId(agent) === reportSession(lead) &&
-                  agent.pane_id === lead.paneId &&
-                  agent.tab_id === lead.tabId &&
-                  (() => {
-                    const state = readLeadCoordinationState(
-                      supervisionRuntime(),
-                      reportSession(lead),
-                    );
-                    return (
-                      state?.piSessionId === reportSession(lead) &&
-                      state.instanceId === lead.instanceId
-                    );
-                  })()
-                );
-              },
-            );
+            const evidence = await inspectLeadRecord({
+              agentId: lead.agentId,
+              lead: reportSession(lead),
+              paneId: lead.paneId,
+            });
             return result({
               ok: true,
               action: "inspect",
@@ -13756,7 +13047,7 @@ export default function (pi: ExtensionAPI): void {
               ...(evidence.recentOutput
                 ? { recent_output: evidence.recentOutput }
                 : {}),
-              ...(evidence.process ? { process: evidence.process } : {}),
+              ...(evidence.foreground ? { foreground: evidence.foreground } : {}),
               agents: lead.agents ?? [],
             });
           }
@@ -13988,7 +13279,7 @@ export default function (pi: ExtensionAPI): void {
         });
       }
       const agentsCommand = {
-        description: "Manage Herdr agents",
+        description: "Manage managed agents",
         getArgumentCompletions: (argumentPrefix: string) => {
           const commands = ["stats", "definitions", "placement", "stop"];
           const trimmed = argumentPrefix.trimStart();
@@ -14090,12 +13381,7 @@ export default function (pi: ExtensionAPI): void {
 
           const runtime: Runtime = {
             label: state.agentLabel,
-            herdrAgent: herdrAgentAlias(
-              state.workspaceId,
-              state.agentLabel,
-              state.runId,
-            ),
-            workspaceId: state.workspaceId,
+              workspaceId: state.workspaceId,
             paneId: state.paneId,
             cwd: state.cwd,
             runId: state.runId,
@@ -14135,8 +13421,6 @@ export default function (pi: ExtensionAPI): void {
             // generation's acknowledgment - is the integration check. There is
             // no mux record to ask for and none is created by asking.
             validateRadarChild(runtime, "integration");
-          } else if (match?.presence.kind === "live") {
-            validateIdentity(runtime, state, match.presence.agent);
           } else if (match) {
             validateIdentity(runtime, state);
           } else {
@@ -14404,7 +13688,6 @@ export default function (pi: ExtensionAPI): void {
         signal,
         false,
         false,
-        undefined,
         false,
       );
       if (signal.aborted || generation !== healthGeneration || !ctx.isIdle())
@@ -14782,21 +14065,14 @@ export default function (pi: ExtensionAPI): void {
         const attemptedDiagnostic =
           firstAttention && availableActions.includes("inspect");
         if (attemptedDiagnostic) {
-          const diagnosticSignal = AbortSignal.any([
-            signal,
-            AbortSignal.timeout(STALE_DIAGNOSTIC_TIMEOUT_MS),
-          ]);
           try {
             diagnostic = await captureManagedInspection(
-              pi,
-              ctx,
               runtimeForListedAgent(
                 agent.listed,
                 current,
                 runtimes.get(current.agentLabel),
                 false,
               ),
-              diagnosticSignal,
             );
           } catch {
             if (signal.aborted || generation !== healthGeneration) return;
@@ -14811,7 +14087,6 @@ export default function (pi: ExtensionAPI): void {
               signal,
               false,
               false,
-              undefined,
               false,
             );
           } catch {
@@ -14851,15 +14126,12 @@ export default function (pi: ExtensionAPI): void {
           !ctx.isIdle()
         )
           continue;
-        if (
-          diagnostic &&
-          normalizeHerdrLifecycleState(diagnostic.identity.agent) !== "working"
-        )
-          continue;
+        if (diagnostic && diagnostic.activity !== "working") continue;
         const inactiveMs = Date.now() - latest.lastActivityAt!;
         const foreground =
-          diagnostic?.process?.foreground_processes?.[0]?.cmdline ??
-          diagnostic?.process?.foreground_processes?.[0]?.argv0;
+          diagnostic?.foreground?.kind === "non_shell"
+            ? (diagnostic.foreground.command ?? diagnostic.foreground.name)
+            : undefined;
         const outputLines = diagnostic?.recentOutput?.split(/\r?\n/) ?? [];
         const recentOutput = outputLines.slice(-STALE_DIAGNOSTIC_LINES);
         const outputTruncated =
@@ -14948,8 +14220,8 @@ export default function (pi: ExtensionAPI): void {
                       ...(diagnostic.recentOutput
                         ? { recent_output: diagnostic.recentOutput }
                         : {}),
-                      ...(diagnostic.process
-                        ? { process: diagnostic.process }
+                      ...(diagnostic.foreground
+                        ? { foreground: diagnostic.foreground }
                         : {}),
                     }
                   : {}),
@@ -15344,7 +14616,7 @@ export default function (pi: ExtensionAPI): void {
       const sessionSignal = controllerAbortController.signal;
       if (controllerScope.kind === "lead") {
         if (
-          process.env.HERDR_SOCKET_PATH &&
+          (await radarLeadIdentity()) !== undefined &&
           !roleSuspended &&
           (chiefMode === "inactive" || chiefMode === "active") &&
           (chiefMode === "active" || leadCoordinationHealthy)
@@ -15353,6 +14625,7 @@ export default function (pi: ExtensionAPI): void {
       }
       if (statusTimer) clearInterval(statusTimer);
       statusTimer = undefined;
+      statusEntries.clear();
       statusRefresh = false;
       statusInFlight = false;
       if (statusWidget) {
@@ -15479,6 +14752,7 @@ export default function (pi: ExtensionAPI): void {
       controllerSessionActive = false;
       if (statusTimer) clearInterval(statusTimer);
       statusTimer = undefined;
+      statusEntries.clear();
       if (healthTimer) clearTimeout(healthTimer);
       healthTimer = undefined;
       ++healthGeneration;
@@ -15835,6 +15109,19 @@ export default function (pi: ExtensionAPI): void {
     });
     pi.registerTool({
       ...agentTool,
+      name: "agent_complete",
+      label: "agent complete",
+      description: "Retrieve an exact owned completion's handoff file and apply its disposition. Defaults to park (wrapup, close, keep session resumable); keep leaves the worker live, retire explicitly ends resumability. Repeating a disposition returns the recorded outcome without repeating effects. An old completion cannot act on newer work.",
+      parameters: agentCompleteParameters,
+      promptSnippet: "Retrieve a worker handoff and park, keep or retire its generation",
+      promptGuidelines: undefined,
+      execute: (id: string, p: any, signal: AbortSignal | undefined, update: unknown, ctx: ExtensionContext) =>
+        agentTool.execute(id, { action: "complete", ...p }, signal, update, ctx),
+      renderCall: (a: unknown, t: any, c: any) => renderCoordinationCall("agent", "complete", a, t, c),
+      renderResult: (r: any, o: any, t: any, c: any) => renderCoordinationResult("agent", "complete", r, o, t, c),
+    });
+    pi.registerTool({
+      ...agentTool,
       name: "agent_close",
       label: "agent close",
       description:
@@ -16136,6 +15423,7 @@ export default function (pi: ExtensionAPI): void {
   let lastLeafBreadcrumb: string[] | undefined;
   const resetLeafStatus = (): void => {
     ++leafStatusGeneration;
+    statusEntries.clear();
     if (leafStatusTimer) clearInterval(leafStatusTimer);
     leafStatusTimer = undefined;
     if (leafStatusWidget) {
@@ -16164,7 +15452,6 @@ export default function (pi: ExtensionAPI): void {
         metadataAbortController?.signal,
         true,
         false,
-        undefined,
         false,
       );
       if (generation !== leafStatusGeneration || ctx !== leafStatusContext)
@@ -16179,8 +15466,11 @@ export default function (pi: ExtensionAPI): void {
         identityOnly: true,
         refreshedAt: Date.now(),
       });
+      // A leaf cannot delegate, so it has no child agents to count.
+      publishStatusEntries(ctx, 0);
     } catch {
-      if (generation === leafStatusGeneration && ctx === leafStatusContext)
+      if (generation === leafStatusGeneration && ctx === leafStatusContext) {
+        publishStatusEntries(ctx, 0);
         leafStatusWidget?.setSnapshot({
           agents: [],
           stale: false,
@@ -16198,6 +15488,7 @@ export default function (pi: ExtensionAPI): void {
           ...ownToolsSnapshot(),
           identityOnly: true,
         });
+      }
     } finally {
       if (generation === leafStatusGeneration && ctx === leafStatusContext)
         leafStatusInFlight = false;
@@ -16713,6 +16004,7 @@ export default function (pi: ExtensionAPI): void {
       ctx.ui.notify(`pi_herdsman_state_error: ${String(e)}`, "error");
     }
   });
+  let preparationInFlight: string | undefined;
   pi.on("input", (event: any, ctx: ExtensionContext) => {
     const text = event.text;
     if (
@@ -16812,6 +16104,28 @@ export default function (pi: ExtensionAPI): void {
         "identity",
         "Request was addressed to another Radar process incarnation",
       );
+      return { action: "handled" };
+    }
+    if (request.kind === "wrapup") {
+      if (preparationInFlight === id) return { action: "handled" };
+      if (state.activeRequestId || state.completedRequestId !== request.text || !ctx.isIdle()) {
+        writePreparationResult(state.ownerSessionId, id, { status: "failed", reason: "worker-not-idle" });
+        acknowledgeAndDiscard(id, false, ctx, "busy", "Worker is not idle at this completion");
+        return { action: "handled" };
+      }
+      preparationInFlight = id;
+      void (async () => {
+        try {
+          const outcome = await wrapupContext(pi.events, ctx.sessionManager.getSessionId());
+          if (!acknowledge(id, true)) throw new Error("Could not acknowledge context preparation");
+          writePreparationResult(state!.ownerSessionId, id, outcome);
+          removeRequest(process.env.PI_HERDSMAN_MAILBOX!, id);
+        } catch (error) {
+          // No terminal reply: the historian may still be running. Keep the request
+          // unresolved rather than authorizing a close on timeout.
+          appendDurableError(pi, ctx, "pi_herdsman_state_error", error);
+        } finally { preparationInFlight = undefined; }
+      })();
       return { action: "handled" };
     }
     let acceptedRequestAssignment: AcceptedAssignmentContract | undefined;
@@ -17919,6 +17233,11 @@ export default function (pi: ExtensionAPI): void {
         }
         resultWriteAttempts++;
         writeResult(mailbox, current);
+        persistCompletion(current, {
+          cwd: ctx.cwd, definition: stateAgentDefinition(state!),
+          piSessionId: ctx.sessionManager.getSessionId(),
+          piSessionFile: ctx.sessionManager.getSessionFile(),
+        });
         pendingResult = undefined;
         if (retryTimer) clearInterval(retryTimer);
         retryTimer = undefined;

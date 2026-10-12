@@ -253,73 +253,94 @@ test("a burst publishes one newest complete snapshot, not a queue of stale ones"
 	}
 });
 
-test("a nested dialog is the blocking reason until it is cleared", async () => {
+test("a blocking label is bounded and cannot blank the record", async () => {
 	const h = harness();
 	try {
-		// A reload can replace the extension mid-run: no agent_start is coming.
-		h.emit("session_start", {}, { isIdle: () => false });
+		h.emit("session_start", {}, { isIdle: () => true });
 		await h.settled();
-		h.events.emit("herdr:blocked", { active: true, label: "  permission  " });
+		h.events.emit("rpiv:ask-user:blocked", {
+			active: true,
+			label: "x".repeat(4000),
+		});
 		await h.settled();
-		h.events.emit("herdr:blocked", { active: true, label: "question" });
+		h.events.emit("rpiv:ask-user:blocked", { active: true, label: "   " });
 		await h.settled();
-		h.emit("agent_settled", { aborted: false }, { isIdle: () => false });
+		const reasons = h.snapshots().map((snapshot) => snapshot.waiting_reason);
+		assert.deepEqual(reasons.map((reason) => reason?.length), [
+			undefined,
+			256,
+			"questionnaire".length,
+		]);
+		assert.equal(reasons[2], "questionnaire");
+	} finally {
+		h.stop();
+	}
+});
+
+test("an open permission prompt blocks until its own decision, and no other decision clears it", async () => {
+	const h = harness();
+	try {
+		h.emit("session_start", {}, { isIdle: () => true });
 		await h.settled();
-		h.events.emit("herdr:blocked", { active: false });
+		h.events.emit("permissions:ui_prompt", { requestId: "req-a" });
+		h.events.emit("permissions:ui_prompt", { requestId: "req-b" });
 		await h.settled();
-		h.events.emit("herdr:blocked", { active: false });
+		assert.equal(h.adapter.blocked(), true);
+		h.events.emit("permissions:decision", { requestId: "req-unrelated" });
+		h.events.emit("permissions:decision", { requestId: "req-a" });
 		await h.settled();
+		assert.equal(h.adapter.blocked(), true);
+		h.events.emit("permissions:decision", { requestId: "req-b" });
+		await h.settled();
+		assert.equal(h.adapter.blocked(), false);
 		assert.deepEqual(h.snapshots(), [
-			{ activity: "working" },
+			{ activity: "idle" },
 			{ activity: "blocked", waiting_reason: "permission" },
-			{ activity: "blocked", waiting_reason: "question" },
-			{ activity: "blocked", waiting_reason: "permission" },
-			{ activity: "working" },
+			{ activity: "idle" },
 		]);
 	} finally {
 		h.stop();
 	}
 });
 
-test("a questionnaire is one wait, not one wait per signal", async () => {
+test("an open permission prompt does not survive its session", async () => {
+	const h = harness();
+	try {
+		h.emit("session_start", {}, { isIdle: () => true });
+		await h.settled();
+		h.events.emit("permissions:ui_prompt", { requestId: "req-a" });
+		h.emit("session_shutdown", {}, {});
+		assert.equal(h.adapter.blocked(), false);
+		h.emit("session_start", {}, { isIdle: () => true });
+		await h.settled();
+		h.events.emit("permissions:decision", { requestId: "req-a" });
+		await h.settled();
+		assert.equal(h.adapter.blocked(), false);
+	} finally {
+		h.stop();
+	}
+});
+
+test("a questionnaire and a permission prompt are independent waits", async () => {
 	const h = harness();
 	try {
 		h.emit("session_start", {}, { isIdle: () => true });
 		await h.settled();
 		h.events.emit("rpiv:ask-user:blocked", { active: true });
-		await h.settled();
-		// The same wait also reported as a dialog must not add a second block, and
-		// the questionnaire is the more useful reason while both are open.
-		h.events.emit("herdr:blocked", { active: true, label: "ask-user-question" });
-		await h.settled();
-		h.events.emit("herdr:blocked", { active: false });
+		h.events.emit("permissions:ui_prompt", { requestId: "req-a" });
 		await h.settled();
 		h.events.emit("rpiv:ask-user:blocked", { active: false });
 		await h.settled();
+		assert.equal(h.adapter.blocked(), true);
+		h.events.emit("permissions:decision", { requestId: "req-a" });
+		await h.settled();
+		assert.equal(h.adapter.blocked(), false);
 		assert.deepEqual(h.snapshots(), [
 			{ activity: "idle" },
 			{ activity: "blocked", waiting_reason: "questionnaire" },
+			{ activity: "blocked", waiting_reason: "permission" },
 			{ activity: "idle" },
 		]);
-	} finally {
-		h.stop();
-	}
-});
-
-test("a dialog label is bounded and cannot blank the record", async () => {
-	const h = harness();
-	try {
-		h.emit("session_start", {}, { isIdle: () => true });
-		await h.settled();
-		h.events.emit("herdr:blocked", { active: true, label: "x".repeat(4000) });
-		await h.settled();
-		h.events.emit("herdr:blocked", { active: false });
-		h.events.emit("herdr:blocked", { active: true, label: "   " });
-		await h.settled();
-		assert.deepEqual(
-			h.snapshots().map((snapshot) => snapshot.waiting_reason?.length),
-			[undefined, 256, undefined],
-		);
 	} finally {
 		h.stop();
 	}

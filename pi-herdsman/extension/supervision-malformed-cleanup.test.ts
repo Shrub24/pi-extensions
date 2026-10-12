@@ -29,6 +29,7 @@ mock.module("node:fs", {
       return realFs.closeSync(fd);
     },
     fstatSync: realFs.fstatSync,
+    lstatSync: realFs.lstatSync,
     fsyncSync: (...args: Parameters<typeof realFs.fsyncSync>) => {
       if (typeof args[0] === "number" && directoryFsyncFds.has(args[0]))
         directoryFsyncCount++;

@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$repo_root"
+
 image=pi-herdsman:smoke
 name="pi-herdsman-smoke-$$"
 home="${name}-home"
@@ -28,7 +31,7 @@ trap cleanup EXIT
 
 ssh-keygen -q -t ed25519 -N '' -f "$tmp/id"
 
-docker build --platform linux/amd64 -t "$image" .
+docker build --platform linux/amd64 -f pi-herdsman/Dockerfile -t "$image" .
 
 default_ids="$(
   docker run --rm --entrypoint /bin/sh "$image" \
@@ -43,8 +46,8 @@ if docker run --rm \
 fi
 grep -q 'PUID must be a positive decimal integer' "$tmp/invalid-id.log"
 
-expected_pi="$(node -p 'require("./package.json").piHerdsman.runtime.pi')"
-expected_herdr="$(node -p 'require("./package.json").piHerdsman.runtime.herdr.version')"
+expected_pi="$(node -p 'require("./pi-herdsman/package.json").piHerdsman.runtime.pi')"
+expected_radar="$(node -p 'require("./pi-herdsman/package.json").piHerdsman.runtime.radar.commit')"
 
 start() {
   docker run -d \
@@ -75,24 +78,152 @@ remote() {
     -o UserKnownHostsFile=/dev/null herdsman@127.0.0.1 "$@"
 }
 
+# Every check is joined to the next with &&: the remote shell has no errexit, so a
+# semicolon list would let the last check's status speak for all the earlier ones,
+# and a negated check is exempt from errexit under `set -e` anyway.
 verify_runtime() {
-  remote "test \"\$(pi --version)\" = '$expected_pi'; \
-    test \"\$(readlink -f \"\$(command -v pi)\")\" = /opt/pi/pi; \
-    ! npm list -g --depth=0 2>/dev/null | grep -q '@earendil-works/pi-coding-agent'; \
-    test \"\$(npm config get update-notifier)\" = false; \
-    command -v node >/dev/null; node --version | grep -q '^v26\\.'; \
-    command -v herdr >/dev/null; test \"\$(herdr --version | awk '{ print \$NF }')\" = '$expected_herdr'; \
-    command -v mise >/dev/null; mise --version >/dev/null; \
-    command -v rg >/dev/null; command -v fd >/dev/null; \
-    command -v jq >/dev/null; command -v gh >/dev/null; \
-    command -v python3 >/dev/null; command -v git >/dev/null; \
-    test -r /AGENTS.md; \
-    grep -q '^# Pi Herdsman container environment$' /AGENTS.md; \
-    grep -q '/opt/pi-herdsman' ~/.pi/agent/settings.json; \
-    test -f ~/.pi/agent/extensions/herdr-agent-state.ts; \
-    pi --offline --help >/tmp/pi-help 2>&1; \
+  remote "test \"\$(pi --version)\" = '$expected_pi' && \
+    test \"\$(readlink -f \"\$(command -v pi)\")\" = /opt/pi/pi && \
+    npm_global=\"\$(npm list -g --depth=0 2>/dev/null)\" && \
+    ! printf '%s\n' \"\$npm_global\" | grep -q '@earendil-works/pi-coding-agent' && \
+    command -v node >/dev/null && node --version | grep -q '^v26\\.' && \
+    command -v radar >/dev/null && command -v tmux >/dev/null && \
+    ! command -v herdr >/dev/null 2>&1 && test ! -e /usr/local/bin/herdr && \
+    test \"\$(cat /usr/share/doc/pi-herdsman/radar-commit)\" = '$expected_radar' && \
+    command -v mise >/dev/null && mise --version >/dev/null && \
+    command -v rg >/dev/null && command -v fd >/dev/null && \
+    command -v jq >/dev/null && command -v gh >/dev/null && \
+    command -v python3 >/dev/null && command -v git >/dev/null && \
+    test -r /AGENTS.md && \
+    grep -q '^# Pi Herdsman container environment$' /AGENTS.md && \
+    grep -q '/opt/pi-herdsman' ~/.pi/agent/settings.json && \
+    pi --offline --help >/tmp/pi-help 2>&1 && \
     ! grep -q 'Failed to load extension' /tmp/pi-help"
 }
+
+# The entrypoint's tmux server holds the one pane it created, running Pi, and the
+# daemon in the container answers for that pane and the registration Pi's own
+# Herdsman extension wrote for itself.
+verify_stack() {
+  panes="$(docker exec --user herdsman "$name" \
+    tmux -L herdsman list-panes -a -F '#{pane_id} #{pane_current_command}')"
+  pi_panes="$(printf '%s\n' "$panes" | grep -cE '^%[0-9]+ pi$' || true)"
+  if [ "$pi_panes" != 1 ]; then
+    echo "the herdsman tmux server does not hold exactly one pane running Pi: $panes" >&2
+    exit 1
+  fi
+  remote 'node - /run/herdsman/control.sock' <"$tmp/radar-stack.cjs"
+}
+
+cat >"$tmp/radar-stack.cjs" <<'PROBE'
+// The container's Radar stack, read over its own control socket: the backend and
+// tmux server it was started for, the pane the entrypoint created, and the Pi in
+// that pane that the Herdsman extension registered. Reads only.
+
+const { connect } = require("node:net");
+const { randomUUID } = require("node:crypto");
+
+const socket = process.argv[2];
+const deadline = Date.now() + Number(process.env.RADAR_PROBE_WAIT_MS || 30000);
+
+function request(method, params) {
+  return new Promise((resolve, reject) => {
+    const client = connect(socket);
+    const id = randomUUID();
+    let buffered = "";
+    client.setEncoding("utf8");
+    client.on("error", reject);
+    client.on("data", (chunk) => {
+      buffered += chunk;
+      const end = buffered.indexOf("\n");
+      if (end === -1) return;
+      const line = buffered.slice(0, end);
+      client.destroy();
+      let reply;
+      try {
+        reply = JSON.parse(line);
+      } catch {
+        reject(new Error(`${method}: unparsable reply ${line}`));
+        return;
+      }
+      if (reply.error) {
+        reject(new Error(`${method}: refused ${reply.error.code}: ${reply.error.message}`));
+      } else if (reply.id !== id) {
+        reject(new Error(`${method}: mismatched reply id ${reply.id}`));
+      } else {
+        resolve(reply.result);
+      }
+    });
+    client.write(`${JSON.stringify({ version: 2, id, method, params })}\n`);
+  });
+}
+
+const pause = (ms) => new Promise((done) => setTimeout(done, ms));
+
+async function main() {
+  const problems = [];
+
+  const ping = await request("daemon.ping", {});
+  if (ping.protocol !== 2) problems.push(`protocol ${ping.protocol}`);
+  if (ping.backend !== "tmux") problems.push(`backend ${ping.backend}`);
+  if (ping.instance !== "herdsman") problems.push(`instance ${ping.instance}`);
+  for (const capability of [
+    "mux.observe",
+    "registry.v1",
+    "spawn.v1",
+    "spawn.close.v1",
+    "spawn.launch_context.v1",
+  ]) {
+    if (!(ping.capabilities ?? []).includes(capability)) problems.push(`capability ${capability}`);
+  }
+
+  const observed = await request("mux.observe", {});
+  const panes = (observed.inventory?.panes ?? [])
+    .map((pane) => pane.location?.pane_id ?? "")
+    .filter((id) => /^tmux:herdsman:%\d+$/.test(id));
+  if (panes.length !== 1) problems.push(`the daemon observed ${panes.length} panes of its server`);
+
+  let registration;
+  while (panes.length === 1) {
+    const listing = await request("agent.list", {});
+    registration = (listing.agents ?? []).find(
+      (agent) => agent.registration?.location?.pane === panes[0],
+    )?.registration;
+    if (registration !== undefined || Date.now() > deadline) break;
+    await pause(500);
+  }
+  if (registration === undefined) problems.push(`no registration is bound to ${panes[0]}`);
+
+  let verification;
+  if (registration !== undefined) {
+    const read = await request("agent.get", { agent_id: registration.agent_id });
+    verification = read.agent?.process?.verification;
+    if (verification !== "verified") {
+      problems.push(`registration ${registration.agent_id} process ${verification}`);
+    }
+  }
+
+  const summary = {
+    protocol: ping.protocol,
+    backend: ping.backend,
+    instance: ping.instance,
+    pane: panes[0] ?? null,
+    agent_id: registration?.agent_id ?? null,
+    source: registration?.source ?? null,
+    process: verification ?? null,
+  };
+  if (problems.length > 0) {
+    console.error(`radar stack failed: ${problems.join("; ")} ${JSON.stringify(summary)}`);
+    process.exit(1);
+  }
+  console.log(JSON.stringify(summary));
+}
+
+main().catch((error) => {
+  console.error(`radar probe error: ${error.message}`);
+  process.exit(1);
+});
+PROBE
 
 docker run -d \
   --name "$name" \
@@ -177,35 +308,45 @@ docker rm -f "$name" >/dev/null
 
 start
 verify_runtime
+verify_stack
+# An SSH session does not carry the image's NPM_CONFIG_UPDATE_NOTIFIER (sshd builds
+# the session environment itself), so the key is asserted where the image sets it:
+# inside the container, whose environment the Pi pane and every exec inherit.
 docker exec --user herdsman "$name" sh -c 'test "$(npm config get update-notifier)" = false'
 
+# An interactive login has to land in the Pi pane's own tmux server instead of
+# starting a second shell outside it. The probe shadows tmux so the login's
+# decision is recorded: it answers the session lookup the guard makes and stops
+# at the attach it asks for. Whether that server really holds the session is what
+# verify_stack reads from the daemon, not this stub's business.
 printf '%s\n' \
   '#!/bin/sh' \
-  'printf "%s:%s:%s\n" "$(id -un)" "$HOME" "$PWD" >> /tmp/herdr-autostart' |
-  remote 'mkdir -p ~/.local/bin; cat > ~/.local/bin/herdr; chmod +x ~/.local/bin/herdr'
+  'printf "%s:%s:%s %s\n" "$(id -un)" "$HOME" "$PWD" "$*" >> /tmp/tmux-autostart' \
+  'exit 0' |
+  remote 'mkdir -p ~/.local/bin && cat > ~/.local/bin/tmux && chmod +x ~/.local/bin/tmux'
 
-docker exec "$name" rm -f /tmp/herdr-autostart
+docker exec "$name" rm -f /tmp/tmux-autostart
 printf 'exit\n' |
   ssh -tt -F /dev/null -i "$tmp/id" -p "$port" \
     -o BatchMode=yes \
     -o StrictHostKeyChecking=no \
     -o UserKnownHostsFile=/dev/null \
-    herdsman@127.0.0.1 >/dev/null 2>&1
-docker exec "$name" grep -qx 'herdsman:/home/herdsman:/home/herdsman' /tmp/herdr-autostart
+    herdsman@127.0.0.1 >/dev/null 2>&1 || true
+docker exec "$name" grep -q '^herdsman:/home/herdsman:/home/herdsman -L herdsman has-session -t herdsman$' \
+  /tmp/tmux-autostart
+docker exec "$name" grep -q '^herdsman:/home/herdsman:/home/herdsman -L herdsman attach-session -t herdsman$' \
+  /tmp/tmux-autostart
 
-docker exec "$name" rm -f /tmp/herdr-autostart
-docker exec --user herdsman \
-  "$name" script -qec 'bash -ic exit' /dev/null >/dev/null
-docker exec "$name" grep -qx 'herdsman:/home/herdsman:/home/herdsman' /tmp/herdr-autostart
+docker exec "$name" rm -f /tmp/tmux-autostart /tmp/bash-ran
+docker exec --user herdsman -e TMUX=/tmp/tmux-1000/herdsman,1,0 \
+  "$name" script -qec 'bash -ic "printf ok > /tmp/bash-ran"' /dev/null >/dev/null
+docker exec "$name" sh -c 'test "$(cat /tmp/bash-ran)" = ok'
+docker exec "$name" test ! -e /tmp/tmux-autostart
 
-docker exec "$name" rm -f /tmp/herdr-autostart
-docker exec --user herdsman -e HERDR_ENV=1 \
-  "$name" script -qec 'bash -ic exit' /dev/null >/dev/null
-docker exec "$name" test ! -e /tmp/herdr-autostart
-
-remote 'rm -f ~/.local/bin/herdr'
-docker exec "$name" rm -f /tmp/herdr-autostart
+remote 'rm -f ~/.local/bin/tmux'
+docker exec "$name" rm -f /tmp/tmux-autostart /tmp/bash-ran
 verify_runtime
+verify_stack
 
 if ssh -F /dev/null -i "$tmp/id" -p "$port" \
   -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
@@ -222,11 +363,12 @@ if ssh -F /dev/null -p "$port" -o BatchMode=yes \
 fi
 
 host_fingerprint="$(docker exec "$name" ssh-keygen -lf /var/lib/herdsman/ssh/ssh_host_ed25519_key.pub)"
-remote 'mkdir -p ~/persist-package && printf "%s\n" "{\"name\":\"persist-package\",\"version\":\"1.0.0\"}" > ~/persist-package/package.json && pi install ~/persist-package && mkdir -p ~/.local/bin && printf "%s\n" "#!/bin/sh" "printf persisted" > ~/.local/bin/persist-tool && chmod +x ~/.local/bin/persist-tool'
+remote 'mkdir -p ~/persist-package/extensions && printf "%s\n" "{\"name\":\"persist-package\",\"version\":\"1.0.0\"}" > ~/persist-package/package.json && printf "%s\n" "export default function () {}" > ~/persist-package/extensions/persist.ts && pi install ~/persist-package && mkdir -p ~/.local/bin && printf "%s\n" "#!/bin/sh" "printf persisted" > ~/.local/bin/persist-tool && chmod +x ~/.local/bin/persist-tool'
 
 docker rm -f "$name" >/dev/null
 start
 verify_runtime
+verify_stack
 remote 'grep -q persist-package ~/.pi/agent/settings.json && test "$(persist-tool)" = persisted'
 test "$host_fingerprint" = "$(docker exec "$name" ssh-keygen -lf /var/lib/herdsman/ssh/ssh_host_ed25519_key.pub)"
 
@@ -257,5 +399,6 @@ docker run --rm \
   -c 'rm -f /home/herdsman/.ssh/authorized_keys /home/herdsman/root-owned-target'
 start
 verify_runtime
+verify_stack
 
-echo "Container smoke test passed (Pi $expected_pi)."
+echo "Container smoke test passed (Pi $expected_pi, Radar $expected_radar)."

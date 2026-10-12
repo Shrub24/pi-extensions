@@ -27,27 +27,16 @@ import support, {
   LEAD_SESSION_ID,
   AGENT_ID,
   WORKSPACE,
-  cascadeExecutor,
   defaultFixtureIdentity,
-  delegatedLifecycleExecutor,
   delegationLockPathForTest,
   assignmentLockPathForTest,
   fakeContext,
   fakePi,
   fakeAgentContext,
-  isAgentList,
-  isApiSnapshot,
-  isHerdrList,
-  isPaneClose,
-  isPaneList,
-  isPreservePaneStop,
-  isTabClose,
-  isTabList,
   listResponse,
   managedState,
   nativeSessions,
   openedSessionPaths,
-  agentControllerExecutor,
   readPendingAsk,
   readRequest,
   readResult,
@@ -64,8 +53,6 @@ import support, {
   removeResult,
   resetAgentMailbox,
   resultEntryDetails,
-  leadExec,
-  runScopedHerdrAlias,
   setLeadEnvironment,
   setAgentEnvironment,
   ensureRadarDaemon,
@@ -74,7 +61,6 @@ import support, {
   drainRadarObserves,
   settleRadarObserves,
   startRadarSession,
-  startupExecutor,
   testChildCommand,
   testTmpRoot,
   truncateModelText,
@@ -3040,7 +3026,7 @@ test("unresolved background work remains active with retention enabled or disabl
     writeAgentState(mailbox, activeState);
     const entries: unknown[] = [];
     const lifecycle = cascadeExecutor([activeState]);
-    const pi = fakePi({ entries, exec: lifecycle.exec });
+    const pi = fakePi({ entries });
     registerExtension!(pi.pi as never);
 
     try {
@@ -3092,7 +3078,7 @@ test("repeated delivered-result cleanup after recovery retains and never closes"
     },
   ];
   const lifecycle = cascadeExecutor([state]);
-  const pi = fakePi({ entries, exec: lifecycle.exec });
+  const pi = fakePi({ entries });
   registerExtension!(pi.pi as never);
   t.mock.timers.enable({ apis: ["setTimeout"] });
   try {
@@ -3140,7 +3126,7 @@ test("a delivered worker with a live pane projects idle with its exact tools", a
     },
   ];
   const lifecycle = cascadeExecutor([state]);
-  const pi = fakePi({ entries, exec: lifecycle.exec });
+  const pi = fakePi({ entries });
   registerExtension!(pi.pi as never);
   t.mock.timers.enable({ apis: ["setTimeout"] });
   try {
@@ -3255,25 +3241,8 @@ test("a restart reuses a retained worker in its existing process", async (t) => 
   const delivered: string[] = [];
   // A retained child is consumed by the daemon that launched it, so this
   // fixture's own stand-in must not be a second consumer of the same request.
-  const worker = startupExecutor(
-    label,
-    () => DEFAULT_PI_SESSION_ID,
-    undefined,
-    (text) => {
-      delivered.push(text);
-    },
-    false,
-    undefined,
-    "/tmp",
-    AGENT_ID,
-    false,
-    true,
-    false,
-    undefined,
-    sessionPath,
-  );
-  worker.stopMailboxConsumer();
-  const pi = fakePi({ entries, exec: worker.exec });
+  const workerMailbox = agentMailboxPath(WORKSPACE, label);
+  const pi = fakePi({ entries });
   registerExtension!(pi.pi as never);
   const context = fakeContext(entries);
   // The daemon this process registers against is the one whose store already
@@ -6215,7 +6184,6 @@ test("a canonical row that contradicts the mailbox never projects a child live",
     workspace_id: WORKSPACE,
     tab_id: `${label}-tab`,
     pane_id: state.paneId,
-    name: runScopedHerdrAlias(WORKSPACE, label, state.runId),
     status: "working",
     facts: { label: overrides.managedLabel ?? label, run: state.runId },
     session: { kind: "uuid", value: overrides.sessionId ?? state.piSessionId },
@@ -6420,7 +6388,6 @@ async function settleUntil(done: () => boolean, budget = 500): Promise<void> {
 function observeFleet(
   reported: Array<{
     state: ManagedAgentState;
-    name?: string;
     sessionId?: string;
     status?: string;
   }>,
@@ -6446,15 +6413,12 @@ function observeFleet(
         pane_id: row.paneId,
       },
     })),
-    agents: reported.map(({ state, name, sessionId, status }) => ({
+    agents: reported.map(({ state, sessionId, status }) => ({
       location: {
         workspace_id: state.workspaceId,
         tab_id: `${state.agentLabel}-tab`,
         pane_id: state.paneId,
       },
-      name:
-        name ??
-        runScopedHerdrAlias(state.workspaceId, state.agentLabel, state.runId),
       status: status ?? (state.activeRequestId ? "working" : "idle"),
       session: { kind: "uuid", value: sessionId ?? state.piSessionId },
     })),
@@ -6711,7 +6675,6 @@ test("agent_extend refuses a non-live worker's recovered window", async (t) => {
   observeFleet([
     {
       state,
-      name: runScopedHerdrAlias(WORKSPACE, label, state.runId),
       sessionId: otherSession,
     },
   ]);
@@ -7239,8 +7202,8 @@ test("a checkpoint covering several Agents offers no single instruction", async 
 test("a delegate records its watcher instruction, and extend replaces or keeps it", async () => {
   setLeadEnvironment();
   const label = "guided-delegate";
-  const startup = startupExecutor(label, () => DEFAULT_PI_SESSION_ID);
-  const pi = fakePi({ exec: startup.exec });
+  const startupMailbox = agentMailboxPath(WORKSPACE, label);
+  const pi = fakePi({});
   registerExtension!(pi.pi as never);
   // The instruction a consumer would receive is the one recorded on the
   // assignment's window, so the recording is where the plumbing is checked.
@@ -7296,8 +7259,7 @@ test("a delegate records its watcher instruction, and extend replaces or keeps i
     assert.equal(recorded(requestId), "Only wake me if the review is refused.");
   } finally {
     pi.events.get("session_shutdown")?.[0]();
-    startup.stopMailboxConsumer();
-    resetAgentMailbox(startup.mailbox);
+    resetAgentMailbox(startupMailbox);
   }
 });
 

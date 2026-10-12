@@ -7,6 +7,7 @@ import {
 	type RadarResult,
 	type RadarSpawnEdge,
 } from "./radar-client.ts";
+import { radarPaneHandle } from "./radar-location.ts";
 import {
 	readAgentState,
 	startupAckMatches,
@@ -169,6 +170,8 @@ export async function observeRadarChild(
 		request_id: string;
 		pane_id: string | undefined;
 		agent_id: string | undefined;
+		/** The session this launch's mailbox records for the child. */
+		session_id: string | undefined;
 	},
 ): Promise<RadarChildObservation> {
 	if (provenance.agent_id === undefined)
@@ -211,6 +214,35 @@ export async function observeRadarChild(
 	if (topology.state !== "bound")
 		return unknownChild(
 			`not currently placed (state ${topology.state ?? "unreported"})`,
+		);
+	// The edge says where the child was bound, not that its process still runs.
+	// The registry's verdict on the bound subject, and the location it registered
+	// with, are what prove the child live.
+	const reply = await client.agentGet(edge.bound.agent_id);
+	if (reply.ok === false)
+		return unknownChild(
+			`process verdict not readable (${reply.code}: ${reply.message})`,
+		);
+	const { verification, location, contextSession } = reply.value;
+	if (verification === "absent" || verification === "mismatched")
+		return {
+			kind: "gone",
+			verification,
+			diagnostic: trajectory(`the registered process is ${verification}`),
+		};
+	if (verification !== "verified")
+		return unknownChild(`process verdict is ${verification}`);
+	if (location?.pane !== provenance.pane_id)
+		return unknownChild(
+			`registered on ${location?.pane ?? "no pane"}, not on ${provenance.pane_id}`,
+		);
+	// The subject must currently publish the session this launch's mailbox names:
+	// a live process in another session, or one publishing none, is not this child.
+	if (provenance.session_id === undefined)
+		return unknownChild("without a session this launch recorded for it");
+	if (contextSession !== provenance.session_id)
+		return unknownChild(
+			`publishing session ${contextSession ?? "none"}, not ${provenance.session_id}`,
 		);
 	return {
 		kind: "live",
@@ -401,11 +433,10 @@ export async function launchRadarWorker(
 					ownerSessionId: launch.identity.ownerSessionId,
 					workspaceId: launch.identity.workspaceId,
 					agentLabel: launch.identity.agentLabel,
-						// The acknowledgment repeats the child's own location, which the
-						// child read from the pane it runs in. Requiring the pane the
-						// daemon created is what refuses a child that inherited another
-						// process's coordinates.
-					paneId: bound.pane_id,
+						// The child writes the raw TMUX_PANE of the pane it runs in. Requiring
+						// the pane the daemon created is what refuses a child that inherited
+						// another process's coordinates.
+					paneId: radarPaneHandle(bound.pane_id),
 				}) &&
 				(launch.observedChildAgent === undefined ||
 					launch.observedChildAgent() === agentId),
@@ -428,7 +459,7 @@ export async function launchRadarWorker(
 		const claimed = readAgentState(launch.mailbox)?.paneId;
 		return unresolvedLaunch(
 			launch.request_id,
-			claimed !== undefined && claimed !== bound.pane_id
+			claimed !== undefined && claimed !== radarPaneHandle(bound.pane_id)
 				? `the bound child ${agentId} claims the pane ${claimed}, not the pane ${bound.pane_id} this launch created for it`
 				: `the bound child ${agentId} has not acknowledged this launch's startup (${String(error)})`,
 		);

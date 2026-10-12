@@ -40,7 +40,8 @@ const {
   startRadarSession,
 } = await import("./support.ts");
 const support = await import("./support.ts");
-const { writeRequest } = await import("./mailbox.ts");
+const { writeRequest, readRequest, readResult } = await import("./mailbox.ts");
+const { readPreparationResult, readCompletion } = await import("./completions.ts");
 import type { RequestAddress, RequestRecord } from "./mailbox.ts";
 import type { FakeRadarDaemon } from "./support-radar.ts";
 
@@ -124,11 +125,63 @@ async function startedWorker(label: string) {
     },
   });
   registerExtension!(worker.pi as never);
-  context = fakeAgentContext();
+  context = fakeAgentContext(worker.entries);
   context.mode = "rpc";
   await startRadarSession(worker, context);
-  return { mailbox, daemon: support.radarDaemon, worker };
+  return { mailbox, daemon: support.radarDaemon, worker, context };
 }
+
+test("the addressed worker runs wrapup without a model turn and acknowledges its durable outcome", async (t) => {
+  const { mailbox, daemon, worker, context } = await startedWorker("wrapup-worker");
+  try {
+    const address = await workerAddress(daemon);
+    const assignment = assignmentRequest(mailbox, address);
+    writeRequest(mailbox, assignment);
+    await t.waitFor(() => assert.equal(readAgentState(mailbox)?.activeRequestId, assignment.requestId));
+    for (const listener of worker.events.get("message_end") ?? [])
+      await listener({ message: { role: "assistant", content: "The task is complete.\n\nDurable worker handoff." } }, context);
+    for (const listener of worker.events.get("agent_settled") ?? []) await listener(undefined, context);
+    const state = readAgentState(mailbox)!;
+    assert.equal(readResult(mailbox, assignment.requestId)?.status, "completed");
+    assert.equal(readCompletion(state.ownerSessionId, assignment.requestId)?.summary, "The task is complete.");
+    const completionId = assignment.requestId;
+    const beforeWrapup = worker.sentUsers.length;
+    let wraps = 0;
+    worker.pi.events.on("magic-context:flush", () => {
+      worker.pi.events.emit("magic-context:flush-result", { sessionId: context.sessionManager.getSessionId(), status: "success" });
+    });
+    worker.pi.events.on("magic-context:wrapup", () => {
+      wraps++;
+      worker.pi.events.emit("magic-context:wrapup-result", { sessionId: context.sessionManager.getSessionId(), status: "success" });
+    });
+    const request: RequestRecord = {
+      ...assignmentRequest(mailbox, await workerAddress(daemon)),
+      kind: "wrapup", text: completionId, acceptedAssignment: undefined, briefProfile: undefined,
+    };
+    writeRequest(mailbox, request);
+    await t.waitFor(() => assert.equal(readPreparationResult(state.ownerSessionId, request.requestId)?.status, "success"));
+    assert.equal(wraps, 1);
+    assert.equal(readAgentState(mailbox)?.lastAck?.accepted, true);
+    assert.equal(readAgentState(mailbox)?.activeRequestId, undefined);
+    assert.equal(readAgentState(mailbox)?.completedRequestId, completionId);
+    assert.equal(readRequest(mailbox, request.requestId), undefined);
+    assert.equal(worker.sentUsers.length, beforeWrapup + 1);
+    // Re-delivering the marker does not re-run context preparation.
+    await worker.events.get("input")![0]({ text: controlMarker(request.requestId, 6) }, context);
+    assert.equal(wraps, 1);
+  } finally { fireShutdown(worker); resetAgentMailbox(mailbox); }
+});
+
+test("an unaddressed wrapup request is rejected before it can reach a worker", async () => {
+  const { mailbox, worker } = await startedWorker("unaddressed-wrapup-worker");
+  try {
+    const request: RequestRecord = {
+      ...assignmentRequest(mailbox), kind: "wrapup", text: randomUUID(),
+      acceptedAssignment: undefined, briefProfile: undefined,
+    };
+    assert.throws(() => writeRequest(mailbox, request), /Wrapup requires an addressed request/);
+  } finally { fireShutdown(worker); resetAgentMailbox(mailbox); }
+});
 
 test("a worker refuses an assignment addressed to another incarnation of itself", async () => {
   const { mailbox, daemon, worker } = await startedWorker("addressed-worker");

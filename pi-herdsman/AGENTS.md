@@ -55,7 +55,6 @@ in `AGENTS.md`.
 
 - `extension/index.ts`: Extension integration and controller/agent lifecycle.
 - `extension/agent-definitions.ts`: Agent-definition discovery, validation, overrides, and launch arguments.
-- `extension/herdr.ts`: Herdr topology, startup, shutdown, and process ownership.
 - `extension/mailbox.ts`: Durable mailbox protocol and record persistence.
 - `extension/core.ts`: Shared lifecycle and message-preparation logic.
 - `extension/errors.ts`: Structured extension error categories.
@@ -66,7 +65,6 @@ in `AGENTS.md`.
 - `extension/support.ts`: Shared extension integration-test mocks and fixtures.
 - `extension/extension-contract.test.ts`: Extension and model contract behavior.
 - `extension/controller-api.test.ts`: Controller authorization and live-control behavior.
-- `extension/herdr.test.ts`: Herdr inspection/read and topology contract behavior.
 - `extension/controller-lifecycle.test.ts`: Authorized delegation lifecycle behavior.
 - `extension/agent-runtime.test.ts`: Managed-agent runtime behavior.
 - `extension/recovery.test.ts`: Failure, recovery, and cleanup behavior.

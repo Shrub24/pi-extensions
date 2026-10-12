@@ -19,7 +19,7 @@ Running processes do not survive container replacement.
 The image includes:
 
 - Pi and Pi Herdsman
-- Herdr
+- Radar daemon and tmux (the Pi pane runs in tmux server `herdsman`)
 - Node.js, npm, and npx
 - mise
 - Git and GitHub CLI

@@ -48,6 +48,7 @@ export type HerdsmanConfig = {
   spawnPlacement: SpawnPlacement;
   contextRetirement: boolean;
   retainWorkers: boolean;
+  savedSessionLimit: number;
   softTimeoutMs: number;
   workerContextBudgetTokens: number;
   workerCompaction: boolean;
@@ -61,6 +62,7 @@ export const DEFAULT_CONFIG: HerdsmanConfig = {
   spawnPlacement: "split",
   contextRetirement: false,
   retainWorkers: true,
+  savedSessionLimit: 10,
   softTimeoutMs: DEFAULT_SOFT_TIMEOUT_MS,
   workerContextBudgetTokens: DEFAULT_WORKER_CONTEXT_BUDGET_TOKENS,
   workerCompaction: true,
@@ -69,6 +71,10 @@ export const DEFAULT_CONFIG: HerdsmanConfig = {
   disabledDefinitions: [],
   modelScopes: {},
 };
+
+export function validSavedSessionLimit(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
 
 export function validByteLimit(value: unknown): value is number {
   return (
@@ -172,6 +178,7 @@ const CONFIG_KEYS = new Set<ConfigKey>([
   "spawnPlacement",
   "contextRetirement",
   "retainWorkers",
+  "savedSessionLimit",
   "softTimeoutMs",
   "workerContextBudgetTokens",
   "workerCompaction",
@@ -212,6 +219,11 @@ function parseRawConfig(content: string): Partial<HerdsmanConfig> {
         throw new Error(`Invalid Pi Herdsman config field ${key}`);
       result[key] = record[key];
     }
+  if ("savedSessionLimit" in record) {
+    if (!validSavedSessionLimit(record.savedSessionLimit))
+      throw new Error("Invalid Pi Herdsman config field savedSessionLimit");
+    result.savedSessionLimit = record.savedSessionLimit;
+  }
   if ("softTimeoutMs" in record) {
     if (!validSoftTimeout(record.softTimeoutMs))
       throw new Error("Invalid Pi Herdsman config field softTimeoutMs");
@@ -305,6 +317,8 @@ export function updateConfig<K extends ConfigKey>(
         typeof value !== "boolean"
       )
         throw new Error(`Invalid Pi Herdsman config field ${key}`);
+      if (key === "savedSessionLimit" && !validSavedSessionLimit(value))
+        throw new Error("Invalid Pi Herdsman config field savedSessionLimit");
       if (key === "softTimeoutMs" && !validSoftTimeout(value))
         throw new Error("Invalid Pi Herdsman config field softTimeoutMs");
       if (
@@ -318,6 +332,7 @@ export function updateConfig<K extends ConfigKey>(
         key !== "spawnPlacement" &&
         key !== "contextRetirement" &&
         key !== "retainWorkers" &&
+        key !== "savedSessionLimit" &&
         key !== "workerCompaction" &&
         key !== "softTimeoutMs" &&
         key !== "workerContextBudgetTokens" &&

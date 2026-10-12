@@ -36,6 +36,8 @@ export const RADAR_EVENTS_CONTRACT = "events.v1";
 /** Backend capabilities of the mux methods this port dispatches. */
 export const RADAR_OBSERVE_CAPABILITY = "mux.observe";
 export const RADAR_FOCUS_CAPABILITY = "mux.focus";
+export const RADAR_OUTPUT_CAPABILITY = "mux.output";
+export const RADAR_PROCESS_INFO_CAPABILITY = "mux.process_info";
 /** The name this extension records on the operations it dispatches. */
 export const RADAR_REQUESTER = "pi-herdsman";
 /** The daemon's own line bound; nothing longer is sent or accepted. */
@@ -303,6 +305,17 @@ export type RadarProcessVerdict =
 export type RadarAgentProcess = {
 	claimed: boolean;
 	verification: RadarProcessVerdict;
+	/** The registration's own location, when it was registered with one. */
+	location?: RadarLocation;
+	/** The registration's session, the one it was registered with. */
+	session?: string;
+	/** The session the registration currently publishes, when it publishes one. */
+	contextSession?: string;
+	/**
+	 * The child's own published activity, present only while its execution
+	 * report is fresh. Absent, stale or unreported is unknown, never a state.
+	 */
+	activity?: string;
 };
 
 export type RadarCapabilities = {
@@ -745,9 +758,29 @@ function agentProcessAt(agent: unknown): RadarResult<RadarAgentProcess> {
 		!PROCESS_VERDICTS.includes(verification as RadarProcessVerdict)
 	)
 		return protocol("agent.get reply carries no process verdict");
+	const registration = recordAt(agent, "registration");
+	const location = locationAt(registration);
+	const session = stringAt(registration, "session");
+	// The pinned reply nests the current session one level down, and it is
+	// current only while the daemon reports that context fresh.
+	const context = recordAt(recordAt(agent, "context"), "context");
+	const contextSession =
+		stringAt(context, "freshness") === "fresh" ? stringAt(context, "session") : undefined;
+	const execution = recordAt(recordAt(agent, "execution"), "snapshot");
+	const activity =
+		stringAt(execution, "freshness") === "fresh"
+			? stringAt(recordAt(execution, "snapshot"), "activity")
+			: undefined;
 	return {
 		ok: true,
-		value: { claimed, verification: verification as RadarProcessVerdict },
+		value: {
+			claimed,
+			verification: verification as RadarProcessVerdict,
+			...(location !== undefined ? { location } : {}),
+			...(session !== undefined ? { session } : {}),
+			...(contextSession !== undefined ? { contextSession } : {}),
+			...(activity !== undefined ? { activity } : {}),
+		},
 	};
 }
 
@@ -942,7 +975,27 @@ export type RadarClient = {
 		request_id: string;
 		pane_id: string;
 	}): Promise<RadarResult<{ request_id: string }>>;
+	/** Bounded, non-consuming snapshot of a pane's recent output. */
+	output(request: {
+		pane_id: string;
+		source: "recent_unwrapped";
+		lines?: number;
+	}): Promise<RadarResult<RadarOutputRead>>;
+	/** Current foreground evidence for a pane; inconclusive is not proof of exit. */
+	processInfo(request: { pane_id: string }): Promise<RadarResult<RadarForeground>>;
 };
+
+export type RadarOutputRead = {
+	text: string;
+	truncated: boolean;
+	revision?: number;
+};
+
+/** The pinned `ForegroundEvidence` kinds, with the leader's facts when known. */
+export type RadarForeground =
+	| { kind: "shell" }
+	| { kind: "non_shell"; pid: number; name?: string; command?: string }
+	| { kind: "inconclusive" };
 
 export type RadarClientOptions = {
 	env?: NodeJS.ProcessEnv;
@@ -1595,6 +1648,53 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 					observed.agents.push(decoded.value);
 				}
 				return { ok: true, value: observed };
+			});
+		},
+		async output(request) {
+			return withCapability(RADAR_OUTPUT_CAPABILITY, async () => {
+				const answer = await call("mux.output", request);
+				if (answer.ok === false) return answer;
+				const read = recordAt(answer.value, "output");
+				const text = stringAt(read, "text");
+				const truncated = recordAt(read, "truncated");
+				if (text === undefined || typeof truncated !== "boolean")
+					return protocol("mux.output reply carries no output read");
+				const revision = recordAt(read, "revision");
+				return {
+					ok: true,
+					value: {
+						text,
+						truncated,
+						...(typeof revision === "number" ? { revision } : {}),
+					},
+				};
+			});
+		},
+		async processInfo(request) {
+			return withCapability(RADAR_PROCESS_INFO_CAPABILITY, async (): Promise<RadarResult<RadarForeground>> => {
+				const answer = await call("mux.process_info", request);
+				if (answer.ok === false) return answer;
+				const evidence = recordAt(answer.value, "evidence");
+				const kind = stringAt(evidence, "kind");
+				if (kind === "shell") return { ok: true, value: { kind: "shell" } };
+				if (kind === "inconclusive")
+					return { ok: true, value: { kind: "inconclusive" } };
+				const pid = recordAt(evidence, "pid");
+				if (kind === "non_shell" && typeof pid === "number")
+					return {
+						ok: true,
+						value: {
+							kind: "non_shell",
+							pid,
+							...(stringAt(evidence, "name") !== undefined
+								? { name: stringAt(evidence, "name") }
+								: {}),
+							...(stringAt(evidence, "command") !== undefined
+								? { command: stringAt(evidence, "command") }
+								: {}),
+						},
+					};
+				return protocol("mux.process_info reply carries no foreground evidence");
 			});
 		},
 		async focus(request) {

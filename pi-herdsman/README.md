@@ -7,13 +7,12 @@
 [![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-blue)](https://github.com/boadij/pi-herdsman/actions/workflows/validate.yml)
 [![License](https://img.shields.io/npm/l/pi-herdsman)](LICENSE)
 
-**The orchestration layer between [Pi](https://github.com/earendil-works/pi) and [herdr](https://github.com/herdrdev/herdr).**
+**The orchestration layer between [Pi](https://github.com/earendil-works/pi) and the [Radar daemon](https://github.com/Shrub24/agent-radar).**
 
 Pi Herdsman turns independent Pi sessions into a coordinated agent system, from
 one background Agent to parallel branch-based project work. Pi owns each
-coding-agent conversation; herdr owns processes, panes, workspaces, and worktree
-placement; Herdsman connects them through delegation, ownership, supervision,
-and supervision.
+coding-agent conversation; the Radar daemon owns the tmux panes those sessions
+run in; Herdsman connects them through delegation, ownership, and supervision.
 
 ## Demo
 
@@ -31,26 +30,25 @@ _Concept animation, not a live recording._
 
 ## Quick start
 
-On Linux or macOS, install the released Pi, herdr, and Pi Herdsman stack:
+On Linux or macOS, install the released Pi and Pi Herdsman stack. Radar and tmux
+are host prerequisites, and the installer checks for them:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/boadij/pi-herdsman/main/install.sh | sh
 ```
 
-If you already manage Pi and herdr yourself:
+If you already manage Pi and Radar yourself:
 
 ```sh
 pi install npm:pi-herdsman
-herdr integration install pi
 ```
 
-Remove pi-herdr if installed. Herdsman reports its own delegation facts to the Radar daemon registry and no longer publishes terminal pane metadata; the official Herdr integration remains the sole state reporter.
-
-Start herdr in your project, then start Pi inside its pane:
+Start the Radar daemon for the tmux server it will serve, then start Pi in a pane
+of that same server:
 
 ```sh
-herdr
-pi
+RADAR_CONTROL_BACKEND=tmux RADAR_TMUX_SERVER=<server> radar daemon
+tmux -L <server> new-session pi
 ```
 
 Delegate naturally:

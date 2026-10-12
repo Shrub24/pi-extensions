@@ -140,6 +140,7 @@ export const AGENT_COORDINATION_TOOLS = [
   "agent_steer",
   "agent_interrupt",
   "agent_reply",
+  "agent_complete",
   "agent_close",
   "agent_inspect",
   "agent_transcript",

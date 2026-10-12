@@ -121,7 +121,7 @@ export interface RequestRecord {
   workspaceId: string;
   agentLabel: string;
   paneId: string;
-  kind: "task" | "steer" | "interrupt" | "reply";
+  kind: "task" | "steer" | "interrupt" | "reply" | "wrapup";
   askId?: string;
   acceptedAssignment?: AcceptedAssignmentContract;
   briefProfile?: BriefProfile;
@@ -777,7 +777,8 @@ function validate(
       v.kind !== "task" &&
       v.kind !== "steer" &&
       v.kind !== "interrupt" &&
-      v.kind !== "reply"
+      v.kind !== "reply" &&
+      v.kind !== "wrapup"
     )
       throw new Error("Invalid request kind");
     if (
@@ -794,6 +795,9 @@ function validate(
       throw new Error("Invalid request address");
     if (typeof v.text !== "string" || !v.text.trim())
       throw new Error("Invalid request text");
+    if (v.kind === "wrapup" &&
+        (version !== ADDRESSED_REQUEST_PROTOCOL_VERSION || !UUID.test(v.text)))
+      throw new Error("Wrapup requires an addressed request and exact completion identity");
     if (currentRequestVersion(version)) {
       const needsAssignment = v.kind === "task" || v.kind === "interrupt";
       if (needsAssignment !== (v.acceptedAssignment !== undefined))

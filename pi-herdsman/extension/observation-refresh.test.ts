@@ -7,7 +7,6 @@ import {
   AGENT_ID,
   LEAD_SESSION_ID,
   WORKSPACE,
-  agentFromState,
   agentMailboxPath,
   ensureRadarDaemon,
   fakeAgentContext,
@@ -262,6 +261,7 @@ test("a recurring tick never opens a legacy transcript, and an explicit listing 
   context.hasUI = true;
   let widget: any;
   context.ui = {
+    setStatus: () => undefined,
     setWidget: (_key: string, content: unknown) => {
       if (typeof content === "function")
         widget = (content as any)(
@@ -378,6 +378,7 @@ const startLeafStatusProbe = async (t: any, label: string) => {
   context.hasUI = true;
   let widget: any;
   context.ui = {
+    setStatus: () => undefined,
     setWidget: (_key: string, content: unknown) => {
       if (typeof content === "function")
         widget = (content as any)(
