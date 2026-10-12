@@ -16,7 +16,8 @@ export interface RouteConfig {
   maxTransitions: number;
   maxRecoveries: number;
 }
-export interface Config { routes: Record<string, RouteConfig>; accounts: Record<string, Account>; quotas: Record<string, QuotaSource>; flushTimeoutMs: number; sharedHealth: boolean; pricingOverrides: Record<string, { input?: number; output?: number; cacheRead?: number; cacheWrite?: number }> }
+export interface Display { providers: Record<string, string>; models: Record<string, string> }
+export interface Config { display?: Display; routes: Record<string, RouteConfig>; accounts: Record<string, Account>; quotas: Record<string, QuotaSource>; flushTimeoutMs: number; sharedHealth: boolean; pricingOverrides: Record<string, { input?: number; output?: number; cacheRead?: number; cacheWrite?: number }> }
 const levels = ["off", "minimal", "low", "medium", "high", "xhigh"];
 function record(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Router config must be an object");
@@ -43,7 +44,20 @@ function parseQuota(where: string, value: unknown): QuotaSource {
 
 export function parseConfig(raw: unknown): Config {
   const config = record(raw);
-  keys(config, ["routes", "accounts", "quotas", "flushTimeoutMs", "sharedHealth", "pricing"]);
+  keys(config, ["routes", "accounts", "quotas", "flushTimeoutMs", "sharedHealth", "pricing", "display"]);
+  // Footer labels only: they never change routing, keys or telemetry. Models are keyed provider/id.
+  const displayRaw = record(config.display ?? {});
+  keys(displayRaw, ["providers", "models"]);
+  const display: Display = { providers: {}, models: {} };
+  for (const [provider, label] of Object.entries(record(displayRaw.providers ?? {}))) {
+    if (typeof label !== "string" || !label.trim()) throw new Error(`display.providers.${provider} must be a non-empty string`);
+    display.providers[provider] = label.trim();
+  }
+  for (const [id, label] of Object.entries(record(displayRaw.models ?? {}))) {
+    if (!id.includes("/")) throw new Error(`display.models key ${id} must be provider/id`);
+    if (typeof label !== "string" || !label.trim()) throw new Error(`display.models.${id} must be a non-empty string`);
+    display.models[id] = label.trim();
+  }
   const pricingOverrides: Record<string, { input?: number; output?: number; cacheRead?: number; cacheWrite?: number }> = {};
   for (const [id, value] of Object.entries(record(record(config.pricing ?? {}).overrides ?? {}))) {
     const parts = id.split("/");
@@ -114,7 +128,7 @@ export function parseConfig(raw: unknown): Config {
     };
     if (routes[role].outputReserve >= routes[role].contextWindow) throw new Error("outputReserve must be below contextWindow");
   }
-  return { routes, accounts, quotas, flushTimeoutMs: integer(config.flushTimeoutMs, 5000, 1, 60_000), sharedHealth: config.sharedHealth !== false, pricingOverrides };
+  return { routes, accounts, quotas, flushTimeoutMs: integer(config.flushTimeoutMs, 5000, 1, 60_000), sharedHealth: config.sharedHealth !== false, pricingOverrides, display };
 }
 
 // User-owned settings only: project config must not silently redirect paid requests.

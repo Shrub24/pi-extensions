@@ -317,12 +317,12 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     if (!ctx.hasUI) return;
     ctx.ui.setStatus(FOOTER_KEYS.physical, undefined);
     ctx.ui.setStatus(FOOTER_KEYS.peak, undefined);
-    ctx.ui.setStatus(FOOTER_KEYS.thinking, model !== undefined && model.provider !== "route" && model.reasoning ? ctx.thinkingLevel : undefined);
+    ctx.ui.setStatus(FOOTER_KEYS.thinking, model !== undefined && model.provider !== "route" && model.reasoning && ctx.thinkingLevel ? thinkingText(ctx.thinkingLevel, undefined) : undefined);
   };
   // The physical model, peak and effective thinking level of a request this route has just resolved.
   const publishRoute = (ctx: ExtensionContext, model: Model<Api>, account: string | undefined, effective: string, requested: string | undefined) => {
     if (!ctx.hasUI) return;
-    ctx.ui.setStatus(FOOTER_KEYS.physical, physicalText(model.id, account));
+    ctx.ui.setStatus(FOOTER_KEYS.physical, physicalText(model.provider, model.id, account, config.display));
     ctx.ui.setStatus(FOOTER_KEYS.peak, peakText(model.provider, model.id, options.now?.() ?? Date.now()));
     ctx.ui.setStatus(FOOTER_KEYS.thinking, model.reasoning ? thinkingText(effective, requested) : undefined);
   };
@@ -333,7 +333,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
   pi.on("thinking_level_select", (event, ctx) => {
     const model = ctx.model;
     if (!model || model.provider !== "route" || !config.routes[model.id]) {
-      if (ctx.hasUI) ctx.ui.setStatus(FOOTER_KEYS.thinking, model?.reasoning ? event.level : undefined);
+      if (ctx.hasUI) ctx.ui.setStatus(FOOTER_KEYS.thinking, model?.reasoning ? thinkingText(event.level, undefined) : undefined);
       return;
     }
     // A switch emits model_select before its thinking change is applied to the new model, so the

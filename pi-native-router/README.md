@@ -146,6 +146,27 @@ A route advertises every thinking level, so Shift+Tab and `/thinking` work on `r
 
 Switching model does not count as a choice: a physical model's own thinking level never becomes a route choice.
 
+`/route-thinking default` clears the choice, so candidate defaults apply again.
+
+### Footer status
+
+The router publishes three status items for powerline's `customItems` (`native-router-physical`, `native-router-peak`, `native-router-thinking`):
+
+- **Physical model:** `provider/model · account` for the candidate serving the current request. Before the first request on a route, the item is hidden.
+- **Peak:** a `▲` while the physical model is in a peak window.
+- **Thinking:** one bar per level, rising from `▁` (off) to `█` (max). A `✎` follows when you chose the level on the route.
+
+Labels are configurable under `display`. They change only what the footer shows, never routing, keys or telemetry:
+
+```json
+"display": {
+  "providers": { "opencode-go": "go" },
+  "models": { "opencode-go/deepseek-v4.1-flash": "ds-v4.1-flash" }
+}
+```
+
+Provider labels replace the provider part of `provider/model`. Model labels are keyed by `provider/id` and replace the model id.
+
 ## Decision log
 
 Each change of physical target is appended to `$PI_CODING_AGENT_DIR/pi-native-router/decisions.jsonl` (default `~/.pi/agent/...`, mode `0600`), one JSON object per line:
