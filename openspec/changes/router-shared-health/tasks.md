@@ -20,7 +20,7 @@ Prerequisite: router-api-key-accounts must supply stable account and correlated 
 
 - [ ] 3.1 Integrate shared eligibility/observations into retry, terminal and direct routing using the dispatched account, preserving configured order, sticky fallback, context floor and native retry ownership; verify scoped exhaustion does not spin or replay completed tools.
 - [ ] 3.2 Add operator inspect and explicit scoped reset with reason/deadline/probe/source status; test resetting X leaves Y and provider outage causes intact, and output identifies shared versus degraded-local coordination.
-- [ ] 3.3 Expose the narrow typed observation/reconciliation boundary required by future quota snapshots without fetching them; verify source-labelled quota causes cannot directly clear auth/rate/outage causes.
+- [x] 3.3 Expose the narrow typed observation/reconciliation boundary required by future quota snapshots without fetching them; verify source-labelled quota causes cannot directly clear auth/rate/outage causes.
 - [ ] 3.4 Document configuration/rollback to process-local mode and parent/worker parity; verify no account-less legacy route silently gains a new identity and direct routing does not mutate session state.
 
 ## 4. Cross-process acceptance

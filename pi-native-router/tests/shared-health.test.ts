@@ -125,3 +125,39 @@ test("a seven-day account reset deadline is kept, not truncated to the transient
   expect(failure).toMatchObject({ kind: "quota", scope: "provider" });
   expect(failure.delayMs).toBeGreaterThanOrEqual(week - 1000);
 });
+
+test("tracker quota reconciliation clears only tracker quota; auth and rate causes on the same scope survive", () => {
+  const root = dir();
+  try {
+    let now = 1000;
+    const store = new HealthStore(join(root, "health.sqlite"), () => now);
+    const key = "opencode-go#go-a";
+    store.mark(key, "auth", now + 60_000, "auth");
+    store.mark(key, "rate", now + 1, "rate");
+    now += 10;
+    const started = store.revision();
+    store.reconcileTrackerQuota(key, now + 30_000, started, "tracker exhausted");
+    expect(store.inspect().causes.map(cause => cause.kind).sort()).toEqual(["auth", "rate", "tracker-quota"]);
+    store.reconcileTrackerQuota(key, undefined, store.revision(), "tracker healthy");
+    expect(store.inspect().causes.map(cause => cause.kind).sort()).toEqual(["auth", "rate"]);
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a healthy tracker reading does not clear a tracker block written after it started", () => {
+  const root = dir();
+  try {
+    let now = 1000;
+    const store = new HealthStore(join(root, "health.sqlite"), () => now);
+    const key = "opencode-go#go-a";
+    const started = store.revision();
+    store.reconcileTrackerQuota(key, now + 30_000, store.revision(), "tracker exhausted");
+    store.reconcileTrackerQuota(key, undefined, started, "stale healthy reading");
+    expect(store.inspect().causes.map(cause => cause.kind)).toEqual(["tracker-quota"]);
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

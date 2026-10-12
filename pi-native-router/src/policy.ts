@@ -1,6 +1,7 @@
 import type { Api, AssistantMessage, Model } from "@earendil-works/pi-ai";
 import type { RouteConfig, Candidate } from "./config";
 import type { HealthStore } from "./health-store";
+import type { ErrorCauseKind } from "./health-store";
 
 export const identity = (model: { provider: string; id: string }, account?: string) => `${model.provider}/${model.id}${account ? `#${account}` : ""}`;
 export const physicalOf = (key: string) => key.split("#")[0];
@@ -71,7 +72,8 @@ export class Health {
     const key = scopeKeys(model, failure, account);
     const until = this.now() + failure.delayMs;
     this.local.set(key, Math.max(this.local.get(key) ?? 0, until));
-    this.attempt(() => this.store?.mark(key, failure.kind, until, failure.kind));
+    const kind: ErrorCauseKind = failure.kind;
+    this.attempt(() => this.store?.mark(key, kind, until, kind));
   }
   eligible(model: { provider: string; id: string }, account?: string) {
     const keys = admissionKeys(model, account);

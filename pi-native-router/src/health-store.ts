@@ -14,7 +14,12 @@ import { dirname } from "node:path";
 const SCHEMA_VERSION = 1;
 const LEASE_MS = 60_000;
 
-export interface CauseRecord { key: string; kind: string; until: number; revision: number; reason: string }
+/** Error-derived causes. Tracker quota is written only through `reconcileTrackerQuota`. */
+export type ErrorCauseKind = "transient" | "rate" | "quota" | "auth";
+/** Cause kinds this store records; `tracker-quota` is owned by the quota boundary alone. */
+export type CauseKind = ErrorCauseKind | "tracker-quota";
+
+export interface CauseRecord { key: string; kind: CauseKind; until: number; revision: number; reason: string }
 export interface LeaseRecord { key: string; holder: string; expires: number; revision: number }
 export interface ProbeLease { key: string; revision: number }
 
@@ -75,8 +80,12 @@ export class HealthStore {
     return undefined;
   }
 
-  /** Records a cause, keeping the strongest deadline. Each write takes a newer revision, fencing older results. */
-  mark(key: string, kind: string, until: number, reason: string): void {
+  /** Records an error-derived cause, keeping the strongest deadline. Each write takes a newer revision, fencing older results. */
+  mark(key: string, kind: ErrorCauseKind, until: number, reason: string): void {
+    this.writeCause(key, kind, until, reason);
+  }
+
+  private writeCause(key: string, kind: CauseKind, until: number, reason: string): void {
     this.tx(() => {
       const revision = this.nextRevision();
       this.db.prepare(`INSERT INTO causes (key, kind, until, revision, reason) VALUES (?, ?, ?, ?, ?)
@@ -176,10 +185,15 @@ export class HealthStore {
   }
 
   /**
-   * Clears a tracker-sourced quota cause, but only one written before `startedRevision`.
-   * Error-derived causes (auth, rate, outage, error quota) carry a different kind and are never touched.
+   * The only write path for tracker-sourced quota. A future `until` records or extends a `tracker-quota`
+   * cause; `undefined` clears one written before `startedRevision`. It never touches error-derived causes
+   * (auth, rate, quota, transient) on the same scope, so recovered quota cannot clear them.
    */
-  clearTrackerQuota(key: string, startedRevision: number): void {
+  reconcileTrackerQuota(key: string, exhaustedUntil: number | undefined, startedRevision: number, reason: string): void {
+    if (exhaustedUntil !== undefined) {
+      this.writeCause(key, "tracker-quota", exhaustedUntil, reason);
+      return;
+    }
     this.tx(() => {
       this.db.prepare("DELETE FROM causes WHERE key = ? AND kind = 'tracker-quota' AND revision <= ?").run(key, startedRevision);
     });
