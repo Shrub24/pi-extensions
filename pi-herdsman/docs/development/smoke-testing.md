@@ -69,6 +69,30 @@ Herdsman, copy normal Pi settings or extensions, or run as part of
 `npm run validate`. Run selected scenarios according to the change being
 verified; `npm run smoke` defaults to `core`.
 
+## Disposable Radar tmux acceptance
+
+This check needs no Herdr and no model. It drives the pinned Radar daemon on a
+uniquely named tmux server, with Herdr made unreachable: a PATH without a
+`herdr` executable, and `HERDR_SOCKET_PATH` pointing at a path that does not
+exist. It starts a real child process in a daemon-created pane and exercises
+launch, exact binding, the process verdict, context readback, close and journal
+resync.
+
+```sh
+RADAR_BIN=/path/to/pinned/radar \
+  node scripts/herdr-free-acceptance.mjs
+```
+
+`RADAR_BIN` must be the daemon built from the commit recorded in
+`.pi-herdsman/herdr-free-acceptance.md`. The script prints one JSON document
+with the binary's SHA-256, the Herdr proof and a status per item. It exits 0
+only when every item passed. Items it cannot drive (Herdsman startup
+acknowledgment, first assignment, saved-session continuation) are reported
+`not_reached`, so a partial run exits 1.
+
+It removes its tmux server, socket and temporary root on exit. It does not
+require or touch the live Herdr session used by `npm run smoke`.
+
 ## Preconditions
 
 Verify:
