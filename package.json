@@ -9,7 +9,6 @@
     "pi-otel",
     "pi-output-policy",
     "pi-reqcap",
-    "pi-subagents",
     "pi-tool-renderer"
   ],
   "scripts": {
