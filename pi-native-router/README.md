@@ -151,9 +151,9 @@ Switching model does not count as a choice: a physical model's own thinking leve
 
 The router publishes three status items for powerline's `customItems` (`native-router-physical`, `native-router-peak`, `native-router-thinking`):
 
-- **Physical model:** `provider/model · account` for the candidate serving the current request. Before the first request on a route, the item is hidden.
+- **Physical model:** `provider/model · account` for the candidate serving the current request. Before the first request on a route, it shows the candidate the next request will try.
 - **Peak:** a `▲` while the physical model is in a peak window.
-- **Thinking:** the level name that will run (e.g. `high`). A `✎` follows when you chose the level on the route.
+- **Thinking:** the one thinking state shown, for direct and route models alike: the level name that will run (e.g. `high`). A `✎` follows when you chose the level on the route. Keep Pi's built-in thinking segment out of the powerline layout so the level is shown once.
 
 The model part of `provider/model` is Pi's own model name, so model labels come from Pi's catalog and need no config. A provider's `name` replaces its id in the footer. Labels change only what the footer shows, never routing, keys or telemetry.
 

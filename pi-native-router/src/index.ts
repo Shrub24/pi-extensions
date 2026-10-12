@@ -70,6 +70,11 @@ async function activeOnly(candidates: Resolved[], ctx: ExtensionContext, config:
 const CACHE_ACTIVITY_ENTRY = "@vanillagreen/pi-native-router/cache-activity";
 /** The user's explicit thinking level while on a route, per role. Persisted so resumed branches keep it. */
 const THINKING_CHOICE_ENTRY = "@vanillagreen/pi-native-router/thinking-choice";
+
+/** The level a route request runs at: the user's route choice clamped to the physical model, else the candidate default. */
+function routeLevel(model: Parameters<typeof clampLevel>[0], candidateLevel: string, explicit: string | undefined): string {
+  return explicit === undefined ? candidateLevel : clampLevel(model, explicit);
+}
 const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 /** The user's physical pin per route, persisted on the branch: a candidate identity, or null for auto. Last entry wins. */
 const PIN_ENTRY = "@vanillagreen/pi-native-router/physical-pin";
@@ -281,7 +286,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       const unchanged = old && JSON.stringify(old) === JSON.stringify(state);
       // An explicit user choice on this route overrides the candidate default; reasoning-less models keep theirs.
       const explicit = userThinking(ctx, role);
-      const thinkingLevel = (explicit === undefined ? selected.candidate.thinkingLevel : clampLevel(selected.model, explicit)) as ModelThinkingLevel;
+      const thinkingLevel = routeLevel(selected.model, selected.candidate.thinkingLevel, explicit) as ModelThinkingLevel;
       publishRoute(ctx, selected.model, selected.candidate.account, thinkingLevel, explicit, isPinned(ctx, role));
       return { model: selected.model, thinkingLevel, state: unchanged ? request.state : state };
     };
@@ -339,29 +344,38 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     if (ctx.model) activeModel.set(ctx.sessionManager.getSessionId(), `${ctx.model.provider}/${ctx.model.id}`);
     publishSelection(ctx, ctx.model);
   });
-  // Footer items for the selected model. A route's physical model and peak are only known when a request resolves,
-  // so a route clears them until then; a direct model shows its session thinking level.
-  // The candidate the next request will try: the pin, else the last served physical, else route order. Shown before any
-  // request, so the footer and /route-pin cycling start from what the route will actually do.
+  // The footer's thinking item is the one thinking state shown: the level that will run. A direct model shows its
+  // session level; a route shows its user choice (marked ✎) or else the candidate default. Pi's built-in thinking
+  // segment is left out of the layout so the level is never shown twice.
+  // The route's physical model and peak are only known when a request resolves, so a route shows the candidate its
+  // next request will try (the pin, else the last served physical, else route order) until then.
   const displayed = (ctx: ExtensionContext, role: string): Resolved | undefined => {
     const route = config.routes[role];
     const pin = pinOf(ctx, role);
     const preferred = typeof pin === "string" ? pin : branchState(ctx, role)?.physical;
     return choose(route, available(route, ctx, config), health, ctx.getContextUsage()?.tokens ?? 0, preferred);
   };
-  const previewRoute = (ctx: ExtensionContext, role: string) => {
+  const clearRoute = (ctx: ExtensionContext) => {
+    ctx.ui.setStatus(FOOTER_KEYS.physical, undefined);
+    ctx.ui.setStatus(FOOTER_KEYS.peak, undefined);
+    ctx.ui.setStatus(FOOTER_KEYS.thinking, undefined);
+  };
+  const previewRoute = (ctx: ExtensionContext, role: string, explicit: string | undefined = userThinking(ctx, role)) => {
     if (!ctx.hasUI) return;
     const shown = displayed(ctx, role);
-    if (!shown) { ctx.ui.setStatus(FOOTER_KEYS.physical, undefined); ctx.ui.setStatus(FOOTER_KEYS.peak, undefined); return; }
+    if (!shown) { clearRoute(ctx); return; }
     const { model, candidate } = shown;
     ctx.ui.setStatus(FOOTER_KEYS.physical, physicalText(model.provider, model.name, candidate.account, config.display, isPinned(ctx, role)));
     ctx.ui.setStatus(FOOTER_KEYS.peak, peakText(model.provider, model.id, options.now?.() ?? Date.now()));
+    const level = routeLevel(model, candidate.thinkingLevel, explicit);
+    ctx.ui.setStatus(FOOTER_KEYS.thinking, model.reasoning ? thinkingText(level, explicit) : undefined);
   };
   const publishSelection = (ctx: ExtensionContext, model: Model<Api> | undefined) => {
     if (!ctx.hasUI) return;
-    if (model?.provider === "route" && config.routes[model.id]) previewRoute(ctx, model.id);
-    else { ctx.ui.setStatus(FOOTER_KEYS.physical, undefined); ctx.ui.setStatus(FOOTER_KEYS.peak, undefined); }
-    ctx.ui.setStatus(FOOTER_KEYS.thinking, model !== undefined && model.provider !== "route" && model.reasoning && ctx.thinkingLevel ? thinkingText(ctx.thinkingLevel, undefined) : undefined);
+    if (model?.provider === "route" && config.routes[model.id]) { previewRoute(ctx, model.id); return; }
+    ctx.ui.setStatus(FOOTER_KEYS.physical, undefined);
+    ctx.ui.setStatus(FOOTER_KEYS.peak, undefined);
+    ctx.ui.setStatus(FOOTER_KEYS.thinking, model?.reasoning && ctx.thinkingLevel ? thinkingText(ctx.thinkingLevel, undefined) : undefined);
   };
   // The physical model, peak and effective thinking level of a request this route has just resolved.
   const publishRoute = (ctx: ExtensionContext, model: Model<Api>, account: string | undefined, effective: string, requested: string | undefined, pinned: boolean) => {
@@ -380,13 +394,13 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       if (ctx.hasUI) ctx.ui.setStatus(FOOTER_KEYS.thinking, model?.reasoning ? thinkingText(event.level, undefined) : undefined);
       return;
     }
-    // A switch emits model_select before its thinking change is applied to the new model, so the
-    // current model is the route only when the last switch (or the session's initial model) was the route.
+    // A model switch sets the new model before its thinking change, so ctx.model is the target here. The change is a
+    // user choice only when the route was already the active model; a switch into the route from elsewhere is not.
     const known = activeModel.get(ctx.sessionManager.getSessionId());
     if (known !== undefined && known !== `route/${model.id}`) return;
     pi.appendEntry(THINKING_CHOICE_ENTRY, { role: model.id, level: event.level });
-    // The next request resolves the physical candidate and clamps this choice; until then it is shown as pending.
-    if (ctx.hasUI) ctx.ui.setStatus(FOOTER_KEYS.thinking, thinkingText(event.level, event.level));
+    // The next request clamps this choice to the physical candidate; the footer shows the clamped level now.
+    previewRoute(ctx, model.id, event.level);
   });
   pi.on("session_start", () => {
     if (quotaScopes.length === 0 || !store) return;
