@@ -132,13 +132,51 @@ destination reads and drops the other.
 | — | `latitude.tags` duplicates `langfuse.trace.tags` | Latitude and Langfuse |
 | — | `latitude.metadata` duplicates `langfuse.trace.metadata.*` (dotted and underscored key names) | Latitude and Langfuse |
 
+## Rebuilding a vendor key in the collector
+
+Whether the exporter can stop emitting a vendor key depends on whether a
+collector transform can produce it. A transform runs per span and sees only that
+span's attributes.
+
+| Vendor key | Derived from | Collector |
+|---|---|---|
+| `langfuse.trace.name` | `pi.session.name` | copy |
+| `langfuse.trace.metadata.*` | eight `pi.*` fields, cut to 256 characters | copy, then cut |
+| `langfuse.trace.tags` | up to four `prefix:value` tags, each present only with its attribute and only under 200 characters | guarded `append` per tag |
+| `langfuse.observation.output` (LLM span) | `gen_ai.output.messages`, the same string | copy |
+| `langfuse.observation.input` (tool span) | `gen_ai.tool.call.arguments` | copy |
+| `langfuse.observation.output` (tool span) | `gen_ai.tool.call.result` | copy |
+| `latitude.capture.name` | the run root's own span name | copy the span name |
+| `langfuse.observation.type` | the span's identity: `agent` for the run root, `chain` for a turn, `generation` for a model request, `tool` for a tool call, `span` for an attempt or a compaction | no — `gen_ai.operation.name` is `chat` on a turn *and* on a model request, so no attribute separates `chain` from `generation`; the mapping needs span names |
+| `langfuse.observation.input` (run root) | JSON wrapping the raw prompt text | no — needs JSON escaping |
+| `langfuse.observation.input` (LLM span) | a JSON object composed from system instructions, input messages and tool definitions | no — needs JSON construction and escaping |
+| `langfuse.observation.output` (run root) | the child LLM span's `gen_ai.output.messages` | no — a span-context transform cannot read another span |
+| `latitude.tags` | JSON array string of the tag list | no — needs JSON encoding |
+| `latitude.metadata` | JSON object string of the eight `pi.*` fields, cut to 256 characters | no — needs JSON encoding |
+
+Checked against the pinned Collector 0.155.0 function list
+(`pkg/ottl/ottlfuncs/README.md` at tag `v0.155.0`): no function escapes or encodes
+JSON. `ParseJSON` only parses, and `Concat` splices values unescaped, so a single
+quote or backslash in a prompt or a session name would corrupt the result.
+`stringify_all` does marshal map and slice values to JSON, but it rewrites every
+non-string value in the span's attribute map, which would also turn
+`langfuse.trace.tags` into a string. The rows marked "no" therefore need a Lua
+processor, or they stay where they are.
+
+The exporter cuts metadata with `String.prototype.slice`, i.e. in UTF-16 code
+units, so a collector-side cut is not byte-identical for text outside the basic
+plane.
+
 ## Current state
 
-- **The exporter still emits every vendor-native key above.** Removing the
-  duplicates from the exporter is gated on the collector transforms being
-  committed and verified against both backends. Removing them first would strip
-  Latitude tags and metadata and Langfuse observation input and output before the
-  collector provides them.
+- **The exporter still emits every vendor-native key above.** Only the copy rows
+  can move to the collector, and only once that copy is committed and verified:
+  until then Langfuse would lose its trace name and metadata and the LLM and tool
+  observation output. The "no" rows stay exporter-emitted, so the duplication is
+  only partly removable at the source.
+- **A route can always drop the foreign keys.** Deleting what a destination does
+  not read is mechanical and needs no rebuild, which is what the collector does
+  today.
 - **Nothing is truncated for size.** Every captured payload — prompts, messages,
   tool arguments and results, span-event content, and log bodies — is exported
   whole. The destinations own their own size limits.
