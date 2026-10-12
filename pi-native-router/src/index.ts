@@ -345,7 +345,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     publishSelection(ctx, ctx.model);
   });
   // The footer's thinking item is the one thinking state shown: the level that will run. A direct model shows its
-  // session level; a route shows its user choice (marked ✎) or else the candidate default. Pi's built-in thinking
+  // session level; a route shows its user choice (marked with the pencil glyph) or else the candidate default. Pi's built-in thinking
   // segment is left out of the layout so the level is never shown twice.
   // The route's physical model and peak are only known when a request resolves, so a route shows the candidate its
   // next request will try (the pin, else the last served physical, else route order) until then.

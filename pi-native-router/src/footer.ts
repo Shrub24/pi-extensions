@@ -26,10 +26,13 @@ export function peakText(provider: string, id: string, atMs: number): string | u
   return isPeakPriced(provider, id, atMs) || isPeakRecorded(provider, id, atMs) ? "▲" : undefined;
 }
 
+/** Nerd Font `nf-fa-pencil` (U+F040), marking a thinking level the user chose on the route. */
+const USER_CHOICE_GLYPH = "\uF040";
+
 /**
  * The thinking level that will run, by its raw name. A level the user chose on the route adds a pencil
- * mark; otherwise the candidate's default applies and the name stands alone.
+ * mark after a space; otherwise the candidate's default applies and the name stands alone.
  */
 export function thinkingText(effective: string, requested: string | undefined): string {
-  return requested === undefined ? effective : `${effective}✎`;
+  return requested === undefined ? effective : `${effective} ${USER_CHOICE_GLYPH}`;
 }
