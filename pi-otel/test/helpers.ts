@@ -185,6 +185,8 @@ export function asstMsg(opts: {
   reasoning?: number;
   totalTokens?: number;
   cost?: number;
+  /** Per-side cost components, as Pi reports them in usage.cost. */
+  costParts?: { input: number; output: number; cacheRead: number; cacheWrite: number };
   peakMultiplier?: number;
   pricingSource?: "catalog" | "override";
   stopReason?: string;
@@ -214,7 +216,7 @@ export function asstMsg(opts: {
       cacheWrite1h: opts.cacheWrite1h,
       reasoning: opts.reasoning,
       totalTokens: opts.totalTokens,
-      cost: { total: opts.cost },
+      cost: { total: opts.cost, ...(opts.costParts ?? {}) },
       ...(opts.peakMultiplier === undefined ? {} : { peakMultiplier: opts.peakMultiplier }),
       ...(opts.pricingSource === undefined ? {} : { pricingSource: opts.pricingSource }),
     },

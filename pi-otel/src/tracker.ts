@@ -49,6 +49,8 @@ import {
   ATTR_GEN_AI_CACHE_WRITE_TOKENS,
   ATTR_GEN_AI_CONVERSATION_ID,
   ATTR_GEN_AI_COST_USD,
+  ATTR_GEN_AI_INPUT_COST_USD,
+  ATTR_GEN_AI_OUTPUT_COST_USD,
   ATTR_GEN_AI_TOTAL_TOKENS,
   ATTR_SESSION_ID,
   ATTR_GEN_AI_INPUT_MESSAGES,
@@ -1187,6 +1189,12 @@ export class SpanTracker {
     }
     if (typeof u.cost?.total === "number") {
       set(ATTR_GEN_AI_COST_USD, u.cost.total);
+      // Latitude's breakdown needs the sides; cache reads and writes fold into the input side, as Latitude defines it.
+      const { input, output, cacheRead, cacheWrite } = u.cost;
+      if ([input, output, cacheRead, cacheWrite].every(v => typeof v === "number" && Number.isFinite(v))) {
+        set(ATTR_GEN_AI_INPUT_COST_USD, input! + cacheRead! + cacheWrite!);
+        set(ATTR_GEN_AI_OUTPUT_COST_USD, output!);
+      }
     }
     // Set by the native router when it applied time-of-day pricing to this message's cost.
     const peak = (u as { peakMultiplier?: unknown }).peakMultiplier;

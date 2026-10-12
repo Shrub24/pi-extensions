@@ -357,6 +357,44 @@ describe("llm usage attribution", () => {
     assert.equal(h.span(SPAN_LLM_REQUEST).attributes["pi.pricing.peak_multiplier"], undefined);
   });
 
+  test("exports the input and output cost sides, with cache folded into input, so the sides sum to the total", async () => {
+    h.tracker.startSession();
+    h.tracker.startInteraction("p");
+    h.tracker.startTurn(0);
+    h.tracker.startLlm("claude-haiku-4-5", "anthropic");
+    h.tracker.completeLlm(asstMsg({
+      input: 100, output: 50, cacheRead: 400, cacheWrite: 20, cost: 0.0011,
+      costParts: { input: 0.0001, output: 0.0005, cacheRead: 0.0004, cacheWrite: 0.0001 },
+      stopReason: "stop", provider: "anthropic", model: "claude-haiku-4-5",
+    }));
+    h.tracker.endTurn();
+    h.tracker.endInteraction();
+    h.tracker.endSession();
+    await h.flush();
+    const a = h.span(SPAN_LLM_REQUEST).attributes;
+    const input = a["gen_ai.usage.input_cost"] as number;
+    const output = a["gen_ai.usage.output_cost"] as number;
+    assert.ok(Math.abs(input - 0.0006) < 1e-12, "input side is uncached input plus cache reads and writes");
+    assert.ok(Math.abs(output - 0.0005) < 1e-12);
+    assert.ok(Math.abs(input + output - (a["gen_ai.usage.cost"] as number)) < 1e-12, "sides sum to the exported total");
+  });
+
+  test("omits the cost sides when Pi reports only a total", async () => {
+    h.tracker.startSession();
+    h.tracker.startInteraction("p");
+    h.tracker.startTurn(0);
+    h.tracker.startLlm("deepseek-v4-flash", "opencode-go");
+    h.tracker.completeLlm(asstMsg({ input: 100, output: 50, cost: 0.0012, stopReason: "stop", provider: "opencode-go", model: "deepseek-v4-flash" }));
+    h.tracker.endTurn();
+    h.tracker.endInteraction();
+    h.tracker.endSession();
+    await h.flush();
+    const a = h.span(SPAN_LLM_REQUEST).attributes;
+    assert.equal(a["gen_ai.usage.cost"], 0.0012);
+    assert.equal(a["gen_ai.usage.input_cost"], undefined);
+    assert.equal(a["gen_ai.usage.output_cost"], undefined);
+  });
+
   test("exports the pricing source only for catalog or override estimates", async () => {
     for (const source of ["catalog", "override"] as const) {
       h.tracker.startSession();

@@ -74,6 +74,9 @@ export const ATTR_GEN_AI_CACHE_CREATION_INPUT_TOKENS = "gen_ai.usage.cache_creat
 export const ATTR_GEN_AI_REASONING_OUTPUT_TOKENS = "gen_ai.usage.reasoning.output_tokens";
 // Cost total in USD. Read as the standard cost field by Latitude and Langfuse.
 export const ATTR_GEN_AI_COST_USD = "gen_ai.usage.cost";
+// Cost sides read by Latitude's cost breakdown. The input side includes cache reads and writes, as Latitude defines it.
+export const ATTR_GEN_AI_INPUT_COST_USD = "gen_ai.usage.input_cost";
+export const ATTR_GEN_AI_OUTPUT_COST_USD = "gen_ai.usage.output_cost";
 // Total tokens as pi reports them. Ingest uses it to resolve inclusive-vs-additive
 // input-token arithmetic instead of guessing from the provider name.
 export const ATTR_GEN_AI_TOTAL_TOKENS = "gen_ai.usage.total_tokens";
