@@ -322,7 +322,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
   // The physical model, peak and effective thinking level of a request this route has just resolved.
   const publishRoute = (ctx: ExtensionContext, model: Model<Api>, account: string | undefined, effective: string, requested: string | undefined) => {
     if (!ctx.hasUI) return;
-    ctx.ui.setStatus(FOOTER_KEYS.physical, physicalText(model.provider, model.id, account));
+    ctx.ui.setStatus(FOOTER_KEYS.physical, physicalText(model.id, account));
     ctx.ui.setStatus(FOOTER_KEYS.peak, peakText(model.provider, model.id, options.now?.() ?? Date.now()));
     ctx.ui.setStatus(FOOTER_KEYS.thinking, model.reasoning ? thinkingText(effective, requested) : undefined);
   };
