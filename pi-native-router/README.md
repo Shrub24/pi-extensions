@@ -145,7 +145,7 @@ A route advertises every thinking level, so Shift+Tab and `/thinking` work on `r
 
 Switching model does not count as a choice: a physical model's own thinking level never becomes a route choice.
 
-`/route-thinking default` clears the choice, so candidate defaults apply again.
+`/route-thinking default` clears the choice, so candidate defaults apply again. A change to the level the shown candidate would run at anyway is stored as no choice, so the pencil only marks a level that differs from the default.
 
 ### Footer status
 

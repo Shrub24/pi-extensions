@@ -360,13 +360,15 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     ctx.ui.setStatus(FOOTER_KEYS.peak, undefined);
     ctx.ui.setStatus(FOOTER_KEYS.thinking, undefined);
   };
-  const previewRoute = (ctx: ExtensionContext, role: string, explicit: string | undefined = userThinking(ctx, role)) => {
+  // `choice` is the route's thinking choice: undefined reads it from the branch, null means no choice.
+  const previewRoute = (ctx: ExtensionContext, role: string, choice: string | null | undefined = userThinking(ctx, role)) => {
     if (!ctx.hasUI) return;
     const shown = displayed(ctx, role);
     if (!shown) { clearRoute(ctx); return; }
     const { model, candidate } = shown;
     ctx.ui.setStatus(FOOTER_KEYS.physical, physicalText(model.provider, model.name, candidate.account, config.display, isPinned(ctx, role)));
     ctx.ui.setStatus(FOOTER_KEYS.peak, peakText(model.provider, model.id, options.now?.() ?? Date.now()));
+    const explicit = choice ?? undefined;
     const level = routeLevel(model, candidate.thinkingLevel, explicit);
     ctx.ui.setStatus(FOOTER_KEYS.thinking, model.reasoning ? thinkingText(level, explicit) : undefined);
   };
@@ -398,9 +400,13 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     // user choice only when the route was already the active model; a switch into the route from elsewhere is not.
     const known = activeModel.get(ctx.sessionManager.getSessionId());
     if (known !== undefined && known !== `route/${model.id}`) return;
-    pi.appendEntry(THINKING_CHOICE_ENTRY, { role: model.id, level: event.level });
+    // A choice that runs at the shown candidate's default changes nothing, so it is stored as no choice (like a pin on auto).
+    const shown = displayed(ctx, model.id);
+    const matchesDefault = shown !== undefined && clampLevel(shown.model, event.level) === clampLevel(shown.model, shown.candidate.thinkingLevel);
+    const choice = matchesDefault ? null : event.level;
+    pi.appendEntry(THINKING_CHOICE_ENTRY, { role: model.id, level: choice });
     // The next request clamps this choice to the physical candidate; the footer shows the clamped level now.
-    previewRoute(ctx, model.id, event.level);
+    previewRoute(ctx, model.id, choice);
   });
   pi.on("session_start", () => {
     if (quotaScopes.length === 0 || !store) return;
