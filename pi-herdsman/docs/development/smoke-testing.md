@@ -35,7 +35,6 @@ npm run smoke
 npm run smoke -- core
 npm run smoke -- continuation
 npm run smoke -- chief-tree
-npm run smoke -- manager-recovery
 ```
 
 `npm run smoke` runs the default `core` scenario. The harness creates a
@@ -55,10 +54,7 @@ managed descendants do not load the probe.
 
 The available scenarios are `core` (nested delegation and candidate-extension
 propagation), `continuation` (persisted Pi-session continuation across managed
-generations), `chief-tree` (current Chief/session_tree behavior), and
-`manager-recovery` (Manager delegation, review messaging, `staff_stop`, missing
-worktree reconstruction with exact Pi-session continuity, retained project
-messages across Manager turnover, and Manager-owned project resolution).
+generations), and `chief-tree` (current Chief/session_tree behavior).
 `chief-tree` records ordinary Lead, Chief, and post-`session_tree` tool
 snapshots and verifies Chief differs from Lead while selecting a pre-Chief
 branch restores ordinary Lead tools. It does not
@@ -306,19 +302,17 @@ After every smoke:
 - disposable herdr resources are closed by exact ID;
 - no repository source file changed unless the smoke explicitly required it.
 
-## Project Manager / Chief supervision live matrix
+## Chief supervision live matrix
 
-`manager-recovery` is the canonical automated live Manager lifecycle check. It
-covers fresh delegation, project review messaging, pause/resume, missing
-worktree recovery, exact Pi-session continuity, retained project messages
-across Manager turnover, completion, and exact cleanup.
-
-The broader matrix below remains optional exploratory acceptance for supervision
-behavior not covered by the automated scenarios. A NOT RUN entry is not a claim
+The matrix below is optional exploratory acceptance for supervision behavior. A NOT RUN entry is not a claim
 of failure.
 
 The manual checks below are **NOT RUN**, not claims of failure or success.
 Automated live scenario results are separate and do not replace these checks.
+
+Every focus row below needs a running `radar daemon` that advertises `observe`
+and `focus`. Focus routes through Agent Radar, and without that daemon no focus
+is performed; see the [command reference](../reference/commands.md#focus-actions).
 
 | Scenario                                                                                                                                                                       | Result  |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------- |
@@ -352,8 +346,6 @@ Automated live scenario results are separate and do not replace these checks.
 | A quarantined message does not block a new message to the same lead                                                                                                            | NOT RUN |
 | Leads retain descendant ownership after a Chief `message`                                                                                                                      | NOT RUN |
 | Lead `supervisor_message` reaches the active Chief                                                                                                                             | NOT RUN |
-| Assigned Lead `supervisor_message` reaches the active Manager as project-scoped coordination                                                                                   | NOT RUN |
-| An assigned Lead can retain a project message while no Manager is active; a replacement Manager receives it                                                                    | NOT RUN |
 | Metadata publication failure does not remove communication eligibility                                                                                                         | NOT RUN |
 | Ordinary lead messages leave lead coordination state unchanged                                                                                                                 | NOT RUN |
 | Follow-up delivery while the receiver is streaming, never steering                                                                                                             | NOT RUN |

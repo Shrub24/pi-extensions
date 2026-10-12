@@ -615,6 +615,28 @@ export function agentDefinitionMetadata(
   };
 }
 
+/**
+ * One line per delegable definition for the session-start system prompt.
+ * Full metadata stays on agent_list; disabled definitions are omitted because
+ * they cannot be delegated to.
+ */
+export function agentDefinitionRosterLines(
+  definitions: Record<string, unknown>[],
+): string {
+  return definitions
+    .filter((definition) => definition.enabled !== false)
+    .map((definition) => {
+      const description =
+        typeof definition.description === "string"
+          ? definition.description.replace(/\s+/g, " ").trim()
+          : "";
+      return description
+        ? `- ${definition.name}: ${description}`
+        : `- ${definition.name}`;
+    })
+    .join("\n");
+}
+
 export type AgentOverrideField = "model" | "thinking" | "enabled";
 
 export function updateAgentOverride(
@@ -828,7 +850,12 @@ export function deniedDiscoveryModelError(input: {
   );
 }
 
-function configuredThinking(agent: AgentDefinition): string | undefined {
+/**
+ * The thinking level a definition pins, or `undefined` when it inherits one.
+ * Exported because a launch's own record of what it started needs the same
+ * answer the argument builder used.
+ */
+export function configuredThinking(agent: AgentDefinition): string | undefined {
   const configured = agent.frontmatter.thinking;
   if (configured === false) return "off";
   if (typeof configured !== "string") return undefined;

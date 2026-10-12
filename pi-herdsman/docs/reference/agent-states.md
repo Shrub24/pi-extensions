@@ -1,6 +1,5 @@
 # Agent states
 
-[Herdr pane metadata](pane-metadata.md) publishes this projection separately from Herdr's semantic state; Radar owns its presentation.
 
 [Documentation index](../README.md)
 
@@ -89,9 +88,10 @@ its process is still proved live. An `idle` worker's `available_tools` is exactl
 `agent_close`; it never lists steering, interrupt, reply, or extend. `idle` is
 not stale, never receives inactivity attention or a soft-deadline digest, and
 does not keep its owner's herd run open. When `retainWorkers` is `false` the
-delivered worker is closed and removed instead, so `idle` never appears. A
-retained worker whose process is proven absent projects as `lost` under the same
-rules as any other worker.
+delivered worker is closed and removed instead, so `idle` never appears; its Pi
+session survives, and `agent_list` reports it under `saved_sessions` while no
+mailbox represents it. A retained worker whose process is proven absent projects
+as `lost` under the same rules as any other worker.
 
 ## `blocked` and owner questions
 
@@ -137,15 +137,17 @@ episode. It does not add mutation actions, prove loss, or broaden `ask_owner`.
 When exact physical evidence changes, re-evaluate the record from fresh state.
 
 A pane that resolves an occupant but not the run-scoped alias is also `unknown`.
-Every destructive control closes a generation through `herdr agent get <alias>`,
-so a pane whose agent never reported that alias — or that holds a different or
-unnamed one — cannot authorize a close, a retirement, or a relaunch. The record
+A destructive control closes a generation only through the record that proves it:
+a Radar-launched child through its own launch binding and startup acknowledgment,
+and nothing else at all — a mailbox this build did not launch through Radar
+refuses a physical close outright. A pane whose occupant reports a different or
+unnamed identity therefore cannot authorize a close, a retirement, or a relaunch. The record
 keeps its empty `available_tools` list, carries a diagnostic naming the pane and
 the alias, and preserves its mailbox and saved Pi session for the operator to
 resolve. Alias absence alone never proves loss.
 
-`lost` is different: a coherent Herdr inventory proves the expected pane,
-session, and run-scoped alias are absent. It is not completion or task failure;
+`lost` is different: a coherent fleet observation from the daemon proves the
+expected pane absent. It is not completion or task failure;
 use direct-owner `agent_close` to abandon the unresolved generation when the
 applicable close preflight succeeds. Lost attention may repeat for the direct
 owner while the assignment remains unresolved.

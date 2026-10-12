@@ -29,7 +29,6 @@ import {
 } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { basename, join } from "node:path";
-import { OWNER_METADATA_TTL_MS } from "./pane-metadata.ts";
 import { herdsmanDataRoot } from "./storage.ts";
 
 export const CONTROL_PROTOCOL_VERSION = 1;
@@ -37,10 +36,6 @@ export const CONTROL_REQUEST_LIMIT_BYTES = 8_192;
 export const CONTROL_DIRECTORY_MODE = 0o700;
 export const CONTROL_FILE_MODE = 0o600;
 export const CONTROL_RESULT_RETENTION_MS = 24 * 60 * 60 * 1000;
-/** The wake hint is short-lived; a missed token leaves the result file. */
-export const CONTROL_METADATA_KEY = "pi_herdsman_control";
-export const CONTROL_METADATA_SOURCE = "pi-herdsman:control";
-export const CONTROL_METADATA_TTL_MS = OWNER_METADATA_TTL_MS;
 
 export type ControlOperation = "close" | "restart";
 export type ControlOutcome = "closed" | "restarted" | "refused" | "unknown";

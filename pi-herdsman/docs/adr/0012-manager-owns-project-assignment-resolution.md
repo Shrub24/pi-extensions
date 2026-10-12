@@ -1,5 +1,7 @@
 # Manager owns project assignment resolution
 
+Superseded by [ADR 0034](0034-remove-manager-orchestration.md): Manager is removed.
+
 ## Decision
 
 - An existing project assignment represents unresolved project work; absence of

@@ -35,49 +35,32 @@ Managed Agents contact their exact direct owner through
 The lifecycle and execution-ownership rules are documented in
 [Lifecycle](concepts/lifecycle.md) and [Delegation](concepts/delegation.md).
 
-## Direct reports and project work
+## Direct reports
 
-Chief and Manager use [Staff tools](reference/staff.md) for direct-report
-observation and communication.
-
-Manager additionally uses branch-based staff operations to start, resume, pause,
-complete, or abandon project work.
+Chief uses [Staff tools](reference/staff.md) for direct-report observation and
+communication.
 
 ```text
 staff_list
 staff_inspect
 staff_transcript
 staff_message
-
-Manager only:
-staff_delegate
-staff_stop
-staff_complete
-staff_discard
 ```
 
 ## Direct supervisor
 
-Ordinary Leads and Managers communicate upward through
-[Supervisor tools](reference/supervisor.md).
+Ordinary Leads communicate upward through [Supervisor tools](reference/supervisor.md).
 
 ```text
 supervisor_message
 ```
 
-Assigned Lead messages are retained with their project assignment and are
-nonterminal. Manager resolves project work with `staff_complete` or
-`staff_discard`; `staff_stop` pauses execution without removing the assignment.
-
-An assigned project Lead saves messages with its project assignment for the
-current or a replacement Manager, even when no Manager is active; it does not
-route those messages to Chief. An unassigned Lead routes to its active Manager
-when one exists, otherwise to Chief. A Manager routes to Chief.
+The message routes to Chief.
 
 ## Same-role peers
 
-Ordinary Leads and active Managers can discover and message live peers of the
-same role through [Peer tools](reference/peer.md):
+Ordinary Leads can discover and message live peer Leads through
+[Peer tools](reference/peer.md):
 
 ```text
 peer_list
@@ -94,5 +77,5 @@ Slash commands and TUI surfaces are separate from the model-facing contracts:
 - [Status widget](reference/status-widget.md)
 - [Getting started](getting-started.md)
 
-For the relationship between Chief, Manager, Lead, Agent, project work, and
-Herdr worktree scope, read [Coordination](concepts/coordination.md).
+For the relationship between Chief, Lead, and Agent, read
+[Coordination](concepts/coordination.md).

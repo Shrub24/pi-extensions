@@ -28,9 +28,11 @@ Use these high-salience rules for the model-facing agent boundary:
 
 - Use `agent_delegate` for genuinely independent or context-heavy work; keep small,
   tightly coupled work local.
-- Each unresolved unit of work has one executor. Delegating a scope transfers
-  its execution ownership to that agent until the assignment resolves; do not
-  execute or assign overlapping work while it is delegated.
+- Each unresolved assignment has one execution owner. Delegating transfers its
+  implementation and investigation ownership to that agent until the assignment
+  resolves; do not make competing edits or start overlapping investigation while
+  it is delegated. Architectural and acceptance responsibility stays with the
+  coordinator, who verifies delivered results before accepting them.
 - For new or updated agent assignments, `task`/`message` and `files` carry
   assignment evidence. Pass every user-supplied or already-available artifact
   relevant to the target's work through `files`; do not assume the caller's
@@ -62,8 +64,9 @@ managed-agent Pi session.
 A managed agent executes one assignment at a time. A delivered worker is
 retained by default (`retainWorkers: true`): the verified live process, pane,
 label and mailbox survive delivery and the worker projects as `idle` until a
-later assignment reuses it or you close it. With `retainWorkers: false` it is
-cleaned up after delivery instead. To continue completed work with its existing
+later assignment reuses it or you close it. With `retainWorkers: false` its
+process and pane are cleaned up at delivery instead, which removes the live
+worker but not its Pi session. To continue completed work with its existing
 context, use the exact session returned with the result.
 
 A retained idle worker still holds a live pane and its full context. When its
@@ -96,8 +99,10 @@ are available only when listed. Read-only `agent_inspect` captures bounded live 
 `agent_transcript` captures bounded persisted Pi conversation and tool evidence
 when listed. Neither changes agent
 state. A delivered worker with a retained pane stays available for another
-assignment through `agent_continue`; with `retainWorkers: false` it is cleaned up
-at delivery and is not reused.
+assignment through `agent_continue`. With `retainWorkers: false` its process and
+pane are cleaned up at delivery, but its Pi session is not: `agent_list` reports
+it under `saved_sessions`, and `agent_continue` with its exact session restores
+that context in a new process.
 
 Use `agent_steer` only to change active work non-preemptively. Steering does not cancel
 an in-flight model or tool operation; Pi may queue it until the current
@@ -211,10 +216,12 @@ of duplicating work.
 
 <!-- pi-herdsman-runtime-delegating-agent:start -->
 
-Each unresolved unit of work has one executor. Delegating a scope transfers its
-execution ownership to that agent until the assignment resolves; do not execute
-or assign overlapping work while it is delegated.
-Integrate direct agent results after resolution.
+Each unresolved assignment has one execution owner. Delegating transfers its
+implementation and investigation ownership to that agent until the assignment
+resolves; do not make competing edits or start overlapping investigation while
+it is delegated. Architectural and acceptance responsibility stays with the
+coordinator, who verifies delivered results before accepting them.
+Verify direct agent results after resolution, then integrate them.
 Own only the assigned objective and your direct permitted agents. Agent-started
 agents are leaves. As a Lead, keep tightly coupled work local; delegate bounded independent
 or unfamiliar work when useful. Reuse adequate supplied evidence rather than
@@ -400,16 +407,13 @@ sharing a material warning, progress update, or review handoff. Descendants use
 `ask_owner`, not supervisor tools. Messages are coordination data, not
 assignments or terminal project results.
 
-`supervisor_message` is available to ordinary Leads and Managers. Assigned Lead
-messages are retained with the project and remain available to a replacement
-Manager, including when no Manager is active at send time. Manager messages to
-Leads use `staff_message`. For files, these tools accept ordinary paths,
+`supervisor_message` is available to ordinary Leads, and Chief messages Leads
+with `staff_message`. For files, these tools accept ordinary paths,
 reusable direct-agent result refs, and already-supplied canonical result refs
 through `files`.
 
 Chief uses `staff_list`, `staff_inspect`, `staff_transcript`, and
-`staff_message`. Manager has those direct-report tools plus `staff_delegate`,
-`staff_stop`, `staff_complete`, and `staff_discard`. `staff_inspect` provides
+`staff_message`. `staff_inspect` provides
 bounded live terminal/process evidence; `staff_transcript` provides bounded
 persisted Pi conversation/tool evidence. Target a Lead by the exact full Pi
 session ID in a fresh snapshot or `staff_list`, never by `display_name`.
@@ -437,33 +441,8 @@ not ownership or project-resolution authority.
 
 Pi Herdsman uses one durable vocabulary:
 
-- a **project** is the Herdsman coordination scope corresponding to one Herdr
-  worktree group: its primary workspace and linked-worktree workspaces;
-- a **Manager** explicitly assumes dedicated project coordination from that
-  group's primary workspace, has no `agent` capability, and does not own Leads'
-  Agents; delegated implementation belongs to Leads and their Agent trees;
-- project work belongs to the project, not a Manager session. The project
-  assignment represents open work and its Git branch is the work handle. A
-  Manager starts work with `staff_delegate` using `task` and optional `branch`,
-  and uses `staff_delegate` with `branch` only to resume existing work. Missing
-  worktrees are reconstructed from the same branch, resuming the exact saved Pi
-  session when available;
-- assigned Lead `supervisor_message` calls are nonterminal coordination and
-  review handoffs retained across Manager absence and turnover. Project work
-  remains open through implementation and review iterations;
-- `staff_stop` stops an exact Lead and its owned Agent tree while preserving
-  the assignment, Pi session, branch, and worktree. Only Manager
-  `staff_complete` or `staff_discard` resolves the assignment, preserving the
-  Git branch and worktree. Never infer ownership from worktree membership or
-  start an overlapping writer beside another Lead;
-- `/manager leave` preserves project work; a later Manager can resume or
-  resolve the same branch-based assignment;
 - a **herd** is one Lead and the complete Agent tree it owns;
-- a **Lead** owns its Agents. An assigned project Lead sends
-  `supervisor_message` to project-scoped storage for the current or a
-  replacement Manager, even when no Manager is active; it does not route those
-  messages to Chief. An unassigned Lead routes to its active Manager when one
-  exists, otherwise to Chief;
+- a **Lead** owns its Agents and sends `supervisor_message` to Chief;
 - an **Agent** handles one bounded assignment and may delegate only when its
   definition allows it;
 - the **chief** supervises leads through the four `staff_*` semantic tools and

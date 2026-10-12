@@ -2,14 +2,14 @@
 
 [Documentation index](../README.md) · [Coordination](../concepts/coordination.md)
 
-`peer` is horizontal coordination between live sessions of the **same coordinator role**: Lead ↔ Lead or Manager ↔ Manager. Discovery and transport are user-global, including across Herdr sockets; they are not project-filtered. Managed Agents and Chief have no peer presence. A healthy coordinator publishes a private generation-bound record in `runtime/peers-v2/peers/`; dead, stale, malformed, or replaced process-lock claims are ignored. Unhealthy coordination withdraws presence while retaining queued messages.
+`peer` is horizontal coordination between live Lead sessions: Lead ↔ Lead. Discovery and transport are user-global, including across Herdr sockets; they are not project-filtered. Managed Agents and Chief have no peer presence. A healthy coordinator publishes a private generation-bound record in `runtime/peers-v2/peers/`; dead, stale, malformed, or replaced process-lock claims are ignored. Unhealthy coordination withdraws presence while retaining queued messages.
 
 ## Presence and identity
 
-An ordinary Lead or active Manager publishes one private peer record under the
+An ordinary Lead publishes one private peer record under the
 user-global `runtime/peers-v2/peers/` directory beneath the Herdsman data root.
 This peer runtime is independent of the socket-scoped supervision runtime, so
-same-role coordinators attached to different Herdr sockets share peer discovery and
+Leads attached to different Herdr sockets share peer discovery and
 transport. The record publishes the exact Pi session, Herdr pane, tab,
 workspace, and current coordinator cwd with the `{ pid, id }` claim for that session's
 per-session process lock immediately. The current session name, repository,
@@ -33,19 +33,19 @@ reread of the captured sender and target generations immediately before
 writing. Presentation-only enrichment does not invalidate a message, and a
 replacement process-lock claim observed by that reread rejects it. The target's
 held presence lock and the inbox message lock are separate, so a replacement
-can race after the reread. Delivery validates the current same-role target
+can race after the reread. Delivery validates the current target
 record and target structure only. Managed agents, Chief sessions, display
 labels, and metadata are never peer targets.
 
 ## Peer tools
 
-Ordinary Leads and active Managers have `peer_list` and `peer_message`.
+Ordinary Leads have `peer_list` and `peer_message`.
 
 ```json
 {}
 ```
 
-Returns this session separately from other same-role sessions:
+Returns this session separately from other Lead sessions:
 
 ```json
 {

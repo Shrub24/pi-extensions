@@ -339,6 +339,12 @@ with `agent_close` once its scope is finished and no follow-up of the same kind 
 expected. Closing keeps its Pi session, so `agent_continue` can resume it later.
 Each delivered result reminds the lead of this for the worker it came from.
 
+With `retainWorkers: false` delivery removes the process, pane, and mailbox
+instead, so no live worker remains and the label is released. The Pi session is
+unaffected: `agent_list` reports it under `saved_sessions`, the delivered result
+names the exact session to continue, and `agent_continue` restores that context
+in a new process under the inherited label.
+
 The outcome of a continuation depends on how the session's managed
 representation stands:
 

@@ -13,7 +13,7 @@ Pi Herdsman turns independent Pi sessions into a coordinated agent system, from
 one background Agent to parallel branch-based project work. Pi owns each
 coding-agent conversation; herdr owns processes, panes, workspaces, and worktree
 placement; Herdsman connects them through delegation, ownership, supervision,
-and project orchestration.
+and supervision.
 
 ## Demo
 
@@ -25,8 +25,7 @@ _Concept animation, not a live recording._
 
 - **Background Agents.** Delegate bounded work without blocking the Lead conversation.
 - **Parallel and nested delegation.** Run independent work concurrently and let explicitly enabled Agents delegate their own bounded subtasks.
-- **Project orchestration.** A Manager coordinates durable branch-based work across independent Leads and their Agent trees.
-- **Direct supervision.** Chief, Manager, Lead, and Agent responsibilities stay explicit instead of collapsing into one global controller.
+- **Direct supervision.** Chief, Lead, and Agent responsibilities stay explicit instead of collapsing into one global controller.
 - **Owned usage visibility.** Inspect Pi-native token usage and cost for the current session plus transitively owned managed-Agent sessions.
 - **Your workflow stays yours.** Bring your own Agent definitions, models, tools, skills, extensions, and development process.
 
@@ -45,7 +44,7 @@ pi install npm:pi-herdsman
 herdr integration install pi
 ```
 
-Remove pi-herdr if installed. Herdsman now owns [pane metadata](docs/reference/pane-metadata.md); the official Herdr integration remains the sole state reporter.
+Remove pi-herdr if installed. Herdsman reports its own delegation facts to the Radar daemon registry and no longer publishes terminal pane metadata; the official Herdr integration remains the sole state reporter.
 
 Start herdr in your project, then start Pi inside its pane:
 
@@ -72,7 +71,7 @@ It also exposes `Session stats` for the current Pi session and its owned Agent s
 See [Getting started](docs/getting-started.md) for prerequisites, configuration,
 observability, and the complete first-use path.
 
-## From one Agent to a project
+## From one Agent to supervised Leads
 
 A normal Pi session is a **Lead**. It owns the Agents it delegates:
 
@@ -83,39 +82,23 @@ You ↔ Lead
       └─ Agent
 ```
 
-For independent project work, an eligible Lead can enter **Manager** mode.
-Managers coordinate Leads instead of implementing through Agents themselves:
-
-```text
-You ↔ Manager
-      ├─ Lead → Agents
-      └─ Lead → Agents
-```
-
-A **Chief** is an optional runtime-wide supervisor above Managers. Without an
-active Manager for a project, Chief can directly supervise its ordinary Leads.
+A **Chief** is an optional runtime-wide supervisor above Leads. It can directly
+supervise its ordinary Leads.
 
 The important boundaries are:
 
 ```text
-supervision: Chief → Manager → Lead
+supervision: Chief → Lead
 ownership: Lead → Agent → Agent
 ```
 
-Project work is durable by Git branch. It does not belong to the Manager session
-that happened to start it, so work can be paused, resumed, completed, or
-reconciled across Manager turnover.
-
-See [Coordination](docs/concepts/coordination.md) for the mental model and
-[Project orchestration](docs/guides/project-orchestration.md) for the Manager
-workflow.
+See [Coordination](docs/concepts/coordination.md) for the mental model.
 
 ## Choose your next step
 
 | Goal                                       | Start here                                                    |
 | ------------------------------------------ | ------------------------------------------------------------- |
 | Install and delegate your first task       | [Getting started](docs/getting-started.md)                    |
-| Run independent branch-based project work  | [Project orchestration](docs/guides/project-orchestration.md) |
 | Understand roles, ownership, and authority | [Coordination](docs/concepts/coordination.md)                 |
 | Customize Agents                           | [Agent definitions](docs/guides/agent-definitions.md)         |
 | Build against the model-facing tools       | [Coordination API](docs/coordination-api.md)                  |
@@ -145,9 +128,12 @@ imported at `156b1c66` (v0.18.0). The fork's own changes:
   stays `idle` until `agent_continue` reuses it; a drifted or missing launch
   fingerprint closes it and continues the same session in a new process
   ([configuration](docs/reference/configuration.md),
-  [handoffs](docs/guides/handoffs.md)). Fork branches: `finalizeDeliveredRoot`
-  (`retainWorkersEnabled`), the `delivered` derivation in `managedAgentSnapshots`
-  and `agentControlState` (`idle`), `listedAgentRecord`, `checkHerdRunFinished`
+  [handoffs](docs/guides/handoffs.md)). With `retainWorkers: false` delivery
+  removes the worker instead, and `agent_list` advertises the surviving session
+  under `saved_sessions` while no mailbox represents it. Fork branches:
+  `finalizeDeliveredRoot` (`retainWorkersEnabled`), the `delivered` derivation
+  in `managedAgentSnapshots` and `agentControlState` (`idle`),
+  `listedAgentRecord`, `savedAgentSessionRecords`, `checkHerdRunFinished`
   (through `maybeFinishHerdRun`), and the delivered-assignment admission in
   `action`.
 

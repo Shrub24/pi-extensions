@@ -22,7 +22,7 @@ This decision governs information architecture, not exact wording, heading order
 
 ## Rationale
 
-Pi Herdsman spans Agent ownership, asynchronous execution, project orchestration, supervision, Pi sessions, Herdr topology, and Git state. Presenting all of those concepts at once makes first use harder and encourages duplicated explanations to drift.
+Pi Herdsman spans Agent ownership, asynchronous execution, supervision, Pi sessions, Herdr topology, and Git state. Presenting all of those concepts at once makes first use harder and encourages duplicated explanations to drift.
 
 Progressive disclosure lets beginners reach useful work quickly while keeping exact contracts available to advanced readers. Single ownership makes updates local and predictable: a behavioral change has one authoritative documentation surface, while other pages provide only the context needed to route readers there.
 

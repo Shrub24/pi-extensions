@@ -42,7 +42,9 @@ import {
   writeRequest as writeMailboxRequest,
   writeAsk,
   writeAgentState,
+  sameRequestAddress,
   agentMailboxPath,
+  type RequestAddress,
   type RequestRecord,
   type ResultRecord,
   type AskRecord,
@@ -190,6 +192,199 @@ test("V5 markers are emitted while V4 markers remain explicitly versioned", () =
   assert.equal(parseControlMarker(`${current} task`), undefined);
   assert.equal(parseControlMarker("__PI_HERDSMAN_AGENT_V5__:bad"), undefined);
   assert.equal(parseControlMarker("__PI_HERDSMAN_AGENT_V5__:"), undefined);
+});
+/**
+ * One address, as a launch writes it: the subject its child registered, the
+ * source that registration names, the process incarnation it holds and the
+ * generation that produced it.
+ */
+const addressedRequest = (
+  address: RequestAddress,
+  overrides: Partial<RequestRecord> = {},
+): RequestRecord => ({
+  version: 6,
+  runId: state.runId,
+  requestId: randomUUID(),
+  ownerSessionId: state.ownerSessionId,
+  workspaceId: state.workspaceId,
+  agentLabel: state.agentLabel,
+  paneId: state.paneId,
+  kind: "steer",
+  address,
+  text: "work",
+  createdAt: Date.now(),
+  ...overrides,
+});
+const processAddress = (): RequestAddress => ({
+  subject: randomUUID(),
+  source: "herdsman-pi",
+  incarnation: randomUUID(),
+  generation: randomUUID(),
+});
+
+test("an addressed request round-trips and names one exact process", () => {
+  const path = mkdtempSync(join(tmpdir(), "pi-herdsman-mailbox-test-"));
+  const address = processAddress();
+  const request = addressedRequest(address);
+  writeMailboxRequest(path, request);
+  assert.deepEqual(readRequest(path, request.requestId), request);
+  assert.equal(sameRequestAddress(address, { ...address }), true);
+  // Every field is part of the process: a mailbox, pane, session or label that
+  // matches is not one, so no difference between two addresses is ignorable.
+  for (const field of [
+    "subject",
+    "source",
+    "incarnation",
+    "generation",
+  ] as const)
+    assert.equal(
+      sameRequestAddress(address, { ...address, [field]: randomUUID() }),
+      false,
+      `${field} must be compared`,
+    );
+  assert.equal(
+    sameRequestAddress(address, undefined),
+    false,
+    "a missing address is never this process",
+  );
+  assert.equal(sameRequestAddress(undefined, address), false);
+});
+
+test("an address must be exactly the four process fields", () => {
+  const path = mkdtempSync(join(tmpdir(), "pi-herdsman-mailbox-test-"));
+  const address = processAddress();
+  const { subject: _subject, ...withoutSubject } = address;
+  const invalid: unknown[] = [
+    withoutSubject,
+    { ...address, subject: "  " },
+    { ...address, incarnation: 7 },
+    { ...address, extra: "field" },
+    "not-an-object",
+    null,
+  ];
+  for (const bad of invalid)
+    assert.throws(
+      () => writeMailboxRequest(path, addressedRequest(bad as never)),
+      /Invalid request address/,
+    );
+  // A V4 record is never addressed - the field is a V5 concept - so a legacy
+  // record carrying one is not a record this build reads.
+  const legacyId = randomUUID();
+  writeFileSync(
+    join(path, `request-${legacyId}.json`),
+    JSON.stringify(
+      addressedRequest(address, { version: 4 as never, requestId: legacyId }),
+    ),
+  );
+  assert.throws(
+    () => readRequest(path, legacyId),
+    /V4 requests cannot contain accepted assignment metadata/,
+  );
+});
+
+test("an addressed request is a version of its own, and only a request has it", () => {
+  const path = mkdtempSync(join(tmpdir(), "pi-herdsman-mailbox-test-"));
+  const address = processAddress();
+  const addressed = addressedRequest(address);
+  assert.equal(addressed.version, 6);
+  writeMailboxRequest(path, addressed);
+  assert.equal(readRequest(path, addressed.requestId)?.version, 6);
+  // Address and version are one fact: a V5 request carries no address, and an
+  // addressed request carries nothing less than a complete one, so neither can
+  // be read as the other.
+  assert.throws(
+    () => writeMailboxRequest(path, { ...addressed, version: 5 }),
+    /Only addressed requests carry a process address/,
+  );
+  const { address: _address, ...unaddressed } = addressed;
+  assert.throws(
+    () => writeMailboxRequest(path, unaddressed as RequestRecord),
+    /Addressed requests require a process address/,
+  );
+  // The version belongs to requests: the same number on any other record kind
+  // is neither a record this build writes nor one it reads.
+  assert.throws(
+    () => writeAgentState(path, { ...state, version: 6 as never }),
+    /Legacy mailbox records are read-only/,
+  );
+  writeFileSync(
+    join(path, "state.json"),
+    JSON.stringify({ ...state, version: 6 }),
+  );
+  assert.throws(
+    () => readAgentState(path),
+    /Only requests can carry the addressed mailbox protocol version/,
+  );
+});
+
+test("the committed V5 reader refuses an addressed request before its task", () => {
+  // The reader committed before addressing existed
+  // (`HEAD:pi-herdsman/extension/mailbox.ts`: a V4|V5 version allowlist, unknown
+  // top-level fields tolerated, the task text read only once both pass) is
+  // pinned here rather than imported, because it no longer exists in the tree.
+  // It is the gate the version bump relies on: a worker from an older build
+  // never reaches the task of an addressed request, so it cannot run one before
+  // its owner rejects the answer.
+  const readPinnedV5Request = (record: unknown): string => {
+    const value = record as Record<string, unknown>;
+    const version = value.version;
+    if (version !== 4 && version !== 5)
+      throw new Error("Invalid mailbox protocol version or record");
+    if (typeof value.text !== "string" || !value.text.trim())
+      throw new Error("Invalid request text");
+    return value.text;
+  };
+  const addressed = addressedRequest(processAddress());
+  const { address: _address, ...legacy } = addressed;
+  assert.equal(
+    readPinnedV5Request({ ...legacy, version: 5 }),
+    "work",
+    "an unaddressed request keeps its previous meaning",
+  );
+  let taskRead = false;
+  assert.throws(
+    () =>
+      readPinnedV5Request({
+        ...addressed,
+        get text() {
+          taskRead = true;
+          return "work";
+        },
+      }),
+    /Invalid mailbox protocol version or record/,
+  );
+  assert.equal(taskRead, false, "the task is never reached");
+});
+
+test("an acknowledgement echoes an address or nothing at all", () => {
+  const path = mkdtempSync(join(tmpdir(), "pi-herdsman-mailbox-test-"));
+  const address = processAddress();
+  const requestId = randomUUID();
+  writeAgentState(path, {
+    ...state,
+    lastAck: {
+      requestId,
+      accepted: true,
+      identity: address,
+      acknowledgedAt: Date.now(),
+    },
+  });
+  assert.deepEqual(readAgentState(path)?.lastAck?.identity, address);
+  const { incarnation: _incarnation, ...withoutIncarnation } = address;
+  for (const bad of [withoutIncarnation, { ...address, subject: "" }, "echo"])
+    assert.throws(
+      () =>
+        writeAgentState(path, {
+          ...state,
+          lastAck: {
+            requestId,
+            accepted: true,
+            identity: bad as never,
+            acknowledgedAt: Date.now(),
+          },
+        }),
+      /Invalid acknowledgement identity/,
+    );
 });
 test("V5 task and interrupt requests require an accepted assignment contract", () => {
   const path = mkdtempSync(join(tmpdir(), "pi-herdsman-mailbox-test-"));

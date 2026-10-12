@@ -1,5 +1,7 @@
 # Prove a live managed generation by a claimed alias
 
+Status: superseded for the Radar path by [ADR 0031](0031-publish-agent-facts-to-the-radar-daemon-registry.md); its rule still governs a legacy generation whose evidence is the mux observation.
+
 ## Decision
 
 A managed generation counts as live only when the inventory carries exactly one
@@ -22,9 +24,13 @@ and the inference that a generation is lost both keep their existing behaviour.
 
 ## Rationale
 
-Every destructive control closes a generation through `herdr agent get <alias>`,
+Every destructive control closed a generation through `herdr agent get <alias>`,
 while liveness was decided from the inventory, where a record reporting no name
-still matched on pane, working directory and session. The two could therefore
+still matched on pane, working directory and session. (The Radar path no longer
+asks Herdr at all: a managed child is proved by its own launch binding and
+startup acknowledgment, and a mailbox that was not launched through Radar refuses
+a physical close. The agreement rule this ADR states is unchanged - what proves
+the generation is not.) The two could therefore
 disagree: a listing advertised an idle, closable worker whose close and continue
 then failed with `herdr ... not found`. ADR 0020 rejects exactly that —
 advertisement and enforcement must agree — and the correction belongs where the

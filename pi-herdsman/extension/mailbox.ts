@@ -51,9 +51,33 @@ export interface ManagedAgentState {
     accepted: boolean;
     code?: "busy" | "idle" | "invalid" | "identity" | "delivery";
     message?: string;
+    /**
+     * The address an addressed request carried, echoed by the process that
+     * accepted it. It is the accepting process's own statement of which process
+     * it is; an owner compares it with the address it wrote.
+     */
+    identity?: RequestAddress;
     acknowledgedAt: number;
   };
+  startupAck?: StartupAck;
   updatedAt: number;
+}
+/**
+ * The child's own statement that Herdsman startup finished for one launch. It
+ * is written only after the state write and the controller/runtime
+ * initialization a fresh worker needs before it can take an assignment, and it
+ * names the launch generation that produced it, so an owner can tell this
+ * launch's readiness from any earlier one in the same mailbox.
+ */
+export interface StartupAck {
+  generation: string;
+  runId: string;
+  ownerSessionId: string;
+  workspaceId: string;
+  agentLabel: string;
+  paneId: string;
+  piSessionId: string;
+  acknowledgedAt: number;
 }
 export interface ResultPersistenceError {
   code: "write_failure";
@@ -71,8 +95,26 @@ export interface ResultPersistenceError {
   cleanupSafe: true;
   nextAction: string;
 }
+/**
+ * The one exact process an assignment is addressed to. A Radar child is a
+ * process, not a mailbox: this names the subject the originating launch bound,
+ * the source and incarnation that child's own registration carries, and the
+ * launch generation that produced it. A retained assignment carries it so the
+ * process that answers can be held to being the one it was meant for, and an
+ * owner can tell that process's own echo from any other.
+ */
+export interface RequestAddress {
+  subject: string;
+  source: string;
+  incarnation: string;
+  generation: string;
+}
 export interface RequestRecord {
-  version: 4 | 5;
+  /**
+   * 6 for a request addressed to one exact process, 5 for an unaddressed one,
+   * and the migrated 4 that only a live assignment may use.
+   */
+  version: 4 | 5 | 6;
   runId: string;
   requestId: string;
   ownerSessionId: string;
@@ -83,6 +125,8 @@ export interface RequestRecord {
   askId?: string;
   acceptedAssignment?: AcceptedAssignmentContract;
   briefProfile?: BriefProfile;
+  /** Present on an addressed request, and on no other record. */
+  address?: RequestAddress;
   text: string;
   createdAt: number;
 }
@@ -138,6 +182,13 @@ export interface ResultRecord {
 const UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 export const MAILBOX_PROTOCOL_VERSION = 5 as const;
+/**
+ * The request version that carries a process address. Addressing is a protocol
+ * version rather than an optional V5 field so a reader that predates it refuses
+ * the record outright, instead of reading an ordinary V5 request and running the
+ * task before its owner can reject the answer.
+ */
+export const ADDRESSED_REQUEST_PROTOCOL_VERSION = 6 as const;
 export const QUESTION_WAITING_MARKER_FILE = "question-waiting.json" as const;
 
 /**
@@ -171,11 +222,29 @@ export function boundedContextUsage(
 
 export const MAILBOX_CONTROL_PREFIX = "__PI_HERDSMAN_AGENT_V5__:";
 export const LEGACY_MAILBOX_CONTROL_PREFIX = "__PI_HERDSMAN_AGENT_V4__:";
+/**
+ * The control marker of an addressed request. A worker checks that the marker
+ * and the record agree, so the marker of an addressed request is v6 for the
+ * same reason the record is: one request has one version, and a reader that
+ * predates addressing recognises neither.
+ */
+export const ADDRESSED_MAILBOX_CONTROL_PREFIX = "__PI_HERDSMAN_AGENT_V6__:";
 const LEGACY_MAILBOX_PROTOCOL_VERSION = 4 as const;
 /** Fixed protocol safety ceiling; configuration only limits new submissions. */
 export const MAILBOX_PROTOCOL_LIMIT_BYTES = 1024 * 1024;
 export function mailboxRecordBytes(record: RequestRecord | AskRecord): number {
   return Buffer.byteLength(JSON.stringify(record), "utf8");
+}
+/**
+ * Whether a request version carries the accepted-assignment contract and the
+ * brief profile it is held to: the V5 request protocol and the addressed V6 that
+ * extends it.
+ */
+export function currentRequestVersion(version: number): boolean {
+  return (
+    version === MAILBOX_PROTOCOL_VERSION ||
+    version === ADDRESSED_REQUEST_PROTOCOL_VERSION
+  );
 }
 export class MailboxClaimOccupiedError extends Error {
   readonly code = "MAILBOX_CLAIM_OCCUPIED";
@@ -288,6 +357,25 @@ function ensure(path: string): void {
   mkdirSync(path, { recursive: true, mode: 0o700 });
   chmodSync(path, 0o700);
 }
+function invalidRequestAddress(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return true;
+  const address = value as Record<string, unknown>;
+  const fields: Array<keyof RequestAddress> = [
+    "subject",
+    "source",
+    "incarnation",
+    "generation",
+  ];
+  return (
+    Object.keys(address).some(
+      (key) => !fields.includes(key as keyof RequestAddress),
+    ) ||
+    fields.some((field) => {
+      const part = address[field];
+      return typeof part !== "string" || !part.trim();
+    })
+  );
+}
 function validate(
   value: unknown,
   kind: keyof typeof LIMITS,
@@ -304,8 +392,16 @@ function validate(
   if (!value || typeof value !== "object")
     throw new Error("Invalid mailbox protocol version or record");
   const version = (value as { version?: unknown }).version;
-  if (version !== LEGACY_MAILBOX_PROTOCOL_VERSION && version !== MAILBOX_PROTOCOL_VERSION)
+  if (
+    version !== LEGACY_MAILBOX_PROTOCOL_VERSION &&
+    version !== MAILBOX_PROTOCOL_VERSION &&
+    version !== ADDRESSED_REQUEST_PROTOCOL_VERSION
+  )
     throw new Error("Invalid mailbox protocol version or record");
+  if (version === ADDRESSED_REQUEST_PROTOCOL_VERSION && kind !== "request")
+    throw new Error(
+      "Only requests can carry the addressed mailbox protocol version",
+    );
   const text = JSON.stringify(value);
   if (Buffer.byteLength(text, "utf8") > LIMITS[kind])
     throw new Error("Mailbox record is too large");
@@ -321,7 +417,7 @@ function validate(
   if (
     version === LEGACY_MAILBOX_PROTOCOL_VERSION &&
     kind === "request" &&
-    ["acceptedAssignment", "briefProfile"].some((field) =>
+    ["acceptedAssignment", "briefProfile", "address"].some((field) =>
       Object.hasOwn(v, field),
     )
   )
@@ -350,6 +446,7 @@ function validate(
           "completedRequestId",
           "resultError",
           "lastAck",
+          "startupAck",
           "updatedAt",
         ]
       : kind === "request"
@@ -362,6 +459,7 @@ function validate(
             "agentLabel",
             "paneId",
             "kind",
+            "address",
       "acceptedAssignment",
             "briefProfile",
             "askId",
@@ -618,6 +716,7 @@ function validate(
         "accepted",
         "code",
         "message",
+        "identity",
         "acknowledgedAt",
       ];
       if (
@@ -639,6 +738,39 @@ function validate(
         (typeof ack.message !== "string" || !ack.message.trim())
       )
         throw new Error("Invalid acknowledgement message");
+      if (ack.identity !== undefined && invalidRequestAddress(ack.identity))
+        throw new Error("Invalid acknowledgement identity");
+    }
+    if (v.startupAck !== undefined) {
+      const ack = v.startupAck as Record<string, unknown>;
+      const ackKeys = [
+        "generation",
+        "runId",
+        "ownerSessionId",
+        "workspaceId",
+        "agentLabel",
+        "paneId",
+        "piSessionId",
+        "acknowledgedAt",
+      ];
+      if (
+        Object.keys(ack).some((key) => !ackKeys.includes(key)) ||
+        typeof ack.generation !== "string" ||
+        !ack.generation.trim() ||
+        ack.runId !== v.runId ||
+        ack.ownerSessionId !== v.ownerSessionId ||
+        ack.workspaceId !== v.workspaceId ||
+        ack.agentLabel !== v.agentLabel ||
+        ack.paneId !== v.paneId ||
+        ack.piSessionId !== v.piSessionId
+      )
+        throw new Error("Invalid startup acknowledgment");
+      if (
+        typeof ack.acknowledgedAt !== "number" ||
+        !Number.isFinite(ack.acknowledgedAt) ||
+        ack.acknowledgedAt < 0
+      )
+        throw new Error("Invalid startup acknowledgment timestamp");
     }
   } else if (kind === "request") {
     if (
@@ -654,9 +786,15 @@ function validate(
       (v.kind !== "reply" && v.askId !== undefined)
     )
       throw new Error("Invalid reply ask ID");
+    if (version === ADDRESSED_REQUEST_PROTOCOL_VERSION && v.address === undefined)
+      throw new Error("Addressed requests require a process address");
+    if (version !== ADDRESSED_REQUEST_PROTOCOL_VERSION && v.address !== undefined)
+      throw new Error("Only addressed requests carry a process address");
+    if (v.address !== undefined && invalidRequestAddress(v.address))
+      throw new Error("Invalid request address");
     if (typeof v.text !== "string" || !v.text.trim())
       throw new Error("Invalid request text");
-    if (version === MAILBOX_PROTOCOL_VERSION) {
+    if (currentRequestVersion(version)) {
       const needsAssignment = v.kind === "task" || v.kind === "interrupt";
       if (needsAssignment !== (v.acceptedAssignment !== undefined))
         throw new Error("V5 task and interrupt requests require an accepted assignment");
@@ -873,10 +1011,16 @@ function validate(
   }
 }
 function atomic(path: string, value: unknown, kind: keyof typeof LIMITS): void {
+  const version =
+    typeof value === "object" && value !== null
+      ? (value as { version?: unknown }).version
+      : undefined;
   if (
-    typeof value !== "object" ||
-    value === null ||
-    (value as { version?: unknown }).version !== MAILBOX_PROTOCOL_VERSION
+    version !== MAILBOX_PROTOCOL_VERSION &&
+    // An addressed request is the one record kind this build writes at the
+    // addressed version; every other record stays at the current version, and a
+    // record from an older build stays read-only.
+    !(kind === "request" && version === ADDRESSED_REQUEST_PROTOCOL_VERSION)
   )
     throw new Error("Legacy mailbox records are read-only");
   validate(value, kind);
@@ -988,6 +1132,77 @@ export function writeAgentState(path: string, state: ManagedAgentState): void {
 }
 export function agentStatePath(path: string): string {
   return file(path, "state.json");
+}
+/**
+ * Records that Herdsman startup finished for one launch generation. The state
+ * must already name this exact identity: an acknowledgment records a fresh
+ * launch, so it never creates state and never rewrites a mailbox that belongs to
+ * another run or pane. The caller holds the mailbox's assignment lock, which is
+ * what makes the read and the write one transition.
+ */
+export function writeStartupAck(path: string, ack: StartupAck): void {
+  const state = readAgentState(path);
+  if (!state) throw new Error("Agent state is unavailable");
+  if (
+    state.runId !== ack.runId ||
+    state.ownerSessionId !== ack.ownerSessionId ||
+    state.workspaceId !== ack.workspaceId ||
+    state.agentLabel !== ack.agentLabel ||
+    state.paneId !== ack.paneId ||
+    state.piSessionId !== ack.piSessionId
+  )
+    throw new Error("Agent identity changed before startup acknowledgment");
+  writeAgentState(path, { ...state, startupAck: ack, updatedAt: Date.now() });
+}
+
+/**
+ * Whether this state carries exactly the acknowledgment one launch waits for.
+ * Every known field is compared, and the acknowledgment must also name the
+ * session this state does: readiness is one launch's own statement, and a
+ * mailbox left over from another run, pane or session cannot answer for it.
+ */
+export function startupAckMatches(
+  state: ManagedAgentState | undefined,
+  expected: {
+    generation: string;
+    runId: string;
+    ownerSessionId: string;
+    workspaceId: string;
+    agentLabel: string;
+    paneId: string;
+  },
+): boolean {
+  const ack = state?.startupAck;
+  return (
+    ack !== undefined &&
+    state !== undefined &&
+    ack.piSessionId === state.piSessionId &&
+    ack.generation === expected.generation &&
+    ack.runId === expected.runId &&
+    ack.ownerSessionId === expected.ownerSessionId &&
+    ack.workspaceId === expected.workspaceId &&
+    ack.agentLabel === expected.agentLabel &&
+    ack.paneId === expected.paneId
+  );
+}
+/**
+ * Whether two addresses name the same exact process. Every field is compared: a
+ * mailbox, pane, label or session that matches is not a process, so an address
+ * that cannot be compared - a missing one, or a generation or incarnation that
+ * differs - is never the process this one names.
+ */
+export function sameRequestAddress(
+  left: RequestAddress | undefined,
+  right: RequestAddress | undefined,
+): boolean {
+  return (
+    left !== undefined &&
+    right !== undefined &&
+    left.subject === right.subject &&
+    left.source === right.source &&
+    left.incarnation === right.incarnation &&
+    left.generation === right.generation
+  );
 }
 export function readAgentState(path: string): ManagedAgentState | undefined {
   const value = read<Record<string, unknown>>(file(path, "state.json"), "state");
@@ -1178,26 +1393,34 @@ export function removeResult(path: string, requestId: string): void {
 }
 export function controlMarker(
   requestId: string,
-  version: 4 | 5 = MAILBOX_PROTOCOL_VERSION,
+  version: 4 | 5 | 6 = MAILBOX_PROTOCOL_VERSION,
 ): string {
   if (!UUID.test(requestId)) throw new Error("Invalid request ID");
-  const prefix = version === LEGACY_MAILBOX_PROTOCOL_VERSION
-    ? LEGACY_MAILBOX_CONTROL_PREFIX
-    : MAILBOX_CONTROL_PREFIX;
+  const prefix =
+    version === LEGACY_MAILBOX_PROTOCOL_VERSION
+      ? LEGACY_MAILBOX_CONTROL_PREFIX
+      : version === ADDRESSED_REQUEST_PROTOCOL_VERSION
+        ? ADDRESSED_MAILBOX_CONTROL_PREFIX
+        : MAILBOX_CONTROL_PREFIX;
   return `${prefix}${requestId}`;
 }
 export function parseControlMarkerVersion(
   text: string,
-): { requestId: string; version: 4 | 5 } | undefined {
+): { requestId: string; version: 4 | 5 | 6 } | undefined {
   const version = text.startsWith(MAILBOX_CONTROL_PREFIX)
     ? MAILBOX_PROTOCOL_VERSION
     : text.startsWith(LEGACY_MAILBOX_CONTROL_PREFIX)
       ? LEGACY_MAILBOX_PROTOCOL_VERSION
-      : undefined;
+      : text.startsWith(ADDRESSED_MAILBOX_CONTROL_PREFIX)
+        ? ADDRESSED_REQUEST_PROTOCOL_VERSION
+        : undefined;
   if (version === undefined) return undefined;
-  const prefix = version === MAILBOX_PROTOCOL_VERSION
-    ? MAILBOX_CONTROL_PREFIX
-    : LEGACY_MAILBOX_CONTROL_PREFIX;
+  const prefix =
+    version === LEGACY_MAILBOX_PROTOCOL_VERSION
+      ? LEGACY_MAILBOX_CONTROL_PREFIX
+      : version === ADDRESSED_REQUEST_PROTOCOL_VERSION
+        ? ADDRESSED_MAILBOX_CONTROL_PREFIX
+        : MAILBOX_CONTROL_PREFIX;
   const requestId = text.slice(prefix.length);
   return UUID.test(requestId) && requestId.length === 36
     ? { requestId, version }

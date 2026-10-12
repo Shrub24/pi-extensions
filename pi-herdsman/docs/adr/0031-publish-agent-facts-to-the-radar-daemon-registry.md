@@ -23,14 +23,31 @@ publication under `~/.pi/agent/pi-herdsman/radar/`. Linux
 be read; it never supplies identity.
 
 Registration carries only facts that are stable for the life of the process.
-Location, launch specification and mutable assignment context are deliberately not
-published: nothing consumes them, and a location would be a mux-specific guess.
+Launch specification and mutable assignment context are deliberately not
+published. The one mux coordinate it does carry is the process's own location,
+because the daemon places a managed child beside its parent's **registered** pane
+and refuses a spawn whose parent names none. It is built from facts rather than
+guessed: the backend and its server are the daemon's own `daemon.ping` answers,
+the pane is the one this process's own environment reports for that backend - a
+tmux pane qualified with the negotiated server, and the process's own client must
+name that same server - and the daemon's canonical fleet observation must report
+that exact pane, whose own location is the containment the record carries. An
+observation that cannot be read, does not contain the pane, or contradicts it
+publishes no location; a process that has no pane of its own publishes no
+location either, and a caller that needs one refuses instead of inventing it.
+Because the record is immutable, a location that is still *pending* - the daemon
+has not answered, or its topology does not report the pane yet - writes no record
+at all: the next attempt asks again, and nothing freezes a gap in the evidence
+into an identity that could never acquire a pane.
 The current session is published, but as the registry's own mutable context record
 (`agent.context`) rather than in registration: a process that switches, resumes or
 forks its session keeps its subject, `agent_id`, writer binding and generation, and
 only advances the record's sequence under the same lease discipline as the
 channels. The context method is implemented at Radar commit `4e376978`; the
-fully verified vendored fixture and validator are pinned at `da0ba99a`. A warned
+fully verified vendored fixture and validator are pinned at `da0ba99a`. Protocol 2
+(`f8734803`) re-vendors that fixture and replaces the version-1 capability names
+with its contracts, so the registry methods this port dispatches now negotiate
+`registry.v1`. A warned
 identical replay does not renew the lease, so local renewal timing remains
 anchored to the prior daemon-accepted context until a newer sequence is
 acknowledged. Session association is therefore neither faked in a prose field
@@ -53,6 +70,18 @@ Existing Herdr usage in Herdsman — launch readiness, presence proofs and the
 control-state word — is unchanged, and no second Herdr publication path was
 added. The native Herdr Pi reporter keeps running until those consumers are
 replaced by a separately scoped coordinator cutover.
+
+### Legacy child identity (Option A)
+
+A child that predates Radar publication is identified from the canonical Radar
+row, not from Herdr. The row is matched by workspace, pane, session and
+label/run-or-alias. The Herdr-only cwd check and `herdr agent get` are dropped
+for this identity proof, so Herdr is no longer asked whether a child exists.
+
+Three conditions are unchanged. Destructive authority still refuses a child not
+launched through Radar. Ambiguity, duplicate-pane and unreadable-inventory
+refusals stay. A row whose session or label contradicts the mailbox does not
+project live.
 
 ## Rationale
 
@@ -78,14 +107,16 @@ inside Pi's event loop.
 
 ## Alternatives considered
 
-**Publish only for managed children.** Rejected: the native reporter already
-reported an operator's own TUI session, and dropping it would degrade Radar's
-existing view for every ordinary session.
+**Publish only for managed children.** Rejected at the time: the native reporter
+already reported an operator's own TUI session, and dropping it would have
+degraded Radar's existing view for every ordinary session. The Herdr-free
+cutover later removed that reporter path anyway, because its facts live in the
+mailbox and this registry, and keeping a Herdr-only mirror would have preserved
+the coupling the cutover exists to remove.
 
 **Keep mirroring state into Herdr metadata alongside the daemon.** Rejected:
 Radar is mux-agnostic and the mirror would preserve exactly the coupling this
-change removes. Preserving the native reporter as a transition dependency is
-different from adding a second publication path.
+change removes.
 
 **Derive subject identity from `/proc` start time** (or from the Pi session
 UUID). Rejected: `/proc` evidence is unavailable off Linux and is a claim, not an
@@ -130,9 +161,6 @@ records accumulate per incarnation like the channels, and the first publish of a
 context record is the only write that carries no credential: if that reply is
 lost, the retry is refused because the record now exists, so the writer stops with
 one diagnostic rather than claiming a successor takeover it never observed. The
-refusal is not parsed for an incumbent handle: protocol prose is not a credential
-transfer mechanism, and replacement requires explicit observation of the exact
-retired or expired writer. The
 refusal is not parsed for an incumbent handle: protocol prose is not a credential
 transfer mechanism, and replacement requires explicit observation of the exact
 retired or expired writer.

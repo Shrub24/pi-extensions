@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
-import { test, type TestContext } from "node:test";
+import { test } from "node:test";
 import { Value } from "typebox/value";
 import { DELEGATION_BRIEF_EXAMPLES, parseDelegationBrief } from "./briefs.ts";
 import type {
@@ -16,21 +16,13 @@ import { OperationError } from "./errors.ts";
 import { STARTUP_TIMEOUT_MAX } from "./herdr.ts";
 import { resultPath, resultRef } from "./storage.ts";
 import {
-  listProjectAssignments,
   listChiefMessagePaths,
   readChiefMessage,
   readChiefDescriptor,
   supervisionRuntime,
   claimChiefLease,
-  claimManagerLease,
-  managerDescriptorPath,
-  writeProjectAssignment,
-  listProjectMessages,
-  writeProjectMessage,
   writeChiefMessage,
   writeLeadCoordinationState,
-  readLeadCoordinationState,
-  drainCoordinationInbox,
 } from "./supervision.ts";
 import support, {
   CHILD_SESSION_ID,
@@ -74,6 +66,10 @@ import support, {
   leadExec,
   setLeadEnvironment,
   setAgentEnvironment,
+  radarDaemon,
+  radarObservedFleet,
+  spawnedArgvs,
+  startRadarSession,
   startupExecutor,
   agentMailboxPath,
   writeAsk,
@@ -81,6 +77,7 @@ import support, {
   writeRequest,
   writeResult,
   writeAgentState,
+  testChildCommand,
   testTmpRoot,
 } from "./support.ts";
 const { writeQuestionWaitEvidence } = await import("./question-waiting.ts");
@@ -165,149 +162,6 @@ const ownershipResult = (
   },
 });
 
-test("assigned Lead saves supervisor messages durably with or without a Manager", async () => {
-  setLeadEnvironment();
-  const socket = join(tmpdir(), `manager-routing-${randomUUID()}.sock`);
-  process.env.HERDR_SOCKET_PATH = socket;
-  process.env.HERDR_WORKSPACE_ID = "linked-workspace";
-  process.env.HERDR_PANE_ID = "lead-pane";
-  process.env.HERDR_TAB_ID = "lead-tab";
-  const chiefId = randomUUID();
-  const managerId = randomUUID();
-  const leadId = randomUUID();
-  const runtime = supervisionRuntime();
-  const chief = claimChiefLease({
-    piSessionId: chiefId,
-    paneId: "chief-pane",
-    tabId: "chief-tab",
-    workspaceId: WORKSPACE,
-  });
-  const manager = claimManagerLease({
-    piSessionId: managerId,
-    paneId: "manager-pane",
-    tabId: "manager-tab",
-    workspaceId: WORKSPACE,
-    repoKey: "repo-key",
-  });
-  const descriptorPath = managerDescriptorPath(runtime, WORKSPACE);
-  const descriptor = readFileSync(descriptorPath, "utf8");
-  let managerReleased = false;
-  const agents = [
-    [chiefId, "chief-pane", "chief-tab", WORKSPACE],
-    [managerId, "manager-pane", "manager-tab", WORKSPACE],
-    [leadId, "lead-pane", "lead-tab", "linked-workspace"],
-  ].map(([id, pane_id, tab_id, workspace_id]) => ({
-    agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: id },
-    pane_id,
-    tab_id,
-    workspace_id,
-  }));
-  const exec = (_command: string, args: string[]) => {
-    let result: unknown = {};
-    if (isApiSnapshot(args)) result = { snapshot: { agents, panes: [] } };
-    else if (isAgentList(args)) result = { agents };
-    else if (args[0] === "agent" && args[1] === "get")
-      result = { agent: agents.find((agent) => agent.pane_id === args[2]) };
-    else if (args[0] === "workspace" && args[1] === "get")
-      result = {
-        workspace: {
-          worktree: { repo_key: "repo-key", is_linked_worktree: true },
-        },
-      };
-    else if (args[0] === "worktree" && args[1] === "list")
-      result = {
-        source: {
-          repo_key: "repo-key",
-          repo_name: "project",
-          source_workspace_id: WORKSPACE,
-        },
-        worktrees: [{ open_workspace_id: "linked-workspace" }],
-      };
-    return {
-      stdout: JSON.stringify({ id: AGENT_ID, result }),
-      stderr: "",
-      code: 0,
-    };
-  };
-  const pi = fakeChiefPi({ exec });
-  registerExtension!(pi.pi as never);
-  const ctx = fakeContext() as any;
-  ctx.sessionManager = {
-    ...ctx.sessionManager,
-    getSessionId: () => leadId,
-    getSessionFile: () => `/tmp/${leadId}.jsonl`,
-  };
-  try {
-    writeProjectAssignment(runtime, {
-      version: 1,
-      id: leadId,
-      repoKey: "repo-key",
-      branch: "smoke/routing",
-      text: "routing assignment",
-    });
-    writeLeadCoordinationState(runtime, {
-      version: 1,
-      role: "manager",
-      instanceId: randomUUID(),
-      piSessionId: managerId,
-      updatedAt: Date.now(),
-    });
-    await pi.events.get("session_start")![0](undefined, ctx);
-    const tool = pi.tools.find(
-      (candidate) => candidate.name === "supervisor_message",
-    )!;
-    const send = (message: string) =>
-      tool.execute("message", { message }, undefined, undefined, ctx);
-    const records = (id: string) =>
-      listChiefMessagePaths(runtime, id).map((path) => readChiefMessage(path));
-
-    const saved = await send("SMOKE_READY_1");
-    assert.match(JSON.stringify(saved), /Project message saved for Manager/);
-    assert.equal(records(managerId).length, 0);
-    assert.deepEqual(
-      listProjectMessages(runtime, "repo-key", "smoke/routing").map(
-        ({ repoKey, branch, fromSessionId, text }) => ({
-          repoKey,
-          branch,
-          fromSessionId,
-          text,
-        }),
-      ),
-      [
-        {
-          repoKey: "repo-key",
-          branch: "smoke/routing",
-          fromSessionId: leadId,
-          text: "SMOKE_READY_1",
-        },
-      ],
-    );
-    manager.release();
-    managerReleased = true;
-    const withoutManager = await send("MANAGER_ABSENT_OK");
-    assert.match(
-      JSON.stringify(withoutManager),
-      /Project message saved for Manager/,
-    );
-    assert.deepEqual(
-      listProjectMessages(runtime, "repo-key", "smoke/routing").map(
-        (record) => record.text,
-      ),
-      ["SMOKE_READY_1", "MANAGER_ABSENT_OK"],
-    );
-  } finally {
-    await pi.events.get("session_shutdown")?.[0]();
-    if (!managerReleased) {
-      if (!realFs.existsSync(descriptorPath))
-        writeFileSync(descriptorPath, descriptor);
-      manager.release();
-    }
-    chief.release();
-    delete process.env.HERDR_SOCKET_PATH;
-    setLeadEnvironment();
-  }
-});
-
 test("unassigned Lead routes supervisor messages directly to Chief", async () => {
   setLeadEnvironment();
   const socket = join(tmpdir(), `unassigned-routing-${randomUUID()}.sock`);
@@ -389,10 +243,6 @@ test("unassigned Lead routes supervisor messages directly to Chief", async () =>
           record.text === "UNASSIGNED_DIRECT_TO_CHIEF"
         );
       }),
-    );
-    assert.deepEqual(
-      listProjectMessages(runtime, "repo-key", "smoke/routing"),
-      [],
     );
   } finally {
     await pi.events.get("session_shutdown")?.[0]();
@@ -512,6 +362,68 @@ test("legacy Lead pendingAsk state is normalized and does not block messaging", 
     await pi.events.get("session_shutdown")?.[0]();
     chief.release();
     delete process.env.HERDR_SOCKET_PATH;
+    setLeadEnvironment();
+  }
+});
+
+test("a Chief's supervision lists a Lead only when the Radar observation proves it", async () => {
+  setLeadEnvironment();
+  process.env.HERDR_SOCKET_PATH = join(tmpdir(), `chief-radar-${randomUUID()}.sock`);
+  process.env.HERDR_PANE_ID = "chief-pane";
+  process.env.HERDR_TAB_ID = "chief-tab";
+  const chiefSession = randomUUID();
+  const leadSession = randomUUID();
+  const unprovenSession = randomUUID();
+  for (const piSessionId of [leadSession, unprovenSession])
+    writeLeadCoordinationState(supervisionRuntime(), {
+      version: 1,
+      role: "lead",
+      instanceId: randomUUID(),
+      piSessionId,
+      updatedAt: Date.now(),
+    });
+  const placed = (pane: string, session: unknown) => ({
+    location: { workspace_id: WORKSPACE, tab_id: `${pane}-tab`, pane_id: pane },
+    session,
+  });
+  radarDaemon.observeInventory = () => ({
+    workspaces: [{ workspace_id: WORKSPACE }],
+    tabs: [
+      { tab_id: "lead-pane-tab", workspace_id: WORKSPACE },
+      { tab_id: "unproven-pane-tab", workspace_id: WORKSPACE },
+    ],
+    panes: [
+      { location: { workspace_id: WORKSPACE, tab_id: "lead-pane-tab", pane_id: "lead-pane" } },
+      { location: { workspace_id: WORKSPACE, tab_id: "unproven-pane-tab", pane_id: "unproven-pane" } },
+    ],
+    agents: [
+      placed("lead-pane", { kind: "uuid", value: leadSession }),
+      placed("unproven-pane", {
+        kind: "reported",
+        value: { source: "other-source", value: unprovenSession },
+      }),
+    ],
+  });
+  const pi = fakeChiefPi({
+    exec: () => ({ stdout: JSON.stringify({ id: AGENT_ID, result: {} }), stderr: "", code: 0 }),
+  });
+  registerExtension!(pi.pi as never);
+  const ctx = fakeContext() as any;
+  ctx.sessionManager = { ...ctx.sessionManager, getSessionId: () => chiefSession };
+  ctx.isIdle = () => true;
+  try {
+    await pi.events.get("session_start")![0](undefined, ctx);
+    await pi.commandOptions.get("chief").handler("", ctx);
+    const started: any = await pi.events.get("before_agent_start")![0](
+      { systemPrompt: "base", systemPromptOptions: { contextFiles: [] } },
+      ctx,
+    );
+    const supervision = JSON.stringify(started.message);
+    assert.ok(supervision.includes(leadSession));
+    assert.equal(supervision.includes(unprovenSession), false);
+  } finally {
+    await pi.events.get("session_shutdown")?.[0]();
+    radarDaemon.observeInventory = radarObservedFleet;
     setLeadEnvironment();
   }
 });
@@ -638,2445 +550,6 @@ test("Chief preflight defers inbox delivery until agent_start", async (t) => {
     setLeadEnvironment();
   }
 });
-
-for (const reachable of [true, false]) {
-  test(`fresh Manager activation ${reachable ? "is immediately reachable without chat" : "rolls back unproven remote identity"}`, async () => {
-    setLeadEnvironment();
-    process.env.HERDR_PANE_ID = "root-pane";
-    process.env.HERDR_TAB_ID = "root-tab";
-    process.env.HERDR_SOCKET_PATH = join(
-      tmpdir(),
-      `manager-bootstrap-${randomUUID()}.sock`,
-    );
-    const runtime = supervisionRuntime();
-    let managerSessionFile = join(
-      tmpdir(),
-      `pi-herdsman-manager-${randomUUID()}.jsonl`,
-    );
-    const managerAgent: any = {
-      agent_session: {
-        source: "herdr:pi",
-        agent: "pi",
-        kind: reachable ? "path" : "id",
-        value: reachable ? managerSessionFile : LEAD_SESSION_ID,
-      },
-      pane_id: "root-pane",
-      tab_id: "root-tab",
-      workspace_id: WORKSPACE,
-    };
-    const exec = async (_command: string, args: string[]) => {
-      let result: unknown = {};
-      if (args[0] === "worktree" && args[1] === "list")
-        result = {
-          source: {
-            repo_key: "repo-key",
-            repo_name: "project",
-            source_workspace_id: WORKSPACE,
-          },
-          worktrees: [],
-        };
-      else if (isAgentList(args))
-        result = { agents: reachable ? [managerAgent] : [] };
-      else if (args[0] === "agent" && args[1] === "get")
-        result = { agent: reachable ? managerAgent : undefined };
-      else if (isApiSnapshot(args))
-        result = {
-          snapshot: { agents: reachable ? [managerAgent] : [], panes: [] },
-        };
-      return {
-        stdout: JSON.stringify({ id: AGENT_ID, result }),
-        stderr: "",
-        code: 0,
-      };
-    };
-    let managerHistory: unknown[] = [];
-    const pi = fakeChiefPi({
-      activeTools: ["read"],
-      exec,
-      sendMessage: (message) => managerHistory.push(message),
-    });
-    registerExtension!(pi.pi as never);
-    const ctx = fakeContext(pi.entries) as any;
-    managerHistory = pi.entries;
-    if (reachable)
-      ctx.sessionManager = {
-        ...ctx.sessionManager,
-        getSessionFile: () => managerSessionFile,
-        getBranch: () => managerHistory,
-      };
-    const notices: string[] = [];
-    ctx.ui.notify = (message: string) => notices.push(message);
-    try {
-      await pi.events.get("session_start")![0](undefined, ctx);
-      // No before_agent_start or conversation turn precedes Manager activation.
-      if (reachable) assert.equal(realFs.existsSync(managerSessionFile), false);
-      await pi.commandOptions.get("manager").handler("", ctx);
-      const state = readLeadCoordinationState(runtime, LEAD_SESSION_ID)!;
-      if (reachable) {
-        assert.ok(notices.includes("Manager mode active."));
-        assert.equal(realFs.existsSync(managerSessionFile), false);
-        assert.equal(state.role, "manager");
-        assert.ok(realFs.existsSync(managerDescriptorPath(runtime, WORKSPACE)));
-        const leadId = randomUUID();
-        const branch = "smoke/manager-replay";
-        const record = {
-          version: 1 as const,
-          id: randomUUID(),
-          repoKey: "repo-key",
-          branch,
-          fromSessionId: leadId,
-          text: "retained project review handoff",
-          createdAt: Date.now(),
-        };
-        writeProjectAssignment(runtime, {
-          version: 1,
-          id: leadId,
-          repoKey: "repo-key",
-          branch,
-          text: "replay assignment",
-        });
-        writeProjectMessage(record, runtime);
-        const projectDeliveries = () =>
-          pi.sent.filter(
-            (message: any) =>
-              message?.customType === "pi-herdsman-project_message" &&
-              message?.details?.id === record.id,
-          );
-        await new Promise((resolve) => setTimeout(resolve, 650));
-        assert.equal(projectDeliveries().length, 1);
-        assert.deepEqual(listProjectMessages(runtime, "repo-key", branch), [
-          record,
-        ]);
-        await new Promise((resolve) => setTimeout(resolve, 600));
-        assert.equal(
-          projectDeliveries().length,
-          1,
-          "same Manager must not receive a duplicate",
-        );
-
-        await pi.commandOptions.get("manager").handler("leave", ctx);
-        const replacementId = randomUUID();
-        managerSessionFile = join(tmpdir(), `${replacementId}.jsonl`);
-        managerAgent.agent_session.value = managerSessionFile;
-        managerHistory = [];
-        ctx.sessionManager = {
-          ...ctx.sessionManager,
-          getSessionId: () => replacementId,
-          getSessionFile: () => managerSessionFile,
-          getBranch: () => managerHistory,
-        };
-        await pi.commandOptions.get("manager").handler("", ctx);
-        await new Promise((resolve) => setTimeout(resolve, 650));
-        assert.equal(
-          projectDeliveries().length,
-          2,
-          "replacement Manager receives retained message",
-        );
-        await new Promise((resolve) => setTimeout(resolve, 600));
-        assert.equal(
-          projectDeliveries().length,
-          2,
-          "replacement Manager history suppresses replay duplicates",
-        );
-        assert.deepEqual(listProjectMessages(runtime, "repo-key", branch), [
-          record,
-        ]);
-        process.env.HERDR_PANE_ID = "lead-pane";
-        process.env.HERDR_TAB_ID = "lead-tab";
-        const lead = fakeChiefPi({ exec });
-        registerExtension!(lead.pi as never);
-        const leadCtx = fakeContext() as any;
-        leadCtx.sessionManager = {
-          ...leadCtx.sessionManager,
-          getSessionId: () => leadId,
-        };
-        try {
-          await lead.events.get("session_start")![0](undefined, leadCtx);
-          const result = await lead.tools
-            .find((tool) => tool.name === "supervisor_message")!
-            .execute(
-              "message",
-              { message: "reachable before chat" },
-              undefined,
-              undefined,
-              leadCtx,
-            );
-          assert.equal(result.details.branch, branch);
-          assert.ok(typeof result.details.id === "string");
-          const saved = listProjectMessages(runtime, "repo-key", branch).find(
-            (message) => message.id === result.details.id,
-          );
-          assert.ok(saved);
-          assert.equal(saved.id, result.details.id);
-          assert.equal(saved.fromSessionId, leadId);
-          assert.equal(saved.text, "reachable before chat");
-        } finally {
-          await lead.events.get("session_shutdown")?.[0]();
-          process.env.HERDR_PANE_ID = "root-pane";
-          process.env.HERDR_TAB_ID = "root-tab";
-        }
-      } else {
-        assert.ok(
-          notices.some((message) =>
-            message.includes("Manager could not be verified in Herdr"),
-          ),
-        );
-        assert.equal(state.role, "lead");
-        assert.equal(
-          realFs.existsSync(managerDescriptorPath(runtime, WORKSPACE)),
-          false,
-        );
-        assert.equal(pi.pi.getActiveTools().includes("staff_delegate"), false);
-      }
-    } finally {
-      await pi.events.get("session_shutdown")?.[0]();
-      delete process.env.HERDR_SOCKET_PATH;
-      setLeadEnvironment();
-    }
-  });
-}
-
-for (const scenario of [
-  {
-    name: "accepts its branch worktree Lead",
-    moved: false,
-    mismatchedPath: false,
-    prospectivePath: false,
-  },
-  {
-    name: "accepts its prospective session path before the file exists",
-    moved: false,
-    mismatchedPath: false,
-    prospectivePath: true,
-  },
-  {
-    name: "denies an exact Lead moved to a sibling worktree",
-    moved: true,
-    mismatchedPath: false,
-    prospectivePath: false,
-  },
-  {
-    name: "denies a mismatched prospective session path",
-    moved: false,
-    mismatchedPath: true,
-    prospectivePath: false,
-  },
-])
-  test(`project assignment delivery ${scenario.name}`, async (t) => {
-    setLeadEnvironment();
-    process.env.HERDR_SOCKET_PATH = join(
-      tmpdir(),
-      `assignment-placement-${randomUUID()}.sock`,
-    );
-    process.env.HERDR_WORKSPACE_ID = "branch-workspace";
-    process.env.HERDR_PANE_ID = "lead-pane";
-    process.env.HERDR_TAB_ID = "lead-tab";
-    const sessionId = randomUUID();
-    const managerId = randomUUID();
-    const sessionPath = join(tmpdir(), `${sessionId}.jsonl`);
-    if (scenario.mismatchedPath) writeFileSync(sessionPath, "");
-    if (scenario.prospectivePath)
-      assert.equal(realFs.existsSync(sessionPath), false);
-    const previousDiagnostics = process.env.PI_HERDSMAN_MANAGER_DIAGNOSTICS;
-    const previousConsoleError = console.error;
-    const diagnosticOutput: string[] = [];
-    if (scenario.prospectivePath) {
-      process.env.PI_HERDSMAN_MANAGER_DIAGNOSTICS = "1";
-      console.error = (...values: unknown[]) => {
-        diagnosticOutput.push(values.join(" "));
-      };
-    } else delete process.env.PI_HERDSMAN_MANAGER_DIAGNOSTICS;
-    const runtime = supervisionRuntime();
-    const assignment = {
-      version: 1 as const,
-      id: sessionId,
-      repoKey: "repo-key",
-      branch: "smoke/delivery-placement",
-      text: "deliver only in the assigned checkout",
-    };
-    writeProjectAssignment(runtime, assignment);
-    writeChiefMessage(
-      {
-        version: 1,
-        id: sessionId,
-        leaseId: randomUUID(),
-        kind: "project_assignment",
-        fromSessionId: managerId,
-        toSessionId: sessionId,
-        leadSessionId: sessionId,
-        branch: assignment.branch,
-        text: `${assignment.text}\n\nYou are the project Lead for this branch. Coordinate implementation through\nyour managed Agents. Delegate implementation and corrective code edits; keep\nyour own work focused on decomposition, technical direction, review,\nintegration decisions, and validation.\n\nUse supervisor_message when the Manager must decide or act, when material scope\nor assumptions change, or when the branch is ready for review. Routine status\nand acknowledgements stay local. The project remains open until the Manager\ncompletes or discards it.`,
-        createdAt: Date.now(),
-      },
-      runtime,
-    );
-    const agent = {
-      agent_session: {
-        source: "herdr:pi",
-        agent: "pi",
-        kind:
-          scenario.mismatchedPath || scenario.prospectivePath ? "path" : "id",
-        value: scenario.mismatchedPath
-          ? join(tmpdir(), `${sessionId}-other.jsonl`)
-          : scenario.prospectivePath
-            ? sessionPath
-            : sessionId,
-      },
-      workspace_id: scenario.moved ? "sibling-workspace" : "branch-workspace",
-      pane_id: "lead-pane",
-      tab_id: "lead-tab",
-    };
-    const manager = {
-      agent_session: {
-        source: "herdr:pi",
-        agent: "pi",
-        kind: "path",
-        value: join(tmpdir(), `${managerId}.jsonl`),
-      },
-      workspace_id: WORKSPACE,
-      pane_id: "manager-pane",
-      tab_id: "manager-tab",
-    };
-    const inventory = [manager, agent];
-    const pi = fakeChiefPi({
-      exec: (_command, args) => {
-        let result: unknown = {};
-        if (isApiSnapshot(args))
-          result = { snapshot: { agents: inventory, panes: [] } };
-        else if (isAgentList(args)) result = { agents: inventory };
-        else if (args[0] === "agent" && args[1] === "get") result = { agent };
-        else if (args[0] === "workspace" && args[1] === "get")
-          result = {
-            workspace: {
-              worktree: { repo_key: "repo-key", is_linked_worktree: true },
-            },
-          };
-        else if (args[0] === "worktree" && args[1] === "list") {
-          result = {
-            source: {
-              repo_key: "repo-key",
-              repo_name: "project",
-              source_workspace_id: WORKSPACE,
-            },
-            worktrees: [
-              {
-                branch: assignment.branch,
-                open_workspace_id: "branch-workspace",
-              },
-              {
-                branch: "smoke/sibling",
-                open_workspace_id: "sibling-workspace",
-              },
-            ],
-          };
-        }
-        return {
-          stdout: JSON.stringify({ id: AGENT_ID, result }),
-          stderr: "",
-          code: 0,
-        };
-      },
-    });
-    registerExtension!(pi.pi as never);
-    const ctx = fakeContext() as any;
-    ctx.sessionManager = {
-      ...ctx.sessionManager,
-      getSessionId: () => sessionId,
-      getSessionFile: () => sessionPath,
-    };
-    try {
-      await pi.events.get("session_start")![0](undefined, ctx);
-      await t.waitFor(() =>
-        assert.equal(listChiefMessagePaths(runtime, sessionId).length, 0),
-      );
-      const delivered = pi.sent.filter(
-        (message: any) =>
-          message.customType === "pi-herdsman-project_assignment",
-      );
-      assert.equal(
-        delivered.length,
-        scenario.moved || scenario.mismatchedPath ? 0 : 1,
-      );
-      if (!scenario.moved && !scenario.mismatchedPath) {
-        assert.equal(delivered[0].details.id, sessionId);
-        assert.equal(delivered[0].details.branch, assignment.branch);
-        assert.ok(delivered[0].content.includes(assignment.branch));
-        assert.equal(delivered[0].content.includes(sessionId), false);
-      }
-      if (scenario.prospectivePath) {
-        assert.equal(realFs.existsSync(sessionPath), false);
-        const diagnosticEvents = diagnosticOutput
-          .filter((line) =>
-            line.startsWith("[pi-herdsman-manager-diagnostic] "),
-          )
-          .map((line) =>
-            JSON.parse(line.slice("[pi-herdsman-manager-diagnostic] ".length)),
-          );
-        assert.deepEqual(
-          diagnosticEvents.map(({ event }) => event),
-          [
-            "session_start_reached",
-            "initial_inbox_drain_start",
-            "inbox_preflight",
-            "inbox_preflight_recheck",
-            "inbox_candidates",
-            "project_assignment_scope_start",
-            "project_assignment_scope_complete",
-            "project_assignment_topology_start",
-            "project_assignment_topology_complete",
-            "project_assignment_live_lead_start",
-            "project_assignment_live_lead_complete",
-            "project_assignment_authorization",
-            "project_assignment_send",
-            "inbox_peer_presence",
-            "inbox_drain_complete",
-          ],
-        );
-        const authorization = diagnosticEvents.find(
-          ({ event }) => event === "project_assignment_authorization",
-        );
-        const send = diagnosticEvents.find(
-          ({ event }) => event === "project_assignment_send",
-        );
-        assert.equal(authorization.outcome, "authorized");
-        assert.equal(authorization.reason, "matched");
-        assert.equal(send.outcome, "resolved");
-        assert.equal(send.triggerTurn, true);
-        assert.doesNotMatch(
-          diagnosticOutput
-            .filter((line) =>
-              line.startsWith("[pi-herdsman-manager-diagnostic] "),
-            )
-            .join("\n"),
-          new RegExp(`${sessionId}|${assignment.text}`),
-        );
-        writeFileSync(
-          sessionPath,
-          `${JSON.stringify({
-            type: "session",
-            version: 3,
-            id: sessionId,
-            timestamp: new Date().toISOString(),
-            cwd: "/tmp",
-          })}\n`,
-        );
-        assert.equal(realFs.existsSync(sessionPath), true);
-      }
-      const saved = await pi.tools
-        .find((tool) => tool.name === "supervisor_message")!
-        .execute(
-          "message",
-          { message: "Ready for review" },
-          undefined,
-          undefined,
-          ctx,
-        );
-      assert.match(JSON.stringify(saved), /Project message saved for Manager/);
-      assert.equal(
-        listProjectMessages(runtime, "repo-key", assignment.branch).length,
-        1,
-      );
-    } finally {
-      if (scenario.mismatchedPath) realFs.rmSync(sessionPath, { force: true });
-      if (scenario.prospectivePath) {
-        realFs.rmSync(sessionPath, { force: true });
-        console.error = previousConsoleError;
-        if (previousDiagnostics === undefined)
-          delete process.env.PI_HERDSMAN_MANAGER_DIAGNOSTICS;
-        else process.env.PI_HERDSMAN_MANAGER_DIAGNOSTICS = previousDiagnostics;
-      } else if (previousDiagnostics !== undefined)
-        process.env.PI_HERDSMAN_MANAGER_DIAGNOSTICS = previousDiagnostics;
-      await pi.events.get("session_shutdown")?.[0]();
-      delete process.env.HERDR_SOCKET_PATH;
-      setLeadEnvironment();
-    }
-  });
-
-test("Manager retry correlates an ambiguous worktree create by persisted branch", async (t) => {
-  setLeadEnvironment();
-  process.env.HERDR_PANE_ID = "root-pane";
-  process.env.HERDR_TAB_ID = "root-tab";
-  process.env.HERDR_SOCKET_PATH = join(
-    tmpdir(),
-    `delegate-recovery-${randomUUID()}.sock`,
-  );
-  const socketPath = process.env.HERDR_SOCKET_PATH;
-  const childWorkspace = `child-${randomUUID()}`;
-  let childSession = "";
-  let topologyCreated = false;
-  let createCalls = 0;
-  let openCalls = 0;
-  let started = false;
-  let delayReadiness = false;
-  let releaseReadiness!: () => void;
-  let markReadinessStarted!: () => void;
-  const readinessPending = new Promise<void>(
-    (resolve) => (releaseReadiness = resolve),
-  );
-  const readinessStarted = new Promise<void>(
-    (resolve) => (markReadinessStarted = resolve),
-  );
-  const respond = (result: unknown) => ({
-    stdout: JSON.stringify({ id: AGENT_ID, result }),
-    stderr: "",
-    code: 0,
-  });
-  const managerAgent = {
-    agent_session: {
-      source: "herdr:pi",
-      agent: "pi",
-      kind: "id",
-      value: LEAD_SESSION_ID,
-    },
-    workspace_id: WORKSPACE,
-    pane_id: "root-pane",
-    tab_id: "root-tab",
-  };
-  const exec = async (command: string, args: string[]) => {
-    if (command === "herdr" && args[0] === "workspace" && args[1] === "get")
-      return respond({
-        workspace: {
-          workspace_id: args[2],
-          worktree: {
-            repo_key: "repo-key",
-            is_linked_worktree: args[2] === childWorkspace,
-            checkout_path:
-              args[2] === childWorkspace
-                ? "/tmp/manager-child"
-                : "/tmp/manager-root",
-          },
-        },
-      });
-    if (command === "herdr" && args[0] === "worktree" && args[1] === "list")
-      return respond({
-        source: {
-          source_workspace_id: WORKSPACE,
-          repo_key: "repo-key",
-          repo_name: "project",
-        },
-        worktrees: topologyCreated
-          ? listProjectAssignments(supervisionRuntime(), "repo-key").map(
-              (assignment) => ({
-                ...(openCalls || topologyCreated
-                  ? { open_workspace_id: childWorkspace }
-                  : {}),
-                branch: assignment.branch,
-                path: "/tmp/manager-child",
-              }),
-            )
-          : [],
-      });
-    if (command === "herdr" && args[0] === "worktree" && args[1] === "open") {
-      openCalls++;
-      assert.deepEqual(args.slice(2), [
-        "--workspace",
-        WORKSPACE,
-        "--branch",
-        args[args.indexOf("--branch") + 1],
-        "--no-focus",
-      ]);
-      assert.ok(args.includes("--branch"));
-      assert.ok(args.includes("--no-focus"));
-      return respond({
-        workspace: { workspace_id: childWorkspace },
-        tab: { tab_id: "child-tab" },
-        root_pane: { pane_id: "child-pane", tab_id: "child-tab" },
-        worktree: {
-          branch: args[args.indexOf("--branch") + 1],
-          path: "/tmp/manager-child",
-        },
-        already_open: true,
-      });
-    }
-    if (command === "herdr" && args[0] === "worktree" && args[1] === "create") {
-      createCalls++;
-      topologyCreated = true; // Herdr succeeded, but the response was lost.
-      return { stdout: "", stderr: "transport closed", code: 1 };
-    }
-    if (command === "herdr" && args[0] === "pane" && args[1] === "list")
-      return respond({
-        panes: [
-          {
-            pane_id: "child-pane",
-            workspace_id: childWorkspace,
-            tab_id: "child-tab",
-            cwd: "/tmp/manager-child",
-            terminal_id: "child-terminal",
-          },
-        ],
-      });
-    if (command === "herdr" && args[0] === "pane" && args[1] === "get")
-      return respond({
-        pane: {
-          pane_id: "child-pane",
-          workspace_id: childWorkspace,
-          tab_id: "child-tab",
-          terminal_id: "child-terminal",
-          cwd: "/tmp/manager-child",
-        },
-      });
-    if (command === "herdr" && args[0] === "pane" && args[1] === "process-info")
-      return respond({
-        process_info: {
-          pane_id: "child-pane",
-          shell_pid: 33,
-          foreground_process_group_id: 33,
-          foreground_processes: [{ pid: 33, argv0: "/bin/zsh" }],
-        },
-      });
-    if (command === "herdr" && args[0] === "pane" && args[1] === "run") {
-      if (delayReadiness) markReadinessStarted();
-      return respond({});
-    }
-    if (
-      command === "herdr" &&
-      args[0] === "pane" &&
-      args[1] === "wait-output"
-    ) {
-      if (delayReadiness) await readinessPending;
-      return respond({});
-    }
-    if (command === "herdr" && args[0] === "agent" && args[1] === "start") {
-      started = true;
-      const assignment = listProjectAssignments(
-        supervisionRuntime(),
-        "repo-key",
-      )[0]!;
-      childSession = assignment.id;
-      writeLeadCoordinationState(supervisionRuntime(), {
-        version: 1,
-        role: "lead",
-        instanceId: randomUUID(),
-        piSessionId: childSession,
-        updatedAt: Date.now(),
-      });
-      assert.equal(assignment.branch.length > 0, true);
-      return respond({
-        agent: {
-          name: "lead",
-          agent_session: {
-            source: "herdr:pi",
-            agent: "pi",
-            kind: "id",
-            value: childSession,
-          },
-        },
-      });
-    }
-    if (command === "herdr" && isApiSnapshot(args))
-      return respond({
-        snapshot: {
-          panes: [],
-          agents: started
-            ? [
-                {
-                  agent_session: {
-                    source: "herdr:pi",
-                    agent: "pi",
-                    kind: "id",
-                    value: childSession,
-                  },
-                  workspace_id: childWorkspace,
-                  pane_id: "child-pane",
-                  tab_id: "child-tab",
-                },
-              ]
-            : [],
-        },
-      });
-    if (command === "herdr" && isAgentList(args))
-      return respond({
-        agents: [
-          managerAgent,
-          ...(started
-            ? [
-                {
-                  agent_session: {
-                    source: "herdr:pi",
-                    agent: "pi",
-                    kind: "id",
-                    value: childSession,
-                  },
-                  workspace_id: childWorkspace,
-                  pane_id: "child-pane",
-                  tab_id: "child-tab",
-                },
-              ]
-            : []),
-        ],
-      });
-    if (command === "herdr" && args[0] === "agent" && args[1] === "get")
-      return respond({ agent: managerAgent });
-    return respond({});
-  };
-  const pi = fakeChiefPi({
-    activeTools: ["read"],
-    exec,
-    persistMessages: true,
-  });
-  registerExtension!(pi.pi as never);
-  try {
-    const ctx = fakeContext(pi.entries) as any;
-    await pi.events.get("session_start")![0](undefined, ctx);
-    await pi.commandOptions.get("manager").handler("", ctx);
-    const staff = pi.tools.find((tool) => tool.name === "staff_delegate")!;
-    const staffListTool = pi.tools.find((tool) => tool.name === "staff_list")!;
-    await assert.rejects(
-      staff.execute(
-        "delegate",
-        {
-          branch: "smoke/bootstrap-recovery",
-          task: "persist through transport loss",
-        },
-        undefined,
-        undefined,
-        ctx,
-      ),
-      /transport closed/,
-    );
-    const pending = listProjectAssignments(
-      supervisionRuntime(),
-      "repo-key",
-    )[0]!;
-    assert.deepEqual(Object.keys(pending).sort(), [
-      "branch",
-      "id",
-      "repoKey",
-      "text",
-      "version",
-    ]);
-    assert.equal(createCalls, 1);
-    assert.ok(
-      pi.calls.some(
-        (args) =>
-          args.includes("--base") &&
-          args[args.indexOf("--base") + 1] === "HEAD",
-      ),
-      "creation must use the base persisted before the Herdr mutation",
-    );
-    const staffList = await staffListTool.execute(
-      "list",
-      {},
-      undefined,
-      undefined,
-      ctx,
-    );
-    assert.equal(staffList.details.ok, true);
-    assert.equal(staffList.details.work[0].branch, pending.branch);
-    assert.equal(staffList.details.work[0].status, "paused");
-    assert.equal("session" in staffList.details.work[0], false);
-    assert.equal("result" in staffList.details.work[0], false);
-    assert.equal("workspace_id" in staffList.details.work[0], false);
-    assert.equal("pane_id" in staffList.details.work[0], false);
-    assert.equal(createCalls, 1, "roster reads must not retry creation");
-    assert.equal(
-      listProjectAssignments(supervisionRuntime(), "repo-key")[0]?.id,
-      pending.id,
-    );
-    await assert.rejects(
-      staff.execute(
-        "delegate",
-        {
-          task: "duplicate branch",
-          branch: pending.branch,
-        },
-        undefined,
-        undefined,
-        ctx,
-      ),
-      /Work already exists/,
-    );
-    {
-      await assert.rejects(
-        staff.execute(
-          "delegate",
-          {
-            task: "duplicate branch",
-            branch: pending.branch,
-          },
-          undefined,
-          undefined,
-          ctx,
-        ),
-        /Work already exists/,
-      );
-    }
-    await assert.rejects(
-      staff.execute(
-        "delegate",
-        {
-          task: "independent branch",
-          branch: "smoke/manager2",
-        },
-        undefined,
-        undefined,
-        ctx,
-      ),
-      /transport closed/,
-    );
-    assert.equal(
-      listProjectAssignments(supervisionRuntime(), "repo-key").length,
-      2,
-    );
-    delayReadiness = true;
-    for (const [field, value] of [
-      ["task", "replacement task"],
-      ["base", "main"],
-    ] as const) {
-      await assert.rejects(
-        staff.execute(
-          "delegate",
-          { branch: pending.branch, [field]: value },
-          undefined,
-          undefined,
-          ctx,
-        ),
-        /Work already exists/,
-      );
-    }
-    const retryPromise = staff.execute(
-      "delegate",
-      { branch: pending.branch },
-      undefined,
-      undefined,
-      ctx,
-    );
-    await Promise.race([
-      readinessStarted,
-      retryPromise.then(
-        () => {
-          throw new Error("Startup completed before readiness");
-        },
-        (error) => {
-          throw error;
-        },
-      ),
-    ]);
-    assert.equal(
-      started,
-      false,
-      "Manager must wait for the exact pane shell readiness marker",
-    );
-    releaseReadiness();
-    const retry = await retryPromise;
-    assert.equal(retry.details.ok, true, JSON.stringify(retry.details));
-    assert.equal(retry.details.branch, pending.branch);
-    assert.equal(retry.details.session, childSession);
-    assert.equal(createCalls, 2);
-    assert.equal(openCalls, 1);
-    assert.equal(
-      listProjectAssignments(supervisionRuntime(), "repo-key").find(
-        (item) => item.id === pending.id,
-      )?.id,
-      pending.id,
-    );
-    await pi.commandOptions.get("manager").handler("leave", ctx);
-    assert.equal(pi.pi.getActiveTools().includes("staff_delegate"), false);
-    assert.equal(
-      listProjectAssignments(supervisionRuntime(), "repo-key").find(
-        (item) => item.id === pending.id,
-      )?.id,
-      pending.id,
-      "Manager leave must retain assignment ownership until completion",
-    );
-
-    setLeadEnvironment();
-    process.env.HERDR_PANE_ID = "child-pane";
-    process.env.HERDR_WORKSPACE_ID = childWorkspace;
-    process.env.HERDR_SOCKET_PATH = socketPath;
-    writeLeadCoordinationState(supervisionRuntime(), {
-      version: 1,
-      role: "lead",
-      instanceId: randomUUID(),
-      piSessionId: childSession,
-      updatedAt: Date.now(),
-    });
-    const leadPi = fakeChiefPi({ activeTools: ["read"], exec });
-    registerExtension!(leadPi.pi as never);
-    const leadContext = fakeContext() as any;
-    leadContext.sessionManager = {
-      ...leadContext.sessionManager,
-      getSessionId: () => childSession,
-      getSessionFile: () => `/tmp/${childSession}.jsonl`,
-    };
-    await leadPi.events.get("session_start")![0](undefined, leadContext);
-    const message = await leadPi.tools
-      .find((tool) => tool.name === "supervisor_message")!
-      .execute(
-        "message",
-        { message: "Ready for review without Manager" },
-        undefined,
-        undefined,
-        leadContext,
-      );
-    assert.match(JSON.stringify(message), /Project message saved for Manager/);
-    assert.equal(
-      listProjectMessages(supervisionRuntime(), "repo-key", pending.branch)[0]
-        ?.text,
-      "Ready for review without Manager",
-    );
-    assert.ok(
-      listProjectAssignments(supervisionRuntime(), "repo-key").some(
-        (item) => item.id === pending.id,
-      ),
-    );
-    await leadPi.events.get("session_shutdown")?.[0]();
-  } finally {
-    await pi.events.get("session_shutdown")?.[0]();
-    delete process.env.HERDR_SOCKET_PATH;
-    setLeadEnvironment();
-  }
-});
-
-async function runManagerStartupScenario(
-  mode:
-    | "success"
-    | "missing-state"
-    | "missing-herdr-session"
-    | "delayed-herdr-session"
-    | "conflict"
-    | "managed-agent"
-    | "unmaterialized-path"
-    | "identity-manager-lost-timeout"
-    | "identity-manager-lost-success"
-    | "identity-timeout"
-    | "identity-zero-byte-timeout"
-    | "identity-unproven"
-    | "identity-mismatch"
-    | "identity-cleanup-mismatch"
-    | "identity-ambiguity"
-    | "mismatched-session"
-    | "recovery"
-    | "preexisting"
-    | "preexisting-closed"
-    | "occupied"
-    | "multiple"
-    | "discard-pane-missing"
-    | "discard-pi"
-    | "invalid-topology"
-    | "concurrent"
-    | "active-loss"
-    | "active-live"
-    | "active-missing"
-    | "active-missing-no-session"
-    | "active-closed"
-    | "close-resume"
-    | "active-discard"
-    | "active-complete"
-    | "close-failure"
-    | "unassigned-close",
-  projectTrusted = false,
-  t?: TestContext,
-  missingPaneCode = "pane_not_found",
-): Promise<void> {
-  setLeadEnvironment();
-  const prospective =
-    mode === "unmaterialized-path" || mode.startsWith("identity-");
-  process.env.HERDR_PANE_ID = "root-pane";
-  process.env.HERDR_TAB_ID = "root-tab";
-  process.env.HERDR_SOCKET_PATH = join(
-    tmpdir(),
-    `delegate-fresh-${randomUUID()}.sock`,
-  );
-  const childWorkspace = `child-${randomUUID()}`;
-  const unrelatedSession = randomUUID();
-  const secondSession = randomUUID();
-  let childSession = "";
-  const childSessionPath = join(tmpdir(), `lead-${randomUUID()}.jsonl`);
-  const childPath = "/tmp/manager-fresh-child";
-  let recipientIdle = true;
-  let created = false;
-  let createdBranch = "";
-  let shellReady = false;
-  let started =
-    mode === "recovery" ||
-    mode === "active-live" ||
-    [
-      "close-resume",
-      "active-discard",
-      "active-complete",
-      "close-failure",
-    ].includes(mode);
-  let startupObservations = 0;
-  let identityObservations = 0;
-  let cleanupOwnershipObservations = 0;
-  let emptySessionStat: ReturnType<typeof realFs.statSync> | undefined;
-  let identityPolled: () => void = () => {};
-  const identityPoll = new Promise<void>((resolve) => {
-    identityPolled = resolve;
-  });
-  const originalNow = Date.now;
-  const childIdentity = () => ({
-    source: "herdr:pi",
-    agent: "pi",
-    kind: prospective ? "path" : "id",
-    value: prospective ? childSessionPath : childSession,
-  });
-  let createCalls = 0;
-  let openCalls = 0;
-  let startCalls = 0;
-  let worktreeListCalls = 0;
-  let invalidTopologyCall = Number.POSITIVE_INFINITY;
-  let inspectedDiscardPane = false;
-  let duplicateWorktree = false;
-  const respond = (result: any) => ({
-    stdout: JSON.stringify({
-      id: AGENT_ID,
-      result:
-        duplicateWorktree && Array.isArray(result?.worktrees)
-          ? { ...result, worktrees: [...result.worktrees, result.worktrees[0]] }
-          : result,
-    }),
-    stderr: "",
-    code: 0,
-  });
-  const managerAgent = {
-    agent_session: {
-      source: "herdr:pi",
-      agent: "pi",
-      kind: "id",
-      value: LEAD_SESSION_ID,
-    },
-    workspace_id: WORKSPACE,
-    pane_id: "root-pane",
-    tab_id: "root-tab",
-  };
-  const exec = async (command: string, args: string[]) => {
-    if (command === "herdr" && args[0] === "workspace" && args[1] === "get")
-      return respond({
-        workspace: {
-          workspace_id: args[2],
-          worktree: {
-            repo_key: "repo-key",
-            is_linked_worktree: args[2] === childWorkspace,
-            checkout_path:
-              args[2] === childWorkspace ? childPath : "/tmp/manager-root",
-          },
-        },
-      });
-    if (command === "herdr" && args[0] === "worktree" && args[1] === "list") {
-      worktreeListCalls++;
-      return respond({
-        source:
-          mode === "invalid-topology" &&
-          worktreeListCalls === invalidTopologyCall
-            ? {
-                source_workspace_id: "wrong-workspace",
-                repo_key: "repo-key",
-                repo_name: "project",
-              }
-            : {
-                source_workspace_id: WORKSPACE,
-                repo_key: "repo-key",
-                repo_name: "project",
-              },
-        worktrees: [
-          "preexisting",
-          "preexisting-closed",
-          "occupied",
-          "multiple",
-        ].includes(mode)
-          ? [
-              {
-                branch: "smoke/existing",
-                path: childPath,
-                ...(["occupied", "multiple"].includes(mode) ||
-                (mode.startsWith("preexisting") && openCalls)
-                  ? { open_workspace_id: childWorkspace }
-                  : {}),
-              },
-            ]
-          : created
-            ? (mode === "unassigned-close"
-                ? [{ branch: "smoke/unassigned" }]
-                : mode === "active-discard" ||
-                    mode === "active-complete" ||
-                    mode === "discard-pane-missing"
-                  ? [{ branch: createdBranch }]
-                  : listProjectAssignments(supervisionRuntime(), "repo-key")
-              ).map((assignment) => ({
-                branch: assignment.branch,
-                path: childPath,
-                ...(mode === "active-closed" && !openCalls
-                  ? {}
-                  : { open_workspace_id: childWorkspace }),
-              }))
-            : [],
-      });
-    }
-    if (command === "herdr" && args[0] === "worktree" && args[1] === "create") {
-      createCalls++;
-      created = true;
-      const branch = args[args.indexOf("--branch") + 1];
-      assert.ok(branch);
-      if (mode === "active-missing")
-        assert.deepEqual(args, [
-          "worktree",
-          "create",
-          "--workspace",
-          WORKSPACE,
-          "--branch",
-          branch,
-          "--no-focus",
-          "--base",
-          branch,
-          "--path",
-          "/old/exact/worktree",
-        ]);
-      if (mode === "active-missing-no-session")
-        assert.deepEqual(args, [
-          "worktree",
-          "create",
-          "--workspace",
-          WORKSPACE,
-          "--branch",
-          branch,
-          "--no-focus",
-          "--base",
-          branch,
-        ]);
-      createdBranch = branch;
-      return respond({
-        workspace: { workspace_id: childWorkspace },
-        tab: { tab_id: "child-tab" },
-        root_pane: { pane_id: "child-pane", tab_id: "child-tab" },
-        worktree: { branch, path: childPath },
-      });
-    }
-    if (command === "herdr" && args[0] === "worktree" && args[1] === "open") {
-      openCalls++;
-      if (
-        mode !== "active-closed" &&
-        mode !== "preexisting" &&
-        mode !== "preexisting-closed" &&
-        !["active-loss", "active-live", "recovery"].includes(mode)
-      )
-        throw new Error("fresh worktree must not be opened again");
-      return respond({
-        workspace: { workspace_id: childWorkspace },
-        tab: { tab_id: "child-tab" },
-        root_pane: { pane_id: "child-pane", tab_id: "child-tab" },
-        worktree: {
-          branch: args[args.indexOf("--branch") + 1],
-          path: childPath,
-        },
-      });
-    }
-    if (command === "herdr" && args[0] === "pane" && args[1] === "list") {
-      return respond({
-        panes: [
-          {
-            pane_id: "child-pane",
-            workspace_id: childWorkspace,
-            tab_id: "child-tab",
-            cwd: childPath,
-            terminal_id: "child-terminal",
-          },
-        ],
-      });
-    }
-    if (command === "herdr" && args[0] === "pane" && args[1] === "get")
-      return respond({
-        pane: {
-          pane_id:
-            mode === "identity-unproven" && identityObservations
-              ? "replacement-pane"
-              : "child-pane",
-          workspace_id: childWorkspace,
-          tab_id: "child-tab",
-          terminal_id: "child-terminal",
-          cwd: childPath,
-          ...(([
-            "close-resume",
-            "active-discard",
-            "active-complete",
-            "close-failure",
-            "unassigned-close",
-          ].includes(mode) ||
-            prospective) &&
-          started
-            ? {
-                agent_session: childIdentity(),
-              }
-            : {}),
-        },
-      });
-    if (command === "herdr" && args[0] === "tab" && args[1] === "list")
-      return respond({
-        tabs: [{ tab_id: "child-tab", workspace_id: childWorkspace }],
-      });
-    if (
-      command === "herdr" &&
-      args[0] === "pane" &&
-      args[1] === "process-info"
-    ) {
-      if (
-        ["discard-pane-missing", "discard-pi"].includes(mode) &&
-        args[3] === "child-pane"
-      ) {
-        inspectedDiscardPane = true;
-        if (mode === "discard-pane-missing")
-          return {
-            stdout: JSON.stringify({
-              id: AGENT_ID,
-              error: { code: missingPaneCode, message: "pane not found" },
-            }),
-            stderr: "",
-            code: 1,
-          };
-        if (mode === "discard-pi")
-          return respond({
-            process_info: {
-              foreground_processes: [
-                {
-                  argv0: "/usr/bin/pi",
-                  cmdline: "pi --session-id awaiting-bootstrap",
-                },
-              ],
-            },
-          });
-      }
-      return respond({
-        process_info: {
-          pane_id: "child-pane",
-          shell_pid: 33,
-          foreground_process_group_id:
-            started &&
-            ([
-              "close-resume",
-              "active-discard",
-              "close-failure",
-              "unassigned-close",
-            ].includes(mode) ||
-              prospective)
-              ? 44
-              : 33,
-          foreground_processes: [
-            {
-              pid: started ? 44 : 33,
-              argv0: started ? "/usr/bin/pi" : "/bin/zsh",
-              ...(mode === "missing-state" && started
-                ? { cmdline: "x".repeat(10_000) }
-                : {}),
-            },
-          ],
-        },
-      });
-    }
-    if (command === "herdr" && args[0] === "pane" && args[1] === "read") {
-      assert.deepEqual(args, [
-        "pane",
-        "read",
-        "child-pane",
-        "--source",
-        "recent-unwrapped",
-        "--lines",
-        "40",
-        "--format",
-        "text",
-        "--raw",
-      ]);
-      return mode === "missing-state"
-        ? { stdout: "", stderr: "read failed", code: 1 }
-        : { stdout: "child bootstrap error", stderr: "", code: 0 };
-    }
-    if (command === "herdr" && args[0] === "pane" && args[1] === "run")
-      return respond({});
-    if (command === "herdr" && args[0] === "agent" && args[1] === "send-keys") {
-      if (
-        [
-          "close-resume",
-          "active-discard",
-          "close-failure",
-          "unassigned-close",
-        ].includes(mode)
-      )
-        assert.deepEqual(args, [
-          "agent",
-          "send-keys",
-          "child-pane",
-          "ctrl+c",
-          "ctrl+d",
-        ]);
-      if (mode === "close-failure") throw new Error("stop refused");
-      started = false;
-      startupObservations = 0;
-      return respond({});
-    }
-    if (
-      command === "herdr" &&
-      args[0] === "pane" &&
-      args[1] === "wait-output"
-    ) {
-      shellReady = true;
-      return respond({});
-    }
-    if (command === "herdr" && args[0] === "agent" && args[1] === "start") {
-      startCalls++;
-      assert.equal(shellReady, true, "agent starts only after shell readiness");
-      assert.deepEqual(args.slice(0, 6), [
-        "agent",
-        "start",
-        args[2],
-        "--kind",
-        "pi",
-        "--pane",
-      ]);
-      assert.equal(args[6], "child-pane");
-      const approvalFlag = projectTrusted ? "--approve" : "--no-approve";
-      assert.ok(args.includes(approvalFlag));
-      assert.equal(
-        args.includes(projectTrusted ? "--no-approve" : "--approve"),
-        false,
-      );
-      const starting = listProjectAssignments(
-        supervisionRuntime(),
-        "repo-key",
-      )[0]!;
-      childSession = starting.id;
-      assert.equal(args[args.indexOf("--session-id") + 1], starting.id);
-      assert.deepEqual(
-        args.slice(
-          args.indexOf("--session-id"),
-          args.indexOf("--session-id") + 3,
-        ),
-        ["--session-id", starting.id, approvalFlag],
-      );
-      assert.deepEqual(Object.keys(starting).sort(), [
-        "branch",
-        "id",
-        "repoKey",
-        "text",
-        "version",
-      ]);
-      started = true;
-      return respond({
-        agent: {
-          name: "lead",
-          agent_session: {
-            source: "herdr:pi",
-            agent: "pi",
-            kind: "id",
-            value: childSession,
-          },
-        },
-      });
-    }
-    if (command === "herdr" && isApiSnapshot(args)) {
-      const currentAssignment = listProjectAssignments(
-        supervisionRuntime(),
-        "repo-key",
-      )[0];
-      if (!childSession && currentAssignment)
-        childSession = currentAssignment.id;
-      if (started) startupObservations++;
-      if (
-        started &&
-        startupObservations === 3 &&
-        !["missing-state", "managed-agent"].includes(mode)
-      )
-        writeLeadCoordinationState(supervisionRuntime(), {
-          version: 1,
-          role: mode === "conflict" ? "manager" : "lead",
-          instanceId: randomUUID(),
-          piSessionId: childSession,
-          updatedAt: Date.now(),
-        });
-      if (mode === "managed-agent" && started && startupObservations === 2) {
-        const identity = {
-          paneId: "child-pane",
-          tabId: "child-tab",
-          piSessionId: childSession,
-          piSessionFile: `/tmp/${childSession}.jsonl`,
-        };
-        writeAgentState(
-          agentMailboxPath(WORKSPACE, "managed-child"),
-          managedState("managed-child", undefined, identity),
-        );
-      }
-      if (
-        ["missing-state", "missing-herdr-session"].includes(mode) &&
-        started &&
-        startupObservations === 2
-      ) {
-        const now = Date.now.bind(Date);
-        Date.now = () => now() + 60_000;
-      }
-      return respond({
-        snapshot: {
-          panes: [],
-          agents: ["occupied", "multiple"].includes(mode)
-            ? [
-                {
-                  agent_session: {
-                    source: "herdr:pi",
-                    agent: "pi",
-                    kind: "id",
-                    value: unrelatedSession,
-                  },
-                  workspace_id: childWorkspace,
-                  pane_id: "child-pane",
-                  tab_id: "child-tab",
-                },
-                ...(mode === "multiple"
-                  ? [
-                      {
-                        agent_session: {
-                          source: "herdr:pi",
-                          agent: "pi",
-                          kind: "id",
-                          value: secondSession,
-                        },
-                        workspace_id: childWorkspace,
-                        pane_id: "child-pane",
-                        tab_id: "child-tab",
-                      },
-                    ]
-                  : []),
-              ]
-            : started &&
-                startupObservations >= 2 &&
-                mode !== "missing-herdr-session"
-              ? [
-                  {
-                    agent_session:
-                      mode === "delayed-herdr-session" &&
-                      startupObservations === 2
-                        ? undefined
-                        : prospective
-                          ? {
-                              source: "herdr:pi",
-                              agent: "pi",
-                              kind: "path",
-                              value: childSessionPath,
-                            }
-                          : {
-                              source: "herdr:pi",
-                              agent: "pi",
-                              kind: "id",
-                              value:
-                                mode === "mismatched-session"
-                                  ? randomUUID()
-                                  : childSession,
-                            },
-                    workspace_id: childWorkspace,
-                    pane_id: "child-pane",
-                    tab_id: "child-tab",
-                    cwd: childPath,
-                  },
-                ]
-              : [],
-        },
-      });
-    }
-    if (command === "herdr" && isAgentList(args)) {
-      const delivered =
-        childSession &&
-        listChiefMessagePaths(supervisionRuntime(), childSession).some(
-          (path) => readChiefMessage(path).kind === "project_assignment",
-        );
-      if (prospective && delivered && started) {
-        identityObservations++;
-        if (
-          mode.startsWith("identity-manager-lost-") &&
-          identityObservations === 1
-        ) {
-          assert.equal(realFs.existsSync(childSessionPath), false);
-          const descriptorPath = managerDescriptorPath(
-            supervisionRuntime(),
-            WORKSPACE,
-          );
-          realFs.unlinkSync(descriptorPath);
-          realFs.rmSync(`${descriptorPath}.lock`, { recursive: true });
-        }
-        if (mode === "unmaterialized-path" && identityObservations === 2)
-          identityPolled();
-        if (
-          mode === "identity-zero-byte-timeout" &&
-          identityObservations === 1
-        ) {
-          assert.equal(realFs.existsSync(childSessionPath), false);
-          realFs.writeFileSync(childSessionPath, "");
-          emptySessionStat = realFs.statSync(childSessionPath);
-        }
-        if (
-          [
-            "identity-timeout",
-            "identity-zero-byte-timeout",
-            "identity-unproven",
-            "identity-mismatch",
-            "identity-cleanup-mismatch",
-            "identity-manager-lost-timeout",
-          ].includes(mode)
-        )
-          Date.now = () => originalNow() + 60_000;
-        if (
-          mode === "identity-mismatch" ||
-          mode === "identity-ambiguity" ||
-          (mode === "identity-manager-lost-success" &&
-            identityObservations === 2)
-        ) {
-          realFs.writeFileSync(
-            childSessionPath,
-            JSON.stringify({
-              type: "session",
-              id:
-                mode === "identity-mismatch" ? unrelatedSession : childSession,
-            }),
-          );
-          nativeSessions.set(childSession, {
-            id: mode === "identity-mismatch" ? unrelatedSession : childSession,
-            path: childSessionPath,
-            cwd: childPath,
-            entries: [],
-          });
-        }
-      }
-      return respond({
-        agents: [
-          managerAgent,
-          ...(["occupied", "multiple"].includes(mode)
-            ? [
-                {
-                  agent_session: {
-                    source: "herdr:pi",
-                    agent: "pi",
-                    kind: "id",
-                    value: unrelatedSession,
-                  },
-                  workspace_id: childWorkspace,
-                  pane_id: "child-pane",
-                  tab_id: "child-tab",
-                },
-              ]
-            : []),
-          ...(mode === "multiple"
-            ? [
-                {
-                  agent_session: {
-                    source: "herdr:pi",
-                    agent: "pi",
-                    kind: "id",
-                    value: secondSession,
-                  },
-                  workspace_id: childWorkspace,
-                  pane_id: "second-pane",
-                  tab_id: "child-tab",
-                },
-              ]
-            : []),
-          ...(mode === "active-live" ||
-          (started && startupObservations >= 3) ||
-          ([
-            "close-resume",
-            "active-discard",
-            "close-failure",
-            "unassigned-close",
-          ].includes(mode) &&
-            started)
-            ? Array.from(
-                { length: mode === "identity-ambiguity" && delivered ? 2 : 1 },
-                () => ({
-                  agent_session: childIdentity(),
-                  workspace_id: childWorkspace,
-                  pane_id: "child-pane",
-                  tab_id: "child-tab",
-                  cwd: childPath,
-                }),
-              )
-            : []),
-        ],
-      });
-    }
-    if (command === "herdr" && args[0] === "agent" && args[1] === "get") {
-      if (
-        mode === "identity-cleanup-mismatch" &&
-        identityObservations &&
-        ++cleanupOwnershipObservations === 1
-      ) {
-        assert.equal(realFs.existsSync(childSessionPath), false);
-        realFs.writeFileSync(
-          childSessionPath,
-          JSON.stringify({
-            type: "session",
-            id: unrelatedSession,
-          }),
-        );
-        nativeSessions.set(childSession, {
-          id: unrelatedSession,
-          path: childSessionPath,
-          cwd: childPath,
-          entries: [],
-        });
-      }
-      return respond({
-        agent:
-          args[2] === "lead" || args[2] === "child-pane"
-            ? {
-                workspace_id: childWorkspace,
-                pane_id: "child-pane",
-                tab_id: "child-tab",
-                cwd: childPath,
-                agent_session: childIdentity(),
-              }
-            : managerAgent,
-      });
-    }
-    return respond({});
-  };
-  const pi = fakeChiefPi({
-    activeTools: ["read"],
-    exec,
-  });
-  registerExtension!(pi.pi as never);
-  try {
-    const activeBranch: any[] = pi.entries;
-    const ctx = fakeContext(pi.entries, activeBranch) as any;
-    ctx.isIdle = () => recipientIdle;
-    if (["occupied", "multiple"].includes(mode))
-      writeLeadCoordinationState(supervisionRuntime(), {
-        version: 1,
-        role: "lead",
-        instanceId: randomUUID(),
-        piSessionId: unrelatedSession,
-        updatedAt: Date.now(),
-      });
-    if (mode === "multiple")
-      writeLeadCoordinationState(supervisionRuntime(), {
-        version: 1,
-        role: "lead",
-        instanceId: randomUUID(),
-        piSessionId: secondSession,
-        updatedAt: Date.now(),
-      });
-    ctx.isProjectTrusted = () => projectTrusted;
-    await pi.events.get("session_start")![0](undefined, ctx);
-    await pi.commandOptions.get("manager").handler("", ctx);
-    const staff = pi.tools.find((tool) => tool.name === "staff_delegate")!;
-    const staleId = randomUUID();
-    const activeMode = [
-      "active-loss",
-      "active-live",
-      "active-missing",
-      "active-missing-no-session",
-      "active-closed",
-      "close-resume",
-      "active-discard",
-      "active-complete",
-      "close-failure",
-    ].includes(mode);
-    if (activeMode) {
-      childSession = staleId;
-      created = !["active-missing", "active-missing-no-session"].includes(mode);
-      if (created) createdBranch = "smoke/recover";
-      writeProjectAssignment(supervisionRuntime(), {
-        version: 1,
-        id: staleId,
-        repoKey: "repo-key",
-        branch: "smoke/recover",
-        text: "recover exact Lead",
-      });
-      if (mode === "active-missing")
-        nativeSessions.set(staleId, {
-          id: staleId,
-          path: `/tmp/${staleId}.jsonl`,
-          cwd: "/old/exact/worktree",
-          entries: [],
-        });
-      if (mode === "active-live")
-        writeLeadCoordinationState(supervisionRuntime(), {
-          version: 1,
-          role: "lead",
-          instanceId: randomUUID(),
-          piSessionId: staleId,
-          updatedAt: Date.now(),
-        });
-      if (
-        [
-          "close-resume",
-          "active-discard",
-          "active-complete",
-          "close-failure",
-        ].includes(mode)
-      )
-        writeLeadCoordinationState(supervisionRuntime(), {
-          version: 1,
-          role: "lead",
-          instanceId: randomUUID(),
-          piSessionId: staleId,
-          updatedAt: Date.now(),
-        });
-      if (["active-discard", "active-complete"].includes(mode))
-        writeProjectMessage(
-          {
-            version: 1,
-            id: randomUUID(),
-            repoKey: "repo-key",
-            branch: "smoke/recover",
-            fromSessionId: staleId,
-            text: "retained before resolution",
-            createdAt: Date.now(),
-          },
-          supervisionRuntime(),
-        );
-    }
-    if (
-      ["invalid-topology", "discard-pane-missing", "discard-pi"].includes(mode)
-    )
-      writeProjectAssignment(supervisionRuntime(), {
-        version: 1,
-        id: staleId,
-        repoKey: "repo-key",
-        branch: "smoke/vanished",
-        text: "recover vanished placement",
-      });
-    if (["discard-pane-missing", "discard-pi"].includes(mode)) {
-      childSession = staleId;
-      created = true;
-      createdBranch = "smoke/vanished";
-    }
-    const execute = () => (
-      (invalidTopologyCall = worktreeListCalls + 4),
-      staff.execute(
-        "delegate",
-        {
-          ...(!["invalid-topology"].includes(mode) && !activeMode
-            ? { task: "deliver the fresh assignment" }
-            : {}),
-          ...([
-            "preexisting",
-            "preexisting-closed",
-            "occupied",
-            "multiple",
-          ].includes(mode)
-            ? { branch: "smoke/existing" }
-            : {}),
-          ...(mode === "concurrent" ? { branch: "smoke/concurrent" } : {}),
-          ...(["invalid-topology"].includes(mode)
-            ? { branch: "smoke/vanished" }
-            : activeMode
-              ? { branch: "smoke/recover" }
-              : {}),
-        },
-        undefined,
-        undefined,
-        ctx,
-      )
-    );
-    if (mode === "unassigned-close") {
-      childSession = staleId;
-      created = true;
-      started = true;
-      writeLeadCoordinationState(supervisionRuntime(), {
-        version: 1,
-        role: "lead",
-        instanceId: randomUUID(),
-        piSessionId: staleId,
-        updatedAt: Date.now(),
-      });
-      assert.deepEqual(
-        listProjectAssignments(supervisionRuntime(), "repo-key"),
-        [],
-      );
-      const closed = await pi.tools
-        .find((tool) => tool.name === "staff_stop")!
-        .execute("close", { session: staleId }, undefined, undefined, ctx);
-      assert.equal(closed.details.ok, true);
-      assert.equal(closed.details.session, staleId);
-      assert.equal("branch" in closed.details, false);
-      assert.equal(started, false);
-      const liveAgents = JSON.parse(
-        (await exec("herdr", ["agent", "list"])).stdout,
-      ).result.agents;
-      assert.equal(
-        liveAgents.some((agent: any) => agent.agent_session?.value === staleId),
-        false,
-      );
-      assert.deepEqual(
-        listProjectAssignments(supervisionRuntime(), "repo-key"),
-        [],
-      );
-      const paneList = JSON.parse(
-        (await exec("herdr", ["pane", "list"])).stdout,
-      ).result.panes;
-      assert.ok(paneList.some((pane: any) => pane.pane_id === "child-pane"));
-      const worktreeList = JSON.parse(
-        (await exec("herdr", ["worktree", "list"])).stdout,
-      ).result.worktrees;
-      assert.ok(
-        worktreeList.some(
-          (worktree: any) =>
-            worktree.branch === "smoke/unassigned" &&
-            worktree.path === childPath,
-        ),
-      );
-      return;
-    }
-    if (activeMode) {
-      if (mode === "active-live") {
-        const running = await execute();
-        assert.equal(running.details.already_running, true);
-        assert.equal(running.details.session, staleId);
-        const messages = () =>
-          listChiefMessagePaths(supervisionRuntime(), staleId)
-            .map((path) => readChiefMessage(path))
-            .filter((message) => message.kind === "project_assignment");
-        assert.deepEqual(
-          messages().map((message) => message.id),
-          [staleId],
-        );
-        const delivered: any[] = [];
-        const entries: any[] = [];
-        const drain = () =>
-          drainCoordinationInbox({
-            runtime: supervisionRuntime(),
-            sessionId: staleId,
-            isAuthorized: (record) =>
-              record.kind === "project_assignment" && record.id === staleId,
-            isDelivered: (id) =>
-              entries.some(
-                (entry) =>
-                  entry?.customType?.startsWith?.("pi-herdsman-") &&
-                  entry?.details?.id === id,
-              ),
-            sendMessage: (message) => delivered.push(message),
-          });
-        assert.equal(await drain(), 1);
-        assert.equal(delivered[0].customType, "pi-herdsman-project_assignment");
-        assert.equal(delivered[0].details.id, staleId);
-        entries.push(delivered[0]);
-        await execute();
-        assert.deepEqual(
-          messages().map((message) => message.id),
-          [staleId],
-        );
-        assert.equal(await drain(), 0);
-        assert.equal(delivered.length, 1);
-      } else if (
-        [
-          "close-resume",
-          "active-discard",
-          "active-complete",
-          "close-failure",
-        ].includes(mode)
-      ) {
-        const control = (name: string, value: unknown) =>
-          pi.tools
-            .find((tool) => tool.name === name)!
-            .execute(name, value, undefined, undefined, ctx);
-        if (mode === "close-failure") {
-          await assert.rejects(control("staff_stop", { session: staleId }));
-          assert.equal(
-            listProjectAssignments(supervisionRuntime(), "repo-key")[0]?.id,
-            staleId,
-          );
-        } else if (mode === "close-resume") {
-          const closed = await control("staff_stop", { session: staleId });
-          assert.equal(closed.details.branch, "smoke/recover");
-          assert.equal(
-            listProjectAssignments(supervisionRuntime(), "repo-key")[0]?.id,
-            staleId,
-          );
-          assert.equal(started, false);
-          assert.equal(created, true);
-          assert.ok(
-            JSON.parse(
-              (await exec("herdr", ["pane", "list"])).stdout,
-            ).result.panes.some((pane: any) => pane.pane_id === "child-pane"),
-          );
-          started = true;
-          const resumed = await execute();
-          assert.equal(resumed.details.session, staleId);
-          assert.equal(
-            listProjectAssignments(supervisionRuntime(), "repo-key")[0]?.id,
-            staleId,
-          );
-        } else {
-          const outcome = mode === "active-complete" ? "complete" : "discard";
-          if (mode === "active-complete") started = false;
-          const discarded = await control(`staff_${outcome}`, {
-            branch: "smoke/recover",
-          });
-          assert.equal(discarded.details.ok, true);
-          assert.deepEqual(
-            listProjectAssignments(supervisionRuntime(), "repo-key"),
-            [],
-          );
-          assert.deepEqual(
-            listProjectMessages(
-              supervisionRuntime(),
-              "repo-key",
-              "smoke/recover",
-            ),
-            [],
-          );
-          assert.equal(created, true);
-          assert.equal(createdBranch, "smoke/recover");
-          assert.equal(started, false);
-          assert.ok(
-            JSON.parse(
-              (await exec("herdr", ["pane", "list"])).stdout,
-            ).result.panes.some((pane: any) => pane.pane_id === "child-pane"),
-          );
-          assert.ok(
-            JSON.parse(
-              (await exec("herdr", ["worktree", "list"])).stdout,
-            ).result.worktrees.some(
-              (worktree: any) =>
-                worktree.branch === "smoke/recover" &&
-                worktree.path === childPath,
-            ),
-          );
-        }
-        return;
-      } else if (
-        ["active-missing", "active-missing-no-session"].includes(mode)
-      ) {
-        const resumed = await execute();
-        assert.equal(resumed.details.session, staleId);
-        assert.equal(resumed.details.branch, "smoke/recover");
-        assert.equal(createCalls, 1);
-        assert.equal(startCalls, 1);
-        assert.equal(
-          listProjectAssignments(supervisionRuntime(), "repo-key")[0]?.id,
-          staleId,
-        );
-      } else {
-        const recovered = await execute();
-        assert.equal(recovered.details.session, staleId);
-        assert.equal(recovered.details.branch, "smoke/recover");
-        const persisted = listProjectAssignments(
-          supervisionRuntime(),
-          "repo-key",
-        )[0];
-        assert.equal(persisted?.id, staleId);
-      }
-      assert.equal(
-        createCalls,
-        ["active-missing", "active-missing-no-session"].includes(mode) ? 1 : 0,
-      );
-      assert.equal(
-        startCalls,
-        [
-          "active-loss",
-          "active-closed",
-          "active-missing",
-          "active-missing-no-session",
-        ].includes(mode)
-          ? 1
-          : 0,
-      );
-      assert.equal(
-        openCalls,
-        ["active-closed", "active-loss"].includes(mode) ? 1 : 0,
-      );
-      assert.equal(
-        listProjectAssignments(supervisionRuntime(), "repo-key").length,
-        1,
-      );
-      if (mode === "active-live") {
-        const { SelectList } = await import("@earendil-works/pi-tui");
-        let renderedList: any;
-        t!.mock.method(SelectList.prototype, "render", function (this: any) {
-          renderedList = this;
-          return this.items.map((item: any) =>
-            [item.label, item.description].filter(Boolean).join(" · "),
-          );
-        });
-        const components: any[] = [];
-        ctx.hasUI = true;
-        ctx.ui.custom = async (factory: any) => {
-          components.push(
-            factory(
-              { requestRender: () => undefined },
-              {
-                fg: (_color: string, text: string) => text,
-                bold: (text: string) => text,
-              },
-              {},
-              () => undefined,
-            ),
-          );
-        };
-        await pi.events.get("before_agent_start")![0](
-          { systemPrompt: "base", systemPromptOptions: { contextFiles: [] } },
-          ctx,
-        );
-        await pi.commandOptions.get("manager").handler("", ctx);
-        const overview = components[0];
-        const initial = overview.render(120).join("\n");
-        assert.match(initial, /smoke\/recover · active · unknown/);
-        duplicateWorktree = true;
-        await pi.events.get("before_agent_start")![0](
-          {
-            systemPrompt: "base",
-            systemPromptOptions: { contextFiles: [] },
-          },
-          ctx,
-        );
-        assert.match(
-          overview.render(120).join("\n"),
-          /conflict · project runtime identity is ambiguous/,
-        );
-        overview.handleInput("\r");
-        await t!.waitFor(() => assert.equal(components.length, 2));
-        const actions = components[1].render(120).join("\n");
-        assert.match(actions, /Focus Lead/);
-        assert.match(actions, /Stop Lead/);
-        assert.match(actions, /Discard work/);
-      }
-      return;
-    }
-    if (mode === "concurrent") {
-      const results = await Promise.allSettled([execute(), execute()]);
-      assert.equal(
-        results.filter((result) => result.status === "fulfilled").length,
-        1,
-      );
-      assert.equal(
-        results.filter(
-          (result) =>
-            result.status === "rejected" &&
-            /Work already exists/.test(String(result.reason)),
-        ).length,
-        1,
-      );
-      assert.equal(createCalls, 1);
-      assert.equal(
-        listProjectAssignments(supervisionRuntime(), "repo-key").length,
-        1,
-      );
-      return;
-    }
-    if (mode === "missing-state" || mode === "missing-herdr-session") {
-      const now = Date.now.bind(Date);
-      try {
-        await assert.rejects(execute(), (error: Error) => {
-          assert.match(
-            error.message,
-            /Timed out verifying the new Lead session/,
-          );
-          assert.match(
-            error.message,
-            mode === "missing-state"
-              ? /Herdr session reported, but Herdsman Lead coordination state was never published/
-              : /Pi process seen in the exact pane, but Herdr never reported a Pi session identity/,
-          );
-          if (mode === "missing-state")
-            assert.match(error.message, /shell_pid/);
-          else assert.match(error.message, /child bootstrap error/);
-          assert.ok(error.message.length <= 4_096);
-          return true;
-        });
-      } finally {
-        Date.now = now;
-      }
-      const assignment = listProjectAssignments(
-        supervisionRuntime(),
-        "repo-key",
-      )[0]!;
-      assert.equal(assignment.id, childSession);
-      assert.equal(createCalls, 1);
-      assert.equal(startCalls, 1);
-      assert.equal(started, true);
-      assert.equal(startupObservations, 2);
-      return;
-    }
-    if (mode === "preexisting" || mode === "preexisting-closed") {
-      await execute();
-      assert.equal(
-        listProjectAssignments(supervisionRuntime(), "repo-key").length,
-        1,
-      );
-      assert.equal(createCalls, 0);
-      assert.equal(startCalls, 1);
-      assert.equal(openCalls, 1);
-      return;
-    }
-    if (mode === "occupied") {
-      await assert.rejects(
-        execute(),
-        new RegExp(`already has live Lead session ${unrelatedSession}`),
-      );
-      assert.deepEqual(
-        listProjectAssignments(supervisionRuntime(), "repo-key"),
-        [],
-      );
-      assert.equal(startCalls, 0);
-      return;
-    }
-    if (mode === "multiple") {
-      await assert.rejects(execute(), /multiple live Leads/);
-      assert.deepEqual(
-        listProjectAssignments(supervisionRuntime(), "repo-key"),
-        [],
-      );
-      return;
-    }
-    if (["discard-pane-missing", "discard-pi"].includes(mode)) {
-      const discard = () =>
-        pi.tools
-          .find((tool) => tool.name === "staff_discard")!
-          .execute(
-            "discard",
-            { branch: "smoke/vanished" },
-            undefined,
-            undefined,
-            ctx,
-          );
-      if (mode === "discard-pane-missing") {
-        const discarded = await discard();
-        assert.equal(discarded.details.ok, true);
-        assert.deepEqual(
-          listProjectAssignments(supervisionRuntime(), "repo-key"),
-          [],
-        );
-      } else {
-        await assert.rejects(
-          discard(),
-          /A possible Pi executor remains; assignment preserved/,
-        );
-        assert.equal(
-          listProjectAssignments(supervisionRuntime(), "repo-key")[0]?.id,
-          staleId,
-        );
-      }
-      assert.equal(inspectedDiscardPane, true);
-      assert.ok(
-        pi.calls.some(
-          (args) =>
-            args[0] === "pane" &&
-            args[1] === "list" &&
-            args[2] === "--workspace" &&
-            args[3] === childWorkspace,
-        ),
-      );
-      assert.equal(created, true);
-      assert.equal(createdBranch, "smoke/vanished");
-      assert.equal(createCalls, 0);
-      assert.equal(startCalls, 0);
-      assert.equal(
-        pi.calls.some(
-          (args) =>
-            args[0] === "worktree" && ["delete", "remove"].includes(args[1]),
-        ),
-        false,
-      );
-      if (mode === "discard-pane-missing") {
-        const topology = JSON.parse(
-          (await exec("herdr", ["worktree", "list"])).stdout,
-        ).result;
-        assert.ok(
-          topology.worktrees.some(
-            (item: any) =>
-              item.branch === "smoke/vanished" && item.path === childPath,
-          ),
-        );
-      }
-      return;
-    }
-    if (mode === "invalid-topology") {
-      await assert.rejects(execute(), /topology is not authoritative/);
-      assert.equal(
-        listProjectAssignments(supervisionRuntime(), "repo-key").length,
-        1,
-      );
-      assert.equal(
-        listProjectAssignments(supervisionRuntime(), "repo-key")[0]?.id,
-        staleId,
-      );
-      assert.equal(createCalls, 0);
-      assert.equal(startCalls, 0);
-      return;
-    }
-    if (mode.startsWith("identity-")) {
-      await assert.rejects(
-        execute(),
-        mode.startsWith("identity-manager-lost-")
-          ? /Manager changed during delegation/
-          : mode === "identity-ambiguity"
-            ? /identity became ambiguous/
-            : /identity did not materialize; assignment preserved/,
-      );
-      const assignment = listProjectAssignments(
-        supervisionRuntime(),
-        "repo-key",
-      )[0]!;
-      assert.deepEqual(Object.keys(assignment).sort(), [
-        "branch",
-        "id",
-        "repoKey",
-        "text",
-        "version",
-      ]);
-      if (mode.startsWith("identity-manager-lost-")) {
-        assert.equal(assignment.id, childSession);
-        assert.equal(created, true);
-        assert.equal(
-          realFs.existsSync(childSessionPath),
-          mode === "identity-manager-lost-success",
-        );
-        if (mode === "identity-manager-lost-success")
-          assert.equal(nativeSessions.get(childSession)?.id, childSession);
-      }
-      assert.equal(
-        listChiefMessagePaths(supervisionRuntime(), childSession).length,
-        1,
-      );
-      if (mode === "identity-cleanup-mismatch") {
-        assert.equal(cleanupOwnershipObservations, 1);
-        assert.equal(realFs.existsSync(childSessionPath), true);
-        assert.equal(nativeSessions.get(childSession)?.id, unrelatedSession);
-        assert.equal(assignment.id, childSession);
-        assert.equal(created, true);
-        assert.equal(createCalls, 1);
-        assert.equal(startCalls, 1);
-      }
-      if (mode === "identity-zero-byte-timeout") {
-        assert.deepEqual(
-          realFs.readFileSync(childSessionPath),
-          Buffer.alloc(0),
-        );
-        const stat = realFs.statSync(childSessionPath);
-        assert.equal(stat.size, 0);
-        assert.equal(stat.mtimeMs, emptySessionStat!.mtimeMs);
-        assert.equal(stat.ino, emptySessionStat!.ino);
-        assert.equal(assignment.id, childSession);
-      }
-      const stopped =
-        mode === "identity-timeout" || mode === "identity-zero-byte-timeout";
-      assert.equal(started, !stopped);
-      assert.equal(
-        pi.calls.some(
-          (args) =>
-            args[0] === "worktree" && ["delete", "remove"].includes(args[1]),
-        ),
-        false,
-      );
-      assert.equal(
-        pi.calls.some((args) => args[0] === "agent" && args[1] === "send-keys"),
-        stopped,
-      );
-      return;
-    }
-    if (
-      mode === "conflict" ||
-      mode === "managed-agent" ||
-      mode === "mismatched-session"
-    )
-      await assert.rejects(
-        execute(),
-        mode === "mismatched-session"
-          ? /Herdr session identity does not match the Manager assignment/
-          : /conflicting role or identity/,
-      );
-    else {
-      const delegation = execute();
-      if (mode === "unmaterialized-path") {
-        let settled = false;
-        void delegation.then(
-          () => {
-            settled = true;
-          },
-          () => {
-            settled = true;
-          },
-        );
-        await Promise.race([
-          identityPoll,
-          delegation.then(() => {
-            throw new Error("Delegation returned before identity materialized");
-          }),
-        ]);
-        assert.equal(settled, false);
-        assert.equal(realFs.existsSync(childSessionPath), false);
-        realFs.writeFileSync(
-          childSessionPath,
-          JSON.stringify({
-            type: "session",
-            id: childSession,
-          }),
-        );
-        nativeSessions.set(childSession, {
-          id: childSession,
-          path: childSessionPath,
-          cwd: childPath,
-          entries: [],
-        });
-      }
-      const result = await delegation;
-      assert.equal(result.details.ok, true);
-      assert.equal(result.details.session, childSession);
-    }
-    const assignment = listProjectAssignments(
-      supervisionRuntime(),
-      "repo-key",
-    )[0]!;
-    assert.deepEqual(Object.keys(assignment).sort(), [
-      "branch",
-      "id",
-      "repoKey",
-      "text",
-      "version",
-    ]);
-    assert.equal(createCalls, 1);
-    assert.equal(startCalls, mode === "recovery" ? 0 : 1);
-    assert.equal(openCalls, 0);
-    assert.equal(
-      startupObservations,
-      mode === "managed-agent" ? 2 : startupObservations,
-    );
-    assert.equal(started, true);
-    if (mode === "success") {
-      await assert.rejects(
-        staff.execute(
-          "delegate",
-          {
-            task: "duplicate active branch",
-            branch: assignment.branch,
-          },
-          undefined,
-          undefined,
-          ctx,
-        ),
-        /Work already exists/,
-      );
-      await assert.rejects(
-        staff.execute(
-          "delegate",
-          {
-            task: "distinct branch but same Lead",
-            branch: "smoke/other-lead",
-          },
-          undefined,
-          undefined,
-          ctx,
-        ),
-        /already has live Lead session/,
-      );
-      assert.equal(createCalls, 2);
-      assert.equal(
-        listProjectAssignments(supervisionRuntime(), "repo-key").filter(
-          (item) => item.id === childSession,
-        ).length,
-        1,
-      );
-      const messages = listChiefMessagePaths(
-        supervisionRuntime(),
-        childSession,
-      ).map((path) => readChiefMessage(path));
-      assert.ok(
-        messages.some(
-          (message) =>
-            message.kind === "project_assignment" &&
-            message.id === childSession &&
-            message.leadSessionId === childSession &&
-            message.branch === assignment.branch &&
-            !message.text.includes(childSession) &&
-            message.text.includes("deliver the fresh assignment"),
-        ),
-      );
-    }
-    if (mode === "unmaterialized-path") {
-      assert.equal(realFs.existsSync(childSessionPath), true);
-      assert.equal(assignment.id, childSession);
-      const closed = await pi.tools
-        .find((tool) => tool.name === "staff_stop")!
-        .execute("close", { session: childSession }, undefined, undefined, ctx);
-      assert.equal(closed.details.ok, true);
-      assert.equal(started, false);
-      assert.equal(
-        listProjectAssignments(supervisionRuntime(), "repo-key")[0]?.id,
-        childSession,
-      );
-    }
-  } finally {
-    Date.now = originalNow;
-    nativeSessions.delete(childSession);
-    realFs.rmSync(childSessionPath, { force: true });
-    support.sessionOpenError = undefined;
-    await pi.events.get("session_shutdown")?.[0]();
-    delete process.env.HERDR_SOCKET_PATH;
-    setLeadEnvironment();
-  }
-}
-
-test("Manager activates only after mocked Lead-state publication", () =>
-  runManagerStartupScenario("success"));
-test("trusted Manager starts its Lead with approval and the assignment session ID", () =>
-  runManagerStartupScenario("success", true));
-test("untrusted Manager starts its Lead without approval and with the assignment session ID", () =>
-  runManagerStartupScenario("success", false));
-test("Manager distinguishes Herdr identity and Lead-state bootstrap timeouts", () =>
-  runManagerStartupScenario("missing-state"));
-test("Manager reports Pi process without a Herdr session identity", () =>
-  runManagerStartupScenario("missing-herdr-session"));
-test("Manager waits for a delayed Herdr session identity", () =>
-  runManagerStartupScenario("delayed-herdr-session"));
-test("Manager startup rejects conflicting role promptly", () =>
-  runManagerStartupScenario("conflict"));
-test("Manager startup rejects managed Agent identity without Lead state", () =>
-  runManagerStartupScenario("managed-agent"));
-test("Manager waits for prospective Lead identity to materialize before success and immediate close", () =>
-  runManagerStartupScenario("unmaterialized-path"));
-for (const mode of [
-  "identity-manager-lost-timeout",
-  "identity-manager-lost-success",
-] as const)
-  test(`Manager rechecks authority after assignment publication on ${mode}`, () =>
-    runManagerStartupScenario(mode));
-for (const mode of [
-  "identity-timeout",
-  "identity-zero-byte-timeout",
-  "identity-unproven",
-  "identity-mismatch",
-  "identity-cleanup-mismatch",
-  "identity-ambiguity",
-] as const)
-  test(`Manager preserves assignment and fails closed on ${mode}`, () =>
-    runManagerStartupScenario(mode));
-test("Manager rejects a resolvable Herdr session ID that differs from its assignment", () =>
-  runManagerStartupScenario("mismatched-session"));
-test("Manager recovery waits on existing exact Pi without restarting it", () =>
-  runManagerStartupScenario("recovery"));
-for (const [mode, label] of [
-  ["active-loss", "relaunches the exact lost Lead"],
-  ["active-live", "returns a live exact Lead idempotently"],
-  ["active-missing", "reconstructs a vanished worktree with saved Pi cwd"],
-  [
-    "active-missing-no-session",
-    "reconstructs a vanished worktree without saved Pi cwd",
-  ],
-  ["active-closed", "reopens a closed worktree workspace"],
-] as const)
-  test(`Manager ${label}`, (t) => runManagerStartupScenario(mode, false, t));
-test("Manager stop preserves the exact assignment and resumes its session", () =>
-  runManagerStartupScenario("close-resume"));
-test("Manager discard stops the active executor and preserves its worktree", () =>
-  runManagerStartupScenario("active-discard"));
-test("Manager complete resolves assignment and preserves its worktree", () =>
-  runManagerStartupScenario("active-complete"));
-test("Manager retains assignment when exact Lead stop fails", () =>
-  runManagerStartupScenario("close-failure"));
-test("Manager closes an unassigned direct Lead and preserves its worktree", () =>
-  runManagerStartupScenario("unassigned-close"));
-test("Manager adopts a preexisting branch worktree for fresh delegation", () =>
-  runManagerStartupScenario("preexisting"));
-test("Manager opens and adopts a closed preexisting branch worktree", () =>
-  runManagerStartupScenario("preexisting-closed"));
-test("Manager refuses an occupied worktree without reserving work", () =>
-  runManagerStartupScenario("occupied"));
-test("Manager refuses ambiguous multiple Leads in a worktree", () =>
-  runManagerStartupScenario("multiple"));
-for (const code of ["not_found", "pane_not_found"])
-  test(`Manager discards when a freshly listed branch pane disappears (${code})`, () =>
-    runManagerStartupScenario("discard-pane-missing", false, undefined, code));
-test("Manager preserves an assignment when a current branch pane may run Pi", () =>
-  runManagerStartupScenario("discard-pi"));
-test("Manager serializes simultaneous same-branch delegation", () =>
-  runManagerStartupScenario("concurrent"));
-test("Manager retains placement when recovery topology is not authoritative", () =>
-  runManagerStartupScenario("invalid-topology"));
 
 test("project agent discovery is gated by Pi project trust", async () => {
   setLeadEnvironment();
@@ -4598,76 +2071,7 @@ test("context retirement rejects managed session continuation only when enabled"
   }
 });
 
-test("session continuation inherits the saved label without an override", async () => {
-  const label = "resume-stable";
-  const run = async () => {
-    setLeadEnvironment();
-    nativeSessions.clear();
-    const sourceId = randomUUID();
-    const source = {
-      id: sourceId,
-      path: join(tmpdir(), `session-delegate-${randomUUID()}.jsonl`),
-      cwd: "/tmp",
-      entries: [
-        {
-          type: "custom",
-          customType: "pi-herdsman-agent-definition",
-          data: { sessionId: sourceId, definition: "agent", label },
-        },
-      ],
-    };
-    realFs.writeFileSync(source.path, "{}", "utf8");
-    nativeSessions.set(source.id, source);
-    const startup = startupExecutor(label, () => DEFAULT_PI_SESSION_ID);
-    const pi = fakePi({ exec: startup.exec });
-    const context = fakeContext([
-      ownershipResult(source.id, LEAD_SESSION_ID, { path: source.path, label }),
-    ]) as any;
-    context.model = { provider: "continue-provider", id: "continue-model" };
-    context.thinkingLevel = "high";
-    registerExtension!(pi.pi as never);
-    try {
-      const result = await agentTool(pi, "continue").execute(
-        "id",
-        {
-          session: source.path,
-          task: "continue with the saved label",
-        },
-        undefined,
-        undefined,
-        context,
-      );
-      assert.equal(result.details.ok, true, JSON.stringify(result.details));
-      assert.equal(result.details.agent, label);
-      assert.equal(
-        readAgentState(agentMailboxPath(WORKSPACE, label))?.agentLabel,
-        label,
-      );
-      const start = pi.calls.find(
-        (args) => args[0] === "agent" && args[1] === "start",
-      )!;
-      assert.ok(start);
-      assert.equal(start.includes("--model"), false);
-      assert.equal(start.includes("--thinking"), false);
-      assert.equal(
-        start[start.indexOf("--session") + 1],
-        realFs.realpathSync(source.path),
-      );
-      assert.equal(start.includes("--fork"), false);
-      return result;
-    } finally {
-      pi.events.get("session_shutdown")?.[0]();
-      nativeSessions.clear();
-      resetAgentMailbox(startup.mailbox);
-      realFs.rmSync(source.path, { force: true });
-    }
-  };
 
-  const first = await run();
-  assert.equal(first.details.agent, label);
-  const reused = await run();
-  assert.equal(reused.details.agent, label);
-});
 
 test("a continued assignment takes its own watcher instruction and inherits none", async () => {
   for (const item of [
@@ -4739,29 +2143,31 @@ test("a continued assignment takes its own watcher instruction and inherits none
   }
 });
 
-const idleRetainedWorkerFixture = async (
+
+
+/**
+ * A retained worker this session launched through Radar. The daemon holds the
+ * edge it bound and the child's own mailbox keeps the generation it
+ * acknowledged, so a continue meets the decision production makes.
+ */
+const retainedRadarWorker = async (
   definition: string,
   options: {
     launchedModel?: string;
     storedFingerprint?: "missing";
     /** The child command the retained process was launched under. */
     launchCommand?: string;
-    onRequest?: (text: string, request?: RequestRecord) => void | Promise<void>;
-    beforeClose?: () => void | Promise<void>;
-    /** The retained generation's physical state as the inventory reports it. */
-    lost?: "vanished" | "shell" | "foreign";
+    onRequest?: (text: string, request: RequestRecord) => void;
   } = {},
 ) => {
   const label = `${definition}-agent`;
   const definitionPath = join(PI_AGENTS_DIR, `${definition}.md`);
   const sourceId = DEFAULT_PI_SESSION_ID;
   const sourcePath = join(testTmpRoot, `${definition}-${sourceId}.jsonl`);
-  const writeDefinition = (model: string) =>
-    realFs.writeFileSync(
-      definitionPath,
-      `---\nname: ${definition}\nmodel: ${model}\n---\nretained\n`,
-    );
-  writeDefinition("explicit/new");
+  realFs.writeFileSync(
+    definitionPath,
+    `---\nname: ${definition}\nmodel: explicit/new\n---\nretained\n`,
+  );
   realFs.writeFileSync(sourcePath, "{}", "utf8");
   nativeSessions.set(sourceId, {
     id: sourceId,
@@ -4777,21 +2183,12 @@ const idleRetainedWorkerFixture = async (
   });
   const mailbox = agentMailboxPath(WORKSPACE, label);
   resetAgentMailbox(mailbox);
-  const state = {
-    ...managedState(label, undefined, {
-      paneId: "startup-pane",
-      tabId: "startup-tab",
-      piSessionId: sourceId,
-      piSessionFile: sourcePath,
-    }),
-    completedRequestId: randomUUID(),
-    // A surviving shell is only a proven lost generation past the longest
-    // startup window the owner would ever wait, so age the record accordingly.
-    ...(options.lost
-      ? { updatedAt: Date.now() - STARTUP_TIMEOUT_MAX - 60_000 }
-      : {}),
-  };
-  writeAgentState(mailbox, state);
+  const state = managedState(label, undefined, {
+    paneId: "startup-pane",
+    tabId: "startup-tab",
+    piSessionId: sourceId,
+    piSessionFile: sourcePath,
+  });
   const { agentLaunchFingerprint, resolveAgentLaunchInputs } = await import(
     "./agent-definitions.ts"
   );
@@ -4802,8 +2199,7 @@ const idleRetainedWorkerFixture = async (
       definition,
     }),
   ];
-  if (options.storedFingerprint !== "missing") {
-    const launched = options.launchedModel ?? "explicit/new";
+  if (options.storedFingerprint !== "missing")
     entries.push({
       type: "custom",
       customType: "pi-herdsman-worker-launch",
@@ -4815,7 +2211,10 @@ const idleRetainedWorkerFixture = async (
             {
               name: definition,
               path: definitionPath,
-              frontmatter: { name: definition, model: launched },
+              frontmatter: {
+                name: definition,
+                model: options.launchedModel ?? "explicit/new",
+              },
               body: "retained",
             },
             { cwd: "/tmp", launchCommand: options.launchCommand },
@@ -4823,100 +2222,35 @@ const idleRetainedWorkerFixture = async (
         ),
       },
     });
-  }
-  const retainedExecutor = startupExecutor(
-    label,
-    () => sourceId,
-    undefined,
-    options.onRequest,
-    false,
-    undefined,
-    "/tmp",
-    AGENT_ID,
-    false,
-    true,
-  );
-  let replacementExecutor: ReturnType<typeof startupExecutor> | undefined;
-  const replacement = () =>
-    (replacementExecutor ??= startupExecutor(
-      label,
-      () => sourceId,
-      undefined,
-      options.onRequest,
-      false,
-      undefined,
-      "/tmp",
-      AGENT_ID,
-      false,
-      true,
-    ));
-  let executor: ReturnType<typeof startupExecutor> = retainedExecutor;
-  let closed = false;
-  const lostInventory = () =>
-    JSON.stringify({
-      id: AGENT_ID,
-      result: {
-        snapshot: {
-          agents:
-            options.lost === "foreign"
-              ? [
-                  {
-                    name: "foreign-agent",
-                    workspace_id: WORKSPACE,
-                    pane_id: "startup-pane",
-                    cwd: "/tmp",
-                  },
-                ]
-              : [],
-          panes:
-            options.lost === "shell"
-              ? [
-                  {
-                    pane_id: "startup-pane",
-                    workspace_id: WORKSPACE,
-                    cwd: "/tmp",
-                    agent_status: "unknown",
-                  },
-                ]
-              : options.lost === "foreign"
-                ? [
-                    {
-                      pane_id: "startup-pane",
-                      workspace_id: WORKSPACE,
-                      cwd: "/tmp",
-                    },
-                  ]
-                : [],
-        },
-      },
-    });
-  const pi = fakePi({
-    exec: async (command, args) => {
-      if (command === "herdr" && isApiSnapshot(args) && options.lost)
-        return { stdout: lostInventory(), stderr: "", code: 0 };
-      if (
-        command === "herdr" &&
-        args[0] === "pane" &&
-        args[1] === "close" &&
-        options.beforeClose
-      )
-        await options.beforeClose();
-      const placing =
-        (args[0] === "tab" && args[1] === "create") ||
-        (args[0] === "pane" && args[1] === "split") ||
-        (args[0] === "agent" && args[1] === "start");
-      // Close first, then launch: placement and startup belong to the
-      // replacement process, while the close proof belongs to the old one.
-      if (closed && placing) executor = replacement();
-      const result = executor.exec(command, args);
-      if (args[0] === "pane" && args[1] === "close") closed = true;
-      return result;
-    },
-  });
+  const pi = fakePi({ entries });
   registerExtension!(pi.pi as never);
   const context = fakeContext(entries) as any;
   context.model = { provider: "controller-provider", id: "controller-model" };
   context.thinkingLevel = "high";
+  await startRadarSession(pi, context);
+  // A relaunch continues the same Pi session in a new process.
+  radarDaemon.childSession = () => ({ id: sourceId, file: sourcePath });
+  const launch = await radarDaemon.adoptRetainedChild({
+    label,
+    runId: state.runId,
+    ownerSessionId: state.ownerSessionId,
+    workspaceId: WORKSPACE,
+    mailbox,
+    pane: state.paneId,
+    definition,
+  });
+  const completedRequestId = randomUUID();
+  writeAgentState(mailbox, { ...readAgentState(mailbox)!, completedRequestId });
+  entries.push({
+    type: "custom",
+    customType: "pi-herdsman-radar-spawn",
+    data: launch,
+  });
+  if (options.onRequest) {
+    const onRequest = options.onRequest;
+    radarDaemon.onChildRequest = (_spawn, request) =>
+      onRequest(request.text, request);
+  }
   return {
     label,
     definition,
@@ -4925,54 +2259,471 @@ const idleRetainedWorkerFixture = async (
     sourcePath,
     mailbox,
     state,
+    completedRequestId,
     pi,
     context,
   };
 };
 
+const releaseRetainedWorker = (fixture: {
+  pi: ReturnType<typeof fakePi>;
+  mailbox: string;
+  definitionPath: string;
+  sourcePath: string;
+}) => {
+  fixture.pi.events.get("session_shutdown")?.[0]();
+  nativeSessions.clear();
+  resetAgentMailbox(fixture.mailbox);
+  realFs.rmSync(fixture.definitionPath, { force: true });
+  realFs.rmSync(fixture.sourcePath, { force: true });
+};
+
 test("definition drift relaunches a retained worker on the same session", async () => {
   setLeadEnvironment();
   nativeSessions.clear();
-  const name = `drift-${randomUUID().slice(0, 8)}`;
-  const fixture = await idleRetainedWorkerFixture(name, {
-    launchedModel: "explicit/old",
+  const fixture = await retainedRadarWorker(
+    `drift-${randomUUID().slice(0, 8)}`,
+    { launchedModel: "explicit/old" },
+  );
+  try {
+    const result = await continueRetainedWorker(fixture);
+    assert.equal(result.details.ok, true, JSON.stringify(result.details));
+    assert.equal(result.details.relaunched, "definition_changed");
+    assert.equal(result.details.agent, fixture.label);
+    assert.equal(radarDaemon.spawns[0]!.closed, true, "the stale process is closed");
+    const argv = spawnedArgvs(radarDaemon).at(-1)!;
+    assert.equal(argv[argv.indexOf("--session") + 1], fixture.sourcePath);
+    assert.equal(argv[argv.indexOf("--model") + 1], "explicit/new");
+    const restarted = readAgentState(fixture.mailbox)!;
+    assert.notEqual(restarted.runId, fixture.state.runId);
+    assert.equal(restarted.piSessionId, fixture.sourceId);
+  } finally {
+    releaseRetainedWorker(fixture);
+  }
+});
+
+
+
+test("a changed child command relaunches a retained worker on the same session", async () => {
+  setLeadEnvironment();
+  nativeSessions.clear();
+  const command = tempChildCommand("drift");
+  // The recorded launch carried no command; the current environment does.
+  process.env.PI_HERDSMAN_CHILD_COMMAND = command;
+  const fixture = await retainedRadarWorker(
+    `command-drift-${randomUUID().slice(0, 8)}`,
+  );
+  try {
+    const result = await continueRetainedWorker(fixture);
+    assert.equal(result.details.ok, true, JSON.stringify(result.details));
+    assert.equal(result.details.relaunched, "definition_changed");
+    const relaunched = radarDaemon.spawns.at(-1)!;
+    assert.equal(relaunched.executable, command, "the relaunch runs the current command");
+    assert.equal(
+      relaunched.argv[relaunched.argv.indexOf("--session") + 1],
+      fixture.sourcePath,
+      "the new process continues the same Pi session",
+    );
+  } finally {
+    releaseRetainedWorker(fixture);
+    realFs.rmSync(command, { force: true });
+    delete process.env.PI_HERDSMAN_CHILD_COMMAND;
+  }
+});
+
+test("a matching child command reuses the retained worker", async () => {
+  setLeadEnvironment();
+  nativeSessions.clear();
+  const command = tempChildCommand("match");
+  process.env.PI_HERDSMAN_CHILD_COMMAND = command;
+  const fixture = await retainedRadarWorker(
+    `command-match-${randomUUID().slice(0, 8)}`,
+    { launchCommand: command },
+  );
+  const spawns = radarDaemon.spawns.length;
+  try {
+    const result = await continueRetainedWorker(fixture);
+    assert.equal(result.details.ok, true, JSON.stringify(result.details));
+    assert.equal(result.details.relaunched, undefined);
+    assert.equal(readAgentState(fixture.mailbox)!.runId, fixture.state.runId);
+    assert.equal(
+      radarDaemon.spawns.length,
+      spawns,
+      "a matching command keeps the existing process",
+    );
+  } finally {
+    releaseRetainedWorker(fixture);
+    realFs.rmSync(command, { force: true });
+    delete process.env.PI_HERDSMAN_CHILD_COMMAND;
+  }
+});
+
+test("clearing the child command relaunches a retained worker", async () => {
+  setLeadEnvironment();
+  nativeSessions.clear();
+  const command = tempChildCommand("cleared");
+  const fixture = await retainedRadarWorker(
+    `command-cleared-${randomUUID().slice(0, 8)}`,
+    { launchCommand: command },
+  );
+  try {
+    const result = await continueRetainedWorker(fixture);
+    assert.equal(result.details.ok, true, JSON.stringify(result.details));
+    assert.equal(result.details.relaunched, "definition_changed");
+  } finally {
+    releaseRetainedWorker(fixture);
+    realFs.rmSync(command, { force: true });
+  }
+});
+
+test("a retained worker the daemon cannot place is refused, never relaunched or reused", async () => {
+  // Each cause leaves the child's presence unproved: a pane the daemon no longer
+  // reports, an observed process exit, and an unreadable observation. Presence does
+  // not decide a relaunch, the process proof does, and the default verdict for a
+  // child that was never closed is `verified`, which refuses.
+  for (const cause of [
+    { locationEvidence: "absent" },
+    { exitObservation: "exited" },
+    { observeUnavailable: true },
+  ] as const) {
+    setLeadEnvironment();
+    nativeSessions.clear();
+    const fixture = await retainedRadarWorker(
+      `unplaced-${randomUUID().slice(0, 8)}`,
+    );
+    Object.assign(radarDaemon.options, cause);
+    const spawns = radarDaemon.spawns.length;
+    try {
+      const result = await continueRetainedWorker(fixture);
+      assert.equal(result.details.ok, false, JSON.stringify(result.details));
+      assert.ok(
+        ["agent_busy", "target_ambiguous"].includes(result.details.error.category),
+        JSON.stringify(result.details),
+      );
+      assert.equal(radarDaemon.spawns.length, spawns, "nothing is launched over it");
+      assert.notEqual(radarDaemon.spawns[0]!.closed, true, "nothing is closed");
+      assert.ok(readAgentState(fixture.mailbox), "the record is preserved");
+    } finally {
+      releaseRetainedWorker(fixture);
+    }
+  }
+});
+
+test("continuation preserves an unretrieved result instead of overwriting it", async () => {
+  setLeadEnvironment();
+  nativeSessions.clear();
+  const fixture = await retainedRadarWorker(
+    `durable-${randomUUID().slice(0, 8)}`,
+    { launchedModel: "explicit/old" },
+  );
+  writeResult(fixture.mailbox, {
+    version: 5,
+    runId: fixture.state.runId,
+    requestId: fixture.completedRequestId,
+    ownerSessionId: fixture.state.ownerSessionId,
+    workspaceId: WORKSPACE,
+    agentLabel: fixture.label,
+    paneId: fixture.state.paneId,
+    status: "completed",
+    text: "unread terminal result",
+    completedAt: Date.now(),
   });
   try {
+    const result = await continueRetainedWorker(fixture);
+    assert.equal(result.details.ok, false, JSON.stringify(result.details));
+    assert.equal(
+      readResult(fixture.mailbox, fixture.completedRequestId)?.text,
+      "unread terminal result",
+      "the unread result is never silently overwritten",
+    );
+    assert.equal(radarDaemon.closes.size, 0, "no close is dispatched over it");
+  } finally {
+    releaseRetainedWorker(fixture);
+  }
+});
+
+test("the relaunch close holds the session reservation against a concurrent continue", async () => {
+  setLeadEnvironment();
+  nativeSessions.clear();
+  const fixture = await retainedRadarWorker(
+    `drift-concurrent-${randomUUID().slice(0, 8)}`,
+    { launchedModel: "explicit/old" },
+  );
+  // The close is applied when it arrives and answered only once released.
+  const close = radarDaemon.holdNextClose();
+  try {
+    const first = continueRetainedWorker(fixture);
+    await close.arrived;
+    const second = await continueRetainedWorker(fixture);
+    // The close owns the reservation, so the second continue is refused by the
+    // session activation claim rather than by the assignment lock.
+    assert.equal(second.details.error.category, "agent_busy", JSON.stringify(second.details));
+    assert.match(second.details.error.message, /already being activated/);
+    close.release();
+    const firstResult = await first;
+    assert.equal(firstResult.details.ok, true, JSON.stringify(firstResult.details));
+    assert.equal(firstResult.details.relaunched, "definition_changed");
+  } finally {
+    close.release();
+    releaseRetainedWorker(fixture);
+  }
+});
+
+test("assignment response overrides do not relaunch a healthy retained worker", async () => {
+  setLeadEnvironment();
+  nativeSessions.clear();
+  const fixture = await retainedRadarWorker(
+    `response-override-${randomUUID().slice(0, 8)}`,
+    { launchCommand: testChildCommand },
+  );
+  const spawns = radarDaemon.spawns.length;
+  try {
+    const task = testBrief("Return a report without changing the worker role.", "common").replace(
+      "response: role-defaults",
+      "response: { schema: response-contract/v1, target: inline, format: markdown, requiredSections: [Outcome] }",
+    );
     const result = await agentTool(fixture.pi, "continue").execute(
       "id",
-      { session: fixture.sourcePath, task: "continue after drift" },
+      { session: fixture.sourcePath, task },
       undefined,
       undefined,
       fixture.context,
     );
     assert.equal(result.details.ok, true, JSON.stringify(result.details));
-    assert.equal(result.details.relaunched, "definition_changed");
-    assert.equal(result.details.reused, undefined);
-    assert.equal(result.details.agent, fixture.label);
-    const closed = fixture.pi.calls.find(
-      (args) => args[0] === "pane" && args[1] === "close",
-    );
-    assert.ok(closed, "the stale process must be closed");
-    const start = fixture.pi.calls.find(
-      (args) => args[0] === "agent" && args[1] === "start",
-    )!;
-    assert.ok(start, "a new process must start");
+    assert.equal(result.details.relaunched, undefined);
+    assert.equal(readAgentState(fixture.mailbox)!.runId, fixture.state.runId);
     assert.equal(
-      start[start.indexOf("--session") + 1],
-      fixture.sourcePath,
-      "the new process continues the same session",
+      radarDaemon.spawns.length,
+      spawns,
+      "an assignment-level response override is not a launch change",
     );
-    assert.equal(start[start.indexOf("--model") + 1], "explicit/new");
-    const restarted = readAgentState(fixture.mailbox)!;
-    assert.notEqual(restarted.runId, fixture.state.runId);
-    assert.equal(restarted.agentLabel, fixture.label);
-    assert.equal(restarted.piSessionId, fixture.sourceId);
   } finally {
-    fixture.pi.events.get("session_shutdown")?.[0]();
+    releaseRetainedWorker(fixture);
+  }
+});
+
+test("a missing launch entry relaunches a retained worker instead of reusing it", async () => {
+  setLeadEnvironment();
+  nativeSessions.clear();
+  const fixture = await retainedRadarWorker(`missing-launch-${randomUUID().slice(0, 8)}`, {
+    storedFingerprint: "missing",
+  });
+  try {
+    const result = await continueRetainedWorker(fixture);
+    assert.equal(result.details.ok, true, JSON.stringify(result.details));
+    assert.equal(result.details.relaunched, "definition_changed");
+    assert.equal(radarDaemon.spawns[0]!.closed, true, "the unproven process is closed");
+    const argv = spawnedArgvs(radarDaemon).at(-1)!;
+    assert.equal(argv[argv.indexOf("--session") + 1], fixture.sourcePath);
+    assert.notEqual(readAgentState(fixture.mailbox)!.runId, fixture.state.runId);
+  } finally {
+    releaseRetainedWorker(fixture);
+  }
+});
+
+test("a relaunch proceeds only on a proved absent or mismatched process, and a refusal consumes nothing", async () => {
+  setLeadEnvironment();
+  nativeSessions.clear();
+  const fixture = await retainedRadarWorker(`verdicts-${randomUUID().slice(0, 8)}`, {
+    launchedModel: "explicit/old",
+  });
+  try {
+    // A registered process that still runs, and one whose birth identity cannot
+    // be read, each refuse; the mailbox they leave is the one the next attempt uses.
+    for (const verification of ["verified", "unavailable"] as const) {
+      radarDaemon.options.processVerdict = verification;
+      const refused = await continueRetainedWorker(fixture);
+      assert.equal(refused.details.ok, false, `${verification} must refuse`);
+      assert.equal(refused.details.error.category, "target_ambiguous");
+      assert.ok(readAgentState(fixture.mailbox), "the mailbox is kept");
+      assert.equal(radarDaemon.spawns.length, 1, "nothing is launched");
+    }
+    radarDaemon.options.processVerdict = "mismatched";
+    const relaunched = await continueRetainedWorker(fixture);
+    assert.equal(relaunched.details.ok, true, JSON.stringify(relaunched.details));
+    assert.equal(relaunched.details.relaunched, "definition_changed");
+    assert.equal(radarDaemon.spawns.length, 2);
+  } finally {
+    releaseRetainedWorker(fixture);
+  }
+});
+
+test("a close outcome decides retirement, never permission on its own", async () => {
+  // An exited pane is a close outcome, not proof that the process is gone, so the
+  // process verdict decides it. A refusal is no more authority than an exit: the
+  // process verdict decides it too, so a live process refuses whatever it said.
+  for (const { setting, verdict, relaunches } of [
+    { setting: { closeOutcome: "already_exited" }, verdict: "verified", relaunches: false },
+    { setting: { closeOutcome: "already_exited" }, verdict: "absent", relaunches: true },
+    { setting: { refuseChildClose: true }, verdict: "verified", relaunches: false },
+  ] as const) {
+    setLeadEnvironment();
     nativeSessions.clear();
-    resetAgentMailbox(fixture.mailbox);
-    realFs.rmSync(fixture.definitionPath, { force: true });
-    realFs.rmSync(fixture.sourcePath, { force: true });
+    const fixture = await retainedRadarWorker(
+      `outcome-${randomUUID().slice(0, 8)}`,
+      { launchedModel: "explicit/old" },
+    );
+    Object.assign(
+      radarDaemon.options,
+      { closeOutcome: "completed", refuseChildClose: false },
+      setting,
+      { processVerdict: verdict },
+    );
+    try {
+      const result = await continueRetainedWorker(fixture);
+      if (relaunches) {
+        assert.equal(result.details.ok, true, JSON.stringify(result.details));
+        assert.equal(radarDaemon.spawns.length, 2, "the absent process is relaunched");
+      } else {
+        assert.equal(result.details.ok, false, JSON.stringify(result.details));
+        assert.equal(result.details.error.category, "target_ambiguous");
+        assert.equal(radarDaemon.spawns.length, 1, "nothing is launched");
+        assert.ok(readAgentState(fixture.mailbox), "the mailbox is kept");
+      }
+    } finally {
+      releaseRetainedWorker(fixture);
+    }
+  }
+});
+
+test("a retained worker whose pane is gone relaunches only on a proved absent process", async () => {
+  setLeadEnvironment();
+  nativeSessions.clear();
+  // Launched under the current child command, so the only reason to relaunch is the pane.
+  const fixture = await retainedRadarWorker(`vanished-${randomUUID().slice(0, 8)}`, {
+    launchCommand: testChildCommand,
+  });
+  try {
+    // No close was ever sent: the pane is gone, so presence cannot prove the process.
+    radarDaemon.vanishPane(radarDaemon.spawns[0]!);
+    radarDaemon.options.processVerdict = "verified";
+    const refused = await continueRetainedWorker(fixture);
+    assert.equal(refused.details.ok, false, JSON.stringify(refused.details));
+    assert.equal(refused.details.error.category, "target_ambiguous");
+    assert.ok(readAgentState(fixture.mailbox), "the mailbox is kept");
+    assert.equal(radarDaemon.spawns.length, 1, "nothing is launched");
+    radarDaemon.options.processVerdict = "absent";
+    const relaunched = await continueRetainedWorker(fixture);
+    assert.equal(relaunched.details.ok, true, JSON.stringify(relaunched.details));
+    assert.equal(relaunched.details.relaunched, "process_lost");
+    assert.equal(radarDaemon.spawns.length, 2, "the absent process is relaunched");
+    assert.equal(radarDaemon.closes.size, 0, "no close is sent over a pane that is gone");
+  } finally {
+    releaseRetainedWorker(fixture);
+  }
+});
+
+test("a stored close never relaunches a child that has an outstanding assignment", async () => {
+  setLeadEnvironment();
+  nativeSessions.clear();
+  const fixture = await retainedRadarWorker(`assigned-${randomUUID().slice(0, 8)}`);
+  try {
+    // The first attempt closes the live pane and is refused by the verified process.
+    radarDaemon.options.processVerdict = "verified";
+    const refused = await continueRetainedWorker(fixture);
+    assert.equal(refused.details.ok, false, JSON.stringify(refused.details));
+    assert.equal(radarDaemon.spawns[0]!.closed, true, "the pane was closed");
+    writeAgentState(fixture.mailbox, {
+      ...readAgentState(fixture.mailbox)!,
+      activeRequestId: randomUUID(),
+    });
+    radarDaemon.options.processVerdict = "absent";
+    const again = await continueRetainedWorker(fixture);
+    assert.equal(again.details.ok, false, JSON.stringify(again.details));
+    // The absent verdict makes this child presence `lost` (a loss under an outstanding
+    // assignment), so the continuation refuses it as busy rather than as unproved.
+    assert.equal(again.details.error.category, "agent_busy");
+    assert.equal(radarDaemon.spawns.length, 1, "nothing is launched");
+    assert.ok(readAgentState(fixture.mailbox), "the mailbox is kept");
+  } finally {
+    releaseRetainedWorker(fixture);
+  }
+});
+
+test("a refused close is not authority: an absent process relaunches and the refused pane stays as residue", async () => {
+  setLeadEnvironment();
+  nativeSessions.clear();
+  const fixture = await retainedRadarWorker(`refused-${randomUUID().slice(0, 8)}`);
+  try {
+    // The pane stays open on a dead shell whose process has stopped.
+    radarDaemon.options.refuseChildClose = true;
+    radarDaemon.exitProcess(radarDaemon.spawns[0]!);
+    const relaunched = await continueRetainedWorker(fixture);
+    assert.equal(relaunched.details.ok, true, JSON.stringify(relaunched.details));
+    assert.equal(radarDaemon.spawns.length, 2, "the absent process is relaunched");
+    assert.notEqual(radarDaemon.spawns[0]!.closed, true, "the refused pane is left as residue");
+    assert.match(String(relaunched.details.residue), /Pane .* was left open/, "the relaunch result names the residue");
+  } finally {
+    radarDaemon.options.refuseChildClose = false;
+    releaseRetainedWorker(fixture);
+  }
+});
+
+/** The fields the loss notice test reads from a sent wake message. */
+type LossNotice = { customType?: string; content: string };
+
+test("an unproved child with an outstanding assignment names no action it would refuse", async () => {
+  setLeadEnvironment();
+  nativeSessions.clear();
+  const fixture = await retainedRadarWorker(`unproved-${randomUUID().slice(0, 8)}`);
+  try {
+    // The pane is gone and the process is still verified: presence is unknown, not lost.
+    radarDaemon.vanishPane(radarDaemon.spawns[0]!);
+    radarDaemon.options.processVerdict = "verified";
+    writeAgentState(fixture.mailbox, {
+      ...readAgentState(fixture.mailbox)!,
+      activeRequestId: randomUUID(),
+    });
+    const result = await continueRetainedWorker(fixture);
+    assert.equal(result.details.ok, false, JSON.stringify(result.details));
+    assert.equal(result.details.error.category, "agent_busy", JSON.stringify(result.details));
+    assert.match(result.details.error.nextAction, /cannot be proved absent/);
+    assert.doesNotMatch(result.details.error.nextAction, /close|continue/);
+    assert.equal(radarDaemon.spawns.length, 1, "nothing is launched");
+    assert.equal(radarDaemon.closes.size, 0, "no close is sent");
+    assert.ok(readAgentState(fixture.mailbox), "the mailbox is kept");
+  } finally {
+    releaseRetainedWorker(fixture);
+  }
+});
+
+test("a proved-gone child with an outstanding assignment publishes a loss and retires nothing", async (t) => {
+  setLeadEnvironment();
+  nativeSessions.clear();
+  const fixture = await retainedRadarWorker(`lost-${randomUUID().slice(0, 8)}`);
+  try {
+    // A refused proof keeps the mailbox and stores the completed close this loss rests on.
+    radarDaemon.options.processVerdict = "verified";
+    const refused = await continueRetainedWorker(fixture);
+    assert.equal(refused.details.ok, false, JSON.stringify(refused.details));
+    assert.equal(radarDaemon.spawns[0]!.closed, true);
+    // A new assignment is outstanding, and it clears the previous completed marker.
+    writeAgentState(fixture.mailbox, {
+      ...readAgentState(fixture.mailbox)!,
+      activeRequestId: randomUUID(),
+      completedRequestId: undefined,
+    });
+    radarDaemon.options.processVerdict = "absent";
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    await fixture.pi.events.get("session_start")![0](undefined, fixture.context);
+    for (let index = 0; index < 4; index++)
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    t.mock.timers.tick(30_000);
+    for (let index = 0; index < 8; index++)
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const notices = (fixture.pi.sent as LossNotice[]).filter(
+      (message) => message.customType === "pi-herdsman-agent-lost",
+    );
+    assert.equal(notices.length, 1, "the loss is published to the operator");
+    assert.match(notices[0]!.content, /proved absent/);
+    assert.match(notices[0]!.content, /neither resumed nor retired/);
+    assert.match(notices[0]!.content, /Use agent_close/, "the notice names the action that works");
+    assert.ok(readAgentState(fixture.mailbox), "the mailbox is kept");
+    assert.equal(radarDaemon.spawns.length, 1, "nothing is launched");
+    assert.equal(radarDaemon.closes.size, 1, "no second close is sent");
+  } finally {
+    releaseRetainedWorker(fixture);
   }
 });
 
@@ -4999,402 +2750,23 @@ const continueRetainedWorker = (fixture: {
     fixture.context,
   );
 
-test("a changed child command relaunches a retained worker on the same session", async () => {
-  setLeadEnvironment();
-  nativeSessions.clear();
-  const name = `command-drift-${randomUUID().slice(0, 8)}`;
-  const command = tempChildCommand("drift");
-  // The recorded launch carried no command; the current environment does, so
-  // the retained process no longer matches its launch configuration.
-  process.env.PI_HERDSMAN_CHILD_COMMAND = command;
-  const fixture = await idleRetainedWorkerFixture(name);
-  try {
-    const result = await continueRetainedWorker(fixture);
-    assert.equal(result.details.ok, true, JSON.stringify(result.details));
-    assert.equal(result.details.relaunched, "definition_changed");
-    const launch = fixture.pi.calls.find(
-      (args) =>
-        args[0] === "pane" &&
-        args[1] === "run" &&
-        String(args[3]).startsWith(`'${command}'`),
-    );
-    assert.ok(launch, "the changed command starts a new process in the pane");
-    assert.ok(
-      String(launch![3]).includes(
-        `'--session' '${realFs.realpathSync(fixture.sourcePath)}'`,
-      ),
-      "the new process continues the same Pi session",
-    );
-    assert.ok(
-      fixture.pi.calls.some(
-        (args) =>
-          args[0] === "tab" &&
-          args[1] === "create" &&
-          args.includes(`PI_HERDSMAN_CHILD_COMMAND=${command}`),
-      ),
-      "the relaunched pane carries the current child command",
-    );
-    const relaunched = readAgentState(fixture.mailbox)!;
-    assert.equal(relaunched.agentLabel, fixture.label);
-    assert.equal(relaunched.piSessionId, fixture.sourceId);
-  } finally {
-    fixture.pi.events.get("session_shutdown")?.[0]();
-    nativeSessions.clear();
-    resetAgentMailbox(fixture.mailbox);
-    realFs.rmSync(fixture.definitionPath, { force: true });
-    realFs.rmSync(fixture.sourcePath, { force: true });
-    realFs.rmSync(command, { force: true });
-    delete process.env.PI_HERDSMAN_CHILD_COMMAND;
-  }
-});
 
-test("a matching child command reuses the retained worker", async () => {
-  setLeadEnvironment();
-  nativeSessions.clear();
-  const name = `command-match-${randomUUID().slice(0, 8)}`;
-  const command = tempChildCommand("match");
-  process.env.PI_HERDSMAN_CHILD_COMMAND = command;
-  const fixture = await idleRetainedWorkerFixture(name, {
-    launchCommand: command,
-  });
-  const callsBeforeAssignment = fixture.pi.calls.length;
-  try {
-    const result = await continueRetainedWorker(fixture);
-    assert.equal(result.details.ok, true, JSON.stringify(result.details));
-    assert.equal(result.details.relaunched, undefined);
-    const after = readAgentState(fixture.mailbox)!;
-    assert.equal(after.runId, fixture.state.runId);
-    assert.equal(after.piSessionId, fixture.state.piSessionId);
-    assert.equal(
-      fixture.pi.calls
-        .slice(callsBeforeAssignment)
-        .some((args) => args[0] === "agent" && args[1] === "start"),
-      false,
-      "a matching command keeps the existing process",
-    );
-  } finally {
-    fixture.pi.events.get("session_shutdown")?.[0]();
-    nativeSessions.clear();
-    resetAgentMailbox(fixture.mailbox);
-    realFs.rmSync(fixture.definitionPath, { force: true });
-    realFs.rmSync(fixture.sourcePath, { force: true });
-    realFs.rmSync(command, { force: true });
-    delete process.env.PI_HERDSMAN_CHILD_COMMAND;
-  }
-});
 
-test("clearing the child command relaunches a retained worker", async () => {
-  setLeadEnvironment();
-  nativeSessions.clear();
-  const name = `command-cleared-${randomUUID().slice(0, 8)}`;
-  const command = tempChildCommand("cleared");
-  const fixture = await idleRetainedWorkerFixture(name, {
-    launchCommand: command,
-  });
-  try {
-    const result = await continueRetainedWorker(fixture);
-    assert.equal(result.details.ok, true, JSON.stringify(result.details));
-    assert.equal(result.details.relaunched, "definition_changed");
-  } finally {
-    fixture.pi.events.get("session_shutdown")?.[0]();
-    nativeSessions.clear();
-    resetAgentMailbox(fixture.mailbox);
-    realFs.rmSync(fixture.definitionPath, { force: true });
-    realFs.rmSync(fixture.sourcePath, { force: true });
-    realFs.rmSync(command, { force: true });
-  }
-});
 
-test("continuation recovers a worker whose pane is gone", async () => {
-  setLeadEnvironment();
-  nativeSessions.clear();
-  const name = `recover-vanished-${randomUUID().slice(0, 8)}`;
-  const fixture = await idleRetainedWorkerFixture(name, { lost: "vanished" });
-  try {
-    const before = fixture.pi.calls.length;
-    const result = await agentTool(fixture.pi, "continue").execute(
-      "recover",
-      { session: fixture.sourcePath, task: "resume the vanished worker" },
-      undefined,
-      undefined,
-      fixture.context,
-    );
-    assert.equal(result.details.ok, true, JSON.stringify(result.details));
-    assert.equal(result.details.relaunched, "process_lost");
-    assert.equal(result.details.agent, fixture.label);
-    const calls = fixture.pi.calls.slice(before);
-    const start = calls.find(
-      (args) => args[0] === "agent" && args[1] === "start",
-    );
-    assert.ok(start, "the recovery starts a new generation");
-    assert.equal(
-      start[start.indexOf("--session") + 1],
-      realFs.realpathSync(fixture.sourcePath),
-    );
-    assert.equal(
-      calls.some(
-        (args) =>
-          (args[0] === "pane" || args[0] === "tab") && args[1] === "close",
-      ),
-      false,
-      "recovery closes no pane it cannot prove",
-    );
-    // The exact Pi session and the prior terminal assignment stay accounted
-    // for: the new generation continues the same session under the same label.
-    const state = readAgentState(fixture.mailbox)!;
-    assert.equal(state.agentLabel, fixture.label);
-    assert.equal(state.piSessionId, fixture.sourceId);
-    assert.notEqual(state.runId, fixture.state.runId);
-    const launches = fixture.pi.entries.filter(
-      (entry: any) => entry?.customType === "pi-herdsman-worker-launch",
-    ) as any[];
-    assert.deepEqual(
-      launches.map((entry) => entry.data.runId),
-      [state.runId],
-      "the new generation's launch record is appended, never replacing the owner's record",
-    );
-    // The prior terminal assignment stays accounted for: the owner's session
-    // still holds the delivered result ancestry and the session still resolves
-    // as a continuation source under the same identity.
-    assert.ok(
-      (fixture.context.sessionManager.getEntries() as any[]).some(
-        (entry: any) => entry?.customType === "pi-herdsman-agent-result",
-      ),
-      "the prior terminal assignment record is preserved",
-    );
-    assert.equal(
-      resolveAssignmentSession(fixture.context, fixture.sourcePath).id,
-      fixture.sourceId,
-    );
-  } finally {
-    fixture.pi.events.get("session_shutdown")?.[0]();
-    nativeSessions.clear();
-    resetAgentMailbox(fixture.mailbox);
-    realFs.rmSync(fixture.definitionPath, { force: true });
-    realFs.rmSync(fixture.sourcePath, { force: true });
-  }
-});
 
-test("continuation recovers a worker behind a surviving shell and leaves the shell alone", async () => {
-  setLeadEnvironment();
-  nativeSessions.clear();
-  const name = `recover-shell-${randomUUID().slice(0, 8)}`;
-  const fixture = await idleRetainedWorkerFixture(name, { lost: "shell" });
-  try {
-    const before = fixture.pi.calls.length;
-    const result = await agentTool(fixture.pi, "continue").execute(
-      "recover",
-      { session: fixture.sourceId, task: "resume behind the shell" },
-      undefined,
-      undefined,
-      fixture.context,
-    );
-    assert.equal(result.details.ok, true, JSON.stringify(result.details));
-    assert.equal(result.details.relaunched, "process_lost");
-    assert.equal(
-      fixture.pi.calls
-        .slice(before)
-        .some(
-          (args) =>
-            (args[0] === "pane" || args[0] === "tab") && args[1] === "close",
-        ),
-      false,
-      "a surviving shell may hold unrelated operator work, so it is untouched",
-    );
-    assert.equal(readAgentState(fixture.mailbox)?.piSessionId, fixture.sourceId);
-  } finally {
-    fixture.pi.events.get("session_shutdown")?.[0]();
-    nativeSessions.clear();
-    resetAgentMailbox(fixture.mailbox);
-    realFs.rmSync(fixture.definitionPath, { force: true });
-    realFs.rmSync(fixture.sourcePath, { force: true });
-  }
-});
 
-test("continuation refuses an unprovable identity instead of weakening presence", async () => {
-  setLeadEnvironment();
-  nativeSessions.clear();
-  const name = `recover-foreign-${randomUUID().slice(0, 8)}`;
-  const fixture = await idleRetainedWorkerFixture(name, { lost: "foreign" });
-  try {
-    const before = fixture.pi.calls.length;
-    const result = await agentTool(fixture.pi, "continue").execute(
-      "refuse",
-      { session: fixture.sourcePath, task: "must not launch over it" },
-      undefined,
-      undefined,
-      fixture.context,
-    );
-    assert.equal(result.details.error.category, "agent_busy");
-    assert.equal(
-      fixture.pi.calls
-        .slice(before)
-        .some(
-          (args) =>
-            args[0] === "agent" && ["start", "prompt"].includes(args[1] ?? ""),
-        ),
-      false,
-    );
-    assert.ok(
-      readAgentState(fixture.mailbox),
-      "the unresolved record is preserved",
-    );
-  } finally {
-    fixture.pi.events.get("session_shutdown")?.[0]();
-    nativeSessions.clear();
-    resetAgentMailbox(fixture.mailbox);
-    realFs.rmSync(fixture.definitionPath, { force: true });
-    realFs.rmSync(fixture.sourcePath, { force: true });
-  }
-});
 
-test("continuation preserves an unretrieved result instead of overwriting it", async () => {
-  setLeadEnvironment();
-  nativeSessions.clear();
-  const name = `recover-durable-${randomUUID().slice(0, 8)}`;
-  const fixture = await idleRetainedWorkerFixture(name, { lost: "vanished" });
-  const requestId = fixture.state.completedRequestId!;
-  writeResult(fixture.mailbox, {
-    version: 5,
-    runId: fixture.state.runId,
-    requestId,
-    ownerSessionId: fixture.state.ownerSessionId,
-    workspaceId: WORKSPACE,
-    agentLabel: fixture.label,
-    paneId: fixture.state.paneId,
-    status: "completed",
-    text: "unread terminal result",
-    completedAt: Date.now(),
-  });
-  try {
-    const before = fixture.pi.calls.length;
-    const result = await agentTool(fixture.pi, "continue").execute(
-      "recover",
-      { session: fixture.sourcePath, task: "must not discard the result" },
-      undefined,
-      undefined,
-      fixture.context,
-    );
-    assert.equal(result.details.error.category, "agent_busy");
-    assert.match(result.details.error.message, /unretrieved result/);
-    assert.equal(
-      readResult(fixture.mailbox, requestId)?.text,
-      "unread terminal result",
-      "the unread result is never silently overwritten",
-    );
-    assert.equal(
-      fixture.pi.calls
-        .slice(before)
-        .some(
-          (args) =>
-            args[0] === "agent" && ["start", "prompt"].includes(args[1] ?? ""),
-        ),
-      false,
-    );
-  } finally {
-    fixture.pi.events.get("session_shutdown")?.[0]();
-    nativeSessions.clear();
-    resetAgentMailbox(fixture.mailbox);
-    realFs.rmSync(fixture.definitionPath, { force: true });
-    realFs.rmSync(fixture.sourcePath, { force: true });
-  }
-});
 
-test("the relaunch close holds the session reservation against a concurrent continue", async () => {
-  setLeadEnvironment();
-  nativeSessions.clear();
-  const name = `drift-concurrent-${randomUUID().slice(0, 8)}`;
-  let closedEntered!: () => void;
-  const entered = new Promise<void>((resolve) => (closedEntered = resolve));
-  let releaseClose!: () => void;
-  const closeGate = new Promise<void>((resolve) => (releaseClose = resolve));
-  const fixture = await idleRetainedWorkerFixture(name, {
-    launchedModel: "explicit/old",
-    beforeClose: async () => {
-      closedEntered();
-      await closeGate;
-    },
-  });
-  try {
-    const first = agentTool(fixture.pi, "continue").execute(
-      "first",
-      { session: fixture.sourcePath, task: "continue after drift" },
-      undefined,
-      undefined,
-      fixture.context,
-    );
-    await entered;
-    const second = await agentTool(fixture.pi, "continue").execute(
-      "second",
-      { session: fixture.sourcePath, task: "must wait for the close" },
-      undefined,
-      undefined,
-      fixture.context,
-    );
-    // The close owns the reservation, so the second continue must be refused by
-    // the session activation claim rather than by the assignment lock the close
-    // happens to hold.
-    assert.equal(
-      second.details.error.category,
-      "agent_busy",
-      JSON.stringify(second.details),
-    );
-    assert.match(second.details.error.message, /already being activated/);
-    releaseClose();
-    const firstResult = await first;
-    assert.equal(
-      firstResult.details.ok,
-      true,
-      JSON.stringify(firstResult.details),
-    );
-    assert.equal(firstResult.details.relaunched, "definition_changed");
-  } finally {
-    releaseClose();
-    fixture.pi.events.get("session_shutdown")?.[0]();
-    nativeSessions.clear();
-    resetAgentMailbox(fixture.mailbox);
-    realFs.rmSync(fixture.definitionPath, { force: true });
-    realFs.rmSync(fixture.sourcePath, { force: true });
-  }
-});
 
-test("assignment response overrides do not relaunch a healthy retained worker", async () => {
-  setLeadEnvironment();
-  nativeSessions.clear();
-  const name = `response-override-${randomUUID().slice(0, 8)}`;
-  const fixture = await idleRetainedWorkerFixture(name);
-  const callsBeforeAssignment = fixture.pi.calls.length;
-  try {
-    const task = testBrief("Return a report without changing the worker role.", "common").replace(
-      "response: role-defaults",
-      "response: { schema: response-contract/v1, target: inline, format: markdown, requiredSections: [Outcome] }",
-    );
-    const result = await agentTool(fixture.pi, "continue").execute(
-      "id",
-      { session: fixture.sourcePath, task },
-      undefined,
-      undefined,
-      fixture.context,
-    );
-    assert.equal(result.details.ok, true, JSON.stringify(result.details));
-    assert.equal(result.details.relaunched, undefined);
-    const after = readAgentState(fixture.mailbox)!;
-    assert.equal(after.runId, fixture.state.runId);
-    assert.equal(after.piSessionId, fixture.state.piSessionId);
-    const newCalls = fixture.pi.calls.slice(callsBeforeAssignment);
-    assert.equal(
-      newCalls.some((args) => args[0] === "agent" && args[1] === "start"),
-      false,
-      "an assignment-level response override is not a launch change",
-    );
-  } finally {
-    fixture.pi.events.get("session_shutdown")?.[0]();
-    nativeSessions.clear();
-    resetAgentMailbox(fixture.mailbox);
-    realFs.rmSync(fixture.definitionPath, { force: true });
-    realFs.rmSync(fixture.sourcePath, { force: true });
-  }
-});
+
+
+
+
+
+
+
+
+
 
 test("validated role-specific brief context reaches worker requests", async () => {
   for (const profile of ["investigation", "research", "execution", "review"] as const) {
@@ -5402,9 +2774,10 @@ test("validated role-specific brief context reaches worker requests", async () =
     nativeSessions.clear();
     const name = `brief-${profile}-${randomUUID().slice(0, 4)}`;
     const received: RequestRecord[] = [];
-    const fixture = await idleRetainedWorkerFixture(name, {
+    const fixture = await retainedRadarWorker(name, {
+      launchCommand: testChildCommand,
       onRequest: (_text, request) => {
-        if (request) received.push(request);
+        received.push(request);
       },
     });
     try {
@@ -5462,45 +2835,68 @@ test("validated role-specific brief context reaches worker requests", async () =
   }
 });
 
-test("a missing launch entry relaunches a retained worker instead of reusing it", async () => {
-  setLeadEnvironment();
-  nativeSessions.clear();
-  const name = `missing-launch-${randomUUID().slice(0, 8)}`;
-  const fixture = await idleRetainedWorkerFixture(name, {
-    storedFingerprint: "missing",
-  });
-  try {
-    const result = await agentTool(fixture.pi, "continue").execute(
-      "id",
-      { session: fixture.sourcePath, task: "continue without launch evidence" },
-      undefined,
-      undefined,
-      fixture.context,
-    );
-    assert.equal(result.details.ok, true, JSON.stringify(result.details));
-    assert.equal(result.details.relaunched, "definition_changed");
-    assert.equal(result.details.agent, fixture.label);
-    assert.ok(
-      fixture.pi.calls.some(
-        (args) => args[0] === "pane" && args[1] === "close",
-      ),
-      "the unproven process must be closed",
-    );
-    const start = fixture.pi.calls.find(
-      (args) => args[0] === "agent" && args[1] === "start",
-    )!;
-    assert.ok(start, "a new process must start");
-    assert.equal(start[start.indexOf("--session") + 1], fixture.sourcePath);
-    const restarted = readAgentState(fixture.mailbox)!;
-    assert.notEqual(restarted.runId, fixture.state.runId);
-    assert.equal(restarted.agentLabel, fixture.label);
-  } finally {
-    fixture.pi.events.get("session_shutdown")?.[0]();
+
+
+
+
+test("session continuation inherits the saved label without an override", async () => {
+  const label = "resume-stable";
+  const run = async () => {
+    setLeadEnvironment();
     nativeSessions.clear();
-    resetAgentMailbox(fixture.mailbox);
-    realFs.rmSync(fixture.definitionPath, { force: true });
-    realFs.rmSync(fixture.sourcePath, { force: true });
-  }
+    const sourceId = randomUUID();
+    const source = {
+      id: sourceId,
+      path: join(tmpdir(), `session-delegate-${randomUUID()}.jsonl`),
+      cwd: "/tmp",
+      entries: [
+        {
+          type: "custom",
+          customType: "pi-herdsman-agent-definition",
+          data: { sessionId: sourceId, definition: "agent", label },
+        },
+      ],
+    };
+    realFs.writeFileSync(source.path, "{}", "utf8");
+    nativeSessions.set(source.id, source);
+    const entries: any[] = [
+      ownershipResult(source.id, LEAD_SESSION_ID, { path: source.path, label }),
+    ];
+    const pi = fakePi({ entries });
+    const context = fakeContext(entries) as any;
+    context.model = { provider: "continue-provider", id: "continue-model" };
+    context.thinkingLevel = "high";
+    registerExtension!(pi.pi as never);
+    await startRadarSession(pi, context);
+    try {
+      const result = await agentTool(pi, "continue").execute(
+        "id",
+        { session: source.path, task: "continue with the saved label" },
+        undefined,
+        undefined,
+        context,
+      );
+      assert.equal(result.details.ok, true, JSON.stringify(result.details));
+      assert.equal(result.details.agent, label);
+      assert.equal(readAgentState(agentMailboxPath(WORKSPACE, label))?.agentLabel, label);
+      const start = spawnedArgvs(radarDaemon).at(-1)!;
+      assert.equal(start.includes("--model"), false);
+      assert.equal(start.includes("--thinking"), false);
+      assert.equal(start.includes("--fork"), false);
+      assert.equal(start[start.indexOf("--session") + 1], realFs.realpathSync(source.path));
+      return result;
+    } finally {
+      pi.events.get("session_shutdown")?.[0]();
+      nativeSessions.clear();
+      resetAgentMailbox(agentMailboxPath(WORKSPACE, label));
+      realFs.rmSync(source.path, { force: true });
+    }
+  };
+
+  const first = await run();
+  assert.equal(first.details.agent, label);
+  const reused = await run();
+  assert.equal(reused.details.agent, label);
 });
 
 test("session continuation keeps explicit definition execution overrides", async () => {
@@ -5510,10 +2906,7 @@ test("session continuation keeps explicit definition execution overrides", async
   const label = `${definition}-agent`;
   const definitionPath = join(PI_AGENTS_DIR, `${definition}.md`);
   const sourceId = randomUUID();
-  const sourcePath = join(
-    tmpdir(),
-    `session-continue-override-${sourceId}.jsonl`,
-  );
+  const sourcePath = join(tmpdir(), `session-continue-override-${sourceId}.jsonl`);
   realFs.writeFileSync(
     definitionPath,
     `---\nname: ${definition}\nmodel: explicit/provider\nthinking: low\n---\ncontinue\n`,
@@ -5531,18 +2924,15 @@ test("session continuation keeps explicit definition execution overrides", async
       },
     ],
   });
-  const startup = startupExecutor(label, () => DEFAULT_PI_SESSION_ID);
-  const pi = fakePi({ exec: startup.exec });
+  const entries: any[] = [
+    ownershipResult(sourceId, LEAD_SESSION_ID, { path: sourcePath, label, definition }),
+  ];
+  const pi = fakePi({ entries });
   registerExtension!(pi.pi as never);
-  const context = fakeContext([
-    ownershipResult(sourceId, LEAD_SESSION_ID, {
-      path: sourcePath,
-      label,
-      definition,
-    }),
-  ]) as any;
+  const context = fakeContext(entries) as any;
   context.model = { provider: "controller-provider", id: "controller-model" };
   context.thinkingLevel = "high";
+  await startRadarSession(pi, context);
   try {
     const result = await agentTool(pi, "continue").execute(
       "id",
@@ -5552,15 +2942,13 @@ test("session continuation keeps explicit definition execution overrides", async
       context,
     );
     assert.equal(result.details.ok, true, JSON.stringify(result.details));
-    const start = pi.calls.find(
-      (args) => args[0] === "agent" && args[1] === "start",
-    )!;
+    const start = spawnedArgvs(radarDaemon).at(-1)!;
     assert.equal(start[start.indexOf("--model") + 1], "explicit/provider");
     assert.equal(start[start.indexOf("--thinking") + 1], "low");
   } finally {
     pi.events.get("session_shutdown")?.[0]();
     nativeSessions.clear();
-    resetAgentMailbox(startup.mailbox);
+    resetAgentMailbox(agentMailboxPath(WORKSPACE, label));
     realFs.rmSync(definitionPath, { force: true });
     realFs.rmSync(sourcePath, { force: true });
   }

@@ -58,7 +58,7 @@ export type HerdsmanConfig = {
 };
 
 export const DEFAULT_CONFIG: HerdsmanConfig = {
-  spawnPlacement: "subtree",
+  spawnPlacement: "split",
   contextRetirement: false,
   retainWorkers: true,
   softTimeoutMs: DEFAULT_SOFT_TIMEOUT_MS,

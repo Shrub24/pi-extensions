@@ -5,7 +5,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type {
-	RadarClient,
 	RadarResult,
 	RadarScheduler,
 } from "./radar-client.ts";
@@ -16,6 +15,7 @@ import {
 import {
 	createRadarProcessSlot,
 	radarBindingKey,
+	type RadarPublicationClient,
 	type RadarProcessSlot,
 } from "./radar-publication.ts";
 
@@ -48,8 +48,7 @@ function harness(
 		options.root ?? mkdtempSync(join(tmpdir(), "radar-execution-test-"));
 	const calls: Array<{ method: string; params: any }> = [];
 	let minted = 0;
-	const client: RadarClient = {
-		socketPath: () => "/nonexistent/radar/control.sock",
+	const client: RadarPublicationClient = {
 		ping: async () => ok({ protocol: 1, capabilities: ["agent_registry"] }),
 		register: async (params) => {
 			calls.push({ method: "agent.register", params });

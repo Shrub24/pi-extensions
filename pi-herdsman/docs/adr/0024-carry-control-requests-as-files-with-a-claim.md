@@ -85,4 +85,4 @@ reports, so the model is not told.
 - [Herdsman control](../reference/herdsman-control.md)
 - [Accept an older owner's request shape](0022-accept-an-older-owners-request-shape.md)
 - [Retain workers across assignments](0013-retain-workers-across-assignments.md)
-- [Manager owns project assignment resolution](0012-manager-owns-project-assignment-resolution.md)
+- [Manager owns project assignment resolution (superseded by ADR 0034)](0012-manager-owns-project-assignment-resolution.md)

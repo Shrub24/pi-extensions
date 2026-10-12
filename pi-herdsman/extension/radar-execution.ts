@@ -1,12 +1,13 @@
 import {
 	boundedRadarSnapshot,
 	isUuid,
-	type RadarClient,
 	type RadarScheduler,
 	type RadarSnapshot,
 } from "./radar-client.ts";
+import type { RadarLocationResolution } from "./radar-location.ts";
 import {
 	createRadarPublication,
+	type RadarPublicationClient,
 	radarProcessIncarnation,
 	radarProcessSlot,
 	readProcessBirth,
@@ -31,7 +32,7 @@ export type RadarExecutionEventApi = {
 };
 
 export type RadarExecutionOptions = {
-	client: RadarClient;
+	client: RadarPublicationClient;
 	/** Reuse an existing publication instead of building one. */
 	publication?: RadarPublication;
 	dataRoot?: string;
@@ -41,6 +42,18 @@ export type RadarExecutionOptions = {
 	incarnation?: string;
 	/** Present and `undefined` means the platform reported no claim. */
 	birth?: ProcessBirth;
+	/**
+	 * The pane coordinates this process's trusted startup environment reported,
+	 * or the read that resolves them. Absent where the environment names no
+	 * location: registration then carries none, and a caller that needs one
+	 * refuses instead of inventing it.
+	 */
+	location?: () => Promise<RadarLocationResolution>;
+	/**
+	 * A daemon-spawned child's one-use launch token, captured before this process
+	 * could observe anything else. It travels with the registration request only.
+	 */
+	spawnToken?: string;
 	/** Only a real fixed managed assignment is part of immutable registration. */
 	managedBinding?: { key: string; run: string; owner: string; label: string };
 	/**
@@ -61,6 +74,23 @@ export type RadarExecutionAdapter = {
 
 /** The publisher name of a Pi process's own execution facts. */
 export const RADAR_SUBJECT_SOURCE = "herdsman-pi";
+
+/**
+ * The identity this process registered under: the source its registration names
+ * and the incarnation the process slot holds. The slot is what tells two
+ * processes apart - an extension reload keeps its incarnation, while another
+ * process occupying the same mailbox, run, pane and session has its own, even
+ * when it resumes the same Pi session.
+ */
+export function radarLocalRegistration(): {
+	source: string;
+	incarnation: string;
+} {
+	return {
+		source: RADAR_SUBJECT_SOURCE,
+		incarnation: radarProcessIncarnation(),
+	};
+}
 
 function dialogLabel(event: unknown): string {
 	if (typeof event !== "object" || event === null) return "";
@@ -102,6 +132,7 @@ function unavailablePublication(): RadarPublication {
 		},
 		assignment: () => writer,
 		binding: () => undefined,
+		subject: async () => undefined,
 		retireAssignment: () => undefined,
 		diagnostic: writer.diagnostic,
 		stop: () => undefined,
@@ -148,7 +179,13 @@ export function createRadarExecutionAdapter(
 					? { owner: managed.owner, run: managed.run, label: managed.label }
 					: {}),
 			},
+			...(options.location !== undefined
+				? { location: options.location }
+				: {}),
 			...(managed !== undefined ? { binding: managed } : {}),
+			...(options.spawnToken !== undefined
+				? { spawnToken: options.spawnToken }
+				: {}),
 		});
 	} catch {
 		publication = unavailablePublication();

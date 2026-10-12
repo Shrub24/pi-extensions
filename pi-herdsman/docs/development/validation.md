@@ -43,6 +43,15 @@ The test runner uses:
 --test
 ```
 
+### Type checking is not a gate yet
+
+`validate` runs no type check, and the tests cannot catch type errors. The interim
+method is an ad-hoc `tsc --noEmit` run compared against a `git archive HEAD` export with
+the same compiler command, so the two counts are comparable. Every count is non-strict,
+because the package has no tsconfig and so no `strictNullChecks`. A gate is added once that
+count reaches zero, not before: a gate on the current count would be red on arrival and
+ignored.
+
 ## Process containment
 
 On POSIX systems the test runner runs in a detached process group. On Windows
@@ -136,7 +145,6 @@ npm run smoke
 npm run smoke -- core
 npm run smoke -- continuation
 npm run smoke -- chief-tree
-npm run smoke -- manager-recovery
 ```
 
 `npm run smoke` defaults to `core`. Run it from an active Herdr-managed Pi

@@ -14,11 +14,13 @@ import {
 } from "node:fs";
 import { dirname, isAbsolute, join, parse, resolve, sep } from "node:path";
 import { herdsmanDataRoot } from "./storage.ts";
+import type { RadarLocationResolution } from "./radar-location.ts";
 import {
 	boundedRadarSnapshot,
 	isUuid,
 	type RadarChannel,
 	type RadarClient,
+	type RadarLocation,
 	type RadarPublisherIdentity,
 	type RadarRegistration,
 	type RadarScheduler,
@@ -26,6 +28,12 @@ import {
 	type RadarTimer,
 	systemScheduler,
 } from "./radar-client.ts";
+
+/** The client members publication calls; consumers narrow to this rather than the whole client. */
+export type RadarPublicationClient = Pick<
+	RadarClient,
+	"ping" | "register" | "acquire" | "publish" | "context" | "retire"
+>;
 
 /**
  * Durable publication state for Radar's registry (`agent-radar`
@@ -455,7 +463,7 @@ export type RadarChannelWriter = {
 
 type ChannelWriterInput = {
 	store: PublicationStore;
-	client: RadarClient;
+	client: RadarPublicationClient;
 	scheduler: RadarScheduler;
 	recordName: string;
 	channel: RadarChannel;
@@ -599,7 +607,7 @@ function createChannelWriter(input: ChannelWriterInput): RadarChannelWriter {
 			channel,
 			publisher,
 		});
-		if (!answer.ok) {
+		if (answer.ok === false) {
 			if (answer.code === "not_found") {
 				// The daemon has lost this subject. The identical immutable content is
 				// registered again on the next heartbeat rather than in a hot retry
@@ -644,7 +652,7 @@ function createChannelWriter(input: ChannelWriterInput): RadarChannelWriter {
 			observed_at: pending.observed_at,
 			snapshot: pending.snapshot,
 		});
-		if (answer.ok) {
+		if (answer.ok === true) {
 			recovering = false;
 			record.sequence = Math.max(record.sequence, answer.value.sequence);
 			record.accepted = { ...pending, sent_at: scheduler.now() };
@@ -754,7 +762,7 @@ function createChannelWriter(input: ChannelWriterInput): RadarChannelWriter {
 				void client
 					.retire({ agent_id: agentId, channel, writer_handle: writer.handle })
 					.then((answer) => {
-				if (answer.ok) {
+				if (answer.ok === true) {
 						try {
 							record.retired_at = new Date(scheduler.now()).toISOString();
 							save();
@@ -796,7 +804,7 @@ export type RadarContextWriter = {
 
 type ContextWriterInput = {
 	store: PublicationStore;
-	client: RadarClient;
+	client: RadarPublicationClient;
 	scheduler: RadarScheduler;
 	recordName: string;
 	publisher: RadarPublisherIdentity;
@@ -949,7 +957,7 @@ function createContextWriter(input: ContextWriterInput): RadarContextWriter {
 			observed_at: pending.observed_at,
 			context: { session: pending.session },
 		});
-		if (answer.ok) {
+		if (answer.ok === true) {
 			recovering = false;
 			record.writer = {
 				handle: answer.value.writer.handle,
@@ -1088,6 +1096,12 @@ export type RadarPublication = {
 	assignment(agentId: string, reportingOwner: string): RadarChannelWriter;
 	/** The exact subject an owned child registered, when it published one. */
 	binding(key: string): RadarChildBinding | undefined;
+	/**
+	 * The exact subject this process is registered as, once the daemon answered.
+	 * Absent while the daemon is unreachable, which is a launch prerequisite's
+	 * answer rather than a reason to register or spawn under another identity.
+	 */
+	subject(): Promise<RadarSubject | undefined>;
 	/** Retire the assignment writer this process actually holds for a child. */
 	retireAssignment(agentId: string): void;
 	diagnostic(): string | undefined;
@@ -1097,19 +1111,40 @@ export type RadarPublication = {
 	reopen(): void;
 };
 
+/** What a process's own registration resolved to, and where it says it is. */
+export type RadarSubject = {
+	agent_id: string;
+	location?: RadarLocation;
+};
+
 export type RadarPublicationOptions = {
 	dataRoot?: string;
 	store?: PublicationStore;
-	client: RadarClient;
-	/** The immutable registration content, apart from the incarnation and claim. */
+	client: RadarPublicationClient;
+	/** The immutable registration content, apart from the incarnation, claim and location. */
 	registration: Pick<RadarRegistration, "source" | "owner" | "run" | "label">;
 	incarnation?: string;
 	slot?: RadarProcessSlot;
 	scheduler?: RadarScheduler;
 	/** `undefined` omits the process claim rather than guessing one. */
 	birth?: ProcessBirth;
+	/**
+	 * The pane this process may publish for itself, resolved when the registration
+	 * record is first built. It is awaited rather than required up front, because
+	 * the daemon may not have answered yet - and a gap in that evidence is not a
+	 * fact to freeze: only a settled answer writes the immutable record, and a
+	 * record that already exists is never rebuilt and never acquires a location
+	 * later.
+	 */
+	location?: () => Promise<RadarLocationResolution>;
 	/** Set on a managed child: the sidecar its owner correlates the subject with. */
 	binding?: { key: string; run: string; owner: string; label: string };
+	/**
+	 * A daemon-spawned child's one-use launch token. It is sent with this
+	 * registration only, and never written to the subject record: a private
+	 * credential is not part of the identity that record holds.
+	 */
+	spawnToken?: string;
 	leaseMs?: number;
 	heartbeatMs?: number;
 };
@@ -1165,6 +1200,7 @@ function unavailablePublication(error?: unknown): RadarPublication {
 		},
 		assignment: () => writer,
 		binding: () => undefined,
+		subject: async () => undefined,
 		retireAssignment: () => undefined,
 		diagnostic: () => diagnostic,
 		stop: () => undefined,
@@ -1179,6 +1215,7 @@ function createRadarPublicationInner(
 	const store = options.store ?? createPublicationStore(dataRoot);
 	const scheduler = options.scheduler ?? systemScheduler;
 	const client = options.client;
+	const spawnToken = options.spawnToken;
 	const slot = options.slot ?? radarProcessSlot();
 	const incarnation = options.incarnation ?? radarProcessIncarnation(slot);
 
@@ -1240,36 +1277,88 @@ function createRadarPublicationInner(
 		};
 	}
 
-	let subject: SubjectRecord = readSubject() ?? {
-		version: RADAR_PUBLICATION_VERSION,
-		registration: {
-			...options.registration,
-			incarnation,
-			...(options.birth !== undefined ? { process: options.birth } : {}),
-		},
-	};
-	store.write(subjectName, subject);
-	let agentId = subject.agent_id;
+	const stored = readSubject();
+	let subject: SubjectRecord | undefined = stored;
 	let registrationDiagnostic: string | undefined;
+	let registrationRecord: Promise<SubjectRecord | undefined> | undefined;
+	/**
+	 * The immutable registration is written before it is ever sent, and the stored
+	 * content wins over a later attempt to build it again: a claim read
+	 * successfully once may not change what this incarnation is registered as. The
+	 * location is the one fact that can still be arriving when the adapter starts,
+	 * so the record is built - and written - at that point rather than earlier. A
+	 * store that cannot hold it leaves this process unregistered and says why,
+	 * rather than throwing out of a lifecycle event.
+	 *
+	 * A location that is still pending writes nothing at all. This process has not
+	 * been told where it is, and an immutable record that froze that gap could
+	 * never be repaired without replacing the identity it belongs to; the next
+	 * attempt asks the daemon again instead.
+	 */
+	async function ensureRegistration(): Promise<SubjectRecord | undefined> {
+		if (subject !== undefined) return subject;
+		registrationRecord ??= (async () => {
+			const resolution = options.location
+				? await options.location()
+				: ({ state: "absent", reason: "this process publishes no location" } as const);
+			if (resolution.state === "pending") {
+				registrationDiagnostic =
+					`location bootstrap pending: ${resolution.reason}`.slice(0, 256);
+				return undefined;
+			}
+			const built: SubjectRecord = {
+				version: RADAR_PUBLICATION_VERSION,
+				registration: {
+					...options.registration,
+					...(resolution.state === "resolved"
+						? { location: resolution.location }
+						: {}),
+					incarnation,
+					...(options.birth !== undefined ? { process: options.birth } : {}),
+				},
+			};
+			try {
+				store.write(subjectName, built);
+			} catch (error) {
+				registrationDiagnostic ??=
+					`private storage unavailable: ${String(error)}`.slice(0, 256);
+				return undefined;
+			}
+			registrationDiagnostic = undefined;
+			subject = built;
+			return built;
+		})();
+		try {
+			return await registrationRecord;
+		} finally {
+			registrationRecord = undefined;
+		}
+	}
+	let agentId = stored?.agent_id;
 	let subjectReady: Promise<string | undefined> | undefined;
 	async function ensureSubject(recheck: boolean): Promise<string | undefined> {
 		if (recheck) agentId = undefined;
 		if (agentId !== undefined) return agentId;
 		subjectReady ??= (async () => {
 			const ready = await client.ping();
-			if (!ready.ok) {
+			if (ready.ok === false) {
 				if (ready.code !== "absent" && ready.code !== "timeout" && ready.code !== "transport")
 					registrationDiagnostic ??= `daemon negotiation failed: ${ready.message}`.slice(0, 256);
 				return undefined;
 			}
-			const answer = await client.register(subject.registration);
-			if (!answer.ok) {
+			const record = await ensureRegistration();
+			if (record === undefined) return undefined;
+			const answer = await client.register({
+				...record.registration,
+				...(spawnToken !== undefined ? { spawn_token: spawnToken } : {}),
+			});
+			if (answer.ok === false) {
 				if (answer.code !== "absent" && answer.code !== "timeout" && answer.code !== "transport")
 					registrationDiagnostic ??= `subject registration refused: ${answer.message}`.slice(0, 256);
 				return undefined;
 			}
 			agentId = answer.value.agent_id;
-			subject = { ...subject, agent_id: agentId };
+			subject = { ...record, agent_id: agentId };
 			store.write(subjectName, subject);
 			if (options.binding !== undefined) writeBinding(options.binding);
 			return agentId;
@@ -1399,6 +1488,17 @@ function createRadarPublicationInner(
 			// Only a writer this process actually holds is retired; retiring by
 			// acquiring first would be an implicit takeover of the channel.
 			assignmentWriters.get(targetAgentId)?.retire();
+		},
+		async subject() {
+			const agentId = await ensureSubject(false);
+			if (agentId === undefined) return undefined;
+			const record = await ensureRegistration();
+			if (record === undefined) return undefined;
+			const location = record.registration.location;
+			return {
+				agent_id: agentId,
+				...(location !== undefined ? { location } : {}),
+			};
 		},
 		diagnostic: () =>
 			registrationDiagnostic ?? execution.diagnostic() ?? context.diagnostic(),

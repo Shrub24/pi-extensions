@@ -56,7 +56,7 @@ or a managed record, which adds the definition, the label and the direct owner:
 | `version` | required | required | Data version; `1` is the only known one |
 | `sessionId` | required | required | The exact Pi session UUID this record describes |
 | `kind` | required | required | `operator` or `managed` session origin |
-| `role` | required | required | `lead`, `manager`, `chief`, or the effective definition name |
+| `role` | required | required | `lead`, `chief`, or the effective definition name |
 | `parentSessionId` | — | required | Current **direct owner's** Pi session UUID |
 | `definition` | — | required | Managed agent definition name |
 | `label` | — | required | Worker runtime label for the current generation |
@@ -72,8 +72,8 @@ still answers admission questions, this entry only answers classification.
 
 `kind` records where the session came from — an ordinary operator session or a
 managed launch — not whether it is alive or what it is doing right now. `role`
-is the effective role: an operator's Lead, Manager or Chief position, or a
-worker's effective definition name, matching `pi_herdsman_role` on the pane.
+is the effective role: an operator's Lead or Chief position, or a worker's
+effective definition name, matching `pi_herdsman_role` on the pane.
 
 A managed session keeps `kind: "managed"` even when its file is opened outside a
 managed launch environment; it is not reclassified as an operator just because a

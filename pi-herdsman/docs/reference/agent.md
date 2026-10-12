@@ -103,7 +103,7 @@ Continuation reports one of four outcomes:
 | reused      | `reused: true`                       | With `retainWorkers` enabled, the session's single representation is a directly owned `idle` worker whose recorded launch configuration still matches the current definition: the task is submitted into that existing verified live process, so no new process, pane, or label appears. |
 | relaunched  | `relaunched: "definition_changed"`    | The idle worker's launch configuration drifted (prompt body including `@file` contents, `systemPromptMode`, model, thinking, the effective tools, skills, extensions, and context inheritance, or the selected child executable) or its launch record is missing. The worker is closed and a fresh generation continues the same session. |
 | recovered   | `relaunched: "process_lost"`         | The session's directly owned worker is a proven `lost` generation: its process is gone, and its pane is either gone too or survives as a shell. A `lost` record is retired through the shared close preflight and a new generation continues the same Pi session in a new process and pane. Nothing is closed or removed by hand first, and a surviving pane is left untouched. Unprovable identity still refuses `agent_busy` — an unclaimed run-scoped alias refuses instead with the named `target_ambiguous` diagnostic — and an unretrieved durable result still refuses rather than being overwritten. |
-| fresh       | neither field                        | The work starts as a new agent generation because no verified live process represents the session.                                                                                                                                                                    |
+| fresh       | neither field                        | The work starts as a new agent generation because no verified live process represents the session — the ordinary case for a `saved_sessions` entry `agent_list` reports after `retainWorkers: false` closed the worker at delivery.                                                                                                                                                                    |
 
 A reused process keeps its launch-time system prompt and in-memory extension
 state, so reuse requires the same launch configuration the process started with.
@@ -129,14 +129,16 @@ prominent for a later `agent_continue` call.
 
 Managed children run the binary selected by `PI_HERDSMAN_CHILD_COMMAND` in the
 lead's own process environment. Herdsman reads it when it builds a launch, so it
-is not a configuration-file setting and has no `/agents` menu entry.
+is not a configuration-file setting and has no `/agents` menu entry. Radar spawn
+execs the resolved file directly, so the value must name an executable this
+process can resolve; a command name is resolved on the launch `PATH` first.
 
 | Value              | Effect                                                                                                                                                                        |
 | ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| unset or empty     | No command is configured; the launch is unchanged.                                                                                                                            |
+| unset or empty     | No executable is named, so a fresh launch refuses before it reaches the daemon; nothing substitutes a default.                                                                |
 | an absolute path   | That file is used; it must exist and be executable.                                                                                                                           |
-| a command name     | The name is resolved on the launch `PATH`, and the resolved executable is used.                                                                                                |
-| anything else      | The launch fails before any pane or process is created, with an `invalid_request` naming `PI_HERDSMAN_CHILD_COMMAND`. No default executable is substituted for a mistyped value. |
+| a command name     | The name is resolved on the launch `PATH`, and the resolved executable is used.                                                                                               |
+| anything else      | The launch fails before any process is created, with an `invalid_request` naming `PI_HERDSMAN_CHILD_COMMAND`. No default executable is substituted for a mistyped value.      |
 
 The selected executable is part of the recorded launch configuration, so a
 retained `idle` worker whose recorded command differs from the current one —
@@ -299,6 +301,19 @@ preflight currently succeeds. Unknown records and non-direct descendants expose
 no mutation actions. Every operation rechecks identity, ownership, mailbox
 state, and lifecycle immediately before mutation.
 The public record does not expose `steerable`.
+
+`agent_list` also reports `saved_sessions`: directly owned Pi sessions whose
+assignment already resolved and whose worker was cleaned up, so no live agent
+represents them. Each entry carries `agent` (the inherited logical label),
+`agent_definition`, the exact `pi_session_id` and `pi_session_path`, and
+`last_result` with the delivered `request_id` and `status`. This is durable
+history read from the controller's own delivered results, not liveness evidence:
+a session is listed only while no mailbox in any workspace represents it, and
+`agent_continue` revalidates the session file, its recorded identity, and the
+caller's ownership before it starts anything. Saved sessions are not live agents;
+they carry no `available_tools` and are not targets for `agent_close`,
+`agent_inspect`, `agent_transcript`, `agent_steer`, `agent_interrupt`, or
+`agent_reply`.
 
 The session-start instructions include the same complete definition metadata
 projection returned by `agent_list` for that controller. It is a startup snapshot;

@@ -15,8 +15,6 @@ import {
   formatSessionUsage,
   formatSupervisionContext,
   formatSupervisionNotification,
-  managerSupervisionItems,
-  supervisionPresentationReports,
   SUPERVISION_CONTEXT_MAX_BYTES,
   formatAgentDefinitions,
   formatSkills,
@@ -32,10 +30,8 @@ import {
   buildSupervisedLeadDisplays,
   createSupervisionWidget,
   groupSupervisedLeads,
-  moveSupervisionSelection,
   renderSupervisionPeek,
   renderSupervisionLeads,
-  retainSupervisionSelection,
   renderCompletionMessage,
   renderAgentAskMessage,
   renderAgentAttentionMessage,
@@ -656,21 +652,7 @@ test("Supervision peeks remain bounded while exposing safe process evidence", (t
   }
 });
 
-test("Supervision selection uses opaque handles and moves safely", (t) => {
-  {
-    const leads = [
-      lead({ lead: "a" }),
-      lead({ lead: "b" }),
-      lead({ lead: "c" }),
-    ];
-    assert.equal(retainSupervisionSelection("b", leads), "b");
-    assert.equal(retainSupervisionSelection("gone", leads), "a");
-    assert.equal(moveSupervisionSelection("b", leads, 1), "c");
-    assert.equal(moveSupervisionSelection("b", leads, -1), "a");
-    assert.equal(moveSupervisionSelection("gone", leads, 1), "b");
-    assert.equal(retainSupervisionSelection("a", []), undefined);
-  }
-
+test("Supervision selection uses opaque handles", (t) => {
   {
     const leads = [
       lead({
@@ -3325,7 +3307,7 @@ test("ask, stale, and lost custom messages preserve attention semantics and iden
   assert.match(collapsedLost, /× researcher lost/);
   assert.match(
     collapsedLost,
-    /assignment remains unresolved · close unavailable; resolve the blocking close-preflight condition first/,
+    /assignment remains unresolved · close unavailable; continue with agent_continue instead/,
   );
   assert.doesNotMatch(collapsedLost, /actions:|next reminder:/);
   const expandedLost = renderedText(
@@ -3925,6 +3907,27 @@ test("List output preserves definitions and agent action state", (t) => {
     );
     assert.doesNotMatch(rendered, /\b(?:inspect|reply|close)\b/);
   }
+
+  {
+    const rendered = formatToolModelResult("list", {
+      ok: true,
+      agents: [],
+      saved_sessions: [
+        {
+          state: "saved",
+          agent: "researcher",
+          agent_definition: "researcher",
+          pi_session_id: "session-id",
+          pi_session_path: "/tmp/researcher.jsonl",
+          last_result: { request_id: "request-id", status: "completed" },
+        },
+      ],
+    });
+    assert.match(
+      rendered,
+      /Saved sessions \(continue with agent_continue\):\n  researcher · definition researcher · last result completed\n    session: session-id/,
+    );
+  }
 });
 
 test("Definition formatting preserves model, status, and source contracts", (t) => {
@@ -4452,273 +4455,21 @@ test("Large model truncation remains bounded at ordinary and boundary inputs", (
   }
 });
 
-test("Manager supervision presentation is role-aware and classifies direct Leads", () => {
-  const snapshot = {
-    leads: [
-      lead({
-        lead: "direct-lead",
-        agentCounts: { active: 0, blocked: 0, total: 0 },
-        availableActions: ["inspect", "message"],
-      }),
-    ],
-  };
-  const reports = supervisionPresentationReports(snapshot);
-  assert.deepEqual(
-    reports.map(({ role }) => role),
-    ["lead"],
-  );
-  assert.equal(
-    renderSupervisionLeads(snapshot, 120, { role: "manager" })[0],
-    "● manager",
-  );
-  assert.equal(
-    renderSupervisionLeads(snapshot, 120, {
-      role: "manager",
-      status: "unavailable",
-    })[0],
-    "● manager · unavailable",
-  );
-  const context = formatSupervisionContext(snapshot, {
-    status: "fresh",
-    role: "manager",
-  });
-  assert.match(context, /Latest validated Manager supervision snapshot\./);
-  assert.match(context, /direct_leads: 1/);
-  assert.doesNotMatch(context, /chief|managers:|unclaimed_direct_leads/iu);
-});
-
-test("Manager context lists only open workspaces without exposing paths", () => {
-  const snapshot = {
-    project: "pi-herdsman",
-    leads: [],
-    openWorkspaces: [
-      {
-        workspaceId: "root",
-        branch: "feat/manager-supervision",
-        path: "/repo/private-primary",
-        linked: false,
-      },
-      {
-        workspaceId: "child",
-        branch: "fix/manager-release-boundaries",
-        path: "/repo/private-linked",
-        linked: true,
-      },
-      {
-        workspaceId: "branchless",
-        path: "/repo/private-branchless",
-        linked: false,
-      },
-      // Closed worktrees are absent from the derived openWorkspaces snapshot.
-    ],
-  };
-  const context = formatSupervisionContext(snapshot, {
-    status: "fresh",
-    role: "manager",
-  });
-
-  assert.ok(
-    context.includes(
-      [
-        "open_workspaces:",
-        "  feat/manager-supervision · workspace=root · primary",
-        "  fix/manager-release-boundaries · workspace=child · linked",
-        "  workspace=branchless · primary",
-      ].join("\n"),
-    ),
-  );
-  assert.doesNotMatch(
-    context,
-    /private-primary|private-linked|private-branchless|\/repo|closed-worktree|undefined/,
-  );
-  assert.ok(
-    Buffer.byteLength(context, "utf8") <= SUPERVISION_CONTEXT_MAX_BYTES,
-  );
-
-  const widget = createSupervisionWidget(
-    () => snapshot,
-    () => "fresh",
-    "manager",
-  )
-    .render(120)
-    .join("\n");
-  assert.doesNotMatch(
-    widget,
-    /open_workspaces|manager-supervision|release-boundaries|private-/,
-  );
-});
-
-test("Chief tree shows project and branch without internal paths or zero counts", () => {
-  const snapshot = {
-    managers: [
-      {
-        session: "manager-session",
-        displayName: "pi-herdsman",
-        project: "pi-herdsman",
-        workspaceId: "workspace",
-        paneId: "pane",
-        tabId: "tab",
-        runtimeState: "idle" as const,
-        agentCounts: { active: 0, blocked: 0, total: 0 },
-        leadCounts: { active: 0, blocked: 0, total: 1 },
-        availableActions: [],
-        leads: [
-          {
-            session: "opaque",
-            branch: "feat/session-usage-stats",
-            displayName: "pi-herdsman/feat/session-usage-stats/lead-12345678",
-            runtimeState: "idle" as const,
-            agentCounts: { active: 0, blocked: 0, total: 0 },
-          },
-        ],
-      },
-    ],
-  };
-  const rows = renderSupervisionLeads(snapshot, 120);
-  assert.equal(rows[0], "● chief · 1 manager");
-  assert.equal(rows[1], "└─ ○ pi-herdsman · 1 lead");
-  assert.equal(rows[2], "   feat/session-usage-stats · idle");
-  assert.doesNotMatch(
-    rows.join("\n"),
-    /\.git|0 agents|0 leads|manager-session|lead-12345678/,
-  );
-  assert.equal(
-    renderSupervisionLeads(
-      { ...snapshot, leads: [lead(), lead({ lead: "other" })] },
-      120,
-    )[0],
-    "● chief · 1 manager · 2 direct leads",
-  );
-});
-
-test("Manager widget shares one bounded work/Lead tree and context includes project work", () => {
-  const work = (["active", "paused", "conflict"] as const).map(
-    (status, index) => ({
-      branch: `feat/${status}-${"long".repeat(20)}`,
-      session: `managed-${index}`,
-      status,
-      ...(status === "active" ? { runtimeState: "blocked" as const } : {}),
-    }),
-  );
-  const snapshot = {
-    project: "pi-herdsman",
-    work,
-    leads: [
-      lead({
-        lead: "manual",
-        branch: "feat/manual",
-        displayName: "opaque/manual",
-      }),
-      lead({
-        lead: "managed-0",
-        branch: work[0]!.branch,
-        runtimeState: "blocked",
-      }),
-    ],
-  };
-  const rows = renderSupervisionLeads(snapshot, 120, { role: "manager" });
-  assert.equal(rows[0], "● manager · pi-herdsman");
-  assert.match(rows[1]!, /!◐ feat\/active.* · active/);
-  assert.match(rows[2]!, /○ feat\/paused.* · paused/);
-  assert.match(rows[3]!, /! feat\/conflict.* · conflict/);
-  assert.match(
-    renderSupervisionLeads(snapshot, 40, { role: "manager" })[1]!,
-    / · active$/,
-  );
-  assert.equal(rows[4], "└─ ○ feat/manual · Lead");
-  assert.equal(rows.filter((row) => row.startsWith("└─")).length, 1);
-  assert.doesNotMatch(rows.join("\n"), /other Lead/i);
-  assert.doesNotMatch(
-    rows.join("\n"),
-    /opaque\/manual|managed-0|0 leads|\.git/,
-  );
-  const items = managerSupervisionItems(snapshot);
-  assert.deepEqual(
-    items.map((item) => item.kind),
-    ["work", "work", "work", "lead"],
-  );
-  assert.equal(items[0]!.kind === "work" && items[0]!.lead?.lead, "managed-0");
-  assert.deepEqual(
-    renderSupervisionLeads(snapshot, 120, {
-      role: "manager",
-      ordinaryCap: 2,
-    }).slice(1),
-    [
-      rows[1],
-      "├─ ○ feat/paused-" + "long".repeat(20) + " · paused",
-      "└─ … 2 more · /manager",
-    ],
-  );
-  const context = formatSupervisionContext(
-    { work, leads: [] },
-    { role: "manager", status: "fresh" },
-  );
-  assert.match(
-    context,
-    /project_work:\n  feat\/active-.* · active · runtime=blocked/,
-  );
-  assert.doesNotMatch(context, /session=|managed-\d/);
-  assert.ok(Buffer.byteLength(context) <= SUPERVISION_CONTEXT_MAX_BYTES);
-  for (let width = 1; width <= 120; width++)
-    assert.ok(
-      renderSupervisionLeads(snapshot, width, { role: "manager" }).every(
-        (row) => visibleWidth(row) <= width,
-      ),
-    );
-  assert.equal(
-    createSupervisionWidget(
-      () => ({ project: "pi-herdsman", work: [], leads: [] }),
-      () => "fresh",
-      "manager",
-    ).render(120)[0],
-    "● manager · pi-herdsman",
-  );
-});
-
-test("Manager work status outranks live Lead markers except when active", () => {
-  for (const [status, marker] of [
-    ["active", "●"],
-    ["paused", "○"],
-    ["conflict", "!"],
-  ] as const) {
-    {
-      const snapshot = {
-        work: [{ branch: "feat/example", session: "assigned", status }],
-        leads: [
-          lead({
-            lead: "assigned",
-            runtimeState: "working",
-          }),
-        ],
-      };
-      assert.deepEqual(
-        renderSupervisionLeads(snapshot, 120, { role: "manager" }, "assigned"),
-        ["● manager", `└─ >${marker} feat/example · ${status}`],
-      );
-    }
-  }
-});
-
 test("coordination messages render compact semantic headings and strip only known envelopes", () => {
   const details = {
     id: "transport-uuid",
     leaseId: "lease-uuid",
     fromSessionId: "sender-session-uuid",
     leadSessionId: "assignment-session-uuid",
-    branch: "feat/bootstrap",
   };
   const envelopes = {
     chief_message: "From chief sender-session-uuid: ",
     lead_message: "From lead sender-session-uuid: ",
-    manager_message: "From manager sender-session-uuid: ",
-    project_assignment: "Project assignment for branch feat/bootstrap:\n\n",
     peer_message: "Peer message from sender-session-uuid: ",
   };
   const headings = {
     chief_message: "Chief message",
     lead_message: "Lead message",
-    manager_message: "Manager message",
-    project_assignment: "→ feat/bootstrap assigned",
     peer_message: "Peer message",
   };
   for (const kind of COORDINATION_MESSAGE_KINDS) {
@@ -4792,20 +4543,6 @@ test("coordination messages render compact semantic headings and strip only know
     ),
     /Peer message from sender-session-uuid:/,
   );
-  for (const content of [
-    "From manager other-session: preserve user-authored text.",
-    "From lead sender-session-uuid: preserve the mismatched role.",
-  ])
-    assert.ok(
-      renderedText(
-        renderCoordinationMessage(
-          "manager_message",
-          { content, details },
-          {},
-          presentationTheme,
-        ),
-      ).includes(content),
-    );
 });
 
 test("expanded coordination messages show complete Markdown and useful provenance only", () => {
@@ -4862,67 +4599,6 @@ test("expanded coordination messages show complete Markdown and useful provenanc
   assert.doesNotMatch(
     ordinary,
     /branch:|From lead lead-pi-session:|manager-session/,
-  );
-});
-
-test("coordination previews strip only known assignment envelopes", () => {
-  const assignment = renderedText(
-    renderCoordinationMessage(
-      "project_assignment",
-      {
-        content:
-          "Project assignment for branch feat/bootstrap:\n\n" +
-          "Implement the bootstrap fix.",
-        details: {
-          fromSessionId: "manager-session-uuid",
-          leadSessionId: "lead-session-uuid",
-          branch: "feat/bootstrap",
-        },
-      },
-      { expanded: true },
-      presentationTheme,
-    ),
-  );
-  assert.match(assignment, /branch: feat\/bootstrap/);
-  assert.match(assignment, /Implement the bootstrap fix/);
-  assert.doesNotMatch(
-    assignment,
-    /session:|manager-session-uuid|lead-session-uuid/,
-  );
-});
-
-test("Manager mixed tree has one final connector and independent Leads share the row cap", () => {
-  const snapshot = {
-    project: "pi-herdsman",
-    work: [
-      {
-        branch: "worktree/lead-management-smoke-ping",
-        session: "assigned",
-        status: "paused" as const,
-      },
-    ],
-    leads: [
-      lead({
-        lead: "independent",
-        branch: "test/manager-lifecycle-smoke",
-        runtimeState: "idle",
-        agentCounts: { active: 1, blocked: 0, total: 1 },
-      }),
-      lead({ lead: "assigned" }),
-    ],
-  };
-  assert.deepEqual(renderSupervisionLeads(snapshot, 120, { role: "manager" }), [
-    "● manager · pi-herdsman",
-    "├─ ○ worktree/lead-management-smoke-ping · paused",
-    "└─ ◉ test/manager-lifecycle-smoke · Lead",
-  ]);
-  assert.deepEqual(
-    renderSupervisionLeads(snapshot, 120, { role: "manager", ordinaryCap: 1 }),
-    [
-      "● manager · pi-herdsman",
-      "├─ ○ worktree/lead-management-smoke-ping · paused",
-      "└─ … 1 more · /manager",
-    ],
   );
 });
 

@@ -18,17 +18,22 @@ import {
   acquireProcessLock,
   isProcessLockClaim,
   readLiveProcessLock,
-  readProcessLockStatus,
   type ProcessLockClaim,
 } from "./lock.ts";
 import { herdsmanDataRoot } from "./storage.ts";
 
-// Authority edges are deliberately asymmetric: Chief -> Manager -> Lead -> Agent.
-// Staff and supervisor cross one edge; only Lead/Manager sessions may be peers.
-export type SessionRole = "lead" | "manager" | "chief";
-export type CoordinatorRole = "lead" | "manager";
+// Authority edges: Chief -> Lead -> Agent. Only Lead sessions may be peers.
+export type SessionRole = "lead" | "chief";
+export type CoordinatorRole = "lead";
 export type PeerRole = CoordinatorRole;
 export type LeadRole = SessionRole;
+
+/** Persisted `manager` roles predate Manager removal and read back as Lead. */
+function readsAsLead<T>(value: T): T {
+  return (value as { role?: unknown } | null)?.role === "manager"
+    ? { ...value, role: "lead" }
+    : value;
+}
 
 export type LeadRoleState = Readonly<{
   role: LeadRole;
@@ -82,7 +87,7 @@ export function sessionLeadRoleState(
         entryOwnedBySession(candidate.data, ownership),
     ) as any;
   if (!entry) return undefined;
-  const data = entry.data;
+  const data = readsAsLead(entry.data);
   if (
     !data ||
     typeof data !== "object" ||
@@ -93,9 +98,7 @@ export function sessionLeadRoleState(
     (data.sessionId !== undefined && typeof data.sessionId !== "string") ||
     !Object.hasOwn(data, "role") ||
     !Object.hasOwn(data, "leadTools") ||
-    (data.role !== "lead" &&
-      data.role !== "manager" &&
-      data.role !== "chief") ||
+    (data.role !== "lead" && data.role !== "chief") ||
     !Array.isArray(data.leadTools) ||
     data.leadTools.some(
       (name: unknown) => typeof name !== "string" || name.length === 0,
@@ -131,8 +134,6 @@ export type SupervisionRuntime = {
   descriptor: string;
   inbox: string;
   coordinators: string;
-  managers: string;
-  assignments: string;
   /** Old caller spelling until the integration lane switches to coordinators. */
   leads: string;
 };
@@ -146,8 +147,6 @@ export type ChiefLease = {
 export const COORDINATION_MESSAGE_KINDS = [
   "chief_message",
   "lead_message",
-  "manager_message",
-  "project_assignment",
   "peer_message",
 ] as const;
 
@@ -164,7 +163,6 @@ export type ChiefMessageRecord = {
   fromSessionId: string;
   toSessionId: string;
   leadSessionId: string;
-  branch?: string;
   text: string;
   createdAt: number;
 };
@@ -229,23 +227,11 @@ function validMessage(value: unknown): value is ChiefMessageRecord {
     "text",
     "createdAt",
   ];
-  const optional = ["branch"];
   if (
-    Object.keys(record).some(
-      (key) => !keys.includes(key) && !optional.includes(key),
-    ) ||
-    Object.keys(record).length < keys.length ||
+    Object.keys(record).length !== keys.length ||
     keys.some((key) => !Object.hasOwn(record, key))
   )
     return false;
-  const projectMessage = record.kind === "project_assignment";
-  if (
-    projectMessage
-      ? !validNativeIdentity(record.branch)
-      : record.branch !== undefined
-  ) {
-    return false;
-  }
   return (
     record.version === 1 &&
     typeof record.id === "string" &&
@@ -738,16 +724,10 @@ function deliveredMessageContent(record: CoordinationMessageRecord): string {
   const prefix =
     record.kind === "chief_message"
       ? `From chief ${record.fromSessionId}: `
-      : record.kind === "manager_message"
-        ? `From manager ${record.fromSessionId}: `
-        : record.kind === "lead_message"
-          ? `From lead ${record.fromSessionId}: `
-          : `Peer message from ${record.fromSessionId}: `;
-  const content =
-    record.kind === "project_assignment"
-      ? `Project assignment for branch ${record.branch}:\n\n${record.text}`
-      : `${prefix}${record.text}`;
-  return Buffer.from(content, "utf8")
+      : record.kind === "lead_message"
+        ? `From lead ${record.fromSessionId}: `
+        : `Peer message from ${record.fromSessionId}: `;
+  return Buffer.from(`${prefix}${record.text}`, "utf8")
     .subarray(0, COORDINATION_MESSAGE_MAX_BYTES)
     .toString("utf8");
 }
@@ -858,7 +838,6 @@ export async function drainCoordinationInbox(
               leaseId: record.leaseId,
               fromSessionId: record.fromSessionId,
               leadSessionId: record.leadSessionId,
-              ...(record.branch ? { branch: record.branch } : {}),
             },
           },
           { deliverAs: "followUp", triggerTurn: true },
@@ -956,8 +935,6 @@ export function supervisionRuntime(socket = socketPath()): SupervisionRuntime {
     inbox: join(root, "inbox"),
     coordinators: join(root, "coordinators"),
     leads: join(root, "coordinators"),
-    managers: join(root, "managers"),
-    assignments: join(root, "assignments"),
   };
 }
 
@@ -993,8 +970,6 @@ export function peerRuntime(_socket?: string): PeerRuntime {
     inbox: join(root, "inbox"),
     coordinators: join(root, "coordinators"),
     leads: join(root, "coordinators"),
-    managers: join(root, "managers"),
-    assignments: join(root, "assignments"),
     peers: join(root, "peers"),
   };
 }
@@ -1055,9 +1030,7 @@ function validPeerLeadRecord(value: unknown): value is PeerLeadRecord {
       "updatedAt",
     ].every((key) => Object.hasOwn(record, key)) &&
     record.version === 1 &&
-    (record.role === undefined ||
-      record.role === "lead" ||
-      record.role === "manager") &&
+    (record.role === undefined || record.role === "lead") &&
     validSession(record.piSessionId) &&
     validNativeIdentity(record.paneId) &&
     validNativeIdentity(record.tabId) &&
@@ -1121,7 +1094,7 @@ export function readPeerLeadRecord(
     const text = readFileSync(path, "utf8");
     if (Buffer.byteLength(text, "utf8") > PEER_LEAD_RECORD_MAX_BYTES)
       throw new Error("peer lead record too large");
-    value = JSON.parse(text);
+    value = readsAsLead(JSON.parse(text));
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw new Error("Unable to read peer lead record", { cause: error });
@@ -1297,7 +1270,7 @@ export function chiefLeaseIsHeld(runtime: SupervisionRuntime): boolean {
 
 function writeDescriptor(
   path: string,
-  descriptor: ChiefDescriptor | ManagerDescriptor,
+  descriptor: ChiefDescriptor,
 ): void {
   const temporary = join(
     dirname(path),
@@ -1420,582 +1393,61 @@ export function claimChiefLease(identity: ChiefIdentity): ChiefLease {
   };
 }
 
-export type ManagerDescriptor = {
-  version: 1;
-  leaseId: string;
-  claim: ProcessLockClaim;
-  piSessionId: string;
-  piSessionFile?: string;
-  paneId: string;
-  tabId: string;
-  workspaceId: string;
-  repoKey: string;
-  createdAt: number;
-};
-export type ManagerIdentity = Pick<
-  ManagerDescriptor,
-  | "piSessionId"
-  | "piSessionFile"
-  | "paneId"
-  | "tabId"
-  | "workspaceId"
-  | "repoKey"
-> & { createdAt?: number };
-export type ManagerLease = {
-  descriptor: ManagerDescriptor;
-  runtime: SupervisionRuntime;
-  release: () => void;
-};
-export type ManagerDescriptorStatus = Readonly<{
-  descriptor: ManagerDescriptor;
-  live: boolean;
-}>;
 
-export function managerDescriptorPath(
-  runtime: SupervisionRuntime,
-  workspaceId: string,
-): string {
-  if (!validNativeIdentity(workspaceId))
-    throw new Error("Invalid Manager workspace ID");
-  return join(
-    runtime.managers,
-    `${createHash("sha256").update(workspaceId).digest("hex")}.json`,
-  );
-}
 
-function validManagerDescriptor(value: unknown): value is ManagerDescriptor {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const r = value as Record<string, unknown>;
-  const keys = [
-    "version",
-    "leaseId",
-    "claim",
-    "piSessionId",
-    "paneId",
-    "tabId",
-    "workspaceId",
-    "repoKey",
-    "createdAt",
-  ];
-  return (
-    Object.keys(r).every(
-      (key) => keys.includes(key) || key === "piSessionFile",
-    ) &&
-    keys.every((key) => Object.hasOwn(r, key)) &&
-    r.version === 1 &&
-    UUID.test(String(r.leaseId)) &&
-    isProcessLockClaim(r.claim) &&
-    validSession(r.piSessionId) &&
-    (r.piSessionFile === undefined ||
-      (typeof r.piSessionFile === "string" && r.piSessionFile.length > 0)) &&
-    validNativeIdentity(r.paneId) &&
-    validNativeIdentity(r.tabId) &&
-    validNativeIdentity(r.workspaceId) &&
-    validNativeIdentity(r.repoKey) &&
-    Number.isInteger(r.createdAt) &&
-    (r.createdAt as number) >= 0
-  );
-}
 
-export function sameManagerDescriptor(
-  actual: ManagerDescriptor,
-  expected: ManagerDescriptor,
-): boolean {
-  return (
-    actual.version === expected.version &&
-    actual.leaseId === expected.leaseId &&
-    actual.claim.pid === expected.claim.pid &&
-    actual.claim.id === expected.claim.id &&
-    actual.piSessionId === expected.piSessionId &&
-    actual.piSessionFile === expected.piSessionFile &&
-    actual.paneId === expected.paneId &&
-    actual.tabId === expected.tabId &&
-    actual.workspaceId === expected.workspaceId &&
-    actual.repoKey === expected.repoKey &&
-    actual.createdAt === expected.createdAt
-  );
-}
 
-export function readManagerDescriptorStatus(
-  runtime: SupervisionRuntime,
-  workspaceId: string,
-): ManagerDescriptorStatus | undefined {
-  const path = managerDescriptorPath(runtime, workspaceId);
-  const lockPath = `${path}.lock`;
-  let content: string;
-  try {
-    if (statSync(path).size > CHIEF_DESCRIPTOR_MAX_BYTES)
-      throw new Error("descriptor too large");
-    content = readFileSync(path, "utf8");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      try {
-        if (!statSync(lockPath, { throwIfNoEntry: false })) return undefined;
-      } catch (lockError) {
-        throw new Error("Unable to verify Manager descriptor", {
-          cause: lockError,
-        });
-      }
-    }
-    throw new Error("Unable to verify Manager descriptor", { cause: error });
-  }
-  let descriptor: unknown;
-  try {
-    descriptor = JSON.parse(content);
-  } catch (error) {
-    throw new Error("Unable to verify Manager descriptor", { cause: error });
-  }
-  if (
-    !validManagerDescriptor(descriptor) ||
-    descriptor.workspaceId !== workspaceId
-  )
-    throw new Error("Unable to verify Manager descriptor");
-  let status: ReturnType<typeof readProcessLockStatus>;
-  try {
-    status = readProcessLockStatus(lockPath, "Manager supervision lease");
-  } catch (error) {
-    throw new Error("Unable to verify Manager descriptor", { cause: error });
-  }
-  if (
-    status.claim.pid !== descriptor.claim.pid ||
-    status.claim.id !== descriptor.claim.id
-  )
-    throw new Error("Manager process-lock generation changed");
-  return { descriptor, live: status.live };
-}
 
-export function readManagerDescriptor(
-  runtime: SupervisionRuntime,
-  workspaceId: string,
-): ManagerDescriptor | undefined {
-  const status = readManagerDescriptorStatus(runtime, workspaceId);
-  if (!status) return undefined;
-  if (!status.live)
-    throw new Error("Unable to verify Manager supervision lease");
-  return status.descriptor;
-}
 
-export function listManagerDescriptors(
-  runtime = supervisionRuntime(),
-): ManagerDescriptor[] {
-  let entries: string[];
-  try {
-    entries = readdirSync(runtime.managers);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-    throw error;
-  }
-  return entries
-    .filter((entry) => /^[0-9a-f]{64}\.json$/.test(entry))
-    .sort()
-    .flatMap((entry) => {
-      try {
-        const path = join(runtime.managers, entry);
-        if (statSync(path).size > CHIEF_DESCRIPTOR_MAX_BYTES) return [];
-        const candidate: unknown = JSON.parse(readFileSync(path, "utf8"));
-        if (
-          !validManagerDescriptor(candidate) ||
-          basename(managerDescriptorPath(runtime, candidate.workspaceId)) !==
-            entry
-        )
-          return [];
-        const verified = readManagerDescriptor(runtime, candidate.workspaceId);
-        return verified ? [verified] : [];
-      } catch {
-        return [];
-      }
-    });
-}
 
-export function claimManagerLease(
-  identity: ManagerIdentity,
-  runtime = supervisionRuntime(),
-): ManagerLease {
-  if (
-    !identity ||
-    !validSession(identity.piSessionId) ||
-    (identity.piSessionFile !== undefined &&
-      (typeof identity.piSessionFile !== "string" ||
-        !identity.piSessionFile)) ||
-    !validNativeIdentity(identity.paneId) ||
-    !validNativeIdentity(identity.tabId) ||
-    !validNativeIdentity(identity.workspaceId) ||
-    !validNativeIdentity(identity.repoKey) ||
-    (identity.createdAt !== undefined &&
-      (!Number.isInteger(identity.createdAt) || identity.createdAt < 0))
-  )
-    throw new Error("Invalid Manager identity");
-  mkdirSync(runtime.managers, { recursive: true, mode: 0o700 });
-  chmodSync(runtime.managers, 0o700);
-  const path = managerDescriptorPath(runtime, identity.workspaceId);
-  const lease = acquireProcessLock(`${path}.lock`, {
-    name: "Manager supervision lease",
-  });
-  const descriptor: ManagerDescriptor = {
-    version: 1,
-    leaseId: randomUUID(),
-    claim: lease.claim,
-    piSessionId: identity.piSessionId,
-    ...(identity.piSessionFile !== undefined
-      ? { piSessionFile: identity.piSessionFile }
-      : {}),
-    paneId: identity.paneId,
-    tabId: identity.tabId,
-    workspaceId: identity.workspaceId,
-    repoKey: identity.repoKey,
-    createdAt: identity.createdAt ?? Date.now(),
-  };
-  try {
-    writeDescriptor(path, descriptor);
-  } catch (error) {
-    lease.release();
-    throw error;
-  }
-  let released = false;
-  return {
-    descriptor,
-    runtime,
-    release: () => {
-      if (released) return;
-      released = true;
-      try {
-        const current = readManagerDescriptor(runtime, identity.workspaceId);
-        if (current && sameManagerDescriptor(current, descriptor)) {
-          unlinkSync(path);
-          fsyncDirectory(runtime.managers);
-        }
-      } catch {
-        /* A replaced or malformed descriptor is not ours to remove. */
-      } finally {
-        lease.release();
-      }
-    },
-  };
-}
 
-export type ProjectAssignment = Readonly<{
-  version: 1;
-  id: string;
-  repoKey: string;
-  branch: string;
-  text: string;
-}>;
-export const PROJECT_ASSIGNMENT_MAX_BYTES = 16 * 1024;
 
-export function projectAssignmentPath(
-  runtime: SupervisionRuntime,
-  repoKey: string,
-  branch: string,
-): string {
-  if (!validNativeIdentity(repoKey) || !validNativeIdentity(branch))
-    throw new Error("Invalid project assignment identity");
-  return join(
-    runtime.assignments,
-    createHash("sha256").update(repoKey).digest("hex"),
-    `${createHash("sha256").update(branch).digest("hex")}.json`,
-  );
-}
 
-function validProjectAssignment(value: unknown): value is ProjectAssignment {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const r = value as Record<string, unknown>;
-  const required = ["version", "id", "repoKey", "branch", "text"];
-  return (
-    required.every((key) => Object.hasOwn(r, key)) &&
-    Object.keys(r).length === required.length &&
-    r.version === 1 &&
-    UUID.test(String(r.id)) &&
-    validNativeIdentity(r.repoKey) &&
-    validNativeIdentity(r.branch) &&
-    typeof r.text === "string" &&
-    r.text.length > 0
-  );
-}
 
-export function writeProjectAssignment(
-  runtime: SupervisionRuntime,
-  assignment: ProjectAssignment,
-): void {
-  if (!validProjectAssignment(assignment))
-    throw new Error("Invalid project assignment");
-  const content = `${JSON.stringify(assignment)}\n`;
-  if (Buffer.byteLength(content, "utf8") > PROJECT_ASSIGNMENT_MAX_BYTES)
-    throw new Error("Project assignment is too large");
-  const path = projectAssignmentPath(
-    runtime,
-    assignment.repoKey,
-    assignment.branch,
-  );
-  const directory = dirname(path);
-  mkdirSync(directory, { recursive: true, mode: 0o700 });
-  chmodSync(runtime.root, 0o700);
-  chmodSync(runtime.assignments, 0o700);
-  chmodSync(directory, 0o700);
-  const temporary = join(directory, `.${assignment.id}.${randomUUID()}.tmp`);
-  let fd: number | undefined;
-  try {
-    fd = openSync(temporary, "wx", 0o600);
-    writeFileSync(fd, content, "utf8");
-    fsyncSync(fd);
-    closeSync(fd);
-    fd = undefined;
-    renameSync(temporary, path);
-    chmodSync(path, 0o600);
-    fsyncDirectory(directory);
-  } finally {
-    if (fd !== undefined) closeSync(fd);
-    try {
-      unlinkSync(temporary);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
-  }
-}
 
-export function readProjectAssignment(
-  runtime: SupervisionRuntime,
-  repoKey: string,
-  branch: string,
-): ProjectAssignment | undefined {
-  const path = projectAssignmentPath(runtime, repoKey, branch);
-  return readProjectAssignmentFile(path, repoKey, branch);
-}
 
-function readProjectAssignmentFile(
-  path: string,
-  repoKey: string,
-  branch?: string,
-): ProjectAssignment | undefined {
-  let value: unknown;
-  try {
-    if (statSync(path).size > PROJECT_ASSIGNMENT_MAX_BYTES)
-      throw new Error("file is too large");
-    value = JSON.parse(readFileSync(path, "utf8"));
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-    const reason =
-      error instanceof SyntaxError
-        ? "invalid JSON"
-        : error instanceof Error && error.message === "file is too large"
-          ? error.message
-          : `read failed${safeFilesystemCode(error)}`;
-    throw projectAssignmentReadError(path, reason);
-  }
-  if (!validProjectAssignment(value))
-    throw projectAssignmentReadError(path, "invalid assignment schema");
-  if (
-    value.repoKey !== repoKey ||
-    basename(dirname(path)) !==
-      createHash("sha256").update(repoKey).digest("hex") ||
-    (branch !== undefined && value.branch !== branch) ||
-    basename(path) !==
-      `${createHash("sha256").update(value.branch).digest("hex")}.json`
-  )
-    throw projectAssignmentReadError(path, "assignment identity mismatch");
-  return value;
-}
 
-function safeFilesystemCode(error: unknown): string {
-  const code = (error as NodeJS.ErrnoException)?.code;
-  return typeof code === "string" && /^[A-Z0-9_]{1,32}$/.test(code)
-    ? ` (${code})`
-    : "";
-}
 
-function projectAssignmentReadError(path: string, reason: string): Error {
-  return new Error(`Unable to read project assignment ${path}: ${reason}`);
-}
 
-export function listProjectAssignments(
-  runtime: SupervisionRuntime,
-  repoKey: string,
-): ProjectAssignment[] {
-  const directory = dirname(projectAssignmentPath(runtime, repoKey, "lookup"));
-  let entries: string[];
-  try {
-    entries = readdirSync(directory);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-    throw error;
-  }
-  return entries
-    .filter((entry) => /^[a-f0-9]{64}\.json$/.test(entry))
-    .map((entry) => {
-      const assignment = readProjectAssignmentFile(
-        join(directory, entry),
-        repoKey,
-      );
-      if (!assignment)
-        throw projectAssignmentReadError(
-          join(directory, entry),
-          "file disappeared while listing",
-        );
-      return assignment;
-    })
-    .sort((a, b) => a.branch.localeCompare(b.branch));
-}
 
-export function findProjectAssignmentBySession(
-  runtime: SupervisionRuntime,
-  repoKey: string,
-  sessionId: string,
-): ProjectAssignment[] {
-  return listProjectAssignments(runtime, repoKey).filter(
-    (assignment) => assignment.id === sessionId,
-  );
-}
 
-export function removeProjectAssignment(
-  runtime: SupervisionRuntime,
-  repoKey: string,
-  branch: string,
-): void {
-  const path = projectAssignmentPath(runtime, repoKey, branch);
-  try {
-    unlinkSync(path);
-    fsyncDirectory(dirname(path));
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
-}
 
-export type ProjectMessage = Readonly<{
-  version: 1;
-  id: string;
-  repoKey: string;
-  branch: string;
-  fromSessionId: string;
-  text: string;
-  createdAt: number;
-}>;
 
-function projectMessageDirectory(
-  runtime: SupervisionRuntime,
-  repoKey: string,
-  branch: string,
-): string {
-  const assignment = projectAssignmentPath(runtime, repoKey, branch);
-  return join(dirname(assignment), `${basename(assignment, ".json")}.messages`);
-}
 
-function validProjectMessage(value: unknown): value is ProjectMessage {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const r = value as Record<string, unknown>;
-  return (
-    Object.keys(r).length === 7 &&
-    [
-      "version",
-      "id",
-      "repoKey",
-      "branch",
-      "fromSessionId",
-      "text",
-      "createdAt",
-    ].every((key) => Object.hasOwn(r, key)) &&
-    r.version === 1 &&
-    UUID.test(String(r.id)) &&
-    validNativeIdentity(r.repoKey) &&
-    validNativeIdentity(r.branch) &&
-    validSession(r.fromSessionId) &&
-    typeof r.text === "string" &&
-    r.text.length > 0 &&
-    Number.isInteger(r.createdAt) &&
-    (r.createdAt as number) >= 0 &&
-    Buffer.byteLength(`${JSON.stringify(r)}\n`, "utf8") <=
-      COORDINATION_MESSAGE_MAX_BYTES
-  );
-}
 
-export function projectMessageBytes(record: ProjectMessage): number {
-  return Buffer.byteLength(`${JSON.stringify(record)}\n`, "utf8");
-}
 
-export function writeProjectMessage(
-  record: ProjectMessage,
-  runtime: SupervisionRuntime,
-): void {
-  if (!validProjectMessage(record)) throw new Error("Invalid project message");
-  const directory = projectMessageDirectory(
-    runtime,
-    record.repoKey,
-    record.branch,
-  );
-  mkdirSync(directory, { recursive: true, mode: 0o700 });
-  chmodSync(runtime.root, 0o700);
-  chmodSync(runtime.assignments, 0o700);
-  chmodSync(dirname(directory), 0o700);
-  chmodSync(directory, 0o700);
-  const path = join(directory, `${record.id}.json`);
-  const temporary = join(directory, `.${record.id}.${randomUUID()}.tmp`);
-  let fd: number | undefined;
-  try {
-    fd = openSync(temporary, "wx", 0o600);
-    writeFileSync(fd, `${JSON.stringify(record)}\n`, "utf8");
-    fsyncSync(fd);
-    closeSync(fd);
-    fd = undefined;
-    renameSync(temporary, path);
-    chmodSync(path, 0o600);
-    fsyncDirectory(directory);
-  } finally {
-    if (fd !== undefined) closeSync(fd);
-    try {
-      unlinkSync(temporary);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
-  }
-}
 
-export function listProjectMessages(
-  runtime: SupervisionRuntime,
-  repoKey: string,
-  branch: string,
-): ProjectMessage[] {
-  const directory = projectMessageDirectory(runtime, repoKey, branch);
-  let entries: string[];
-  try {
-    entries = readdirSync(directory);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-    throw error;
-  }
-  return entries
-    .filter((entry) => UUID.test(entry.slice(0, -5)) && entry.endsWith(".json"))
-    .map((entry) => {
-      const path = join(directory, entry);
-      try {
-        if (statSync(path).size > COORDINATION_MESSAGE_MAX_BYTES)
-          throw new Error("large");
-        const value: unknown = JSON.parse(readFileSync(path, "utf8"));
-        if (
-          !validProjectMessage(value) ||
-          value.repoKey !== repoKey ||
-          value.branch !== branch ||
-          entry !== `${value.id}.json`
-        )
-          throw new Error("invalid");
-        return value;
-      } catch (error) {
-        throw new Error(`Unable to read project message ${path}`, {
-          cause: error,
-        });
-      }
-    })
-    .sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id));
-}
 
-export function removeProjectMessages(
-  runtime: SupervisionRuntime,
-  repoKey: string,
-  branch: string,
-): void {
-  rmSync(projectMessageDirectory(runtime, repoKey, branch), {
-    recursive: true,
-    force: true,
-  });
-  fsyncDirectory(dirname(projectAssignmentPath(runtime, repoKey, branch)));
-}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 export type CoordinatorState = {
   version: 1;
@@ -2022,121 +1474,19 @@ export type SupervisedLead = {
   availableActions: Array<"inspect" | "transcript" | "message">;
   agents: Array<{ id: string; label: string; state: RuntimeState }>;
 };
-/** Chief can act on these Managers only; nested Leads are observational. */
-export type SupervisedManager = {
-  session: string;
-  instanceId?: string;
-  displayName: string;
-  project: string;
-  workspaceId: string;
-  paneId: string;
-  tabId: string;
-  runtimeState: RuntimeState;
-  agentCounts: { active: number; blocked: number; total: number };
-  leadCounts: { active: number; blocked: number; total: number };
-  leads: Array<{
-    session: string;
-    displayName: string;
-    runtimeState: RuntimeState;
-    agentCounts: { active: number; blocked: number; total: number };
-  }>;
-  availableActions: Array<"inspect" | "transcript" | "message">;
-};
-/** A Chief snapshot has Managers as its only actionable reports. */
-export type ChiefManagerReportSnapshot = {
-  managers: SupervisedManager[];
-  diagnostics?: string[];
-};
+
+
+
 export type SupervisionSnapshot = {
   leads: SupervisedLead[];
-  project?: string;
-  work?: ProjectWorkSnapshot[];
-  openWorkspaces?: readonly OpenProjectWorkspace[];
   diagnostics?: string[];
 };
-export type OpenProjectWorkspace = Readonly<{
-  workspaceId: string;
-  branch?: string;
-  path: string;
-  linked: boolean;
-}>;
-export type ProjectWorkStatus = "active" | "paused" | "conflict";
-export type ProjectWorkSnapshot = Readonly<{
-  branch: string;
-  session: string;
-  status: ProjectWorkStatus;
-  runtimeState?: RuntimeState;
-  task?: string;
-  issue?: string;
-}>;
-/** Derive work from one caller-validated Lead inventory and one Herdr worktree list. */
-export function projectWorkSnapshot(options: {
-  assignments: readonly ProjectAssignment[];
-  worktrees: readonly Readonly<{
-    branch: string;
-    open_workspace_id?: string | null;
-  }>[];
-  leads: readonly Pick<
-    SupervisedLead,
-    "lead" | "workspaceId" | "runtimeState"
-  >[];
-}): ProjectWorkSnapshot[] {
-  return options.assignments.map((assignment) => {
-    const worktrees = options.worktrees.filter(
-      (item) => item.branch === assignment.branch,
-    );
-    const exact = options.leads.filter((lead) => lead.lead === assignment.id);
-    let status: ProjectWorkStatus;
-    let runtimeState: RuntimeState | undefined;
-    let issue: string | undefined;
-    if (worktrees.length > 1 || exact.length > 1) {
-      status = "conflict";
-      issue = "project runtime identity is ambiguous";
-    } else {
-      const workspaceId = worktrees[0]?.open_workspace_id ?? undefined;
-      const occupants = workspaceId
-        ? options.leads.filter((lead) => lead.workspaceId === workspaceId)
-        : [];
-      if (
-        exact.length === 1 &&
-        (!workspaceId || exact[0]!.workspaceId !== workspaceId)
-      ) {
-        status = "conflict";
-        issue = "assigned Lead is running outside its branch worktree";
-      } else if (occupants.some((lead) => lead.lead !== assignment.id)) {
-        status = "conflict";
-        issue = "another Lead is active in this worktree";
-      } else if (exact.length === 1) {
-        status = "active";
-        runtimeState = exact[0]!.runtimeState;
-      } else {
-        status = "paused";
-      }
-    }
-    const task = assignment.text
-      .replace(/[\u0000-\u001f\u007f]/g, " ")
-      .replace(/\s+/gu, " ")
-      .trim();
-    const characters = Array.from(task);
-    return {
-      branch: assignment.branch,
-      session: assignment.id,
-      status,
-      ...(runtimeState ? { runtimeState } : {}),
-      ...(task
-        ? {
-            task:
-              characters.length <= 160
-                ? task
-                : `${characters.slice(0, 159).join("")}…`,
-          }
-        : {}),
-      ...(issue ? { issue } : {}),
-    };
-  });
-}
-export type SupervisionPresentationSnapshot =
-  SupervisionSnapshot | ChiefManagerReportSnapshot;
+
+
+
+
+
+
 export type RuntimeState =
   | "idle"
   | "working"
@@ -2154,10 +1504,7 @@ export type LiveAgent = {
   workspaceId: string;
   paneId: string;
   tabId: string;
-  workspaceCwd?: string;
-  herdrName?: string;
   tabLabel?: string;
-  tokens?: Readonly<Record<string, unknown>>;
   runtimeState?: RuntimeState;
 };
 export type WorkspaceProvenance = Readonly<{
@@ -2205,7 +1552,7 @@ function validLeadState(value: unknown): value is CoordinatorState {
     return false;
   return (
     r.version === 1 &&
-    (r.role === undefined || r.role === "lead" || r.role === "manager") &&
+    (r.role === undefined || r.role === "lead") &&
     UUID.test(String(r.instanceId)) &&
     validSession(r.piSessionId) &&
     Number.isInteger(r.updatedAt) &&
@@ -2221,7 +1568,7 @@ export function readLeadCoordinationState(
     const text = readFileSync(path, "utf8");
     if (Buffer.byteLength(text, "utf8") > LEAD_STATE_MAX_BYTES)
       throw new Error("lead state too large");
-    const value: unknown = JSON.parse(text);
+    const value: unknown = readsAsLead(JSON.parse(text));
     const currentState =
       value && typeof value === "object" && !Array.isArray(value)
         ? Object.fromEntries(
@@ -2297,7 +1644,6 @@ export const readCoordinatorState = readLeadCoordinationState;
 export const writeCoordinatorState = writeLeadCoordinationState;
 export const invalidateCoordinatorState = invalidateLeadCoordinationState;
 export const COORDINATOR_STATE_MAX_BYTES = LEAD_STATE_MAX_BYTES;
-export const peerRecordPath = peerLeadRecordPath;
 export const peerLockPath = peerLeadLockPath;
 export const readPeerRecord = readPeerLeadRecord;
 export const writePeerRecord = writePeerLeadRecord;
@@ -2321,12 +1667,9 @@ export function projectSupervision(options: {
   agents: LiveAgent[];
   managedAgents: ValidatedManagedAgentEvidence[];
   coordinationStates: LeadCoordinationState[];
-  openWorkspaces?: readonly OpenProjectWorkspace[];
   workspaceProvenance?: ReadonlyMap<string, WorkspaceProvenance>;
   chiefSessionId?: string;
   excludedSessionIds?: ReadonlySet<string>;
-  /** Leads already reported to an active Manager must not also report to Chief. */
-  managerSupervisedLeadSessionIds?: ReadonlySet<string>;
   managedAgentSessionIds?: Set<string>;
 }): SupervisionSnapshot {
   const states = new Map<string, LeadCoordinationState>();
@@ -2370,7 +1713,6 @@ export function projectSupervision(options: {
       duplicateStates.has(agent.sessionId) ||
       agent.sessionId === options.chiefSessionId ||
       options.excludedSessionIds?.has(agent.sessionId) ||
-      options.managerSupervisedLeadSessionIds?.has(agent.sessionId) ||
       options.managedAgentSessionIds?.has(agent.sessionId) ||
       duplicatePhysical.has(
         `${agent.workspaceId}\0${agent.tabId}\0${agent.paneId}`,
@@ -2378,9 +1720,7 @@ export function projectSupervision(options: {
     )
       continue;
     const runtimeState = agent.runtimeState ?? "unknown";
-    const provenance =
-      options.workspaceProvenance?.get(agent.workspaceId) ??
-      (agent.workspaceCwd ? { workspaceCwd: agent.workspaceCwd } : undefined);
+    const provenance = options.workspaceProvenance?.get(agent.workspaceId);
     const workspaceLabel =
       provenance?.repoName && provenance.branch
         ? `${provenance.repoName}/${provenance.branch}`
@@ -2389,21 +1729,8 @@ export function projectSupervision(options: {
             ? basename(provenance.workspaceCwd)
             : undefined) ||
           agent.workspaceId;
-    const tokensName =
-      typeof agent.tokens?.pi_herdsman_name === "string"
-        ? agent.tokens.pi_herdsman_name.trim()
-        : "";
-    const herdrName = agent.herdrName?.trim();
     const tabLabel = agent.tabLabel?.trim();
-    const name =
-      tokensName ||
-      (herdrName &&
-      herdrName !== agent.sessionId &&
-      !/_[0-9a-f]{16}$/iu.test(herdrName)
-        ? herdrName
-        : undefined) ||
-      tabLabel ||
-      `lead-${agent.sessionId.slice(0, 8)}`;
+    const name = tabLabel || `lead-${agent.sessionId.slice(0, 8)}`;
     leads.push({
       lead: agent.sessionId,
       instanceId: state.instanceId,
@@ -2468,12 +1795,7 @@ export function projectSupervision(options: {
       a.displayName.localeCompare(b.displayName) ||
       a.lead.localeCompare(b.lead),
   );
-  return {
-    leads,
-    ...(options.openWorkspaces
-      ? { openWorkspaces: options.openWorkspaces }
-      : {}),
-  };
+  return { leads };
 }
 
 export function serializeSupervision(snapshot: SupervisionSnapshot) {

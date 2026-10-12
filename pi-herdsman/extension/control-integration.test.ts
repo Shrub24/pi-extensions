@@ -10,19 +10,17 @@ import {
   PI_AGENTS_DIR,
   WORKSPACE,
   agentMailboxPath,
+  ensureRadarDaemon,
   fakeContext,
   fakePi,
-  isPaneClose,
-  isPreservePaneStop,
   managedState,
   nativeSessions,
+  radarDaemon,
   readAgentState,
   realFs,
   registerExtension,
   resetAgentMailbox,
-  runScopedHerdrAlias,
   setLeadEnvironment,
-  startupExecutor,
   writeAgentState,
   writeResult,
 } from "./support.ts";
@@ -39,9 +37,6 @@ import support from "./support.ts";
 const { updateConfig } = await import("./config.ts");
 // These suites drive retained workers; a test opts in per fixture.
 beforeEach(() => updateConfig("retainWorkers", false));
-const { agentLaunchFingerprint, resolveAgentLaunchInputs } =
-  await import("./agent-definitions.ts");
-
 // ---- Herdsman control (owner side) ----
 //
 // These tests drive the real owner path: a request file is written into the
@@ -90,23 +85,13 @@ const agentTool = (pi: ReturnType<typeof fakePi>, operation: string) =>
   pi.tools.find((candidate) => candidate.name === `agent_${operation}`)!;
 
 /**
- * One idle retained managed worker of the lead: its result was delivered and
- * its launch fingerprint is on record, so this session can close it or relaunch
- * it through the retained-worker path (ADR 0013).
+ * One idle retained managed worker of the lead, launched through Radar: the
+ * daemon holds the launch edge, and the child's own binding, mailbox state and
+ * startup acknowledgment are the facts a control close proves it by (ADR 0013).
  */
-const controlWorkerFixture = (
-  suffix: string,
-  options: {
-    snapshot?: (
-      snapshot: any,
-      details: { label: string; runId: string; sessionId: string },
-    ) => void;
-  } = {},
-) => {
+const controlWorkerFixture = (suffix: string) => {
   setLeadEnvironment();
   updateConfig("retainWorkers", true);
-  // The owner publishes its completion token on its own pane.
-  process.env.HERDR_PANE_ID = "lead-pane";
   const name = `ctl-${suffix}`;
   const label = `${name}-agent`;
   const definitionPath = join(PI_AGENTS_DIR, `${name}.md`);
@@ -121,113 +106,8 @@ const controlWorkerFixture = (
   };
   nativeSessions.set(session.id, session);
   const mailbox = agentMailboxPath(WORKSPACE, label);
-  const starts: string[][] = [];
-  const startup = startupExecutor(
-    label,
-    () => session.id,
-    undefined,
-    undefined,
-    false,
-    (args: string[]) => starts.push(args),
-    "/tmp",
-    AGENT_ID,
-    false,
-    true,
-    false,
-    undefined,
-    sessionPath,
-  );
-  // The fixture answers `agent get`, `pane get` and `api snapshot` with its own
-  // default session identity, so every response is pinned to this worker's
-  // session: the owner proves ownership against the recorded session.
-  const pinSession = (value: any): void => {
-    if (!value || typeof value !== "object") return;
-    if (Array.isArray(value)) {
-      for (const item of value) pinSession(item);
-      return;
-    }
-    if (value.agent_session && typeof value.agent_session === "object")
-      value.agent_session = {
-        source: "herdr:pi",
-        agent: "pi",
-        kind: "id",
-        value: session.id,
-      };
-    for (const key of Object.keys(value)) pinSession(value[key]);
-  };
-  const exec = async (command: string, args: string[], execOptions: any) => {
-    if (command === "herdr") {
-      // `startupExecutor` writes a synthetic mailbox state for any command it
-      // does not model, and the owner-state publication is one of them; these
-      // three are answered here so the worker's record stays what the test
-      // wrote and the relaunch can see a project topology.
-      if (args[0] === "pane" && args[1] === "report-metadata")
-        return { stdout: "{}", stderr: "", code: 0 };
-      if (args[0] === "worktree" && args[1] === "list")
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              source: {
-                repo_key: "repo-key",
-                repo_name: "project",
-                source_workspace_id: WORKSPACE,
-              },
-              worktrees: [],
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      if (args[0] === "workspace" && args[1] === "get")
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              workspace: {
-                worktree: { repo_key: "repo-key", is_linked_worktree: false },
-              },
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-    }
-    const result = await startup.exec(command, args, execOptions);
-    if (command !== "herdr" || !["agent", "pane", "api"].includes(args[0]!))
-      return result;
-    let payload: any;
-    try {
-      payload = JSON.parse(result.stdout);
-    } catch {
-      return result;
-    }
-    pinSession(payload);
-    // A live agent answers with the run-scoped alias of the generation the
-    // mailbox currently holds, so a state the test replaces mid-flight is the
-    // generation Herdr reports, not the one this fixture started with.
-    const current = readAgentState(mailbox);
-    if (
-      args[0] === "agent" &&
-      args[1] === "get" &&
-      current &&
-      payload?.result?.agent
-    )
-      payload.result.agent.name = runScopedHerdrAlias(
-        WORKSPACE,
-        label,
-        current.runId,
-      );
-    if (args[0] === "api" && options.snapshot)
-      options.snapshot(payload.result.snapshot, {
-        label,
-        runId: AGENT_ID,
-        sessionId: session.id,
-      });
-    return { ...result, stdout: JSON.stringify(payload) };
-  };
   const entries: unknown[] = [];
-  const pi = fakePi({ exec, entries });
+  const pi = fakePi({ entries });
   registerExtension!(pi.pi as never);
   const context = fakeContext(entries);
   const identity = {
@@ -238,8 +118,6 @@ const controlWorkerFixture = (
   };
   const state = {
     ...managedState(label, undefined, identity),
-    // The definition and the launch record are what this session needs to
-    // close the worker or relaunch it.
     agentDefinition: name,
     completedRequestId: randomUUID(),
   };
@@ -280,46 +158,59 @@ const controlWorkerFixture = (
     session,
     sessionPath,
     mailbox,
-    startup,
     pi,
     context,
     entries,
     state,
     identity,
-    starts,
     list,
-    /** Starts the session, then leaves the worker retained and idle. */
+    /**
+     * Starts the session, then leaves the worker retained and idle.
+     *
+     * Radar performs the launch: the daemon records the edge this session
+     * closes against, the child's own binding and mailbox state, and the
+     * startup acknowledgment the child wrote for this launch generation. The
+     * state the test dictates carries that acknowledgment, because a close
+     * checks the child's generation against the launch it was created for.
+     */
     async open() {
+      await ensureRadarDaemon();
       for (const handler of pi.events.get("session_start") ?? [])
         await handler(undefined, context);
-      resetAgentMailbox(mailbox);
-      writeAgentState(mailbox, state);
-      publish("first assignment");
+      // The child the daemon simulates is this worker's own session, so the
+      // acknowledgment it writes names the session this state does.
+      radarDaemon.childSession = () => ({ id: session.id, file: sessionPath });
+      const launch = await radarDaemon.adoptRetainedChild({
+        label,
+        runId: state.runId,
+        ownerSessionId: LEAD_SESSION_ID,
+        workspaceId: WORKSPACE,
+        mailbox,
+        pane: identity.paneId,
+        definition: name,
+        cwd: "/tmp",
+      });
       entries.push({
         type: "custom",
-        customType: "pi-herdsman-worker-launch",
-        data: {
-          runId: state.runId,
-          label,
-          fingerprint: agentLaunchFingerprint(
-            resolveAgentLaunchInputs(
-              {
-                name,
-                path: definitionPath,
-                frontmatter: { name },
-                body: "ctl body",
-              },
-              { cwd: "/tmp" },
-            ),
-          ),
-        },
+        customType: "pi-herdsman-radar-spawn",
+        data: launch,
       });
+      const child = readAgentState(mailbox);
+      writeAgentState(mailbox, {
+        ...state,
+        ...(child?.startupAck ? { startupAck: child.startupAck } : {}),
+      });
+      publish("first assignment");
     },
     /** The worker takes an assignment that has not produced a result yet. */
     work(requestId: string) {
+      // Taking an assignment is not a new launch: the acknowledgment the child
+      // wrote for this generation stays what a close proves it by.
+      const current = readAgentState(mailbox);
       const working = {
         ...managedState(label, requestId, identity),
         agentDefinition: name,
+        ...(current?.startupAck ? { startupAck: current.startupAck } : {}),
         updatedAt: Date.now(),
       };
       writeAgentState(mailbox, working);
@@ -340,12 +231,8 @@ const controlWorkerFixture = (
         completedAt: Date.now(),
       });
     },
-    metadata: () =>
-      pi.calls.filter(
-        (args) => args[0] === "pane" && args[1] === "report-metadata",
-      ),
-    paneCloses: () => pi.calls.filter((args) => isPaneClose(args)),
-    preservedStops: () => pi.calls.filter((args) => isPreservePaneStop(args)),
+    /** The closes the daemon recorded: a Radar close issues no CLI command. */
+    closes: () => [...radarDaemon.closes.values()],
     wakeMessages: () =>
       pi.sent.filter(
         (message: any) => message?.customType === "pi-herdsman-agent-result",
@@ -393,22 +280,12 @@ test("a control request closes an idle retained worker and answers from its file
       claimExists(request.requestId),
       "the claim is the proof that execution started",
     );
-    assert.equal(worker.paneCloses().length, 1);
+    assert.equal(worker.closes().length, 1);
     assert.equal(readAgentState(worker.mailbox), undefined);
     assert.equal(await worker.list(), undefined);
-    // The token is a hint on the owner's own pane; the result file is the record.
-    await t.waitFor(
-      () =>
-        assert.ok(
-          worker
-            .metadata()
-            .some((args) =>
-              args.includes(`pi_herdsman_control=${request.requestId}:closed`),
-            ),
-          "the owner published no completion token",
-        ),
-      { timeout: 5_000 },
-    );
+    // The result file is the record: the wake hint that used to mirror it into
+    // pane metadata is gone, and the control entry below is what the operator
+    // reads.
     // An operator action is not a conversation turn.
     assert.equal(worker.wakeMessages().length, wakesBefore);
     assert.equal(worker.pi.sentUsers.length, usersBefore);
@@ -444,45 +321,9 @@ test("a control close abandons a working worker's assignment as closed by an ope
   }
 });
 
-test("a control restart relaunches an idle retained worker and refuses a busy one", async (t) => {
-  const worker = controlWorkerFixture("restart");
-  try {
-    await worker.open();
-    const request = controlRequest("restart", worker.label, AGENT_ID, {
-      paneId: "startup-pane",
-      piSessionId: worker.session.id,
-    });
-    assert.equal(writeControlRequest(request, LEAD_SESSION_ID).ok, true);
-    const result = await answered(t, request.requestId);
-    assert.equal(result.outcome, "restarted", JSON.stringify(result));
-    assert.deepEqual(result.effects, [
-      "process_ended",
-      "session_retained",
-      "process_relaunched",
-    ]);
-    assert.equal(
-      worker.preservedStops().length,
-      1,
-      "the retained process is stopped and its pane kept",
-    );
-    assert.deepEqual(worker.paneCloses(), []);
-    const started = worker.starts.at(-1)!;
-    assert.ok(started, "the worker was not relaunched");
-    assert.equal(
-      started[started.indexOf("--session") + 1],
-      worker.sessionPath,
-      "the relaunch continues the same Pi session",
-    );
-    assert.equal(
-      started.includes("--session-dir"),
-      false,
-      "a restart keeps the saved session file where it is",
-    );
-  } finally {
-    worker.shutdown();
-  }
-
-  // A working target is refused and left untouched.
+test("a control restart refuses a working target and leaves it untouched", async (t) => {
+  // The replacement itself is the positive restart test above; this one owns the
+  // owner-side refusal.
   const busy = controlWorkerFixture("restart-busy");
   try {
     await busy.open();
@@ -495,8 +336,7 @@ test("a control restart relaunches an idle retained worker and refuses a busy on
     assert.equal(result.outcome, "refused");
     assert.equal(result.category, "agent_busy");
     assert.deepEqual(result.effects, []);
-    assert.deepEqual(busy.preservedStops(), []);
-    assert.deepEqual(busy.paneCloses(), []);
+    assert.deepEqual(busy.closes(), []);
     assert.equal(readAgentState(busy.mailbox)?.activeRequestId, assignmentId);
     assert.deepEqual(busy.wakeMessages(), []);
   } finally {
@@ -504,74 +344,167 @@ test("a control restart relaunches an idle retained worker and refuses a busy on
   }
 });
 
-test("a control restart reuses its pane and applies the current child command", async (t) => {
-  const worker = controlWorkerFixture("restart-command");
+test("a control restart replaces an idle worker's process by close and relaunch", async (t) => {
+  const worker = controlWorkerFixture("restart");
   try {
     await worker.open();
-    const command = join(
-      tmpdir(),
-      `pi-herdsman-child-command-restart-${randomUUID().slice(0, 8)}`,
-    );
-    realFs.writeFileSync(command, "#!/bin/sh\n", { mode: 0o755 });
-    process.env.PI_HERDSMAN_CHILD_COMMAND = command;
-    try {
-      const callsBeforeRestart = worker.pi.calls.length;
-      const request = controlRequest("restart", worker.label, AGENT_ID, {
-        paneId: "startup-pane",
-        piSessionId: worker.session.id,
-      });
-      assert.equal(writeControlRequest(request, LEAD_SESSION_ID).ok, true);
-      const result = await answered(t, request.requestId);
-      assert.equal(result.outcome, "restarted", JSON.stringify(result));
-      const after = worker.pi.calls.slice(callsBeforeRestart);
-      assert.equal(
-        after.filter(
-          (args) =>
-            args[0] === "pane" &&
-            args[1] === "run" &&
-            String(args[3]).startsWith(`'${command}'`),
-        ).length,
-        1,
-        "the current command runs in the pane the restart reused",
-      );
-      assert.equal(
-        after.some((args) => args[0] === "agent" && args[1] === "start"),
-        false,
-        "the restart no longer asks Herdr for its canonical executable",
-      );
-      assert.deepEqual(
-        after.filter((args) => args[0] === "tab" && args[1] === "create"),
-        [],
-        "a restart reuses the pane the command was typed into",
-      );
-    } finally {
-      delete process.env.PI_HERDSMAN_CHILD_COMMAND;
-      realFs.rmSync(command, { force: true });
-    }
+    const request = controlRequest("restart", worker.label, AGENT_ID);
+    assert.equal(writeControlRequest(request, LEAD_SESSION_ID).ok, true);
+    const result = await answered(t, request.requestId);
+    assert.equal(result.outcome, "restarted", JSON.stringify(result));
+    assert.ok(result.effects.includes("process_relaunched"));
+    assert.equal(radarDaemon.spawns[0]!.closed, true, "the retained process is closed first");
+    assert.equal(radarDaemon.spawns.length, 2, "a fresh launch replaces it");
+    assert.notEqual(radarDaemon.spawns[1]!.pane, radarDaemon.spawns[0]!.pane, "in a new pane");
+    assert.notEqual(readAgentState(worker.mailbox)?.runId, worker.state.runId, "as a new run");
   } finally {
     worker.shutdown();
   }
 });
 
+test("a control restart on an unreadable listing defers to the assignment state", async (t) => {
+  // The positively non-idle side is the working-target refusal above. An unreadable
+  // listing has no state to refuse on, so only the assignment state decides it.
+  const worker = controlWorkerFixture("restart-unreadable");
+  try {
+    await worker.open();
+    radarDaemon.vanishPane(radarDaemon.spawns[0]!);
+    radarDaemon.options.processVerdict = "absent";
+    assert.equal((await worker.list())?.state, "unknown");
+    const assigned = controlRequest("restart", worker.label, AGENT_ID);
+    writeAgentState(worker.mailbox, {
+      ...readAgentState(worker.mailbox)!,
+      activeRequestId: randomUUID(),
+    });
+    assert.equal(writeControlRequest(assigned, LEAD_SESSION_ID).ok, true);
+    const refusedAssigned = await answered(t, assigned.requestId);
+    assert.equal(refusedAssigned.outcome, "refused", JSON.stringify(refusedAssigned));
+    assert.equal(radarDaemon.spawns.length, 1, "an outstanding assignment is not relaunched past");
+    writeAgentState(worker.mailbox, {
+      ...readAgentState(worker.mailbox)!,
+      activeRequestId: undefined,
+    });
+    const request = controlRequest("restart", worker.label, AGENT_ID);
+    assert.equal(writeControlRequest(request, LEAD_SESSION_ID).ok, true);
+    const result = await answered(t, request.requestId);
+    assert.equal(result.outcome, "restarted", JSON.stringify(result));
+    assert.equal(radarDaemon.spawns.length, 2, "a fresh launch replaces it");
+    assert.equal(radarDaemon.closes.size, 0, "no close is sent over a pane that is gone");
+  } finally {
+    worker.shutdown();
+  }
+});
+
+test("a control close retires a proved-gone child's assignment without closing its pane", async (t) => {
+  const gone = controlWorkerFixture("gone");
+  try {
+    await gone.open();
+    gone.work(randomUUID());
+    radarDaemon.vanishPane(radarDaemon.spawns[0]!);
+    radarDaemon.options.processVerdict = "absent";
+    const request = controlRequest("close", gone.label, AGENT_ID, {
+      paneId: "startup-pane",
+    });
+    assert.equal(writeControlRequest(request, LEAD_SESSION_ID).ok, true);
+    const result = await answered(t, request.requestId);
+    assert.equal(result.outcome, "closed", JSON.stringify(result));
+    assert.match(result.message, /proved absent/, "the verdict is the recorded evidence");
+    assert.equal(readAgentState(gone.mailbox), undefined, "the mailbox is retired");
+    assert.equal(radarDaemon.closes.size, 0, "no pane close is sent");
+    const wake = gone.wakeMessages() as any[];
+    assert.equal(wake.length, 1, "the abandoned assignment reaches the model");
+    assert.match(String(wake[0].content), /proved absent/);
+  } finally {
+    gone.shutdown();
+  }
+});
+
+test("a control close refuses a child whose process is not proved gone and keeps its mailbox", async (t) => {
+  const unproven = controlWorkerFixture("unproven");
+  try {
+    await unproven.open();
+    unproven.work(randomUUID());
+    radarDaemon.vanishPane(radarDaemon.spawns[0]!);
+    radarDaemon.options.processVerdict = "verified";
+    const request = controlRequest("close", unproven.label, AGENT_ID, {
+      paneId: "startup-pane",
+    });
+    assert.equal(writeControlRequest(request, LEAD_SESSION_ID).ok, true);
+    const result = await answered(t, request.requestId);
+    assert.equal(result.outcome, "refused", JSON.stringify(result));
+    assert.equal(result.category, "target_not_found");
+    assert.ok(readAgentState(unproven.mailbox), "the mailbox is kept");
+    assert.equal(radarDaemon.closes.size, 0);
+  } finally {
+    unproven.shutdown();
+  }
+});
+
+test("a control restart with a non-idle listing relaunches only on a proved-gone process", async (t) => {
+  const settling = controlWorkerFixture("restart-gone");
+  try {
+    await settling.open();
+    // A dead shell: the pane stays reported, so the listing reads the mailbox, and the
+    // process is gone.
+    radarDaemon.exitProcess(radarDaemon.spawns[0]!);
+    writeAgentState(settling.mailbox, {
+      ...readAgentState(settling.mailbox)!,
+      completedRequestId: undefined,
+    });
+    assert.equal((await settling.list())?.state, "settling");
+    const request = controlRequest("restart", settling.label, AGENT_ID);
+    assert.equal(writeControlRequest(request, LEAD_SESSION_ID).ok, true);
+    const result = await answered(t, request.requestId);
+    assert.equal(result.outcome, "restarted", JSON.stringify(result));
+    assert.equal(radarDaemon.spawns.length, 2, "the proved-gone process is replaced");
+    assert.equal(radarDaemon.closes.size, 1, "the dead pane is closed before the absence proof");
+  } finally {
+    settling.shutdown();
+  }
+});
+
+test("a control restart with a non-idle listing refuses while the process is not proved gone", async (t) => {
+  const settling = controlWorkerFixture("restart-unproven");
+  try {
+    await settling.open();
+    radarDaemon.options.processVerdict = "verified";
+    writeAgentState(settling.mailbox, {
+      ...readAgentState(settling.mailbox)!,
+      completedRequestId: undefined,
+    });
+    assert.equal((await settling.list())?.state, "settling");
+    const request = controlRequest("restart", settling.label, AGENT_ID);
+    assert.equal(writeControlRequest(request, LEAD_SESSION_ID).ok, true);
+    const result = await answered(t, request.requestId);
+    assert.equal(result.outcome, "refused", JSON.stringify(result));
+    assert.equal(result.category, "agent_busy");
+    assert.equal(radarDaemon.spawns.length, 1, "nothing is relaunched");
+    assert.ok(readAgentState(settling.mailbox), "the mailbox is kept");
+  } finally {
+    settling.shutdown();
+  }
+});
+
+test("a control restart past a refused close names the residue it left", async (t) => {
+  const worker = controlWorkerFixture("restart-residue");
+  try {
+    await worker.open();
+    radarDaemon.options.refuseChildClose = true;
+    radarDaemon.exitProcess(radarDaemon.spawns[0]!);
+    const request = controlRequest("restart", worker.label, AGENT_ID);
+    assert.equal(writeControlRequest(request, LEAD_SESSION_ID).ok, true);
+    const result = await answered(t, request.requestId);
+    assert.equal(result.outcome, "restarted", JSON.stringify(result));
+    assert.match(result.message, /Pane .* was left open/, "the result names the residue");
+    assert.equal(radarDaemon.spawns.length, 2, "the absent process is replaced");
+  } finally {
+    radarDaemon.options.refuseChildClose = false;
+    worker.shutdown();
+  }
+});
+
 test("control refusals name their category and leave the target as it was", async (t) => {
-  const worker = controlWorkerFixture("refusal", {
-    snapshot: (snapshot, details) => {
-      // A live Pi identity with no owner pointer: a Lead or standalone session,
-      // which has no owner to act on a request.
-      snapshot.agents.push({
-        name: "lead-session",
-        agent_status: "idle",
-        workspace_id: WORKSPACE,
-        pane_id: "lead-pane",
-        tab_id: "lead-tab",
-        cwd: "/tmp",
-        tokens: {
-          pi_herdsman_label: "lead",
-          pi_herdsman_run: "6c5b4a39-2817-4065-8e4d-3c2b1a09f876",
-        },
-      });
-    },
-  });
+  const worker = controlWorkerFixture("refusal");
   try {
     await worker.open();
     const refused = async (request: ControlRequest) => {
@@ -602,24 +535,13 @@ test("control refusals name their category and leave the target as it was", asyn
       }),
     );
     assert.equal(ambiguousRestart.category, "target_ambiguous");
-    assert.deepEqual(worker.preservedStops(), []);
-    assert.equal(worker.paneCloses().length, 0);
+    assert.equal(worker.closes().length, 0);
 
     // No managed worker matches the named identity.
     const missing = await refused(
       controlRequest("close", "implementer-9", randomUUID()),
     );
     assert.equal(missing.category, "target_not_found");
-
-    // A live identity with no owner pointer has nobody to ask.
-    const unsupported = await refused(
-      controlRequest(
-        "restart",
-        "lead",
-        "6c5b4a39-2817-4065-8e4d-3c2b1a09f876",
-      ),
-    );
-    assert.equal(unsupported.category, "unsupported_target");
 
     // A version this build does not speak is refused and leaves no claim.
     const versioned = controlRequest("close", worker.label, AGENT_ID, {
@@ -653,75 +575,8 @@ test("control refusals name their category and leave the target as it was", asyn
   }
 });
 
-test("a pane that does not claim the alias refuses control with the pane named", async (t) => {
-  const worker = controlWorkerFixture("unclaimed-alias", {
-    snapshot: (snapshot: any) => {
-      // The pane holds the generation, but Herdr does not report the run-scoped
-      // alias every destructive control resolves it through.
-      for (const agent of snapshot.agents) delete agent.name;
-    },
-  });
-  try {
-    await worker.open();
-    const request = controlRequest("close", worker.label, AGENT_ID);
-    assert.equal(writeControlRequest(request, LEAD_SESSION_ID).ok, true);
-    const result = await answered(t, request.requestId);
-    assert.equal(result.outcome, "refused", JSON.stringify(result));
-    assert.equal(result.category, "target_not_found");
-    assert.match(String(result.message), /startup-pane/);
-    assert.deepEqual(result.effects, []);
-    assert.equal(worker.paneCloses().length, 0);
-    assert.ok(readAgentState(worker.mailbox), "the target is untouched");
-  } finally {
-    worker.shutdown();
-  }
-});
-
-test("a presence another pane can claim refuses without acting", async (t) => {
-  const worker = controlWorkerFixture("ghost", {
-    snapshot: (snapshot, details) => {
-      // A second agent claims the same identity from another pane: presence
-      // cannot be proved, so nothing may be done to this generation.
-      snapshot.agents.push({
-        name: runScopedHerdrAlias(WORKSPACE, details.label, details.runId),
-        agent_status: "idle",
-        workspace_id: WORKSPACE,
-        pane_id: "ghost-pane",
-        cwd: "/tmp",
-        agent_session: {
-          source: "herdr:pi",
-          agent: "pi",
-          kind: "id",
-          value: details.sessionId,
-        },
-      });
-    },
-  });
-  try {
-    await worker.open();
-    const request = controlRequest("close", worker.label, AGENT_ID);
-    assert.equal(writeControlRequest(request, LEAD_SESSION_ID).ok, true);
-    const result = await answered(t, request.requestId);
-    assert.equal(result.outcome, "refused", JSON.stringify(result));
-    assert.equal(result.category, "target_not_found");
-    assert.deepEqual(result.effects, []);
-    assert.equal(worker.paneCloses().length, 0);
-    assert.ok(readAgentState(worker.mailbox), "the target is untouched");
-  } finally {
-    worker.shutdown();
-  }
-});
-
 test("a generation replaced after the request is resolved is refused untouched", async (t) => {
-  // `resolved` turns true on the first inventory read after the request is
-  // written; the swap lands on the next mailbox read, which is the one the
-  // shared close makes for the generation it is about to act on.
-  const gate = { armed: false, resolved: false };
-  const worker = controlWorkerFixture("race", {
-    snapshot: () => {
-      if (gate.armed) gate.resolved = true;
-    },
-  });
+  const worker = controlWorkerFixture("race");
   const replacement = {
     ...managedState(worker.label, undefined, {
       paneId: worker.identity.paneId,
@@ -736,12 +591,16 @@ test("a generation replaced after the request is resolved is refused untouched",
   const statePath = join(worker.mailbox, "state.json");
   try {
     await worker.open();
-    gate.armed = true;
+    // The request resolves against generation A on the first read of the
+    // mailbox; the second read is the one the shared close makes for the
+    // generation it is about to act on, and the mailbox already holds the
+    // generation that replaced it.
+    let reads = 0;
     support.agentStateReadHook = (path) => {
-      if (path !== statePath || !gate.resolved) return;
+      if (path !== statePath) return;
+      reads += 1;
+      if (reads < 2) return;
       support.agentStateReadHook = undefined;
-      // The request was resolved against generation A; the mailbox already
-      // holds the generation that replaced it.
       writeAgentState(worker.mailbox, replacement);
     };
     const request = controlRequest("close", worker.label, AGENT_ID);
@@ -752,8 +611,7 @@ test("a generation replaced after the request is resolved is refused untouched",
     assert.deepEqual(result.effects, []);
     // The replacement is a different generation: it is not the target this
     // request resolved, so nothing may be done to it.
-    assert.deepEqual(worker.paneCloses(), []);
-    assert.deepEqual(worker.preservedStops(), []);
+    assert.deepEqual(worker.closes(), []);
     assert.equal(readAgentState(worker.mailbox)?.runId, replacement.runId);
   } finally {
     support.agentStateReadHook = undefined;
@@ -780,7 +638,7 @@ test("a request written while the owner was down is handled at start by expiry",
       false,
       "an expired request is refused before the claim",
     );
-    assert.deepEqual(worker.paneCloses(), []);
+    assert.deepEqual(worker.closes(), []);
     assert.ok(readAgentState(worker.mailbox), "the target is untouched");
   } finally {
     worker.shutdown();
@@ -798,7 +656,7 @@ test("a control close is refused while the target's result is unretrieved", asyn
     const result = await answered(t, request.requestId);
     assert.equal(result.outcome, "refused", JSON.stringify(result));
     assert.deepEqual(result.effects, []);
-    assert.deepEqual(worker.paneCloses(), []);
+    assert.deepEqual(worker.closes(), []);
     assert.ok(
       readAgentState(worker.mailbox),
       "the pane is left open and the target intact",

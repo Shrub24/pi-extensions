@@ -4,17 +4,40 @@ import { createConnection } from "node:net";
 import { dirname, join } from "node:path";
 
 /**
- * Transport for Radar's direct agent registry (agent-radar
- * `docs/agent-registration.md`, contract version 1).
+ * Transport for Radar's control plane (agent-radar `docs/control-plane.md`,
+ * protocol version 2, and `docs/agent-registration.md` for `registry.v1`).
  *
  * One connection per call, one canonical-UUID request, exactly one matching
- * reply, bounded on both sides. Nothing here is a mux client: only the registry
- * methods this port publishes through are implemented. Every call reports a
+ * reply, bounded on both sides. The registry methods this port publishes
+ * through, the managed spawn and verified child-pane close it launches and
+ * retires children with, and the two mux methods its supervised-lead focus
+ * action dispatches are implemented; nothing else is. Every call reports a
  * discriminated outcome instead of throwing, because the daemon is optional and
  * its absence must never reach a caller's control flow.
+ *
+ * Version 2 is a clean break: every method this port names is a version-2 name,
+ * and a method the daemon has removed is answered `unknown_method` rather than
+ * served under the old name.
  */
-export const RADAR_PROTOCOL_VERSION = 1;
-export const RADAR_REGISTRY_CAPABILITY = "agent_registry";
+export const RADAR_PROTOCOL_VERSION = 2;
+/**
+ * The daemon contracts this port negotiates at `daemon.ping`.
+ *
+ * A contract is the daemon's own versioned promise that the methods a set of
+ * backend capabilities makes servable are served; the capabilities themselves
+ * are the adapter's declaration and are never requested on their own
+ * (`control-plane.md`, Handshake).
+ */
+export const RADAR_REGISTRY_CONTRACT = "registry.v1";
+export const RADAR_SPAWN_CONTRACT = "spawn.v1";
+export const RADAR_SPAWN_CLOSE_CONTRACT = "spawn.close.v1";
+export const RADAR_SPAWN_LAUNCH_CONTEXT_CONTRACT = "spawn.launch_context.v1";
+export const RADAR_EVENTS_CONTRACT = "events.v1";
+/** Backend capabilities of the mux methods this port dispatches. */
+export const RADAR_OBSERVE_CAPABILITY = "mux.observe";
+export const RADAR_FOCUS_CAPABILITY = "mux.focus";
+/** The name this extension records on the operations it dispatches. */
+export const RADAR_REQUESTER = "pi-herdsman";
 /** The daemon's own line bound; nothing longer is sent or accepted. */
 export const RADAR_MAX_LINE_BYTES = 1024 * 1024;
 export const RADAR_CALL_TIMEOUT_MS = 2_000;
@@ -27,6 +50,10 @@ export type RadarChannel = "execution" | "assignment";
  * value is the daemon's own refusal code passed through unchanged, because a
  * publisher has to tell fencing (`refused`) from a daemon that lost the record
  * (`not_found`) and from one that is merely missing (`absent`).
+ *
+ * `unknown` is local to a dispatched mutation: the daemon may have performed it
+ * without leaving a trustworthy outcome. It is never proof of non-execution, so
+ * a caller must not resend and must not fall back to the direct adapter.
  */
 export type RadarErrorCode =
 	| "absent"
@@ -34,6 +61,7 @@ export type RadarErrorCode =
 	| "transport"
 	| "protocol"
 	| "unsupported"
+	| "unknown"
 	| "bad_version"
 	| "bad_request"
 	| "bad_params"
@@ -56,6 +84,18 @@ const DAEMON_ERROR_CODES: readonly RadarErrorCode[] = [
 	"backend_unavailable",
 	"internal",
 ];
+
+/**
+ * The daemon's dedicated dispatch-uncertainty code, read as this client's own
+ * `unknown`.
+ *
+ * `outcome_unknown` says a managed close may have been dispatched and cannot be
+ * confirmed, which is the same fact as the local `unknown` every caller already
+ * refuses to retry. Translating it here keeps that one meaning in one word.
+ */
+const DAEMON_CODE_ALIASES: Record<string, RadarErrorCode> = {
+	outcome_unknown: "unknown",
+};
 
 export type RadarResult<T> =
 	| { ok: true; value: T }
@@ -85,6 +125,12 @@ export type RadarRegistration = {
 	label?: string;
 	location?: RadarLocation;
 	process?: RadarProcessClaim;
+	/**
+	 * Private, and only for a daemon-spawned child: the one-use value this launch
+	 * exported as `PI_RADAR_SPAWN_TOKEN`. It never leaves the registration
+	 * request, so it is not part of the persisted subject record.
+	 */
+	spawn_token?: string;
 };
 
 export type RadarPublisherIdentity = {
@@ -123,9 +169,151 @@ export type RadarContextValue = {
 	session: string | null;
 };
 
+/**
+ * The session identity a normalized observation reports for an agent.
+ *
+ * The daemon keeps only what its source proved: an explicit UUID identity stays
+ * an opaque UUID, and every other reported reference keeps its source alongside
+ * the exact value it was reported as (a Pi session file path, for Herdr).
+ */
+export type RadarObservedSession =
+	| { kind: "uuid"; value: string }
+	| { kind: "reported"; value: string; source?: string };
+
+/** One agent a fresh observation places on one pane. */
+export type RadarObservedAgent = {
+	workspace_id: string;
+	tab_id: string;
+	pane_id: string;
+	/** The reported agent name, e.g. `pi`. Never the managed worker's label. */
+	name?: string;
+	/** The runtime lifecycle as reported; unknown labels are preserved. */
+	status?: string;
+	/** A managed worker's own label and run, when the source published them. */
+	managed_label?: string;
+	managed_run?: string;
+	session?: RadarObservedSession;
+};
+
+/** One pane a fresh observation reports, with its canonical containment. */
+export type RadarObservedPane = {
+	workspace_id: string;
+	tab_id: string;
+	pane_id: string;
+};
+
+/** One workspace a fresh observation reports. */
+export type RadarObservedWorkspace = { workspace_id: string };
+
+/** One tab a fresh observation reports, inside its workspace. */
+export type RadarObservedTab = {
+	tab_id: string;
+	workspace_id: string;
+};
+
+/**
+ * The normalized fleet observation, decoded whole.
+ *
+ * Every array is decoded even when it is empty. `agents` is the set the daemon
+ * presents as facts, projected from its registry for every backend, so an empty
+ * array means no registered child is on those panes; a backend's own records
+ * never land there. A missing or malformed array is a malformed observation
+ * rather than an empty fleet.
+ */
+export type RadarInventory = {
+	workspaces: RadarObservedWorkspace[];
+	tabs: RadarObservedTab[];
+	panes: RadarObservedPane[];
+	agents: RadarObservedAgent[];
+};
+
+/**
+ * The durable outcome of one managed close. `completed` means the backend
+ * confirmed the pane closed, `already_exited` that the edge's recorded pane
+ * command had exited and its retained pane was cleaned up, `refused` a positive
+ * refusal before any effect, and `unknown` that dispatch may have happened
+ * without confirmation - which is never retried, and never read as process exit.
+ */
+export type RadarCloseOutcome = {
+	outcome: "completed" | "already_exited" | "refused" | "unknown";
+	pane?: string;
+	/** The edge's own recorded exit, present only for `already_exited`. */
+	exit_observation?: RadarSpawnExitObservation;
+	message?: string;
+};
+
+/** What one effect of a spawn did, as the daemon's own record reports it. */
+export type RadarEffectOutcome = "completed" | "refused" | "unknown";
+
+/**
+ * One durable spawn edge as the daemon publishes it (`spawn.get`).
+ *
+ * `bound.agent_id` is the exact registry identity the child obtained with the
+ * launch's private token, which is the only thing that says *this* child belongs
+ * to *this* spawn: a label, a pane or a session UUID would each be a guess.
+ */
+export type RadarSpawnEdge = {
+	request_id: string;
+	parent: string;
+	created: RadarEffectOutcome;
+	launched: RadarEffectOutcome;
+	location?: RadarLocation;
+	bound?: { source: string; incarnation: string; agent_id?: string };
+	exit_observation?: RadarSpawnExitObservation;
+};
+
+/**
+ * What a topology read learned about the child's own process exit. The daemon
+ * records the first typed exit it observed while it still had the pane; a pane
+ * that disappears is never an exit, and `unknown` is the only value that says
+ * no exit was observed.
+ */
+export type RadarSpawnExitObservation =
+	| { state: "unknown" }
+	| { state: "exited"; code?: number; signal?: number; observed_at?: string };
+
+/**
+ * One edge with what *that read* learned about the location it recorded.
+ *
+ * `spawn.get` and `spawn.list` answer with this, and its two derived fields
+ * belong to the read, not to the record: `freshness: "fresh"` means the
+ * backend's inventory reported the recorded pane when this answer was built,
+ * while `stale` covers both a pane it did not report and an inventory that
+ * could not be consulted. `state: "unresolved"` is a recorded location the
+ * backend no longer reports - never process exit.
+ */
+export type RadarSpawnTopology = {
+	edge: RadarSpawnEdge;
+	state?: "unbound" | "bound" | "unresolved";
+	freshness?: "fresh" | "stale";
+};
+
+/**
+ * What the daemon verified about a registered child's own process birth
+ * identity (`agent.get`). Only `absent` and `mismatched` say the registered
+ * process is no longer there; `unavailable` covers no claim, timeout and every
+ * unreadable answer, and is never evidence of absence.
+ */
+export type RadarProcessVerdict =
+	| "verified"
+	| "absent"
+	| "mismatched"
+	| "unavailable";
+
+export type RadarAgentProcess = {
+	claimed: boolean;
+	verification: RadarProcessVerdict;
+};
+
 export type RadarCapabilities = {
 	protocol: number;
 	backend?: string;
+	/**
+	 * The instance the wired backend addresses: the tmux server name, and null
+	 * (absent here) for a backend that addresses none. It is what qualifies a
+	 * local pane id into a handle the daemon recognises.
+	 */
+	instance?: string;
 	capabilities: string[];
 };
 
@@ -138,12 +326,18 @@ export type RadarScheduler = {
 	now(): number;
 };
 
+// Captured when the module loads: a control-socket deadline is wall-clock I/O,
+// and a consumer that fakes the global timers must not fire it before the reply
+// it is waiting for can arrive.
+const wallClock = { setTimeout, clearTimeout, setInterval, clearInterval };
+
 export const systemScheduler: RadarScheduler = {
-	setTimeout: (handler, ms) => setTimeout(handler, ms),
-	clearTimeout: (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
-	setInterval: (handler, ms) => setInterval(handler, ms),
+	setTimeout: (handler, ms) => wallClock.setTimeout(handler, ms),
+	clearTimeout: (timer) =>
+		wallClock.clearTimeout(timer as ReturnType<typeof setTimeout>),
+	setInterval: (handler, ms) => wallClock.setInterval(handler, ms),
 	clearInterval: (timer) =>
-		clearInterval(timer as ReturnType<typeof setInterval>),
+		wallClock.clearInterval(timer as ReturnType<typeof setInterval>),
 	now: () => Date.now(),
 };
 
@@ -240,9 +434,11 @@ function decodeReply(
 		return {
 			ok: false,
 			code:
-				typeof code === "string" &&
-				DAEMON_ERROR_CODES.includes(code as RadarErrorCode)
-					? (code as RadarErrorCode)
+				typeof code === "string"
+					? (DAEMON_CODE_ALIASES[code] ??
+						(DAEMON_ERROR_CODES.includes(code as RadarErrorCode)
+							? (code as RadarErrorCode)
+							: "internal"))
 					: "internal",
 			message: `${typeof code === "string" ? code : "error"}: ${
 				typeof message === "string" ? message : "no message"
@@ -307,6 +503,368 @@ function writerBinding(value: unknown): RadarWriterBinding | undefined {
 	};
 }
 
+/**
+ * One observed agent, decoded from the normalized inventory.
+ *
+ * Only the location and the session identity are kept: they are what an exact
+ * identity proof needs, and a partially understood record must fail closed
+ * rather than be guessed at.
+ */
+function observedAgent(value: unknown): RadarResult<RadarObservedAgent> {
+	const location = recordAt(value, "location");
+	const workspaceId = stringAt(location, "workspace_id");
+	const tabId = stringAt(location, "tab_id");
+	const paneId = stringAt(location, "pane_id");
+	if (!workspaceId || !tabId || !paneId)
+		return protocol("observe reply carries a malformed agent location");
+	const observed = recordAt(value, "session");
+	let session: RadarObservedSession | undefined;
+	if (observed !== undefined && observed !== null) {
+		const kind = stringAt(observed, "kind");
+		const identity = stringAt(observed, "value");
+		if (kind === "uuid" && isUuid(identity)) session = { kind: "uuid", value: identity };
+		else if (kind === "reported") {
+			// A source-qualified reference keeps the exact value it was reported
+			// as, beside the source that reported it.
+			const reported = recordAt(observed, "value");
+			const reference = stringAt(reported, "value");
+			if (reference === undefined || reference === "")
+				return protocol("observe reply carries a malformed session reference");
+			const source = stringAt(reported, "source");
+			session = {
+				kind: "reported",
+				value: reference,
+				...(source !== undefined ? { source } : {}),
+			};
+		} else return protocol("observe reply carries an unrecognized session identity");
+	}
+	const facts = recordAt(value, "facts");
+	const name = stringAt(value, "name");
+	const status = runtimeStatus(value);
+	const managedLabel = stringAt(facts, "label");
+	const managedRun = stringAt(facts, "run");
+	return {
+		ok: true,
+		value: {
+			workspace_id: workspaceId,
+			tab_id: tabId,
+			pane_id: paneId,
+			...(name !== undefined ? { name } : {}),
+			...(status !== undefined ? { status } : {}),
+			...(managedLabel !== undefined ? { managed_label: managedLabel } : {}),
+			...(managedRun !== undefined ? { managed_run: managedRun } : {}),
+			...(session === undefined ? {} : { session }),
+		},
+	};
+}
+
+/**
+ * The reported lifecycle word, with an unrecognized label preserved verbatim.
+ *
+ * The model serializes a known status as its own snake_case word and anything
+ * else as `{"other":"…"}`, so a source that invents a status never fails an
+ * otherwise valid inventory.
+ */
+function runtimeStatus(value: unknown): string | undefined {
+	const status = recordAt(value, "status");
+	if (typeof status === "string") return status;
+	return stringAt(status, "other");
+}
+
+export function radarLifecycleState(
+	agent: Pick<RadarObservedAgent, "status">,
+): "idle" | "working" | "blocked" | "done" | "unknown" {
+	const status = agent.status;
+	return status === "idle" ||
+		status === "working" ||
+		status === "blocked" ||
+		status === "done"
+		? status
+		: "unknown";
+}
+
+/** One canonical pane row: its identity and the containment it was reported in. */
+function observedPane(value: unknown): RadarResult<RadarObservedPane> {
+	const location = recordAt(value, "location");
+	const workspaceId = stringAt(location, "workspace_id");
+	const tabId = stringAt(location, "tab_id");
+	const paneId = stringAt(location, "pane_id");
+	if (!workspaceId || !tabId || !paneId)
+		return protocol("observe reply carries a malformed pane location");
+	return {
+		ok: true,
+		value: { workspace_id: workspaceId, tab_id: tabId, pane_id: paneId },
+	};
+}
+
+/**
+ * The failure codes that prove the daemon never dispatched the effect. Every
+ * other failure — a lost reply, a write that may have landed, the daemon's own
+ * `internal` — leaves a dispatched mutation unresolved (`control-plane.md`,
+ * Durable operations).
+ */
+const DISPATCH_REFUSED_CODES: readonly RadarErrorCode[] = [
+	"absent",
+	"unsupported",
+	"bad_version",
+	"bad_request",
+	"bad_params",
+	"unknown_method",
+	"refused",
+	"not_found",
+	"busy",
+	"backend_unavailable",
+];
+
+function unresolvedOperation(requestId: string, detail: string): RadarResult<never> {
+	return {
+		ok: false,
+		code: "unknown",
+		message: `focus ${requestId} is unresolved (${detail})`,
+	};
+}
+
+export const RADAR_SPAWN_TOKEN_ENV = "PI_RADAR_SPAWN_TOKEN";
+
+/**
+ * A spawn this process may still have caused.
+ *
+ * It carries the request id so the caller keeps reconciling that one edge, and
+ * it is never a reason to send the spawn again or to reach for another
+ * launcher: the pane and the child may already exist under this id.
+ */
+function unresolvedSpawn(requestId: string, detail: string): RadarResult<never> {
+	return {
+		ok: false,
+		code: "unknown",
+		message: `spawn ${requestId} is unresolved (${detail})`,
+	};
+}
+
+const EFFECT_OUTCOMES: readonly RadarEffectOutcome[] = [
+	"completed",
+	"refused",
+	"unknown",
+];
+
+function effectAt(
+	value: unknown,
+	field: string,
+): RadarEffectOutcome | undefined {
+	const found = stringAt(value, field);
+	return found !== undefined &&
+		EFFECT_OUTCOMES.includes(found as RadarEffectOutcome)
+		? (found as RadarEffectOutcome)
+		: undefined;
+}
+
+/** The location a create named, or nothing when the edge recorded none. */
+function locationAt(value: unknown): RadarLocation | undefined {
+	const location = recordAt(value, "location");
+	const backend = stringAt(location, "backend");
+	if (backend === undefined || backend === "") return undefined;
+	const instance = stringAt(location, "instance");
+	const workspace = stringAt(location, "workspace");
+	const tab = stringAt(location, "tab");
+	const pane = stringAt(location, "pane");
+	return {
+		backend,
+		...(instance !== undefined ? { instance } : {}),
+		...(workspace !== undefined ? { workspace } : {}),
+		...(tab !== undefined ? { tab } : {}),
+		...(pane !== undefined ? { pane } : {}),
+	};
+}
+
+/**
+ * One durable edge, decoded strictly. The bound child's `agent_id` is kept only
+ * when it is a canonical UUID: a legacy binding has none, and an unreadable one
+ * is not an identity to correlate with.
+ */
+function spawnEdge(value: unknown): RadarResult<RadarSpawnEdge> {
+	const requestId = stringAt(value, "request_id");
+	const parent = stringAt(value, "parent");
+	const created = effectAt(value, "created");
+	const launched = effectAt(value, "launched");
+	if (
+		!isUuid(requestId) ||
+		!isUuid(parent) ||
+		created === undefined ||
+		launched === undefined
+	)
+		return protocol("spawn reply carries no durable edge");
+	const location = locationAt(value);
+	const bound = recordAt(value, "bound");
+	const source = stringAt(bound, "source");
+	const incarnation = stringAt(bound, "incarnation");
+	const agentId = stringAt(bound, "agent_id");
+	const exit = exitAt(recordAt(value, "exit_observation"));
+	return {
+		ok: true,
+		value: {
+			request_id: requestId,
+			parent,
+			created,
+			launched,
+			...(location !== undefined ? { location } : {}),
+			...(source !== undefined && incarnation !== undefined
+				? {
+						bound: {
+							source,
+							incarnation,
+							...(isUuid(agentId) ? { agent_id: agentId } : {}),
+						},
+					}
+				: {}),
+			...(exit !== undefined ? { exit_observation: exit } : {}),
+		},
+	};
+}
+
+/**
+ * The exit observation as this client reads it.
+ *
+ * An observation that is present but says neither `unknown` nor a decodable
+ * `exited` is reported as an exit: reading an unreadable observation as "no exit
+ * observed" would turn a maybe-dead child into a live one.
+ */
+const PROCESS_VERDICTS: readonly RadarProcessVerdict[] = [
+	"verified",
+	"absent",
+	"mismatched",
+	"unavailable",
+];
+
+function agentProcessAt(agent: unknown): RadarResult<RadarAgentProcess> {
+	const process = recordAt(agent, "process");
+	const claimed = recordAt(process, "claimed");
+	const verification = stringAt(process, "verification");
+	if (
+		typeof claimed !== "boolean" ||
+		verification === undefined ||
+		!PROCESS_VERDICTS.includes(verification as RadarProcessVerdict)
+	)
+		return protocol("agent.get reply carries no process verdict");
+	return {
+		ok: true,
+		value: { claimed, verification: verification as RadarProcessVerdict },
+	};
+}
+
+function exitAt(value: unknown): RadarSpawnExitObservation | undefined {
+	if (value === undefined) return undefined;
+	if (stringAt(value, "state") === "unknown") return { state: "unknown" };
+	const code = numberAt(value, "code");
+	const signal = numberAt(value, "signal");
+	const observedAt = stringAt(value, "observed_at");
+	return {
+		state: "exited",
+		...(code !== undefined ? { code } : {}),
+		...(signal !== undefined ? { signal } : {}),
+		...(observedAt !== undefined ? { observed_at: observedAt } : {}),
+	};
+}
+
+/**
+ * One topology read, decoded strictly: the derived fields only matter in the
+ * words the daemon writes, and a reply whose `spawn` is not an edge carrying a
+ * nested edge is a protocol error rather than an edge with no liveness.
+ */
+function spawnTopology(value: unknown): RadarResult<RadarSpawnTopology> {
+	const edge = spawnEdge(value);
+	if (edge.ok === false) return edge;
+	const state = stringAt(value, "state");
+	const freshness = stringAt(value, "freshness");
+	return {
+		ok: true,
+		value: {
+			edge: edge.value,
+			...(state === "unbound" || state === "bound" || state === "unresolved"
+				? { state }
+				: {}),
+			...(freshness === "fresh" || freshness === "stale"
+				? { freshness }
+				: {}),
+		},
+	};
+}
+
+/**
+ * The command and identity shape refused before anything is dialed.
+ *
+ * The daemon validates its own request shape, and its refusal would also land
+ * before any effect; this is the same refusal one step earlier, where a launch
+ * argument no supported backend can carry (a control character, a second line, a
+ * reserved name) fails with the caller's own words instead of the far end's.
+ */
+function spawnRequestShape(request: {
+	request_id: string;
+	parent: string;
+	parent_session_id: string;
+	executable: string;
+	argv: string[];
+	cwd?: string;
+	env?: Record<string, string>;
+}): string | undefined {
+	if (!isUuid(request.request_id))
+		return "spawn requires a canonical request UUID";
+	if (!isUuid(request.parent))
+		return "spawn requires the parent's canonical agent UUID";
+	if (!isUuid(request.parent_session_id))
+		return "spawn requires a canonical parent session UUID";
+	if (!request.executable.startsWith("/") || /\p{Cc}/u.test(request.executable))
+		return "spawn requires an absolute, printable executable path";
+	if (request.argv.some((argument) => /\p{Cc}/u.test(argument)))
+		return "no supported backend carries a control character or a second line in an argument";
+	if (request.cwd !== undefined && !request.cwd.startsWith("/"))
+		return "spawn cwd must be an absolute path";
+	const env = Object.entries(request.env ?? {});
+	if (env.length > 256) return "spawn env names more than 256 entries";
+	for (const [name, value] of env) {
+		if (name === RADAR_SPAWN_TOKEN_ENV)
+			return `spawn env cannot set the reserved ${RADAR_SPAWN_TOKEN_ENV}`;
+		if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) || /\p{Cc}/u.test(value))
+			return `spawn env contains an invalid name or value: ${name}`;
+	}
+	return undefined;
+}
+
+/**
+ * The outcome a durable operation record supports. Only `completed` is success
+ * and only `refused` proves the effect did not run; a record that is still in
+ * flight, or one with no terminal outcome, stays unresolved.
+ */
+function focusOutcome(
+	record: unknown,
+	requestId: string,
+): RadarResult<{ request_id: string }> {
+	if (typeof record !== "object" || record === null)
+		return unresolvedOperation(requestId, "the daemon returned no operation record");
+	const outcome = stringAt(record, "outcome");
+	if (outcome === "completed") return { ok: true, value: { request_id: requestId } };
+	if (outcome === "refused")
+		return {
+			ok: false,
+			code: "refused",
+			message: stringAt(record, "message") ?? `the daemon refused focus ${requestId}`,
+		};
+	return unresolvedOperation(
+		requestId,
+		`the record is ${stringAt(record, "state") ?? "unreadable"} with ${
+			outcome === undefined ? "no outcome" : `outcome ${outcome}`
+		}`,
+	);
+}
+
+/**
+ * One answer from the event journal. Events are pointers, so a page carries
+ * only where it ends: `sequence` is the last delivered event, or the request's
+ * own `after` when nothing was delivered.
+ */
+export type RadarEventsReply =
+	| { kind: "page"; epoch: string; sequence: number; more: boolean }
+	| { kind: "expired"; epoch: string; sequence: number };
+
 export type RadarClient = {
 	socketPath(): string;
 	ping(): Promise<RadarResult<RadarCapabilities>>;
@@ -343,13 +901,47 @@ export type RadarClient = {
 		channel: RadarChannel;
 		writer_handle: string;
 	}): Promise<RadarResult<void>>;
+	/**
+	 * Close the exact pane a daemon-authored spawn edge created for one bound
+	 * child. `request_id` is this close's own durable key: a lost reply is
+	 * reconciled by resending the identical request, never by a new key.
+	 */
 	childClose(request: {
 		request_id: string;
 		spawn_request_id: string;
 		source: string;
 		incarnation: string;
 		intent: "complete" | "cancel";
-	}): Promise<RadarResult<{ outcome: "completed"; pane: string }>>;
+	}): Promise<RadarResult<RadarCloseOutcome>>;
+	/**
+	 * Create and launch one managed child under a registered parent's own pane.
+	 * `request_id` is the caller's durable key: it is what a lost reply is
+	 * reconciled with, and it must never be replaced by a second attempt.
+	 */
+	spawn(request: {
+		request_id: string;
+		parent: string;
+		parent_session_id: string;
+		executable: string;
+		argv: string[];
+		cwd?: string;
+		env?: Record<string, string>;
+	}): Promise<RadarResult<RadarSpawnEdge>>;
+	spawnGet(request_id: string): Promise<RadarResult<RadarSpawnTopology>>;
+	/** The registered child's process verdict, read from its immutable claim. */
+	agentGet(agent_id: string): Promise<RadarResult<RadarAgentProcess>>;
+	observe(): Promise<RadarResult<RadarInventory>>;
+	/** Read the durable event journal after `after`, waiting at most `wait_ms`. */
+	events(request: {
+		after: number;
+		epoch?: string;
+		wait_ms: number;
+	}): Promise<RadarResult<RadarEventsReply>>;
+	focus(request: {
+		/** The caller's fresh operation UUID; it is also the reconciliation key. */
+		request_id: string;
+		pane_id: string;
+	}): Promise<RadarResult<{ request_id: string }>>;
 };
 
 export type RadarClientOptions = {
@@ -359,6 +951,118 @@ export type RadarClientOptions = {
 	scheduler?: RadarScheduler;
 	timeoutMs?: number;
 };
+
+function eventsReplyAt(
+	after: number,
+	value: unknown,
+): RadarEventsReply | undefined {
+	const expired = recordAt(value, "cursor_expired");
+	if (expired !== undefined) {
+		const epoch = stringAt(expired, "epoch");
+		const sequence = numberAt(recordAt(expired, "cursor"), "sequence");
+		return epoch !== undefined && sequence !== undefined
+			? { kind: "expired", epoch, sequence }
+			: undefined;
+	}
+	const epoch = stringAt(value, "epoch");
+	const events = recordAt(value, "events");
+	const more = recordAt(value, "more");
+	if (epoch === undefined || !Array.isArray(events) || typeof more !== "boolean")
+		return undefined;
+	let sequence = after;
+	for (const event of events) {
+		const seq = numberAt(event, "seq");
+		if (seq === undefined || seq <= sequence) return undefined;
+		sequence = seq;
+	}
+	return { kind: "page", epoch, sequence, more };
+}
+
+/** The longest one journal read may wait: the daemon's own bound. */
+const RADAR_EVENT_WAIT_MS = 1_000;
+/** The pause before a journal read the daemon could not answer is retried. */
+export const RADAR_EVENT_RETRY_MS = 1_000;
+
+/**
+ * Follow the daemon's event journal as a wake-up only. A page or an expiry says
+ * that something changed and nothing more: `wake` carries no body, so no event
+ * can set state. The caller reconciles from current reads, and its own periodic
+ * reconciliation covers a wake that never arrives.
+ *
+ * A page that has more behind it is read again at once. The cursor only moves
+ * to the last delivered sequence, never to the journal tail. A refused contract
+ * is reported once per outage through `diagnose`, then retried. A throwing
+ * `wake` is diagnosed once per run of failures and never ends the loop.
+ */
+export function watchRadarEvents(
+	client: Pick<RadarClient, "events">,
+	signal: AbortSignal,
+	handlers: { wake: () => void; diagnose: (message: string) => void },
+): void {
+	let after = 0;
+	let epoch: string | undefined;
+	let refusing = false;
+	let faulting = false;
+	// A notice that cannot be delivered must not end the watcher: the periodic
+	// scan keeps the system correct without it.
+	const diagnose = (message: string): void => {
+		try {
+			handlers.diagnose(message);
+		} catch {
+			// The notice channel is gone, for example a stale extension context.
+		}
+	};
+	const wake = (): void => {
+		try {
+			handlers.wake();
+			faulting = false;
+		} catch (error) {
+			if (!faulting) diagnose(`event wake failed: ${String(error)}`);
+			faulting = true;
+		}
+	};
+	const pause = (ms: number): Promise<void> =>
+		new Promise((resolve) => {
+			const done = (): void => {
+				clearTimeout(timer);
+				signal.removeEventListener("abort", done);
+				resolve();
+			};
+			const timer = setTimeout(done, ms);
+			timer.unref?.();
+			signal.addEventListener("abort", done, { once: true });
+		});
+	const follow = async (): Promise<void> => {
+		let wait = RADAR_EVENT_WAIT_MS;
+		while (!signal.aborted) {
+			const result = await client.events({ after, epoch, wait_ms: wait });
+			if (signal.aborted) return;
+			if (result.ok === false) {
+				if (result.code === "unsupported" && !refusing) {
+					refusing = true;
+					diagnose(result.message);
+				}
+				await pause(RADAR_EVENT_RETRY_MS);
+				wait = RADAR_EVENT_WAIT_MS;
+				continue;
+			}
+			refusing = false;
+			const reply = result.value;
+			epoch = reply.epoch;
+			const moved = reply.kind === "expired" || reply.sequence > after;
+			after = reply.sequence;
+			if (moved) wake();
+			wait = reply.kind === "page" && reply.more ? 0 : RADAR_EVENT_WAIT_MS;
+		}
+	};
+	// Invariant: the loop ends only through `signal`, because `client.events`
+	// resolves rather than rejects - `call` turns every fault into a result. If
+	// that stops being true, this catch is the only signal. Nothing retries it,
+	// and the periodic scan keeps state correct meanwhile.
+	void follow().catch((error) =>
+		diagnose(`event watch stopped: ${String(error)}`),
+	);
+}
 
 export function createRadarClient(options: RadarClientOptions = {}): RadarClient {
 	const env = options.env ?? process.env;
@@ -370,15 +1074,20 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 
 	const currentPath = (): string => radarControlSocketPath(env, uid).path;
 
+	/**
+	 * One envelope per connection. `id` is the caller's own operation UUID when a
+	 * mutation has to be reconcilable after a lost reply; it is otherwise minted
+	 * per call.
+	 */
 	async function call(
 		method: string,
 		params: Record<string, unknown>,
+		id: string = randomUUID(),
 	): Promise<RadarResult<unknown>> {
 		const path = currentPath();
 		const refused = untrustedControlSocket(path, uid);
 		if (refused !== undefined)
 			return { ok: false, code: "absent", message: refused };
-		const id = randomUUID();
 		const line = `${JSON.stringify({
 			version: RADAR_PROTOCOL_VERSION,
 			id,
@@ -471,32 +1180,25 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 
 	const socketPath = currentPath;
 
-	let capabilities: Promise<RadarResult<RadarCapabilities>> | undefined;
-	const ping = async (): Promise<RadarResult<RadarCapabilities>> => {
-		const answer = await call("ping", {});
-			if (!answer.ok) return answer;
-			const protocolVersion = numberAt(answer.value, "protocol");
-			if (protocolVersion !== RADAR_PROTOCOL_VERSION)
-				return {
-					ok: false,
-					code: "unsupported",
-					message: `the daemon at ${currentPath()} speaks protocol ${
-						protocolVersion ?? "unknown"
-					}, not ${RADAR_PROTOCOL_VERSION}`,
-				};
-			const capabilities = Array.isArray(
-				(answer.value as { capabilities?: unknown }).capabilities,
-			)
-				? ((answer.value as { capabilities: unknown[] }).capabilities.filter(
-						(name): name is string => typeof name === "string",
-					) as string[])
-				: [];
-			if (!capabilities.includes(RADAR_REGISTRY_CAPABILITY))
-				return {
-					ok: false,
-					code: "unsupported",
-					message: `the daemon at ${currentPath()} does not provide \`${RADAR_REGISTRY_CAPABILITY}\``,
-				};
+	const probe = async (): Promise<RadarResult<RadarCapabilities>> => {
+		const answer = await call("daemon.ping", {});
+		if (answer.ok === false) return answer;
+		const protocolVersion = numberAt(answer.value, "protocol");
+		if (protocolVersion !== RADAR_PROTOCOL_VERSION)
+			return {
+				ok: false,
+				code: "unsupported",
+				message: `the daemon at ${currentPath()} speaks protocol ${
+					protocolVersion ?? "unknown"
+				}, not ${RADAR_PROTOCOL_VERSION}`,
+			};
+		const advertised = Array.isArray(
+			(answer.value as { capabilities?: unknown }).capabilities,
+		)
+			? ((answer.value as { capabilities: unknown[] }).capabilities.filter(
+					(name): name is string => typeof name === "string",
+				) as string[])
+			: [];
 		return {
 			ok: true,
 			value: {
@@ -504,27 +1206,78 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 				...(stringAt(answer.value, "backend") !== undefined
 					? { backend: stringAt(answer.value, "backend") }
 					: {}),
-				capabilities,
+				...(stringAt(answer.value, "instance") !== undefined
+					? { instance: stringAt(answer.value, "instance") }
+					: {}),
+				capabilities: advertised,
 			},
 		};
 	};
-	const negotiated = async (): Promise<RadarResult<void>> => {
-		capabilities ??= ping();
+	/** The public readiness check: a fresh handshake that also proves the registry. */
+	const ping = async (): Promise<RadarResult<RadarCapabilities>> => {
+		const answer = await probe();
+		if (answer.ok === false) return answer;
+		if (!answer.value.capabilities.includes(RADAR_REGISTRY_CONTRACT))
+			return {
+				ok: false,
+				code: "unsupported",
+				message: `the daemon at ${currentPath()} does not provide \`${RADAR_REGISTRY_CONTRACT}\``,
+			};
+		return answer;
+	};
+	let capabilities: Promise<RadarResult<RadarCapabilities>> | undefined;
+	const negotiated = async (): Promise<RadarResult<RadarCapabilities>> => {
+		capabilities ??= probe();
 		const attempt = capabilities;
 		try {
 			const result = await attempt;
-			if (!result.ok && capabilities === attempt) capabilities = undefined;
-			return result.ok ? { ok: true, value: undefined } : result;
+			if (result.ok === false && capabilities === attempt) capabilities = undefined;
+			return result;
 		} catch (error) {
 			if (capabilities === attempt) capabilities = undefined;
 			throw error;
 		}
 	};
-	const withRegistry = async <T>(
+	/**
+	 * Run a method whose capability was negotiated. A missing capability is the
+	 * daemon's own refusal, never a reason to attempt another operation.
+	 */
+	const withCapability = async <T>(
+		capability: string,
 		operation: () => Promise<RadarResult<T>>,
 	): Promise<RadarResult<T>> => {
 		const ready = await negotiated();
-		return ready.ok ? operation() : ready;
+		if (ready.ok === false) return ready;
+		return ready.value.capabilities.includes(capability)
+			? operation()
+			: {
+					ok: false,
+					code: "unsupported",
+					message: `the daemon at ${currentPath()} does not provide \`${capability}\``,
+				};
+	};
+	const withRegistry = <T>(operation: () => Promise<RadarResult<T>>) =>
+		withCapability(RADAR_REGISTRY_CONTRACT, operation);
+	/**
+	 * Run a method whose every capability was negotiated. `spawn` is one method
+	 * behind three capabilities, so its absence is checked as a set: a partial
+	 * answer would otherwise attempt a launch no backend can carry.
+	 */
+	const withCapabilities = async <T>(
+		needed: readonly string[],
+		operation: () => Promise<RadarResult<T>>,
+	): Promise<RadarResult<T>> => {
+		const ready = await negotiated();
+		if (ready.ok === false) return ready;
+		const missing = needed.find(
+			(capability) => !ready.value.capabilities.includes(capability),
+		);
+		if (missing === undefined) return operation();
+		return {
+			ok: false,
+			code: "unsupported",
+			message: `the daemon at ${currentPath()} does not provide \`${missing}\``,
+		};
 	};
 
 	return {
@@ -534,6 +1287,9 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 			return withRegistry(async () => {
 				const answer = await call("agent.register", {
 					source: registration.source,
+					...(registration.spawn_token !== undefined
+						? { spawn_token: registration.spawn_token }
+						: {}),
 					incarnation: registration.incarnation,
 					...(registration.session !== undefined
 						? { session: registration.session }
@@ -544,7 +1300,7 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 					...(registration.location !== undefined ? { location: registration.location } : {}),
 					...(registration.process !== undefined ? { process: registration.process } : {}),
 				});
-				if (!answer.ok) return answer;
+				if (answer.ok === false) return answer;
 				const record = (answer.value as { registration?: unknown }).registration;
 				const agentId = stringAt(record, "agent_id");
 				if (!isUuid(agentId)) return protocol("registration reply carries no agent_id");
@@ -559,7 +1315,7 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 					publisher: request.publisher,
 					...(request.replace !== undefined ? { replace: request.replace } : {}),
 				});
-				if (!answer.ok) return answer;
+				if (answer.ok === false) return answer;
 				const writer = writerBinding(
 					(answer.value as { writer?: unknown }).writer,
 				);
@@ -579,7 +1335,7 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 					...(request.observed_at !== undefined ? { observed_at: request.observed_at } : {}),
 					snapshot: request.snapshot,
 				});
-				if (!answer.ok) return answer;
+				if (answer.ok === false) return answer;
 				const channel = (answer.value as { channel?: unknown }).channel;
 				const writer = (channel as { writer?: unknown } | undefined)?.writer;
 				const sequence = numberAt(writer, "sequence");
@@ -603,7 +1359,7 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 						: {}),
 					context: request.context,
 				});
-				if (!answer.ok) return answer;
+				if (answer.ok === false) return answer;
 				const writer = writerBinding(
 					(answer.value as { writer?: unknown }).writer,
 				);
@@ -619,27 +1375,271 @@ export function createRadarClient(options: RadarClientOptions = {}): RadarClient
 		async retire(request) {
 			return withRegistry(async () => {
 				const answer = await call("agent.retire", request);
-				return answer.ok ? { ok: true, value: undefined } : answer;
+				return answer.ok === true ? { ok: true, value: undefined } : answer;
+			});
+		},
+		async spawn(request) {
+			const shape = spawnRequestShape(request);
+			if (shape !== undefined)
+				return { ok: false, code: "bad_params", message: shape };
+			const carriesContext =
+				request.cwd !== undefined ||
+				(request.env !== undefined && Object.keys(request.env).length > 0);
+			return withCapabilities(
+				carriesContext
+					? [RADAR_SPAWN_CONTRACT, RADAR_SPAWN_LAUNCH_CONTEXT_CONTRACT]
+					: [RADAR_SPAWN_CONTRACT],
+				async () => {
+					const answer = await call(
+						"spawn.create",
+						{
+							request: {
+								parent: request.parent,
+								parent_session_id: request.parent_session_id,
+								executable: request.executable,
+								argv: request.argv,
+								...(request.cwd !== undefined ? { cwd: request.cwd } : {}),
+								...(carriesContext && request.env !== undefined
+									? { env: request.env }
+									: {}),
+							},
+							requester: RADAR_REQUESTER,
+						},
+						request.request_id,
+					);
+					if (answer.ok === true) return spawnEdge(recordAt(answer.value, "spawn"));
+					if (DISPATCH_REFUSED_CODES.includes(answer.code)) return answer;
+					// The reply is gone but the effects may not be. Read the edge this exact
+					// request id authored: a create and launch the daemon completed is a spawn
+					// that happened, and anything short of both stays unresolved. Resending the
+					// spawn would only return this record, and a second request id is a second
+					// pane and child.
+					const readback = await call("spawn.get", {
+						request_id: request.request_id,
+					});
+					if (readback.ok === false)
+						return unresolvedSpawn(
+							request.request_id,
+							`${answer.message}; its edge could not be read back (${readback.code}: ${readback.message})`,
+						);
+					const recovered = spawnTopology(recordAt(readback.value, "spawn"));
+					if (recovered.ok === false) return recovered;
+					const recorded = recovered.value.edge;
+					if (
+						recorded.created === "completed" &&
+						recorded.launched === "completed"
+					)
+						return { ok: true, value: recorded };
+					return unresolvedSpawn(
+						request.request_id,
+						`${answer.message}; the recorded edge is created ${recorded.created} and launched ${recorded.launched}`,
+					);
+				},
+			);
+		},
+		async spawnGet(requestId) {
+			if (!isUuid(requestId))
+				return {
+					ok: false,
+					code: "bad_params",
+					message: "spawn.get requires a canonical request UUID",
+				};
+			return withRegistry(async () => {
+				const answer = await call("spawn.get", { request_id: requestId });
+				if (answer.ok === false) return answer;
+				return spawnTopology(recordAt(answer.value, "spawn"));
+			});
+		},
+		async agentGet(agentId) {
+			if (!isUuid(agentId))
+				return {
+					ok: false,
+					code: "bad_params",
+					message: "agent.get requires a canonical agent UUID",
+				};
+			return withRegistry(async () => {
+				const answer = await call("agent.get", { agent_id: agentId });
+				if (answer.ok === false) return answer;
+				return agentProcessAt(recordAt(answer.value, "agent"));
 			});
 		},
 		async childClose(request) {
-			if (!isUuid(request.request_id) || !isUuid(request.spawn_request_id) || !isUuid(request.incarnation))
-				return { ok: false, code: "bad_params", message: "child.close requires canonical request, spawn and incarnation UUIDs" };
-			const answer = await call("child.close", {
-				spawn_request_id: request.spawn_request_id,
-				source: request.source,
-				incarnation: request.incarnation,
-				intent: request.intent,
+			if (
+				!isUuid(request.request_id) ||
+				!isUuid(request.spawn_request_id) ||
+				!isUuid(request.incarnation)
+			)
+				return {
+					ok: false,
+					code: "bad_params",
+					message:
+						"spawn.close requires canonical request, spawn and incarnation UUIDs",
+				};
+			return withCapability(RADAR_SPAWN_CLOSE_CONTRACT, async (): Promise<RadarResult<RadarCloseOutcome>> => {
+				// The caller's UUID is the envelope id: it is the durable record this
+				// close is reconciled with, so a replayed call must carry it unchanged
+				// rather than asking for a second close.
+				const answer = await call(
+					"spawn.close",
+					{
+						spawn_request_id: request.spawn_request_id,
+						source: request.source,
+						incarnation: request.incarnation,
+						intent: request.intent,
+					},
+					request.request_id,
+				);
+				if (answer.ok === false) return answer;
+				const close = recordAt(answer.value, "close");
+				const outcome = stringAt(close, "outcome");
+				const pane = stringAt(close, "pane");
+				const detail = stringAt(close, "message");
+				if (outcome === "completed")
+					return pane !== undefined
+						? { ok: true, value: { outcome, pane } }
+						: protocol("spawn.close reply does not name the closed pane");
+				if (outcome === "already_exited") {
+					const exit = exitAt(recordAt(close, "exit_observation"));
+					return pane !== undefined && exit !== undefined
+						? {
+								ok: true,
+								value: { outcome, pane, exit_observation: exit },
+							}
+						: protocol(
+								"spawn.close reply does not report the exit it cleaned up",
+							);
+				}
+				if (outcome === "refused" || outcome === "unknown")
+					return {
+						ok: true,
+						value: {
+							outcome,
+							...(pane !== undefined ? { pane } : {}),
+							...(detail !== undefined ? { message: detail } : {}),
+						},
+					};
+				return protocol("spawn.close reply carries no close outcome");
 			});
-			if (!answer.ok) return answer;
-			const close = recordAt(answer.value, "close");
-			const outcome = stringAt(close, "outcome");
-			const pane = stringAt(close, "pane");
-			return outcome === "completed" && pane !== undefined
-				? { ok: true, value: { outcome, pane } }
-				: protocol("child.close reply does not confirm pane closure");
 		},
-
+		async events(request) {
+			if (
+				!Number.isSafeInteger(request.after) ||
+				request.after < 0 ||
+				!Number.isSafeInteger(request.wait_ms) ||
+				request.wait_ms < 0 ||
+				request.wait_ms > RADAR_EVENT_WAIT_MS
+			)
+				return {
+					ok: false,
+					code: "bad_params",
+					message: "events.read requires a sequence and a wait of 0 to 1000 ms",
+				};
+			return withCapability(RADAR_EVENTS_CONTRACT, async () => {
+				const answer = await call("events.read", {
+					after: request.after,
+					wait_ms: request.wait_ms,
+					...(request.epoch !== undefined ? { epoch: request.epoch } : {}),
+				});
+				if (answer.ok === false) return answer;
+				const reply = eventsReplyAt(request.after, answer.value);
+				return reply !== undefined
+					? { ok: true, value: reply }
+					: protocol("events.read reply carries no journal page or cursor_expired");
+			});
+		},
+		async observe() {
+			return withCapability(RADAR_OBSERVE_CAPABILITY, async () => {
+				const answer = await call("mux.observe", {});
+				if (answer.ok === false) return answer;
+				const inventory = recordAt(answer.value, "inventory");
+				const workspaces = recordAt(inventory, "workspaces");
+				const tabs = recordAt(inventory, "tabs");
+				const panes = recordAt(inventory, "panes");
+				const agents = recordAt(inventory, "agents");
+				if (
+					!Array.isArray(workspaces) ||
+					!Array.isArray(tabs) ||
+					!Array.isArray(panes) ||
+					!Array.isArray(agents)
+				)
+					return protocol(
+						"mux.observe reply carries no canonical fleet inventory",
+					);
+				const observed: RadarInventory = {
+					workspaces: [],
+					tabs: [],
+					panes: [],
+					agents: [],
+				};
+				for (const workspace of workspaces) {
+					const id = stringAt(workspace, "workspace_id");
+					if (id === undefined || id === "")
+						return protocol("observe reply carries a malformed workspace");
+					observed.workspaces.push({ workspace_id: id });
+				}
+				for (const tab of tabs) {
+					const id = stringAt(tab, "tab_id");
+					const workspaceId = stringAt(tab, "workspace_id");
+					if (!id || !workspaceId)
+						return protocol("observe reply carries a malformed tab");
+					observed.tabs.push({ tab_id: id, workspace_id: workspaceId });
+				}
+				for (const pane of panes) {
+					const decoded = observedPane(pane);
+					if (decoded.ok === false) return decoded;
+					observed.panes.push(decoded.value);
+				}
+				for (const agent of agents) {
+					const decoded = observedAgent(agent);
+					if (decoded.ok === false) return decoded;
+					observed.agents.push(decoded.value);
+				}
+				return { ok: true, value: observed };
+			});
+		},
+		async focus(request) {
+			if (!isUuid(request.request_id))
+				return {
+					ok: false,
+					code: "bad_params",
+					message: "focus requires a canonical operation UUID",
+				};
+			return withCapability(RADAR_FOCUS_CAPABILITY, async () => {
+				const answer = await call(
+					"mux.focus",
+					{
+						target: request.pane_id,
+						target_kind: "pane",
+						requester: RADAR_REQUESTER,
+					},
+					request.request_id,
+				);
+				if (answer.ok === true)
+					return focusOutcome(
+						recordAt(answer.value, "request"),
+						request.request_id,
+					);
+				if (DISPATCH_REFUSED_CODES.includes(answer.code)) return answer;
+				// The reply is gone but the request may still have been recorded and
+				// dispatched, so read that exact durable record back. Resending the same
+				// id would only return the record, and the direct adapter would be a
+				// second effect.
+				const readback = await call("mux.request.get", {
+					id: request.request_id,
+				});
+				if (readback.ok === false)
+					return unresolvedOperation(
+						request.request_id,
+						readback.code === "not_found"
+							? `${answer.message}; the daemon holds no record of it`
+							: `${answer.message}; its record could not be read back (${readback.code}: ${readback.message})`,
+					);
+				return focusOutcome(
+					recordAt(readback.value, "request"),
+					request.request_id,
+				);
+			});
+		},
 	};
 }
 

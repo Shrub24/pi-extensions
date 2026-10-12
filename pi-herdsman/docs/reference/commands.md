@@ -22,8 +22,6 @@ diagnostic that includes the running Pi Herdsman package version.
 /agents definitions
 /agents placement [tab|subtree|split]
 /agents stop
-/manager
-/manager leave
 /chief
 /chief leave
 ```
@@ -54,8 +52,8 @@ usage entries to their recorded model, and tool/summary usage to
 `Tools/summaries`, sorted by cost.
 
 Repeated continuations of the same Pi session are counted once. Peer Leads,
-Manager/Chief staff, supervised Leads, and unrelated Pi sessions are excluded.
-A Manager or Chief still sees usage for its own current Pi session. Missing,
+Chief staff, supervised Leads, and unrelated Pi sessions are excluded.
+Chief still sees usage for its own current Pi session. Missing,
 malformed, or identity-mismatched owned-session evidence is skipped and marks
 coverage incomplete instead of guessing or scanning global sessions.
 
@@ -126,9 +124,10 @@ lower-precedence value.
 ## `/agents` Running
 
 Select a live managed agent from the shared status projection to focus its pane.
-Pi Herdsman refreshes and verifies the exact label, pane, and session identity
-before issuing herdr's focus command. If the agent changed, no focus command
-is sent.
+Pi Herdsman refreshes and verifies the exact label, pane, and session identity,
+then asks the Agent Radar daemon to focus that pane; see
+[Focus actions](#focus-actions). If the agent changed, or the daemon cannot
+confirm that exact session at the pane, nothing is focused.
 
 ## `/agents placement`
 
@@ -149,7 +148,8 @@ See [Configuration](configuration.md).
 `Retain workers  on|off` toggles `retainWorkers`. Enabled, a delivered worker
 keeps its verified live process, pane, label, and mailbox and stays in the
 public `idle` state until a later `agent_continue` reuses it. Disabled, each
-worker is cleaned up after its result is delivered. See
+worker's process and pane are cleaned up after its result is delivered, and its
+Pi session stays continuable through `agent_continue`. See
 [Configuration](configuration.md) and [Handoffs and files](../guides/handoffs.md).
 
 `Soft timeout  <value>` edits `softTimeoutMs` from `2 min`, `5 min`, `10 min`,
@@ -177,34 +177,41 @@ independent failures.
 
 Use ordinary `agent_close` for normal targeted model-driven control.
 
-## Project Manager and Chief
+## Chief
 
-Every session starts as a Lead. A Lead in an ordinary Git primary Herdr
-workspace can use `/manager` to claim the exclusive Manager lease for its
-Herdsman project scope and enter the Manager profile. No prior chat turn or
-existing linked worktree is required; the first project delegation can create
-the first linked worktree. Leads in linked-worktree workspaces cannot enter
-Manager mode. If another live Manager
-holds the lease, activation fails and the
-caller remains an ordinary Lead. Manager activation also refuses while the
-session owns unresolved Agent work. A restored Manager uses the same profile,
-supervision UI, and context as explicit activation, without the Lead Agent
-roster or Lead-owned Agent recovery. `/manager leave` preserves project work
-and is refused only when a Lead is waiting for this Manager's answer or the
-Manager's own ask to Chief remains pending; otherwise it
-relinquishes the lease and restores the exact Lead tool baseline, including
-`agent`, and Lead instruction profile. Invoking `/manager` while already active
-opens the overview without changing the role or lease. See
-[Coordination](../concepts/coordination.md) for the role and project boundaries.
-The Manager overview lists branch-based work, including paused work whose Lead
-is no longer running. It offers resume, close, and discard actions as applicable;
-discard removes the assignment but keeps the Git branch and worktree.
+Every session starts as a Lead. An eligible ordinary Lead can activate runtime
+Chief mode with `/chief`. While Chief, `/chief` opens the overview and
+`/chief leave` exits the mode. Chief's staff roster contains the ordinary Leads
+it supervises directly. See [Coordination](../concepts/coordination.md) for the
+role boundaries.
 
-An eligible ordinary Lead can activate runtime Chief mode with `/chief`.
-While Chief, `/chief` opens the overview and `/chief leave` exits the mode.
-A Manager cannot activate Chief. Chief's staff roster contains active
-Managers, and may contain ordinary Leads in worktree groups without an active
-Manager; a Manager's roster contains Leads from its worktree group.
+### Focus actions
+
+Selecting a live row in the Chief overview, `/chief` on a Herdr
+runtime where a Chief already holds the lease, and `/agents` Running all focus a
+pane. Each refreshes its own identity proof — a supervision row, the verified
+Chief descriptor, or a live managed row — and then asks the Agent Radar daemon
+to observe and focus that exact pane. `herdr agent focus` is no longer called.
+
+Focus therefore requires a running daemon that advertises both `observe` and
+`focus`. Without one nothing is focused, no other adapter is tried, and the
+action reports it:
+
+- No usable daemon: `Radar control plane unavailable (code: message); the lead
+  was not focused.`
+- The fresh observation no longer places exactly one agent with that Pi session
+  at the proved pane: `Radar could not confirm the lead from a fresh observation;
+  reopen staff.`
+- The daemon refused the operation: `Radar did not focus the lead (code:
+  message).`
+- The daemon accepted the operation but its reply was lost: `Radar did not
+  confirm the focus (message); the lead may already be focused.` The action then
+  reads that operation's record back under the same operation id, so a focus is
+  never submitted twice.
+
+Each notice names its own surface: `the lead` with `reopen staff.` for an
+overview row, `the chief` with `reopen the command.` for `/chief`, and `the
+selected agent` with `reopen Running.` for `/agents` Running.
 
 ## See also
 

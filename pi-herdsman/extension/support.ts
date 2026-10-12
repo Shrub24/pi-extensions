@@ -17,6 +17,16 @@ import {
   parseDelegationBrief,
   type BriefProfile,
 } from "./briefs.ts";
+import {
+  spawnedArgvs,
+  spawnedEnvironmentAssignments,
+  spawnedLabels,
+  startFakeRadarDaemon,
+} from "./support-radar.ts";
+
+export { spawnedArgvs, spawnedEnvironmentAssignments, spawnedLabels };
+import { radarProcessSlot } from "./radar-publication.ts";
+import { herdsmanDataRoot } from "./storage.ts";
 import { DEFAULT_RESPONSE_CONTRACT } from "./response-contracts.ts";
 import { claimProcessLock } from "./lock.ts";
 import { OperationError } from "./errors.ts";
@@ -41,6 +51,9 @@ export let failNextRequestRemoval = false;
 export let failNextResultRemoval = false;
 export let resultRemovalAttempts = 0;
 export let agentDefinitionReadCount = 0;
+// Saved-session listing must not reopen a child session body; recording every
+// open path keeps that check attributable to the read it forbids.
+export const openedSessionPaths: string[] = [];
 export let configReadHook: (() => void) | undefined;
 export let agentStateReadHook: ((path: string) => void) | undefined;
 
@@ -105,6 +118,237 @@ const {
   truncateTail: nativeTruncateTail,
 } = await import("@earendil-works/pi-coding-agent");
 after(() => realFs.rmSync(testTmpRoot, { recursive: true, force: true }));
+
+/**
+ * The Radar control plane every suite runs against. Radar spawn creates panes
+ * and child processes, which a test cannot observe directly, so the daemon also
+ * performs the child's own share of a launch.
+ */
+export let radarDaemon = await startFakeRadarDaemon();
+radarDaemon.observeInventory = radarObservedFleet;
+process.env.RADAR_CONTROL_SOCKET = radarDaemon.socketPath;
+after(() => radarDaemon.close());
+
+/**
+ * The shared daemon a test dials, replaced when its socket no longer exists.
+ *
+ * The socket lives in a temporary directory outside this suite's control and
+ * does not survive every test in a file, so a test that needs a reachable
+ * daemon asks for one instead of trusting the module-load instance.
+ */
+export async function ensureRadarDaemon(): Promise<void> {
+  // This socket is the only one the extension dials. A test that pointed the
+  // environment at a daemon of its own would otherwise leave this session
+  // registering nowhere, which reads as a process with no Radar registration.
+  process.env.RADAR_CONTROL_SOCKET = radarDaemon.socketPath;
+  if (realFs.existsSync(radarDaemon.socketPath)) return;
+  const {
+    onChildStart,
+    onChildState,
+    onChildRequest,
+    onChildAccepted,
+    childSession,
+  } = radarDaemon;
+  const stale = radarDaemon;
+  // The replacement keeps the superseded daemon's live settings but starts from
+  // that daemon's own creation state: a setting a test changed mid-flight is
+  // that test's own and must not become the baseline its own reset restores for
+  // every test that follows.
+  radarDaemon = await startFakeRadarDaemon(
+    stale.options,
+    stale.creationOptions(),
+  );
+  process.env.RADAR_CONTROL_SOCKET = radarDaemon.socketPath;
+  Object.assign(radarDaemon, {
+    onChildStart,
+    onChildState,
+    onChildRequest,
+    onChildAccepted,
+    childSession,
+    observeInventory: radarObservedFleet,
+  });
+  // The superseded daemon is left alone: its socket is already gone, and closing
+  // it would end the mailbox consumers and simulated children the test that
+  // caused the replacement is still holding.
+}
+
+
+/**
+ * A canonical fleet observation built from the rows a fixture reports.
+ */
+export function fleetFromRows(
+  rows: Array<{
+    paneId: string;
+    workspaceId?: string;
+    tabId?: string;
+    name?: string;
+    sessionId?: string | null;
+    sessionFile?: string;
+    status?: string;
+  }>,
+): {
+  workspaces: unknown[];
+  tabs: unknown[];
+  panes: unknown[];
+  agents: unknown[];
+} {
+  const workspaces = new Map<string, unknown>();
+  const tabs = new Map<string, unknown>();
+  const panes: unknown[] = [];
+  const agents: unknown[] = [];
+  for (const row of rows) {
+    if (!row.paneId) continue;
+    const workspaceId = row.workspaceId ?? WORKSPACE;
+    const tabId = row.tabId ?? `${row.name ?? row.paneId}-tab`;
+    workspaces.set(workspaceId, { workspace_id: workspaceId });
+    tabs.set(tabId, { tab_id: tabId, workspace_id: workspaceId });
+    panes.push({
+      location: {
+        workspace_id: workspaceId,
+        tab_id: tabId,
+        pane_id: row.paneId,
+      },
+    });
+    agents.push({
+      location: {
+        workspace_id: workspaceId,
+        tab_id: tabId,
+        pane_id: row.paneId,
+      },
+      ...(row.name !== undefined ? { name: row.name } : {}),
+      ...(row.status !== undefined ? { status: row.status } : {}),
+      ...(row.sessionId
+        ? { session: { kind: "uuid", value: row.sessionId } }
+        : row.sessionFile !== undefined
+          ? {
+              session: {
+                kind: "reported",
+                value: { source: "herdr:pi", value: row.sessionFile },
+              },
+            }
+          : {}),
+    });
+  }
+  return {
+    workspaces: [...workspaces.values()],
+    tabs: [...tabs.values()],
+    panes,
+    agents,
+  };
+}
+
+/**
+ * The fleet the shared daemon observes for this fixture.
+ *
+ * A live daemon reports whatever its mux holds: this process's own pane, and one
+ * pane per mailbox this session owns, with the managed label, run and session
+ * identity the owner recorded. That is what this fixture's daemon answers
+ * `mux.observe` with, so a presence decision reads the same canonical rows a real
+ * daemon reports. A test that needs a topology of its own - a pane that is
+ * absent, a contradiction, or a backend carrying no agent facts - sets
+ * `radarDaemon.options.inventory` instead.
+ */
+export function radarObservedFleet(): {
+  workspaces: unknown[];
+  tabs: unknown[];
+  panes: unknown[];
+  agents: unknown[];
+} {
+  const workspaces = new Map<string, unknown>();
+  const tabs = new Map<string, unknown>();
+  const panes: unknown[] = [];
+  const agents: unknown[] = [];
+  const add = (
+    workspaceId: string,
+    tabId: string,
+    paneId: string,
+    agent?: {
+      name?: string;
+      label?: string;
+      run?: string;
+      session?: { id?: string; file?: string };
+      status?: string;
+    },
+  ): void => {
+    if (!paneId) return;
+    workspaces.set(workspaceId, { workspace_id: workspaceId });
+    tabs.set(tabId, { tab_id: tabId, workspace_id: workspaceId });
+    panes.push({
+      location: { workspace_id: workspaceId, tab_id: tabId, pane_id: paneId },
+    });
+    if (!agent) return;
+    agents.push({
+      location: { workspace_id: workspaceId, tab_id: tabId, pane_id: paneId },
+      ...(agent.name !== undefined ? { name: agent.name } : {}),
+      ...(agent.status !== undefined ? { status: agent.status } : {}),
+      ...(agent.label !== undefined || agent.run !== undefined
+        ? {
+            facts: {
+              ...(agent.label !== undefined ? { label: agent.label } : {}),
+              ...(agent.run !== undefined ? { run: agent.run } : {}),
+            },
+          }
+        : {}),
+      ...(agent.session?.id !== undefined
+        ? { session: { kind: "uuid", value: agent.session.id } }
+        : agent.session?.file !== undefined
+          ? {
+              session: {
+                kind: "reported",
+                value: { source: "herdr:pi", value: agent.session.file },
+              },
+            }
+          : {}),
+    });
+  };
+  const ownPane = process.env.HERDR_PANE_ID?.trim();
+  if (ownPane)
+    add(
+      process.env.HERDR_WORKSPACE_ID?.trim() ?? WORKSPACE,
+      process.env.HERDR_TAB_ID?.trim() ?? `${WORKSPACE}:t1`,
+      ownPane,
+    );
+  for (const { state } of listAgentStates()) {
+    if (state.paneId === ownPane) continue;
+    add(state.workspaceId, `${state.agentLabel}-tab`, state.paneId, {
+      name: runScopedHerdrAlias(
+        state.workspaceId,
+        state.agentLabel,
+        state.runId,
+      ),
+      label: state.agentLabel,
+      run: state.runId,
+      session: { id: state.piSessionId, file: state.piSessionFile },
+      // A child waiting on background work is not executing a turn; claiming it
+      // is working would let the observation overrule the mailbox's projection.
+      status:
+        state.activeRequestId && !state.backgroundWaiting ? "working" : "idle",
+    });
+  }
+  return {
+    workspaces: [...workspaces.values()],
+    tabs: [...tabs.values()],
+    panes,
+    agents,
+  };
+}
+
+export function resetRadarState(): void {
+  realFs.rmSync(join(herdsmanDataRoot(), "radar"), {
+    recursive: true,
+    force: true,
+  });
+  const slot = radarProcessSlot();
+  slot.publications.clear();
+  slot.incarnation = undefined;
+  radarDaemon.reset();
+  radarDaemon.observeInventory = radarObservedFleet;
+  radarDaemon.onChildStart = undefined;
+  radarDaemon.onChildState = undefined;
+  radarDaemon.onChildRequest = undefined;
+  radarDaemon.onChildAccepted = undefined;
+  radarDaemon.childSession = undefined;
+}
 mock.module("node:fs", {
   namedExports: {
     accessSync: realFs.accessSync,
@@ -197,9 +441,8 @@ export const {
   writeResult,
   writeAgentState: writeMailboxAgentState,
 } = await import("./mailbox.ts");
-const { createAcceptedAssignmentContract } = await import(
-  "./response-validation.ts"
-);
+const { createAcceptedAssignmentContract } =
+  await import("./response-validation.ts");
 
 export const writeRequestRaw = writeMailboxRequest;
 export const writeAgentStateRaw = writeMailboxAgentState;
@@ -264,15 +507,14 @@ export function writeRequest(mailbox: string, request: RequestRecord): void {
         request.kind === "task"
           ? request.requestId
           : (state?.activeRequestId ??
-            state?.completedRequestId ??
-            request.requestId),
+              state?.completedRequestId ??
+              request.requestId),
         state?.briefProfile ?? "common",
       );
     request = {
       ...request,
       acceptedAssignment,
-      briefProfile:
-        request.briefProfile ?? acceptedAssignment.brief.profile,
+      briefProfile: request.briefProfile ?? acceptedAssignment.brief.profile,
     };
   }
   writeMailboxRequest(mailbox, request);
@@ -328,6 +570,7 @@ mock.module("@earendil-works/pi-coding-agent", {
           cwd: session.cwd,
         })),
       open: (path: string) => {
+        openedSessionPaths.push(path);
         if (sessionOpenError !== undefined) throw sessionOpenError;
         const session = [...nativeSessions.values()].find(
           (item) =>
@@ -949,8 +1192,97 @@ export function stopSummary(pi: ReturnType<typeof fakePi>): string {
     : "";
 }
 
+/** A real executable a launch can run, outside the repository. */
+export const testChildCommand = join(testTmpRoot, "child-command");
+realFs.writeFileSync(testChildCommand, "#!/bin/sh\n", { mode: 0o755 });
+
+/**
+ * The launch configuration a fresh worker is started with.
+ *
+ * Radar spawn places a child beside its parent's registered pane and runs an
+ * executable the caller resolved, so a delegating session needs both: the pane
+ * its own environment reports, and a child command. It also makes the supported
+ * placement the harness default; the placement tests set their own.
+ */
+export function configureSupportedLaunch(): void {
+  process.env.PI_HERDSMAN_CHILD_COMMAND = testChildCommand;
+  realFs.writeFileSync(testChildCommand, "#!/bin/sh\n", { mode: 0o755 });
+  const configPath = join(PI_AGENT_ROOT, "pi-herdsman", "config.json");
+  realFs.mkdirSync(join(PI_AGENT_ROOT, "pi-herdsman"), { recursive: true });
+  // The suite sets per-test configuration (for example `retainWorkers`) before
+  // each test runs, so the placement this fixture needs is merged into it.
+  const configured = realFs.existsSync(configPath)
+    ? (JSON.parse(realFs.readFileSync(configPath, "utf8")) as Record<
+        string,
+        unknown
+      >)
+    : {};
+  realFs.writeFileSync(
+    configPath,
+    JSON.stringify({ ...configured, spawnPlacement: "split" }),
+  );
+}
+
+/**
+ * The durable Radar launch records this session kept, read exactly as the
+ * production readers do (`radarSpawnFromEntries`): custom entries under the
+ * extension's own type, keyed by the mailbox and run each was created for.
+ */
+export function radarSpawnRecords(pi: ReturnType<typeof fakePi>): unknown[] {
+  return pi.entries.filter(
+    (entry: any) =>
+      entry?.type === "custom" &&
+      entry.customType === "pi-herdsman-radar-spawn",
+  );
+}
+
+/**
+ * Start the fixture session, which is what registers this process with the
+ * daemon. A launch needs that registration naming its own pane, and the real
+ * extension registers during session start, so a fixture that delegates has to
+ * start a session too.
+ */
+export async function startRadarSession(
+  pi: ReturnType<typeof fakePi>,
+  context: ReturnType<typeof fakeContext> = fakeContext(),
+): Promise<void> {
+  await ensureRadarDaemon();
+  for (const handler of pi.events.get("session_start") ?? [])
+    await handler(undefined, context);
+}
+
+/** A delegation brief with the assignment detail a test varies, as the tool requires. */
+export const testBrief = (task: string) =>
+  `${DELEGATION_BRIEF_EXAMPLES.common.trimEnd()}\n\nAssignment-specific detail:\n${task}`;
+
+/**
+ * Delegates one assignment through the production launch edge and returns the
+ * mailbox state the daemon's own simulated launch wrote for the child. The
+ * child is Radar-bound: its record carries the agent id the spawn returned.
+ */
+export async function delegateRadarChild(
+  pi: ReturnType<typeof fakePi>,
+  label: string,
+  task = "placement",
+): Promise<ManagedAgentState> {
+  const tool = pi.tools.find(
+    (candidate) => candidate.name === "agent_delegate",
+  )!;
+  const result = await tool.execute(
+    `delegate-${label}`,
+    { definition: "agent", label, task: testBrief(task) },
+    undefined,
+    undefined,
+    fakeContext(),
+  );
+  assert.equal(result.details.ok, true, JSON.stringify(result.details));
+  return readAgentState(agentMailboxPath(WORKSPACE, label))!;
+}
+
 export function setLeadEnvironment(): void {
+  resetRadarState();
   clearTestMailboxes();
+  realFs.mkdirSync(PI_AGENTS_DIR, { recursive: true });
   for (const entry of realFs.readdirSync(PI_AGENTS_DIR))
     if (entry.endsWith(".md")) realFs.rmSync(join(PI_AGENTS_DIR, entry));
   realFs.writeFileSync(
@@ -973,15 +1305,22 @@ export function setLeadEnvironment(): void {
     "PI_HERDSMAN_BRIEF_PROFILE",
     "PI_HERDSMAN_ALLOWED_AGENT_DEFINITIONS",
     "HERDR_PANE_ID",
+    "HERDR_TAB_ID",
     "HERDR_SOCKET_PATH",
+    "PI_HERDSMAN_CHILD_COMMAND",
+    "PI_HERDSMAN_LAUNCH_GENERATION",
+    "PI_HERDSMAN_PARENT_PANE_ID",
   ])
     delete process.env[key];
+  configureSupportedLaunch();
+  process.env.HERDR_PANE_ID = "lead-pane";
 }
 
 export function setAgentEnvironment(
   label = "registered-agent",
   allowedAgentDefinitions?: string[],
 ): string {
+  resetRadarState();
   clearTestMailboxes();
   for (const entry of realFs.readdirSync(PI_AGENTS_DIR))
     if (entry.endsWith(".md")) realFs.rmSync(join(PI_AGENTS_DIR, entry));
@@ -1006,20 +1345,29 @@ export function setAgentEnvironment(
   process.env.PI_HERDSMAN_AGENT_DEFINITION = "agent";
   process.env.PI_HERDSMAN_BRIEF_PROFILE = "common";
   process.env.HERDR_PANE_ID = "registered-pane";
+  // The operator's own mux is not this fixture's: an inherited tab would
+  // otherwise reach a registration or a Herdr call as though this process had
+  // been started there.
+  process.env.HERDR_TAB_ID = defaultFixtureIdentity.tabId;
+  delete process.env.PI_HERDSMAN_LAUNCH_GENERATION;
+  delete process.env.PI_HERDSMAN_PARENT_PANE_ID;
   if (allowedAgentDefinitions === undefined)
     delete process.env.PI_HERDSMAN_ALLOWED_AGENT_DEFINITIONS;
   else
     process.env.PI_HERDSMAN_ALLOWED_AGENT_DEFINITIONS = JSON.stringify(
       allowedAgentDefinitions,
     );
+  configureSupportedLaunch();
   resetAgentMailbox(mailbox);
   return mailbox;
 }
 
 function clearTestMailboxes(): void {
-  for (const { path, state } of listAgentStates())
-    if (state.workspaceId === WORKSPACE)
-      realFs.rmSync(path, { recursive: true, force: true });
+  // The daemon's observation is derived from the mailbox store, so a state an
+  // earlier test left in any workspace would present itself as a live child of
+  // the next one. This fixture owns the whole store, so it empties it.
+  for (const { path } of listAgentStates())
+    realFs.rmSync(path, { recursive: true, force: true });
 }
 
 export function managedState(
@@ -1114,15 +1462,18 @@ export function requestRecordBytes(
   text: string,
 ): number {
   return Buffer.byteLength(
-    JSON.stringify({ version: 5, runId: AGENT_ID,
-    requestId: REQUEST_ID,
-    ownerSessionId: LEAD_SESSION_ID,
-    workspaceId: WORKSPACE,
-    agentLabel,
-    paneId,
-    kind: "task",
-    text,
-    createdAt: 1_700_000_000_000, }),
+    JSON.stringify({
+      version: 5,
+      runId: AGENT_ID,
+      requestId: REQUEST_ID,
+      ownerSessionId: LEAD_SESSION_ID,
+      workspaceId: WORKSPACE,
+      agentLabel,
+      paneId,
+      kind: "task",
+      text,
+      createdAt: 1_700_000_000_000,
+    }),
     "utf8",
   );
 }
@@ -1712,15 +2063,18 @@ export function delegatedLifecycleExecutor(
         const workspaceId = paneEnvironment.PI_HERDSMAN_WORKSPACE_ID;
         const paneId = args[args.indexOf("--pane") + 1];
         const tabForPane = tabByPane.get(paneId) ?? "delegated-tab";
-        const state: ManagedAgentState = { version: 5, runId,
-        ownerSessionId,
-        workspaceId,
-        agentLabel: label,
-        paneId,
-        piSessionId: childSessionIds[createdChildren++],
-        piSessionFile: `/tmp/${label}.jsonl`,
-        cwd: testCwd,
-        updatedAt: Date.now(), };
+        const state: ManagedAgentState = {
+          version: 5,
+          runId,
+          ownerSessionId,
+          workspaceId,
+          agentLabel: label,
+          paneId,
+          piSessionId: childSessionIds[createdChildren++],
+          piSessionFile: `/tmp/${label}.jsonl`,
+          cwd: testCwd,
+          updatedAt: Date.now(),
+        };
         live.set(label, state);
         tabByPane.set(paneId, tabForPane);
         writeAgentState(agentMailboxPath(workspaceId, label), state);
@@ -1763,10 +2117,6 @@ export function cascadeExecutor(
   states: ManagedAgentState[],
   options: {
     failCloseLabel?: string;
-    mismatchSessionLabel?: string;
-    paneOnly?: string[];
-    omitAgentLabels?: string[];
-    omitPaneLabels?: string[];
   } = {},
 ): {
   exec: ExecHandler;
@@ -1774,9 +2124,6 @@ export function cascadeExecutor(
   live: Map<string, ManagedAgentState>;
 } {
   const live = new Map(states.map((state) => [state.agentLabel, state]));
-  const paneOnly = new Set(options.paneOnly ?? []);
-  const omitAgentLabels = new Set(options.omitAgentLabels ?? []);
-  const omitPaneLabels = new Set(options.omitPaneLabels ?? []);
   const closeOrder: string[] = [];
   const paneFor = (paneId: string) =>
     [...live.values()].find((state) => state.paneId === paneId);
@@ -1789,102 +2136,6 @@ export function cascadeExecutor(
         return herdrStatusResult();
       if (args[0] === "--version")
         return { stdout: "0.8.0", stderr: "", code: 0 };
-      if (isAgentList(args)) {
-        const agents = [...live.values()]
-          .filter((state) => !omitAgentLabels.has(state.agentLabel))
-          .map((state) => {
-            const agent = agentFromState(state);
-            if (state.agentLabel === options.mismatchSessionLabel)
-              agent.agent_session = {
-                source: "herdr:pi",
-                agent: "pi",
-                kind: "id",
-                value: "22222222-2222-4222-8222-222222222222",
-              };
-            return agent;
-          });
-        return {
-          stdout: JSON.stringify({ id: AGENT_ID, result: { agents } }),
-          stderr: "",
-          code: 0,
-        };
-      }
-      if (isPaneList(args)) {
-        const panes = [
-          ...[...live.values()]
-            .filter((state) => !omitPaneLabels.has(state.agentLabel))
-            .map((state) => ({
-              pane_id: state.paneId,
-              tab_id: `${state.agentLabel}-tab`,
-              workspace_id: state.workspaceId,
-              cwd: state.cwd,
-              foreground_cwd: state.cwd,
-              agent_status: "unknown",
-              agent_session: {
-                source: "herdr:pi",
-                agent: "pi",
-                kind: "id",
-                value: state.piSessionId,
-              },
-            })),
-          ...[...paneOnly].map((paneId) => ({
-            pane_id: paneId,
-            workspace_id: WORKSPACE,
-            cwd: "/tmp",
-          })),
-        ];
-        return {
-          stdout: JSON.stringify({ id: AGENT_ID, result: { panes } }),
-          stderr: "",
-          code: 0,
-        };
-      }
-      if (isApiSnapshot(args)) {
-        const agents = [...live.values()]
-          .filter((state) => !omitAgentLabels.has(state.agentLabel))
-          .map((state) => {
-            const agent = agentFromState(state);
-            if (state.agentLabel === options.mismatchSessionLabel)
-              agent.agent_session = {
-                source: "herdr:pi",
-                agent: "pi",
-                kind: "id",
-                value: "22222222-2222-4222-8222-222222222222",
-              };
-            return agent;
-          });
-        const panes = [
-          ...[...live.values()]
-            .filter((state) => !omitPaneLabels.has(state.agentLabel))
-            .map((state) => ({
-              pane_id: state.paneId,
-              tab_id: `${state.agentLabel}-tab`,
-              workspace_id: state.workspaceId,
-              cwd: state.cwd,
-              foreground_cwd: state.cwd,
-              agent_status: "unknown",
-              agent_session: {
-                source: "herdr:pi",
-                agent: "pi",
-                kind: "id",
-                value: state.piSessionId,
-              },
-            })),
-          ...[...paneOnly].map((paneId) => ({
-            pane_id: paneId,
-            workspace_id: WORKSPACE,
-            cwd: "/tmp",
-          })),
-        ];
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: { snapshot: { agents, panes } },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      }
       if (args[0] === "agent" && args[1] === "get") {
         const requested = args[2];
         const state =
@@ -1904,60 +2155,12 @@ export function cascadeExecutor(
             code: 0,
           };
         const agent = agentFromState(state);
-        if (state.agentLabel === options.mismatchSessionLabel)
-          agent.agent_session = {
-            source: "herdr:pi",
-            agent: "pi",
-            kind: "id",
-            value: "22222222-2222-4222-8222-222222222222",
-          };
         return {
           stdout: JSON.stringify({ id: AGENT_ID, result: { agent } }),
           stderr: "",
           code: 0,
         };
       }
-      if (isTabList(args))
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              tabs: [...live.values()].map((state) => ({
-                tab_id: `${state.agentLabel}-tab`,
-                workspace_id: state.workspaceId,
-              })),
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      if (isPaneList(args))
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              panes: [
-                ...[...live.values()]
-                  .filter((state) => !omitPaneLabels.has(state.agentLabel))
-                  .map((state) => ({
-                    pane_id: state.paneId,
-                    tab_id: `${state.agentLabel}-tab`,
-                    workspace_id: state.workspaceId,
-                    cwd: state.cwd,
-                    foreground_cwd: state.cwd,
-                    agent_status: "unknown",
-                  })),
-                ...[...paneOnly].map((paneId) => ({
-                  pane_id: paneId,
-                  workspace_id: WORKSPACE,
-                  cwd: "/tmp",
-                })),
-              ],
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
       if (args[0] === "pane" && args[1] === "get") {
         const state = paneFor(args[2]!);
         return {
@@ -2157,6 +2360,11 @@ function acceptMailboxRequest(mailbox: string, request: RequestRecord): void {
     lastAck: {
       requestId: request.requestId,
       accepted: true,
+      // An addressed request is answered by the process it names, and that
+      // process's own echo is what the owner holds the acceptance to. The
+      // fixture answers as the child it stands in for, exactly as a real one
+      // does; an unaddressed request echoes nothing, which is the legacy form.
+      ...(request.address !== undefined ? { identity: request.address } : {}),
       acknowledgedAt: Date.now(),
     },
     updatedAt: Date.now(),
@@ -2169,21 +2377,16 @@ export function createStagedAssignmentFixture(
 ) {
   setLeadEnvironment();
   const startupMailbox = agentMailboxPath(WORKSPACE, label);
-  const initialStatus = testGate<ExecResult>();
-  const start = testGate<void>();
-  const preSubmitValidation = testGate<void>();
+  const childStart = testGate<void>();
+  const childState = testGate<void>();
   const handoff = testGate<void>();
-  let holdInitialStatus = true;
-  let holdStart = true;
-  let holdPreSubmitValidation = true;
   let holdHandoff = true;
-  let started = false;
-  let paneClosed = false;
+  let childStateReady = false;
   let requestId: string | undefined;
-  let preSubmitValidationReady = false;
   let acceptedRequestIdWritten: string | undefined;
   let workingObservations = 0;
   let renderRequests = 0;
+  let pendingDelegation: Promise<void> | undefined;
   const startup = startupExecutor(
     label,
     () => DEFAULT_PI_SESSION_ID,
@@ -2215,34 +2418,42 @@ export function createStagedAssignmentFixture(
     },
   );
 
+  // A launch's stages are the daemon's now: the child starts, its state exists,
+  // and the assignment reaches it. The fixture holds each stage so a test can
+  // assert what the launch publishes while it waits.
+  radarDaemon.onChildStart = () => childStart.promise;
+  radarDaemon.onChildState = () => {
+    childStateReady = true;
+    return childState.promise;
+  };
+
   const pi = fakePi({
     persistMessages: true,
     exec: async (command, args, options) => {
       if (command === "herdr" && isAgentList(args)) {
         const state = readAgentState(startupMailbox);
-        const agents =
-          state && !paneClosed
-            ? [
-                {
-                  ...JSON.parse(
-                    listResponse(
-                      label,
-                      state.activeRequestId ? "working" : "idle",
-                    ),
-                  ).agents[0],
-                  name: runScopedHerdrAlias(WORKSPACE, label, state.runId),
-                  pane_id: "startup-pane",
-                  workspace_id: WORKSPACE,
-                  cwd: "/tmp",
-                  agent_session: {
-                    source: "herdr:pi",
-                    agent: "pi",
-                    kind: "id",
-                    value: state.piSessionId,
-                  },
+        const agents = state
+          ? [
+              {
+                ...JSON.parse(
+                  listResponse(
+                    label,
+                    state.activeRequestId ? "working" : "idle",
+                  ),
+                ).agents[0],
+                name: runScopedHerdrAlias(WORKSPACE, label, state.runId),
+                pane_id: "startup-pane",
+                workspace_id: WORKSPACE,
+                cwd: "/tmp",
+                agent_session: {
+                  source: "herdr:pi",
+                  agent: "pi",
+                  kind: "id",
+                  value: state.piSessionId,
                 },
-              ]
-            : [];
+              },
+            ]
+          : [];
         if (agents.some((agent: any) => agent.agent_status === "working"))
           workingObservations++;
         return {
@@ -2252,19 +2463,6 @@ export function createStagedAssignmentFixture(
         };
       }
       if (command === "herdr" && isApiSnapshot(args)) {
-        if (holdInitialStatus) {
-          holdInitialStatus = false;
-          return initialStatus.promise;
-        }
-        if (!started)
-          return {
-            stdout: JSON.stringify({
-              id: 1,
-              result: { snapshot: { agents: [], panes: [] } },
-            }),
-            stderr: "",
-            code: 0,
-          };
         const result = await startup.exec(command, args, options);
         const payload = JSON.parse(result.stdout);
         const agents = payload.result?.snapshot?.agents ?? [];
@@ -2272,39 +2470,6 @@ export function createStagedAssignmentFixture(
           workingObservations++;
         return result;
       }
-      if (command === "herdr" && args[0] === "agent" && args[1] === "get") {
-        if (holdPreSubmitValidation && args[2] === "startup-pane") {
-          holdPreSubmitValidation = false;
-          preSubmitValidationReady = true;
-          await preSubmitValidation.promise;
-        }
-        return startup.exec(command, args, options);
-      }
-      if (command === "herdr" && args[0] === "agent" && args[1] === "start") {
-        if (holdStart) {
-          holdStart = false;
-          await start.promise;
-        }
-        const result = await startup.exec(command, args, options);
-        const state = readAgentState(startup.mailbox);
-        assert.ok(state, "staged startup must create mailbox state");
-        writeAgentState(startup.mailbox, {
-          ...state,
-          updatedAt: Date.now(),
-        });
-        started = true;
-        return result;
-      }
-      if (command === "herdr" && isPaneClose(args)) {
-        paneClosed = true;
-        started = false;
-      }
-      if (command === "herdr" && isPaneList(args) && paneClosed)
-        return {
-          stdout: JSON.stringify({ id: 1, result: { panes: [] } }),
-          stderr: "",
-          code: 0,
-        };
       return startup.exec(command, args, options);
     },
   });
@@ -2329,14 +2494,6 @@ export function createStagedAssignmentFixture(
 
   registerExtension!(pi.pi as never);
   const sessionStart = pi.events.get("session_start")![0](undefined, context);
-  const emptyStatus = (): ExecResult => ({
-    stdout: JSON.stringify({
-      id: 1,
-      result: { snapshot: { agents: [], panes: [] } },
-    }),
-    stderr: "",
-    code: 0,
-  });
   return {
     pi,
     context,
@@ -2354,8 +2511,8 @@ export function createStagedAssignmentFixture(
     get requestObserved(): boolean {
       return requestId !== undefined;
     },
-    get preSubmitValidationReady(): boolean {
-      return preSubmitValidationReady;
+    get childStateReady(): boolean {
+      return childStateReady;
     },
     get acceptedRequestIdWritten(): string {
       assert.ok(
@@ -2370,15 +2527,9 @@ export function createStagedAssignmentFixture(
     get renderRequests(): number {
       return renderRequests;
     },
-    releaseInitialStatus: () =>
-      initialStatus.resolve(
-        readAgentState(startupMailbox)
-          ? startup.exec("herdr", ["api", "snapshot"])
-          : emptyStatus(),
-      ),
-    releaseStart: () => start.resolve(),
-    releasePreSubmitValidation: () => preSubmitValidation.resolve(),
-    releaseAcknowledgement: () => handoff.resolve(),
+    releaseChildStart: () => childStart.resolve(),
+    releaseStartupAck: () => childState.resolve(),
+    releaseHandoff: () => handoff.resolve(),
     async list() {
       return pi.tools[0].execute(
         "id",
@@ -2387,6 +2538,18 @@ export function createStagedAssignmentFixture(
         undefined,
         context,
       );
+    },
+    /**
+     * Follow one delegation to its settlement. A teardown that merely drops the
+     * test's reference would leave the launch waiting on a gate forever, so the
+     * shutdown below has to be able to wait for the same promise the test holds.
+     */
+    track<T>(delegation: Promise<T>): Promise<T> {
+      pendingDelegation = delegation.then(
+        () => undefined,
+        () => undefined,
+      );
+      return delegation;
     },
     markWorking(requestId: string) {
       const state = readAgentState(startup.mailbox);
@@ -2408,22 +2571,34 @@ export function createStagedAssignmentFixture(
         completedRequestId: requestId,
         updatedAt: Date.now(),
       });
-      writeResult(startup.mailbox, { version: 5, runId: state.runId,
-      requestId,
-      ownerSessionId: state.ownerSessionId,
-      workspaceId: state.workspaceId,
-      agentLabel: state.agentLabel,
-      paneId: state.paneId,
-      status: "completed",
-      text: "completed before working was observed",
-      completedAt: Date.now(), });
+      writeResult(startup.mailbox, {
+        version: 5,
+        runId: state.runId,
+        requestId,
+        ownerSessionId: state.ownerSessionId,
+        workspaceId: state.workspaceId,
+        agentLabel: state.agentLabel,
+        paneId: state.paneId,
+        status: "completed",
+        text: "completed before working was observed",
+        completedAt: Date.now(),
+      });
       watchedResultPaths.get(`${startup.mailbox}/result-${requestId}.json`)?.(
         {},
         {},
       );
     },
-    shutdown() {
-      pi.events.get("session_shutdown")?.[0]();
+    async shutdown() {
+      // A failed assertion can leave this launch waiting on a gate the test will
+      // never open. Open them and wait for the delegation to settle: the launch
+      // releases its mailbox startup claim on the way out, and a claim left held
+      // makes the next test's label collide with this one's.
+      childStart.resolve();
+      childState.resolve();
+      handoff.resolve();
+      await pendingDelegation;
+      for (const handler of pi.events.get("session_shutdown") ?? [])
+        await handler(undefined, context);
       resetAgentMailbox(startup.mailbox);
     },
   };
@@ -2485,6 +2660,9 @@ export function startupExecutor(
   let runId = testRunId;
   let ownerSessionId = testRunId ? LEAD_SESSION_ID : "";
   let activePaneId = "startup-pane";
+  // A launch reads the pane this process's own Radar registration names, so a
+  // fixture session stands in a pane unless the test names its own.
+  process.env.HERDR_PANE_ID ??= "startup-pane";
   const paneEnvironment: Record<string, string> = {};
   let stopped = false;
   let tabClosed = false;
@@ -2496,6 +2674,13 @@ export function startupExecutor(
   let childName: string | undefined;
   const READINESS_MARKER = "echo __PI_HERDSMAN_READY_";
   const registerChild = () => {
+    // Only a launch makes this fixture's child exist. A child already
+    // registered under another run was launched by the Radar daemon for this
+    // session: the run, owner and acknowledgment in its own state are what the
+    // control path holds it by, and this fixture's stand-in must not rewrite
+    // them for a read that happens to arrive after the launch.
+    const existing = readAgentState(mailbox);
+    if (existing !== undefined && existing.runId !== runId) return;
     writeAgentState(mailbox, {
       version: 5,
       runId,
@@ -2529,6 +2714,20 @@ export function startupExecutor(
     value.agents = [];
     return JSON.stringify({ id: AGENT_ID, result: value });
   };
+  // Radar spawn starts the child, so the daemon performs the child's share: it
+  // reports this fixture's session, runs the test's request handler, and accepts
+  // the assignment. The mailbox consumer below stays for the direct-launch paths
+  // that still run a child of their own.
+  radarDaemon.childSession = () => ({
+    id: sessionForGet(0) ?? "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+    file: sessionFile,
+  });
+  if (onStart) radarDaemon.onChildStart = (spawn) => onStart([...spawn.argv]);
+  if (onRequest)
+    radarDaemon.onChildRequest = (_spawn, request) =>
+      onRequest(request.text, request);
+  if (onAccepted)
+    radarDaemon.onChildAccepted = (request) => onAccepted(request);
   const stopMailboxConsumer = consumeMailboxRequest(
     mailbox,
     async (request) => {
@@ -2938,6 +3137,14 @@ export function startupExecutor(
       if (args[0] === "agent" && args[1] === "start") {
         onStart?.(args);
       }
+      // A report or a topology read is not a launch: only a launch makes this
+      // fixture's child exist, and answering a publication with a synthesized
+      // child would hand the next launch a child it never started.
+      if (
+        (args[0] === "pane" && args[1] === "report-metadata") ||
+        (args[0] === "workspace" && args[1] === "get")
+      )
+        return { stdout: "{}", stderr: "", code: 0 };
       const startedAgent = {
         name: args[2],
         pane_id: activePaneId,
@@ -3048,6 +3255,9 @@ export function writePromptDefinition(
 }
 
 export default {
+  get openedSessionPaths() {
+    return openedSessionPaths;
+  },
   get sessionOpenError() {
     return sessionOpenError;
   },

@@ -23,9 +23,11 @@ cleanup
 gone
 ```
 
-If the expected pane, Pi session, and run-scoped alias are all absent from a
-coherent Herdr inventory before a durable result resolves the assignment, the
-assignment projects as `lost`. The mailbox remains the durable owner of that
+If the expected pane is absent from the daemon's own coherent fleet observation
+before a durable result resolves the assignment, the assignment projects as
+`lost`. The observation reports an agent's session and managed label/run where
+its backend carries them, so a pane whose occupant claims a different identity is
+unproved rather than lost. The mailbox remains the durable owner of that
 generation until its direct owner continues or closes it; physical disappearance
 does not mean completion or task failure. Continuing the exact saved session with
 `agent_continue` retires that record and starts a new generation on the same Pi
@@ -211,8 +213,9 @@ agent generation executes one assignment at a time; by default
 (`retainWorkers: true`) delivering the terminal result, completed or failed,
 leaves the verified live worker in place as `idle`, and a later controller
 assignment starts a new assignment on that same process. With `retainWorkers`
-set to `false` a delivered agent is cleaned up and is not available for another
-task.
+set to `false` a delivered agent's process and pane are cleaned up instead, so
+no live worker remains, but its Pi session stays continuable through a later
+`agent_continue`.
 
 Result publication and cleanup are separate convergence steps. An agent may
 therefore appear `settling` after its model has finished. Any cleanup follows

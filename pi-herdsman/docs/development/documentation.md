@@ -28,11 +28,10 @@ disagrees.
 | Product positioning and repository first impression    | [`README.md`](../../README.md)                                      |
 | First successful use                                   | [Getting started](../getting-started.md)                            |
 | Model-facing API navigation                            | [Coordination API](../coordination-api.md)                          |
-| Roles, authority, project scope, and system boundaries | [Coordination](../concepts/coordination.md)                         |
+| Roles, authority, and system boundaries                | [Coordination](../concepts/coordination.md)                         |
 | Agent identity                                         | [Agents and identity](../concepts/agents.md)                        |
 | Delegation and execution ownership                     | [Delegation](../concepts/delegation.md)                             |
 | Asynchronous Agent lifecycle                           | [Lifecycle](../concepts/lifecycle.md)                               |
-| Manager workflow                                       | [Project orchestration](../guides/project-orchestration.md)         |
 | Creating Agent definitions                             | [Agent definitions](../guides/agent-definitions.md)                 |
 | Overrides and prompt composition                       | [Customizing bundled Agents](../guides/customizing-agents.md)       |
 | Handoffs, files, and result references                 | [Handoffs and files](../guides/handoffs.md)                         |
@@ -142,8 +141,8 @@ When implementation and prose disagree:
 3. stale prose is deleted rather than preserved as another contract
 
 Particularly verify runtime implementation for `agent_*`, `ask_owner`,
-`staff_*`, `supervisor_*`, `peer_*`, `/agents`, `/manager`, `/chief`, states,
-definition composition, project work, recovery, and presentation behavior.
+`staff_*`, `supervisor_*`, `peer_*`, `/agents`, `/chief`, states,
+definition composition, recovery, and presentation behavior.
 
 Use `package.json` for supported Pi versions and package resources.
 

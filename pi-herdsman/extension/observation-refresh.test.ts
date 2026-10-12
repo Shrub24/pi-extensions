@@ -7,15 +7,16 @@ import {
   AGENT_ID,
   LEAD_SESSION_ID,
   WORKSPACE,
-  agentMailboxPath,
   agentFromState,
+  agentMailboxPath,
+  ensureRadarDaemon,
   fakeAgentContext,
   fakeContext,
   fakePi,
-  isAgentList,
-  isApiSnapshot,
   managedState,
   nativeSessions,
+  radarDaemon,
+  radarObservedFleet,
   realFs,
   recoveryIdentity,
   registerExtension,
@@ -51,10 +52,15 @@ test("a recurring health tick leaves a definition-less mailbox unresolved withou
     { label: "health-tick-legacy", withDefinition: true },
     { label: "health-tick-opaque", withDefinition: false },
   ].map(({ label, withDefinition }) => {
-    const state = managedState(label, randomUUID(), {
-      ...recoveryIdentity(label),
-      piSessionId: randomUUID(),
-    });
+    // Each worker records its own run: a shared run makes every worker a
+    // candidate claimant of the others' pane, so none is provably live.
+    const state = {
+      ...managedState(label, randomUUID(), {
+        ...recoveryIdentity(label),
+        piSessionId: randomUUID(),
+      }),
+      runId: randomUUID(),
+    };
     const mailbox = agentMailboxPath(WORKSPACE, label);
     resetAgentMailbox(mailbox);
     writeAgentState(mailbox, state);
@@ -198,7 +204,7 @@ test("a recurring health tick leaves a definition-less mailbox unresolved withou
   );
 });
 
-test("recurring lead status does not open transcript bodies, and explicit legacy resolution still wins", async (t) => {
+test("a recurring tick never opens a legacy transcript, and an explicit listing still resolves the definition", async (t) => {
   setLeadEnvironment();
   const leadFile = join(tmpdir(), `probe-lead-${randomUUID()}.jsonl`);
   realFs.writeFileSync(
@@ -284,7 +290,17 @@ test("recurring lead status does not open transcript bodies, and explicit legacy
   const manager = SessionManager as any;
   const originalOpen = manager.open;
   let opens = 0;
-  manager.open = (...args: unknown[]) => { opens++; return originalOpen(...args); };
+  // Only the first read of the worker's transcript fails: that automatic
+  // negative is what the runtime cache holds for the rest of the session.
+  let failedFirstRead = false;
+  manager.open = (...args: unknown[]) => {
+    opens++;
+    if (!failedFirstRead && args[0] === state.piSessionFile) {
+      failedFirstRead = true;
+      throw new Error("transcript unreadable");
+    }
+    return originalOpen(...args);
+  };
   t.after(() => { manager.open = originalOpen; });
   registerExtension!(pi.pi as never);
   await pi.events.get("session_start")![0](undefined, context);
@@ -309,21 +325,18 @@ test("recurring lead status does not open transcript bodies, and explicit legacy
   assert.equal(after2 - after1, 0);
   assert.equal(rendered1, rendered2);
   assert.match(rendered1, /herd/);
+  assert.ok(failedFirstRead, "the session start never read the transcript");
   const list = pi.tools.find((tool) => tool.name === "agent_list")!;
   const beforeExplicit = opens;
   const resolved = await list.execute("explicit-list", {}, undefined, undefined, context);
-  assert.ok(opens > beforeExplicit, `explicit legacy resolution did not open entries: ${JSON.stringify(resolved)}`);
-  assert.match(JSON.stringify(resolved), /worker/);
+  assert.ok(opens > beforeExplicit, `explicit listing did not read the transcript: ${JSON.stringify(resolved)}`);
+  assert.match(JSON.stringify(resolved), /probe-worker · definition worker/);
 });
 
 // Drives the recurring worker-leaf status tick. The leaf owns one mailbox whose
 // owner is a lead Pi session; the lead boundary is proven from published
 // coordination state (never the owner's transcript).
-const startLeafStatusProbe = async (
-  t: any,
-  label: string,
-  leadSession: Record<string, unknown>,
-) => {
+const startLeafStatusProbe = async (t: any, label: string) => {
   setAgentEnvironment(label);
   process.env.HERDR_SOCKET_PATH = join(
     tmpdir(),
@@ -337,37 +350,28 @@ const startLeafStatusProbe = async (
     setLeadEnvironment();
   });
 
-  const leafState = managedState(label);
-  const leafAgent = {
-    ...agentFromState(leafState, "working"),
-    agent: "pi",
-    tokens: {},
+  // The leaf is a mailbox this session owns, so the daemon observes its row and
+  // the snapshot lists it. Without the mailbox the leaf never reaches the lead walk.
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  resetAgentMailbox(mailbox);
+  writeAgentState(mailbox, managedState(label));
+  t.after(() => resetAgentMailbox(mailbox));
+  // The owner lead is a daemon-observed agent whose session is its own UUID, in
+  // this workspace: the canonical row the breadcrumb proves the lead from.
+  await ensureRadarDaemon();
+  radarDaemon.observeInventory = () => {
+    const fleet = radarObservedFleet();
+    const location = { workspace_id: WORKSPACE, tab_id: "lead-tab", pane_id: "lead-pane" };
+    return {
+      ...fleet,
+      panes: [...fleet.panes, { location }],
+      agents: [
+        ...fleet.agents,
+        { location, session: { kind: "uuid", value: LEAD_SESSION_ID } },
+      ],
+    };
   };
-  const leadAgent = {
-    agent: "pi",
-    workspace_id: WORKSPACE,
-    pane_id: "lead-pane",
-    tab_id: "lead-tab",
-    agent_session: leadSession,
-  };
-  const envelope = JSON.stringify({
-    id: AGENT_ID,
-    result: {
-      snapshot: {
-        agents: [leafAgent, leadAgent],
-        panes: [leafAgent, leadAgent],
-      },
-      agents: [leafAgent, leadAgent],
-      panes: [leafAgent, leadAgent],
-    },
-  });
-  const pi = fakePi({
-    activeTools: [],
-    exec: (command, args) =>
-      command === "herdr" && (isApiSnapshot(args) || isAgentList(args))
-        ? { stdout: envelope, stderr: "", code: 0 }
-        : { stdout: "{}", stderr: "", code: 0 },
-  });
+  const pi = fakePi({ activeTools: [] });
 
   const context = fakeAgentContext() as any;
   context.mode = "tui";
@@ -412,12 +416,6 @@ test("recurring leaf observation keeps malformed and absent coordinator state un
   const { runtime, coordinatorPath, widget, tick } = await startLeafStatusProbe(
     t,
     "coordinator-probe",
-    {
-      source: "herdr:pi",
-      agent: "pi",
-      kind: "id",
-      value: LEAD_SESSION_ID,
-    },
   );
 
   // No coordinator record: the lead boundary stays unknown rather than proven.
@@ -445,24 +443,7 @@ test("recurring leaf observation keeps malformed and absent coordinator state un
 });
 
 test("recurring worker-leaf status ticks open no transcript body", async (t) => {
-  const leadFile = join(tmpdir(), `leaf-open-lead-${randomUUID()}.jsonl`);
-  realFs.writeFileSync(
-    leadFile,
-    JSON.stringify({ type: "session", id: LEAD_SESSION_ID, cwd: "/tmp" }) +
-      "\n",
-  );
-  t.after(() => realFs.rmSync(leadFile, { force: true }));
-
-  const { runtime, widget, tick } = await startLeafStatusProbe(
-    t,
-    "leaf-open-probe",
-    {
-      source: "herdr:pi",
-      agent: "pi",
-      kind: "path",
-      value: leadFile,
-    },
-  );
+  const { runtime, widget, tick } = await startLeafStatusProbe(t, "leaf-open-probe");
   writeLeadCoordinationState(runtime, {
     version: 1,
     role: "lead",
@@ -471,7 +452,7 @@ test("recurring worker-leaf status ticks open no transcript body", async (t) => 
     updatedAt: Date.now(),
   });
 
-  // The bounded Pi-session header read proves the owner lead without a body load.
+  // The lead is proven from coordination state and the daemon's row, not a transcript.
   const { SessionManager } = await import("@earendil-works/pi-coding-agent");
   const manager = SessionManager as any;
   const originalOpen = manager.open;

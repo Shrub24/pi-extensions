@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import fs, {
   mkdirSync,
   mkdtempSync,
@@ -12,7 +12,6 @@ import fs, {
   writeFileSync,
 } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
-import { createServer, type Socket } from "node:net";
 import test from "node:test";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { dirname, join } from "node:path";
@@ -24,9 +23,7 @@ import {
   listHerdrAgents,
   listAllHerdrAgents,
   herdrReporterExtensionPath,
-  herdrSessionSnapshot,
   worktreeGroupScope,
-  watchHerdrLifecycle,
   inspectHerdrAgent,
   runHerdr,
   sameShellProcessOwner,
@@ -662,119 +659,6 @@ test("agent list fails closed when the native agents array is absent", async () 
       listAllHerdrAgents(pi, { cwd: "/tmp" } as any),
       /agent list ownership proof is unavailable/,
     );
-  }
-});
-
-test("session snapshot accepts only coherent pane and agent inventories", async () => {
-  for (const snapshot of [
-    { panes: [{ pane_id: "pane" }], agents: [{ name: "agent" }] },
-  ]) {
-    const pi = {
-      exec: async () => ({
-        code: 0,
-        stdout: JSON.stringify({ id: 1, result: { snapshot } }),
-        stderr: "",
-      }),
-    } as any;
-    assert.deepEqual(
-      await herdrSessionSnapshot(pi, { cwd: "/tmp" } as any),
-      snapshot,
-    );
-  }
-  for (const snapshot of [
-    {},
-    { panes: [], agents: null },
-    { panes: {}, agents: [] },
-  ]) {
-    const pi = {
-      exec: async () => ({
-        code: 0,
-        stdout: JSON.stringify({ id: 1, result: { snapshot } }),
-        stderr: "",
-      }),
-    } as any;
-    await assert.rejects(
-      herdrSessionSnapshot(pi, { cwd: "/tmp" } as any),
-      /session inventory is unavailable/,
-    );
-  }
-});
-
-test("lifecycle watcher subscribes, reconciles, reconnects, and aborts", async () => {
-  const socketPath =
-    globalThis.process.platform === "win32"
-      ? `\\\\.\\pipe\\pi-herdsman-${randomUUID()}`
-      : join(tmpdir(), `pi-herdsman-${randomUUID()}.sock`);
-  const server = createServer();
-  const sockets = new Set<Socket>();
-  let connections = 0;
-  let request: any;
-  server.on("connection", (socket) => {
-    sockets.add(socket);
-    socket.once("close", () => sockets.delete(socket));
-    connections++;
-    let buffer = "";
-    socket.setEncoding("utf8");
-    socket.on("data", (chunk) => {
-      buffer += chunk;
-      const newline = buffer.indexOf("\n");
-      if (newline < 0) return;
-      request = JSON.parse(buffer.slice(0, newline));
-      socket.write(JSON.stringify({ id: request.id, result: {} }) + "\n");
-      if (connections === 1) {
-        socket.write(
-          JSON.stringify({
-            id: request.id,
-            error: {
-              code: "events_lost",
-              message:
-                "event subscription fell behind retained history; resubscribe and resync with session.snapshot",
-            },
-          }) + "\n",
-        );
-        socket.end();
-      }
-    });
-  });
-  await new Promise<void>((resolve) => server.listen(socketPath, resolve));
-  const controller = new AbortController();
-  let changes = 0;
-  let ready!: () => void;
-  let timeout!: ReturnType<typeof setTimeout>;
-  const reconnected = new Promise<void>((resolve, reject) => {
-    ready = resolve;
-    timeout = setTimeout(
-      () => reject(new Error("lifecycle watcher did not resubscribe")),
-      5_000,
-    );
-    timeout.unref();
-  });
-  try {
-    watchHerdrLifecycle(socketPath, controller.signal, () => {
-      changes++;
-      if (changes >= 3 && connections >= 2) ready();
-    });
-    await reconnected;
-    assert.equal(request.method, "events.subscribe");
-    assert.deepEqual(
-      request.params.subscriptions.map((entry: any) => entry.type),
-      [
-        "pane.closed",
-        "pane.exited",
-        "pane.moved",
-        "tab.closed",
-        "workspace.closed",
-      ],
-    );
-    assert.equal(connections, 2);
-    assert.equal(changes, 3);
-  } finally {
-    clearTimeout(timeout);
-    controller.abort();
-    for (const socket of sockets) socket.destroy();
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-    if (globalThis.process.platform !== "win32")
-      rmSync(socketPath, { force: true });
   }
 });
 

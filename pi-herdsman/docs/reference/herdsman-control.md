@@ -225,5 +225,4 @@ older than 24 hours and never prunes a claim that has no result.
 
 - [Agent tools](agent.md#agent_close)
 - [Agent states](agent-states.md)
-- [Pane metadata and hierarchy](pane-metadata.md)
 - [Errors](errors.md)

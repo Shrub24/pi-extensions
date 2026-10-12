@@ -100,6 +100,14 @@ test("the latest current-session record wins", () => {
   );
 });
 
+test("a persisted manager operator role reads back as lead", () => {
+  const sessionId = randomUUID();
+  assert.deepEqual(
+    readSessionMetadata([entry(operator(sessionId, "manager"))], sessionId),
+    { status: "available", metadata: operator(sessionId, "lead") },
+  );
+});
+
 test("foreign records are ignored before their payload is validated", () => {
   const sessionId = randomUUID();
   const foreign = randomUUID();
@@ -114,7 +122,7 @@ test("foreign records are ignored before their payload is validated", () => {
       ],
       sessionId,
     ),
-    { status: "available", metadata: operator(sessionId, "manager") },
+    { status: "available", metadata: operator(sessionId, "lead") },
   );
   // A fork holding only its source's records is not classified by them.
   assert.deepEqual(

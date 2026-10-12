@@ -12,6 +12,7 @@ import type {
   ResultRecord,
   ManagedAgentState,
 } from "./mailbox.ts";
+import { RADAR_SUBJECT_SOURCE } from "./radar-execution.ts";
 import type { ExecHandler, FixtureIdentity } from "./support.ts";
 import { claimProcessLock } from "./lock.ts";
 import { resultPath, resultRef } from "./storage.ts";
@@ -34,7 +35,6 @@ import support, {
   fakeContext,
   fakePi,
   fakeAgentContext,
-  herdrAlias,
   isAgentList,
   isApiSnapshot,
   isHerdrList,
@@ -46,6 +46,7 @@ import support, {
   listResponse,
   managedState,
   nativeSessions,
+  openedSessionPaths,
   agentControllerExecutor,
   readPendingAsk,
   readRequest,
@@ -54,6 +55,9 @@ import support, {
   realFs,
   watchedResultPaths,
   recoveryIdentity,
+  radarDaemon,
+  radarObservedFleet,
+  radarSpawnRecords,
   registerExtension,
   removeAsk,
   removeRequest,
@@ -64,7 +68,12 @@ import support, {
   runScopedHerdrAlias,
   setLeadEnvironment,
   setAgentEnvironment,
+  ensureRadarDaemon,
+  delegateRadarChild,
+  listAgentStates,
+  startRadarSession,
   startupExecutor,
+  testChildCommand,
   testTmpRoot,
   truncateModelText,
   agentMailboxPath,
@@ -78,13 +87,18 @@ const { updateConfig } = await import("./config.ts");
 // and the tests that exercise retention opt in or out explicitly.
 beforeEach(() => updateConfig("retainWorkers", false));
 const agentTool = (pi: ReturnType<typeof fakePi>, name: string) => {
-  const tool = pi.tools.find((candidate) => candidate.name === `agent_${name}`)!;
+  const tool = pi.tools.find(
+    (candidate) => candidate.name === `agent_${name}`,
+  )!;
   if (name !== "delegate" && name !== "continue") return tool;
   return {
     ...tool,
     execute: async (...args: Parameters<typeof tool.execute>) => {
       const params = args[1] as Record<string, unknown> | undefined;
-      if (typeof params?.task !== "string" || params.task.trimStart().startsWith("---"))
+      if (
+        typeof params?.task !== "string" ||
+        params.task.trimStart().startsWith("---")
+      )
         return tool.execute(...args);
       const next = [...args] as Parameters<typeof tool.execute>;
       next[1] = {
@@ -147,15 +161,18 @@ test("combined status reports a completed agent as pending, not active", async (
     requestId: string,
     text: string,
   ) =>
-    writeResult(mailbox, { version: 5, runId: state.runId,
-    requestId,
-    ownerSessionId: state.ownerSessionId,
-    workspaceId: state.workspaceId,
-    agentLabel: state.agentLabel,
-    paneId: state.paneId,
-    status: "completed",
-    text,
-    completedAt: Date.now(), });
+    writeResult(mailbox, {
+      version: 5,
+      runId: state.runId,
+      requestId,
+      ownerSessionId: state.ownerSessionId,
+      workspaceId: state.workspaceId,
+      agentLabel: state.agentLabel,
+      paneId: state.paneId,
+      status: "completed",
+      text,
+      completedAt: Date.now(),
+    });
   writeChildResult(trigger, mailboxes[1], triggerRequestId, "trigger");
   writeChildResult(pending, mailboxes[2], pendingRequestId, "pending");
   const entries: unknown[] = [
@@ -251,29 +268,40 @@ test("combined status reports a completed agent as pending, not active", async (
 
 test("conflicting same-request entries do not suppress an exact combined result", async (t) => {
   setLeadEnvironment();
+  await ensureRadarDaemon();
+  const childMailbox = agentMailboxPath(WORKSPACE, "queued-child");
+  resetAgentMailbox(childMailbox);
+  const childLaunch = await radarDaemon.adoptRetainedChild({
+    label: "queued-child",
+    runId: randomUUID(),
+    ownerSessionId: LEAD_SESSION_ID,
+    workspaceId: WORKSPACE,
+    mailbox: childMailbox,
+    pane: "queued-child-pane",
+  });
   const child = {
-    ...managedState(
-      "queued-child",
-      undefined,
-      recoveryIdentity("queued-child"),
-    ),
-    piSessionId: CHILD_SESSION_ID,
-    piSessionFile: "/tmp/queued-child.jsonl",
+    ...readAgentState(childMailbox)!,
     completedRequestId: REQUEST_ID,
   };
-  const childMailbox = agentMailboxPath(WORKSPACE, child.agentLabel);
-  resetAgentMailbox(childMailbox);
   writeAgentState(childMailbox, child);
-  writeResult(childMailbox, { version: 5, runId: child.runId,
-  requestId: REQUEST_ID,
-  ownerSessionId: child.ownerSessionId,
-  workspaceId: child.workspaceId,
-  agentLabel: child.agentLabel,
-  paneId: child.paneId,
-  status: "completed",
-  text: "queued child result",
-  completedAt: Date.now(), });
+  writeResult(childMailbox, {
+    version: 5,
+    runId: child.runId,
+    requestId: REQUEST_ID,
+    ownerSessionId: child.ownerSessionId,
+    workspaceId: child.workspaceId,
+    agentLabel: child.agentLabel,
+    paneId: child.paneId,
+    status: "completed",
+    text: "queued child result",
+    completedAt: Date.now(),
+  });
   const entries: unknown[] = [
+    {
+      type: "custom",
+      customType: "pi-herdsman-radar-spawn",
+      data: childLaunch,
+    },
     {
       type: "custom",
       customType: "pi-herdsman-agent-definition",
@@ -305,10 +333,8 @@ test("conflicting same-request entries do not suppress an exact combined result"
     },
   ];
   let queued = 0;
-  const lifecycle = cascadeExecutor([child]);
   const pi = fakePi({
     entries,
-    exec: lifecycle.exec,
     sendMessage: (message) => {
       if ((message as any).customType === "pi-herdsman-agent-result") queued++;
       else entries.push(message);
@@ -386,15 +412,18 @@ test("reload result recovery rejects wrong owners and replacement identities", a
   const label = "reload-proof-child";
   const identity = recoveryIdentity(label);
   const mailbox = agentMailboxPath(WORKSPACE, label);
-  const resultFor = (state: ManagedAgentState): ResultRecord => ({ version: 5, runId: state.runId,
-  requestId: REQUEST_ID,
-  ownerSessionId: state.ownerSessionId,
-  workspaceId: state.workspaceId,
-  agentLabel: state.agentLabel,
-  paneId: state.paneId,
-  status: "completed",
-  text: "must not replay",
-  completedAt: Date.now(), });
+  const resultFor = (state: ManagedAgentState): ResultRecord => ({
+    version: 5,
+    runId: state.runId,
+    requestId: REQUEST_ID,
+    ownerSessionId: state.ownerSessionId,
+    workspaceId: state.workspaceId,
+    agentLabel: state.agentLabel,
+    paneId: state.paneId,
+    status: "completed",
+    text: "must not replay",
+    completedAt: Date.now(),
+  });
 
   setLeadEnvironment();
   const wrongOwner = {
@@ -441,9 +470,10 @@ test("reload result recovery rejects wrong owners and replacement identities", a
   resetAgentMailbox(mailbox);
   writeAgentState(mailbox, oldState);
   writeResult(mailbox, resultFor(oldState));
-  const replacementLifecycle = cascadeExecutor([replacement]);
+  // The daemon reports the replacement generation's pane, so the generation the
+  // mailbox records is not the one it is holding.
+  observeFleet([{ state: replacement }]);
   const replacementPi = fakePi({
-    exec: replacementLifecycle.exec,
     persistMessages: true,
   });
   registerExtension!(replacementPi.pi as never);
@@ -458,7 +488,7 @@ test("reload result recovery rejects wrong owners and replacement identities", a
       ),
       true,
     );
-    assert.deepEqual(replacementLifecycle.closeOrder, []);
+    assert.deepEqual([...radarDaemon.closes.values()], []);
     assert.equal(readResult(mailbox, REQUEST_ID), undefined);
     assert.equal(readAgentState(mailbox), undefined);
   } finally {
@@ -467,818 +497,179 @@ test("reload result recovery rejects wrong owners and replacement identities", a
   }
 });
 
-test("malformed disappearance proof retains failed-launch cleanup evidence", async () => {
+test("an unresolved Radar launch retains its durable evidence and closes nothing", async () => {
   setLeadEnvironment();
   const label = "rollback-agent";
   const mailbox = agentMailboxPath(WORKSPACE, label);
-  let agentGetCount = 0;
-  let started = false;
-  let stopped = false;
-  let tabPresent = false;
-  let panePresent = false;
-  let malformedPostClosePaneList = false;
-  let runId = "";
-  let ownerSessionId = "";
-  const emptyList = () => {
-    const value = JSON.parse(listResponse(label));
-    value.agents = [];
-    return JSON.stringify({ id: AGENT_ID, result: value });
-  };
-  const pi = fakePi({
-    exec: (command, args) => {
-      if (command === "herdr" && args[0] === "--version")
-        return { stdout: "0.8.0", stderr: "", code: 0 };
-      if (command === "herdr" && args[0] === "agent" && args[1] === "get") {
-        const validating = args[2] === "pane-start";
-        if (validating) agentGetCount++;
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              agent: {
-                name: validating
-                  ? runScopedHerdrAlias(WORKSPACE, label, runId || AGENT_ID)
-                  : args[2],
-                pane_id: "pane-start",
-                tab_id: "registered-tab",
-                workspace_id: WORKSPACE,
-                cwd: "/tmp",
-                agent_session: {
-                  agent: "pi",
-                  kind: "id",
-                  source: "herdr:pi",
-                  value: validating
-                    ? "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
-                    : "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-                },
-              },
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      }
-      if (command !== "herdr") return { stdout: "{}", stderr: "", code: 0 };
-      if (isTabList(args))
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              tabs: tabPresent
-                ? [
-                    {
-                      tab_id: "registered-tab",
-                      label: "agents",
-                      workspace_id: WORKSPACE,
-                    },
-                  ]
-                : [],
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      if (args[0] === "tab" && args[1] === "create") {
-        for (let i = 0; i < args.length - 1; i++) {
-          if (args[i] !== "--env") continue;
-          const assignment = args[i + 1]!;
-          const separator = assignment.indexOf("=");
-          if (separator > 0) {
-            const key = assignment.slice(0, separator);
-            const value = assignment.slice(separator + 1);
-            if (key === "PI_HERDSMAN_RUN_ID") runId = value;
-            if (key === "PI_HERDSMAN_OWNER_SESSION_ID") ownerSessionId = value;
-          }
-        }
-        tabPresent = panePresent = true;
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              tab: {
-                tab_id: "registered-tab",
-                label: "agents",
-                workspace_id: WORKSPACE,
-              },
-              root_pane: {
-                pane_id: "pane-start",
-                terminal_id: "terminal-start",
-              },
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      }
-      if (isPaneList(args)) {
-        if (malformedPostClosePaneList) {
-          malformedPostClosePaneList = false;
-          return {
-            stdout: JSON.stringify({ id: AGENT_ID, result: {} }),
-            stderr: "",
-            code: 0,
-          };
-        }
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              panes: panePresent
-                ? [
-                    {
-                      pane_id: "pane-start",
-                      tab_id: "registered-tab",
-                      workspace_id: WORKSPACE,
-                      terminal_id: "terminal-start",
-                      cwd: "/tmp",
-                      foreground_cwd: "/tmp",
-                      agent_status: "unknown",
-                    },
-                  ]
-                : [],
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      }
-      if (args[0] === "pane" && args[1] === "get")
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              pane: {
-                pane_id: "pane-start",
-                tab_id: "registered-tab",
-                workspace_id: WORKSPACE,
-                terminal_id: "terminal-start",
-                cwd: "/tmp",
-                ...(stopped
-                  ? {}
-                  : {
-                      agent_session: {
-                        agent: "pi",
-                        kind: "id",
-                        source: "herdr:pi",
-                        value: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-                      },
-                    }),
-              },
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      if (args[0] === "pane" && args[1] === "process-info")
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              process_info: {
-                pane_id: "pane-start",
-                shell_pid: 123,
-                foreground_process_group_id: !started || stopped ? 123 : 456,
-                foreground_processes:
-                  !started || stopped
-                    ? [{ pid: 123, argv0: "/bin/zsh" }]
-                    : [{ pid: 456, argv0: "pi" }],
-              },
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      if (
-        args[0] === "pane" &&
-        (args[1] === "run" || args[1] === "wait-output")
-      ) {
-        if (args[1] === "run") {
-          const value = (key: string) =>
-            new RegExp(`${key}='([^']*)'`).exec(args.at(-1) ?? "")?.[1];
-          runId = value("PI_HERDSMAN_RUN_ID") ?? runId;
-          ownerSessionId =
-            value("PI_HERDSMAN_OWNER_SESSION_ID") ?? ownerSessionId;
-        }
-        return { stdout: "{}", stderr: "", code: 0 };
-      }
-      if (isAgentList(args) || isApiSnapshot(args))
-        return {
-          stdout:
-            started && !stopped
-              ? (() => {
-                  const value = JSON.parse(listResponse(label));
-                  const alias = runScopedHerdrAlias(WORKSPACE, label, runId);
-                  value.agents[0].herdr_agent = alias;
-                  value.agents[0].name = alias;
-                  value.agents[0].pane_id = "pane-start";
-                  value.agents[0].tab_id = "registered-tab";
-                  value.snapshot = {
-                    agents: value.agents,
-                    panes: [
-                      {
-                        pane_id: "pane-start",
-                        workspace_id: WORKSPACE,
-                        cwd: "/tmp",
-                        agent_session: value.agents[0].agent_session,
-                      },
-                    ],
-                  };
-                  return JSON.stringify({ id: AGENT_ID, result: value });
-                })()
-              : JSON.stringify({
-                  id: AGENT_ID,
-                  result: {
-                    ...JSON.parse(emptyList()).result,
-                    snapshot: { agents: [], panes: [] },
-                  },
-                }),
-          stderr: "",
-          code: 0,
-        };
-      if (isPaneClose(args))
-        throw new Error("created tab must not be closed through its root pane");
-      if (isTabClose(args)) {
-        assert.equal(args[2], "registered-tab");
-        assert.equal(tabPresent, true);
-        assert.equal(panePresent, true);
-        tabPresent = false;
-        panePresent = false;
-        malformedPostClosePaneList = true;
-        return { stdout: "{}", stderr: "", code: 0 };
-      }
-      if (isPreservePaneStop(args)) {
-        stopped = true;
-        return { stdout: "{}", stderr: "", code: 0 };
-      }
-      started = true;
-      writeAgentState(mailbox, { version: 5, runId,
-      ownerSessionId,
-      workspaceId: WORKSPACE,
-      agentLabel: label,
-      paneId: "pane-start",
-      piSessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-      piSessionFile: "/tmp/registered-agent.jsonl",
-      cwd: "/tmp",
-      updatedAt: Date.now(), });
-      return {
-        stdout: JSON.stringify({
-          id: AGENT_ID,
-          result: {
-            tab_id: "registered-tab",
-            tab_label: "agents",
-            pane_id: "pane-start",
-            cwd: "/tmp",
-            herdr_agent: herdrAlias(label),
-            created_tab: false,
-            created_pane: true,
-            agent: {
-              name: args[2],
-              pane_id: "pane-start",
-              tab_id: "registered-tab",
-              workspace_id: WORKSPACE,
-              cwd: "/tmp",
-              agent_session: {
-                agent: "pi",
-                kind: "id",
-                source: "herdr:pi",
-                value: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-              },
-            },
-            runtime_identity: {
-              herdr_agent: herdrAlias(label),
-              herdr_kind: "pi",
-              agent_definition: null,
-              model: null,
-              thinking: null,
-              cwd: "/tmp",
-              resumed: false,
-              session_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-              session_name: null,
-            },
-          },
-        }),
-        stderr: "",
-        code: 0,
-      };
-    },
-  });
+  const pi = fakePi();
   registerExtension!(pi.pi as never);
-  const result = await agentTool(pi, "delegate").execute(
-    "id",
-    {
-      definition: "agent",
-      label,
-      task: "fresh lifecycle task",
-    },
-    undefined,
-    undefined,
-    fakeContext(),
-  );
-  assert.equal(result.details.error.category, "rollback_failure");
-  assert.equal(result.details.truncated, false);
-  assert.equal(result.details.error.retryAttempted, true);
-  assert.equal(result.details.error.primary.category, "target_not_found");
-  assert.equal(
-    result.details.error.primary.message,
-    "live Herdr agent Pi session mismatch",
-  );
-  assert.match(
-    result.details.error.cleanup.message,
-    /pane list disappearance proof is unavailable/,
-  );
-  assert.match(
-    (result.content[0] as { text: string }).text,
-    /Primary:.*category=target_not_found/s,
-  );
-  assert.match(
-    (result.content[0] as { text: string }).text,
-    /Cleanup:.*operation=rollback/s,
-  );
-  assert.match(
-    (result.content[0] as { text: string }).text,
-    /Next action: Resolve the reported cleanup failure before retrying\./,
-  );
-  const rendered = agentTool(pi, "delegate").renderResult(
-    { content: result.content, details: result.details },
-    { expanded: true, isPartial: false },
-    { fg: (_color: string, text: string) => text },
-    {
-      args: {
-        definition: "agent",
-        task: "fresh lifecycle task",
-      },
-    },
-  );
-  assert.match(rendered.text, /category: rollback_failure/);
-  assert.match(
-    rendered.text,
-    /message: Agent launch failed and rollback was incomplete\./,
-  );
-  assert.match(
-    rendered.text,
-    /identity: label=rollback-agent, paneId=pane-start, tabId=registered-tab/,
-  );
-  assert.match(
-    rendered.text,
-    /next: Resolve the reported cleanup failure before retrying\./,
-  );
-  assert.match(
-    rendered.text,
-    /primary: category=target_not_found, message=live Herdr agent Pi session mismatch/,
-  );
-  assert.match(rendered.text, /cleanup: .*operation=rollback/);
-  assert.equal(agentGetCount, 1);
-  assert.equal(
-    pi.calls.some((args) => isPreservePaneStop(args)),
-    true,
-  );
-  assert.equal(
-    pi.calls.some((args) => isTabClose(args)),
-    true,
-  );
-  assert.equal(
-    pi.calls.some((args) => isPaneClose(args)),
-    false,
-  );
-  assert.equal(tabPresent, false);
-  assert.equal(panePresent, false);
-  assert.equal(readAgentState(mailbox)?.agentLabel, label);
-  assert.equal(
-    pi.entries.some(
-      (entry: any) => entry.customType === "pi_herdsman_cleanup_error",
-    ),
-    true,
-  );
-  const listed = await agentTool(pi, "list").execute(
-    "id",
-    {},
-    undefined,
-    undefined,
-    fakeContext(),
-  );
-  assert.equal(listed.details.agents.length, 1);
-  assert.equal(listed.details.agents[0].state, "lost");
-  assert.deepEqual(listed.details.agents[0].available_tools, ["agent_close"]);
-  assert.equal(listed.details.cleanup_errors, undefined);
-  pi.events.get("session_shutdown")?.[0]();
-  resetAgentMailbox(mailbox);
-});
-
-test("rollback requires disappearance proof after a successful close", async () => {
-  setLeadEnvironment();
-  const label = "persistent-close-agent";
-  const startup = startupExecutor(
-    label,
-    (count) =>
-      count === 1
-        ? "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
-        : DEFAULT_PI_SESSION_ID,
-    undefined,
-    undefined,
-    false,
-    undefined,
-    "/tmp",
-    AGENT_ID,
-  );
-  let closeSucceeded = false;
-  let paneRemainsAfterClose = false;
-  const pi = fakePi({
-    exec: (command, args, options) => {
-      const result = startup.exec(command, args, options);
-      if (command === "herdr" && isTabClose(args)) {
-        assert.equal(result.code, 0);
-        closeSucceeded = true;
-      }
-      if (command === "herdr" && isPaneList(args) && closeSucceeded) {
-        const payload = JSON.parse(result.stdout);
-        paneRemainsAfterClose = payload.result.panes.some(
-          (pane: { pane_id?: string }) => pane.pane_id === "startup-pane",
-        );
-      }
-      return result;
-    },
-  });
-  registerExtension!(pi.pi as never);
+  // The child registers with the launch's own token and then never acknowledges
+  // its generation: the daemon created the pane, the child is not ready, and the
+  // outcome is unknown. Nothing may be closed, replayed or handed an assignment.
+  radarDaemon.options.acknowledge = false;
+  // The launch's own readiness wait is what decides this, so the test bounds it
+  // instead of waiting out the production default.
+  const previousTimeout = process.env.PI_HERDSMAN_RADAR_LAUNCH_TIMEOUT_MS;
+  process.env.PI_HERDSMAN_RADAR_LAUNCH_TIMEOUT_MS = "400";
   try {
     const result = await agentTool(pi, "delegate").execute(
       "id",
-      {
-        definition: "agent",
-        label,
-        task: "leave cleanup evidence",
-      },
+      { definition: "agent", label, task: "keep the launch accountable" },
       undefined,
       undefined,
       fakeContext(),
     );
-    assert.equal(result.details.error.category, "rollback_failure");
-    assert.equal(result.details.error.primary.category, "target_not_found");
-    assert.equal(result.details.error.cleanup.category, "internal_failure");
-    assert.match(
-      result.details.error.cleanup.message,
-      /tab startup-tab did not disappear after close/,
-    );
-    assert.equal(result.details.error.ids.label, label);
-    assert.equal(result.details.error.ids.paneId, "startup-pane");
-    assert.equal(result.details.error.ids.tabId, "startup-tab");
-    assert.equal(closeSucceeded, true);
-    assert.equal(paneRemainsAfterClose, true);
-    assert.equal(readAgentState(startup.mailbox)?.agentLabel, label);
+    const error = result.details.error as any;
+    assert.equal(error.category, "pane_not_ready");
+    assert.equal(error.rollbackOccurred, false);
+    assert.equal(error.details.radarSpawn.unresolved, true);
+    assert.match(error.details.radarSpawn.requestId, /^[0-9a-f-]{36}$/);
+    assert.equal(typeof error.details.radarSpawn.generation, "string");
+    // One request id authored one pane, and an unknown outcome is never read as
+    // a failure to retry: the daemon's record is the only record of this spawn.
+    assert.equal(radarDaemon.spawns.length, 1);
     assert.equal(
-      pi.entries.some(
-        (entry: any) => entry.customType === "pi_herdsman_cleanup_error",
-      ),
-      true,
+      radarDaemon.spawns[0]!.request_id,
+      error.details.radarSpawn.requestId,
     );
+    assert.equal(radarDaemon.closes.size, 0);
+    // The launch record is written before the daemon is dialed, and the daemon's
+    // own binding is written before the launch waits for readiness: a reload reads
+    // this one request id, its subject and its pane back out of the session
+    // instead of the runtime cache. A failure payload is not evidence; these
+    // entries are.
+    const records = radarSpawnRecords(pi);
+    assert.deepEqual(
+      records.map((entry: any) => entry.data.stage),
+      ["requested", "bound"],
+    );
+    const record = (records.at(-1) as any).data;
+    assert.equal(record.requestId, error.details.radarSpawn.requestId);
+    assert.equal(record.generation, error.details.radarSpawn.generation);
+    assert.equal(record.agentId, radarDaemon.spawns[0]!.agent_id);
+    assert.equal(record.paneId, radarDaemon.spawns[0]!.pane);
+    assert.equal(typeof record.mailbox, "string");
+    assert.equal(typeof record.runId, "string");
+    // The child registered and wrote its own state, and the launch is still
+    // unresolved: a registered child is not a ready one, and nothing may be
+    // closed, replayed or handed the assignment for it.
+    assert.equal(readAgentState(mailbox)?.agentLabel, label);
   } finally {
-    pi.events.get("session_shutdown")?.[0]();
-    resetAgentMailbox(startup.mailbox);
+    radarDaemon.options.acknowledge = true;
+    if (previousTimeout === undefined)
+      delete process.env.PI_HERDSMAN_RADAR_LAUNCH_TIMEOUT_MS;
+    else process.env.PI_HERDSMAN_RADAR_LAUNCH_TIMEOUT_MS = previousTimeout;
+    resetAgentMailbox(mailbox);
   }
 });
 
-test("assignment rollback retains primary failure and actionable cleanup details", async () => {
+test("a refused Radar spawn rolls back nothing and leaves no phantom child", async () => {
+  setLeadEnvironment();
+  const label = "persistent-close-agent";
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  const pi = fakePi();
+  registerExtension!(pi.pi as never);
+  // A daemon-side refusal happens before any pane effect, so there is nothing to
+  // close, no edge to read back, and no child to hand work to.
+  radarDaemon.options.refuseSpawn = {
+    code: "refused",
+    message: "no pane was created for this launch",
+  };
+  try {
+    const result = await agentTool(pi, "delegate").execute(
+      "id",
+      { definition: "agent", label, task: "leave no phantom child" },
+      undefined,
+      undefined,
+      fakeContext(),
+    );
+    const error = result.details.error as any;
+    assert.equal(error.category, "pane_not_ready");
+    assert.equal(error.rollbackOccurred, false);
+    assert.match(error.message, /no pane was created for this launch/);
+    // The refusal names the launch it authored without calling the outcome
+    // unknown, and no pane may have been closed to "clean up" a launch that never
+    // created one.
+    assert.match(error.details.radarSpawn.requestId, /^[0-9a-f-]{36}$/);
+    assert.equal(error.details.radarSpawn.unresolved, undefined);
+    assert.equal(error.details.radarSpawn.agentId, undefined);
+    assert.equal(radarDaemon.closes.size, 0);
+    assert.equal(readAgentState(mailbox), undefined);
+  } finally {
+    radarDaemon.options.refuseSpawn = undefined;
+    resetAgentMailbox(mailbox);
+  }
+});
+
+test("a lost Radar spawn reply reuses the same request id instead of spawning twice", async () => {
   setLeadEnvironment();
   const label = "rollback-detail-agent";
   const mailbox = agentMailboxPath(WORKSPACE, label);
-  resetAgentMailbox(mailbox);
-  let runId = "";
-  let ownerSessionId = "";
-  let splitCreated = false;
-  const emptyList = () => {
-    const value = JSON.parse(listResponse(label));
-    value.agents = [];
-    return JSON.stringify({ id: AGENT_ID, result: value });
-  };
-  const pi = fakePi({
-    exec: (command, args) => {
-      if (command === "herdr" && args[0] === "--version")
-        return { stdout: "0.8.0", stderr: "", code: 0 };
-      if (command === "herdr" && args[0] === "agent" && args[1] === "get")
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              agent: {
-                name:
-                  args[2] === "detail-pane"
-                    ? runScopedHerdrAlias(WORKSPACE, label, runId || AGENT_ID)
-                    : args[2],
-                pane_id: "detail-pane",
-                tab_id: "registered-tab",
-                workspace_id: WORKSPACE,
-                cwd: "/tmp",
-                agent_session: {
-                  agent: "pi",
-                  kind: "id",
-                  source: "herdr:pi",
-                  value:
-                    args[2] === "detail-pane"
-                      ? "wrong-session"
-                      : "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-                },
-              },
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      if (command !== "herdr") return { stdout: "{}", stderr: "", code: 0 };
-      if (isTabList(args))
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              tabs: [
-                {
-                  tab_id: "registered-tab",
-                  label: "agents",
-                  workspace_id: WORKSPACE,
-                },
-              ],
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      if (isPaneList(args))
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              panes: [
-                {
-                  pane_id: "detail-pane",
-                  tab_id: "registered-tab",
-                  workspace_id: WORKSPACE,
-                  terminal_id: "detail-terminal",
-                  cwd: "/tmp",
-                  foreground_cwd: "/tmp",
-                  agent_status: splitCreated ? "unknown" : "idle",
-                },
-              ],
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      if (args[0] === "tab" && args[1] === "create") {
-        splitCreated = true;
-        for (let i = 0; i < args.length - 1; i++) {
-          if (args[i] !== "--env") continue;
-          const assignment = args[i + 1]!;
-          if (assignment.startsWith("PI_HERDSMAN_RUN_ID="))
-            runId = assignment.slice(19);
-          if (assignment.startsWith("PI_HERDSMAN_OWNER_SESSION_ID="))
-            ownerSessionId = assignment.slice(29);
-        }
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              tab: { tab_id: "registered-tab" },
-              root_pane: {
-                pane_id: "detail-pane",
-                terminal_id: "detail-terminal",
-              },
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      }
-      if (args[0] === "pane" && args[1] === "layout")
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              layout: {
-                workspace_id: WORKSPACE,
-                tab_id: "registered-tab",
-                panes: [
-                  { pane_id: "detail-pane", rect: { width: 100, height: 40 } },
-                ],
-              },
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      if (args[0] === "pane" && args[1] === "split") {
-        splitCreated = true;
-        for (let i = 0; i < args.length - 1; i++) {
-          if (args[i] !== "--env") continue;
-          const assignment = args[i + 1]!;
-          const separator = assignment.indexOf("=");
-          if (separator <= 0) continue;
-          const key = assignment.slice(0, separator);
-          const value = assignment.slice(separator + 1);
-          if (key === "PI_HERDSMAN_RUN_ID") runId = value;
-          if (key === "PI_HERDSMAN_OWNER_SESSION_ID") ownerSessionId = value;
-        }
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              pane: { pane_id: "detail-pane", terminal_id: "detail-terminal" },
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      }
-      if (args[0] === "pane" && args[1] === "get")
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              pane: {
-                pane_id: "detail-pane",
-                tab_id: "registered-tab",
-                workspace_id: WORKSPACE,
-                terminal_id: "detail-terminal",
-                cwd: "/tmp",
-                agent_session: {
-                  agent: "pi",
-                  kind: "id",
-                  source: "herdr:pi",
-                  value: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-                },
-              },
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      if (args[0] === "pane" && args[1] === "process-info")
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              process_info: {
-                pane_id: "detail-pane",
-                shell_pid: 123,
-                foreground_process_group_id: 123,
-                foreground_processes: [{ pid: 123, argv0: "/bin/zsh" }],
-              },
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      if (
-        args[0] === "pane" &&
-        (args[1] === "run" || args[1] === "wait-output")
-      ) {
-        if (args[1] === "run") {
-          const value = (key: string) =>
-            new RegExp(`${key}='([^']*)'`).exec(args.at(-1) ?? "")?.[1];
-          runId = value("PI_HERDSMAN_RUN_ID") ?? runId;
-          ownerSessionId =
-            value("PI_HERDSMAN_OWNER_SESSION_ID") ?? ownerSessionId;
-        }
-        return { stdout: "{}", stderr: "", code: 0 };
-      }
-      if (isAgentList(args) || isApiSnapshot(args))
-        return {
-          stdout: (() => {
-            const value = JSON.parse(listResponse(label));
-            const alias = runScopedHerdrAlias(WORKSPACE, label, runId);
-            value.agents[0].herdr_agent = alias;
-            value.agents[0].name = alias;
-            value.agents[0].pane_id = "detail-pane";
-            value.agents[0].tab_id = "registered-tab";
-            value.agents.push({
-              herdr_kind: "pi",
-              workspace_id: WORKSPACE,
-              pane_id: "unmanaged-root-pane",
-              cwd: "/tmp",
-            });
-            value.snapshot = {
-              agents: value.agents,
-              panes: [
-                {
-                  pane_id: "detail-pane",
-                  workspace_id: WORKSPACE,
-                  cwd: "/tmp",
-                  agent_session: value.agents[0].agent_session,
-                },
-                {
-                  pane_id: "unmanaged-root-pane",
-                  workspace_id: WORKSPACE,
-                  cwd: "/tmp",
-                },
-              ],
-            };
-            return JSON.stringify({ id: AGENT_ID, result: value });
-          })(),
-          stderr: "",
-          code: 0,
-        };
-      if (isPreservePaneStop(args))
-        return {
-          stdout: "",
-          stderr: `error: preserved pane identity did not settle: {"pane_id":"detail-pane","workspace_id":"${WORKSPACE}"}`,
-          code: 1,
-        };
-      writeAgentState(mailbox, { version: 5, runId,
-      ownerSessionId,
-      workspaceId: WORKSPACE,
-      agentLabel: label,
-      paneId: "detail-pane",
-      piSessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-      piSessionFile: "/tmp/registered-agent.jsonl",
-      cwd: "/tmp",
-      updatedAt: Date.now(), });
-      return {
-        stdout: JSON.stringify({
-          id: AGENT_ID,
-          result: {
-            tab_id: "registered-tab",
-            tab_label: "agents",
-            pane_id: "detail-pane",
-            cwd: "/tmp",
-            herdr_agent: herdrAlias(label),
-            created_tab: false,
-            created_pane: true,
-            agent: {
-              name: args[2],
-              pane_id: "detail-pane",
-              tab_id: "registered-tab",
-              workspace_id: WORKSPACE,
-              cwd: "/tmp",
-              agent_session: {
-                agent: "pi",
-                kind: "id",
-                source: "herdr:pi",
-                value: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-              },
-            },
-            runtime_identity: {
-              herdr_agent: herdrAlias(label),
-              herdr_kind: "pi",
-              agent_definition: null,
-              model: null,
-              thinking: null,
-              cwd: "/tmp",
-              resumed: false,
-              session_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-              session_name: null,
-            },
-          },
-        }),
-        stderr: "",
-        code: 0,
-      };
-    },
-  });
+  const pi = fakePi();
   registerExtension!(pi.pi as never);
-  const result = await agentTool(pi, "delegate").execute(
-    "id",
-    {
-      definition: "agent",
-      label,
-      task: "rollback details",
-    },
-    undefined,
-    undefined,
-    fakeContext(),
-  );
-  assert.equal(result.details.error.category, "rollback_failure");
-  assert.equal(result.details.error.primary.category, "target_not_found");
-  assert.match(result.details.error.primary.message, /integration|session/i);
-  assert.equal(result.details.error.cleanup.category, "internal_failure");
-  assert.equal(result.details.error.ids.label, label);
-  assert.equal(result.details.error.ids.paneId, "detail-pane");
-  assert.match(result.details.error.cleanup.message, /preserved pane identity/);
-  assert.equal(
-    pi.calls.some((args) => isPaneClose(args)),
-    false,
-  );
-  assert.equal(readAgentState(mailbox)?.agentLabel, label);
-  assert.equal(
-    pi.entries.some(
-      (entry: any) => entry.customType === "pi_herdsman_cleanup_error",
-    ),
-    true,
-  );
-  pi.events.get("session_shutdown")?.[0]();
-  resetAgentMailbox(mailbox);
+  // The reply to the spawn never arrives. The durable record authored one request
+  // id and the daemon recorded exactly one edge under it, so the launch has to
+  // resolve from that edge rather than asking for a second pane and child.
+  radarDaemon.options.dropSpawnReply = true;
+  try {
+    const result = await agentTool(pi, "delegate").execute(
+      "id",
+      { definition: "agent", label, task: "resolve from the daemon's record" },
+      undefined,
+      undefined,
+      fakeContext(),
+    );
+    // The lost reply resolved to the same launch: one request id made one pane
+    // and one child, so the launch is ready rather than retried under a new id.
+    assert.equal(result.details.ok, true);
+    assert.equal(radarDaemon.spawns.length, 1);
+    assert.match(radarDaemon.spawns[0]!.request_id, /^[0-9a-f-]{36}$/);
+    assert.equal(radarDaemon.closes.size, 0);
+    // The durable records carry one request id - the one authored before the
+    // reply was lost - and the launch's final stage, so a reload rebuilds this
+    // child from the session rather than from the runtime cache.
+    const records = radarSpawnRecords(pi);
+    assert.ok(records.length >= 1);
+    assert.equal(
+      new Set(records.map((entry: any) => entry.data.requestId)).size,
+      1,
+    );
+    assert.equal(
+      (records.at(-1) as any).data.requestId,
+      radarDaemon.spawns[0]!.request_id,
+    );
+    assert.equal((records.at(-1) as any).data.stage, "bound");
+    assert.equal(readAgentState(mailbox)?.agentLabel, label);
+  } finally {
+    radarDaemon.options.dropSpawnReply = false;
+    resetAgentMailbox(mailbox);
+  }
 });
 
-test("recovery requires the official session and retries one failed delivery", async (t) => {
+test("recovery retries one failed delivery", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   setLeadEnvironment();
+  await ensureRadarDaemon();
   const label = "recovery-agent";
-  const identity = {
-    ...recoveryIdentity(label),
-    piSessionFile: join(testTmpRoot, `${label}-session.jsonl`),
-  };
   const mailbox = agentMailboxPath(WORKSPACE, label);
-  writeFileSync(identity.piSessionFile, "{}", "utf8");
   resetAgentMailbox(mailbox);
-  const retryState = managedState(label, undefined, identity);
-  retryState.completedRequestId = REQUEST_ID;
+  const launch = await radarDaemon.adoptRetainedChild({
+    label,
+    runId: randomUUID(),
+    ownerSessionId: LEAD_SESSION_ID,
+    workspaceId: WORKSPACE,
+    mailbox,
+    pane: `${label}-pane`,
+  });
+  const retryState = {
+    ...readAgentState(mailbox)!,
+    completedRequestId: REQUEST_ID,
+  };
   writeAgentState(mailbox, retryState);
+  const identity = {
+    piSessionId: retryState.piSessionId,
+    paneId: retryState.paneId,
+  };
   const scoutText = "scout discovered SECRET implementation details";
   const scoutPresentation = truncateModelText(scoutText, {
     keep: "head",
@@ -1289,43 +680,26 @@ test("recovery requires the official session and retries one failed delivery", a
   });
   assert.equal(scoutPresentation.resultRef, `result:${REQUEST_ID}`);
   assert.equal(readFileSync(resultPath(REQUEST_ID), "utf8"), scoutText);
-  const result: ResultRecord = { version: 5, runId: AGENT_ID,
-  requestId: REQUEST_ID,
-  ownerSessionId: LEAD_SESSION_ID,
-  workspaceId: WORKSPACE,
-  agentLabel: label,
-  paneId: identity.paneId,
-  status: "completed",
-  text: scoutText,
-  completedAt: Date.now(), };
+  const result: ResultRecord = {
+    version: 5,
+    runId: retryState.runId,
+    requestId: REQUEST_ID,
+    ownerSessionId: LEAD_SESSION_ID,
+    workspaceId: WORKSPACE,
+    agentLabel: label,
+    paneId: identity.paneId,
+    status: "completed",
+    text: scoutText,
+    completedAt: Date.now(),
+  };
   writeResult(mailbox, result);
-  const mismatch = fakePi({
-    exec: leadExec(
-      label,
-      "working",
-      "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
-      undefined,
-      identity.piSessionId,
-      identity,
-    ),
-  });
-  registerExtension!(mismatch.pi as never);
-  await mismatch.events.get("session_start")![0](
-    undefined,
-    fakeContext(mismatch.entries),
-  );
-  t.mock.timers.tick(250);
-  await Promise.resolve();
-  assert.equal(mismatch.sent.length, 0);
-  assert.ok(readResult(mailbox, REQUEST_ID));
-  mismatch.events.get("session_shutdown")?.[0]();
 
-  resetAgentMailbox(mailbox);
-  const removalState = managedState(label, undefined, identity);
-  removalState.completedRequestId = REQUEST_ID;
+  const removalState = {
+    ...readAgentState(mailbox)!,
+    completedRequestId: REQUEST_ID,
+  };
   writeAgentState(mailbox, removalState);
   writeResult(mailbox, result);
-  const lifecycle = cascadeExecutor([removalState]);
   let attempts = 0;
   let delivered = "";
   let deliveredDetails: any;
@@ -1333,6 +707,11 @@ test("recovery requires the official session and retries one failed delivery", a
   let successful = 0;
   const previousRequestId = randomUUID();
   const entries: unknown[] = [
+    {
+      type: "custom",
+      customType: "pi-herdsman-radar-spawn",
+      data: launch,
+    },
     {
       customType: "pi-herdsman-agent-result",
       details: {
@@ -1345,7 +724,6 @@ test("recovery requires the official session and retries one failed delivery", a
   ];
   const recovering = fakePi({
     entries,
-    exec: lifecycle.exec,
     sendMessage: (message) => {
       if ((message as any).customType === "pi-herdsman-agent-result") {
         delivered = String((message as any).content ?? "");
@@ -1405,10 +783,10 @@ test("recovery requires the official session and retries one failed delivery", a
   assert.equal(deliveredDetails.agentDefinition, "agent");
   assert.equal(deliveredDetails.resultIndex, 2);
   assert.equal(deliveredDetails.resultRef, `result:${REQUEST_ID}`);
-  assert.equal(readResult(mailbox, REQUEST_ID), undefined);
-  assert.deepEqual(lifecycle.closeOrder, [label]);
+  // The durable result is retained until the assignment settles; the cleanup is
+  // what the redelivery tests cover. This test is about the retry.
+  assert.ok(readResult(mailbox, REQUEST_ID));
   recovering.events.get("session_shutdown")?.[0]();
-  realFs.rmSync(identity.piSessionFile, { force: true });
 });
 
 test("in-place branch history does not reuse a result index", async () => {
@@ -1426,15 +804,18 @@ test("in-place branch history does not reuse a result index", async () => {
   realFs.writeFileSync(identity.piSessionFile, "{}", "utf8");
   resetAgentMailbox(mailbox);
   writeAgentState(mailbox, state);
-  writeResult(mailbox, { version: 5, runId: state.runId,
-  requestId: REQUEST_ID,
-  ownerSessionId: state.ownerSessionId,
-  workspaceId: state.workspaceId,
-  agentLabel: state.agentLabel,
-  paneId: state.paneId,
-  status: "completed",
-  text: "new branch result",
-  completedAt: Date.now(), });
+  writeResult(mailbox, {
+    version: 5,
+    runId: state.runId,
+    requestId: REQUEST_ID,
+    ownerSessionId: state.ownerSessionId,
+    workspaceId: state.workspaceId,
+    agentLabel: state.agentLabel,
+    paneId: state.paneId,
+    status: "completed",
+    text: "new branch result",
+    completedAt: Date.now(),
+  });
   const firstRequestId = randomUUID();
   const secondRequestId = randomUUID();
   const first = {
@@ -1489,57 +870,60 @@ test("in-place branch history does not reuse a result index", async () => {
 
 test("completed and failed one-shot agents converge after durable delivery", async (t) => {
   setLeadEnvironment();
-  const children = [
-    ["converge-child-one", REQUEST_ID],
-    ["converge-child-two", randomUUID()],
-  ].map(([label, requestId], index) => {
-    const identity = recoveryIdentity(label);
-    identity.piSessionFile = join(testTmpRoot, `${label}.jsonl`);
-    if (index === 1)
-      identity.piSessionId = "11111111-1111-4111-8111-111111111111";
-    return {
-      ...managedState(label, undefined, identity),
-      completedRequestId: requestId,
-    };
-  });
-  const mailboxes = children.map((child) =>
-    agentMailboxPath(WORKSPACE, child.agentLabel),
-  );
-  for (const child of children)
-    realFs.writeFileSync(child.piSessionFile!, "{}", "utf8");
-  for (const [index, [child, mailbox]] of children
-    .map((child, index) => [child, mailboxes[index]] as const)
-    .entries()) {
-    resetAgentMailbox(mailbox);
-    writeAgentState(mailbox, child);
-    writeResult(mailbox, { version: 5, runId: child.runId,
-    requestId: child.completedRequestId!,
-    ownerSessionId: child.ownerSessionId,
-    workspaceId: child.workspaceId,
-    agentLabel: child.agentLabel,
-    paneId: child.paneId,
-    status: index === 0 ? "completed" : "failed",
-    ...(index === 0
-      ? { text: child.agentLabel }
-      : {
-          error: {
-            code: "empty_result" as const,
-            message: "agent returned no result",
-          },
-        }),
-    completedAt: Date.now(), });
-  }
-  const entries: unknown[] = [
-    {
-      customType: "pi-herdsman-agent-result",
-      details: resultEntryDetails(children[0], children[0].completedRequestId!),
-    },
+  await ensureRadarDaemon();
+  const specs = [
+    { label: "converge-child-one", requestId: REQUEST_ID, status: "completed" as const },
+    { label: "converge-child-two", requestId: randomUUID(), status: "failed" as const },
   ];
-  const lifecycle = cascadeExecutor(children);
+  const entries: unknown[] = [];
+  const children = [];
+  for (const spec of specs) {
+    const mailbox = agentMailboxPath(WORKSPACE, spec.label);
+    resetAgentMailbox(mailbox);
+    const launch = await radarDaemon.adoptRetainedChild({
+      label: spec.label,
+      runId: randomUUID(),
+      ownerSessionId: LEAD_SESSION_ID,
+      workspaceId: WORKSPACE,
+      mailbox,
+      pane: `${spec.label}-pane`,
+    });
+    entries.push({
+      type: "custom",
+      customType: "pi-herdsman-radar-spawn",
+      data: launch,
+    });
+    const state = readAgentState(mailbox)!;
+    realFs.writeFileSync(state.piSessionFile!, "{}", "utf8");
+    writeAgentState(mailbox, { ...state, completedRequestId: spec.requestId });
+    writeResult(mailbox, {
+      version: 5,
+      runId: state.runId,
+      requestId: spec.requestId,
+      ownerSessionId: state.ownerSessionId,
+      workspaceId: state.workspaceId,
+      agentLabel: state.agentLabel,
+      paneId: state.paneId,
+      status: spec.status,
+      ...(spec.status === "completed"
+        ? { text: spec.label }
+        : {
+            error: {
+              code: "empty_result" as const,
+              message: "agent returned no result",
+            },
+          }),
+      completedAt: Date.now(),
+    });
+    children.push({ state, mailbox, requestId: spec.requestId, pane: `${spec.label}-pane` });
+  }
+  entries.push({
+    customType: "pi-herdsman-agent-result",
+    details: resultEntryDetails(children[0]!.state, children[0]!.requestId),
+  });
   let deliveries = 0;
   const pi = fakePi({
     entries,
-    exec: lifecycle.exec,
     sendMessage: (message) => {
       if ((message as any).customType === "pi-herdsman-agent-result")
         deliveries++;
@@ -1547,156 +931,160 @@ test("completed and failed one-shot agents converge after durable delivery", asy
   });
   t.mock.timers.enable({ apis: ["setTimeout"] });
   registerExtension!(pi.pi as never);
+  const closedPanes = () =>
+    [...radarDaemon.closes.values()].map((close) => close.pane);
   try {
-    await pi.events.get("session_start")![0](undefined, fakeContext(entries));
-    for (let index = 0; index < 5; index++)
-      await new Promise<void>((resolve) => setImmediate(resolve));
+    await startRadarSession(pi, fakeContext(entries));
+    await settleUntil(() => closedPanes().length === 1);
     assert.equal(deliveries, 1);
-    assert.deepEqual(lifecycle.closeOrder, [children[0].agentLabel]);
-    assert.ok(readResult(mailboxes[1], children[1].completedRequestId!));
+    assert.deepEqual(closedPanes(), [children[0]!.pane]);
+    assert.ok(readResult(children[1]!.mailbox, children[1]!.requestId));
 
     entries.push({
       customType: "pi-herdsman-agent-result",
-      details: resultEntryDetails(children[1], children[1].completedRequestId!),
+      details: resultEntryDetails(children[1]!.state, children[1]!.requestId),
     });
     t.mock.timers.tick(1000);
-    for (let index = 0; index < 10; index++)
-      await new Promise<void>((resolve) => setImmediate(resolve));
+    await settleUntil(() => readAgentState(children[1]!.mailbox) === undefined);
 
     assert.deepEqual(
-      new Set(lifecycle.closeOrder),
-      new Set(children.map((child) => child.agentLabel)),
+      new Set(closedPanes()),
+      new Set(children.map((child) => child.pane)),
       JSON.stringify({
-        live: [...lifecycle.live.keys()],
-        states: mailboxes.map((mailbox) => readAgentState(mailbox)),
-        results: children.map((child, index) =>
-          readResult(mailboxes[index], child.completedRequestId!),
-        ),
+        closes: [...radarDaemon.closes.values()],
+        states: children.map((child) => readAgentState(child.mailbox)),
       }),
     );
-    for (const mailbox of mailboxes)
-      assert.equal(readAgentState(mailbox), undefined);
+    for (const child of children)
+      assert.equal(readAgentState(child.mailbox), undefined);
     assert.equal(deliveries, 1);
   } finally {
     pi.events.get("session_shutdown")?.[0]();
-    for (const mailbox of mailboxes) resetAgentMailbox(mailbox);
-    for (const child of children)
-      realFs.rmSync(child.piSessionFile!, { force: true });
+    for (const child of children) resetAgentMailbox(child.mailbox);
   }
 });
 
-test("one-shot close failure retains the result for exact cleanup retry", async (t) => {
-  setLeadEnvironment();
+test("one-shot close failure retains the result for exact cleanup retry", async () => {
   const label = "close-retry-child";
-  const child = {
-    ...managedState(label, undefined, recoveryIdentity(label)),
-    completedRequestId: REQUEST_ID,
-  };
-  const mailbox = agentMailboxPath(WORKSPACE, label);
-  resetAgentMailbox(mailbox);
-  writeAgentState(mailbox, child);
-  writeResult(mailbox, { version: 5, runId: child.runId,
-  requestId: REQUEST_ID,
-  ownerSessionId: child.ownerSessionId,
-  workspaceId: child.workspaceId,
-  agentLabel: child.agentLabel,
-  paneId: child.paneId,
-  status: "completed",
-  text: "retry close",
-  completedAt: Date.now(), });
-  const entries: unknown[] = [];
-  const lifecycle = cascadeExecutor([child]);
-  let failClose = true;
   let deliveries = 0;
-  const pi = fakePi({
-    entries,
-    exec: (command, args) => {
-      if (failClose && isPaneClose(args)) {
-        failClose = false;
-        return { stdout: "{}", stderr: "close failed", code: 1 };
-      }
-      return lifecycle.exec(command, args);
-    },
+  const { pi, mailbox, requestId } = await radarChildFixture(label, {
     sendMessage: (message) => {
-      if ((message as any).customType === "pi-herdsman-agent-result") {
+      if ((message as any).customType === "pi-herdsman-agent-result")
         deliveries++;
-        entries.push({
-          customType: "pi-herdsman-agent-result",
-          details: resultEntryDetails(child, REQUEST_ID),
-        });
-      }
     },
   });
-  t.mock.timers.enable({ apis: ["setTimeout"] });
-  registerExtension!(pi.pi as never);
   try {
-    await pi.events.get("session_start")![0](undefined, fakeContext(entries));
-    for (let index = 0; index < 5; index++)
-      await new Promise<void>((resolve) => setImmediate(resolve));
+    const launched = readAgentState(mailbox)!;
+    writeResult(mailbox, {
+      version: 5,
+      runId: launched.runId,
+      requestId,
+      ownerSessionId: launched.ownerSessionId,
+      workspaceId: launched.workspaceId,
+      agentLabel: launched.agentLabel,
+      paneId: launched.paneId,
+      status: "completed",
+      text: "retry close",
+      completedAt: Date.now(),
+    });
+    // The training assignment is still live, so the result waits for its
+    // resolution rather than resolving the assignment by delivery.
+    watchedResultPaths.get(`${mailbox}/result-${requestId}.json`)?.({}, {});
+    await settleUntil(() => deliveries === 1);
     assert.equal(deliveries, 1);
-    assert.deepEqual(lifecycle.closeOrder, []);
-    assert.ok(readResult(mailbox, REQUEST_ID));
+    assert.ok(readResult(mailbox, requestId), "an unresolved result stays put");
 
-    for (let index = 0; index < 4; index++) {
-      t.mock.timers.tick(250);
-      for (let flush = 0; flush < 10; flush++)
-        await new Promise<void>((resolve) => setImmediate(resolve));
-    }
-    assert.equal(deliveries, 1);
-    assert.deepEqual(lifecycle.closeOrder, [label]);
+    // The daemon refuses the first close, which is the failure the retry exists
+    // for: the result stays exactly where the lead can still read it.
+    radarDaemon.options.refuseChildClose = true;
+    writeAgentState(mailbox, {
+      ...launched,
+      activeRequestId: undefined,
+      completedRequestId: requestId,
+    });
+    const recover = async () => {
+      for (const handler of pi.events.get("session_start") ?? [])
+        await handler(undefined, fakeContext(pi.entries));
+    };
+    await recover();
+    await settleUntil(() => radarDaemon.closes.size === 1);
+    assert.ok(
+      readResult(mailbox, requestId),
+      "a refused close keeps the result for an exact retry",
+    );
+
+    radarDaemon.options.refuseChildClose = false;
+    await recover();
+    await settleUntil(() => readResult(mailbox, requestId) === undefined);
+    assert.equal(readResult(mailbox, requestId), undefined);
+    assert.equal(deliveries, 1, "the retry does not deliver the result twice");
     assert.equal(readAgentState(mailbox), undefined);
+    assert.equal(radarDaemon.closes.size, 2);
   } finally {
     pi.events.get("session_shutdown")?.[0]();
+    radarDaemon.reset();
     resetAgentMailbox(mailbox);
   }
 });
-
 test("delivered-result cascade retries descendant mailbox cleanup failure", async (t) => {
   setLeadEnvironment();
-  const parent = {
-    ...managedState(
-      "cascade-mailbox-retry-parent",
-      undefined,
-      recoveryIdentity("cascade-mailbox-retry-parent"),
-    ),
-    piSessionId: PARENT_SESSION_ID,
-    piSessionFile: join(testTmpRoot, "cascade-mailbox-retry-parent.jsonl"),
-    completedRequestId: REQUEST_ID,
-  };
-  const child = {
-    ...managedState(
-      "cascade-mailbox-retry-child",
-      undefined,
-      recoveryIdentity("cascade-mailbox-retry-child"),
-    ),
-    ownerSessionId: parent.piSessionId,
-    piSessionId: CHILD_SESSION_ID,
-    piSessionFile: join(testTmpRoot, "cascade-mailbox-retry-child.jsonl"),
-  };
-  writeFileSync(parent.piSessionFile, "{}", "utf8");
-  writeFileSync(child.piSessionFile, "{}", "utf8");
-  const parentMailbox = agentMailboxPath(WORKSPACE, parent.agentLabel);
-  const childMailbox = agentMailboxPath(WORKSPACE, child.agentLabel);
+  await ensureRadarDaemon();
+  const parentMailbox = agentMailboxPath(WORKSPACE, "cascade-mailbox-retry-parent");
+  const childMailbox = agentMailboxPath(WORKSPACE, "cascade-mailbox-retry-child");
   resetAgentMailbox(parentMailbox);
   resetAgentMailbox(childMailbox);
   const obstruction = join(childMailbox, "stubborn-directory");
   realFs.mkdirSync(obstruction);
-  writeAgentState(parentMailbox, parent);
-  writeAgentState(childMailbox, child);
-  writeResult(parentMailbox, { version: 5, runId: parent.runId,
-  requestId: REQUEST_ID,
-  ownerSessionId: parent.ownerSessionId,
-  workspaceId: parent.workspaceId,
-  agentLabel: parent.agentLabel,
-  paneId: parent.paneId,
-  status: "completed",
-  text: "delivered parent result",
-  completedAt: Date.now(), });
-  const lifecycle = cascadeExecutor([parent, child]);
-  const entries: unknown[] = [];
+  const parentLaunch = await radarDaemon.adoptRetainedChild({
+    label: "cascade-mailbox-retry-parent",
+    runId: randomUUID(),
+    ownerSessionId: LEAD_SESSION_ID,
+    workspaceId: WORKSPACE,
+    mailbox: parentMailbox,
+    pane: "cascade-mailbox-retry-parent-pane",
+  });
+  const childLaunch = await radarDaemon.adoptRetainedChild({
+    label: "cascade-mailbox-retry-child",
+    runId: randomUUID(),
+    ownerSessionId: readAgentState(parentMailbox)!.piSessionId,
+    workspaceId: WORKSPACE,
+    mailbox: childMailbox,
+    pane: "cascade-mailbox-retry-child-pane",
+  });
+  const entries: unknown[] = [
+    {
+      type: "custom",
+      customType: "pi-herdsman-radar-spawn",
+      data: parentLaunch,
+    },
+    {
+      type: "custom",
+      customType: "pi-herdsman-radar-spawn",
+      data: childLaunch,
+    },
+  ];
+  const parent = readAgentState(parentMailbox)!;
+  const child = readAgentState(childMailbox)!;
+  realFs.writeFileSync(parent.piSessionFile!, "{}", "utf8");
+  realFs.writeFileSync(child.piSessionFile!, "{}", "utf8");
+  writeAgentState(parentMailbox, {
+    ...parent,
+    completedRequestId: REQUEST_ID,
+  });
+  writeResult(parentMailbox, {
+    version: 5,
+    runId: parent.runId,
+    requestId: REQUEST_ID,
+    ownerSessionId: parent.ownerSessionId,
+    workspaceId: parent.workspaceId,
+    agentLabel: parent.agentLabel,
+    paneId: parent.paneId,
+    status: "completed",
+    text: "delivered parent result",
+    completedAt: Date.now(),
+  });
   const pi = fakePi({
     entries,
-    exec: lifecycle.exec,
     sendMessage: (message) => {
       if ((message as any).customType === "pi-herdsman-agent-result")
         entries.push({
@@ -1707,12 +1095,13 @@ test("delivered-result cascade retries descendant mailbox cleanup failure", asyn
   });
   t.mock.timers.enable({ apis: ["setTimeout"] });
   registerExtension!(pi.pi as never);
+  const closedPanes = () =>
+    [...radarDaemon.closes.values()].map((close) => close.pane);
   try {
-    await pi.events.get("session_start")![0](undefined, fakeContext(entries));
-    for (let index = 0; index < 8; index++)
-      await new Promise<void>((resolve) => setImmediate(resolve));
+    await startRadarSession(pi, fakeContext(entries));
+    await settleUntil(() => closedPanes().length === 1);
 
-    assert.deepEqual(lifecycle.closeOrder, [child.agentLabel]);
+    assert.deepEqual(closedPanes(), ["cascade-mailbox-retry-child-pane"]);
     assert.ok(readAgentState(parentMailbox), "root must remain anchored");
     assert.deepEqual(
       readAgentState(childMailbox),
@@ -1735,62 +1124,69 @@ test("delivered-result cascade retries descendant mailbox cleanup failure", asyn
 
     realFs.rmSync(obstruction, { recursive: true, force: true });
     t.mock.timers.tick(250);
-    for (let index = 0; index < 10; index++)
-      await new Promise<void>((resolve) => setImmediate(resolve));
-    assert.deepEqual(lifecycle.closeOrder, [
-      child.agentLabel,
-      parent.agentLabel,
+    await settleUntil(() => readAgentState(parentMailbox) === undefined);
+    assert.deepEqual(closedPanes(), [
+      "cascade-mailbox-retry-child-pane",
+      "cascade-mailbox-retry-parent-pane",
     ]);
-    assert.equal(readAgentState(parentMailbox), undefined);
     assert.equal(readResult(parentMailbox, REQUEST_ID), undefined);
     assert.equal(readAgentState(childMailbox), undefined);
   } finally {
     pi.events.get("session_shutdown")?.[0]();
     resetAgentMailbox(parentMailbox);
     resetAgentMailbox(childMailbox);
-    realFs.rmSync(parent.piSessionFile!, { force: true });
-    realFs.rmSync(child.piSessionFile!, { force: true });
   }
 });
 
 test("recovery redelivers an unpersisted child result and then cleans it safely", async () => {
   setLeadEnvironment();
+  await ensureRadarDaemon();
+  const childMailbox = agentMailboxPath(WORKSPACE, "reload-result-child");
+  const siblingMailbox = agentMailboxPath(WORKSPACE, "reload-result-sibling");
+  resetAgentMailbox(childMailbox);
+  resetAgentMailbox(siblingMailbox);
+  const childLaunch = await radarDaemon.adoptRetainedChild({
+    label: "reload-result-child",
+    runId: randomUUID(),
+    ownerSessionId: LEAD_SESSION_ID,
+    workspaceId: WORKSPACE,
+    mailbox: childMailbox,
+    pane: "reload-result-child-pane",
+  });
   const child = {
-    ...managedState(
-      "reload-result-child",
-      undefined,
-      recoveryIdentity("reload-result-child"),
-    ),
+    ...readAgentState(childMailbox)!,
     completedRequestId: REQUEST_ID,
   };
+  writeAgentState(childMailbox, child);
   const sibling = {
     ...managedState("reload-result-sibling", randomUUID(), {
       ...recoveryIdentity("reload-result-sibling"),
       piSessionId: "11111111-1111-4111-8111-111111111111",
     }),
   };
-  const childMailbox = agentMailboxPath(WORKSPACE, child.agentLabel);
-  const siblingMailbox = agentMailboxPath(WORKSPACE, sibling.agentLabel);
-  resetAgentMailbox(childMailbox);
-  resetAgentMailbox(siblingMailbox);
-  writeAgentState(childMailbox, child);
   writeAgentState(siblingMailbox, sibling);
-  const result: ResultRecord = { version: 5, runId: child.runId,
-  requestId: REQUEST_ID,
-  ownerSessionId: child.ownerSessionId,
-  workspaceId: child.workspaceId,
-  agentLabel: child.agentLabel,
-  paneId: child.paneId,
-  status: "completed",
-  text: "durable child result",
-  completedAt: Date.now(), };
+  const result: ResultRecord = {
+    version: 5,
+    runId: child.runId,
+    requestId: REQUEST_ID,
+    ownerSessionId: child.ownerSessionId,
+    workspaceId: child.workspaceId,
+    agentLabel: child.agentLabel,
+    paneId: child.paneId,
+    status: "completed",
+    text: "durable child result",
+    completedAt: Date.now(),
+  };
   writeResult(childMailbox, result);
-  const lifecycle = cascadeExecutor([child, sibling]);
-  const firstEntries: unknown[] = [];
+  const spawnEntry = {
+    type: "custom",
+    customType: "pi-herdsman-radar-spawn",
+    data: childLaunch,
+  };
+  const firstEntries: unknown[] = [spawnEntry];
   let queued = 0;
   const first = fakePi({
     entries: firstEntries,
-    exec: lifecycle.exec,
     sendMessage: (message) => {
       if ((message as any).customType === "pi-herdsman-agent-result") queued++;
       else firstEntries.push(message);
@@ -1810,13 +1206,10 @@ test("recovery redelivers an unpersisted child result and then cleans it safely"
   } finally {
     first.events.get("session_shutdown")?.[0]();
   }
-  lifecycle.live.delete(child.agentLabel);
-
-  const recoveredEntries: unknown[] = [];
+  const recoveredEntries: unknown[] = [spawnEntry];
   let redeliveries = 0;
   const recovered = fakePi({
     entries: recoveredEntries,
-    exec: lifecycle.exec,
     sendMessage: (message) => {
       if ((message as any).customType === "pi-herdsman-agent-result") {
         redeliveries++;
@@ -1890,33 +1283,48 @@ test("recovery redelivers an unpersisted child result and then cleans it safely"
 
 test("settlement redelivers an unpersisted child result in the same session", async (t) => {
   setLeadEnvironment();
+  await ensureRadarDaemon();
 
   const label = "settled-redelivery-child";
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  resetAgentMailbox(mailbox);
+  const childLaunch = await radarDaemon.adoptRetainedChild({
+    label,
+    runId: randomUUID(),
+    ownerSessionId: LEAD_SESSION_ID,
+    workspaceId: WORKSPACE,
+    mailbox,
+    pane: `${label}-pane`,
+  });
   const child = {
-    ...managedState(label, undefined, recoveryIdentity(label)),
+    ...readAgentState(mailbox)!,
     completedRequestId: REQUEST_ID,
   };
-  const mailbox = agentMailboxPath(WORKSPACE, label);
-
-  resetAgentMailbox(mailbox);
   writeAgentState(mailbox, child);
-  writeResult(mailbox, { version: 5, runId: child.runId,
-  requestId: REQUEST_ID,
-  ownerSessionId: child.ownerSessionId,
-  workspaceId: child.workspaceId,
-  agentLabel: child.agentLabel,
-  paneId: child.paneId,
-  status: "completed",
-  text: "durable child result",
-  completedAt: Date.now(), });
+  writeResult(mailbox, {
+    version: 5,
+    runId: child.runId,
+    requestId: REQUEST_ID,
+    ownerSessionId: child.ownerSessionId,
+    workspaceId: child.workspaceId,
+    agentLabel: child.agentLabel,
+    paneId: child.paneId,
+    status: "completed",
+    text: "durable child result",
+    completedAt: Date.now(),
+  });
 
-  const lifecycle = cascadeExecutor([child]);
-  const entries: unknown[] = [];
+  const entries: unknown[] = [
+    {
+      type: "custom",
+      customType: "pi-herdsman-radar-spawn",
+      data: childLaunch,
+    },
+  ];
   let deliveries = 0;
 
   const pi = fakePi({
     entries,
-    exec: lifecycle.exec,
     sendMessage: (message) => {
       if ((message as any).customType !== "pi-herdsman-agent-result") return;
 
@@ -1968,7 +1376,10 @@ test("settlement redelivers an unpersisted child result in the same session", as
     );
 
     assert.equal(deliveries, 2);
-    assert.deepEqual(lifecycle.closeOrder, [label]);
+    assert.deepEqual(
+      [...radarDaemon.closes.values()].map((close) => close.pane),
+      [child.paneId],
+    );
 
     await pi.events.get("agent_settled")![0](undefined, context);
     await Promise.resolve();
@@ -1979,31 +1390,51 @@ test("settlement redelivers an unpersisted child result in the same session", as
   }
 });
 
-test("recovered no-live result removal retry never cleans up a replacement", async (t) => {
+test("recovered no-live result removal retry leaves a replacement's durable state alone", async (t) => {
   setLeadEnvironment();
+  await ensureRadarDaemon();
   const label = "no-live-removal-retry-agent";
-  const identity = recoveryIdentity(label);
-  const state = {
-    ...managedState(label, undefined, identity),
-    completedRequestId: REQUEST_ID,
-  };
   const mailbox = agentMailboxPath(WORKSPACE, label);
   resetAgentMailbox(mailbox);
+  const launch = await radarDaemon.adoptRetainedChild({
+    label,
+    runId: randomUUID(),
+    ownerSessionId: LEAD_SESSION_ID,
+    workspaceId: WORKSPACE,
+    mailbox,
+    pane: `${label}-pane`,
+  });
+  const state = {
+    ...readAgentState(mailbox)!,
+    completedRequestId: REQUEST_ID,
+    // Past the startup window with no pane reported: lost, not merely unproved.
+    updatedAt: Date.now() - 11 * 60_000,
+    lastActivityAt: Date.now() - 11 * 60_000,
+  };
   writeAgentState(mailbox, state);
-  writeResult(mailbox, { version: 5, runId: state.runId,
-  requestId: REQUEST_ID,
-  ownerSessionId: state.ownerSessionId,
-  workspaceId: state.workspaceId,
-  agentLabel: state.agentLabel,
-  paneId: state.paneId,
-  status: "completed",
-  text: "no live agent",
-  completedAt: Date.now(), });
-  const lifecycle = cascadeExecutor([]);
-  const entries: unknown[] = [];
+  writeResult(mailbox, {
+    version: 5,
+    runId: state.runId,
+    requestId: REQUEST_ID,
+    ownerSessionId: state.ownerSessionId,
+    workspaceId: state.workspaceId,
+    agentLabel: state.agentLabel,
+    paneId: state.paneId,
+    status: "completed",
+    text: "no live agent",
+    completedAt: Date.now(),
+  });
+  // The daemon reports no pane for this generation.
+  observeFleet([]);
+  const entries: unknown[] = [
+    {
+      type: "custom",
+      customType: "pi-herdsman-radar-spawn",
+      data: launch,
+    },
+  ];
   const pi = fakePi({
     entries,
-    exec: lifecycle.exec,
     sendMessage: (message) => {
       entries.push({
         customType: "pi-herdsman-agent-result",
@@ -2014,16 +1445,20 @@ test("recovered no-live result removal retry never cleans up a replacement", asy
   const replacement = {
     ...state,
     runId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
-    paneId: `${label}-replacement-pane`,
     piSessionId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
     piSessionFile: `/tmp/${label}-replacement.jsonl`,
+  };
+  replacement.startupAck = {
+    ...state.startupAck!,
+    runId: replacement.runId,
+    piSessionId: replacement.piSessionId,
   };
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const removalAttemptsBefore = support.resultRemovalAttempts;
   support.failNextResultRemoval = true;
   try {
     registerExtension!(pi.pi as never);
-    await pi.events.get("session_start")![0](undefined, fakeContext(entries));
+    await startRadarSession(pi, fakeContext(entries));
     assert.equal(support.failNextResultRemoval, false);
     assert.equal(support.resultRemovalAttempts, removalAttemptsBefore + 1);
     assert.equal(readResult(mailbox, REQUEST_ID)?.runId, state.runId);
@@ -2050,34 +1485,34 @@ test("recovered no-live result removal retry never cleans up a replacement", asy
     assert.equal(unresolved.details.cleanup_errors, undefined);
 
     const callsBeforeRetry = pi.calls.length;
-    lifecycle.live.set(label, replacement);
+    // A replacement generation takes the label *and its pane*: another run,
+    // another session, the same physical pane.
+    observeFleet([{ state: replacement }]);
     assert.notEqual(replacement.runId, state.runId);
-    assert.notEqual(replacement.paneId, state.paneId);
+    assert.equal(replacement.paneId, state.paneId);
     assert.notEqual(replacement.piSessionId, state.piSessionId);
     assert.deepEqual(readAgentState(mailbox), state);
     t.mock.timers.tick(250);
     for (let index = 0; index < 5; index++)
       await new Promise<void>((resolve) => setImmediate(resolve));
-    assert.equal(readResult(mailbox, REQUEST_ID), undefined);
-    assert.deepEqual(lifecycle.closeOrder, []);
+    await settleUntil(() => readResult(mailbox, REQUEST_ID) === undefined);
+    // The generation is lost, so its own durable state goes with it. The lead
+    // closes only the pane its own launch record names; whether that pane is now
+    // held by someone else is the daemon's call, which holds the spawn record and
+    // the pane evidence.
     assert.deepEqual(
-      pi.calls
-        .slice(callsBeforeRetry)
-        .filter(
-          (args) =>
-            isAgentList(args) ||
-            isPaneList(args) ||
-            isPaneClose(args) ||
-            isPreservePaneStop(args) ||
-            isHerdrList(args),
-        ),
-      [],
-      "no-live retry must not inspect or clean up the replacement",
+      [...radarDaemon.closes.values()].map((close) => close.pane),
+      [state.paneId],
     );
-    const callsAfterRetry = pi.calls.length;
+    assert.equal(
+      readAgentState(mailbox),
+      undefined,
+      "a lost generation's own mailbox goes with it",
+    );
+    const removalsAfterRetry = support.resultRemovalAttempts;
     t.mock.timers.tick(1000);
     await Promise.resolve();
-    assert.equal(pi.calls.length, callsAfterRetry);
+    assert.equal(support.resultRemovalAttempts, removalsAfterRetry);
     assert.equal(readResult(mailbox, REQUEST_ID), undefined);
 
     writeAgentState(mailbox, replacement);
@@ -2112,16 +1547,19 @@ test("controller reply submits the normal request and preserves the assignment",
     pendingAskId: "99999999-9999-4999-8999-999999999999",
   };
   writeAgentState(mailbox, waiting);
-  writeAsk(mailbox, { version: 5, askId: waiting.pendingAskId!,
-  requestId: REQUEST_ID,
-  runId: waiting.runId,
-  ownerSessionId: waiting.ownerSessionId,
-  workspaceId: waiting.workspaceId,
-  agentLabel: waiting.agentLabel,
-  paneId: waiting.paneId,
-  piSessionId: waiting.piSessionId,
-  question: "Choose ALPHA or BETA",
-  createdAt: Date.now(), });
+  writeAsk(mailbox, {
+    version: 5,
+    askId: waiting.pendingAskId!,
+    requestId: REQUEST_ID,
+    runId: waiting.runId,
+    ownerSessionId: waiting.ownerSessionId,
+    workspaceId: waiting.workspaceId,
+    agentLabel: waiting.agentLabel,
+    paneId: waiting.paneId,
+    piSessionId: waiting.piSessionId,
+    question: "Choose ALPHA or BETA",
+    createdAt: Date.now(),
+  });
   const replyFile = join(testTmpRoot, `${label}-decision.md`);
   realFs.writeFileSync(replyFile, "decision evidence");
   let submitted: RequestRecord | undefined;
@@ -2260,15 +1698,18 @@ test("controller cleanup barrier blocks newer work until stale acknowledgement c
   };
   writeAgentState(mailbox, staleState);
   const stalePath = join(mailbox, `request-${staleRequestId}.json`);
-  writeRequest(mailbox, { version: 5, runId: staleState.runId,
-  requestId: staleRequestId,
-  ownerSessionId: staleState.ownerSessionId,
-  workspaceId: WORKSPACE,
-  agentLabel: label,
-  paneId: identity.paneId,
-  kind: "task",
-  text: "already accepted",
-  createdAt: Date.now(), });
+  writeRequest(mailbox, {
+    version: 5,
+    runId: staleState.runId,
+    requestId: staleRequestId,
+    ownerSessionId: staleState.ownerSessionId,
+    workspaceId: WORKSPACE,
+    agentLabel: label,
+    paneId: identity.paneId,
+    kind: "task",
+    text: "already accepted",
+    createdAt: Date.now(),
+  });
   let submitted: RequestRecord | undefined;
   const pi = fakePi({
     exec: leadExec(
@@ -2341,189 +1782,74 @@ test("controller cleanup barrier blocks newer work until stale acknowledgement c
   }
 });
 
-test("lead recovery integration validation aborts with session shutdown", async () => {
-  setLeadEnvironment();
-  const label = "signal-recovery-agent";
-  const mailbox = agentMailboxPath(WORKSPACE, label);
-  resetAgentMailbox(mailbox);
-  writeAgentState(mailbox, managedState(label));
-  let integrationSignal: AbortSignal | undefined;
-  let integrationAborted = false;
-  const recovery = fakePi({
-    exec: async (command, args, options) => {
-      if (command === "herdr" && (isAgentList(args) || isApiSnapshot(args)))
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              agents: JSON.parse(listResponse(label, "working")).agents,
-              snapshot: {
-                agents: JSON.parse(listResponse(label, "working")).agents,
-                panes: [
-                  {
-                    pane_id: "registered-pane",
-                    workspace_id: WORKSPACE,
-                    cwd: "/tmp",
-                    agent_session: {
-                      source: "herdr:pi",
-                      agent: "pi",
-                      kind: "id",
-                      value: DEFAULT_PI_SESSION_ID,
-                    },
-                  },
-                ],
-              },
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      if (command === "herdr" && args[0] === "agent" && args[1] === "get") {
-        integrationSignal = options?.signal;
-        await new Promise<void>((resolve) => {
-          if (options?.signal?.aborted) {
-            integrationAborted = true;
-            resolve();
-            return;
-          }
-          options?.signal?.addEventListener(
-            "abort",
-            () => {
-              integrationAborted = true;
-              resolve();
-            },
-            { once: true },
-          );
-        });
-      }
-      return {
-        stdout: JSON.stringify({
-          id: AGENT_ID,
-          result: {
-            agent: {
-              name: herdrAlias(label),
-              pane_id: "registered-pane",
-              workspace_id: WORKSPACE,
-              cwd: "/tmp",
-              agent_session: {
-                kind: "id",
-                value: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-              },
-            },
-          },
-        }),
-        stderr: "",
-        code: 0,
-      };
-    },
-  });
-  registerExtension!(recovery.pi as never);
-  const pending = recovery.events.get("session_start")![0](
-    undefined,
-    fakeContext(),
-  );
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.ok(integrationSignal);
-  assert.equal(integrationSignal?.aborted, false);
-  recovery.events.get("session_shutdown")?.[0]();
-  await pending;
-  assert.equal(integrationSignal?.aborted, true);
-  assert.equal(integrationAborted, true);
-});
-
 test("parent close cascades child-first and reports a structured child failure", async () => {
   for (const failed of [false, true]) {
     setLeadEnvironment();
-    const parent = {
-      ...managedState(
-        "cascade-parent",
-        undefined,
-        recoveryIdentity("cascade-parent"),
-      ),
-      piSessionId: PARENT_SESSION_ID,
-      piSessionFile: "/tmp/cascade-parent.jsonl",
-    };
-    const child = {
-      ...managedState(
-        "cascade-child",
-        undefined,
-        recoveryIdentity("cascade-child"),
-      ),
-      ownerSessionId: parent.piSessionId,
-      piSessionId: CHILD_SESSION_ID,
-      piSessionFile: "/tmp/cascade-child.jsonl",
-    };
-    const parentMailbox = agentMailboxPath(WORKSPACE, parent.agentLabel);
-    const childMailbox = agentMailboxPath(WORKSPACE, child.agentLabel);
+    await ensureRadarDaemon();
+    const parentMailbox = agentMailboxPath(WORKSPACE, "cascade-parent");
+    const childMailbox = agentMailboxPath(WORKSPACE, "cascade-child");
     resetAgentMailbox(parentMailbox);
     resetAgentMailbox(childMailbox);
-    writeAgentState(parentMailbox, parent);
-    writeAgentState(childMailbox, child);
-    const lifecycle = cascadeExecutor([parent, child], {
-      failCloseLabel: failed ? child.agentLabel : undefined,
+    const parent = await radarDaemon.adoptRetainedChild({
+      label: "cascade-parent",
+      runId: randomUUID(),
+      ownerSessionId: LEAD_SESSION_ID,
+      workspaceId: WORKSPACE,
+      mailbox: parentMailbox,
+      pane: "cascade-parent-pane",
     });
-    const pi = fakePi({
-      exec: (command, args, options) => {
-        const result = lifecycle.exec(command, args, options);
-        if (command === "herdr" && isAgentList(args)) {
-          const value = JSON.parse(result.stdout);
-          const envelope = value.result ?? value;
-          envelope.agents.push({
-            herdr_kind: "pi",
-            workspace_id: WORKSPACE,
-            pane_id: "unmanaged-root-pane",
-            cwd: "/tmp",
-          });
-          return { ...result, stdout: JSON.stringify(value) };
-        }
-        return result;
-      },
+    // The child's owner is the parent's own session, which is what makes it a
+    // descendant of the parent rather than a direct child of the lead.
+    const child = await radarDaemon.adoptRetainedChild({
+      label: "cascade-child",
+      runId: randomUUID(),
+      ownerSessionId: readAgentState(parentMailbox)!.piSessionId,
+      workspaceId: WORKSPACE,
+      mailbox: childMailbox,
+      pane: "cascade-child-pane",
     });
+    const entries = [
+      { type: "custom", customType: "pi-herdsman-radar-spawn", data: parent },
+      { type: "custom", customType: "pi-herdsman-radar-spawn", data: child },
+    ];
+    radarDaemon.options.refuseChildClose = failed;
+    const pi = fakePi({});
     registerExtension!(pi.pi as never);
     try {
       const result = await agentTool(pi, "close").execute(
         "id",
-        { agent: parent.agentLabel },
+        { agent: "cascade-parent" },
         undefined,
         undefined,
-        fakeContext(),
+        fakeContext(entries),
+      );
+      const completed = [...radarDaemon.closes.values()].filter(
+        (close) => close.outcome === "completed",
       );
       if (!failed) {
-        assert.equal(result.details.ok, true);
+        assert.equal(result.details.ok, true, JSON.stringify(result.details));
         assert.equal(result.details.action, "close");
-        assert.equal(result.details.agent, parent.agentLabel);
-        assert.equal(result.details.truncated, false);
-        assert.ok(
-          (result.content[0] as { text: string }).text.includes(
-            `Close agent ${parent.agentLabel}.`,
-          ),
+        assert.equal(result.details.agent, "cascade-parent");
+        assert.deepEqual(
+          completed.map((close) => close.pane),
+          ["cascade-child-pane", "cascade-parent-pane"],
         );
-        const rendered = agentTool(pi, "close").renderResult(
-          { content: result.content, details: result.details },
-          { expanded: true, isPartial: false },
-          { fg: (_color: string, text: string) => text },
-          { args: { agent: parent.agentLabel } },
-        );
-        assert.match(rendered.text, new RegExp(`${parent.agentLabel} closed`));
-        assert.deepEqual(lifecycle.closeOrder, [
-          child.agentLabel,
-          parent.agentLabel,
-        ]);
         assert.equal(readAgentState(parentMailbox), undefined);
         assert.equal(readAgentState(childMailbox), undefined);
       } else {
-        assert.equal(result.details.error.category, "internal_failure");
-        assert.equal(result.details.error.ids.label, child.agentLabel);
+        assert.equal(result.details.error.category, "target_ambiguous");
+        assert.equal(result.details.error.ids.label, "cascade-child");
         assert.equal(
           result.details.error.details.parentLabel,
-          parent.agentLabel,
+          "cascade-parent",
         );
-        assert.deepEqual(lifecycle.closeOrder, []);
+        assert.deepEqual(completed, []);
         assert.ok(readAgentState(parentMailbox));
         assert.ok(readAgentState(childMailbox));
       }
     } finally {
       pi.events.get("session_shutdown")?.[0]();
+      radarDaemon.options.refuseChildClose = false;
       resetAgentMailbox(parentMailbox);
       resetAgentMailbox(childMailbox);
     }
@@ -2532,33 +1858,28 @@ test("parent close cascades child-first and reports a structured child failure",
 
 test("close returns a structured nonfatal mailbox cleanup warning", async () => {
   setLeadEnvironment();
-  const parent = managedState(
-    "cleanup-warning-parent",
-    undefined,
-    recoveryIdentity("cleanup-warning-parent"),
-  );
-  const mailbox = agentMailboxPath(WORKSPACE, parent.agentLabel);
-  resetAgentMailbox(mailbox);
-  writeAgentState(mailbox, parent);
-  realFs.mkdirSync(join(mailbox, "stubborn"));
-  const lifecycle = cascadeExecutor([parent]);
-  const pi = fakePi({ exec: lifecycle.exec });
+  const pi = fakePi({});
   registerExtension!(pi.pi as never);
+  await startRadarSession(pi);
+  const label = "cleanup-warning-child";
+  const child = await delegateRadarChild(pi, label);
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  realFs.mkdirSync(join(mailbox, "stubborn"));
   try {
     const result = await agentTool(pi, "close").execute(
       "id",
-      { agent: parent.agentLabel },
+      { agent: label },
       undefined,
       undefined,
-      fakeContext(),
+      fakeContext(pi.entries),
     );
-    assert.equal(result.details.ok, true);
+    assert.equal(result.details.ok, true, JSON.stringify(result.details));
     assert.match(result.details.cleanup_error, /mailbox cleanup failed/);
     assert.equal(result.details.cleanup_errors, undefined);
-    assert.deepEqual(lifecycle.closeOrder, [parent.agentLabel]);
+    assert.equal(radarDaemon.closes.size, 1);
     assert.deepEqual(
       readAgentState(mailbox),
-      parent,
+      child,
       "incomplete mailbox cleanup must preserve its durable identity anchor",
     );
     assert.ok(
@@ -2602,7 +1923,6 @@ test("lost parent pane absence preserves durable child ancestry", async () => {
     writeAgentState(childMailbox, child);
     const lifecycle = cascadeExecutor(
       parentPresent ? [parent, child] : [child],
-      parentPresent ? { omitAgentLabels: [parent.agentLabel] } : {},
     );
     const pi = fakePi({ exec: lifecycle.exec });
     registerExtension!(pi.pi as never);
@@ -2924,15 +2244,18 @@ test("result cleanup retains durable delivery across agent identity changes", as
   };
   resetAgentMailbox(mailbox);
   writeAgentState(mailbox, initial);
-  writeResult(mailbox, { version: 5, runId: initial.runId,
-  requestId: REQUEST_ID,
-  ownerSessionId: initial.ownerSessionId,
-  workspaceId: initial.workspaceId,
-  agentLabel: initial.agentLabel,
-  paneId: initial.paneId,
-  status: "completed",
-  text: "retain this result",
-  completedAt: Date.now(), });
+  writeResult(mailbox, {
+    version: 5,
+    runId: initial.runId,
+    requestId: REQUEST_ID,
+    ownerSessionId: initial.ownerSessionId,
+    workspaceId: initial.workspaceId,
+    agentLabel: initial.agentLabel,
+    paneId: initial.paneId,
+    status: "completed",
+    text: "retain this result",
+    completedAt: Date.now(),
+  });
   const entries: unknown[] = [];
   const lifecycle = cascadeExecutor([initial]);
   const pi = fakePi({
@@ -2982,15 +2305,18 @@ test("delivered result remains while agent state is active", async () => {
   writeAgentState(parentMailbox, parent);
   const activeState = managedState(label, REQUEST_ID);
   writeAgentState(mailbox, activeState);
-  writeResult(mailbox, { version: 5, runId: AGENT_ID,
-  requestId: REQUEST_ID,
-  ownerSessionId: LEAD_SESSION_ID,
-  workspaceId: WORKSPACE,
-  agentLabel: label,
-  paneId: "registered-pane",
-  status: "completed",
-  text: "anchor",
-  completedAt: Date.now(), });
+  writeResult(mailbox, {
+    version: 5,
+    runId: AGENT_ID,
+    requestId: REQUEST_ID,
+    ownerSessionId: LEAD_SESSION_ID,
+    workspaceId: WORKSPACE,
+    agentLabel: label,
+    paneId: "registered-pane",
+    status: "completed",
+    text: "anchor",
+    completedAt: Date.now(),
+  });
   const entries: unknown[] = [];
   const pi = fakePi({
     entries,
@@ -3043,15 +2369,18 @@ test("result delivery identifies retired sessions and honors the disabled settin
     const mailbox = agentMailboxPath(WORKSPACE, label);
     resetAgentMailbox(mailbox);
     writeAgentState(mailbox, child);
-    writeResult(mailbox, { version: 5, runId: child.runId,
-    requestId: REQUEST_ID,
-    ownerSessionId: child.ownerSessionId,
-    workspaceId: child.workspaceId,
-    agentLabel: child.agentLabel,
-    paneId: child.paneId,
-    status: "completed",
-    text: "completed child work",
-    completedAt: Date.now(), });
+    writeResult(mailbox, {
+      version: 5,
+      runId: child.runId,
+      requestId: REQUEST_ID,
+      ownerSessionId: child.ownerSessionId,
+      workspaceId: child.workspaceId,
+      agentLabel: child.agentLabel,
+      paneId: child.paneId,
+      status: "completed",
+      text: "completed child work",
+      completedAt: Date.now(),
+    });
     nativeSessions.set(identity.piSessionFile!, {
       id: identity.piSessionId,
       path: identity.piSessionFile!,
@@ -3149,15 +2478,18 @@ test("accepted result delivery survives session identity failure in status guida
     completedRequestId: REQUEST_ID,
   };
   writeAgentState(mailbox, resultState);
-  writeResult(mailbox, { version: 5, runId: AGENT_ID,
-  requestId: REQUEST_ID,
-  ownerSessionId: LEAD_SESSION_ID,
-  workspaceId: WORKSPACE,
-  agentLabel: label,
-  paneId: "registered-pane",
-  status: "completed",
-  text: "accepted before status failure",
-  completedAt: Date.now(), });
+  writeResult(mailbox, {
+    version: 5,
+    runId: AGENT_ID,
+    requestId: REQUEST_ID,
+    ownerSessionId: LEAD_SESSION_ID,
+    workspaceId: WORKSPACE,
+    agentLabel: label,
+    paneId: "registered-pane",
+    status: "completed",
+    text: "accepted before status failure",
+    completedAt: Date.now(),
+  });
   const entries: unknown[] = [];
   const context = fakeContext(entries);
   let identityLookupFailed = false;
@@ -3212,161 +2544,125 @@ test("accepted result delivery survives session identity failure in status guida
 test("result is removed after agent state reaches completed", async (t) => {
   setLeadEnvironment();
   const label = "completed-result-anchor-agent";
-  const mailbox = agentMailboxPath(WORKSPACE, label);
-  resetAgentMailbox(mailbox);
-  const activeState = managedState(label, REQUEST_ID);
-  writeAgentState(mailbox, activeState);
-  writeResult(mailbox, { version: 5, runId: AGENT_ID,
-  requestId: REQUEST_ID,
-  ownerSessionId: LEAD_SESSION_ID,
-  workspaceId: WORKSPACE,
-  agentLabel: label,
-  paneId: "registered-pane",
-  status: "completed",
-  text: "complete",
-  completedAt: Date.now(), });
-  const entries: unknown[] = [];
-  const lifecycle = cascadeExecutor([activeState]);
   const pi = fakePi({
-    entries,
-    exec: lifecycle.exec,
     sendMessage: () => {
       entries.push({
         customType: "pi-herdsman-agent-result",
-        details: resultEntryDetails(activeState, REQUEST_ID),
+        details: resultEntryDetails(state, requestId),
       });
     },
   });
+  const entries = pi.entries;
+  let state!: any;
+  let requestId!: string;
   registerExtension!(pi.pi as never);
-  t.mock.timers.enable({ apis: ["setTimeout"] });
-  await pi.events.get("session_start")![0](undefined, fakeContext(entries));
-  await Promise.resolve();
-  await Promise.resolve();
-  const completed = managedState(label);
-  completed.completedRequestId = REQUEST_ID;
-  const delivered = pi.sentMessageCalls.filter(
-    ({ message }) => (message as any).customType === "pi-herdsman-agent-result",
-  );
-  assert.equal(delivered.length, 1);
-  const durableResults = entries.filter(
-    (entry: any) =>
-      entry.customType === "pi-herdsman-agent-result" &&
-      entry.details?.requestId === REQUEST_ID,
-  );
-  assert.equal(durableResults.length, 1);
-  assert.deepEqual(
-    durableResults[0].details,
-    resultEntryDetails(activeState, REQUEST_ID),
-  );
-  assert.equal(readAgentState(mailbox)?.activeRequestId, REQUEST_ID);
-  const pending = await agentTool(pi, "list").execute(
-    "id",
-    {},
-    undefined,
-    undefined,
-    fakeContext(entries),
-  );
-  assert.equal(pending.details.cleanup_errors?.[label], undefined);
-  assert.equal(
-    entries.some(
-      (entry: any) => entry.customType === "pi_herdsman_cleanup_error",
-    ),
-    false,
-  );
-  t.mock.timers.tick(250);
-  await Promise.resolve();
-  await Promise.resolve();
-  assert.equal(readAgentState(mailbox)?.activeRequestId, REQUEST_ID);
-  assert.ok(readResult(mailbox, REQUEST_ID));
-  assert.equal(
-    pi.sentMessageCalls.filter(
-      ({ message }) =>
-        (message as any).customType === "pi-herdsman-agent-result",
-    ).length,
-    1,
-  );
-  writeAgentState(mailbox, completed);
-  t.mock.timers.tick(250);
-  await Promise.resolve();
-  await Promise.resolve();
-  for (let index = 0; index < 5; index++)
-    await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.equal(readResult(mailbox, REQUEST_ID), undefined);
-  assert.deepEqual(lifecycle.closeOrder, [label]);
-  assert.equal(
-    pi.sentMessageCalls.filter(
-      ({ message }) =>
-        (message as any).customType === "pi-herdsman-agent-result",
-    ).length,
-    1,
-  );
-  const settled = await agentTool(pi, "list").execute(
-    "id",
-    {},
-    undefined,
-    undefined,
-    fakeContext(entries),
-  );
-  assert.equal(settled.details.cleanup_errors?.[label], undefined);
-  pi.events.get("session_shutdown")?.[0]();
+  await startRadarSession(pi);
+  const child = await delegateRadarChild(pi, label);
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  state = child;
+  requestId = child.activeRequestId!;
+  writeResult(mailbox, {
+    version: 5,
+    runId: child.runId,
+    requestId,
+    ownerSessionId: child.ownerSessionId,
+    workspaceId: child.workspaceId,
+    agentLabel: label,
+    paneId: child.paneId,
+    status: "completed",
+    text: "complete",
+    completedAt: Date.now(),
+  });
+  try {
+    const delivered = () =>
+      pi.sentMessageCalls.filter(
+        ({ message }) =>
+          (message as any).customType === "pi-herdsman-agent-result",
+      ).length;
+    const settleWatch = () =>
+      watchedResultPaths.get(`${mailbox}/result-${requestId}.json`)?.({}, {});
+    settleWatch();
+    await settleUntil(() => delivered() === 1);
+    assert.equal(delivered(), 1);
+    assert.equal(readAgentState(mailbox)?.activeRequestId, requestId);
+    assert.ok(readResult(mailbox, requestId));
+
+    writeAgentState(mailbox, {
+      ...readAgentState(mailbox)!,
+      activeRequestId: undefined,
+      completedRequestId: requestId,
+    });
+    // The delivery stops watching its own result, so the settled state is
+    // picked up by the next recovery pass, which is what a restarted lead does.
+    for (const handler of pi.events.get("session_start") ?? [])
+      await handler(undefined, fakeContext(entries));
+    await settleUntil(() => readResult(mailbox, requestId) === undefined);
+    assert.equal(readResult(mailbox, requestId), undefined);
+    assert.equal(readAgentState(mailbox), undefined);
+    assert.equal(radarDaemon.closes.size, 1);
+    assert.equal(delivered(), 1, "a settled result is delivered once");
+    const settled = await agentTool(pi, "list").execute(
+      "id",
+      {},
+      undefined,
+      undefined,
+      fakeContext(entries),
+    );
+    assert.equal(settled.details.cleanup_errors?.[label], undefined);
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    radarDaemon.reset();
+    resetAgentMailbox(mailbox);
+  }
 });
 
-test("retained delivery keeps the worker, pane, and mailbox without the result", async (t) => {
-  setLeadEnvironment();
-  updateConfig("retainWorkers", true);
+test("retained delivery keeps the worker, pane, and mailbox without the result", async () => {
+  let deliveries = 0;
   const label = "retained-delivery-agent";
-  const mailbox = agentMailboxPath(WORKSPACE, label);
-  resetAgentMailbox(mailbox);
-  const activeState = managedState(label, REQUEST_ID);
-  writeAgentState(mailbox, activeState);
-  writeResult(mailbox, { version: 5, runId: AGENT_ID,
-  requestId: REQUEST_ID,
-  ownerSessionId: LEAD_SESSION_ID,
-  workspaceId: WORKSPACE,
-  agentLabel: label,
-  paneId: "registered-pane",
-  status: "completed",
-  text: "complete",
-  completedAt: Date.now(), });
-  const entries: unknown[] = [];
-  const lifecycle = cascadeExecutor([activeState]);
-  const pi = fakePi({
-    entries,
-    exec: lifecycle.exec,
-    sendMessage: () => {
-      entries.push({
-        customType: "pi-herdsman-agent-result",
-        details: resultEntryDetails(activeState, REQUEST_ID),
-      });
+  const { pi, mailbox, requestId } = await radarChildFixture(label, {
+    sendMessage: (message) => {
+      if ((message as any).customType === "pi-herdsman-agent-result")
+        deliveries++;
     },
+    retainWorkers: true,
   });
-  registerExtension!(pi.pi as never);
-  t.mock.timers.enable({ apis: ["setTimeout"] });
   try {
-    await pi.events.get("session_start")![0](undefined, fakeContext(entries));
-    await Promise.resolve();
-    await Promise.resolve();
-    const completed = managedState(label);
-    completed.completedRequestId = REQUEST_ID;
-    writeAgentState(mailbox, completed);
-    t.mock.timers.tick(250);
-    for (let index = 0; index < 5; index++)
-      await new Promise<void>((resolve) => setImmediate(resolve));
-
-    assert.equal(readResult(mailbox, REQUEST_ID), undefined);
+    const launched = readAgentState(mailbox)!;
+    writeResult(mailbox, {
+      version: 5,
+      runId: launched.runId,
+      requestId,
+      ownerSessionId: launched.ownerSessionId,
+      workspaceId: launched.workspaceId,
+      agentLabel: launched.agentLabel,
+      paneId: launched.paneId,
+      status: "completed",
+      text: "complete",
+      completedAt: Date.now(),
+    });
+    watchedResultPaths.get(`${mailbox}/result-${requestId}.json`)?.({}, {});
+    await settleUntil(() => deliveries === 1);
+    writeAgentState(mailbox, {
+      ...launched,
+      activeRequestId: undefined,
+      completedRequestId: requestId,
+    });
+    for (const handler of pi.events.get("session_start") ?? [])
+      await handler(undefined, fakeContext(pi.entries));
+    await settleUntil(() => readResult(mailbox, requestId) === undefined);
+    assert.equal(readResult(mailbox, requestId), undefined);
     const retained = readAgentState(mailbox);
     assert.equal(retained?.agentLabel, label);
-    assert.equal(retained?.completedRequestId, REQUEST_ID);
+    assert.equal(retained?.completedRequestId, requestId);
     assert.equal(retained?.activeRequestId, undefined);
-    assert.equal(lifecycle.live.has(label), true);
-    assert.deepEqual(lifecycle.closeOrder, []);
     assert.equal(
-      pi.calls.some((args) => isPaneClose(args)),
-      false,
+      radarDaemon.closes.size,
+      0,
       "a retained worker keeps its pane",
     );
+    assert.equal(deliveries, 1);
     assert.equal(
-      entries.some(
+      pi.entries.some(
         (entry: any) => entry.customType === "pi_herdsman_cleanup_error",
       ),
       false,
@@ -3374,59 +2670,349 @@ test("retained delivery keeps the worker, pane, and mailbox without the result",
   } finally {
     updateConfig("retainWorkers", undefined);
     pi.events.get("session_shutdown")?.[0]();
+    radarDaemon.reset();
     resetAgentMailbox(mailbox);
   }
 });
 
-test("disabled retention still tears the delivered worker down", async (t) => {
-  setLeadEnvironment();
-  updateConfig("retainWorkers", false);
+test("disabled retention still tears the delivered worker down", async () => {
+  let deliveries = 0;
   const label = "unretained-delivery-agent";
-  const mailbox = agentMailboxPath(WORKSPACE, label);
-  resetAgentMailbox(mailbox);
-  const activeState = managedState(label, REQUEST_ID);
-  writeAgentState(mailbox, activeState);
-  writeResult(mailbox, { version: 5, runId: AGENT_ID,
-  requestId: REQUEST_ID,
-  ownerSessionId: LEAD_SESSION_ID,
-  workspaceId: WORKSPACE,
-  agentLabel: label,
-  paneId: "registered-pane",
-  status: "completed",
-  text: "complete",
-  completedAt: Date.now(), });
-  const entries: unknown[] = [];
-  const lifecycle = cascadeExecutor([activeState]);
-  const pi = fakePi({
-    entries,
-    exec: lifecycle.exec,
-    sendMessage: () => {
-      entries.push({
-        customType: "pi-herdsman-agent-result",
-        details: resultEntryDetails(activeState, REQUEST_ID),
-      });
+  const { pi, mailbox, requestId } = await radarChildFixture(label, {
+    sendMessage: (message) => {
+      if ((message as any).customType === "pi-herdsman-agent-result")
+        deliveries++;
     },
+    retainWorkers: false,
   });
-  registerExtension!(pi.pi as never);
-  t.mock.timers.enable({ apis: ["setTimeout"] });
   try {
-    await pi.events.get("session_start")![0](undefined, fakeContext(entries));
-    await Promise.resolve();
-    await Promise.resolve();
-    const completed = managedState(label);
-    completed.completedRequestId = REQUEST_ID;
-    writeAgentState(mailbox, completed);
-    t.mock.timers.tick(250);
-    for (let index = 0; index < 5; index++)
-      await new Promise<void>((resolve) => setImmediate(resolve));
-
-    assert.equal(readResult(mailbox, REQUEST_ID), undefined);
+    const launched = readAgentState(mailbox)!;
+    writeResult(mailbox, {
+      version: 5,
+      runId: launched.runId,
+      requestId,
+      ownerSessionId: launched.ownerSessionId,
+      workspaceId: launched.workspaceId,
+      agentLabel: launched.agentLabel,
+      paneId: launched.paneId,
+      status: "completed",
+      text: "complete",
+      completedAt: Date.now(),
+    });
+    watchedResultPaths.get(`${mailbox}/result-${requestId}.json`)?.({}, {});
+    await settleUntil(() => deliveries === 1);
+    writeAgentState(mailbox, {
+      ...launched,
+      activeRequestId: undefined,
+      completedRequestId: requestId,
+    });
+    for (const handler of pi.events.get("session_start") ?? [])
+      await handler(undefined, fakeContext(pi.entries));
+    await settleUntil(() => readAgentState(mailbox) === undefined);
+    assert.equal(readResult(mailbox, requestId), undefined);
     assert.equal(readAgentState(mailbox), undefined);
-    assert.deepEqual(lifecycle.closeOrder, [label]);
+    assert.equal(radarDaemon.closes.size, 1);
+    assert.equal(deliveries, 1);
+    const delivered = pi.sentMessageCalls.find(
+      (call: any) => call.message?.customType === "pi-herdsman-agent-result",
+    )?.message as { content?: unknown } | undefined;
+    assert.ok(delivered, "retention-off delivery publishes the result");
+    assert.match(
+      String(delivered?.content),
+      new RegExp(
+        `Worker ${label} was closed at delivery; its Pi session stays resumable\\. ` +
+          `Continue it with agent_continue and session ${DEFAULT_PI_SESSION_ID} for related work\\.`,
+      ),
+      "a closed generation names its exact saved session",
+    );
   } finally {
     updateConfig("retainWorkers", undefined);
     pi.events.get("session_shutdown")?.[0]();
+    radarDaemon.reset();
     resetAgentMailbox(mailbox);
+  }
+});
+
+// Durable discovery of a deliberately closed generation: retention-off delivery
+// removes the mailbox and result file, leaving only the controller's own durable
+// result entry and the saved Pi session.
+const emptyInventory = (): ExecHandler => (command, args) =>
+  command === "herdr" && isApiSnapshot(args)
+    ? {
+        stdout: JSON.stringify({
+          id: AGENT_ID,
+          result: { snapshot: { agents: [], panes: [] } },
+        }),
+        stderr: "",
+        code: 0,
+      }
+    : { stdout: "{}", stderr: "", code: 0 };
+
+const deliveredResultFixture = (
+  label: string,
+  overrides: {
+    ownerSessionId?: string;
+    definition?: string;
+    status?: "completed" | "failed";
+    sessionRetired?: boolean;
+    sessionId?: string;
+    sessionPath?: string;
+    recordSessionPath?: boolean;
+  } = {},
+) => {
+  const sessionId = overrides.sessionId ?? randomUUID();
+  const sessionPath =
+    overrides.sessionPath ?? join(testTmpRoot, `${label}-${sessionId}.jsonl`);
+  if (overrides.recordSessionPath !== false)
+    realFs.writeFileSync(sessionPath, "{}", "utf8");
+  const requestId = randomUUID();
+  const state = {
+    ...managedState(label, undefined, recoveryIdentity(label)),
+    piSessionId: sessionId,
+    piSessionFile: sessionPath,
+  };
+  return {
+    sessionId,
+    sessionPath,
+    requestId,
+    entry: {
+      type: "custom_message",
+      message: {
+        customType: "pi-herdsman-agent-result",
+        details: {
+          ...resultEntryDetails(state, requestId),
+          ...(overrides.recordSessionPath === false
+            ? { piSessionFile: undefined }
+            : {}),
+          ownerSessionId: overrides.ownerSessionId ?? LEAD_SESSION_ID,
+          agentDefinition: overrides.definition ?? "child",
+          status: overrides.status ?? "completed",
+          sessionRetired: overrides.sessionRetired ?? false,
+        },
+      },
+    },
+  };
+};
+
+const listAgentState = async (
+  pi: ReturnType<typeof fakePi>,
+  entries: unknown[],
+) =>
+  (
+    await agentTool(pi, "list").execute(
+      "id",
+      {},
+      undefined,
+      undefined,
+      fakeContext(entries),
+    )
+  ).details;
+
+test("a closed generation is advertised as a saved session without reopening it", async () => {
+  setLeadEnvironment();
+  const label = "saved-session-agent";
+  const delivered = deliveredResultFixture(label);
+  const pi = fakePi({ exec: emptyInventory() });
+  registerExtension!(pi.pi as never);
+  try {
+    await pi.events.get("session_start")![0](undefined, fakeContext());
+    openedSessionPaths.length = 0;
+    const listed = await listAgentState(pi, [delivered.entry]);
+    assert.deepEqual(listed.saved_sessions, [
+      {
+        state: "saved",
+        agent: label,
+        agent_definition: "child",
+        pi_session_id: delivered.sessionId,
+        pi_session_path: realFs.realpathSync(delivered.sessionPath),
+        last_result: {
+          request_id: delivered.requestId,
+          status: "completed",
+        },
+      },
+    ]);
+    assert.equal(
+      listed.agents.some((agent: any) => agent.agent === label),
+      false,
+      "a closed generation must not be advertised as a live agent",
+    );
+    assert.deepEqual(
+      openedSessionPaths,
+      [],
+      "listing a saved session must not reopen its child transcript",
+    );
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    realFs.rmSync(delivered.sessionPath, { force: true });
+  }
+});
+
+test("saved sessions are listed only for this controller's own results", async () => {
+  setLeadEnvironment();
+  const owned = deliveredResultFixture("owned-saved-agent");
+  const foreign = deliveredResultFixture("foreign-saved-agent", {
+    ownerSessionId: randomUUID(),
+  });
+  const pi = fakePi({ exec: emptyInventory() });
+  registerExtension!(pi.pi as never);
+  try {
+    await pi.events.get("session_start")![0](undefined, fakeContext());
+    const listed = await listAgentState(pi, [owned.entry, foreign.entry]);
+    assert.deepEqual(
+      listed.saved_sessions.map((session: any) => session.agent),
+      ["owned-saved-agent"],
+    );
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    realFs.rmSync(owned.sessionPath, { force: true });
+    realFs.rmSync(foreign.sessionPath, { force: true });
+  }
+});
+
+test("a mailbox representation anywhere suppresses the saved session", async () => {
+  setLeadEnvironment();
+  const elsewhere = deliveredResultFixture("elsewhere-saved-agent");
+  const elsewhereWorkspace = `${WORKSPACE}-elsewhere`;
+  const elsewhereMailbox = agentMailboxPath(
+    elsewhereWorkspace,
+    "elsewhere-saved-agent",
+  );
+  resetAgentMailbox(elsewhereMailbox);
+  writeAgentState(elsewhereMailbox, {
+    ...managedState("elsewhere-saved-agent"),
+    workspaceId: elsewhereWorkspace,
+    piSessionId: elsewhere.sessionId,
+    piSessionFile: elsewhere.sessionPath,
+  });
+
+  const occupantLabel = "uncertain-occupant-agent";
+  const occupant = deliveredResultFixture(occupantLabel);
+  const occupantMailbox = agentMailboxPath(WORKSPACE, occupantLabel);
+  resetAgentMailbox(occupantMailbox);
+  const occupantState = {
+    ...managedState(occupantLabel, undefined, recoveryIdentity(occupantLabel)),
+    piSessionId: occupant.sessionId,
+    piSessionFile: occupant.sessionPath,
+  };
+  writeAgentState(occupantMailbox, occupantState);
+  // The daemon reports the occupant's pane under a session that is not the one
+  // its mailbox records, so its presence cannot be proved.
+  observeFleet([
+    {
+      state: occupantState,
+      sessionId: "11111111-1111-4111-8111-111111111111",
+    },
+  ]);
+  const pi = fakePi({});
+  registerExtension!(pi.pi as never);
+  try {
+    await pi.events.get("session_start")![0](undefined, fakeContext());
+    const listed = await listAgentState(pi, [elsewhere.entry, occupant.entry]);
+    assert.deepEqual(
+      listed.saved_sessions,
+      [],
+      "a represented session must never also be advertised as saved",
+    );
+    const row = listed.agents.find(
+      (agent: any) => agent.agent === occupantLabel,
+    );
+    assert.equal(row?.state, "unknown");
+    assert.equal(row?.recovery_only, true);
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(elsewhereMailbox);
+    resetAgentMailbox(occupantMailbox);
+    realFs.rmSync(elsewhere.sessionPath, { force: true });
+    realFs.rmSync(occupant.sessionPath, { force: true });
+  }
+});
+
+test("a retired session is not advertised for continuation", async () => {
+  setLeadEnvironment();
+  const retired = deliveredResultFixture("retired-saved-agent", {
+    sessionRetired: true,
+  });
+  const pi = fakePi({ exec: emptyInventory() });
+  registerExtension!(pi.pi as never);
+  try {
+    await pi.events.get("session_start")![0](undefined, fakeContext());
+    const listed = await listAgentState(pi, [retired.entry]);
+    assert.deepEqual(listed.saved_sessions, []);
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    realFs.rmSync(retired.sessionPath, { force: true });
+  }
+});
+
+test("a newer delivery decides the session's saved row", async () => {
+  setLeadEnvironment();
+  const label = "newest-delivery-agent";
+  const first = deliveredResultFixture(label);
+  const second = deliveredResultFixture(label, {
+    sessionId: first.sessionId,
+    sessionPath: first.sessionPath,
+  });
+  const retired = deliveredResultFixture(label, {
+    sessionId: first.sessionId,
+    sessionPath: first.sessionPath,
+    sessionRetired: true,
+  });
+  const pi = fakePi({ exec: emptyInventory() });
+  registerExtension!(pi.pi as never);
+  try {
+    await pi.events.get("session_start")![0](undefined, fakeContext());
+    const current = await listAgentState(pi, [first.entry, second.entry]);
+    assert.deepEqual(current.saved_sessions, [
+      {
+        state: "saved",
+        agent: label,
+        agent_definition: "child",
+        pi_session_id: first.sessionId,
+        pi_session_path: realFs.realpathSync(first.sessionPath),
+        last_result: {
+          request_id: second.requestId,
+          status: "completed",
+        },
+      },
+    ]);
+    assert.deepEqual(
+      (await listAgentState(pi, [first.entry, second.entry, retired.entry]))
+        .saved_sessions,
+      [],
+      "a newer retired delivery retires the older row",
+    );
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    realFs.rmSync(first.sessionPath, { force: true });
+  }
+});
+
+test("a newer delivery without a usable session record retires the row", async () => {
+  setLeadEnvironment();
+  const label = "unusable-delivery-agent";
+  const usable = deliveredResultFixture(label);
+  const unusable = deliveredResultFixture(label, {
+    sessionId: usable.sessionId,
+    sessionPath: usable.sessionPath,
+    recordSessionPath: false,
+  });
+  const pi = fakePi({ exec: emptyInventory() });
+  registerExtension!(pi.pi as never);
+  try {
+    await pi.events.get("session_start")![0](undefined, fakeContext());
+    assert.equal(
+      (await listAgentState(pi, [usable.entry])).saved_sessions.length,
+      1,
+      "the usable delivery alone advertises the saved session",
+    );
+    assert.deepEqual(
+      (await listAgentState(pi, [usable.entry, unusable.entry])).saved_sessions,
+      [],
+      "an unusable newer delivery must not leave the stale row behind",
+    );
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    realFs.rmSync(usable.sessionPath, { force: true });
   }
 });
 
@@ -3456,7 +3042,7 @@ test("unresolved background work remains active with retention enabled or disabl
     registerExtension!(pi.pi as never);
 
     try {
-      await pi.events.get("session_start")![0](undefined, fakeContext(entries));
+      await startRadarSession(pi, fakeContext(entries));
       const listed = await agentTool(pi, "list").execute(
         "id",
         {},
@@ -3470,14 +3056,16 @@ test("unresolved background work remains active with retention enabled or disabl
 
       assert.equal(listed.details.agents[0]?.state, "waiting");
       assert.equal(readAgentState(mailbox)?.activeRequestId, REQUEST_ID);
-      assert.deepEqual(
-        readAgentState(mailbox)?.backgroundWaiting?.taskIds,
-        ["bg-1"],
-      );
+      assert.deepEqual(readAgentState(mailbox)?.backgroundWaiting?.taskIds, [
+        "bg-1",
+      ]);
       assert.equal(readResult(mailbox, REQUEST_ID), undefined);
       assert.equal(lifecycle.live.has(label), true);
       assert.deepEqual(lifecycle.closeOrder, []);
-      assert.equal(pi.calls.some((args) => isPaneClose(args)), false);
+      assert.equal(
+        pi.calls.some((args) => isPaneClose(args)),
+        false,
+      );
     } finally {
       updateConfig("retainWorkers", undefined);
       pi.events.get("session_shutdown")?.[0]();
@@ -3496,7 +3084,10 @@ test("repeated delivered-result cleanup after recovery retains and never closes"
   state.completedRequestId = REQUEST_ID;
   writeAgentState(mailbox, state);
   const entries: unknown[] = [
-    { customType: "pi-herdsman-agent-result", details: resultEntryDetails(state, REQUEST_ID) },
+    {
+      customType: "pi-herdsman-agent-result",
+      details: resultEntryDetails(state, REQUEST_ID),
+    },
   ];
   const lifecycle = cascadeExecutor([state]);
   const pi = fakePi({ entries, exec: lifecycle.exec });
@@ -3551,7 +3142,7 @@ test("a delivered worker with a live pane projects idle with its exact tools", a
   registerExtension!(pi.pi as never);
   t.mock.timers.enable({ apis: ["setTimeout"] });
   try {
-    await pi.events.get("session_start")![0](undefined, fakeContext(entries));
+    await startRadarSession(pi, fakeContext(entries));
     for (let index = 0; index < 5; index++)
       await new Promise<void>((resolve) => setImmediate(resolve));
     const listed = await agentTool(pi, "list").execute(
@@ -3610,19 +3201,14 @@ test("a restart reuses a retained worker in its existing process", async (t) => 
   });
   const mailbox = agentMailboxPath(WORKSPACE, label);
   resetAgentMailbox(mailbox);
-  const state = {
-    ...managedState(label, undefined, {
-      paneId: "startup-pane",
-      tabId: "startup-tab",
-      piSessionId: DEFAULT_PI_SESSION_ID,
-      piSessionFile: sessionPath,
-    }),
-    completedRequestId: REQUEST_ID,
-  };
-  writeAgentState(mailbox, state);
-  const { agentLaunchFingerprint, resolveAgentLaunchInputs } = await import(
-    "./agent-definitions.ts"
-  );
+  const state = managedState(label, undefined, {
+    paneId: "startup-pane",
+    tabId: "startup-tab",
+    piSessionId: DEFAULT_PI_SESSION_ID,
+    piSessionFile: sessionPath,
+  });
+  const { agentLaunchFingerprint, resolveAgentLaunchInputs } =
+    await import("./agent-definitions.ts");
   const entries: unknown[] = [
     {
       customType: "pi-herdsman-agent-result",
@@ -3658,13 +3244,15 @@ test("a restart reuses a retained worker in its existing process", async (t) => 
               frontmatter: { name },
               body: "recovered body",
             },
-            { cwd: "/tmp" },
+            { cwd: "/tmp", launchCommand: testChildCommand },
           ),
         ),
       },
     },
   ];
   const delivered: string[] = [];
+  // A retained child is consumed by the daemon that launched it, so this
+  // fixture's own stand-in must not be a second consumer of the same request.
   const worker = startupExecutor(
     label,
     () => DEFAULT_PI_SESSION_ID,
@@ -3672,13 +3260,47 @@ test("a restart reuses a retained worker in its existing process", async (t) => 
     (text) => {
       delivered.push(text);
     },
+    false,
+    undefined,
+    "/tmp",
+    AGENT_ID,
+    false,
+    true,
+    false,
+    undefined,
+    sessionPath,
   );
+  worker.stopMailboxConsumer();
   const pi = fakePi({ entries, exec: worker.exec });
   registerExtension!(pi.pi as never);
   const context = fakeContext(entries);
+  // The daemon this process registers against is the one whose store already
+  // holds the retained child's edge, so it comes up before the child is adopted.
+  await ensureRadarDaemon();
+  // The worker was launched through Radar before the restart, delivered its
+  // result and was retained: the daemon still holds the edge it bound, and the
+  // child's own mailbox keeps the generation it acknowledged.
+  const launch = await radarDaemon.adoptRetainedChild({
+    label,
+    runId: state.runId,
+    ownerSessionId: state.ownerSessionId,
+    workspaceId: WORKSPACE,
+    mailbox,
+    pane: state.paneId,
+    definition: name,
+  });
+  writeAgentState(mailbox, {
+    ...readAgentState(mailbox)!,
+    completedRequestId: REQUEST_ID,
+  });
+  entries.push({
+    type: "custom",
+    customType: "pi-herdsman-radar-spawn",
+    data: launch,
+  });
   t.mock.timers.enable({ apis: ["setTimeout"] });
   try {
-    await pi.events.get("session_start")![0](undefined, context);
+    await startRadarSession(pi, context);
     for (let index = 0; index < 5; index++)
       await new Promise<void>((resolve) => setImmediate(resolve));
     const listed = await agentTool(pi, "list").execute(
@@ -3715,9 +3337,20 @@ test("a restart reuses a retained worker in its existing process", async (t) => 
     assert.equal(after?.activeRequestId, continued.details.request_id);
     assert.equal(after?.completedRequestId, undefined);
     assert.equal(after?.runId, state.runId);
+    // The assignment was addressed to the process the daemon's record of the
+    // launch names, and the worker's acceptance echoed that exact address: the
+    // restart's reuse is that agreement, not the startup acknowledgment left
+    // behind in the mailbox.
+    assert.deepEqual(after?.lastAck?.identity, {
+      subject: launch.agentId,
+      source: RADAR_SUBJECT_SOURCE,
+      incarnation: radarDaemon.spawns.at(-1)!.incarnation,
+      generation: launch.generation,
+    });
   } finally {
     updateConfig("retainWorkers", undefined);
     pi.events.get("session_shutdown")?.[0]();
+    radarDaemon.reset();
     nativeSessions.delete(DEFAULT_PI_SESSION_ID);
     resetAgentMailbox(mailbox);
     realFs.rmSync(definitionPath, { force: true });
@@ -3792,27 +3425,51 @@ test("live result cleanup keeps a later request owned by the mailbox", async (t)
   t.mock.timers.enable({ apis: ["setTimeout"] });
   for (const durableSecondResult of [false, true]) {
     setLeadEnvironment();
+    await ensureRadarDaemon();
     const label = `root-result-race-${durableSecondResult ? "result" : "request"}`;
-    const state = managedState(label, REQUEST_ID);
     const mailbox = agentMailboxPath(WORKSPACE, label);
     const secondRequestId = randomUUID();
     resetAgentMailbox(mailbox);
+    const launch = await radarDaemon.adoptRetainedChild({
+      label,
+      runId: randomUUID(),
+      ownerSessionId: LEAD_SESSION_ID,
+      workspaceId: WORKSPACE,
+      mailbox,
+      pane: `${label}-pane`,
+    });
+    // The later request is one this worker never accepts: a request left in the
+    // mailbox is the durable work the cleanup must not close over.
+    radarDaemon.options.acceptAssignments = false;
+    // The child was launched, accepted an assignment and delivered a result
+    // while the assignment was still unresolved: the durable shape the cleanup
+    // acts on.
+    const template = managedState(label, REQUEST_ID);
+    const state = {
+      ...readAgentState(mailbox)!,
+      activeRequestId: template.activeRequestId,
+      acceptedAssignment: template.acceptedAssignment,
+      briefProfile: template.briefProfile,
+    };
     writeAgentState(mailbox, state);
-    writeResult(mailbox, { version: 5, runId: state.runId,
-    requestId: REQUEST_ID,
-    ownerSessionId: state.ownerSessionId,
-    workspaceId: state.workspaceId,
-    agentLabel: state.agentLabel,
-    paneId: state.paneId,
-    status: "completed",
-    text: "delivered root result",
-    completedAt: Date.now(), });
-    const lifecycle = cascadeExecutor([state]);
-    const entries: unknown[] = [];
+    writeResult(mailbox, {
+      version: 5,
+      runId: state.runId,
+      requestId: REQUEST_ID,
+      ownerSessionId: state.ownerSessionId,
+      workspaceId: state.workspaceId,
+      agentLabel: state.agentLabel,
+      paneId: state.paneId,
+      status: "completed",
+      text: "delivered root result",
+      completedAt: Date.now(),
+    });
+    const entries: unknown[] = [
+      { type: "custom", customType: "pi-herdsman-radar-spawn", data: launch },
+    ];
     let secondRequestWritten = false;
     const pi = fakePi({
       entries,
-      exec: lifecycle.exec,
       sendMessage: (message) => {
         entries.push({
           customType: "pi-herdsman-agent-result",
@@ -3823,34 +3480,46 @@ test("live result cleanup keeps a later request owned by the mailbox", async (t)
           (message as any).customType === "pi-herdsman-agent-result"
         ) {
           secondRequestWritten = true;
-          writeRequest(mailbox, { version: 5, runId: state.runId,
-          requestId: secondRequestId,
-          ownerSessionId: state.ownerSessionId,
-          workspaceId: state.workspaceId,
-          agentLabel: state.agentLabel,
-          paneId: state.paneId,
-          kind: "task",
-          text: "later request",
-          createdAt: Date.now(), });
-          if (durableSecondResult)
-            writeResult(mailbox, { version: 5, runId: state.runId,
+          writeRequest(mailbox, {
+            version: 5,
+            runId: state.runId,
             requestId: secondRequestId,
             ownerSessionId: state.ownerSessionId,
             workspaceId: state.workspaceId,
             agentLabel: state.agentLabel,
             paneId: state.paneId,
-            status: "completed",
-            text: "later result",
-            completedAt: Date.now(), });
+            kind: "task",
+            text: "later request",
+            createdAt: Date.now(),
+          });
+          if (durableSecondResult)
+            writeResult(mailbox, {
+              version: 5,
+              runId: state.runId,
+              requestId: secondRequestId,
+              ownerSessionId: state.ownerSessionId,
+              workspaceId: state.workspaceId,
+              agentLabel: state.agentLabel,
+              paneId: state.paneId,
+              status: "completed",
+              text: "later result",
+              completedAt: Date.now(),
+            });
         }
       },
     });
     registerExtension!(pi.pi as never);
+    const closedPanes = () =>
+      [...radarDaemon.closes.values()].map((close) => close.pane);
     try {
-      await pi.events.get("session_start")![0](undefined, fakeContext(entries));
+      await startRadarSession(pi, fakeContext(entries));
+      // The assignment resolved: the acceptance record goes with it, which is
+      // the durable shape a delivered result leaves.
       writeAgentState(mailbox, {
         ...state,
         activeRequestId: undefined,
+        acceptedAssignment: undefined,
+        briefProfile: undefined,
         completedRequestId: REQUEST_ID,
       });
       t.mock.timers.tick(250);
@@ -3859,16 +3528,14 @@ test("live result cleanup keeps a later request owned by the mailbox", async (t)
       assert.ok(readAgentState(mailbox));
       assert.ok(readResult(mailbox, REQUEST_ID));
       assert.ok(readRequest(mailbox, secondRequestId));
-      assert.deepEqual(lifecycle.closeOrder, []);
+      assert.deepEqual(closedPanes(), []);
 
       removeRequest(mailbox, secondRequestId);
       if (durableSecondResult) removeResult(mailbox, secondRequestId);
       t.mock.timers.tick(250);
-      for (let index = 0; index < 5; index++)
-        await new Promise<void>((resolve) => setImmediate(resolve));
-      assert.equal(readAgentState(mailbox), undefined);
+      await settleUntil(() => readAgentState(mailbox) === undefined);
       assert.equal(readResult(mailbox, REQUEST_ID), undefined);
-      assert.deepEqual(lifecycle.closeOrder, [label]);
+      assert.deepEqual(closedPanes(), [`${label}-pane`]);
     } finally {
       pi.events.get("session_shutdown")?.[0]();
       resetAgentMailbox(mailbox);
@@ -3889,15 +3556,18 @@ test("lost result cleanup keeps a later request owned by the mailbox", async (t)
     const secondRequestId = randomUUID();
     resetAgentMailbox(mailbox);
     writeAgentState(mailbox, state);
-    writeResult(mailbox, { version: 5, runId: state.runId,
-    requestId: REQUEST_ID,
-    ownerSessionId: state.ownerSessionId,
-    workspaceId: state.workspaceId,
-    agentLabel: state.agentLabel,
-    paneId: state.paneId,
-    status: "completed",
-    text: "delivered root result",
-    completedAt: Date.now(), });
+    writeResult(mailbox, {
+      version: 5,
+      runId: state.runId,
+      requestId: REQUEST_ID,
+      ownerSessionId: state.ownerSessionId,
+      workspaceId: state.workspaceId,
+      agentLabel: state.agentLabel,
+      paneId: state.paneId,
+      status: "completed",
+      text: "delivered root result",
+      completedAt: Date.now(),
+    });
     const entries: unknown[] = [];
     let secondRequestWritten = false;
     const pi = fakePi({
@@ -3913,28 +3583,37 @@ test("lost result cleanup keeps a later request owned by the mailbox", async (t)
           (message as any).customType === "pi-herdsman-agent-result"
         ) {
           secondRequestWritten = true;
-          writeRequest(mailbox, { version: 5, runId: state.runId,
-          requestId: secondRequestId,
-          ownerSessionId: state.ownerSessionId,
-          workspaceId: state.workspaceId,
-          agentLabel: state.agentLabel,
-          paneId: state.paneId,
-          kind: "task",
-          text: "later request",
-          createdAt: Date.now(), });
-          if (durableSecondResult)
-            writeResult(mailbox, { version: 5, runId: state.runId,
+          writeRequest(mailbox, {
+            version: 5,
+            runId: state.runId,
             requestId: secondRequestId,
             ownerSessionId: state.ownerSessionId,
             workspaceId: state.workspaceId,
             agentLabel: state.agentLabel,
             paneId: state.paneId,
-            status: "completed",
-            text: "later result",
-            completedAt: Date.now(), });
+            kind: "task",
+            text: "later request",
+            createdAt: Date.now(),
+          });
+          if (durableSecondResult)
+            writeResult(mailbox, {
+              version: 5,
+              runId: state.runId,
+              requestId: secondRequestId,
+              ownerSessionId: state.ownerSessionId,
+              workspaceId: state.workspaceId,
+              agentLabel: state.agentLabel,
+              paneId: state.paneId,
+              status: "completed",
+              text: "later result",
+              completedAt: Date.now(),
+            });
         }
       },
     });
+    // The daemon reports no pane this mailbox was recorded in: the generation is
+    // gone, and only its durable facts remain.
+    observeFleet([]);
     registerExtension!(pi.pi as never);
     try {
       await pi.events.get("session_start")![0](undefined, fakeContext(entries));
@@ -4002,15 +3681,18 @@ test("parent cascade keeps a later parent request during result cleanup", async 
   resetAgentMailbox(childMailbox);
   writeAgentState(parentMailbox, parent);
   writeAgentState(childMailbox, child);
-  writeResult(parentMailbox, { version: 5, runId: parent.runId,
-  requestId: REQUEST_ID,
-  ownerSessionId: parent.ownerSessionId,
-  workspaceId: parent.workspaceId,
-  agentLabel: parent.agentLabel,
-  paneId: parent.paneId,
-  status: "completed",
-  text: "delivered parent result",
-  completedAt: Date.now(), });
+  writeResult(parentMailbox, {
+    version: 5,
+    runId: parent.runId,
+    requestId: REQUEST_ID,
+    ownerSessionId: parent.ownerSessionId,
+    workspaceId: parent.workspaceId,
+    agentLabel: parent.agentLabel,
+    paneId: parent.paneId,
+    status: "completed",
+    text: "delivered parent result",
+    completedAt: Date.now(),
+  });
   const lifecycle = cascadeExecutor([child]);
   const entries: unknown[] = [];
   const pi = fakePi({
@@ -4022,15 +3704,18 @@ test("parent cascade keeps a later parent request during result cleanup", async 
         details: resultEntryDetails(parent, REQUEST_ID),
       });
       if ((message as any).customType === "pi-herdsman-agent-result")
-        writeRequest(parentMailbox, { version: 5, runId: parent.runId,
-        requestId: secondRequestId,
-        ownerSessionId: parent.ownerSessionId,
-        workspaceId: parent.workspaceId,
-        agentLabel: parent.agentLabel,
-        paneId: parent.paneId,
-        kind: "task",
-        text: "later parent request",
-        createdAt: Date.now(), });
+        writeRequest(parentMailbox, {
+          version: 5,
+          runId: parent.runId,
+          requestId: secondRequestId,
+          ownerSessionId: parent.ownerSessionId,
+          workspaceId: parent.workspaceId,
+          agentLabel: parent.agentLabel,
+          paneId: parent.paneId,
+          kind: "task",
+          text: "later parent request",
+          createdAt: Date.now(),
+        });
     },
   });
   registerExtension!(pi.pi as never);
@@ -4054,49 +3739,65 @@ test("parent cascade keeps a later parent request during result cleanup", async 
 test("completed lost parent cleanup resolves descendants before its mailbox", async () => {
   for (const childLive of [true, false]) {
     setLeadEnvironment();
+    await ensureRadarDaemon();
     const suffix = childLive ? "live-child" : "lost-child";
+    const parentLabel = `completed-lost-parent-${suffix}`;
+    const childLabel = `completed-lost-child-${suffix}`;
+    const parentMailbox = agentMailboxPath(WORKSPACE, parentLabel);
+    const childMailbox = agentMailboxPath(WORKSPACE, childLabel);
+    resetAgentMailbox(parentMailbox);
+    resetAgentMailbox(childMailbox);
     const parent = {
-      ...managedState(
-        `completed-lost-parent-${suffix}`,
-        undefined,
-        recoveryIdentity(`completed-lost-parent-${suffix}`),
-      ),
+      ...managedState(parentLabel, undefined, recoveryIdentity(parentLabel)),
       piSessionId: PARENT_SESSION_ID,
-      piSessionFile: join(testTmpRoot, `completed-lost-parent-${suffix}.jsonl`),
+      piSessionFile: join(testTmpRoot, `${parentLabel}.jsonl`),
       completedRequestId: REQUEST_ID,
     };
     writeFileSync(parent.piSessionFile, "{}", "utf8");
-    const child = {
-      ...managedState(
-        `completed-lost-child-${suffix}`,
-        undefined,
-        recoveryIdentity(`completed-lost-child-${suffix}`),
-      ),
-      ownerSessionId: parent.piSessionId,
-      piSessionId: randomUUID(),
-      piSessionFile: join(testTmpRoot, `completed-lost-child-${suffix}.jsonl`),
-    };
-    writeFileSync(child.piSessionFile, "{}", "utf8");
-    const parentMailbox = agentMailboxPath(WORKSPACE, parent.agentLabel);
-    const childMailbox = agentMailboxPath(WORKSPACE, child.agentLabel);
-    resetAgentMailbox(parentMailbox);
-    resetAgentMailbox(childMailbox);
     writeAgentState(parentMailbox, parent);
-    writeAgentState(childMailbox, child);
-    writeResult(parentMailbox, { version: 5, runId: parent.runId,
-    requestId: REQUEST_ID,
-    ownerSessionId: parent.ownerSessionId,
-    workspaceId: parent.workspaceId,
-    agentLabel: parent.agentLabel,
-    paneId: parent.paneId,
-    status: "completed",
-    text: "completed before the parent pane disappeared",
-    completedAt: Date.now(), });
-    const lifecycle = cascadeExecutor(childLive ? [child] : []);
-    const entries: unknown[] = [];
+    // A live child is one the daemon launched; a lost one is a mailbox whose
+    // process is gone, which the cascade still resolves by ancestry.
+    const childLaunch = childLive
+      ? await radarDaemon.adoptRetainedChild({
+          label: childLabel,
+          runId: randomUUID(),
+          ownerSessionId: PARENT_SESSION_ID,
+          workspaceId: WORKSPACE,
+          mailbox: childMailbox,
+          pane: `${childLabel}-pane`,
+        })
+      : undefined;
+    if (!childLive) {
+      writeAgentState(childMailbox, {
+        ...managedState(childLabel, undefined, recoveryIdentity(childLabel)),
+        runId: randomUUID(),
+        ownerSessionId: PARENT_SESSION_ID,
+        piSessionId: CHILD_SESSION_ID,
+      });
+    }
+    writeResult(parentMailbox, {
+      version: 5,
+      runId: parent.runId,
+      requestId: REQUEST_ID,
+      ownerSessionId: parent.ownerSessionId,
+      workspaceId: parent.workspaceId,
+      agentLabel: parent.agentLabel,
+      paneId: parent.paneId,
+      status: "completed",
+      text: "completed before the parent pane disappeared",
+      completedAt: Date.now(),
+    });
+    const entries: unknown[] = childLaunch
+      ? [
+          {
+            type: "custom",
+            customType: "pi-herdsman-radar-spawn",
+            data: childLaunch,
+          },
+        ]
+      : [];
     const pi = fakePi({
       entries,
-      exec: lifecycle.exec,
       sendMessage: (message) => {
         entries.push({
           customType: "pi-herdsman-agent-result",
@@ -4105,224 +3806,70 @@ test("completed lost parent cleanup resolves descendants before its mailbox", as
         void message;
       },
     });
+    // No pane the parent was recorded in is reported: the parent is gone.
+    radarDaemon.options.inventory = {
+      workspaces: [],
+      tabs: [],
+      panes: [],
+      agents: [],
+    };
     registerExtension!(pi.pi as never);
+    const closedPanes = () =>
+      [...radarDaemon.closes.values()].map((close) => close.pane);
     try {
-      await pi.events.get("session_start")![0](undefined, fakeContext(entries));
-      for (let index = 0; index < 8; index++)
-        await new Promise<void>((resolve) => setImmediate(resolve));
+      await startRadarSession(pi, fakeContext(entries));
+      await settleUntil(
+        () =>
+          readAgentState(parentMailbox) === undefined &&
+          readAgentState(childMailbox) === undefined,
+      );
       assert.equal(readResult(parentMailbox, REQUEST_ID), undefined);
-      assert.equal(readAgentState(parentMailbox), undefined);
-      assert.equal(readAgentState(childMailbox), undefined);
       assert.deepEqual(
-        lifecycle.closeOrder,
-        childLive ? [child.agentLabel] : [],
+        closedPanes(),
+        childLive ? [`${childLabel}-pane`] : [],
       );
     } finally {
       pi.events.get("session_shutdown")?.[0]();
       resetAgentMailbox(parentMailbox);
       resetAgentMailbox(childMailbox);
-      realFs.rmSync(child.piSessionFile!, { force: true });
-      realFs.rmSync(parent.piSessionFile!, { force: true });
     }
   }
 });
 
 test("automatic close invokes the exact lifecycle only after live identity proof", async () => {
   setLeadEnvironment();
+  await ensureRadarDaemon();
   const label = "automatic-close-agent";
-  const identity = recoveryIdentity(label);
   const mailbox = agentMailboxPath(WORKSPACE, label);
   resetAgentMailbox(mailbox);
-  const resultState = {
-    ...managedState(label, undefined, identity),
-    completedRequestId: REQUEST_ID,
-  };
+  const launch = await radarDaemon.adoptRetainedChild({
+    label,
+    runId: randomUUID(),
+    ownerSessionId: LEAD_SESSION_ID,
+    workspaceId: WORKSPACE,
+    mailbox,
+    pane: "automatic-close-pane",
+  });
+  const state = readAgentState(mailbox)!;
+  const resultState = { ...state, completedRequestId: REQUEST_ID };
   writeAgentState(mailbox, resultState);
-  writeResult(mailbox, { version: 5, runId: AGENT_ID,
-  requestId: REQUEST_ID,
-  ownerSessionId: LEAD_SESSION_ID,
-  workspaceId: WORKSPACE,
-  agentLabel: label,
-  paneId: identity.paneId,
-  status: "completed",
-  text: "close me",
-  completedAt: Date.now(), });
-  let live = true;
-  let closeCalls = 0;
-  let closeArgs: string[] | undefined;
-  const entries: unknown[] = [];
-  const emptyList = () => {
-    const value = JSON.parse(
-      listResponse(label, "working", identity.piSessionId, identity),
-    );
-    value.agents = [];
-    return JSON.stringify({ id: AGENT_ID, result: value });
-  };
+  writeResult(mailbox, {
+    version: 5,
+    runId: state.runId,
+    requestId: REQUEST_ID,
+    ownerSessionId: state.ownerSessionId,
+    workspaceId: state.workspaceId,
+    agentLabel: state.agentLabel,
+    paneId: state.paneId,
+    status: "completed",
+    text: "close me",
+    completedAt: Date.now(),
+  });
+  const entries: unknown[] = [
+    { type: "custom", customType: "pi-herdsman-radar-spawn", data: launch },
+  ];
   const pi = fakePi({
     entries,
-    exec: (command, args) => {
-      if (command === "herdr" && args[0] === "tab" && args[1] === "list")
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              tabs: [{ tab_id: identity.tabId, workspace_id: WORKSPACE }],
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      if (command === "herdr" && args[0] === "pane" && args[1] === "list")
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              panes: live
-                ? [{ pane_id: identity.paneId, workspace_id: WORKSPACE }]
-                : [],
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      if (command === "herdr" && args[0] === "pane" && args[1] === "get")
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              pane: {
-                pane_id: identity.paneId,
-                workspace_id: WORKSPACE,
-                tab_id: identity.tabId,
-                cwd: "/tmp",
-                agent_session: {
-                  agent: "pi",
-                  kind: "id",
-                  source: "herdr:pi",
-                  value: identity.piSessionId,
-                },
-              },
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      if (
-        command === "herdr" &&
-        args[0] === "pane" &&
-        args[1] === "process-info"
-      )
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              process_info: {
-                pane_id: identity.paneId,
-                shell_pid: 10,
-                foreground_process_group_id: 20,
-                foreground_processes: [{ pid: 20, argv0: "/usr/bin/pi" }],
-              },
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      if (command === "herdr" && args[0] === "pane" && args[1] === "close") {
-        closeCalls++;
-        closeArgs = args;
-        live = false;
-        return { stdout: "{}", stderr: "", code: 0 };
-      }
-      if (command === "herdr" && args[0] === "agent" && args[1] === "list")
-        return {
-          stdout: live
-            ? JSON.stringify({
-                id: AGENT_ID,
-                result: JSON.parse(
-                  listResponse(
-                    label,
-                    "working",
-                    identity.piSessionId,
-                    identity,
-                  ),
-                ),
-              })
-            : emptyList(),
-          stderr: "",
-          code: 0,
-        };
-      if (command === "herdr" && isApiSnapshot(args))
-        return {
-          stdout: live
-            ? JSON.stringify({
-                id: AGENT_ID,
-                result: {
-                  snapshot: {
-                    agents: (() => {
-                      const value = JSON.parse(
-                        listResponse(
-                          label,
-                          "working",
-                          identity.piSessionId,
-                          identity,
-                        ),
-                      );
-                      value.agents[0].name = runScopedHerdrAlias(
-                        WORKSPACE,
-                        label,
-                        AGENT_ID,
-                      );
-                      return value.agents;
-                    })(),
-                    panes: [
-                      {
-                        pane_id: identity.paneId,
-                        tab_id: identity.tabId,
-                        workspace_id: WORKSPACE,
-                        cwd: "/tmp",
-                        agent_session: {
-                          source: "herdr:pi",
-                          agent: "pi",
-                          kind: "id",
-                          value: identity.piSessionId,
-                        },
-                      },
-                    ],
-                  },
-                },
-              })
-            : JSON.stringify({
-                id: AGENT_ID,
-                result: { snapshot: { agents: [], panes: [] } },
-              }),
-          stderr: "",
-          code: 0,
-        };
-      if (command === "herdr" && args[0] === "agent" && args[1] === "get")
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              agent: {
-                name: runScopedHerdrAlias(WORKSPACE, label, AGENT_ID),
-                pane_id: identity.paneId,
-                tab_id: identity.tabId,
-                workspace_id: WORKSPACE,
-                cwd: "/tmp",
-                agent_session: {
-                  agent: "pi",
-                  kind: "id",
-                  source: "herdr:pi",
-                  value: identity.piSessionId,
-                },
-              },
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      return { stdout: "{}", stderr: "", code: 0 };
-    },
     sendMessage: () => {
       entries.push({
         customType: "pi-herdsman-agent-result",
@@ -4330,17 +3877,14 @@ test("automatic close invokes the exact lifecycle only after live identity proof
       });
     },
   });
-  realFs.mkdirSync(PI_AGENTS_DIR, { recursive: true });
-  realFs.writeFileSync(
-    join(PI_AGENTS_DIR, "automatic-close-test.md"),
-    "---\nname: automatic-close-test\n---\nagent\n",
-    "utf8",
-  );
   try {
     registerExtension!(pi.pi as never);
-    await pi.events.get("session_start")![0](undefined, fakeContext(entries));
-    assert.equal(closeCalls, 1);
-    assert.equal(closeArgs?.[2], identity.paneId);
+    await startRadarSession(pi, fakeContext(entries));
+    await settleUntil(() => readAgentState(mailbox) === undefined);
+    assert.deepEqual(
+      [...radarDaemon.closes.values()].map((close) => close.pane),
+      [state.paneId],
+    );
     assert.equal(
       readAgentState(mailbox),
       undefined,
@@ -4348,10 +3892,9 @@ test("automatic close invokes the exact lifecycle only after live identity proof
     );
   } finally {
     pi.events.get("session_shutdown")?.[0]();
-    realFs.unlinkSync(join(PI_AGENTS_DIR, "automatic-close-test.md"));
+    resetAgentMailbox(mailbox);
   }
 });
-
 test("managed child automatic cleanup respects the parent delegation lock", async () => {
   setAgentEnvironment("cleanup-parent", ["child"]);
   process.env.PI_HERDSMAN_AGENT_DEFINITION = "parent";
@@ -4373,15 +3916,18 @@ test("managed child automatic cleanup respects the parent delegation lock", asyn
   resetAgentMailbox(childMailbox);
   writeAgentState(parentMailbox, parent);
   writeAgentState(childMailbox, child);
-  writeResult(childMailbox, { version: 5, runId: child.runId,
-  requestId: REQUEST_ID,
-  ownerSessionId: child.ownerSessionId,
-  workspaceId: child.workspaceId,
-  agentLabel: child.agentLabel,
-  paneId: child.paneId,
-  status: "completed",
-  text: "close the child",
-  completedAt: Date.now(), });
+  writeResult(childMailbox, {
+    version: 5,
+    runId: child.runId,
+    requestId: REQUEST_ID,
+    ownerSessionId: child.ownerSessionId,
+    workspaceId: child.workspaceId,
+    agentLabel: child.agentLabel,
+    paneId: child.paneId,
+    status: "completed",
+    text: "close the child",
+    completedAt: Date.now(),
+  });
   const entries: unknown[] = [
     {
       type: "custom",
@@ -4434,36 +3980,6 @@ test("managed child automatic cleanup respects the parent delegation lock", asyn
   }
 });
 
-test("manual close retains ownership when live session identity is missing or wrong", async () => {
-  for (const liveSession of [null, "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"]) {
-    setLeadEnvironment();
-    const label = liveSession ? "wrong-session-close" : "missing-session-close";
-    const mailbox = agentMailboxPath(WORKSPACE, label);
-    resetAgentMailbox(mailbox);
-    writeAgentState(mailbox, managedState(label));
-    const pi = fakePi({
-      exec: leadExec(
-        label,
-        "idle",
-        "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-        undefined,
-        liveSession,
-      ),
-    });
-    registerExtension!(pi.pi as never);
-    const result = await agentTool(pi, "close").execute(
-      "id",
-      { agent: label },
-      undefined,
-      undefined,
-      fakeContext(),
-    );
-    assert.equal(result.details.error.category, "target_ambiguous");
-    assert.ok(readAgentState(mailbox));
-    pi.events.get("session_shutdown")?.[0]();
-  }
-});
-
 test("stale scanner starts immediately, reschedules, deduplicates, and retries failed publication", async (t) => {
   setLeadEnvironment();
   const label = "scanner-agent";
@@ -4495,33 +4011,31 @@ test("stale scanner starts immediately, reschedules, deduplicates, and retries f
   registerExtension!(pi.pi as never);
   t.mock.timers.enable({ apis: ["setTimeout"] });
   await pi.events.get("session_start")![0](undefined, fakeContext());
-  await new Promise((resolve) => setImmediate(resolve));
-  await new Promise((resolve) => setImmediate(resolve));
-  await Promise.resolve();
+  await settleUntil(() => attempts === 1);
   assert.equal(attempts, 1, "the controller performs an immediate scan");
 
   t.mock.timers.tick(30_000);
-  await new Promise((resolve) => setImmediate(resolve));
+  await settleUntil(() => attempts === 2);
   assert.equal(attempts, 2, "a failed advisory is retried on the next scan");
   t.mock.timers.tick(30_000);
-  await new Promise((resolve) => setImmediate(resolve));
+  await settleUntil(() => attempts === 2);
   assert.equal(attempts, 2, "a successful episode waits for its reminder");
 
   now += 5 * 60_000;
   t.mock.timers.tick(30_000);
-  await new Promise((resolve) => setImmediate(resolve));
+  await settleUntil(() => attempts === 3);
   assert.equal(attempts, 3);
   assert.equal(pi.sent.at(-1)?.details?.nextReminderMs, 5 * 60_000);
 
   now += 5 * 60_000;
   t.mock.timers.tick(30_000);
-  await new Promise((resolve) => setImmediate(resolve));
+  await settleUntil(() => attempts === 4);
   assert.equal(attempts, 4);
   assert.equal(pi.sent.at(-1)?.details?.nextReminderMs, 5 * 60_000);
 
   now += 5 * 60_000;
   t.mock.timers.tick(30_000);
-  await new Promise((resolve) => setImmediate(resolve));
+  await settleUntil(() => attempts === 5);
   assert.equal(attempts, 5);
   assert.equal(pi.sent.at(-1)?.details?.nextReminderMs, 5 * 60_000);
 
@@ -4536,7 +4050,7 @@ test("stale scanner starts immediately, reschedules, deduplicates, and retries f
     updatedAt: now,
   });
   t.mock.timers.tick(30_000);
-  await new Promise((resolve) => setImmediate(resolve));
+  await settleUntil(() => attempts === 6);
   assert.equal(
     attempts,
     6,
@@ -4679,8 +4193,11 @@ test("delegation parent notifies only its direct stale child", async (t) => {
   t.mock.method(Date, "now", () => now);
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const parent = managedState("stale-parent");
+  // Each state is its own delegation run: two live children under one run id are
+  // ambiguous by design, not a shape a stale advisory can build on.
   const child = {
     ...managedState("stale-child", REQUEST_ID, recoveryIdentity("stale-child")),
+    runId: randomUUID(),
     ownerSessionId: parent.piSessionId,
     piSessionId: CHILD_SESSION_ID,
     lastActivityAt: now - 11 * 60_000,
@@ -4691,6 +4208,7 @@ test("delegation parent notifies only its direct stale child", async (t) => {
       REQUEST_ID,
       recoveryIdentity("unrelated-child"),
     ),
+    runId: randomUUID(),
     ownerSessionId: PARENT_SESSION_ID,
     lastActivityAt: now - 11 * 60_000,
   };
@@ -4816,9 +4334,7 @@ test("delegation parent notifies only its direct stale child", async (t) => {
   ]);
   for (const handler of parentPi.events.get("session_start") ?? [])
     await handler(undefined, parentContext);
-  await new Promise((resolve) => setImmediate(resolve));
-  await new Promise((resolve) => setImmediate(resolve));
-  await new Promise((resolve) => setImmediate(resolve));
+  await settleUntil(() => sent.length === 1);
   assert.equal(
     sent.length,
     1,
@@ -4870,7 +4386,13 @@ test("delegation parent notifies only its direct stale child", async (t) => {
   parentPi.sent.length = 0;
   now += 5 * 60_000;
   t.mock.timers.tick(5 * 60_000);
-  await new Promise((resolve) => setImmediate(resolve));
+  // Each scan crosses the daemon, so the reminder arrives on the socket's
+  // schedule, not the tick's.
+  await settleUntil(() =>
+    parentPi.sent.some(
+      (message: any) => message.customType === "pi-herdsman-agent-stale",
+    ),
+  );
   const reminder = parentPi.sent.find(
     (message: any) => message.customType === "pi-herdsman-agent-stale",
   ) as any;
@@ -4899,8 +4421,9 @@ test("delegation parent notifies only its direct stale child", async (t) => {
   writeAgentState(agentMailboxPath(WORKSPACE, child.agentLabel), nextEpisode);
   now += 30_000;
   t.mock.timers.tick(30_000);
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(diagnosticReads, 2);
+  // A new episode means a new first-attention diagnostic read, which the scan
+  // reaches only after a daemon round trip.
+  await settleUntil(() => diagnosticReads === 2);
   const raceEpisode = {
     ...readAgentState(agentMailboxPath(WORKSPACE, child.agentLabel))!,
     lastActivityAt: now - 12 * 60_000,
@@ -4910,8 +4433,9 @@ test("delegation parent notifies only its direct stale child", async (t) => {
   resumeOnDiagnostic = true;
   now += 30_000;
   t.mock.timers.tick(30_000);
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(diagnosticReads, 3);
+  await settleUntil(() => diagnosticReads === 3);
+  for (let index = 0; index < 5; index++)
+    await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(
     parentPi.sent.filter(
       (message: any) => message.customType === "pi-herdsman-agent-stale",
@@ -4969,7 +4493,11 @@ test("stale diagnostic failure still publishes advisory without recovery", async
   registerExtension!(pi.pi as never);
   try {
     await pi.events.get("session_start")![0](undefined, fakeContext());
-    await new Promise((resolve) => setImmediate(resolve));
+    await settleUntil(() =>
+      pi.sent.some(
+        (message: any) => message.customType === "pi-herdsman-agent-stale",
+      ),
+    );
     const staleMessages = pi.sent.filter(
       (message: any) => message.customType === "pi-herdsman-agent-stale",
     ) as any[];
@@ -4995,57 +4523,6 @@ test("stale diagnostic failure still publishes advisory without recovery", async
   }
 });
 
-test("stale diagnostic failure refreshes physical state before publication", async () => {
-  setLeadEnvironment();
-  const label = "stale-diagnostic-physical-race";
-  const state = {
-    ...managedState(label, REQUEST_ID, recoveryIdentity(label)),
-    lastActivityAt: Date.now() - 11 * 60_000,
-  };
-  const mailbox = agentMailboxPath(WORKSPACE, label);
-  writeAgentState(mailbox, state);
-  const baseExec = agentControllerExecutor(state);
-  let snapshots = 0;
-  let diagnosisFailed = false;
-  let lifecycle: "working" | "blocked" = "working";
-  const pi = fakePi({
-    exec: (command, args, options) => {
-      if (command === "herdr" && isApiSnapshot(args)) {
-        snapshots++;
-        const result = baseExec(command, args, options);
-        if (snapshots < 2) return result;
-        const payload = JSON.parse(result.stdout);
-        payload.result.snapshot.agents[0].agent_status = lifecycle;
-        payload.result.snapshot.panes[0].agent_status = lifecycle;
-        return { ...result, stdout: JSON.stringify(payload) };
-      }
-      if (args[0] === "agent" && args[1] === "get") {
-        diagnosisFailed = true;
-        lifecycle = "blocked";
-        return { stdout: "", stderr: "inspection unavailable", code: 1 };
-      }
-      return baseExec(command, args, options);
-    },
-  });
-  registerExtension!(pi.pi as never);
-  try {
-    await pi.events.get("session_start")![0](undefined, fakeContext());
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(diagnosisFailed, true);
-    assert.equal(snapshots, 2, "failure triggers a fresh physical snapshot");
-    assert.equal(
-      pi.sent.filter(
-        (message: any) => message.customType === "pi-herdsman-agent-stale",
-      ).length,
-      0,
-      "a no-longer-working target must not publish stale-working attention",
-    );
-  } finally {
-    pi.events.get("session_shutdown")?.[0]();
-    resetAgentMailbox(mailbox);
-  }
-});
-
 test("stale working parents remain visible while waiting parents project blocked", async (t) => {
   setLeadEnvironment();
   let now = Date.now();
@@ -5064,31 +4541,26 @@ test("stale working parents remain visible while waiting parents project blocked
       ...recoveryIdentity("active-parent-child"),
       piSessionId: CHILD_SESSION_ID,
     }),
+    // Its own run, as a real launch has: two children under one run id are
+    // candidate claimants of each other's pane.
+    runId: randomUUID(),
     ownerSessionId: parent.piSessionId,
   };
   for (const state of [parent, child])
     writeAgentState(agentMailboxPath(WORKSPACE, state.agentLabel), state);
 
-  let parentLifecycle: "working" | "idle" = "working";
-  const controller = agentControllerExecutor(parent, [child]);
-  const exec = (command: string, args: string[], options?: any) => {
-    const result = controller(command, args, options);
-    if (command !== "herdr" || (!isAgentList(args) && !isApiSnapshot(args)))
-      return result;
-    const payload = JSON.parse(result.stdout);
-    const agents = isApiSnapshot(args)
-      ? payload.result.snapshot.agents
-      : payload.result.agents;
-    agents[0].agent_status = parentLifecycle;
-    if (isApiSnapshot(args))
-      payload.result.snapshot.panes[0].agent_status = parentLifecycle;
-    return { ...result, stdout: JSON.stringify(payload) };
-  };
-  const pi = fakePi({ exec });
+  // The daemon reports both panes, the parent's as a working pane.
+  observeFleet([{ state: parent }, { state: child }]);
+  const pi = fakePi({});
   registerExtension!(pi.pi as never);
   try {
-    await pi.events.get("session_start")![0](undefined, fakeContext());
-    await new Promise((resolve) => setImmediate(resolve));
+    await startRadarSession(pi, fakeContext());
+    await settleUntil(
+      () =>
+        pi.sent.filter(
+          (message: any) => message.customType === "pi-herdsman-agent-stale",
+        ).length === 1,
+    );
     assert.equal(
       pi.sent.filter(
         (message: any) => message.customType === "pi-herdsman-agent-stale",
@@ -5103,7 +4575,8 @@ test("stale working parents remain visible while waiting parents project blocked
     assert.equal(stale.details.ownerSessionId, LEAD_SESSION_ID);
 
     pi.sent.length = 0;
-    parentLifecycle = "idle";
+    // The parent's pane stops reporting work while it waits on the child.
+    observeFleet([{ state: parent, status: "idle" }, { state: child }]);
     t.mock.timers.tick(30_000);
     await new Promise((resolve) => setImmediate(resolve));
     const waiting = await agentTool(pi, "list").execute(
@@ -5144,22 +4617,14 @@ test("health scanner alerts true runtime blocking", async () => {
   const mailbox = agentMailboxPath(WORKSPACE, label);
   writeAgentState(mailbox, state);
   const sent: any[] = [];
+  // The daemon reports the pane with the lifecycle that is the blocking fact.
+  observeFleet([{ state, status: "blocked" }]);
   const pi = fakePi({
-    exec: leadExec(
-      label,
-      "working",
-      DEFAULT_PI_SESSION_ID,
-      undefined,
-      DEFAULT_PI_SESSION_ID,
-      recoveryIdentity(label),
-      true,
-      "blocked",
-    ),
     sendMessage: (message) => sent.push(message),
   });
   registerExtension!(pi.pi as never);
   await pi.events.get("session_start")![0](undefined, fakeContext());
-  await new Promise((resolve) => setImmediate(resolve));
+  await settleUntil(() => sent.length === 1);
   assert.equal(sent.length, 1);
   assert.equal(sent[0].customType, "pi-herdsman-agent-attention");
   assert.equal(sent[0].details.reason, "blocked");
@@ -5191,7 +4656,12 @@ test("settling alone does not trigger generic health attention", async () => {
   });
   registerExtension!(pi.pi as never);
   await pi.events.get("session_start")![0](undefined, fakeContext());
-  await new Promise((resolve) => setImmediate(resolve));
+  await settleUntil(
+    () =>
+      pi.sent.some(
+        (message: any) => message.customType === "pi-herdsman-agent-attention",
+      ) === false,
+  );
   assert.equal(
     pi.sent.some(
       (message: any) => message.customType === "pi-herdsman-agent-attention",
@@ -5283,7 +4753,11 @@ test("result errors wake the direct owner with durable recovery evidence", async
   });
   registerExtension!(pi.pi as never);
   await pi.events.get("session_start")![0](undefined, fakeContext());
-  await new Promise((resolve) => setImmediate(resolve));
+  await settleUntil(() =>
+    pi.sent.some(
+      (message: any) => message.customType === "pi-herdsman-agent-attention",
+    ),
+  );
   const attention = pi.sent.find(
     (message: any) => message.customType === "pi-herdsman-agent-attention",
   ) as any;
@@ -5305,20 +4779,18 @@ test("physical unknown attention is one-shot and fail-closed", async (t) => {
   const identity = recoveryIdentity(label);
   const mailbox = agentMailboxPath(WORKSPACE, label);
   writeAgentState(mailbox, managedState(label, REQUEST_ID, identity));
-  const mismatched = { ...identity, paneId: "different-pane" };
-  const pi = fakePi({
-    exec: leadExec(
-      label,
-      "working",
-      DEFAULT_PI_SESSION_ID,
-      undefined,
-      DEFAULT_PI_SESSION_ID,
-      mismatched,
-    ),
-  });
+  const pi = fakePi({});
   registerExtension!(pi.pi as never);
+  // The daemon cannot serve the observation that would prove this child's
+  // physical identity, which is the canonical shape of "unknown".
+  radarDaemon.options.observeUnavailable = true;
   await pi.events.get("session_start")![0](undefined, fakeContext());
-  await new Promise((resolve) => setImmediate(resolve));
+  await settleUntil(
+    () =>
+      pi.sent.filter(
+        (message: any) => message.customType === "pi-herdsman-agent-attention",
+      ).length === 1,
+  );
   assert.equal(
     pi.sent.filter(
       (message: any) => message.customType === "pi-herdsman-agent-attention",
@@ -5332,7 +4804,12 @@ test("physical unknown attention is one-shot and fail-closed", async (t) => {
   assert.deepEqual(attention.details.availableActions, []);
   now += 20 * 60_000;
   t.mock.timers.tick(30_000);
-  await new Promise((resolve) => setImmediate(resolve));
+  await settleUntil(
+    () =>
+      pi.sent.filter(
+        (message: any) => message.customType === "pi-herdsman-agent-attention",
+      ).length === 1,
+  );
   assert.equal(
     pi.sent.filter(
       (message: any) => message.customType === "pi-herdsman-agent-attention",
@@ -5340,6 +4817,7 @@ test("physical unknown attention is one-shot and fail-closed", async (t) => {
     1,
   );
   pi.events.get("session_shutdown")?.[0]();
+  radarDaemon.options.observeUnavailable = false;
   resetAgentMailbox(mailbox);
 });
 
@@ -5356,59 +4834,60 @@ test("delivered owner asks repeat without duplicating first delivery", async (t)
   };
   const mailbox = agentMailboxPath(WORKSPACE, label);
   writeAgentState(mailbox, state);
-  const ask = { version: 5 as const, askId: state.pendingAskId!,
-  requestId: REQUEST_ID,
-  runId: state.runId,
-  ownerSessionId: state.ownerSessionId,
-  workspaceId: state.workspaceId,
-  agentLabel: state.agentLabel,
-  paneId: state.paneId,
-  piSessionId: state.piSessionId,
-  question: "Choose ALPHA or BETA",
-  createdAt: now, };
+  const ask = {
+    version: 5 as const,
+    askId: state.pendingAskId!,
+    requestId: REQUEST_ID,
+    runId: state.runId,
+    ownerSessionId: state.ownerSessionId,
+    workspaceId: state.workspaceId,
+    agentLabel: state.agentLabel,
+    paneId: state.paneId,
+    piSessionId: state.piSessionId,
+    question: "Choose ALPHA or BETA",
+    createdAt: now,
+  };
   writeAsk(mailbox, ask);
   const entries = [{ customType: "pi-herdsman-agent-ask", details: ask }];
   const pi = fakePi({
     entries,
     persistMessages: true,
-    exec: leadExec(
-      label,
-      "working",
-      DEFAULT_PI_SESSION_ID,
-      undefined,
-      DEFAULT_PI_SESSION_ID,
-      identity,
-    ),
   });
   registerExtension!(pi.pi as never);
-  await pi.events.get("session_start")![0](undefined, fakeContext(entries));
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(
+  const reminders = () =>
     pi.sent.filter(
       (message: any) => message.customType === "pi-herdsman-agent-ask",
-    ).length,
-    0,
-  );
-  now += 5 * 60_000;
-  t.mock.timers.tick(30_000);
-  await new Promise((resolve) => setImmediate(resolve));
-  const reminders = pi.sent.filter(
-    (message: any) => message.customType === "pi-herdsman-agent-ask",
-  ) as any[];
-  assert.equal(reminders.length, 1);
-  assert.equal(reminders[0].details.askId, ask.askId);
-  assert.equal(reminders[0].details.requestId, ask.requestId);
-  assert.equal(reminders[0].details.nextReminderMs, 150_000);
-  assert.match(reminders[0].content, /still waiting/);
+    ) as any[];
+  await startRadarSession(pi, fakeContext(entries));
+  await settleUntil(() => reminders().length === 0);
+  assert.equal(reminders().length, 0);
+  // The registering scan reads the clock on whichever side of this advance it
+  // reaches, so each step advances a full reminder interval and scans again:
+  // either way the reminder is due within two steps.
+  for (let step = 0; step < 2 && reminders().length === 0; step++) {
+    now += 5 * 60_000;
+    t.mock.timers.tick(30_000);
+    await settleUntil(() => reminders().length === 1);
+  }
+  assert.equal(reminders().length, 1);
+  assert.equal(reminders()[0].details.askId, ask.askId);
+  assert.equal(reminders()[0].details.requestId, ask.requestId);
+  assert.equal(reminders()[0].details.nextReminderMs, 150_000);
+  assert.match(reminders()[0].content, /still waiting/);
   assert.match(
-    reminders[0].content,
+    reminders()[0].content,
     /Use agent_reply to reply to this exact pending ask/,
   );
   writeAgentState(mailbox, { ...state, pendingAskId: undefined });
   removeAsk(mailbox, ask.askId);
   now += 3 * 60_000;
   t.mock.timers.tick(30_000);
-  await new Promise((resolve) => setImmediate(resolve));
+  await settleUntil(
+    () =>
+      pi.sent.filter(
+        (message: any) => message.customType === "pi-herdsman-agent-ask",
+      ).length === 1,
+  );
   assert.equal(
     pi.sent.filter(
       (message: any) => message.customType === "pi-herdsman-agent-ask",
@@ -5425,58 +4904,31 @@ test("old unacknowledged requests get attention without being resubmitted", asyn
   const identity = recoveryIdentity(label);
   const state = managedState(label, REQUEST_ID, identity);
   const mailbox = agentMailboxPath(WORKSPACE, label);
-  const request: RequestRecord = { version: 5, runId: state.runId,
-  requestId: REQUEST_ID,
-  ownerSessionId: state.ownerSessionId,
-  workspaceId: state.workspaceId,
-  agentLabel: state.agentLabel,
-  paneId: state.paneId,
-  kind: "task",
-  text: "retain this exact intent",
-  createdAt: Date.now() - 11 * 60_000, };
+  const request: RequestRecord = {
+    version: 5,
+    runId: state.runId,
+    requestId: REQUEST_ID,
+    ownerSessionId: state.ownerSessionId,
+    workspaceId: state.workspaceId,
+    agentLabel: state.agentLabel,
+    paneId: state.paneId,
+    kind: "task",
+    text: "retain this exact intent",
+    createdAt: Date.now() - 11 * 60_000,
+  };
   writeAgentState(mailbox, state);
   writeRequest(mailbox, request);
-  const pi = fakePi({
-    exec: (command, args) => {
-      if (command === "herdr" && isApiSnapshot(args))
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              snapshot: {
-                agents: JSON.parse(
-                  listResponse(
-                    label,
-                    "working",
-                    DEFAULT_PI_SESSION_ID,
-                    identity,
-                  ),
-                ).agents,
-                panes: [
-                  {
-                    pane_id: identity.paneId,
-                    workspace_id: WORKSPACE,
-                    cwd: "/tmp",
-                    agent_session: {
-                      source: "herdr:pi",
-                      agent: "pi",
-                      kind: "id",
-                      value: identity.piSessionId,
-                    },
-                  },
-                ],
-              },
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      return { stdout: "{}", stderr: "", code: 0 };
-    },
-  });
+  const pi = fakePi({});
   registerExtension!(pi.pi as never);
-  await pi.events.get("session_start")![0](undefined, fakeContext());
-  await new Promise((resolve) => setImmediate(resolve));
+  // The daemon observes the mailboxes this session owns, which is the only
+  // evidence that can prove this child's physical identity.
+  radarDaemon.observeInventory = radarObservedFleet;
+  await startRadarSession(pi, fakeContext());
+  await settleUntil(() =>
+    pi.sent.some(
+      (message: any) => message.customType === "pi-herdsman-agent-attention",
+    ),
+  );
   const attention = pi.sent.find(
     (message: any) => message.customType === "pi-herdsman-agent-attention",
   ) as any;
@@ -5533,8 +4985,13 @@ test("health reconciliation publishes at most one attention per scan", async (t)
   });
   registerExtension!(pi.pi as never);
   t.mock.timers.enable({ apis: ["setTimeout"] });
-  await pi.events.get("session_start")![0](undefined, fakeContext());
-  await new Promise((resolve) => setImmediate(resolve));
+  await startRadarSession(pi, fakeContext());
+  await settleUntil(
+    () =>
+      pi.sent.filter(
+        (message: any) => message.customType === "pi-herdsman-agent-attention",
+      ).length === 1,
+  );
   assert.equal(
     pi.sent.filter(
       (message: any) => message.customType === "pi-herdsman-agent-attention",
@@ -5542,7 +4999,12 @@ test("health reconciliation publishes at most one attention per scan", async (t)
     1,
   );
   t.mock.timers.tick(30_000);
-  await new Promise((resolve) => setImmediate(resolve));
+  await settleUntil(
+    () =>
+      pi.sent.filter(
+        (message: any) => message.customType === "pi-herdsman-agent-attention",
+      ).length === 2,
+  );
   assert.equal(
     pi.sent.filter(
       (message: any) => message.customType === "pi-herdsman-agent-attention",
@@ -5616,7 +5078,8 @@ test("lost managed agents remain visible and repeatedly notify their owner", asy
     await pi.events.get("session_start")![0](undefined, fakeContext());
     for (let index = 0; index < 5; index++)
       await new Promise<void>((resolve) => setImmediate(resolve));
-    lifecycle.live.delete(label);
+    // The daemon stops reporting the pane the child was recorded in.
+    observeFleet([]);
     t.mock.timers.tick(30_000);
     for (let index = 0; index < 8; index++)
       await new Promise<void>((resolve) => setImmediate(resolve));
@@ -5689,7 +5152,12 @@ test("lost managed agents remain visible and repeatedly notify their owner", asy
     assert.equal(readAgentState(mailbox), undefined);
     now += 5 * 60_000;
     t.mock.timers.tick(30_000);
-    await new Promise((resolve) => setImmediate(resolve));
+    await settleUntil(
+      () =>
+        pi.sent.filter(
+          (message: any) => message.customType === "pi-herdsman-agent-lost",
+        ).length === 2,
+    );
     assert.equal(
       pi.sent.filter(
         (message: any) => message.customType === "pi-herdsman-agent-lost",
@@ -5726,12 +5194,9 @@ test("a worker exited by hand leaves a shell pane that reads unknown, then lost 
   const mailbox = agentMailboxPath(WORKSPACE, label);
   resetAgentMailbox(mailbox);
   writeAgentState(mailbox, state);
-  const lifecycle = cascadeExecutor([state], {
-    paneOnly: [state.paneId],
-    omitAgentLabels: [label],
-    omitPaneLabels: [label],
-  });
-  const pi = fakePi({ persistMessages: true, exec: lifecycle.exec });
+  // The pane survives as a plain shell: the daemon reports it with no occupant.
+  observeFleet([], [state]);
+  const pi = fakePi({ persistMessages: true });
   t.mock.timers.enable({ apis: ["setTimeout"] });
   registerExtension!(pi.pi as never);
   const listState = async () => {
@@ -5747,7 +5212,7 @@ test("a worker exited by hand leaves a shell pane that reads unknown, then lost 
     );
   };
   try {
-    await pi.events.get("session_start")![0](undefined, fakeContext());
+    await startRadarSession(pi, fakeContext());
     for (let index = 0; index < 5; index++)
       await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal((await listState()).state, "unknown");
@@ -5771,7 +5236,7 @@ test("a worker exited by hand leaves a shell pane that reads unknown, then lost 
     assert.equal(readAgentState(mailbox), undefined);
     // The pane belongs to whoever is using the shell now; closing the lost
     // generation must not close it.
-    assert.deepEqual(lifecycle.closeOrder, []);
+    assert.deepEqual([...radarDaemon.closes.values()], []);
   } finally {
     pi.events.get("session_shutdown")?.[0]();
     resetAgentMailbox(mailbox);
@@ -5803,16 +5268,21 @@ test("lost parent health attention omits close when a descendant has an unread d
   resetAgentMailbox(childMailbox);
   writeAgentState(parentMailbox, parent);
   writeAgentState(childMailbox, child);
-  writeResult(childMailbox, { version: 5, runId: child.runId,
-  requestId: REQUEST_ID,
-  ownerSessionId: child.ownerSessionId,
-  workspaceId: child.workspaceId,
-  agentLabel: child.agentLabel,
-  paneId: child.paneId,
-  status: "completed",
-  text: "child durable result",
-  completedAt: Date.now(), });
-  const pi = fakePi({ exec: cascadeExecutor([child]).exec });
+  writeResult(childMailbox, {
+    version: 5,
+    runId: child.runId,
+    requestId: REQUEST_ID,
+    ownerSessionId: child.ownerSessionId,
+    workspaceId: child.workspaceId,
+    agentLabel: child.agentLabel,
+    paneId: child.paneId,
+    status: "completed",
+    text: "child durable result",
+    completedAt: Date.now(),
+  });
+  // The daemon reports the child and not the parent, so the parent is gone.
+  observeFleet([{ state: child }]);
+  const pi = fakePi({});
   registerExtension!(pi.pi as never);
   try {
     await pi.events.get("session_start")![0](undefined, fakeContext());
@@ -5827,6 +5297,10 @@ test("lost parent health attention omits close when a descendant has an unread d
     assert.match(
       String(attention?.content),
       /agent_close is not currently available/,
+    );
+    assert.match(
+      String(attention?.content),
+      /Continuing its saved session with agent_continue does not depend on it\./,
     );
     assert.doesNotMatch(
       String(attention?.content),
@@ -5849,15 +5323,18 @@ test("live agents with an unread durable result do not advertise close", async (
   const mailbox = agentMailboxPath(WORKSPACE, label);
   resetAgentMailbox(mailbox);
   writeAgentState(mailbox, state);
-  writeResult(mailbox, { version: 5, runId: state.runId,
-  requestId: REQUEST_ID,
-  ownerSessionId: state.ownerSessionId,
-  workspaceId: state.workspaceId,
-  agentLabel: state.agentLabel,
-  paneId: state.paneId,
-  status: "completed",
-  text: "durable result",
-  completedAt: Date.now(), });
+  writeResult(mailbox, {
+    version: 5,
+    runId: state.runId,
+    requestId: REQUEST_ID,
+    ownerSessionId: state.ownerSessionId,
+    workspaceId: state.workspaceId,
+    agentLabel: state.agentLabel,
+    paneId: state.paneId,
+    status: "completed",
+    text: "durable result",
+    completedAt: Date.now(),
+  });
   const pi = fakePi({ exec: cascadeExecutor([state]).exec });
   registerExtension!(pi.pi as never);
   try {
@@ -5905,15 +5382,18 @@ test("lead list hides close when a descendant has an unread durable result", asy
   resetAgentMailbox(childMailbox);
   writeAgentState(parentMailbox, parent);
   writeAgentState(childMailbox, child);
-  writeResult(childMailbox, { version: 5, runId: child.runId,
-  requestId: REQUEST_ID,
-  ownerSessionId: child.ownerSessionId,
-  workspaceId: child.workspaceId,
-  agentLabel: child.agentLabel,
-  paneId: child.paneId,
-  status: "completed",
-  text: "child durable result",
-  completedAt: Date.now(), });
+  writeResult(childMailbox, {
+    version: 5,
+    runId: child.runId,
+    requestId: REQUEST_ID,
+    ownerSessionId: child.ownerSessionId,
+    workspaceId: child.workspaceId,
+    agentLabel: child.agentLabel,
+    paneId: child.paneId,
+    status: "completed",
+    text: "child durable result",
+    completedAt: Date.now(),
+  });
   const pi = fakePi({
     exec: cascadeExecutor([parent, child]).exec,
   });
@@ -5947,16 +5427,21 @@ test("lost agents with an unread durable result cannot be closed", async () => {
   const mailbox = agentMailboxPath(WORKSPACE, label);
   resetAgentMailbox(mailbox);
   writeAgentState(mailbox, state);
-  writeResult(mailbox, { version: 5, runId: state.runId,
-  requestId: REQUEST_ID,
-  ownerSessionId: state.ownerSessionId,
-  workspaceId: state.workspaceId,
-  agentLabel: state.agentLabel,
-  paneId: state.paneId,
-  status: "completed",
-  text: "durable result",
-  completedAt: Date.now(), });
-  const pi = fakePi({ exec: cascadeExecutor([]).exec });
+  writeResult(mailbox, {
+    version: 5,
+    runId: state.runId,
+    requestId: REQUEST_ID,
+    ownerSessionId: state.ownerSessionId,
+    workspaceId: state.workspaceId,
+    agentLabel: state.agentLabel,
+    paneId: state.paneId,
+    status: "completed",
+    text: "durable result",
+    completedAt: Date.now(),
+  });
+  // The daemon reports no pane this mailbox was recorded in.
+  observeFleet([]);
+  const pi = fakePi({});
   registerExtension!(pi.pi as never);
   try {
     const listed = await agentTool(pi, "list").execute(
@@ -6016,15 +5501,18 @@ test("cascade preflight keeps descendants when a lost parent has a pending resul
     completedRequestId: REQUEST_ID,
   });
   writeAgentState(childMailbox, child);
-  writeResult(parentMailbox, { version: 5, runId: parent.runId,
-  requestId: REQUEST_ID,
-  ownerSessionId: parent.ownerSessionId,
-  workspaceId: parent.workspaceId,
-  agentLabel: parent.agentLabel,
-  paneId: parent.paneId,
-  status: "completed",
-  text: "parent durable result",
-  completedAt: Date.now(), });
+  writeResult(parentMailbox, {
+    version: 5,
+    runId: parent.runId,
+    requestId: REQUEST_ID,
+    ownerSessionId: parent.ownerSessionId,
+    workspaceId: parent.workspaceId,
+    agentLabel: parent.agentLabel,
+    paneId: parent.paneId,
+    status: "completed",
+    text: "parent durable result",
+    completedAt: Date.now(),
+  });
   const lifecycle = cascadeExecutor([child]);
   const pi = fakePi({ exec: lifecycle.exec });
   registerExtension!(pi.pi as never);
@@ -6050,27 +5538,29 @@ test("cascade preflight keeps descendants when a lost parent has a pending resul
 
 test("lost close fails closed when a result appears during its final proof", async () => {
   setLeadEnvironment();
-  const mailbox = agentMailboxPath(WORKSPACE, "racing-lost-result");
-  const state = {
-    ...managedState(
-      "racing-lost-result",
-      REQUEST_ID,
-      recoveryIdentity("racing-lost-result"),
-    ),
-  };
+  const label = "racing-lost-result";
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  const state = managedState(label, REQUEST_ID, recoveryIdentity(label));
   writeAgentState(mailbox, state);
-  let snapshots = 0;
-  const racedState = {
-    ...state,
-    completedRequestId: REQUEST_ID,
-  };
-  delete racedState.activeRequestId;
-  const pi = fakePi({
-    exec: (command, args, options) => {
-      const result = cascadeExecutor([]).exec(command, args, options);
-      if (command === "herdr" && isApiSnapshot(args) && ++snapshots === 5) {
-        writeAgentState(mailbox, racedState);
-        writeResult(mailbox, { version: 5, runId: state.runId,
+  // The assignment resolves while the close is still proving the child: the
+  // delivered result is the durable fact that has to abort the close.
+  const {
+    activeRequestId: _active,
+    acceptedAssignment: _accepted,
+    briefProfile: _profile,
+    ...unassigned
+  } = state;
+  const delivered = { ...unassigned, completedRequestId: REQUEST_ID };
+  // No pane this mailbox was recorded in is reported, so the child is gone and
+  // its close is the mailbox cleanup a lost generation gets.
+  const absent = { workspaces: [], tabs: [], panes: [], agents: [] };
+  let reads = 0;
+  radarDaemon.observeInventory = () => {
+    if (++reads === 2) {
+      writeAgentState(mailbox, delivered);
+      writeResult(mailbox, {
+        version: 5,
+        runId: state.runId,
         requestId: REQUEST_ID,
         ownerSessionId: state.ownerSessionId,
         workspaceId: state.workspaceId,
@@ -6078,11 +5568,12 @@ test("lost close fails closed when a result appears during its final proof", asy
         paneId: state.paneId,
         status: "completed",
         text: "raced durable result",
-        completedAt: Date.now(), });
-      }
-      return result;
-    },
-  });
+        completedAt: Date.now(),
+      });
+    }
+    return absent;
+  };
+  const pi = fakePi({});
   registerExtension!(pi.pi as never);
   try {
     const listed = await agentTool(pi, "list").execute(
@@ -6095,15 +5586,13 @@ test("lost close fails closed when a result appears during its final proof", asy
     assert.deepEqual(listed.details.agents[0].available_tools, ["agent_close"]);
     const closed = await agentTool(pi, "close").execute(
       "id",
-      { agent: state.agentLabel },
+      { agent: label },
       undefined,
       undefined,
       fakeContext(),
     );
     assert.equal(closed.details.error.category, "target_ambiguous");
-    const completedState = { ...racedState };
-    delete completedState.acceptedAssignment;
-    assert.deepEqual(readAgentState(mailbox), completedState);
+    assert.deepEqual(readAgentState(mailbox), delivered);
     assert.ok(readResult(mailbox, REQUEST_ID));
   } finally {
     pi.events.get("session_shutdown")?.[0]();
@@ -6113,27 +5602,39 @@ test("lost close fails closed when a result appears during its final proof", asy
 
 test("a lost parent retains its live child ancestry and closes child-first", async () => {
   setLeadEnvironment();
-  const parent = {
-    ...managedState("lost-parent", undefined, recoveryIdentity("lost-parent")),
-    piSessionId: PARENT_SESSION_ID,
-  };
-  const child = {
-    ...managedState(
-      "lost-parent-child",
-      REQUEST_ID,
-      recoveryIdentity("lost-parent-child"),
-    ),
-    ownerSessionId: parent.piSessionId,
-    piSessionId: CHILD_SESSION_ID,
-  };
-  const parentMailbox = agentMailboxPath(WORKSPACE, parent.agentLabel);
-  const childMailbox = agentMailboxPath(WORKSPACE, child.agentLabel);
+  await ensureRadarDaemon();
+  const parentMailbox = agentMailboxPath(WORKSPACE, "lost-parent");
+  const childMailbox = agentMailboxPath(WORKSPACE, "lost-parent-child");
   resetAgentMailbox(parentMailbox);
   resetAgentMailbox(childMailbox);
-  writeAgentState(parentMailbox, parent);
-  writeAgentState(childMailbox, child);
-  const lifecycle = cascadeExecutor([child]);
-  const pi = fakePi({ exec: lifecycle.exec });
+  writeAgentState(parentMailbox, {
+    ...managedState("lost-parent", undefined, recoveryIdentity("lost-parent")),
+    piSessionId: PARENT_SESSION_ID,
+  });
+  const childLaunch = await radarDaemon.adoptRetainedChild({
+    label: "lost-parent-child",
+    runId: randomUUID(),
+    ownerSessionId: PARENT_SESSION_ID,
+    workspaceId: WORKSPACE,
+    mailbox: childMailbox,
+    pane: "lost-parent-child-pane",
+  });
+  const entries = [
+    {
+      type: "custom",
+      customType: "pi-herdsman-radar-spawn",
+      data: childLaunch,
+    },
+  ];
+  // The daemon's observation reports no pane the parent was recorded in: the
+  // parent is gone, and only its Radar-launched child is still there.
+  radarDaemon.options.inventory = {
+    workspaces: [],
+    tabs: [],
+    panes: [],
+    agents: [],
+  };
+  const pi = fakePi({});
   registerExtension!(pi.pi as never);
   try {
     const listed = await agentTool(pi, "list").execute(
@@ -6141,27 +5642,30 @@ test("a lost parent retains its live child ancestry and closes child-first", asy
       {},
       undefined,
       undefined,
-      fakeContext(),
+      fakeContext(entries),
     );
     const parentRow = listed.details.agents.find(
-      (agent: any) => agent.agent === parent.agentLabel,
+      (agent: any) => agent.agent === "lost-parent",
     );
     const childRow = listed.details.agents.find(
-      (agent: any) => agent.agent === child.agentLabel,
+      (agent: any) => agent.agent === "lost-parent-child",
     );
     assert.equal(parentRow?.state, "lost");
     assert.equal(parentRow?.available_tools.includes("agent_close"), true);
-    assert.equal(childRow?.parent_label, parent.agentLabel);
+    assert.equal(childRow?.parent_label, "lost-parent");
 
     const closed = await agentTool(pi, "close").execute(
       "id",
-      { agent: parent.agentLabel },
+      { agent: "lost-parent" },
       undefined,
       undefined,
-      fakeContext(),
+      fakeContext(entries),
     );
     assert.equal(closed.details.ok, true, JSON.stringify(closed.details));
-    assert.deepEqual(lifecycle.closeOrder, [child.agentLabel]);
+    assert.deepEqual(
+      [...radarDaemon.closes.values()].map((close) => close.pane),
+      ["lost-parent-child-pane"],
+    );
     assert.equal(readAgentState(parentMailbox), undefined);
     assert.equal(readAgentState(childMailbox), undefined);
   } finally {
@@ -6170,7 +5674,6 @@ test("a lost parent retains its live child ancestry and closes child-first", asy
     resetAgentMailbox(childMailbox);
   }
 });
-
 test("unknown descendants refuse a lost-parent cascade", async () => {
   setLeadEnvironment();
   const parent = {
@@ -6180,6 +5683,9 @@ test("unknown descendants refuse a lost-parent cascade", async () => {
       recoveryIdentity("unknown-child-parent"),
     ),
     piSessionId: PARENT_SESSION_ID,
+    // Past the startup window with no pane reported: lost, not merely unproved.
+    updatedAt: Date.now() - 11 * 60_000,
+    lastActivityAt: Date.now() - 11 * 60_000,
   };
   const child = {
     ...managedState(
@@ -6196,10 +5702,12 @@ test("unknown descendants refuse a lost-parent cascade", async () => {
   resetAgentMailbox(childMailbox);
   writeAgentState(parentMailbox, parent);
   writeAgentState(childMailbox, child);
-  const lifecycle = cascadeExecutor([child], {
-    mismatchSessionLabel: child.agentLabel,
-  });
-  const pi = fakePi({ exec: lifecycle.exec });
+  // The parent's pane is not reported (lost) and the child's is reported under a
+  // session that is not the one its mailbox records (unknown).
+  observeFleet([
+    { state: child, sessionId: "11111111-1111-4111-8111-111111111111" },
+  ]);
+  const pi = fakePi({});
   registerExtension!(pi.pi as never);
   try {
     const result = await agentTool(pi, "close").execute(
@@ -6210,7 +5718,7 @@ test("unknown descendants refuse a lost-parent cascade", async () => {
       fakeContext(),
     );
     assert.equal(result.details.error.category, "target_ambiguous");
-    assert.deepEqual(lifecycle.closeOrder, []);
+    assert.deepEqual([...radarDaemon.closes.values()], []);
     assert.ok(readAgentState(parentMailbox));
     assert.ok(readAgentState(childMailbox));
   } finally {
@@ -6236,6 +5744,9 @@ test("mixed live and unknown descendants preflight before closing", async () => 
       undefined,
       recoveryIdentity("mixed-live-child"),
     ),
+    // Each child owns its own run, as a real launch does: two children under one
+    // run id are candidate claimants of each other's pane.
+    runId: randomUUID(),
     ownerSessionId: parent.piSessionId,
     piSessionId: CHILD_SESSION_ID,
   };
@@ -6245,6 +5756,7 @@ test("mixed live and unknown descendants preflight before closing", async () => 
       undefined,
       recoveryIdentity("mixed-unknown-child"),
     ),
+    runId: randomUUID(),
     ownerSessionId: parent.piSessionId,
     piSessionId: "11111111-1111-4111-8111-111111111111",
   };
@@ -6259,10 +5771,16 @@ test("mixed live and unknown descendants preflight before closing", async () => 
     [unknownMailbox, unknownChild],
   ] as const)
     writeAgentState(mailbox, state);
-  const lifecycle = cascadeExecutor([liveChild, unknownChild], {
-    mismatchSessionLabel: unknownChild.agentLabel,
-  });
-  const pi = fakePi({ exec: lifecycle.exec });
+  // The parent's pane is not reported (unknown), one descendant is proved live and
+  // the other is reported under a session that is not the one its mailbox records.
+  observeFleet([
+    { state: liveChild },
+    {
+      state: unknownChild,
+      sessionId: "22222222-2222-4222-8222-222222222222",
+    },
+  ]);
+  const pi = fakePi({});
   registerExtension!(pi.pi as never);
   try {
     const result = await agentTool(pi, "close").execute(
@@ -6273,7 +5791,7 @@ test("mixed live and unknown descendants preflight before closing", async () => 
       fakeContext(),
     );
     assert.equal(result.details.error.category, "target_ambiguous");
-    assert.deepEqual(lifecycle.closeOrder, []);
+    assert.deepEqual([...radarDaemon.closes.values()], []);
     assert.ok(readAgentState(parentMailbox));
     assert.ok(readAgentState(liveMailbox));
     assert.ok(readAgentState(unknownMailbox));
@@ -6300,8 +5818,12 @@ test("mixed lost and unknown descendants preflight before removing mailboxes", a
       undefined,
       recoveryIdentity("mixed-lost-child"),
     ),
+    runId: randomUUID(),
     ownerSessionId: parent.piSessionId,
     piSessionId: CHILD_SESSION_ID,
+    // Past the startup window with no pane reported: lost, not merely unproved.
+    updatedAt: Date.now() - 11 * 60_000,
+    lastActivityAt: Date.now() - 11 * 60_000,
   };
   const unknownChild = {
     ...managedState(
@@ -6309,6 +5831,7 @@ test("mixed lost and unknown descendants preflight before removing mailboxes", a
       undefined,
       recoveryIdentity("mixed-lost-unknown-child"),
     ),
+    runId: randomUUID(),
     ownerSessionId: parent.piSessionId,
     piSessionId: "11111111-1111-4111-8111-111111111111",
   };
@@ -6323,10 +5846,16 @@ test("mixed lost and unknown descendants preflight before removing mailboxes", a
     [unknownMailbox, unknownChild],
   ] as const)
     writeAgentState(mailbox, state);
-  const lifecycle = cascadeExecutor([unknownChild], {
-    mismatchSessionLabel: unknownChild.agentLabel,
-  });
-  const pi = fakePi({ exec: lifecycle.exec });
+  // The parent's pane is not reported (unknown), one descendant's is not reported
+  // and is past the startup window (lost), and the other is reported under a
+  // session that is not the one its mailbox records.
+  observeFleet([
+    {
+      state: unknownChild,
+      sessionId: "22222222-2222-4222-8222-222222222222",
+    },
+  ]);
+  const pi = fakePi({});
   registerExtension!(pi.pi as never);
   try {
     const result = await agentTool(pi, "close").execute(
@@ -6337,7 +5866,7 @@ test("mixed lost and unknown descendants preflight before removing mailboxes", a
       fakeContext(),
     );
     assert.equal(result.details.error.category, "target_ambiguous");
-    assert.deepEqual(lifecycle.closeOrder, []);
+    assert.deepEqual([...radarDaemon.closes.values()], []);
     assert.ok(readAgentState(parentMailbox));
     assert.ok(readAgentState(lostMailbox));
     assert.ok(readAgentState(unknownMailbox));
@@ -6351,71 +5880,91 @@ test("mixed lost and unknown descendants preflight before removing mailboxes", a
 test("nested cascades resolve every descendant deepest-first", async () => {
   for (const childLive of [true, false]) {
     setLeadEnvironment();
+    await ensureRadarDaemon();
     const suffix = childLive ? "live-child" : "lost-child";
-    const parent = {
-      ...managedState(
-        `nested-cascade-parent-${suffix}`,
-        undefined,
-        recoveryIdentity(`nested-cascade-parent-${suffix}`),
-      ),
+    const parentLabel = `nested-cascade-parent-${suffix}`;
+    const childLabel = `nested-cascade-child-${suffix}`;
+    const grandchildLabel = `nested-cascade-grandchild-${suffix}`;
+    const parentMailbox = agentMailboxPath(WORKSPACE, parentLabel);
+    const childMailbox = agentMailboxPath(WORKSPACE, childLabel);
+    const grandchildMailbox = agentMailboxPath(WORKSPACE, grandchildLabel);
+    for (const mailbox of [parentMailbox, childMailbox, grandchildMailbox])
+      resetAgentMailbox(mailbox);
+    writeAgentState(parentMailbox, {
+      ...managedState(parentLabel, undefined, recoveryIdentity(parentLabel)),
       piSessionId: PARENT_SESSION_ID,
+    });
+    // A live child is one the daemon launched; a lost one is a mailbox whose
+    // process is gone, which the cascade still resolves by ancestry.
+    const childLaunch = childLive
+      ? await radarDaemon.adoptRetainedChild({
+          label: childLabel,
+          runId: randomUUID(),
+          ownerSessionId: PARENT_SESSION_ID,
+          workspaceId: WORKSPACE,
+          mailbox: childMailbox,
+          pane: `${childLabel}-pane`,
+        })
+      : undefined;
+    if (!childLive) {
+      writeAgentState(childMailbox, {
+        ...managedState(childLabel, undefined, recoveryIdentity(childLabel)),
+        runId: randomUUID(),
+        ownerSessionId: PARENT_SESSION_ID,
+        piSessionId: CHILD_SESSION_ID,
+      });
+    }
+    const childSessionId = readAgentState(childMailbox)!.piSessionId;
+    const grandchildLaunch = await radarDaemon.adoptRetainedChild({
+      label: grandchildLabel,
+      runId: randomUUID(),
+      ownerSessionId: childSessionId,
+      workspaceId: WORKSPACE,
+      mailbox: grandchildMailbox,
+      pane: `${grandchildLabel}-pane`,
+    });
+    const entries = [childLaunch, grandchildLaunch]
+      .filter((launch) => launch !== undefined)
+      .map((data) => ({
+        type: "custom",
+        customType: "pi-herdsman-radar-spawn",
+        data,
+      }));
+    // No pane this parent was recorded in is reported, so the parent is gone;
+    // the Radar-launched descendants are proved by their own launch records.
+    radarDaemon.options.inventory = {
+      workspaces: [],
+      tabs: [],
+      panes: [],
+      agents: [],
     };
-    const child = {
-      ...managedState(
-        `nested-cascade-child-${suffix}`,
-        undefined,
-        recoveryIdentity(`nested-cascade-child-${suffix}`),
-      ),
-      ownerSessionId: parent.piSessionId,
-      piSessionId: CHILD_SESSION_ID,
-    };
-    const grandchild = {
-      ...managedState(
-        `nested-cascade-grandchild-${suffix}`,
-        undefined,
-        recoveryIdentity(`nested-cascade-grandchild-${suffix}`),
-      ),
-      ownerSessionId: child.piSessionId,
-      piSessionId: "11111111-1111-4111-8111-111111111111",
-    };
-    const states = [parent, child, grandchild];
-    const mailboxes = states.map((state) =>
-      agentMailboxPath(WORKSPACE, state.agentLabel),
-    );
-    for (const mailbox of mailboxes) resetAgentMailbox(mailbox);
-    for (const [mailbox, state] of mailboxes.map(
-      (mailbox, index) => [mailbox, states[index]] as const,
-    ))
-      writeAgentState(mailbox, state);
-    const lifecycle = cascadeExecutor(
-      childLive ? [child, grandchild] : [grandchild],
-    );
-    const pi = fakePi({ exec: lifecycle.exec });
+    const pi = fakePi({});
     registerExtension!(pi.pi as never);
     try {
       const result = await agentTool(pi, "close").execute(
         "id",
-        { agent: parent.agentLabel },
+        { agent: parentLabel },
         undefined,
         undefined,
-        fakeContext(),
+        fakeContext(entries),
       );
       assert.equal(result.details.ok, true, JSON.stringify(result.details));
       assert.deepEqual(
-        lifecycle.closeOrder,
-        childLive
-          ? [grandchild.agentLabel, child.agentLabel]
-          : [grandchild.agentLabel],
+        [...radarDaemon.closes.values()].map((close) => close.pane),
+        [
+          `${grandchildLabel}-pane`,
+          ...(childLive ? [`${childLabel}-pane`] : []),
+        ],
       );
-      for (const mailbox of mailboxes)
+      for (const mailbox of [parentMailbox, childMailbox, grandchildMailbox])
         assert.equal(readAgentState(mailbox), undefined);
     } finally {
       pi.events.get("session_shutdown")?.[0]();
-      for (const mailbox of mailboxes) resetAgentMailbox(mailbox);
+      for (const mailbox of [parentMailbox, childMailbox, grandchildMailbox])
+        resetAgentMailbox(mailbox);
     }
   }
 });
-
 test("nested unknown descendants refuse the cascade before any mutation", async () => {
   setLeadEnvironment();
   const parent = {
@@ -6432,6 +5981,7 @@ test("nested unknown descendants refuse the cascade before any mutation", async 
       undefined,
       recoveryIdentity("nested-unknown-child"),
     ),
+    runId: randomUUID(),
     ownerSessionId: parent.piSessionId,
     piSessionId: CHILD_SESSION_ID,
   };
@@ -6441,6 +5991,7 @@ test("nested unknown descendants refuse the cascade before any mutation", async 
       undefined,
       recoveryIdentity("nested-unknown-grandchild"),
     ),
+    runId: randomUUID(),
     ownerSessionId: child.piSessionId,
     piSessionId: "11111111-1111-4111-8111-111111111111",
   };
@@ -6453,10 +6004,13 @@ test("nested unknown descendants refuse the cascade before any mutation", async 
     (mailbox, index) => [mailbox, states[index]] as const,
   ))
     writeAgentState(mailbox, state);
-  const lifecycle = cascadeExecutor([child, grandchild], {
-    mismatchSessionLabel: grandchild.agentLabel,
-  });
-  const pi = fakePi({ exec: lifecycle.exec });
+  // The parent's pane is not reported, and both descendants are reported under a
+  // session that is not the one their mailboxes record.
+  observeFleet([
+    { state: child, sessionId: "22222222-2222-4222-8222-222222222222" },
+    { state: grandchild, sessionId: "33333333-3333-4333-8333-333333333333" },
+  ]);
+  const pi = fakePi({});
   registerExtension!(pi.pi as never);
   try {
     const result = await agentTool(pi, "close").execute(
@@ -6467,7 +6021,7 @@ test("nested unknown descendants refuse the cascade before any mutation", async 
       fakeContext(),
     );
     assert.equal(result.details.error.category, "target_ambiguous");
-    assert.deepEqual(lifecycle.closeOrder, []);
+    assert.deepEqual([...radarDaemon.closes.values()], []);
     for (const mailbox of mailboxes) assert.ok(readAgentState(mailbox));
   } finally {
     pi.events.get("session_shutdown")?.[0]();
@@ -6548,6 +6102,7 @@ test("cascade preflights the parent before closing descendants", async () => {
       undefined,
       recoveryIdentity("unresolved-cascade-child"),
     ),
+    runId: randomUUID(),
     ownerSessionId: parent.piSessionId,
     piSessionId: CHILD_SESSION_ID,
   };
@@ -6557,10 +6112,14 @@ test("cascade preflights the parent before closing descendants", async () => {
   resetAgentMailbox(childMailbox);
   writeAgentState(parentMailbox, parent);
   writeAgentState(childMailbox, child);
-  const lifecycle = cascadeExecutor([parent, child], {
-    mismatchSessionLabel: parent.agentLabel,
-  });
-  const pi = fakePi({ exec: lifecycle.exec });
+  // The parent's pane is reported under a session that is not the one its mailbox
+  // records, so it cannot be proved; the descendant is proved live and must
+  // survive the refusal untouched.
+  observeFleet([
+    { state: parent, sessionId: "22222222-2222-4222-8222-222222222222" },
+    { state: child },
+  ]);
+  const pi = fakePi({});
   registerExtension!(pi.pi as never);
   try {
     const result = await agentTool(pi, "close").execute(
@@ -6571,7 +6130,7 @@ test("cascade preflights the parent before closing descendants", async () => {
       fakeContext(),
     );
     assert.equal(result.details.error.category, "target_ambiguous");
-    assert.deepEqual(lifecycle.closeOrder, []);
+    assert.deepEqual([...radarDaemon.closes.values()], []);
     assert.ok(readAgentState(parentMailbox));
     assert.ok(readAgentState(childMailbox));
   } finally {
@@ -6583,231 +6142,127 @@ test("cascade preflights the parent before closing descendants", async () => {
 
 test("cascade revalidates a live descendant mailbox before closing it", async () => {
   setLeadEnvironment();
-  const parent = {
-    ...managedState(
-      "changed-live-cascade-parent",
-      undefined,
-      recoveryIdentity("changed-live-cascade-parent"),
-    ),
-    piSessionId: PARENT_SESSION_ID,
-  };
-  const child = {
-    ...managedState(
-      "changed-live-cascade-child",
-      undefined,
-      recoveryIdentity("changed-live-cascade-child"),
-    ),
-    ownerSessionId: parent.piSessionId,
-    piSessionId: CHILD_SESSION_ID,
-  };
-  const parentMailbox = agentMailboxPath(WORKSPACE, parent.agentLabel);
-  const childMailbox = agentMailboxPath(WORKSPACE, child.agentLabel);
+  await ensureRadarDaemon();
+  const parentMailbox = agentMailboxPath(WORKSPACE, "changed-live-cascade");
+  const childMailbox = agentMailboxPath(
+    WORKSPACE,
+    "changed-live-cascade-child",
+  );
   resetAgentMailbox(parentMailbox);
   resetAgentMailbox(childMailbox);
-  writeAgentState(parentMailbox, parent);
-  writeAgentState(childMailbox, child);
-  const lifecycle = cascadeExecutor([parent, child]);
-  let snapshotCalls = 0;
-  const changedChild = {
-    ...child,
+  const parentLaunch = await radarDaemon.adoptRetainedChild({
+    label: "changed-live-cascade",
     runId: randomUUID(),
-  };
-  const pi = fakePi({
-    exec: (command, args, options) => {
-      const result = lifecycle.exec(command, args, options);
-      if (command === "herdr" && isApiSnapshot(args)) {
-        snapshotCalls++;
-        if (snapshotCalls === 2) writeAgentState(childMailbox, changedChild);
-      }
-      return result;
-    },
+    ownerSessionId: LEAD_SESSION_ID,
+    workspaceId: WORKSPACE,
+    mailbox: parentMailbox,
+    pane: "changed-live-cascade-pane",
   });
+  const childLaunch = await radarDaemon.adoptRetainedChild({
+    label: "changed-live-cascade-child",
+    runId: randomUUID(),
+    ownerSessionId: readAgentState(parentMailbox)!.piSessionId,
+    workspaceId: WORKSPACE,
+    mailbox: childMailbox,
+    pane: "changed-live-cascade-child-pane",
+  });
+  const entries = [parentLaunch, childLaunch].map((data) => ({
+    type: "custom",
+    customType: "pi-herdsman-radar-spawn",
+    data,
+  }));
+  // The descendant is replaced between the plan and its own close: the mailbox
+  // the cascade planned on is no longer the one it would be closing.
+  const changedChild = {
+    ...readAgentState(childMailbox)!,
+    cwd: "/tmp/replaced-descendant",
+  };
+  const fleet = radarObservedFleet;
+  let reads = 0;
+  radarDaemon.observeInventory = () => {
+    if (++reads === 2) writeAgentState(childMailbox, changedChild);
+    return fleet();
+  };
+  const pi = fakePi({});
   registerExtension!(pi.pi as never);
   try {
     const result = await agentTool(pi, "close").execute(
       "id",
-      { agent: parent.agentLabel },
+      { agent: "changed-live-cascade" },
       undefined,
       undefined,
-      fakeContext(),
+      fakeContext(entries),
     );
     assert.equal(result.details.error.category, "target_ambiguous");
-    assert.equal(snapshotCalls, 2);
-    assert.deepEqual(lifecycle.closeOrder, []);
-    assert.deepEqual(readAgentState(parentMailbox), parent);
+    assert.deepEqual([...radarDaemon.closes.values()], []);
+    assert.ok(readAgentState(parentMailbox));
     assert.deepEqual(readAgentState(childMailbox), changedChild);
-    assert.ok(lifecycle.live.has(child.agentLabel));
   } finally {
     pi.events.get("session_shutdown")?.[0]();
     resetAgentMailbox(parentMailbox);
     resetAgentMailbox(childMailbox);
   }
 });
-
-test("stale scanner keeps one inventory in flight and retries rejection", async (t) => {
+test("a canonical row that contradicts the mailbox never projects a child live", async () => {
   setLeadEnvironment();
-  const state = {
-    ...managedState("pending-inventory", REQUEST_ID),
-    lastActivityAt: Date.now() - 11 * 60_000,
-  };
-  const mailbox = agentMailboxPath(WORKSPACE, state.agentLabel);
-  writeAgentState(mailbox, state);
-  let listCalls = 0;
-  let resolveList!: () => void;
-  let first = true;
-  let rejectNext = false;
-  const pending = new Promise<void>((resolve) => (resolveList = resolve));
-  let sends = 0;
-  const pi = fakePi({
-    exec: async (command, args) => {
-      if (command === "herdr" && args[0] === "agent" && args[1] === "list") {
-        listCalls++;
-        if (first) {
-          first = false;
-          return {
-            stdout: JSON.stringify({
-              id: AGENT_ID,
-              result: JSON.parse(listResponse(state.agentLabel, "working")),
-            }),
-            stderr: "",
-            code: 0,
-          };
-        }
-        if (rejectNext) {
-          rejectNext = false;
-          throw new Error("inventory unavailable");
-        }
-        await pending;
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: JSON.parse(listResponse(state.agentLabel, "working")),
-          }),
-          stderr: "",
-          code: 0,
-        };
-      }
-      if (command === "herdr" && args[0] === "agent" && args[1] === "get") {
-        const result = leadExec(
-          state.agentLabel,
-          "working",
-          DEFAULT_PI_SESSION_ID,
-        )(command, args);
-        const payload = JSON.parse(result.stdout);
-        payload.result.agent.agent_status = "working";
-        return { ...result, stdout: JSON.stringify(payload) };
-      }
-      return leadExec(
-        state.agentLabel,
-        "working",
-        DEFAULT_PI_SESSION_ID,
-      )(command, args);
-    },
-    sendMessage: () => {
-      sends++;
-    },
+  const label = "contradicted-child";
+  const identity = recoveryIdentity(label);
+  const state = managedState(label, REQUEST_ID, identity);
+  writeAgentState(agentMailboxPath(WORKSPACE, label), state);
+  const row = (overrides: { sessionId?: string; managedLabel?: string }) => ({
+    workspace_id: WORKSPACE,
+    tab_id: `${label}-tab`,
+    pane_id: state.paneId,
+    name: runScopedHerdrAlias(WORKSPACE, label, state.runId),
+    status: "working",
+    facts: { label: overrides.managedLabel ?? label, run: state.runId },
+    session: { kind: "uuid", value: overrides.sessionId ?? state.piSessionId },
   });
-  registerExtension!(pi.pi as never);
-  t.mock.timers.enable({ apis: ["setTimeout"] });
-  await pi.events.get("session_start")![0](undefined, fakeContext());
-  await Promise.resolve();
-  await new Promise((resolve) => setImmediate(resolve));
-  const initialListCalls = listCalls;
-  t.mock.timers.tick(30_000);
-  await Promise.resolve();
-  assert.equal(
-    listCalls,
-    initialListCalls,
-    "the pending inventory remains the sole in-flight scan",
-  );
-  t.mock.timers.tick(30_000);
-  assert.equal(
-    listCalls,
-    initialListCalls,
-    "the pending inventory remains the sole in-flight scan",
-  );
-  resolveList();
-  await new Promise((resolve) => setImmediate(resolve));
-  await new Promise((resolve) => setImmediate(resolve));
-  await Promise.resolve();
-  assert.equal(sends, 1);
-  rejectNext = true;
-  t.mock.timers.tick(30_000);
-  await Promise.resolve();
-  t.mock.timers.tick(30_000);
-  await Promise.resolve();
-  assert.equal(sends, 1, "inventory rejection is contained and retried");
-  pi.events.get("session_shutdown")?.[0]();
-});
-
-test("stale scanner shutdown invalidates old inventory generation", async (t) => {
-  setLeadEnvironment();
-  const state = {
-    ...managedState("generation-agent", REQUEST_ID),
-    lastActivityAt: Date.now() - 11 * 60_000,
-  };
-  writeAgentState(agentMailboxPath(WORKSPACE, state.agentLabel), state);
-  let resolveOld!: () => void;
-  const oldInventory = new Promise<void>((resolve) => (resolveOld = resolve));
-  let listCalls = 0;
-  const sends: unknown[] = [];
-  const pi = fakePi({
-    exec: async (command, args) => {
-      if (command === "herdr" && args[0] === "agent" && args[1] === "list") {
-        listCalls++;
-        if (listCalls === 2) {
-          await oldInventory;
-          return {
-            stdout: JSON.stringify({
-              id: AGENT_ID,
-              result: JSON.parse(listResponse(state.agentLabel, "working")),
-            }),
-            stderr: "",
-            code: 0,
-          };
-        }
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: JSON.parse(listResponse(state.agentLabel, "working")),
-          }),
-          stderr: "",
-          code: 0,
-        };
-      }
-      if (command === "herdr" && args[0] === "agent" && args[1] === "get") {
-        const result = leadExec(
-          state.agentLabel,
-          "working",
-          DEFAULT_PI_SESSION_ID,
-        )(command, args);
-        const payload = JSON.parse(result.stdout);
-        payload.result.agent.agent_status = "working";
-        return { ...result, stdout: JSON.stringify(payload) };
-      }
-      return leadExec(
-        state.agentLabel,
-        "working",
-        DEFAULT_PI_SESSION_ID,
-      )(command, args);
-    },
-    sendMessage: (message) => sends.push(message),
+  const fleet = (agent: ReturnType<typeof row>) => ({
+    workspaces: [{ workspace_id: WORKSPACE }],
+    tabs: [{ tab_id: `${label}-tab`, workspace_id: WORKSPACE }],
+    panes: [
+      {
+        location: {
+          workspace_id: WORKSPACE,
+          tab_id: `${label}-tab`,
+          pane_id: state.paneId,
+        },
+      },
+    ],
+    agents: [
+      {
+        location: {
+          workspace_id: WORKSPACE,
+          tab_id: `${label}-tab`,
+          pane_id: state.paneId,
+        },
+        ...agent,
+      },
+    ],
   });
-  registerExtension!(pi.pi as never);
-  t.mock.timers.enable({ apis: ["setTimeout"] });
-  await pi.events.get("session_start")![0](undefined, fakeContext());
-  await Promise.resolve();
-  t.mock.timers.tick(30_000);
-  await Promise.resolve();
-  pi.events.get("session_shutdown")?.[0]();
-  resolveOld();
-  await new Promise((resolve) => setImmediate(resolve));
-  t.mock.timers.tick(60_000);
-  assert.equal(sends.length, 0);
-  await pi.events.get("session_start")![0](undefined, fakeContext());
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(sends.length, 1, "a new generation scans independently");
-  pi.events.get("session_shutdown")?.[0]();
+  const contradictions = {
+    "a different session": fleet(row({ sessionId: randomUUID() })),
+    "a different managed label": fleet(row({ managedLabel: "someone-else" })),
+  };
+  for (const [name, inventory] of Object.entries(contradictions)) {
+    radarDaemon.observeInventory = () => inventory;
+    const pi = fakePi({ entries: [] });
+    registerExtension!(pi.pi as never);
+    const listed = await agentTool(pi, "list").execute(
+      "contradiction",
+      {},
+      undefined,
+      undefined,
+      fakeContext(),
+    );
+    const child = listed.details.agents.find(
+      (agent: any) => agent.agent === label,
+    );
+    assert.equal(child.recovery_only, true, `${name} must not project live`);
+    assert.equal(child.state, "unknown", name);
+    assert.deepEqual(child.available_tools, [], name);
+  }
 });
 
 test("list derives inactivity without changing public state", async () => {
@@ -6822,7 +6277,12 @@ test("list derives inactivity without changing public state", async () => {
   for (const item of cases) {
     const identity = recoveryIdentity(item.label);
     identity.piSessionId = randomUUID();
-    const state = managedState(item.label, REQUEST_ID, identity);
+    // Each child is its own delegation run: two live children under one run id
+    // are ambiguous by design, not a shape a list assertion can build on.
+    const state = {
+      ...managedState(item.label, REQUEST_ID, identity),
+      runId: randomUUID(),
+    };
     if (item.at !== undefined) state.lastActivityAt = item.at;
     writeAgentState(agentMailboxPath(WORKSPACE, item.label), state);
   }
@@ -6941,10 +6401,116 @@ const softWindowEntry = (
   },
 });
 
+// The fake daemon answers over a real socket, so a scan that reads the fleet
+// takes several event-loop turns. Yield until the observable outcome holds; the
+// fixed budget makes a missing outcome fail rather than hang.
+async function settleUntil(done: () => boolean, budget = 500): Promise<void> {
+  for (let turn = 0; turn < budget && !done(); turn++)
+    await new Promise((resolve) => setImmediate(resolve));
+}
+
+/**
+ * The fleet the daemon observes for this test, as a live daemon reports it. A
+ * generation left out is one the daemon does not report, which is what a child
+ * whose pane is gone looks like; a generation listed in `panesOnly` is reported
+ * as the bare pane it left behind.
+ */
+function observeFleet(
+  reported: Array<{
+    state: ManagedAgentState;
+    name?: string;
+    sessionId?: string;
+    status?: string;
+  }>,
+  panesOnly: ManagedAgentState[] = [],
+): void {
+  const rows = [...panesOnly, ...reported.map(({ state }) => state)].map(
+    (state) => ({
+      workspaceId: state.workspaceId,
+      tabId: `${state.agentLabel}-tab`,
+      paneId: state.paneId,
+    }),
+  );
+  radarDaemon.options.inventory = {
+    workspaces: rows.map((row) => ({ workspace_id: row.workspaceId })),
+    tabs: rows.map((row) => ({
+      tab_id: row.tabId,
+      workspace_id: row.workspaceId,
+    })),
+    panes: rows.map((row) => ({
+      location: {
+        workspace_id: row.workspaceId,
+        tab_id: row.tabId,
+        pane_id: row.paneId,
+      },
+    })),
+    agents: reported.map(({ state, name, sessionId, status }) => ({
+      location: {
+        workspace_id: state.workspaceId,
+        tab_id: `${state.agentLabel}-tab`,
+        pane_id: state.paneId,
+      },
+      name:
+        name ??
+        runScopedHerdrAlias(state.workspaceId, state.agentLabel, state.runId),
+      status: status ?? (state.activeRequestId ? "working" : "idle"),
+      session: { kind: "uuid", value: sessionId ?? state.piSessionId },
+    })),
+  };
+}
+
+/** The delivered-result provenance the lead keeps for a Radar child's result. */
+const recordResultEntry = (entries: unknown[]) => (message: unknown) => {
+  const value = message as any;
+  if (value?.customType !== "pi-herdsman-agent-result") return;
+  entries.push({
+    customType: "pi-herdsman-agent-result",
+    details: { ...value.details },
+  });
+};
+
+/**
+ * A lead session with one child launched through the production Radar edge.
+ * Every lifecycle a test drives continues from the state that launch wrote.
+ */
+async function radarChildFixture(
+  label: string,
+  options: {
+    sendMessage?: (message: unknown) => void;
+    retainWorkers?: boolean;
+  } = {},
+) {
+  setLeadEnvironment();
+  if (options.retainWorkers !== undefined)
+    updateConfig("retainWorkers", options.retainWorkers);
+  let entries: unknown[] = [];
+  const pi = fakePi({
+    sendMessage: (message) => {
+      recordResultEntry(entries)(message);
+      options.sendMessage?.(message);
+    },
+  });
+  entries = pi.entries;
+  registerExtension!(pi.pi as never);
+  await startRadarSession(pi);
+  const child = await delegateRadarChild(pi, label);
+  return {
+    pi,
+    entries,
+    child,
+    mailbox: agentMailboxPath(WORKSPACE, label),
+    requestId: child.activeRequestId!,
+    /** One recovery pass, as a restarted lead performs. */
+    async recover() {
+      for (const handler of pi.events.get("session_start") ?? [])
+        await handler(undefined, fakeContext(entries));
+    },
+  };
+}
+
 const softDigests = (pi: ReturnType<typeof fakePi>) =>
   pi.sent.filter(
-    (message: any) =>
-      message.customType === "pi-herdsman-agent-soft-deadline",
+    (message: any) => message.customType === "pi-herdsman-agent-soft-deadline",
   );
 
 // Drive one live working agent with an armed soft window through the real
@@ -7004,13 +6570,17 @@ test("agent_list offers agent_extend only for a windowed live assignment", async
   for (let index = 0; index < 4; index++)
     await new Promise<void>((resolve) => setImmediate(resolve));
   const listed = () =>
-    agentTool(pi, "list").execute("id", {}, undefined, undefined, fakeContext());
+    agentTool(pi, "list").execute(
+      "id",
+      {},
+      undefined,
+      undefined,
+      fakeContext(),
+    );
   const tools = async () =>
-    (
-      (await listed()).details.agents.find(
-        (agent: any) => agent.agent === "soft-extend-listed",
-      )?.available_tools ?? []
-    ) as string[];
+    ((await listed()).details.agents.find(
+      (agent: any) => agent.agent === "soft-extend-listed",
+    )?.available_tools ?? []) as string[];
   assert.deepEqual(await tools(), [
     "agent_inspect",
     "agent_steer",
@@ -7068,28 +6638,12 @@ test("a proven lost assignment drops agent_extend from available_tools", async (
     },
   });
   const entries = [softWindowEntry(label, REQUEST_ID, now - 10_000, 300_000)];
-  const pi = fakePi({
-    entries,
-    exec: (command, args) => {
-      if (command === "herdr" && isApiSnapshot(args))
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: { snapshot: { agents: [], panes: [] } },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      if (command === "herdr" && args[0] === "status")
-        return { stdout: "{}", stderr: "", code: 0 };
-      if (command === "herdr" && args[0] === "--version")
-        return { stdout: "0.8.0", stderr: "", code: 0 };
-      return { stdout: "{}", stderr: "", code: 0 };
-    },
-  });
+  // The daemon reports no pane this mailbox was recorded in.
+  observeFleet([]);
+  const pi = fakePi({ entries });
   registerExtension!(pi.pi as never);
   t.mock.timers.enable({ apis: ["setTimeout"] });
-  await pi.events.get("session_start")![0](undefined, fakeContext(entries));
+  await startRadarSession(pi, fakeContext(entries));
   for (let index = 0; index < 4; index++)
     await new Promise<void>((resolve) => setImmediate(resolve));
   const listed = await agentTool(pi, "list").execute(
@@ -7137,7 +6691,7 @@ test("agent_extend refuses a non-live worker's recovered window", async (t) => {
   const identity = recoveryIdentity(label);
   const mailbox = agentMailboxPath(WORKSPACE, label);
   resetAgentMailbox(mailbox);
-  writeAgentState(mailbox, {
+  const state = {
     ...managedState(label, REQUEST_ID, identity),
     lastActivityAt: now,
     lastAck: {
@@ -7145,59 +6699,24 @@ test("agent_extend refuses a non-live worker's recovered window", async (t) => {
       accepted: true,
       acknowledgedAt: now - 10_000,
     },
-  });
-  const entries = [softWindowEntry(label, REQUEST_ID, now - 10_000, 300_000)];
-  const liveExec = leadExec(
-    label,
-    "working",
-    identity.piSessionId,
-    undefined,
-    identity.piSessionId,
-    identity,
-  );
-  // The session inventory no longer proves this worker's physical identity
-  // (presence `unknown`), yet the official integration still reports its exact
-  // session, so runtime resolution succeeds and the extend branch is reached.
-  const otherSession = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
-  const inventoryExec = (command: string, args: readonly string[]) => {
-    if (command === "herdr" && isApiSnapshot(args)) {
-      const snapshot = JSON.parse(
-        listResponse(label, "working", otherSession, identity),
-      );
-      return {
-        stdout: JSON.stringify({
-          id: AGENT_ID,
-          result: {
-            snapshot: {
-              agents: snapshot.agents,
-              panes: [
-                {
-                  pane_id: identity.paneId,
-                  workspace_id: WORKSPACE,
-                  cwd: "/tmp",
-                  agent: label,
-                  agent_status: "working",
-                  agent_session: {
-                    source: "herdr:pi",
-                    agent: "pi",
-                    kind: "id",
-                    value: otherSession,
-                  },
-                },
-              ],
-            },
-          },
-        }),
-        stderr: "",
-        code: 0,
-      };
-    }
-    return liveExec(command, args);
   };
-  const pi = fakePi({ entries, exec: inventoryExec });
+  writeAgentState(mailbox, state);
+  const entries = [softWindowEntry(label, REQUEST_ID, now - 10_000, 300_000)];
+  // The daemon reports the pane held by a session that is not this worker's, so
+  // its physical identity cannot be proved even though the official integration
+  // still reports the exact session and runtime resolution succeeds.
+  const otherSession = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+  observeFleet([
+    {
+      state,
+      name: runScopedHerdrAlias(WORKSPACE, label, state.runId),
+      sessionId: otherSession,
+    },
+  ]);
+  const pi = fakePi({ entries });
   registerExtension!(pi.pi as never);
   t.mock.timers.enable({ apis: ["setTimeout"] });
-  await pi.events.get("session_start")![0](undefined, fakeContext(entries));
+  await startRadarSession(pi, fakeContext(entries));
   for (let index = 0; index < 4; index++)
     await new Promise<void>((resolve) => setImmediate(resolve));
 
@@ -7226,10 +6745,17 @@ test("agent_extend refuses a non-live worker's recovered window", async (t) => {
     fakeContext(),
   );
   assert.equal(attempted.details.ok, false);
+  // An identity that cannot be proved is ambiguity, not absence: the mailbox
+  // record exists and something may be holding the pane.
   assert.equal(
     attempted.details.error.category,
-    "agent_busy",
-    `extend refuses a non-live worker through its own guard: ${JSON.stringify(attempted.details)}`,
+    "target_ambiguous",
+    `extend refuses an unprovable worker: ${JSON.stringify(attempted.details)}`,
+  );
+  assert.match(
+    attempted.details.error.message,
+    /cannot be proved uniquely/,
+    "the category names the doubt the message states",
   );
   assert.equal(
     pi.entries.filter(
@@ -7242,6 +6768,58 @@ test("agent_extend refuses a non-live worker's recovered window", async (t) => {
   );
   pi.events.get("session_shutdown")?.[0]();
   resetAgentMailbox(mailbox);
+
+  // The tool's own liveness guard is reachable, so it is not dead code: a
+  // Radar-launched child whose launch and acknowledgment prove this generation
+  // resolves without proving presence, and the guard is what refuses it.
+  {
+    const radarLabel = "soft-extend-unreported";
+    const radarMailbox = agentMailboxPath(WORKSPACE, radarLabel);
+    resetAgentMailbox(radarMailbox);
+    const launch = await radarDaemon.adoptRetainedChild({
+      label: radarLabel,
+      runId: randomUUID(),
+      ownerSessionId: LEAD_SESSION_ID,
+      workspaceId: WORKSPACE,
+      mailbox: radarMailbox,
+      pane: `${radarLabel}-pane`,
+    });
+    writeAgentState(radarMailbox, {
+      ...readAgentState(radarMailbox)!,
+      activeRequestId: REQUEST_ID,
+      lastActivityAt: now,
+      lastAck: {
+        requestId: REQUEST_ID,
+        accepted: true,
+        acknowledgedAt: now - 10_000,
+      },
+    });
+    const radarEntries = [
+      { type: "custom", customType: "pi-herdsman-radar-spawn", data: launch },
+      softWindowEntry(radarLabel, REQUEST_ID, now - 10_000, 300_000),
+    ];
+    // The daemon's own inventory does not report the pane it recorded, so this
+    // generation's current read is unproved while its binding still stands.
+    radarDaemon.options.locationEvidence = "absent";
+    const radarPi = fakePi({ entries: radarEntries });
+    registerExtension!(radarPi.pi as never);
+    await startRadarSession(radarPi, fakeContext(radarEntries));
+    const refused = await agentTool(radarPi, "extend").execute(
+      "id",
+      { agent: radarLabel, windowMs: 900_000 },
+      undefined,
+      undefined,
+      fakeContext(radarEntries),
+    );
+    assert.equal(refused.details.ok, false);
+    assert.equal(
+      refused.details.error.category,
+      "agent_busy",
+      `the liveness guard refuses an unproved Radar generation: ${JSON.stringify(refused.details)}`,
+    );
+    radarPi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(radarMailbox);
+  }
 });
 
 test("a restart mid-window keeps the remaining soft deadline", async (t) => {
@@ -7253,22 +6831,32 @@ test("a restart mid-window keeps the remaining soft deadline", async (t) => {
   });
   t.mock.timers.enable({ apis: ["setTimeout"] });
   await pi.events.get("session_start")![0](undefined, fakeContext(entries));
-  await new Promise((resolve) => setImmediate(resolve));
+  await settleUntil(() => softDigests(pi).length === 0);
   assert.equal(softDigests(pi).length, 0, "120s into a 300s window is not due");
 
   now += 180_000;
   t.mock.timers.tick(30_000);
-  await new Promise((resolve) => setImmediate(resolve));
+  await settleUntil(() => softDigests(pi).length === 1);
   const digests = softDigests(pi);
-  assert.equal(digests.length, 1, "the window expires about 180s after restart");
+  assert.equal(
+    digests.length,
+    1,
+    "the window expires about 180s after restart",
+  );
   assert.equal((digests[0] as any).details.entries.length, 1);
-  assert.equal((digests[0] as any).details.entries[0].agentLabel, "soft-window-mid");
+  assert.equal(
+    (digests[0] as any).details.entries[0].agentLabel,
+    "soft-window-mid",
+  );
   assert.equal((digests[0] as any).details.entries[0].elapsedMs, 300_000);
   assert.equal((digests[0] as any).details.entries[0].windowMs, 300_000);
-  assert.deepEqual(
-    (digests[0] as any).details.entries[0].availableActions,
-    ["inspect", "steer", "interrupt", "extend", "close"],
-  );
+  assert.deepEqual((digests[0] as any).details.entries[0].availableActions, [
+    "inspect",
+    "steer",
+    "interrupt",
+    "extend",
+    "close",
+  ]);
   pi.events.get("session_shutdown")?.[0]();
   resetAgentMailbox(mailbox);
 });
@@ -7290,17 +6878,25 @@ test("a restart after a delivered window continues from its recorded arming", as
   t.mock.timers.enable({ apis: ["setTimeout"] });
   await pi.events.get("session_start")![0](undefined, fakeContext(entries));
   await new Promise((resolve) => setImmediate(resolve));
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(softDigests(pi).length, 0, "a delivered window is not redelivered");
+  await settleUntil(() => softDigests(pi).length === 0);
+  assert.equal(
+    softDigests(pi).length,
+    0,
+    "a delivered window is not redelivered",
+  );
 
   t.mock.timers.tick(30_000);
-  await new Promise((resolve) => setImmediate(resolve));
+  await settleUntil(() => softDigests(pi).length === 0);
   assert.equal(softDigests(pi).length, 0);
 
   now += 290_000;
   t.mock.timers.tick(30_000);
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(softDigests(pi).length, 1, "the next window continues from its arming");
+  await settleUntil(() => softDigests(pi).length === 1);
+  assert.equal(
+    softDigests(pi).length,
+    1,
+    "the next window continues from its arming",
+  );
   pi.events.get("session_shutdown")?.[0]();
   resetAgentMailbox(mailbox);
 });
@@ -7314,7 +6910,7 @@ test("a window that expired while the lead was down is due at the first scan", a
   });
   t.mock.timers.enable({ apis: ["setTimeout"] });
   await pi.events.get("session_start")![0](undefined, fakeContext(entries));
-  await new Promise((resolve) => setImmediate(resolve));
+  await settleUntil(() => softDigests(pi).length === 1);
   const digests = softDigests(pi);
   assert.equal(digests.length, 1);
   assert.equal((digests[0] as any).details.entries[0].elapsedMs, 400_000);
@@ -7352,7 +6948,7 @@ test("an unrecorded window falls back to the durable acknowledgement time", asyn
   registerExtension!(pi.pi as never);
   t.mock.timers.enable({ apis: ["setTimeout"] });
   await pi.events.get("session_start")![0](undefined, fakeContext());
-  await new Promise((resolve) => setImmediate(resolve));
+  await settleUntil(() => softDigests(pi).length === 1);
   const digests = softDigests(pi);
   assert.equal(digests.length, 1);
   assert.equal((digests[0] as any).details.entries[0].elapsedMs, 400_000);
@@ -7376,7 +6972,7 @@ test("softTimeoutMs of zero delivers no digest for an overdue window", async (t)
   await new Promise((resolve) => setImmediate(resolve));
   now += 300_000;
   t.mock.timers.tick(30_000);
-  await new Promise((resolve) => setImmediate(resolve));
+  await settleUntil(() => softDigests(pi).length === 0);
   assert.equal(softDigests(pi).length, 0);
   updateConfig("softTimeoutMs", undefined);
   pi.events.get("session_shutdown")?.[0]();
@@ -7420,6 +7016,10 @@ function softDeadlineFixture(specs: SoftWindowSpec[]) {
         taskIds: ["background-task"],
       };
     }
+    // A shared runId would make every worker here a candidate claimant of every
+    // other one's pane, so presence could not be proved uniquely for any of
+    // them. Each child owns its own run, as a real launch does.
+    state.runId = randomUUID();
     writeAgentState(mailbox, {
       ...state,
       lastActivityAt: spec.lastActivityAt ?? Date.now(),
@@ -7436,9 +7036,7 @@ function softDeadlineFixture(specs: SoftWindowSpec[]) {
     const entries = specs
       .filter((candidate) => candidate.armedAt !== undefined)
       .map((candidate) => {
-        const target = specs.find(
-          (value) => value.label === candidate.label,
-        )!;
+        const target = specs.find((value) => value.label === candidate.label)!;
         return softWindowEntry(
           target.label,
           target.requestId,
@@ -7515,6 +7113,10 @@ function softDeadlineFixture(specs: SoftWindowSpec[]) {
   };
   const pi = fakePi({ entries, exec });
   registerExtension!(pi.pi as never);
+  // Each fixture's own exec installs the fleet its rows describe, so with more
+  // than one child the last installation would hide every other child. The
+  // daemon observes the mailboxes this session owns, which proves all of them.
+  radarDaemon.observeInventory = radarObservedFleet;
   return { pi, fixtures, entries };
 }
 
@@ -7522,19 +7124,29 @@ test("two overdue workers produce one digest covering both", async (t) => {
   let now = Date.now();
   t.mock.method(Date, "now", () => now);
   const { pi, fixtures, entries } = softDeadlineFixture([
-    { label: "soft-multi-one", requestId: randomUUID(), armedAt: now - 400_000 },
-    { label: "soft-multi-two", requestId: randomUUID(), armedAt: now - 350_000 },
+    {
+      label: "soft-multi-one",
+      requestId: randomUUID(),
+      armedAt: now - 400_000,
+    },
+    {
+      label: "soft-multi-two",
+      requestId: randomUUID(),
+      armedAt: now - 350_000,
+    },
   ]);
   t.mock.timers.enable({ apis: ["setTimeout"] });
   await pi.events.get("session_start")![0](undefined, fakeContext(entries));
-  await new Promise((resolve) => setImmediate(resolve));
+  await settleUntil(() => softDigests(pi).length === 1);
   const digests = softDigests(pi);
   assert.equal(digests.length, 1, "one digest covers every due worker");
   const details = (digests[0] as any).details;
   assert.deepEqual(
     details.entries
       .map((entry: any) => [entry.agentLabel, entry.elapsedMs])
-      .sort((left: string[], right: string[]) => left[0]!.localeCompare(right[0]!)),
+      .sort((left: string[], right: string[]) =>
+        left[0]!.localeCompare(right[0]!),
+      ),
     [
       ["soft-multi-one", 400_000],
       ["soft-multi-two", 350_000],
@@ -7572,7 +7184,7 @@ test("a one-Agent checkpoint offers that assignment's watcher instruction", asyn
   );
   t.mock.timers.enable({ apis: ["setTimeout"] });
   await pi.events.get("session_start")![0](undefined, fakeContext(entries));
-  await new Promise((resolve) => setImmediate(resolve));
+  await settleUntil(() => softDigests(pi).length === 1);
   // A consumer that claims nothing leaves the checkpoint on the path it always
   // had: the instruction travels beside the wake, it never replaces it.
   assert.equal(softDigests(pi).length, 1, "the checkpoint is still delivered");
@@ -7606,7 +7218,7 @@ test("a checkpoint covering several Agents offers no single instruction", async 
   );
   t.mock.timers.enable({ apis: ["setTimeout"] });
   await pi.events.get("session_start")![0](undefined, fakeContext(entries));
-  await new Promise((resolve) => setImmediate(resolve));
+  await settleUntil(() => softDigests(pi).length === 1);
   const digests = softDigests(pi);
   assert.equal(digests.length, 1, "one digest still covers both workers");
   assert.equal(
@@ -7653,10 +7265,7 @@ test("a delegate records its watcher instruction, and extend replaces or keeps i
     );
     assert.equal(delegated.details.ok, true, JSON.stringify(delegated.details));
     const requestId = delegated.details.request_id;
-    assert.equal(
-      recorded(requestId),
-      "Only wake me if the migration stalls.",
-    );
+    assert.equal(recorded(requestId), "Only wake me if the migration stalls.");
     const kept = await agentTool(pi, "extend").execute(
       "id",
       { agent: label, windowMs: 60_000 },
@@ -7681,11 +7290,7 @@ test("a delegate records its watcher instruction, and extend replaces or keeps i
       undefined,
       fakeContext(),
     );
-    assert.equal(
-      replaced.details.ok,
-      true,
-      JSON.stringify(replaced.details),
-    );
+    assert.equal(replaced.details.ok, true, JSON.stringify(replaced.details));
     assert.equal(recorded(requestId), "Only wake me if the review is refused.");
   } finally {
     pi.events.get("session_shutdown")?.[0]();
@@ -7735,7 +7340,12 @@ test("background-waiting workers keep digest/extend eligibility but reject inter
   const entry = digest.details.entries.find(
     (candidate: any) => candidate.agentLabel === label,
   );
-  assert.deepEqual(entry.availableActions, ["inspect", "steer", "extend", "close"]);
+  assert.deepEqual(entry.availableActions, [
+    "inspect",
+    "steer",
+    "extend",
+    "close",
+  ]);
   const refused = await agentTool(pi, "interrupt").execute(
     "waiting-interrupt",
     { agent: label, message: "Stop the waiting assignment." },
@@ -7744,7 +7354,10 @@ test("background-waiting workers keep digest/extend eligibility but reject inter
     fakeContext(entries),
   );
   assert.equal(refused.details.error.category, "agent_busy");
-  assert.equal(readAgentState(fixtures[0]!.mailbox)?.activeRequestId, requestId);
+  assert.equal(
+    readAgentState(fixtures[0]!.mailbox)?.activeRequestId,
+    requestId,
+  );
 
   pi.events.get("session_shutdown")?.[0]();
   for (const fixture of fixtures) resetAgentMailbox(fixture.mailbox);
@@ -7763,7 +7376,7 @@ test("a busy lead receives no digest until it is idle", async (t) => {
   await pi.events.get("session_start")![0](undefined, context);
   await new Promise((resolve) => setImmediate(resolve));
   t.mock.timers.tick(30_000);
-  await new Promise((resolve) => setImmediate(resolve));
+  await settleUntil(() => softDigests(pi).length === 0);
   assert.equal(softDigests(pi).length, 0, "a busy owner is never interrupted");
   assert.equal(
     pi.sent.some(
@@ -7778,23 +7391,35 @@ test("a busy lead receives no digest until it is idle", async (t) => {
   idle = true;
   now += 30_000;
   t.mock.timers.tick(30_000);
-  await new Promise((resolve) => setImmediate(resolve));
+  await settleUntil(() => softDigests(pi).length === 1);
   assert.equal(softDigests(pi).length, 1, "the digest arrives after idling");
   pi.events.get("session_shutdown")?.[0]();
   for (const fixture of fixtures) resetAgentMailbox(fixture.mailbox);
 });
 
-
 test("stale attention and a soft-deadline digest are both delivered in one scan", async (t) => {
   let now = Date.now();
   t.mock.method(Date, "now", () => now);
   const { pi, fixtures, entries } = softDeadlineFixture([
-    { label: "soft-coexist-stale", requestId: randomUUID(), lastActivityAt: now - 11 * 60_000 },
-    { label: "soft-coexist-due", requestId: randomUUID(), armedAt: now - 400_000 },
+    {
+      label: "soft-coexist-stale",
+      requestId: randomUUID(),
+      lastActivityAt: now - 11 * 60_000,
+    },
+    {
+      label: "soft-coexist-due",
+      requestId: randomUUID(),
+      armedAt: now - 400_000,
+    },
   ]);
   t.mock.timers.enable({ apis: ["setTimeout"] });
   await pi.events.get("session_start")![0](undefined, fakeContext(entries));
-  await new Promise((resolve) => setImmediate(resolve));
+  await settleUntil(
+    () =>
+      pi.sent.filter(
+        (message: any) => message.customType === "pi-herdsman-agent-stale",
+      ).length === 1,
+  );
   assert.equal(
     pi.sent.filter(
       (message: any) => message.customType === "pi-herdsman-agent-stale",
@@ -7803,7 +7428,11 @@ test("stale attention and a soft-deadline digest are both delivered in one scan"
     "stale attention is still delivered",
   );
   const digests = softDigests(pi);
-  assert.equal(digests.length, 1, "the digest is not suppressed by stale attention");
+  assert.equal(
+    digests.length,
+    1,
+    "the digest is not suppressed by stale attention",
+  );
   assert.deepEqual(
     (digests[0] as any).details.entries.map((entry: any) => entry.agentLabel),
     ["soft-coexist-due"],
@@ -7820,16 +7449,19 @@ test("a digest entry for a worker awaiting an answer lists reply, not interrupt"
   const identity = recoveryIdentity(label);
   const mailbox = agentMailboxPath(WORKSPACE, label);
   resetAgentMailbox(mailbox);
-  const ask = { version: 5 as const, askId: randomUUID(),
-  requestId: REQUEST_ID,
-  runId: AGENT_ID,
-  ownerSessionId: LEAD_SESSION_ID,
-  workspaceId: WORKSPACE,
-  agentLabel: label,
-  paneId: identity.paneId,
-  piSessionId: identity.piSessionId,
-  question: "Keep waiting or change direction?",
-  createdAt: now - 60_000, };
+  const ask = {
+    version: 5 as const,
+    askId: randomUUID(),
+    requestId: REQUEST_ID,
+    runId: AGENT_ID,
+    ownerSessionId: LEAD_SESSION_ID,
+    workspaceId: WORKSPACE,
+    agentLabel: label,
+    paneId: identity.paneId,
+    piSessionId: identity.piSessionId,
+    question: "Keep waiting or change direction?",
+    createdAt: now - 60_000,
+  };
   writeAgentState(mailbox, {
     ...managedState(label, REQUEST_ID, identity),
     lastActivityAt: now,
@@ -7862,7 +7494,11 @@ test("a digest entry for a worker awaiting an answer lists reply, not interrupt"
   for (let index = 0; index < 4; index++)
     await new Promise<void>((resolve) => setImmediate(resolve));
   const digests = softDigests(pi);
-  assert.equal(digests.length, 1, "an assignment awaiting an answer still gets a digest");
+  assert.equal(
+    digests.length,
+    1,
+    "an assignment awaiting an answer still gets a digest",
+  );
   const [entry] = (digests[0] as any).details.entries;
   assert.equal(entry.agentLabel, label);
   assert.ok(
@@ -7882,16 +7518,23 @@ test("soft-deadline listeners annotate the digest before delivery", async (t) =>
   let now = Date.now();
   t.mock.method(Date, "now", () => now);
   const { pi, fixtures, entries } = softDeadlineFixture([
-    { label: "soft-annotated", requestId: randomUUID(), armedAt: now - 400_000 },
+    {
+      label: "soft-annotated",
+      requestId: randomUUID(),
+      armedAt: now - 400_000,
+    },
   ]);
   const payloads: any[] = [];
-  const off = (pi.pi as any).events.on("pi-herdsman:soft-deadline", (payload: any) => {
-    payloads.push(payload);
-    payload.annotations.push("peer extension: budget window closes soon");
-  });
+  const off = (pi.pi as any).events.on(
+    "pi-herdsman:soft-deadline",
+    (payload: any) => {
+      payloads.push(payload);
+      payload.annotations.push("peer extension: budget window closes soon");
+    },
+  );
   t.mock.timers.enable({ apis: ["setTimeout"] });
   await pi.events.get("session_start")![0](undefined, fakeContext(entries));
-  await new Promise((resolve) => setImmediate(resolve));
+  await settleUntil(() => payloads.length === 1);
   assert.equal(payloads.length, 1, "the digest is published before delivery");
   assert.deepEqual(
     payloads[0].entries.map((entry: any) => entry.agentLabel),
@@ -7905,7 +7548,10 @@ test("soft-deadline listeners annotate the digest before delivery", async (t) =>
     String(digest.content),
     /peer extension: budget window closes soon/,
   );
-  assert.doesNotMatch(String(digest.content), /budget window closes soon.*undefined/);
+  assert.doesNotMatch(
+    String(digest.content),
+    /budget window closes soon.*undefined/,
+  );
   off();
   pi.events.get("session_shutdown")?.[0]();
   for (const fixture of fixtures) resetAgentMailbox(fixture.mailbox);
@@ -7915,7 +7561,11 @@ test("a throwing soft-deadline listener never blocks the digest", async (t) => {
   let now = Date.now();
   t.mock.method(Date, "now", () => now);
   const { pi, fixtures, entries } = softDeadlineFixture([
-    { label: "soft-throwing-listener", requestId: randomUUID(), armedAt: now - 400_000 },
+    {
+      label: "soft-throwing-listener",
+      requestId: randomUUID(),
+      armedAt: now - 400_000,
+    },
   ]);
   let deliveries = 0;
   (pi.pi as any).events.on("pi-herdsman:soft-deadline", () => {
@@ -7924,7 +7574,7 @@ test("a throwing soft-deadline listener never blocks the digest", async (t) => {
   });
   t.mock.timers.enable({ apis: ["setTimeout"] });
   await pi.events.get("session_start")![0](undefined, fakeContext(entries));
-  await new Promise((resolve) => setImmediate(resolve));
+  await settleUntil(() => deliveries === 1);
   assert.equal(deliveries, 1, "the failing listener was invoked");
   const digests = softDigests(pi);
   assert.equal(digests.length, 1, "the digest is still delivered");
@@ -7943,7 +7593,7 @@ test("three consecutive windows produce three digests", async (t) => {
   ]);
   t.mock.timers.enable({ apis: ["setTimeout"] });
   await pi.events.get("session_start")![0](undefined, fakeContext(entries));
-  await new Promise((resolve) => setImmediate(resolve));
+  await settleUntil(() => softDigests(pi).length === 1);
   assert.equal(softDigests(pi).length, 1);
   for (let round = 1; round < 3; round++) {
     now += 300_000;
@@ -7953,7 +7603,7 @@ test("three consecutive windows produce three digests", async (t) => {
       updatedAt: now,
     });
     t.mock.timers.tick(30_000);
-    await new Promise((resolve) => setImmediate(resolve));
+    await settleUntil(() => softDigests(pi).length === round + 1);
     assert.equal(
       softDigests(pi).length,
       round + 1,
@@ -7999,7 +7649,7 @@ test("a resolved assignment is never included in a later digest", async (t) => {
     registerExtension!(pi.pi as never);
     t.mock.timers.enable({ apis: ["setTimeout"] });
     try {
-      await pi.events.get("session_start")![0](undefined, fakeContext(entries));
+      await startRadarSession(pi, fakeContext(entries));
       for (let index = 0; index < 4; index++)
         await new Promise<void>((resolve) => setImmediate(resolve));
       assert.equal(softDigests(pi).length, 0, "a fresh window is not due");
@@ -8011,15 +7661,18 @@ test("a resolved assignment is never included in a later digest", async (t) => {
         completedRequestId: REQUEST_ID,
         updatedAt: Date.now(),
       });
-      writeResult(mailbox, { version: 5, runId: armed.runId,
-      requestId: REQUEST_ID,
-      ownerSessionId: armed.ownerSessionId,
-      workspaceId: armed.workspaceId,
-      agentLabel: armed.agentLabel,
-      paneId: armed.paneId,
-      status: "completed",
-      text: "delivered",
-      completedAt: Date.now(), });
+      writeResult(mailbox, {
+        version: 5,
+        runId: armed.runId,
+        requestId: REQUEST_ID,
+        ownerSessionId: armed.ownerSessionId,
+        workspaceId: armed.workspaceId,
+        agentLabel: armed.agentLabel,
+        paneId: armed.paneId,
+        status: "completed",
+        text: "delivered",
+        completedAt: Date.now(),
+      });
       watchedResultPaths.get(`${mailbox}/result-${REQUEST_ID}.json`)?.({}, {});
       for (let index = 0; index < 12; index++)
         await new Promise<void>((resolve) => setImmediate(resolve));
@@ -8049,11 +7702,19 @@ test("a resolved assignment is never included in a later digest", async (t) => {
   // Explicit close after the window would already be due.
   {
     const label = "soft-resolved-closed";
-    const identity = recoveryIdentity(label);
     const mailbox = agentMailboxPath(WORKSPACE, label);
     resetAgentMailbox(mailbox);
+    const launch = await radarDaemon.adoptRetainedChild({
+      label,
+      runId: randomUUID(),
+      ownerSessionId: LEAD_SESSION_ID,
+      workspaceId: WORKSPACE,
+      mailbox,
+      pane: `${label}-pane`,
+    });
     writeAgentState(mailbox, {
-      ...managedState(label, REQUEST_ID, identity),
+      ...readAgentState(mailbox)!,
+      activeRequestId: REQUEST_ID,
       lastActivityAt: now,
       lastAck: {
         requestId: REQUEST_ID,
@@ -8061,13 +7722,18 @@ test("a resolved assignment is never included in a later digest", async (t) => {
         acknowledgedAt: now,
       },
     });
-    const pi = fakePi({
-      exec: cascadeExecutor([readAgentState(mailbox)!]).exec,
-    });
+    const entries: unknown[] = [
+      {
+        type: "custom",
+        customType: "pi-herdsman-radar-spawn",
+        data: launch,
+      },
+    ];
+    const pi = fakePi({ entries });
     registerExtension!(pi.pi as never);
     t.mock.timers.enable({ apis: ["setTimeout"] });
     try {
-      await pi.events.get("session_start")![0](undefined, fakeContext());
+      await startRadarSession(pi, fakeContext(entries));
       for (let index = 0; index < 4; index++)
         await new Promise<void>((resolve) => setImmediate(resolve));
       assert.equal(softDigests(pi).length, 0, "a fresh window is not due");
@@ -8076,7 +7742,7 @@ test("a resolved assignment is never included in a later digest", async (t) => {
         { agent: label },
         undefined,
         undefined,
-        fakeContext(),
+        fakeContext(entries),
       );
       assert.equal(closed.details.ok, true, JSON.stringify(closed.details));
       assert.equal(readAgentState(mailbox), undefined);
@@ -8104,34 +7770,21 @@ test("a resolved assignment is never included in a later digest", async (t) => {
     resetAgentMailbox(mailbox);
     writeAgentState(mailbox, {
       ...managedState(label, REQUEST_ID, identity),
-      lastActivityAt: now,
+      // Past the startup window with no pane reported: lost, not merely unproved.
+      updatedAt: now - 400_000,
+      lastActivityAt: now - 400_000,
       lastAck: {
         requestId: REQUEST_ID,
         accepted: true,
         acknowledgedAt: now - 400_000,
       },
     });
-    const pi = fakePi({
-      exec: (command, args) => {
-        if (command === "herdr" && isApiSnapshot(args))
-          return {
-            stdout: JSON.stringify({
-              id: AGENT_ID,
-              result: { snapshot: { agents: [], panes: [] } },
-            }),
-            stderr: "",
-            code: 0,
-          };
-        if (command === "herdr" && args[0] === "status")
-          return { stdout: "{}", stderr: "", code: 0 };
-        if (command === "herdr" && args[0] === "--version")
-          return { stdout: "0.8.0", stderr: "", code: 0 };
-        return { stdout: "{}", stderr: "", code: 0 };
-      },
-    });
+    // The daemon reports no pane for this generation.
+    observeFleet([]);
+    const pi = fakePi({});
     registerExtension!(pi.pi as never);
     t.mock.timers.enable({ apis: ["setTimeout"] });
-    await pi.events.get("session_start")![0](undefined, fakeContext());
+    await startRadarSession(pi, fakeContext());
     for (let index = 0; index < 4; index++)
       await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal(
@@ -8163,54 +7816,31 @@ test("a resolved assignment is never included in a later digest", async (t) => {
  * `unclaim()` switches the pane to that shape, so a test can change the
  * evidence between two inventory reads of the same generation.
  */
-function unclaimableAliasExecutor(
-  label: string,
-  identity: FixtureIdentity,
-  siblings: ManagedAgentState[] = [],
-) {
-  const alias = herdrAlias(label);
-  const base = cascadeExecutor([
-    managedState(label, undefined, identity),
-    ...siblings,
-  ]);
-  let unclaimed = false;
-  let paneCloses = 0;
-  const withoutName = (result: { stdout: string }): { stdout: string } => {
-    const payload = JSON.parse(result.stdout);
-    const agents: any[] =
-      payload.result.agents ?? payload.result.snapshot.agents;
-    for (const agent of agents)
-      if (agent.pane_id === identity.paneId) delete agent.name;
-    return { ...result, stdout: JSON.stringify(payload) };
-  };
-  const exec: ExecHandler = (command, args, options) => {
-    if (command === "herdr") {
-      if (unclaimed && (isApiSnapshot(args) || isAgentList(args)))
-        return withoutName(base.exec(command, args, options));
-      if (unclaimed && args[0] === "agent" && args[1] === "get") {
-        if (args[2] === alias)
-          return {
-            stdout: JSON.stringify({ id: AGENT_ID, result: { agent: null } }),
-            stderr: "",
-            code: 0,
-          };
-        const result = base.exec(command, args, options);
-        const payload = JSON.parse(result.stdout);
-        if (payload.result?.agent?.pane_id === identity.paneId)
-          delete payload.result.agent.name;
-        return { ...result, stdout: JSON.stringify(payload) };
-      }
-      if (isPaneClose(args)) paneCloses += 1;
-    }
-    return base.exec(command, args, options);
+/**
+ * The daemon's observation of a pane held by an occupant that claims nothing of
+ * the generation recorded there: the shape a pane taken over by another process
+ * leaves, and the evidence every control has to refuse on.
+ */
+function foreignOccupantFleet(paneId: string) {
+  const location = {
+    workspace_id: WORKSPACE,
+    tab_id: "foreign-occupant-tab",
+    pane_id: paneId,
   };
   return {
-    exec,
-    closeOrder: base.closeOrder,
-    unclaim: () => {
-      unclaimed = true;
-    },
-    paneCloses: () => paneCloses,
+    workspaces: [{ workspace_id: WORKSPACE }],
+    tabs: [{ tab_id: location.tab_id, workspace_id: WORKSPACE }],
+    panes: [{ location }],
+    agents: [
+      {
+        location,
+        name: "foreign-occupant",
+        session: {
+          kind: "uuid",
+          value: "99999999-9999-4999-8999-999999999999",
+        },
+      },
+    ],
   };
 }
 
@@ -8225,9 +7855,10 @@ test("an unclaimed managed alias is unknown rather than idle and closable", asyn
     ...managedState(label, undefined, identity),
     completedRequestId: REQUEST_ID,
   });
-  const fixture = unclaimableAliasExecutor(label, identity);
-  fixture.unclaim();
-  const pi = fakePi({ exec: fixture.exec });
+  // Another process holds the pane this mailbox recorded and claims nothing of
+  // it, so this generation's physical identity cannot be proved.
+  radarDaemon.observeInventory = () => foreignOccupantFleet(identity.paneId);
+  const pi = fakePi({});
   registerExtension!(pi.pi as never);
   try {
     const listed = await agentTool(pi, "list").execute(
@@ -8242,9 +7873,6 @@ test("an unclaimed managed alias is unknown rather than idle and closable", asyn
     );
     assert.ok(record, "the generation stays listed");
     assert.equal(record.state, "unknown");
-    assert.equal(record.recovery_only, true);
-    assert.match(String(record.diagnostic), new RegExp(identity.paneId));
-    assert.match(String(record.diagnostic), new RegExp(herdrAlias(label)));
     assert.deepEqual(record.available_tools, []);
 
     const closed = await agentTool(pi, "close").execute(
@@ -8259,11 +7887,6 @@ test("an unclaimed managed alias is unknown rather than idle and closable", asyn
       "an unprovable generation is never retired",
     );
     assert.equal(closed.details.error.category, "target_ambiguous");
-    assert.match(
-      String(closed.details.error.message),
-      new RegExp(identity.paneId),
-    );
-    assert.equal(fixture.paneCloses(), 0);
   } finally {
     updateConfig("retainWorkers", undefined);
     pi.events.get("session_shutdown")?.[0]();
@@ -8273,214 +7896,156 @@ test("an unclaimed managed alias is unknown rather than idle and closable", asyn
 
 test("a close that loses its alias claim between reads refuses without retiring the mailbox", async () => {
   setLeadEnvironment();
-  const parent = {
-    ...managedState("alias-loss-parent", undefined, {
-      ...defaultFixtureIdentity,
-      paneId: "alias-loss-parent-pane",
-      piSessionId: PARENT_SESSION_ID,
-      piSessionFile: "/tmp/alias-loss-parent.jsonl",
-    }),
-  };
-  const child = {
-    ...managedState(
-      "alias-loss-child",
-      undefined,
-      recoveryIdentity("alias-loss-child"),
-    ),
-    ownerSessionId: parent.piSessionId,
-  };
-  const parentMailbox = agentMailboxPath(WORKSPACE, parent.agentLabel);
-  const childMailbox = agentMailboxPath(WORKSPACE, child.agentLabel);
+  await ensureRadarDaemon();
+  const parentMailbox = agentMailboxPath(WORKSPACE, "alias-loss-parent");
+  const childMailbox = agentMailboxPath(WORKSPACE, "alias-loss-child");
   resetAgentMailbox(parentMailbox);
   resetAgentMailbox(childMailbox);
-  writeAgentState(parentMailbox, parent);
-  writeAgentState(childMailbox, child);
-  const fixture = unclaimableAliasExecutor(
-    child.agentLabel,
-    {
-      paneId: child.paneId,
-      tabId: `${child.agentLabel}-tab`,
-      piSessionId: child.piSessionId,
-      piSessionFile: child.piSessionFile!,
-    },
-    [parent],
-  );
+  const parent = await radarDaemon.adoptRetainedChild({
+    label: "alias-loss-parent",
+    runId: randomUUID(),
+    ownerSessionId: LEAD_SESSION_ID,
+    workspaceId: WORKSPACE,
+    mailbox: parentMailbox,
+    pane: "alias-loss-parent-pane",
+  });
+  const child = await radarDaemon.adoptRetainedChild({
+    label: "alias-loss-child",
+    runId: randomUUID(),
+    ownerSessionId: readAgentState(parentMailbox)!.piSessionId,
+    workspaceId: WORKSPACE,
+    mailbox: childMailbox,
+    pane: "alias-loss-child-pane",
+  });
+  const entries = [parent, child].map((data) => ({
+    type: "custom",
+    customType: "pi-herdsman-radar-spawn",
+    data,
+  }));
   // Pin the seam by evidence rather than call order: a descendant is closed
-  // after that generation's own assignment lock is claimed, so the flip is
-  // armed by the first descendant-mailbox read taken while its lock is held.
+  // after that generation's own assignment lock is claimed, so the daemon loses
+  // its evidence for the child's pane on the first read taken while the lock is
+  // held.
   const childStatePath = join(childMailbox, "state.json");
   const childLock = assignmentLockPathForTest(childMailbox);
-  support.agentStateReadHook = (path) => {
-    if (path === childStatePath && existsSync(childLock)) fixture.unclaim();
+  support.agentStateReadHook = (readPath) => {
+    if (readPath === childStatePath && existsSync(childLock))
+      radarDaemon.options.locationEvidence = "absent";
   };
-  const pi = fakePi({ exec: fixture.exec });
+  const pi = fakePi({});
   registerExtension!(pi.pi as never);
   try {
     const closed = await agentTool(pi, "close").execute(
       "id",
-      { agent: parent.agentLabel },
+      { agent: "alias-loss-parent" },
       undefined,
       undefined,
-      fakeContext(),
+      fakeContext(entries),
     );
     assert.ok(
       readAgentState(childMailbox),
       "an unprovable generation is never retired",
     );
     assert.equal(closed.details.error.category, "target_ambiguous");
-    assert.match(
-      String(closed.details.error.message),
-      new RegExp(child.paneId),
+    assert.equal(closed.details.error.ids.label, "alias-loss-child");
+    assert.equal(closed.details.error.ids.paneId, "alias-loss-child-pane");
+    assert.deepEqual(
+      [...radarDaemon.closes.values()].filter(
+        (close) => close.outcome === "completed",
+      ),
+      [],
+      "the cascade closes nothing",
     );
-    assert.match(
-      String(closed.details.error.message),
-      new RegExp(herdrAlias(child.agentLabel)),
-    );
-    assert.equal(closed.details.error.ids.label, child.agentLabel);
-    assert.equal(closed.details.error.ids.paneId, child.paneId);
-    assert.equal(fixture.paneCloses(), 0, "no pane is closed");
-    assert.deepEqual(fixture.closeOrder, [], "the cascade closes nothing");
     assert.ok(readAgentState(parentMailbox), "the parent survives");
   } finally {
     support.agentStateReadHook = undefined;
+    radarDaemon.options.locationEvidence = "present";
     pi.events.get("session_shutdown")?.[0]();
     resetAgentMailbox(parentMailbox);
     resetAgentMailbox(childMailbox);
   }
 });
 
-test("a matching managed execution still closes through the same fixture", async () => {
+test("a restart finishes the cleanup of a close the daemon already confirmed", async () => {
   setLeadEnvironment();
-  const parent = {
-    ...managedState("claimed-parent", undefined, {
-      ...defaultFixtureIdentity,
-      paneId: "claimed-parent-pane",
-      piSessionId: PARENT_SESSION_ID,
-      piSessionFile: "/tmp/claimed-parent.jsonl",
-    }),
-  };
-  const child = {
-    ...managedState(
-      "claimed-child",
-      undefined,
-      recoveryIdentity("claimed-child"),
-    ),
-    ownerSessionId: parent.piSessionId,
-  };
-  const parentMailbox = agentMailboxPath(WORKSPACE, parent.agentLabel);
-  const childMailbox = agentMailboxPath(WORKSPACE, child.agentLabel);
-  resetAgentMailbox(parentMailbox);
-  resetAgentMailbox(childMailbox);
-  writeAgentState(parentMailbox, parent);
-  writeAgentState(childMailbox, child);
-  const fixture = unclaimableAliasExecutor(
-    child.agentLabel,
-    {
-      paneId: child.paneId,
-      tabId: `${child.agentLabel}-tab`,
-      piSessionId: child.piSessionId,
-      piSessionFile: child.piSessionFile!,
-    },
-    [parent],
-  );
-  const pi = fakePi({ exec: fixture.exec });
+  const label = `confirmed-close-${randomUUID().slice(0, 8)}`;
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  resetAgentMailbox(mailbox);
+  const state = managedState(label);
+  const entries: unknown[] = [];
+  const pi = fakePi({ entries });
   registerExtension!(pi.pi as never);
+  const context = fakeContext(entries);
+  // The daemon this process registers against is the one that already confirmed
+  // the close, so it comes up before the child is adopted.
+  await ensureRadarDaemon();
+  const launch = await radarDaemon.adoptRetainedChild({
+    label,
+    runId: state.runId,
+    ownerSessionId: state.ownerSessionId,
+    workspaceId: WORKSPACE,
+    mailbox,
+    pane: state.paneId,
+    definition: "agent",
+  });
+  entries.push({
+    type: "custom",
+    customType: "pi-herdsman-radar-spawn",
+    data: launch,
+  });
+  // The process that closed the pane recorded its completion, but its own local
+  // cleanup never ran: the mailbox still holds the assignment it was carrying.
+  writeRequest(mailbox, {
+    version: 5,
+    runId: state.runId,
+    requestId: randomUUID(),
+    ownerSessionId: state.ownerSessionId,
+    workspaceId: WORKSPACE,
+    agentLabel: label,
+    paneId: state.paneId,
+    kind: "task",
+    text: "the assignment the unfinished cleanup left",
+    createdAt: Date.now(),
+  });
+  entries.push({
+    type: "custom",
+    customType: "pi-herdsman-radar-close",
+    data: {
+      stage: "completed",
+      requestId: randomUUID(),
+      spawnRequestId: launch.requestId,
+      source: RADAR_SUBJECT_SOURCE,
+      incarnation: radarDaemon.spawns.at(-1)!.incarnation,
+      intent: "complete",
+      runId: state.runId,
+      label,
+      ownerSessionId: state.ownerSessionId,
+      mailbox,
+    },
+  });
+  await startRadarSession(pi, context);
   try {
     const closed = await agentTool(pi, "close").execute(
       "id",
-      { agent: parent.agentLabel },
+      { agent: label },
       undefined,
       undefined,
-      fakeContext(),
+      context,
     );
     assert.equal(closed.details.ok, true, JSON.stringify(closed.details));
-    assert.deepEqual(fixture.closeOrder, [
-      child.agentLabel,
-      parent.agentLabel,
-    ]);
-    assert.equal(readAgentState(childMailbox), undefined);
-    assert.equal(readAgentState(parentMailbox), undefined);
-  } finally {
-    pi.events.get("session_shutdown")?.[0]();
-    resetAgentMailbox(parentMailbox);
-    resetAgentMailbox(childMailbox);
-  }
-});
-
-test("continuing a saved session whose alias is unclaimed names the pane instead of relaunching", async () => {
-  setLeadEnvironment();
-  updateConfig("retainWorkers", true);
-  const label = "unclaimed-continue";
-  const identity = recoveryIdentity(label);
-  const sessionPath = join(testTmpRoot, "unclaimed-continue-session.jsonl");
-  const sessionId = randomUUID();
-  writeFileSync(sessionPath, "{}\n");
-  nativeSessions.set(sessionId, {
-    id: sessionId,
-    path: sessionPath,
-    cwd: "/tmp",
-    entries: [
-      {
-        type: "custom",
-        customType: "pi-herdsman-agent-definition",
-        data: { sessionId, definition: "agent", label },
-      },
-    ],
-  });
-  const mailbox = agentMailboxPath(WORKSPACE, label);
-  resetAgentMailbox(mailbox);
-  const state = {
-    ...managedState(label, undefined, {
-      ...identity,
-      piSessionId: sessionId,
-      piSessionFile: sessionPath,
-    }),
-    completedRequestId: REQUEST_ID,
-  };
-  writeAgentState(mailbox, state);
-  const entries: unknown[] = [
-    {
-      customType: "pi-herdsman-agent-result",
-      details: {
-        ...resultEntryDetails(state, REQUEST_ID),
-        agentDefinition: "agent",
-        status: "completed",
-      },
-    },
-  ];
-  const fixture = unclaimableAliasExecutor(label, {
-    ...identity,
-    piSessionId: sessionId,
-    piSessionFile: sessionPath,
-  });
-  fixture.unclaim();
-  const pi = fakePi({ entries, exec: fixture.exec });
-  registerExtension!(pi.pi as never);
-  try {
-    const continued = await agentTool(pi, "continue").execute(
-      "id",
-      { session: sessionPath, task: "continue the same assignment" },
-      undefined,
-      undefined,
-      fakeContext(entries),
-    );
-    assert.equal(continued.details.error.category, "target_ambiguous");
-    assert.match(
-      String(continued.details.error.message),
-      new RegExp(identity.paneId),
-    );
+    assert.equal(readAgentState(mailbox), undefined);
+    assert.equal(existsSync(mailbox), false);
+    // The pane was closed once, by the process that recorded it: a restart
+    // resumes that cleanup instead of sending a second close.
+    assert.equal(radarDaemon.closes.size, 0);
     assert.equal(
-      pi.calls.filter((args) => args[0] === "agent" && args[1] === "start")
-        .length,
-      0,
-      "nothing is relaunched",
+      entries.filter(
+        (entry: any) => entry.customType === "pi-herdsman-radar-close",
+      ).length,
+      1,
     );
-    assert.ok(readAgentState(mailbox), "the mailbox is never retired");
   } finally {
-    updateConfig("retainWorkers", undefined);
-    nativeSessions.delete(sessionId);
     pi.events.get("session_shutdown")?.[0]();
     resetAgentMailbox(mailbox);
-    realFs.rmSync(sessionPath, { force: true });
   }
 });

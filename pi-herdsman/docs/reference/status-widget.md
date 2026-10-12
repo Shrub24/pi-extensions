@@ -8,12 +8,10 @@ agents plus controller-local transient starting assignments.
 It does not replace mailbox assignment/result authority.
 
 An active Chief receives a separate supervision widget for its current direct
-reports (Managers and ordinary Leads without an active project Manager). It
-shows both categories together when both exist, not managed Agent rows. An
-active Manager receives a work-centric branch projection rather than the
-ordinary Lead Agent widget. Chief's complete overview, peek, and focus behavior
-is documented in the [command reference](commands.md#project-manager-and-chief). Supervision and
-Agent widgets are never combined.
+Leads. It shows supervision rows, not managed Agent rows. Chief's complete
+overview, peek, and focus behavior is documented in the
+[command reference](commands.md#chief). Supervision and Agent widgets are never
+combined.
 
 The Chief supervision rows use `├─` for non-final visible reports and `└─` for the
 final visible report. Selection and lifecycle remain separate: `>` means
@@ -22,25 +20,9 @@ selected, `●` means working, `◐` means blocked,
 `×` means lost. An idle or done lead with active delegated descendants uses
 `◉`. Workspace labels are presentation text inside each lead row, not
 additional hierarchy nodes. The widget caps ordinary reports and shows omitted reports in a final
-`└─ … N more · /chief` or `└─ … N more · /manager` row, according to the active role.
+`└─ … N more · /chief` row.
 
-Chief's header shows only nonzero categories (`manager`, `direct lead`), or
-`no reports`. Manager's header shows the project name and lists managed
-branches as work, including work without live Leads:
-
-```text
-● manager · pi-herdsman
-├─ ● feat/example · active
-└─ ○ fix/other · paused
-```
-
-Manager work status is `active`, `paused`, or `conflict`.
-An active row uses the live Lead's lifecycle marker when an executor is present;
-otherwise it uses `●`. Paused uses `○` and conflict uses `!`. The row suffix is
-project status, not the Lead's runtime state.
-Unassigned live Leads are shown separately, not treated as managed work.
-Branches are display handles; exact session identity is revalidated for control
-actions.
+The header shows the count of direct Leads, or `no reports`.
 
 ## Installation
 

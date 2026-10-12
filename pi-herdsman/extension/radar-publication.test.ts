@@ -14,7 +14,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type {
-	RadarClient,
 	RadarErrorCode,
 	RadarResult,
 	RadarScheduler,
@@ -31,6 +30,7 @@ import {
 	radarProcessIncarnation,
 	type PublicationStore,
 	type RadarPublication,
+	type RadarPublicationClient,
 } from "./radar-publication.ts";
 
 const ok = <T>(value: T): RadarResult<T> => ({ ok: true, value });
@@ -63,10 +63,9 @@ function fakeDaemon(script: Script = {}) {
 		count(method: string): number {
 			return daemon.all(method).length;
 		},
-		client: undefined as unknown as RadarClient,
+		client: undefined as unknown as RadarPublicationClient,
 	};
 	daemon.client = {
-		socketPath: () => "/nonexistent/radar/control.sock",
 		ping: async () => ok({ protocol: 1, capabilities: ["agent_registry"] }),
 		register: async (params) => answer("agent.register", params, () => {
 			const agentId = mint();
@@ -309,6 +308,10 @@ test("publisher storage failures are contained at initialization, drain, and ret
 			remove: (name) => store.remove(name),
 			write: () => { throw new Error("injected initialization failure"); },
 		} });
+		// The registration record is built at first use - it carries a location that
+		// may still be arriving - so an unwritable store is reported when that
+		// record is first written, and never thrown out of a lifecycle event.
+		assert.equal(await brokenStorePublication.subject(), undefined);
 		assert.equal(brokenStorePublication.diagnostic()?.includes("unavailable"), true);
 
 		let failWrites = false;

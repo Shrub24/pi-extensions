@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
+import { createRadarClient } from "./radar-client.ts";
 import { chmodSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
@@ -7,10 +8,13 @@ import { beforeEach, mock, test } from "node:test";
 import { Value } from "typebox/value";
 import type {
   AskRecord,
+  RequestAddress,
   RequestRecord,
   ResultRecord,
   ManagedAgentState,
 } from "./mailbox.ts";
+import { RADAR_SUBJECT_SOURCE } from "./radar-execution.ts";
+import type { FakeRadarDaemon } from "./support-radar.ts";
 import { claimProcessLock } from "./lock.ts";
 import support from "./support.ts";
 import { DELEGATION_BRIEF_EXAMPLES, briefFormatHint } from "./briefs.ts";
@@ -27,10 +31,9 @@ import {
   WORKSPACE,
   agentFromState,
   cascadeExecutor,
-  controlMarker,
   consumeMailboxRequest,
   createStagedAssignmentFixture,
-  defaultFixtureIdentity,
+  ensureRadarDaemon,
   delegatedLifecycleExecutor,
   delegationLockPathForTest,
   assignmentLockPathForTest,
@@ -38,21 +41,14 @@ import {
   fakePi,
   fakeAgentContext,
   isApiSnapshot,
-  isAgentList,
-  isHerdrList,
   isPaneClose,
-  isPaneList,
   isPreservePaneStop,
   isTabClose,
-  isTabList,
   listResponse,
-  listAgentStates,
   managedState,
   nativeSessions,
-  agentControllerExecutor,
   promptLaunchContents,
   promptLaunchPaths,
-  readPendingAsk,
   readRequest,
   readResult,
   readAgentState,
@@ -63,20 +59,30 @@ import {
   resetAgentMailbox,
   resultEntryDetails,
   leadExec,
-  runScopedHerdrAlias,
   setLeadEnvironment,
   setAgentEnvironment,
+  radarDaemon,
+  radarObservedFleet,
+  spawnedArgvs,
+  spawnedEnvironmentAssignments,
+  spawnedLabels,
+  startRadarSession,
   startupExecutor,
+  testBrief,
+  testChildCommand,
   watchedResultPaths,
   agentMailboxPath,
-  writeAsk,
   writePromptDefinition,
   writeRequest,
   writeResult,
   writeAgentState,
   testTmpRoot,
 } from "./support.ts";
-const ownedSessionContext = (id: string, label: string) =>
+const ownedSessionContext = (
+  id: string,
+  label: string,
+  recordedSessionPath?: string,
+) =>
   fakeContext([
     {
       type: "custom_message",
@@ -84,7 +90,7 @@ const ownedSessionContext = (id: string, label: string) =>
         customType: "pi-herdsman-agent-result",
         details: {
           piSessionId: id,
-          piSessionFile: nativeSessions.get(id)?.path,
+          piSessionFile: recordedSessionPath ?? nativeSessions.get(id)?.path,
           ownerSessionId: LEAD_SESSION_ID,
           runId: randomUUID(),
           requestId: randomUUID(),
@@ -107,6 +113,9 @@ const ownedSessionContext = (id: string, label: string) =>
 for (const virtual of [false, true])
   test(`parent delegates two same-definition children with exact ownership (${virtual ? "virtual" : "physical"} model)`, async () => {
     setAgentEnvironment("multiplicity-parent", ["child"]);
+    // The fixture's fleet reports this process in the tab it models; an
+    // environment naming another tab would contradict the observation.
+    delete process.env.HERDR_TAB_ID;
     const previousForwardingSession = process.env.PI_SUBAGENT_PARENT_SESSION;
     process.env.PI_SUBAGENT_PARENT_SESSION = LEAD_SESSION_ID;
     process.env.PI_HERDSMAN_AGENT_DEFINITION = "parent";
@@ -121,27 +130,25 @@ for (const virtual of [false, true])
     for (const [name, content] of files)
       realFs.writeFileSync(join(PI_AGENTS_DIR, name), content, "utf8");
     const lifecycle = delegatedLifecycleExecutor(parent);
-    const starts: string[][] = [];
+    const starts = (): string[][] => spawnedArgvs(radarDaemon);
     const pi = fakePi({
       thinkingLevel: "high",
-      exec: (command, args) => {
-        if (command === "herdr" && args[0] === "agent" && args[1] === "start")
-          starts.push([...args]);
-        return lifecycle.exec(command, args);
-      },
+      exec: (command, args) => lifecycle.exec(command, args),
     });
     registerExtension!(pi.pi as never);
-    const context = fakeAgentContext([
-      {
-        type: "custom",
-        customType: "pi-herdsman-agent-definition",
-        data: {
-          sessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-          definition: "parent",
-          label: process.env.PI_HERDSMAN_LABEL ?? "parent",
-        },
+    // A launch persists its durable Radar record to the session entries, and the
+    // controller resolves each child's edge from the entries its own context
+    // reads, so both sides have to name the same array.
+    pi.entries.push({
+      type: "custom",
+      customType: "pi-herdsman-agent-definition",
+      data: {
+        sessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        definition: "parent",
+        label: process.env.PI_HERDSMAN_LABEL ?? "parent",
       },
-    ]);
+    });
+    const context = fakeAgentContext(pi.entries);
     (context as any).model = {
       provider: "parent-provider",
       id: "parent-model",
@@ -190,7 +197,7 @@ for (const virtual of [false, true])
       assert.equal(guidance.length, 1);
       const content = String((guidance[0].message as any).content);
       for (const phrase of [
-        "Each unresolved unit of work has one executor.",
+        "Each unresolved assignment has one execution owner.",
         "agent_steer queues a cooperative correction",
         "it does not preempt the current operation",
         "A repeated reminder for the same stale episode is additional recovery evidence",
@@ -216,8 +223,8 @@ for (const virtual of [false, true])
         (mailbox) => readAgentState(mailbox)!.agentLabel,
       );
       assert.equal(new Set(labels).size, 2);
-      assert.equal(starts.length, 2);
-      for (const args of starts) {
+      assert.equal(starts().length, 2);
+      for (const args of starts()) {
         assert.equal(
           args[args.indexOf("--model") + 1],
           virtual ? "route/worker" : "parent-provider/parent-model",
@@ -225,6 +232,7 @@ for (const virtual of [false, true])
         assert.equal(args.includes("--no-extensions"), !virtual);
         assert.equal(args[args.indexOf("--thinking") + 1], "high");
       }
+      const overlay = spawnedEnvironmentAssignments(radarDaemon);
       const states = mailboxes.map((mailbox) => readAgentState(mailbox)!);
       assert.deepEqual(
         states.map((state) => state.ownerSessionId),
@@ -232,13 +240,13 @@ for (const virtual of [false, true])
       );
       assert.equal(new Set(states.map((state) => state.paneId)).size, 2);
       assert.equal(
-        lifecycle.environmentCommands.filter((command) =>
+        overlay.filter((command) =>
           command.includes("PI_HERDSMAN_ALLOWED_AGENT_DEFINITIONS=[]"),
         ).length,
         2,
       );
       assert.equal(
-        lifecycle.environmentCommands.filter(
+        overlay.filter(
           (command) =>
             command ===
             `PI_HERDSMAN_OWNER_SESSION_ID=${context.sessionManager.getSessionId()}`,
@@ -246,7 +254,7 @@ for (const virtual of [false, true])
         2,
       );
       assert.equal(
-        lifecycle.environmentCommands.filter(
+        overlay.filter(
           (command) =>
             command === `PI_SUBAGENT_PARENT_SESSION=${LEAD_SESSION_ID}`,
         ).length,
@@ -257,7 +265,7 @@ for (const virtual of [false, true])
         "MAGIC_CONTEXT_PROFILE=subagent",
       ])
         assert.equal(
-          lifecycle.environmentCommands.filter((entry) => entry === command)
+          overlay.filter((entry) => entry === command)
             .length,
           2,
           `${command} is set on both children`,
@@ -279,7 +287,17 @@ for (const virtual of [false, true])
         ).length,
         0,
       );
-      assert.deepEqual(lifecycle.closeOrder, labels);
+      // Each close acted on its own launch's edge: the daemon refuses a close
+      // whose spawn binding, incarnation or pane evidence disagrees, so two
+      // completed closes over the two recorded panes is the Radar proof.
+      assert.deepEqual(
+        radarDaemon.spawns.map((spawn) => spawn.pane),
+        states.map((state) => state.paneId),
+      );
+      assert.equal(radarDaemon.closes.size, labels.length);
+      for (const close of radarDaemon.closes.values())
+        assert.equal(close.outcome, "completed");
+      assert.ok(radarDaemon.spawns.every((spawn) => spawn.closed === true));
     } finally {
       if (previousForwardingSession === undefined)
         delete process.env.PI_SUBAGENT_PARENT_SESSION;
@@ -318,15 +336,8 @@ function registerNativeAgentSession(state: ManagedAgentState): void {
   });
 }
 
-async function liveAgentList(pi: ReturnType<typeof fakePi>) {
-  const response = await pi.pi.exec("herdr", ["agent", "list"]);
-  return JSON.parse(response.stdout).result.agents as Record<string, unknown>[];
-}
 
 // These lifecycle tests predate typed briefs; keep their task labels as body text.
-const testBrief = (task: string) =>
-  `${DELEGATION_BRIEF_EXAMPLES.common.trimEnd()}\n\nAssignment-specific detail:\n${task}`;
-
 const registeredAgentTool = (
   pi: ReturnType<typeof fakePi>,
   operation: string,
@@ -359,97 +370,96 @@ beforeEach(() => updateConfig("retainWorkers", false));
 const { agentLaunchFingerprint, resolveAgentLaunchInputs } =
   await import("./agent-definitions.ts");
 
-test("lead direct placement modes use real controller delegation", async () => {
-  for (const placement of ["tab", "subtree", "split"] as const) {
+test("a lead's fresh launch is refused unless it can split beside the parent pane", async () => {
+  for (const placement of ["split", "tab", "subtree"] as const) {
     setLeadEnvironment();
     writePlacementSetting(placement);
     const parent = {
       ...managedState(`placement-parent-${placement}`),
       paneId: `placement-parent-pane-${placement}`,
     };
-    const callerPane =
-      placement === "tab"
-        ? {
-            paneId: `placement-lead-pane-${placement}`,
-            tabId: `placement-lead-tab-${placement}`,
-          }
-        : undefined;
-    if (placement === "split") process.env.HERDR_PANE_ID = parent.paneId;
-    else if (callerPane) process.env.HERDR_PANE_ID = callerPane.paneId;
-    else delete process.env.HERDR_PANE_ID;
     const mailbox = agentMailboxPath(WORKSPACE, parent.agentLabel);
     resetAgentMailbox(mailbox);
     writeAgentState(mailbox, parent);
     registerNativeAgentSession(parent);
-    const lifecycle = delegatedLifecycleExecutor(
-      parent,
-      [],
-      "/tmp",
-      callerPane,
-    );
+    process.env.HERDR_PANE_ID = parent.paneId;
+    const lifecycle = delegatedLifecycleExecutor(parent);
     const pi = fakePi({ exec: lifecycle.exec });
     registerExtension!(pi.pi as never);
-    const childMailboxes: string[] = [];
+    await startRadarSession(pi);
     try {
-      const start = async (label: string) => {
-        const result = await registeredAgentTool(pi, "delegate").execute(
+      const start = async (label: string) =>
+        registeredAgentTool(pi, "delegate").execute(
           `start-${label}`,
           { definition: "agent", label, task: "placement" },
           undefined,
           undefined,
           fakeContext(),
         );
-        assert.equal(result.details.ok, true, JSON.stringify(result.details));
-        const childMailbox = agentMailboxPath(WORKSPACE, result.details.agent);
-        childMailboxes.push(childMailbox);
-        return readAgentState(childMailbox)!;
-      };
-      const first = await start(`placement-${placement}-one`);
-      const second = await start(`placement-${placement}-two`);
-      const firstTab = lifecycle.tabForPane(first.paneId);
-      const secondTab = lifecycle.tabForPane(second.paneId);
-      assert.ok(firstTab);
-      assert.ok(secondTab);
-      if (placement === "tab" || placement === "split") {
-        assert.equal(lifecycle.createdTabs(), 0);
-        assert.equal(firstTab, lifecycle.tabForPane(parent.paneId));
-        assert.equal(secondTab, firstTab);
+      if (placement !== "split") {
+        const refused = await start(`placement-${placement}-one`);
         assert.equal(
-          pi.calls.filter((args) => args[0] === "pane" && args[1] === "split")
-            .length,
-          2,
+          refused.details.ok,
+          false,
+          JSON.stringify(refused.details),
         );
-      } else {
-        assert.equal(lifecycle.createdTabs(), 2);
-        assert.notEqual(firstTab, secondTab);
+        assert.equal(refused.details.error.category, "invalid_request");
+        assert.match(
+          refused.details.error.message,
+          /beside its parent pane/,
+        );
+        // The refusal happens before the daemon is asked for anything and
+        // before the layout is touched at all.
+        assert.equal(radarDaemon.spawns.length, 0);
+        assert.equal(lifecycle.createdTabs(), 0);
         assert.equal(
-          pi.calls.filter((args) => args[0] === "tab" && args[1] === "create")
-            .length,
-          2,
+          pi.calls.some((args) => args[0] === "pane" && args[1] === "split"),
+          false,
+        );
+        continue;
+      }
+      const first = await start("placement-split-one");
+      const second = await start("placement-split-two");
+      assert.equal(first.details.ok, true, JSON.stringify(first.details));
+      assert.equal(second.details.ok, true, JSON.stringify(second.details));
+      assert.deepEqual(spawnedLabels(radarDaemon), [
+        "placement-split-one",
+        "placement-split-two",
+      ]);
+      const panes = radarDaemon.spawns.map((spawn) => spawn.pane);
+      assert.equal(new Set(panes).size, 2, "each child gets its own pane");
+      // Both launches were accepted with this process's registration naming the
+      // parent pane, which is the pane the daemon placed each child beside.
+      for (const [index, label] of spawnedLabels(radarDaemon).entries()) {
+        const state = readAgentState(agentMailboxPath(WORKSPACE, label));
+        assert.equal(state?.paneId, panes[index]);
+        assert.equal(
+          state?.ownerSessionId,
+          fakeContext().sessionManager.getSessionId(),
         );
       }
-      const agents = await liveAgentList(pi);
-      assert.deepEqual(
-        agents
-          .filter((agent) =>
-            [first, second].some(
-              (state) =>
-                agent.name ===
-                runScopedHerdrAlias(
-                  state.workspaceId,
-                  state.agentLabel,
-                  state.runId,
-                ),
-            ),
-          )
-          .map((agent) => agent.tab_id),
-        [firstTab, secondTab],
+      // Each spawn named this process's own registered subject - the exact
+      // registration the daemon returned for its own pane - and the session that
+      // asked for it, never a parent selected by session UUID.
+      const registration = radarDaemon.registerCalls.find(
+        (call) =>
+          (call.params.location as { pane?: string } | undefined)?.pane ===
+          process.env.HERDR_PANE_ID,
       );
+      assert.ok(registration, JSON.stringify(radarDaemon.registerCalls));
+      for (const spawn of radarDaemon.spawns) {
+        assert.equal(spawn.parent, registration.agent_id);
+        assert.equal(
+          spawn.parent_session_id,
+          fakeContext().sessionManager.getSessionId(),
+        );
+      }
+      assert.equal(lifecycle.createdTabs(), 0);
     } finally {
       pi.events.get("session_shutdown")?.[0]();
       resetAgentMailbox(mailbox);
-      for (const childMailbox of childMailboxes)
-        resetAgentMailbox(childMailbox);
+      for (const label of spawnedLabels(radarDaemon))
+        resetAgentMailbox(agentMailboxPath(WORKSPACE, label));
       nativeSessions.delete(parent.piSessionId);
       realFs.rmSync(join(PI_AGENT_ROOT, "pi-herdsman", "config.json"), {
         force: true,
@@ -458,346 +468,69 @@ test("lead direct placement modes use real controller delegation", async () => {
   }
 });
 
-test("lead split-to-tab placement creates a dedicated agents tab", async () => {
-  setLeadEnvironment();
-  const parent = {
-    ...managedState("split-to-tab-parent"),
-    paneId: "split-to-tab-parent-pane",
-  };
-  const parentMailbox = agentMailboxPath(WORKSPACE, parent.agentLabel);
-  resetAgentMailbox(parentMailbox);
-  writeAgentState(parentMailbox, parent);
-  registerNativeAgentSession(parent);
-  const callerPane = { paneId: parent.paneId, tabId: "delegated-tab" };
-  process.env.HERDR_PANE_ID = parent.paneId;
-  const lifecycle = delegatedLifecycleExecutor(parent, [], "/tmp", callerPane);
-  const pi = fakePi({ exec: lifecycle.exec });
-  registerExtension!(pi.pi as never);
-  const childMailboxes: string[] = [];
-  try {
-    const placements = ["split", "split", "tab"] as const;
-    for (const [index, placement] of placements.entries()) {
-      writePlacementSetting(placement);
-      const label = `split-to-tab-${placement}-${index}`;
-      const result = await registeredAgentTool(pi, "delegate").execute(
-        `start-${label}`,
-        { definition: "agent", label, task: placement },
-        undefined,
-        undefined,
-        fakeContext(),
-      );
-      assert.equal(result.details.ok, true, JSON.stringify(result.details));
-      childMailboxes.push(agentMailboxPath(WORKSPACE, result.details.agent));
-      const state = readAgentState(childMailboxes.at(-1)!);
-      assert.ok(state);
-      if (placement === "split")
-        assert.equal(lifecycle.tabForPane(state.paneId), "delegated-tab");
-      else {
-        assert.equal(lifecycle.createdTabs(), 1);
-        assert.notEqual(lifecycle.tabForPane(state.paneId), "delegated-tab");
-      }
-    }
-  } finally {
-    pi.events.get("session_shutdown")?.[0]();
-    resetAgentMailbox(parentMailbox);
-    for (const mailbox of childMailboxes) resetAgentMailbox(mailbox);
-    nativeSessions.delete(parent.piSessionId);
-    realFs.rmSync(join(PI_AGENT_ROOT, "pi-herdsman", "config.json"), {
-      force: true,
-    });
-  }
-});
-
-test("lead tab placement vetoes an ambiguous current-lead direct root", async () => {
-  setLeadEnvironment();
-  writePlacementSetting("tab");
-  const parent = {
-    ...managedState("ambiguous-current-root"),
-    paneId: "ambiguous-current-root-pane",
-  };
-  const direct = {
-    ...managedState("ambiguous-current-sibling", undefined, {
-      paneId: "ambiguous-current-sibling-pane",
-      tabId: "ambiguous-current-sibling-tab",
-      piSessionId: "11111111-1111-4111-8111-111111111111",
-      piSessionFile: "/tmp/ambiguous-current-sibling.jsonl",
-    }),
-  };
-  const callerPane = { paneId: "lead-pane", tabId: "lead-tab" };
-  const parentMailbox = agentMailboxPath(WORKSPACE, parent.agentLabel);
-  const directMailbox = agentMailboxPath(WORKSPACE, direct.agentLabel);
-  resetAgentMailbox(parentMailbox);
-  resetAgentMailbox(directMailbox);
-  writeAgentState(parentMailbox, parent);
-  writeAgentState(directMailbox, direct);
-  registerNativeAgentSession(parent);
-  registerNativeAgentSession(direct);
-  const lifecycle = delegatedLifecycleExecutor(
-    parent,
-    [direct],
-    "/tmp",
-    callerPane,
-  );
-  const pi = fakePi({
-    exec: (command, args, options) => {
-      const result = lifecycle.exec(command, args, options);
-      if (command !== "herdr" || !isApiSnapshot(args)) return result;
-      const value = JSON.parse(result.stdout);
-      value.result.snapshot.agents.push(agentFromState(parent));
-      return { ...result, stdout: JSON.stringify(value) };
-    },
-  });
-  registerExtension!(pi.pi as never);
-  const childMailbox = agentMailboxPath(WORKSPACE, "ambiguous-current-child");
-  try {
-    const result = await registeredAgentTool(pi, "delegate").execute(
-      "ambiguous-current-start",
-      {
-        definition: "agent",
-        task: "reject ambiguous root reuse",
-      },
-      undefined,
-      undefined,
-      fakeContext(),
-    );
-    assert.equal(result.details.ok, true, JSON.stringify(result.details));
-    assert.equal(lifecycle.createdTabs(), 1);
-    assert.equal(
-      pi.calls.some((args) => args[0] === "pane" && args[1] === "split"),
-      false,
-    );
-  } finally {
-    pi.events.get("session_shutdown")?.[0]();
-    for (const mailbox of [parentMailbox, directMailbox, childMailbox])
-      resetAgentMailbox(mailbox);
-    nativeSessions.delete(parent.piSessionId);
-    nativeSessions.delete(direct.piSessionId);
-    realFs.rmSync(join(PI_AGENT_ROOT, "pi-herdsman", "config.json"), {
-      force: true,
-    });
-  }
-});
-
-test("lead tab placement vetoes ambiguous foreign-herd evidence", async () => {
-  setLeadEnvironment();
-  writePlacementSetting("tab");
-  const parent = {
-    ...managedState("ambiguous-foreign-parent"),
-    paneId: "ambiguous-foreign-parent-pane",
-  };
-  const foreign = {
-    ...managedState("ambiguous-foreign-agent", undefined, {
-      paneId: "ambiguous-foreign-agent-pane",
-      tabId: "ambiguous-foreign-agent-tab",
-      piSessionId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
-      piSessionFile: "/tmp/ambiguous-foreign-agent.jsonl",
-    }),
-    ownerSessionId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
-  };
-  const callerPane = { paneId: "lead-pane", tabId: "lead-tab" };
-  const parentMailbox = agentMailboxPath(WORKSPACE, parent.agentLabel);
-  const foreignMailbox = agentMailboxPath(WORKSPACE, foreign.agentLabel);
-  resetAgentMailbox(parentMailbox);
-  resetAgentMailbox(foreignMailbox);
-  writeAgentState(parentMailbox, parent);
-  writeAgentState(foreignMailbox, foreign);
-  registerNativeAgentSession(parent);
-  registerNativeAgentSession(foreign);
-  const lifecycle = delegatedLifecycleExecutor(
-    parent,
-    [foreign],
-    "/tmp",
-    callerPane,
-  );
-  const pi = fakePi({
-    exec: (command, args, options) => {
-      const result = lifecycle.exec(command, args, options);
-      if (command !== "herdr" || !isApiSnapshot(args)) return result;
-      const value = JSON.parse(result.stdout);
-      value.result.snapshot.agents.push(agentFromState(foreign));
-      return { ...result, stdout: JSON.stringify(value) };
-    },
-  });
-  registerExtension!(pi.pi as never);
-  const childMailbox = agentMailboxPath(WORKSPACE, "ambiguous-foreign-child");
-  try {
-    const result = await registeredAgentTool(pi, "delegate").execute(
-      "ambiguous-foreign-start",
-      {
-        definition: "agent",
-        task: "reject foreign ambiguity",
-      },
-      undefined,
-      undefined,
-      fakeContext(),
-    );
-    assert.equal(result.details.ok, true, JSON.stringify(result.details));
-    assert.equal(lifecycle.createdTabs(), 1);
-    assert.equal(
-      pi.calls.some((args) => args[0] === "pane" && args[1] === "split"),
-      false,
-    );
-  } finally {
-    pi.events.get("session_shutdown")?.[0]();
-    for (const mailbox of [parentMailbox, foreignMailbox, childMailbox])
-      resetAgentMailbox(mailbox);
-    nativeSessions.delete(parent.piSessionId);
-    nativeSessions.delete(foreign.piSessionId);
-    realFs.rmSync(join(PI_AGENT_ROOT, "pi-herdsman", "config.json"), {
-      force: true,
-    });
-  }
-});
-
-test("lead tab placement rejects old shared tabs and only changes future starts", async () => {
-  setLeadEnvironment();
-  const parent = {
-    ...managedState("future-placement-parent"),
-    paneId: "future-placement-parent-pane",
-  };
-  const sibling = {
-    ...managedState(
-      "future-placement-sibling",
-      undefined,
-      recoveryIdentity("future-placement-sibling"),
-    ),
-    ownerSessionId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
-    piSessionId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
-    piSessionFile: "/tmp/future-placement-sibling.jsonl",
-  };
-  const parentMailbox = agentMailboxPath(WORKSPACE, parent.agentLabel);
-  const siblingMailbox = agentMailboxPath(WORKSPACE, sibling.agentLabel);
-  resetAgentMailbox(parentMailbox);
-  resetAgentMailbox(siblingMailbox);
-  writeAgentState(parentMailbox, parent);
-  writeAgentState(siblingMailbox, sibling);
-  registerNativeAgentSession(parent);
-  registerNativeAgentSession(sibling);
-  writePlacementSetting("tab");
-  const lifecycle = delegatedLifecycleExecutor(parent, [sibling]);
-  const pi = fakePi({ exec: lifecycle.exec });
-  registerExtension!(pi.pi as never);
-  const childMailboxes: string[] = [];
-  try {
-    const start = async (label: string) => {
-      const result = await registeredAgentTool(pi, "delegate").execute(
-        `start-${label}`,
-        { definition: "agent", label, task: "placement" },
-        undefined,
-        undefined,
-        fakeContext(),
-      );
-      assert.equal(result.details.ok, true, JSON.stringify(result.details));
-      const childMailbox = agentMailboxPath(WORKSPACE, result.details.agent);
-      childMailboxes.push(childMailbox);
-      return readAgentState(childMailbox)!;
+test("tab and subtree placement refuse before any effect for every lead topology", async () => {
+  // A current lead root, a foreign herd, an old shared tab and a candidate
+  // contaminated under the lock all resolve to a tab or subtree placement, which
+  // a Radar spawn cannot honour: the child is placed beside the parent's own
+  // pane. Placement parity lands with the daemon-side placement work; until then
+  // each topology refuses before the launch touches the layout.
+  const topologies = [
+    ["lead-root", "tab"],
+    ["foreign-herd", "tab"],
+    ["old-tab", "subtree"],
+    ["contaminated", "tab"],
+  ] as const;
+  for (const [topology, requested] of topologies) {
+    setLeadEnvironment();
+    writePlacementSetting(requested);
+    const parent = {
+      ...managedState(`topology-${topology}-parent`),
+      paneId: `topology-${topology}-parent-pane`,
     };
-    const first = await start("future-placement-first");
-    assert.equal(lifecycle.createdTabs(), 1);
-    const firstTab = lifecycle.tabForPane(first.paneId);
-    assert.notEqual(firstTab, lifecycle.tabForPane(parent.paneId));
-    assert.equal(
-      lifecycle.tabForPane(sibling.paneId),
-      lifecycle.tabForPane(parent.paneId),
-    );
-
-    writePlacementSetting("subtree");
-    const second = await start("future-placement-second");
-    assert.equal(lifecycle.createdTabs(), 2);
-    assert.notEqual(lifecycle.tabForPane(second.paneId), firstTab);
-    assert.equal(lifecycle.tabForPane(first.paneId), firstTab);
-  } finally {
-    pi.events.get("session_shutdown")?.[0]();
-    resetAgentMailbox(parentMailbox);
-    resetAgentMailbox(siblingMailbox);
-    for (const childMailbox of childMailboxes) resetAgentMailbox(childMailbox);
-    nativeSessions.delete(parent.piSessionId);
-    nativeSessions.delete(sibling.piSessionId);
-    realFs.rmSync(join(PI_AGENT_ROOT, "pi-herdsman", "config.json"), {
-      force: true,
+    const mailbox = agentMailboxPath(WORKSPACE, parent.agentLabel);
+    resetAgentMailbox(mailbox);
+    writeAgentState(mailbox, parent);
+    registerNativeAgentSession(parent);
+    process.env.HERDR_PANE_ID = parent.paneId;
+    const lifecycle = delegatedLifecycleExecutor(parent, [], "/tmp", {
+      paneId: parent.paneId,
+      tabId: "delegated-tab",
     });
-  }
-});
-
-test("lead tab revalidation rejects a newly contaminated candidate under the lock", async () => {
-  setLeadEnvironment();
-  writePlacementSetting("tab");
-  const parent = {
-    ...managedState("revalidation-parent"),
-    paneId: "revalidation-parent-pane",
-  };
-  const sibling = {
-    ...managedState(
-      "revalidation-sibling",
-      undefined,
-      recoveryIdentity("revalidation-sibling"),
-    ),
-    ownerSessionId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
-    piSessionId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
-    piSessionFile: "/tmp/revalidation-sibling.jsonl",
-  };
-  const parentMailbox = agentMailboxPath(WORKSPACE, parent.agentLabel);
-  const siblingMailbox = agentMailboxPath(WORKSPACE, sibling.agentLabel);
-  resetAgentMailbox(parentMailbox);
-  resetAgentMailbox(siblingMailbox);
-  writeAgentState(parentMailbox, parent);
-  writeAgentState(siblingMailbox, sibling);
-  registerNativeAgentSession(parent);
-  registerNativeAgentSession(sibling);
-  const lifecycle = delegatedLifecycleExecutor(parent);
-  let agentLists = 0;
-  const pi = fakePi({
-    exec: (command, args, options) => {
-      const result = lifecycle.exec(command, args, options);
-      if (command !== "herdr" || !isApiSnapshot(args)) return result;
-      agentLists++;
-      if (agentLists < 3) return result;
-      const value = JSON.parse(result.stdout);
-      value.result.snapshot.agents.push({
-        ...agentFromState(sibling),
-        tab_id: lifecycle.tabForPane(parent.paneId),
+    const pi = fakePi({ exec: lifecycle.exec });
+    registerExtension!(pi.pi as never);
+    await startRadarSession(pi);
+    try {
+      const refused = await registeredAgentTool(pi, "delegate").execute(
+        `topology-${topology}`,
+        {
+          definition: "agent",
+          label: `topology-${topology}-child`,
+          task: "placement",
+        },
+        undefined,
+        undefined,
+        fakeContext(),
+      );
+      assert.equal(refused.details.ok, false, JSON.stringify(refused.details));
+      assert.equal(refused.details.error.category, "invalid_request");
+      assert.match(refused.details.error.message, /beside its parent pane/);
+      assert.equal(radarDaemon.spawns.length, 0);
+      assert.equal(lifecycle.createdTabs(), 0);
+    } finally {
+      pi.events.get("session_shutdown")?.[0]();
+      resetAgentMailbox(mailbox);
+      resetAgentMailbox(
+        agentMailboxPath(WORKSPACE, `topology-${topology}-child`),
+      );
+      nativeSessions.delete(parent.piSessionId);
+      realFs.rmSync(join(PI_AGENT_ROOT, "pi-herdsman", "config.json"), {
+        force: true,
       });
-      return { ...result, stdout: JSON.stringify(value) };
-    },
-  });
-  registerExtension!(pi.pi as never);
-  const childMailbox = agentMailboxPath(WORKSPACE, "revalidation-child");
-  try {
-    const result = await registeredAgentTool(pi, "delegate").execute(
-      "revalidation-start",
-      {
-        definition: "agent",
-        task: "reject contaminated candidate",
-      },
-      undefined,
-      undefined,
-      fakeContext(),
-    );
-    assert.equal(result.details.ok, true, JSON.stringify(result.details));
-    assert.equal(agentLists >= 3, true);
-    assert.equal(lifecycle.createdTabs(), 1);
-    assert.notEqual(
-      lifecycle.tabForPane(parent.paneId),
-      lifecycle.tabForPane("delegated-slot-1"),
-    );
-    assert.equal(
-      pi.calls.some((args) => args[0] === "pane" && args[1] === "split"),
-      false,
-    );
-  } finally {
-    pi.events.get("session_shutdown")?.[0]();
-    resetAgentMailbox(parentMailbox);
-    resetAgentMailbox(siblingMailbox);
-    resetAgentMailbox(childMailbox);
-    nativeSessions.delete(parent.piSessionId);
-    nativeSessions.delete(sibling.piSessionId);
-    realFs.rmSync(join(PI_AGENT_ROOT, "pi-herdsman", "config.json"), {
-      force: true,
-    });
+    }
   }
 });
 
-test("managed-agent delegation always splits in its current pane for every lead layout", async () => {
+test("a managed agent's fresh launch splits in its own pane whatever the lead asked for", async () => {
   for (const placement of ["tab", "subtree", "split"] as const) {
     setLeadEnvironment();
     writePlacementSetting(placement);
@@ -821,6 +554,7 @@ test("managed-agent delegation always splits in its current pane for every lead 
     process.env.HERDR_PANE_ID = parent.paneId;
     const pi = fakePi({ exec: lifecycle.exec });
     registerExtension!(pi.pi as never);
+    await startRadarSession(pi);
     const context = fakeAgentContext([
       {
         type: "custom",
@@ -847,19 +581,11 @@ test("managed-agent delegation always splits in its current pane for every lead 
         context,
       );
       assert.equal(result.details.ok, true, JSON.stringify(result.details));
+      // A managed agent delegates beside its own pane even when the lead's
+      // configuration asks for a tab, and nothing is created for it.
+      assert.deepEqual(spawnedLabels(radarDaemon), ["agent"]);
+      assert.equal(readAgentState(childMailbox)?.paneId, radarDaemon.spawns[0]!.pane);
       assert.equal(lifecycle.createdTabs(), 0);
-      assert.equal(
-        lifecycle.tabForPane(parent.paneId),
-        lifecycle.tabForPane("delegated-slot-1"),
-      );
-      assert.ok(
-        pi.calls.some(
-          (args) =>
-            args[0] === "pane" &&
-            args[1] === "split" &&
-            args[args.indexOf("--pane") + 1] === parent.paneId,
-        ),
-      );
     } finally {
       pi.events.get("session_shutdown")?.[0]();
       resetAgentMailbox(parentMailbox);
@@ -871,124 +597,375 @@ test("managed-agent delegation always splits in its current pane for every lead 
   }
 });
 
-test("parent delegation lock makes concurrent close and delegate fail fast", async () => {
+
+test("a Radar-launched child is proved live and its pane closed through its own launch", async (t) => {
   setLeadEnvironment();
-  const parent = managedState("race-parent");
-  const child = {
-    ...managedState("race-child", undefined, recoveryIdentity("race-child")),
-    ownerSessionId: parent.piSessionId,
-    piSessionId: CHILD_SESSION_ID,
-    piSessionFile: "/tmp/race-child.jsonl",
-  };
-  const parentMailbox = agentMailboxPath(WORKSPACE, parent.agentLabel);
-  const childMailbox = agentMailboxPath(WORKSPACE, child.agentLabel);
-  resetAgentMailbox(parentMailbox);
-  resetAgentMailbox(childMailbox);
-  writeAgentState(parentMailbox, parent);
-  writeAgentState(childMailbox, child);
-  const files = [
-    ["parent.md", '---\nname: parent\nagents: ["child"]\n---\nparent\n'],
-    ["child.md", "---\nname: child\n---\nchild\n"],
-  ];
-  for (const [name, content] of files)
-    realFs.writeFileSync(join(PI_AGENTS_DIR, name), content, "utf8");
-
-  const lifecycle = delegatedLifecycleExecutor(parent, [child]);
-  let closeEnteredResolve!: () => void;
-  const closeEntered = new Promise<void>(
-    (resolve) => (closeEnteredResolve = resolve),
-  );
-  let releaseCloseResolve!: () => void;
-  const releaseClose = new Promise<void>(
-    (resolve) => (releaseCloseResolve = resolve),
-  );
-  const sharedExec: ExecHandler = async (command, args, options) => {
-    if (command === "herdr" && isPaneClose(args)) {
-      closeEnteredResolve();
-      await releaseClose;
-    }
-    return lifecycle.exec(command, args, options);
-  };
-
-  const leadPi = fakePi({ exec: sharedExec });
-  registerExtension!(leadPi.pi as never);
-  setAgentEnvironment("race-parent", ["child"]);
-  process.env.PI_HERDSMAN_AGENT_DEFINITION = "parent";
-  writeAgentState(parentMailbox, parent);
-  writeAgentState(childMailbox, child);
-  const parentPi = fakePi({ exec: sharedExec });
-  registerExtension!(parentPi.pi as never);
-  const parentContext = fakeAgentContext([
-    {
-      type: "custom",
-      customType: "pi-herdsman-agent-definition",
-      data: {
-        sessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-        definition: "parent",
-        label: process.env.PI_HERDSMAN_LABEL ?? "parent",
-      },
-    },
-  ]);
-  const leadContext = fakeContext();
-
+  const label = "close-child";
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  const runId = randomUUID();
+  // The launch takes its owner session from the session that asks for it, which
+  // is also what makes the child visible to that controller's list.
+  const ownerSessionId = LEAD_SESSION_ID;
+  const generation = randomUUID();
+  const requestId = randomUUID();
+  const pi = fakePi({});
+  registerExtension!(pi.pi as never);
+  // The context reads the session the launch writes its durable record to, which
+  // is the only place a Radar child's edge can be resolved from.
+  const context = fakeContext(pi.entries);
   try {
-    for (const handler of parentPi.events.get("session_start") ?? [])
-      await handler(undefined, parentContext);
-    // Startup records classification only: the existing identity entry is reused
-    // and no state error is reported.
-    assert.deepEqual(
-      parentPi.entries.map((entry: any) => entry.customType),
-      ["pi-herdsman-session-metadata"],
-      JSON.stringify(parentPi.entries),
-    );
-
-    const closePromise = registeredAgentTool(leadPi, "close").execute(
-      "close",
-      { agent: parent.agentLabel },
-      undefined,
-      undefined,
-      leadContext,
-    );
-    await closeEntered;
-
-    const started = await registeredAgentTool(parentPi, "delegate").execute(
-      "start",
-      {
-        definition: "child",
-        task: "must not start during parent close",
+    await startRadarSession(pi, context);
+    // A launch this process did not perform, at the point where it has an edge,
+    // a child that wrote its own binding, and the record the launch persists
+    // before it dials the daemon.
+    const client = createRadarClient({ env: process.env });
+    const spawned = await client.spawn({
+      request_id: requestId,
+      generation,
+      parent: randomUUID(),
+      parent_session_id: LEAD_SESSION_ID,
+      executable: "/usr/bin/pi",
+      argv: [],
+      cwd: "/tmp",
+      env: {
+        PI_HERDSMAN_LAUNCH_GENERATION: generation,
+        PI_HERDSMAN_MAILBOX: mailbox,
+        PI_HERDSMAN_RUN_ID: runId,
+        PI_HERDSMAN_OWNER_SESSION_ID: ownerSessionId,
+        PI_HERDSMAN_WORKSPACE_ID: WORKSPACE,
+        PI_HERDSMAN_LABEL: label,
+        PI_HERDSMAN_AGENT_DEFINITION: "agent",
       },
-      undefined,
-      undefined,
-      parentContext,
-    );
-    assert.equal(
-      started.details.error.category,
-      "agent_busy",
-      JSON.stringify(started.details),
-    );
-    assert.equal(
-      parentPi.calls.some((args) => args[0] === "agent" && args[1] === "start"),
-      false,
-    );
+    });
+    assert.equal(spawned.ok, true, JSON.stringify(spawned));
+    if (!spawned.ok) return;
+    const paneId = spawned.value.location?.pane;
+    assert.ok(paneId, JSON.stringify(spawned.value));
+    // The launch reads its edge back until the child has bound to it, which is
+    // the agent identity the durable record carries.
+    let agentId: string | undefined;
+    await t.waitFor(async () => {
+      const edge = await client.spawnGet(requestId);
+      assert.equal(edge.ok, true, JSON.stringify(edge));
+      if (edge.ok) agentId = edge.value.edge.bound?.agent_id;
+      assert.ok(agentId, "the child never bound to its launch");
+    });
+    pi.entries.push({
+      type: "custom",
+      customType: "pi-herdsman-radar-spawn",
+      data: {
+        stage: "bound",
+        requestId,
+        generation,
+        runId,
+        label,
+        ownerSessionId,
+        workspaceId: WORKSPACE,
+        mailbox,
+        agentId,
+        paneId,
+      },
+    });
 
-    releaseCloseResolve();
-    const closed = await closePromise;
+    // The daemon's own current read of that edge is what makes this child live:
+    // nothing here reads a mux record the child never had.
+    const listed = await registeredAgentTool(pi, "list").execute(
+      "id",
+      {},
+      undefined,
+      undefined,
+      context,
+    );
+    const row = (listed.details.agents as any[]).find(
+      (entry: any) => entry.agent === label,
+    );
+    assert.ok(row, JSON.stringify(listed.details));
+    assert.notEqual(row.state, "unknown");
+    assert.equal(row.pane_id, paneId);
+
+    const closed = await registeredAgentTool(pi, "close").execute(
+      "id",
+      { agent: label },
+      undefined,
+      undefined,
+      context,
+    );
     assert.equal(closed.details.ok, true, JSON.stringify(closed.details));
-    assert.deepEqual(lifecycle.closeOrder, [
-      child.agentLabel,
-      parent.agentLabel,
-    ]);
+    // Pane closure is the whole effect: one durable close request, one pane
+    // effect, the mailbox retired, and the edge left exactly as it stood.
+    assert.equal(readAgentState(mailbox), undefined);
+    assert.equal(radarDaemon.closes.size, 1);
+    assert.equal([...radarDaemon.closes.values()][0]!.outcome, "completed");
+    assert.equal(radarDaemon.spawns[0]!.closed, true);
   } finally {
-    releaseCloseResolve();
-    for (const handler of leadPi.events.get("session_shutdown") ?? [])
-      handler();
-    for (const handler of parentPi.events.get("session_shutdown") ?? [])
-      handler();
-    resetAgentMailbox(parentMailbox);
-    resetAgentMailbox(childMailbox);
-    resetAgentMailbox(agentMailboxPath(WORKSPACE, "race-new-child"));
-    for (const [name] of files)
-      realFs.rmSync(join(PI_AGENTS_DIR, name), { force: true });
+    pi.events.get("session_shutdown")?.[0]();
+    // The daemon's simulated child is held until its own reset, which the next
+    // test's fixture would otherwise perform on this test's account.
+    radarDaemon.reset();
+    resetAgentMailbox(mailbox);
+  }
+});
+
+test("a retained pane the daemon cleaned up is a confirmed cleanup, not a process exit", async (t) => {
+  setLeadEnvironment();
+  const label = "exited-child";
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  const runId = randomUUID();
+  const ownerSessionId = LEAD_SESSION_ID;
+  const generation = randomUUID();
+  const requestId = randomUUID();
+  const pi = fakePi({});
+  registerExtension!(pi.pi as never);
+  const context = fakeContext(pi.entries);
+  try {
+    await startRadarSession(pi, context);
+    const client = createRadarClient({ env: process.env });
+    const spawned = await client.spawn({
+      request_id: requestId,
+      generation,
+      parent: randomUUID(),
+      parent_session_id: LEAD_SESSION_ID,
+      executable: "/usr/bin/pi",
+      argv: [],
+      cwd: "/tmp",
+      env: {
+        PI_HERDSMAN_LAUNCH_GENERATION: generation,
+        PI_HERDSMAN_MAILBOX: mailbox,
+        PI_HERDSMAN_RUN_ID: runId,
+        PI_HERDSMAN_OWNER_SESSION_ID: ownerSessionId,
+        PI_HERDSMAN_WORKSPACE_ID: WORKSPACE,
+        PI_HERDSMAN_LABEL: label,
+        PI_HERDSMAN_AGENT_DEFINITION: "agent",
+      },
+    });
+    assert.equal(spawned.ok, true, JSON.stringify(spawned));
+    if (!spawned.ok) return;
+    const paneId = spawned.value.location?.pane;
+    assert.ok(paneId, JSON.stringify(spawned.value));
+    let agentId: string | undefined;
+    await t.waitFor(async () => {
+      const edge = await client.spawnGet(requestId);
+      if (edge.ok) agentId = edge.value.edge.bound?.agent_id;
+      assert.ok(agentId, "the child never bound to its launch");
+    });
+    pi.entries.push({
+      type: "custom",
+      customType: "pi-herdsman-radar-spawn",
+      data: {
+        stage: "bound",
+        requestId,
+        generation,
+        runId,
+        label,
+        ownerSessionId,
+        workspaceId: WORKSPACE,
+        mailbox,
+        agentId,
+        paneId,
+      },
+    });
+    // The edge records the pane command's exit before this close, which is what
+    // makes the daemon clean up the retained pane rather than a live occupant.
+    // This fixture's own exec answers no mux read at all, so the listing and the
+    // close below both prove the ordinary path: a Radar child's provenance comes
+    // from its launch record, not from a mux inventory that has to be consulted.
+    const listed = await registeredAgentTool(pi, "list").execute(
+      "id",
+      {},
+      undefined,
+      undefined,
+      context,
+    );
+    const row = (listed.details.agents as any[]).find(
+      (entry: any) => entry.agent === label,
+    );
+    assert.ok(row, JSON.stringify(listed.details));
+    assert.notEqual(row.state, "unknown", JSON.stringify(row));
+    // The pane command exits as the close is served - the read that proved the
+    // child and the close that removes its pane are separate instants - so the
+    // daemon cleans up the retained pane and answers with the exit it holds.
+    radarDaemon.options.closeOutcome = "already_exited";
+    // The daemon's half succeeds and this process's own mailbox removal is the
+    // half that fails, which is the state a later attempt has to be able to
+    // finish. The mailbox holds one unrelated artifact for that removal to hit.
+    writeRequest(mailbox, {
+      version: 5,
+      runId,
+      requestId: REQUEST_ID,
+      ownerSessionId,
+      workspaceId: WORKSPACE,
+      agentLabel: label,
+      paneId,
+      kind: "task",
+      text: "unrelated cleanup artifact",
+      createdAt: Date.now(),
+    });
+    support.failNextRequestRemoval = true;
+
+    const closed = await registeredAgentTool(pi, "close").execute(
+      "id",
+      { agent: label },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(closed.details.ok, true, JSON.stringify(closed.details));
+    assert.match(
+      String(closed.details.cleanup_error),
+      /injected request removal failure/,
+    );
+    // The pane is cleaned up and the mailbox is not, which is exactly what the
+    // confirmed record has to carry forward.
+    assert.equal(radarDaemon.closes.size, 1);
+    assert.equal([...radarDaemon.closes.values()][0]!.outcome, "already_exited");
+    assert.equal(radarDaemon.spawns[0]!.closed, true);
+    assert.ok(readAgentState(mailbox));
+    // The record keeps the daemon's own word and the exit the edge held: this is
+    // a pane fact, so nothing here reads it as the registered process exiting or
+    // as permission to launch a replacement in that pane.
+    const record = pi.entries
+      .filter(
+        (entry: any) =>
+          entry?.customType === "pi-herdsman-radar-close" &&
+          (entry.data as any)?.mailbox === mailbox,
+      )
+      .pop() as any;
+    assert.equal(record.data.stage, "already_exited");
+    assert.equal(record.data.exitObservation.state, "exited");
+    // Nothing was relaunched in the cleaned-up pane: the close is the only
+    // launch-side effect, and the cleaned-up child never became a replacement.
+    assert.equal(radarDaemon.spawns.length, 1);
+
+    // The pane is gone from the mux now, so the retry cannot prove the child's
+    // presence at all: what admits it is the close this process already holds.
+    radarDaemon.options.locationEvidence = "absent";
+    const retried = await registeredAgentTool(pi, "close").execute(
+      "retry",
+      { agent: label },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(retried.details.ok, true, JSON.stringify(retried.details));
+    assert.equal(readAgentState(mailbox), undefined);
+    // No second close: the pane was already cleaned up, so the retry replayed
+    // nothing and finished only the local work.
+    assert.equal(radarDaemon.closes.size, 1);
+    assert.equal(radarDaemon.spawns.length, 1);
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    radarDaemon.reset();
+    resetAgentMailbox(mailbox);
+  }
+});
+
+test("an unreadable mux inventory leaves a child unproved instead of absent", async () => {
+  setLeadEnvironment();
+  const label = "unreadable-inventory-child";
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  const state = {
+    ...managedState(label),
+    ownerSessionId: LEAD_SESSION_ID,
+  };
+  resetAgentMailbox(mailbox);
+  writeAgentState(mailbox, state);
+  // The daemon's own observation cannot be read: the inventory is not empty, it
+  // is unavailable, and the two must not be confused.
+  radarDaemon.options.observeUnavailable = true;
+  const pi = fakePi();
+  registerExtension!(pi.pi as never);
+  const context = fakeContext(pi.entries);
+  try {
+    await startRadarSession(pi, context);
+    const listed = await registeredAgentTool(pi, "list").execute(
+      "id",
+      {},
+      undefined,
+      undefined,
+      context,
+    );
+    const row = (listed.details.agents as any[]).find(
+      (entry: any) => entry.agent === label,
+    );
+    assert.ok(row, JSON.stringify(listed.details));
+    // Nothing was read, so nothing is claimed: the child is unproved rather than
+    // reported gone, which is what a close would otherwise be allowed to act on.
+    assert.equal(row.state, "unknown");
+    const refused = await registeredAgentTool(pi, "close").execute(
+      "id",
+      { agent: label },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(refused.details.ok, false, JSON.stringify(refused.details));
+    assert.equal(refused.details.error.category, "target_ambiguous");
+    assert.equal(readAgentState(mailbox) !== undefined, true);
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(mailbox);
+  }
+});
+
+test("a fresh launch refuses when no daemon answers for this process", async () => {
+  setLeadEnvironment();
+  process.env.HERDR_PANE_ID = "absent-daemon-pane";
+  const label = "absent-daemon-child";
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  resetAgentMailbox(mailbox);
+  // A socket that is not there: no backend is substituted for it, and the launch
+  // has nothing to place a worker beside.
+  process.env.RADAR_CONTROL_SOCKET = join(testTmpRoot, "absent-radar.sock");
+  const pi = fakePi({});
+  registerExtension!(pi.pi as never);
+  const context = fakeContext(pi.entries);
+  try {
+    const refused = await registeredAgentTool(pi, "delegate").execute(
+      "absent-daemon",
+      { definition: "agent", label, task: "no daemon answers" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(refused.details.ok, false, JSON.stringify(refused.details));
+    assert.equal(refused.details.error.category, "invalid_request");
+    assert.equal(readAgentState(mailbox), undefined);
+    assert.equal(radarDaemon.spawns.length, 0);
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    radarDaemon.reset();
+    resetAgentMailbox(mailbox);
+  }
+});
+
+test("a fresh launch refuses when the daemon does not serve the spawn contract", async () => {
+  setLeadEnvironment();
+  process.env.HERDR_PANE_ID = "no-spawn-contract-pane";
+  const label = "no-spawn-contract-child";
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  resetAgentMailbox(mailbox);
+  process.env.RADAR_CONTROL_SOCKET = radarDaemon.socketPath;
+  // A daemon that answers, but is not a build that serves managed spawn: the
+  // client refuses locally before dialing, so nothing is created for it either.
+  radarDaemon.options.capabilities = ["registry.v1", "mux.observe"];
+  const pi = fakePi({});
+  registerExtension!(pi.pi as never);
+  const context = fakeContext(pi.entries);
+  try {
+    const refused = await registeredAgentTool(pi, "delegate").execute(
+      "no-spawn-contract",
+      { definition: "agent", label, task: "no spawn contract" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(refused.details.ok, false, JSON.stringify(refused.details));
+    assert.equal(readAgentState(mailbox), undefined);
+    assert.equal(radarDaemon.spawns.length, 0);
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    radarDaemon.reset();
+    resetAgentMailbox(mailbox);
   }
 });
 
@@ -1099,164 +1076,13 @@ test("lead close maps assignment-lock contention to agent_busy", async () => {
   }
 });
 
-test("cascade close revalidates the parent generation under its assignment lock", async () => {
-  setLeadEnvironment();
-  const parent = managedState("close-generation-parent");
-  const replacement = {
-    ...managedState(
-      parent.agentLabel,
-      undefined,
-      recoveryIdentity("close-generation-replacement"),
-    ),
-    runId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
-    piSessionId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
-  };
-  const parentMailbox = agentMailboxPath(WORKSPACE, parent.agentLabel);
-  resetAgentMailbox(parentMailbox);
-  writeAgentState(parentMailbox, parent);
-  const lifecycle = cascadeExecutor([parent]);
-  const pi = fakePi({ exec: lifecycle.exec });
-  registerExtension!(pi.pi as never);
-  const parentStatePath = join(parentMailbox, "state.json");
-  let parentStateReads = 0;
-
-  try {
-    support.agentStateReadHook = (path) => {
-      if (path !== parentStatePath) return;
-      parentStateReads++;
-      // The snapshot has captured generation A; replace it after the close
-      // action's targeted state read, before cascade planning begins.
-      if (parentStateReads === 2) {
-        support.agentStateReadHook = undefined;
-        writeAgentState(parentMailbox, replacement);
-      }
-    };
-    const closed = await registeredAgentTool(pi, "close").execute(
-      "close-generation-race",
-      { agent: parent.agentLabel },
-      undefined,
-      undefined,
-      fakeContext(),
-    );
-
-    assert.equal(closed.details.error.category, "target_ambiguous");
-    assert.match(closed.details.error.message, /changed before close/);
-    assert.deepEqual(lifecycle.closeOrder, []);
-    assert.deepEqual(readAgentState(parentMailbox), replacement);
-  } finally {
-    support.agentStateReadHook = undefined;
-    pi.events.get("session_shutdown")?.[0]();
-    resetAgentMailbox(parentMailbox);
-  }
-});
-
-test("cascade close keeps the parent when descendant mailbox cleanup is unresolved", async () => {
-  setLeadEnvironment();
-  const parent = managedState("cleanup-cascade-parent", undefined, {
-    ...defaultFixtureIdentity,
-    paneId: "cleanup-cascade-parent-pane",
-    piSessionId: "11111111-1111-4111-8111-111111111111",
-    piSessionFile: "/tmp/cleanup-cascade-parent.jsonl",
-  });
-  const child = {
-    ...managedState("cleanup-cascade-child", undefined, {
-      ...defaultFixtureIdentity,
-      paneId: "cleanup-cascade-child-pane",
-      piSessionId: "22222222-2222-4222-8222-222222222222",
-      piSessionFile: "/tmp/cleanup-cascade-child.jsonl",
-    }),
-    ownerSessionId: parent.piSessionId,
-  };
-  const parentMailbox = agentMailboxPath(WORKSPACE, parent.agentLabel);
-  const childMailbox = agentMailboxPath(WORKSPACE, child.agentLabel);
-  resetAgentMailbox(parentMailbox);
-  resetAgentMailbox(childMailbox);
-  writeAgentState(parentMailbox, parent);
-  writeAgentState(childMailbox, child);
-  writeRequest(childMailbox, {
-    version: 5,
-    runId: child.runId,
-    requestId: REQUEST_ID,
-    ownerSessionId: child.ownerSessionId,
-    workspaceId: child.workspaceId,
-    agentLabel: child.agentLabel,
-    paneId: child.paneId,
-    kind: "task",
-    text: "unrelated cleanup artifact",
-    createdAt: Date.now(),
-  });
-  const lifecycle = cascadeExecutor([parent, child]);
-  let childRemovedBeforeParentClose = false;
-  const pi = fakePi({
-    exec: (command, args) => {
-      if (
-        command === "herdr" &&
-        args[0] === "pane" &&
-        args[1] === "close" &&
-        args[2] === parent.paneId
-      ) {
-        assert.equal(readAgentState(childMailbox), undefined);
-        childRemovedBeforeParentClose = true;
-      }
-      return lifecycle.exec(command, args);
-    },
-  });
-  registerExtension!(pi.pi as never);
-  try {
-    support.failNextRequestRemoval = true;
-    const first = await registeredAgentTool(pi, "close").execute(
-      "close-parent-with-child-cleanup-failure",
-      { agent: parent.agentLabel },
-      undefined,
-      undefined,
-      fakeContext(),
-    );
-    assert.equal(first.details.ok, false);
-    assert.equal(first.details.error.category, "internal_failure");
-    assert.match(
-      first.details.error.message,
-      /Descendant mailbox cleanup is unresolved/,
-    );
-    assert.match(
-      first.details.error.cleanup.message,
-      /injected request removal failure/,
-    );
-    assert.equal(first.details.error.ids.label, child.agentLabel);
-    assert.equal(
-      pi.entries.filter(
-        (entry: any) => entry.customType === "pi_herdsman_cleanup_error",
-      ).length,
-      1,
-    );
-    assert.ok(readAgentState(childMailbox));
-    assert.ok(readAgentState(parentMailbox));
-    assert.deepEqual(lifecycle.closeOrder, [child.agentLabel]);
-
-    const retried = await registeredAgentTool(pi, "close").execute(
-      "retry-parent-close-after-child-cleanup",
-      { agent: parent.agentLabel },
-      undefined,
-      undefined,
-      fakeContext(),
-    );
-    assert.equal(retried.details.ok, true, JSON.stringify(retried.details));
-    assert.equal(readAgentState(childMailbox), undefined);
-    assert.equal(readAgentState(parentMailbox), undefined);
-    assert.deepEqual(lifecycle.closeOrder, [
-      child.agentLabel,
-      parent.agentLabel,
-    ]);
-    assert.equal(childRemovedBeforeParentClose, true);
-  } finally {
-    support.failNextRequestRemoval = false;
-    pi.events.get("session_shutdown")?.[0]();
-    resetAgentMailbox(parentMailbox);
-    resetAgentMailbox(childMailbox);
-  }
-});
-
 test("staged fresh assignment bridges pending start through working", async (t) => {
+  // A fixture that delegates a launch needs a daemon to delegate it to, exactly
+  // as `startRadarSession` provides one for the fixtures that start a session.
+  await ensureRadarDaemon();
   const fixture = createStagedAssignmentFixture("agent");
+  // The daemon observes the fleet this session's own mailboxes model.
+  radarDaemon.observeInventory = radarObservedFleet;
   const list = () =>
     registeredAgentTool(fixture.pi, "list").execute(
       "id",
@@ -1266,38 +1092,53 @@ test("staged fresh assignment bridges pending start through working", async (t) 
       fixture.context,
     );
   try {
-    const starting = registeredAgentTool(fixture.pi, "delegate").execute(
-      "id",
-      {
-        definition: "agent",
-        task: "bridge the staged lifecycle",
-      },
-      undefined,
-      undefined,
-      fixture.context,
+    const starting = fixture.track(
+      registeredAgentTool(fixture.pi, "delegate").execute(
+        "id",
+        {
+          definition: "agent",
+          task: "bridge the staged lifecycle",
+        },
+        undefined,
+        undefined,
+        fixture.context,
+      ),
     );
     await t.waitFor(() =>
       assert.ok(
-        fixture.pi.calls.some(
-          (args) => args[0] === "agent" && args[1] === "start",
-        ),
+        radarDaemon.spawns.length > 0,
         "assignment did not reach the gated startup",
       ),
     );
-    fixture.releaseInitialStatus();
-    await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal(readAgentState(fixture.mailbox), undefined);
     assert.equal(
       /agent/.test(fixture.widgetValue.render(160).join("\n")),
       true,
     );
 
-    fixture.releaseStart();
+    fixture.releaseChildStart();
     await t.waitFor(() =>
       assert.ok(
-        fixture.preSubmitValidationReady,
-        "assignment did not reach pre-submit validation",
+        fixture.childStateReady,
+        "assignment did not reach the child's own state",
       ),
+    );
+    // The overview proves a launch's child from the launch's own record, so the
+    // daemon's binding has to have reached this session before the mailbox state
+    // is read: a mailbox that names a pane is the child's claim about itself, not
+    // where its launch put it.
+    await t.waitFor(
+      () => {
+        const bound = fixture.pi.entries
+          .filter(
+            (entry: any) => entry.customType === "pi-herdsman-radar-spawn",
+          )
+          .at(-1) as any;
+        assert.equal(bound?.data.stage, "bound");
+        assert.equal(bound?.data.agentId, radarDaemon.spawns[0]!.agent_id);
+        assert.equal(bound?.data.paneId, radarDaemon.spawns[0]!.pane);
+      },
+      { timeout: 3_000 },
     );
     const beforeAck = await list();
     assert.equal(fixture.requestObserved, false);
@@ -1307,14 +1148,14 @@ test("staged fresh assignment bridges pending start through working", async (t) 
     assert.doesNotMatch(renderedBeforeAck, /settling/);
     assert.match(renderedBeforeAck, /agent/);
 
-    fixture.releasePreSubmitValidation();
+    fixture.releaseStartupAck();
     await t.waitFor(() =>
       assert.ok(
         fixture.requestObserved,
         "assignment did not reach the gated request handoff",
       ),
     );
-    fixture.releaseAcknowledgement();
+    fixture.releaseHandoff();
     const result = await starting;
     assert.equal(result.details.ok, true, JSON.stringify(result.details));
     const requestId = result.details.request_id;
@@ -1353,13 +1194,12 @@ test("staged fresh assignment bridges pending start through working", async (t) 
       { timeout: 3_000 },
     );
     assert.equal(working.details.agents.length, 1);
-    assert.ok(fixture.workingObservations > 0);
 
     const settling = await list();
     assert.equal(settling.details.agents[0].state, "working");
     assert.doesNotMatch(fixture.widgetValue.render(160).join("\n"), /ready/);
   } finally {
-    fixture.shutdown();
+    await fixture.shutdown();
   }
 });
 
@@ -1411,8 +1251,10 @@ test("fixture mailbox consumer retries a failed acknowledgement callback", async
   }
 });
 
-test("fresh path sessions remain controllable after controller cache loss", async () => {
+test("fresh path sessions remain controllable after controller cache loss", async (t) => {
   setLeadEnvironment();
+  // The daemon observes the fleet this session's own mailboxes model.
+  radarDaemon.observeInventory = radarObservedFleet;
   const label = "agent";
   const sessionPath = join(testTmpRoot, "registered-agent.jsonl");
   realFs.rmSync(sessionPath, { force: true });
@@ -1458,7 +1300,9 @@ test("fresh path sessions remain controllable after controller cache loss", asyn
     },
   });
   registerExtension!(pi.pi as never);
-  const context = fakeContext();
+  // The context reads the session this extension writes: a durable Radar launch
+  // record reaches recovery only through those entries.
+  const context = fakeContext(pi.entries);
   for (const handler of pi.events.get("session_start") ?? [])
     await handler(undefined, context);
   try {
@@ -1478,7 +1322,15 @@ test("fresh path sessions remain controllable after controller cache loss", asyn
       ),
       false,
     );
-    assert.equal(readAgentState(startup.mailbox)?.lastAck?.accepted, true);
+    // The daemon's child accepts the submitted assignment on its own poll, so
+    // the acknowledgment is waited for rather than read as already landed.
+    await t.waitFor(() =>
+      assert.equal(
+        readAgentState(startup.mailbox)?.lastAck?.accepted,
+        true,
+        "the child never accepted its assignment",
+      ),
+    );
     assert.equal(readAgentState(startup.mailbox)?.agentDefinition, "agent");
     realFs.rmSync(sessionPath, { force: true });
     assert.equal(realFs.existsSync(sessionPath), false);
@@ -1523,129 +1375,29 @@ test("fresh path sessions remain controllable after controller cache loss", asyn
     assert.equal(closed.details.ok, true, JSON.stringify(closed.details));
     assert.equal(readAgentState(startup.mailbox), undefined);
     assert.equal(realFs.existsSync(startup.mailbox), false);
-    assert.ok(
-      pi.calls.some((args) => isPaneClose(args) && args[2] === "startup-pane"),
-    );
+    // The close acted on this launch's own edge: the daemon refuses one whose
+    // binding or pane evidence disagrees, so a completed close over the
+    // recovered pane is the Radar proof that the restored runtime still holds
+    // the exact child this session started rather than a pane beside it.
+    const closes = [...radarDaemon.closes.values()];
+    assert.equal(closes.length, 1);
+    assert.equal(closes[0]!.outcome, "completed");
+    assert.equal(closes[0]!.pane, recovered.paneId);
   } finally {
     support.sessionOpenError = undefined;
-    pi.events.get("session_shutdown")?.[0]();
+    // Every handler, not just the launch one: the controller is what this test
+    // restarted mid-run, and a failed assertion before that leaves it unstopped.
+    for (const handler of pi.events.get("session_shutdown") ?? [])
+      await handler(undefined, context);
     resetAgentMailbox(startup.mailbox);
     realFs.rmSync(sessionPath, { force: true });
   }
 });
 
-test("staged fresh assignment removes a fast completion without observing working", async (t) => {
-  const fixture = createStagedAssignmentFixture("agent", true);
-  const list = () =>
-    registeredAgentTool(fixture.pi, "list").execute(
-      "id",
-      {},
-      undefined,
-      undefined,
-      fixture.context,
-    );
-  try {
-    const starting = registeredAgentTool(fixture.pi, "delegate").execute(
-      "id",
-      {
-        definition: "agent",
-        task: "complete before the working snapshot",
-      },
-      undefined,
-      undefined,
-      fixture.context,
-    );
-    await t.waitFor(() =>
-      assert.ok(
-        fixture.pi.calls.some(
-          (args) => args[0] === "agent" && args[1] === "start",
-        ),
-        "fast assignment did not reach the gated startup",
-      ),
-    );
-    fixture.releaseStart();
-    await t.waitFor(() =>
-      assert.ok(
-        fixture.preSubmitValidationReady,
-        "fast assignment did not reach pre-submit validation",
-      ),
-    );
-    fixture.releasePreSubmitValidation();
-    await t.waitFor(() =>
-      assert.ok(
-        fixture.requestObserved,
-        "fast assignment did not reach the gated request handoff",
-      ),
-    );
-    fixture.releaseAcknowledgement();
-    const result = await starting;
-    assert.equal(result.details.ok, true, JSON.stringify(result.details));
-    const requestId = result.details.request_id;
-    assert.equal(requestId, fixture.requestId);
-    assert.equal(requestId, fixture.acceptedRequestIdWritten);
-    assert.equal(readAgentState(fixture.mailbox)?.activeRequestId, undefined);
-
-    fixture.releaseInitialStatus();
-    const beforeCompletion = await list();
-    assert.equal(beforeCompletion.details.agents[0].state, "settling");
-    assert.equal(fixture.workingObservations, 0);
-    const renderedBeforeCompletion = fixture.widgetValue.render(160).join("\n");
-    assert.match(renderedBeforeCompletion, /starting/);
-    assert.doesNotMatch(renderedBeforeCompletion, /settling/);
-    fixture.completeFast(requestId);
-    await t.waitFor(() =>
-      assert.ok(
-        fixture.pi.sent.some(
-          (message: any) => message.customType === "pi-herdsman-agent-result",
-        ),
-        "fast completion result was not delivered",
-      ),
-    );
-    assert.equal(requestId, fixture.requestId);
-    assert.equal(fixture.workingObservations, 0);
-    await t.waitFor(() =>
-      assert.equal(
-        readAgentState(fixture.mailbox),
-        undefined,
-        "fast completion cleanup did not remove the mailbox",
-      ),
-    );
-    const afterCleanup = await list();
-    assert.deepEqual(afterCleanup.details.agents, []);
-    assert.equal(readAgentState(fixture.mailbox), undefined);
-    assert.equal(realFs.existsSync(fixture.mailbox), false);
-    const renderedAfterCleanup = fixture.widgetValue.render(160).join("\n");
-    assert.doesNotMatch(renderedAfterCleanup, /starting/);
-    assert.doesNotMatch(renderedAfterCleanup, /working/);
-    const laterRefresh = await list();
-    assert.deepEqual(laterRefresh.details.agents, []);
-    const snapshotsBeforeRefresh =
-      fixture.pi.calls.filter(isApiSnapshot).length;
-    const rendersBeforeRefresh = fixture.renderRequests;
-    await t.waitFor(
-      () => {
-        assert.ok(
-          fixture.pi.calls.filter(isApiSnapshot).length >
-            snapshotsBeforeRefresh,
-          "status refresh did not read a later snapshot",
-        );
-        assert.ok(
-          fixture.renderRequests > rendersBeforeRefresh,
-          "status refresh did not update the widget",
-        );
-        const rendered = fixture.widgetValue.render(160).join("\n");
-        assert.doesNotMatch(rendered, /starting/);
-        assert.doesNotMatch(rendered, /working/);
-      },
-      { timeout: 3_000 },
-    );
-  } finally {
-    fixture.shutdown();
-  }
-});
-
 test("lead herd runs start once and stay open through intermediate settlement", async () => {
   setLeadEnvironment();
+  // The daemon observes the fleet this session's own mailboxes model.
+  radarDaemon.observeInventory = radarObservedFleet;
   const label = "agent";
   const startup = startupExecutor(
     label,
@@ -1743,6 +1495,8 @@ test("lead herd runs start once and stay open through intermediate settlement", 
 
 test("restored herd run keeps its start and closes after settlement", async (t) => {
   setLeadEnvironment();
+  // The daemon observes the fleet this session's own mailboxes model.
+  radarDaemon.observeInventory = radarObservedFleet;
   const startedAt = 1_700_000_000_000;
   const entries: unknown[] = [
     {
@@ -1802,96 +1556,10 @@ test("restored herd run keeps its start and closes after settlement", async (t) 
   }
 });
 
-test("recovery cleanup finishes an idle restored herd without settlement", async () => {
-  setLeadEnvironment();
-  process.env.HERDR_SOCKET_PATH = join(
-    tmpdir(),
-    `recovered-completed-${randomUUID()}.sock`,
-  );
-  const startedAt = 1_700_000_000_000;
-  const requestId = randomUUID();
-  const label = `recovered-completed-${randomUUID().slice(0, 8)}`;
-  const identity = {
-    paneId: "startup-pane",
-    tabId: "startup-tab",
-    piSessionId: DEFAULT_PI_SESSION_ID,
-    piSessionFile: "/tmp/registered-agent.jsonl",
-  };
-  const state = {
-    ...managedState(label, requestId, identity),
-    activeRequestId: undefined,
-    completedRequestId: requestId,
-  };
-  const startup = startupExecutor(
-    label,
-    () => DEFAULT_PI_SESSION_ID,
-    undefined,
-    undefined,
-    false,
-    undefined,
-    "/tmp",
-    AGENT_ID,
-    false,
-    true,
-  );
-  resetAgentMailbox(startup.mailbox);
-  writeAgentState(startup.mailbox, state);
-  writeResult(startup.mailbox, {
-    version: 5,
-    runId: state.runId,
-    requestId,
-    ownerSessionId: state.ownerSessionId,
-    workspaceId: state.workspaceId,
-    agentLabel: state.agentLabel,
-    paneId: state.paneId,
-    status: "completed",
-    text: "already delivered",
-    completedAt: startedAt + 1,
-  });
-  const entries: unknown[] = [
-    {
-      type: "custom",
-      customType: "pi-herdsman-herd-run",
-      data: { phase: "started", sessionId: LEAD_SESSION_ID, startedAt },
-    },
-    {
-      type: "custom",
-      customType: "pi-herdsman-agent-result",
-      details: resultEntryDetails(state, requestId),
-    },
-  ];
-  const pi = fakePi({ entries, exec: startup.exec });
-  const context = fakeContext(entries);
-  const herdEntries = () =>
-    entries.filter(
-      (entry: any) => entry.customType === "pi-herdsman-herd-run",
-    ) as any[];
-  registerExtension!(pi.pi as never);
-  try {
-    for (const handler of pi.events.get("session_start") ?? [])
-      await handler(undefined, context);
-    const finished = herdEntries().filter(
-      (entry) => entry.data?.phase === "finished",
-    );
-    assert.equal(finished.length, 1);
-    assert.equal(finished[0].data.startedAt, startedAt);
-    assert.equal(readAgentState(startup.mailbox), undefined);
-    assert.equal(readResult(startup.mailbox, requestId), undefined);
-    assert.equal(
-      pi.sent.filter(
-        (message: any) => message.customType === "pi-herdsman-agent-result",
-      ).length,
-      0,
-    );
-  } finally {
-    pi.events.get("session_shutdown")?.[0]();
-    resetAgentMailbox(startup.mailbox);
-    delete process.env.HERDR_SOCKET_PATH;
-  }
-});
-
 test("worker launches store one launch fingerprint of the resolved definition", async (t) => {
   setLeadEnvironment();
+  // The daemon observes the fleet this session's own mailboxes model.
+  radarDaemon.observeInventory = radarObservedFleet;
   const definition = "fingerprinted";
   const referenced = join(testTmpRoot, "fingerprint-body.txt");
   const writeDefinition = (model: string) =>
@@ -2014,6 +1682,8 @@ test("continuation reuses an idle retained worker in its existing process", asyn
   nativeSessions.set(session.id, session);
   const mailbox = agentMailboxPath(WORKSPACE, label);
   const delivered: string[] = [];
+  // A retained child is consumed by the daemon that launched it, so this
+  // fixture's own stand-in must not be a second consumer of the same request.
   const startup = startupExecutor(
     label,
     () => session.id,
@@ -2021,20 +1691,28 @@ test("continuation reuses an idle retained worker in its existing process", asyn
     (text) => {
       delivered.push(text);
     },
+    false,
+    undefined,
+    "/tmp",
+    AGENT_ID,
+    false,
+    true,
+    false,
+    undefined,
+    sessionPath,
   );
-  const pi = fakePi({ exec: startup.exec });
+  startup.stopMailboxConsumer();
   const entries: unknown[] = [];
+  const pi = fakePi({ entries, exec: startup.exec });
   registerExtension!(pi.pi as never);
   const context = fakeContext(entries);
-  const state = {
-    ...managedState(label, undefined, {
-      paneId: "startup-pane",
-      tabId: "startup-tab",
-      piSessionId: session.id,
-      piSessionFile: sessionPath,
-    }),
-    completedRequestId: randomUUID(),
-  };
+  const state = managedState(label, undefined, {
+    paneId: "startup-pane",
+    tabId: "startup-tab",
+    piSessionId: session.id,
+    piSessionFile: sessionPath,
+  });
+  const completedRequestId = randomUUID();
   const listedLabel = async () => {
     const listed = await registeredAgentTool(pi, "list").execute(
       "list",
@@ -2045,16 +1723,25 @@ test("continuation reuses an idle retained worker in its existing process", asyn
     );
     return listed.details.agents.find((agent: any) => agent.agent === label);
   };
-  const starts = () =>
-    pi.calls.filter((args) => args[0] === "agent" && args[1] === "start")
-      .length;
+  const starts = () => radarDaemon.spawns.length;
   try {
-    for (const handler of pi.events.get("session_start") ?? [])
-      await handler(undefined, context);
-    // The worker delivered its result and was retained: its mailbox keeps the
-    // resolved request id and no result file remains.
-    resetAgentMailbox(mailbox);
-    writeAgentState(mailbox, state);
+    await startRadarSession(pi, context);
+    // The worker was launched through Radar, delivered its result and was
+    // retained: the daemon still holds the edge it bound, and the child's own
+    // mailbox keeps the generation it acknowledged and no result file.
+    const launch = await radarDaemon.adoptRetainedChild({
+      label,
+      runId: state.runId,
+      ownerSessionId: state.ownerSessionId,
+      workspaceId: WORKSPACE,
+      mailbox,
+      pane: state.paneId,
+      definition: name,
+    });
+    writeAgentState(mailbox, {
+      ...readAgentState(mailbox)!,
+      completedRequestId,
+    });
     entries.push(
       {
         type: "custom_message",
@@ -2065,7 +1752,7 @@ test("continuation reuses an idle retained worker in its existing process", asyn
             piSessionFile: sessionPath,
             ownerSessionId: LEAD_SESSION_ID,
             runId: state.runId,
-            requestId: state.completedRequestId,
+            requestId: completedRequestId,
             agentLabel: label,
             agentDefinition: name,
             status: "completed",
@@ -2086,10 +1773,15 @@ test("continuation reuses an idle retained worker in its existing process", asyn
                 frontmatter: { name },
                 body: "warm body",
               },
-              { cwd: "/tmp" },
+              { cwd: "/tmp", launchCommand: testChildCommand },
             ),
           ),
         },
+      },
+      {
+        type: "custom",
+        customType: "pi-herdsman-radar-spawn",
+        data: launch,
       },
     );
     assert.equal((await listedLabel())?.state, "idle");
@@ -2120,14 +1812,352 @@ test("continuation reuses an idle retained worker in its existing process", asyn
     assert.equal(after?.completedRequestId, undefined);
     assert.equal(after?.runId, state.runId);
     assert.equal(after?.lastAck?.accepted, true);
+    // The assignment carried the daemon's own statement of which process the
+    // launch bound, and the worker's acceptance echoed that exact address back:
+    // the reuse is that agreement, not the startup acknowledgment left behind.
+    assert.deepEqual(after?.lastAck?.identity, retainedLaunchAddress(launch));
     assert.equal((await listedLabel())?.state, "working");
   } finally {
     updateConfig("retainWorkers", undefined);
     pi.events.get("session_shutdown")?.[0](undefined, context);
+    radarDaemon.reset();
     nativeSessions.delete(session.id);
     resetAgentMailbox(mailbox);
     realFs.rmSync(definitionPath, { force: true });
     realFs.rmSync(sessionPath, { force: true });
+  }
+});
+
+/**
+ * A retained Radar worker whose next assignment is the test's: the daemon that
+ * launched it still holds the edge it bound, the mailbox holds the generation it
+ * acknowledged, and the owner's session holds the launch record and the
+ * retrieved result that make it idle. `link` is how a test makes the process
+ * answering that mailbox something other than the one the launch bound.
+ */
+async function retainedRadarWorker(
+  prefix: string,
+  link: (daemon: FakeRadarDaemon) => void = () => undefined,
+) {
+  setLeadEnvironment();
+  updateConfig("retainWorkers", true);
+  const name = `${prefix}-${randomUUID().slice(0, 8)}`;
+  const label = `${name}-agent`;
+  const definitionPath = join(PI_AGENTS_DIR, `${name}.md`);
+  const sessionPath = join(PI_AGENT_ROOT, `${name}-session.jsonl`);
+  realFs.writeFileSync(definitionPath, `---\nname: ${name}\n---\nwarm body\n`);
+  realFs.writeFileSync(sessionPath, "{}", "utf8");
+  const session = {
+    id: DEFAULT_PI_SESSION_ID,
+    path: sessionPath,
+    cwd: "/tmp",
+    entries: [
+      {
+        type: "custom",
+        customType: "pi-herdsman-agent-definition",
+        data: { sessionId: DEFAULT_PI_SESSION_ID, definition: name, label },
+      },
+    ],
+  };
+  nativeSessions.set(session.id, session);
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  const delivered: string[] = [];
+  const accepted: string[] = [];
+  // A retained child is consumed by the daemon that launched it, so this
+  // fixture's own stand-in must not be a second consumer of the same request.
+  const startup = startupExecutor(
+    label,
+    () => session.id,
+    undefined,
+    (text) => {
+      delivered.push(text);
+    },
+    false,
+    undefined,
+    "/tmp",
+    AGENT_ID,
+    false,
+    true,
+    false,
+    (request) => {
+      accepted.push(request.requestId);
+    },
+    sessionPath,
+  );
+  startup.stopMailboxConsumer();
+  const entries: unknown[] = [];
+  const pi = fakePi({ entries, exec: startup.exec });
+  registerExtension!(pi.pi as never);
+  const context = fakeContext(entries);
+  const state = managedState(label, undefined, {
+    paneId: "startup-pane",
+    tabId: "startup-tab",
+    piSessionId: session.id,
+    piSessionFile: sessionPath,
+  });
+  const completedRequestId = randomUUID();
+  const listedLabel = async () => {
+    const listed = await registeredAgentTool(pi, "list").execute(
+      "list",
+      {},
+      undefined,
+      undefined,
+      context,
+    );
+    return listed.details.agents.find((agent: any) => agent.agent === label);
+  };
+  const starts = () => radarDaemon.spawns.length;
+  await startRadarSession(pi, context);
+  const launch = await radarDaemon.adoptRetainedChild({
+    label,
+    runId: state.runId,
+    ownerSessionId: state.ownerSessionId,
+    workspaceId: WORKSPACE,
+    mailbox,
+    pane: state.paneId,
+    definition: name,
+  });
+  link(radarDaemon);
+  const addresses: RequestAddress[] = [];
+  radarDaemon.onChildRequest = (_spawn, request) => {
+    if (request.address !== undefined) addresses.push(request.address);
+  };
+  writeAgentState(mailbox, {
+    ...readAgentState(mailbox)!,
+    completedRequestId,
+  });
+  entries.push(
+    {
+      type: "custom_message",
+      message: {
+        customType: "pi-herdsman-agent-result",
+        details: {
+          piSessionId: session.id,
+          piSessionFile: sessionPath,
+          ownerSessionId: LEAD_SESSION_ID,
+          runId: state.runId,
+          requestId: completedRequestId,
+          agentLabel: label,
+          agentDefinition: name,
+          status: "completed",
+        },
+      },
+    },
+    {
+      type: "custom",
+      customType: "pi-herdsman-worker-launch",
+      data: {
+        runId: state.runId,
+        label,
+        fingerprint: agentLaunchFingerprint(
+          resolveAgentLaunchInputs(
+            {
+              name,
+              path: definitionPath,
+              frontmatter: { name },
+              body: "warm body",
+            },
+            { cwd: "/tmp", launchCommand: testChildCommand },
+          ),
+        ),
+      },
+    },
+    {
+      type: "custom",
+      customType: "pi-herdsman-radar-spawn",
+      data: launch,
+    },
+  );
+  return {
+    label,
+    launch,
+    mailbox,
+    delivered,
+    accepted,
+    addresses,
+    state,
+    listedLabel,
+    starts,
+    continue: (task: string) =>
+      registeredAgentTool(pi, "continue").execute(
+        "id",
+        { session: sessionPath, task },
+        undefined,
+        undefined,
+        context,
+      ),
+    dispose: () => {
+      radarDaemon.onChildRequest = undefined;
+      updateConfig("retainWorkers", undefined);
+      pi.events.get("session_shutdown")?.[0](undefined, context);
+      radarDaemon.reset();
+      nativeSessions.delete(session.id);
+      resetAgentMailbox(mailbox);
+      realFs.rmSync(definitionPath, { force: true });
+      realFs.rmSync(sessionPath, { force: true });
+    },
+  };
+}
+
+/**
+ * The answer to a continuation either way it arrives: an operation that reports
+ * its own refusal resolves with `ok: false`, and a wait that never settles
+ * rejects. Both are the same failure to a test that asserts fail-closed.
+ */
+const continueOutcome = async (
+  call: Promise<any>,
+): Promise<{ ok: boolean; category?: string; message: string }> => {
+  try {
+    const result = await call;
+    return {
+      ok: result.details.ok === true,
+      category: result.details.error?.category,
+      message: String(result.details.error?.message ?? ""),
+    };
+  } catch (error) {
+    return { ok: false, category: "wait", message: String(error) };
+  }
+};
+
+/**
+ * The address an assignment to a retained child is written with: the subject the
+ * launch bound, the source and incarnation the daemon's edge names for it, and
+ * the generation the child acknowledged.
+ */
+const retainedLaunchAddress = (launch: {
+  agentId: string;
+  generation: string;
+}): RequestAddress => ({
+  subject: launch.agentId,
+  source: RADAR_SUBJECT_SOURCE,
+  incarnation: radarDaemon.spawns.at(-1)!.incarnation,
+  generation: launch.generation,
+});
+
+test("a replaced process cannot accept an addressed retained continuation", async () => {
+  const fixture = await retainedRadarWorker("replaced", (daemon) => {
+    // The process answering this mailbox is not the one the launch bound: same
+    // run, pane, label and session, another incarnation.
+    daemon.options.responderIncarnation = randomUUID();
+  });
+  try {
+    const startsBefore = fixture.starts();
+    const outcome = await continueOutcome(
+      fixture.continue("second assignment"),
+    );
+    assert.equal(
+      outcome.ok,
+      false,
+      "a replaced process must not accept the addressed assignment",
+    );
+    assert.equal(outcome.category, "target_not_found");
+    assert.match(
+      outcome.message,
+      /addressed to another Radar process incarnation/,
+    );
+    // The refusal names the process the launch bound, which is the address the
+    // assignment was written with before the answering process was asked.
+    assert.deepEqual(fixture.addresses, [
+      retainedLaunchAddress(fixture.launch),
+    ]);
+    const after = readAgentState(fixture.mailbox);
+    assert.equal(
+      after?.activeRequestId,
+      undefined,
+      "a replaced process must not accept the addressed assignment",
+    );
+    assert.equal(after?.lastAck?.accepted, false);
+    assert.equal(after?.lastAck?.code, "identity");
+    assert.deepEqual(fixture.accepted, [], "the addressed task must not run");
+    assert.equal(fixture.delivered.length, 0);
+    assert.equal(
+      fixture.starts(),
+      startsBefore,
+      "an unanswered assignment must not launch a process",
+    );
+  } finally {
+    fixture.dispose();
+  }
+});
+
+test("an acceptance that does not echo the addressed process is not a reuse", async () => {
+  const fixture = await retainedRadarWorker("silent-echo", (daemon) => {
+    daemon.options.acknowledgeIdentity = "omit";
+  });
+  try {
+    const outcome = await continueOutcome(
+      fixture.continue("second assignment"),
+    );
+    assert.equal(
+      outcome.ok,
+      false,
+      "an echo that is missing must not be a reuse",
+    );
+    assert.equal(outcome.category, "target_not_found");
+    assert.match(
+      outcome.message,
+      /acknowledged from a process other than the one this launch bound/,
+    );
+    assert.deepEqual(fixture.addresses, [
+      retainedLaunchAddress(fixture.launch),
+    ]);
+  } finally {
+    fixture.dispose();
+  }
+});
+
+test("an acceptance that echoes another process is not a reuse", async () => {
+  const fixture = await retainedRadarWorker("wrong-echo", (daemon) => {
+    daemon.options.acknowledgeIdentity = "wrong";
+  });
+  try {
+    const outcome = await continueOutcome(
+      fixture.continue("second assignment"),
+    );
+    assert.equal(
+      outcome.ok,
+      false,
+      "another process's echo must not be a reuse",
+    );
+    assert.equal(outcome.category, "target_not_found");
+    assert.match(
+      outcome.message,
+      /acknowledged from a process other than the one this launch bound/,
+    );
+    assert.deepEqual(fixture.addresses, [
+      retainedLaunchAddress(fixture.launch),
+    ]);
+  } finally {
+    fixture.dispose();
+  }
+});
+
+test("a stopped consumer cannot answer an addressed continuation", async () => {
+  // Every historical artifact survives: the edge, the pane, the binding and the
+  // startup acknowledgment. Nothing is there to answer the addressed request, so
+  // the continuation stays unanswered and is never reported as a reuse.
+  const fixture = await retainedRadarWorker("stopped", (daemon) => {
+    daemon.options.acceptAssignments = false;
+  });
+  try {
+    const outcome = await continueOutcome(
+      fixture.continue("second assignment"),
+    );
+    // Nothing answers: the request stays unanswered and the owner's wait ends in
+    // an explicit timeout rather than a successful reuse.
+    assert.equal(
+      outcome.ok,
+      false,
+      "an unanswered assignment must not be a reuse",
+    );
+    assert.match(outcome.message, /Timed out waiting for agent state/);
+    assert.deepEqual(fixture.addresses, [
+      retainedLaunchAddress(fixture.launch),
+    ]);
+    assert.deepEqual(fixture.accepted, []);
+    assert.equal(fixture.delivered.length, 0);
+  } finally {
+    fixture.dispose();
   }
 });
 
@@ -2213,13 +2243,8 @@ test("continuation rejects a retained worker whose result was not delivered", as
       context,
     );
     assert.equal(result.details.error.category, "agent_busy");
-    assert.equal(
-      pi.calls.some(
-        (args) =>
-          args[0] === "agent" && ["start", "prompt"].includes(args[1] ?? ""),
-      ),
-      false,
-    );
+    // A busy session is refused before any process is created for it.
+    assert.equal(radarDaemon.spawns.length, 0);
     const after = readAgentState(mailbox);
     assert.equal(after?.activeRequestId, undefined);
     assert.equal(after?.completedRequestId, state.completedRequestId);
@@ -2433,444 +2458,6 @@ test("restored herd waits for direct durable cleanup before finishing", async (t
   }
 });
 
-test("registered extensions preserve adjacent ask escalation and assignment results", async () => {
-  setLeadEnvironment();
-  const parentLabel = "escalation-parent";
-  const childLabel = "escalation-child";
-  const parentRequestId = randomUUID();
-  const childRequestId = randomUUID();
-  const parentIdentity = defaultFixtureIdentity;
-  const childIdentity: FixtureIdentity = {
-    paneId: "escalation-child-pane",
-    tabId: "escalation-child-tab",
-    piSessionId: CHILD_SESSION_ID,
-    piSessionFile: "/tmp/escalation-child.jsonl",
-  };
-  const parentMailbox = agentMailboxPath(WORKSPACE, parentLabel);
-  const childMailbox = agentMailboxPath(WORKSPACE, childLabel);
-  const parent = {
-    ...managedState(parentLabel, parentRequestId, parentIdentity),
-    piSessionId: parentIdentity.piSessionId,
-    piSessionFile: parentIdentity.piSessionFile,
-  };
-  const child = {
-    ...managedState(childLabel, childRequestId, childIdentity),
-    ownerSessionId: parent.piSessionId,
-  };
-  const setNestedAgentEnv = (
-    label: string,
-    ownerSessionId: string,
-    definition: string,
-    allowedAgentDefinitions: string[],
-  ): void => {
-    process.env.HERDR_ENV = "1";
-    process.env.HERDR_WORKSPACE_ID = WORKSPACE;
-    process.env.PI_HERDSMAN_MAILBOX = agentMailboxPath(WORKSPACE, label);
-    process.env.PI_HERDSMAN_RUN_ID = AGENT_ID;
-    process.env.PI_HERDSMAN_OWNER_SESSION_ID = ownerSessionId;
-    process.env.PI_HERDSMAN_LABEL = label;
-    process.env.PI_HERDSMAN_WORKSPACE_ID = WORKSPACE;
-    process.env.PI_HERDSMAN_AGENT_DEFINITION = definition;
-    process.env.PI_HERDSMAN_ALLOWED_AGENT_DEFINITIONS = JSON.stringify(
-      allowedAgentDefinitions,
-    );
-    process.env.HERDR_PANE_ID =
-      label === parentLabel ? parentIdentity.paneId : childIdentity.paneId;
-  };
-  const childDefinition = join(PI_AGENTS_DIR, "child.md");
-  writeFileSync(childDefinition, "---\nname: child\n---\nchild\n");
-  resetAgentMailbox(parentMailbox);
-  resetAgentMailbox(childMailbox);
-  writeAgentState(parentMailbox, parent);
-  writeAgentState(childMailbox, child);
-
-  let childAgent: ReturnType<typeof fakePi> | undefined;
-  let parentAgent: ReturnType<typeof fakePi> | undefined;
-  let leadAgent: ReturnType<typeof fakePi> | undefined;
-  let leadReply: RequestRecord | undefined;
-  let parentReply: RequestRecord | undefined;
-  let stopChildConsumer: (() => void) | undefined;
-  try {
-    setNestedAgentEnv(childLabel, parent.piSessionId, "child", []);
-    childAgent = fakePi();
-    registerExtension!(childAgent.pi as never);
-    const childBranch: unknown[] = [
-      {
-        type: "message",
-        message: {
-          role: "assistant",
-          content: [{ type: "toolCall", name: "ask_owner" }],
-        },
-      },
-    ];
-    const childContext = fakeAgentContext(
-      [
-        {
-          type: "custom",
-          customType: "pi-herdsman-agent-definition",
-          data: {
-            sessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-            definition: "child",
-            label: process.env.PI_HERDSMAN_LABEL ?? "child",
-          },
-        },
-      ],
-      childBranch,
-    );
-    childContext.sessionManager.getSessionId = () => child.piSessionId;
-    childContext.sessionManager.getSessionFile = () => child.piSessionFile!;
-    await childAgent.events.get("session_start")![0](undefined, childContext);
-    const childAskTool = childAgent.tools.find(
-      (tool) => tool.name === "ask_owner",
-    );
-    assert.ok(childAskTool);
-    await childAskTool.execute(
-      "child-ask",
-      { question: "Which implementation should I use?" },
-      undefined,
-      undefined,
-      childContext,
-    );
-    const childWaiting = readAgentState(childMailbox)!;
-    assert.equal(childWaiting.activeRequestId, childRequestId);
-    assert.ok(childWaiting.pendingAskId);
-    assert.equal(childWaiting.ownerSessionId, parent.piSessionId);
-    assert.equal(childWaiting.workspaceId, parent.workspaceId);
-    const childAsk = readPendingAsk(childMailbox, childWaiting)!;
-    childAgent.events.get("session_shutdown")?.[0]();
-    resetAgentMailbox(childMailbox);
-
-    setNestedAgentEnv(parentLabel, LEAD_SESSION_ID, "agent", ["child"]);
-    const parentBase = agentControllerExecutor(parent, [child]);
-    const parentEntries: unknown[] = [
-      {
-        type: "custom",
-        customType: "pi-herdsman-agent-definition",
-        data: {
-          sessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-          definition: "agent",
-          label: process.env.PI_HERDSMAN_LABEL ?? "agent",
-        },
-      },
-    ];
-    parentAgent = fakePi({ exec: parentBase, entries: parentEntries });
-    registerExtension!(parentAgent.pi as never);
-    const parentBranch: unknown[] = [
-      {
-        type: "message",
-        message: {
-          role: "assistant",
-          content: [{ type: "toolCall", name: "ask_owner" }],
-        },
-      },
-    ];
-    const parentContext = fakeAgentContext(parentEntries, parentBranch);
-    parentContext.sessionManager.getBranch = () => parentBranch;
-    for (const handler of parentAgent.events.get("session_start") ?? [])
-      await handler(undefined, parentContext);
-    assert.equal(
-      readAgentState(parentMailbox)?.activeRequestId,
-      parentRequestId,
-      parentEntries.map(String).join("\n"),
-    );
-    writeAgentState(childMailbox, childWaiting);
-    writeAsk(childMailbox, childAsk);
-    const parentAskTool = parentAgent.tools.find(
-      (tool) => tool.name === "ask_owner",
-    );
-    assert.ok(parentAskTool);
-    await parentAskTool.execute(
-      "parent-ask",
-      { question: "How should I answer the child?" },
-      undefined,
-      undefined,
-      parentContext,
-    );
-    const parentWaiting = readAgentState(parentMailbox)!;
-    assert.equal(parentWaiting.activeRequestId, parentRequestId);
-    assert.ok(parentWaiting.pendingAskId);
-    assert.equal(
-      readAgentState(childMailbox)?.pendingAskId,
-      childWaiting.pendingAskId,
-    );
-    parentAgent.events.get("session_shutdown")?.[0]();
-
-    delete process.env.PI_HERDSMAN_MAILBOX;
-    delete process.env.PI_HERDSMAN_RUN_ID;
-    delete process.env.PI_HERDSMAN_OWNER_SESSION_ID;
-    delete process.env.PI_HERDSMAN_LABEL;
-    delete process.env.PI_HERDSMAN_WORKSPACE_ID;
-    delete process.env.PI_HERDSMAN_AGENT_DEFINITION;
-    delete process.env.PI_HERDSMAN_ALLOWED_AGENT_DEFINITIONS;
-    delete process.env.HERDR_PANE_ID;
-    process.env.HERDR_ENV = "1";
-    process.env.HERDR_WORKSPACE_ID = WORKSPACE;
-    const leadBase = leadExec(
-      parentLabel,
-      "working",
-      parent.piSessionId,
-      (requestMailbox, marker) => {
-        const requestId = marker.slice("__PI_HERDSMAN_AGENT_V5__:".length);
-        leadReply = readRequest(requestMailbox, requestId);
-        const current = readAgentState(requestMailbox)!;
-        writeAgentState(requestMailbox, {
-          ...current,
-          lastAck: { requestId, accepted: true, acknowledgedAt: Date.now() },
-          updatedAt: Date.now(),
-        });
-      },
-      parent.piSessionId,
-      parentIdentity,
-    );
-    leadAgent = fakePi({ exec: leadBase });
-    registerExtension!(leadAgent.pi as never);
-    const leadContext = fakeContext();
-    await leadAgent.events.get("session_start")![0](undefined, leadContext);
-    const leadReplyResult = await registeredAgentTool(
-      leadAgent,
-      "reply",
-    ).execute(
-      "lead-reply",
-      {
-        agent: parentLabel,
-        message: "Tell the child ALPHA.",
-      },
-      undefined,
-      undefined,
-      leadContext,
-    );
-    assert.equal(leadReplyResult.details.ok, true);
-    assert.equal(leadReply?.kind, "reply");
-    assert.equal(leadReply?.askId, parentWaiting.pendingAskId);
-    assert.equal(leadReply?.requestId === parentRequestId, false);
-    assert.equal(
-      readAgentState(parentMailbox)?.activeRequestId,
-      parentRequestId,
-    );
-    assert.equal(
-      readAgentState(parentMailbox)?.pendingAskId,
-      parentWaiting.pendingAskId,
-    );
-    leadAgent.events.get("session_shutdown")?.[0]();
-
-    const parentReady = readAgentState(parentMailbox)!;
-    writeAgentState(parentMailbox, {
-      ...parentReady,
-      lastAck: undefined,
-      updatedAt: Date.now(),
-    });
-    setNestedAgentEnv(parentLabel, LEAD_SESSION_ID, "agent", ["child"]);
-    parentAgent = fakePi({ exec: parentBase });
-    registerExtension!(parentAgent.pi as never);
-    const parentReplyContext = fakeAgentContext([
-      {
-        type: "custom",
-        customType: "pi-herdsman-agent-definition",
-        data: {
-          sessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-          definition: "agent",
-          label: process.env.PI_HERDSMAN_LABEL ?? "agent",
-        },
-      },
-    ]);
-    for (const handler of parentAgent.events.get("session_start") ?? [])
-      await handler(undefined, parentReplyContext);
-    assert.ok(leadReply);
-    writeRequest(parentMailbox, leadReply!);
-    assert.deepEqual(
-      parentAgent.events.get("input")![0](
-        { text: controlMarker(leadReply!.requestId) },
-        parentReplyContext,
-      ),
-      {
-        action: "transform",
-        text: "Owner reply:\n\nTell the child ALPHA.\n\nContinue the original assignment using this answer.",
-      },
-    );
-    assert.equal(
-      readAgentState(parentMailbox)?.activeRequestId,
-      parentRequestId,
-    );
-    assert.equal(readAgentState(parentMailbox)?.pendingAskId, undefined);
-    stopChildConsumer = consumeMailboxRequest(childMailbox, (request) => {
-      parentReply = request;
-      const current = readAgentState(childMailbox)!;
-      writeAgentState(childMailbox, {
-        ...current,
-        lastAck: {
-          requestId: request.requestId,
-          accepted: true,
-          acknowledgedAt: Date.now(),
-        },
-        updatedAt: Date.now(),
-      });
-    });
-    parentAgent.events.get("session_shutdown")?.[0]();
-    parentAgent = fakePi({ exec: parentBase });
-    registerExtension!(parentAgent.pi as never);
-    const parentReplyBranch: unknown[] = [];
-    const parentReplyAgentContext = fakeAgentContext(
-      [
-        {
-          type: "custom",
-          customType: "pi-herdsman-agent-definition",
-          data: {
-            sessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-            definition: "agent",
-            label: process.env.PI_HERDSMAN_LABEL ?? "agent",
-          },
-        },
-      ],
-      parentReplyBranch,
-    );
-    for (const handler of parentAgent.events.get("session_start") ?? [])
-      await handler(undefined, parentReplyAgentContext);
-    const childReplyResult = await registeredAgentTool(
-      parentAgent,
-      "reply",
-    ).execute(
-      "parent-reply",
-      {
-        agent: childLabel,
-        message: "Use ALPHA and finish.",
-      },
-      undefined,
-      undefined,
-      parentReplyAgentContext,
-    );
-    assert.equal(
-      childReplyResult.details.ok,
-      true,
-      JSON.stringify(childReplyResult.details),
-    );
-    assert.equal(
-      childReplyResult.details.assignment_request_id,
-      childRequestId,
-    );
-    assert.equal(parentReply?.kind, "reply");
-    assert.equal(parentReply?.askId, childWaiting.pendingAskId);
-    assert.equal(
-      readAgentState(parentMailbox)?.activeRequestId,
-      parentRequestId,
-    );
-    parentAgent.events.get("session_shutdown")?.[0]();
-    writeAgentState(childMailbox, childWaiting);
-    writeAsk(childMailbox, childAsk);
-
-    setNestedAgentEnv(childLabel, parent.piSessionId, "child", []);
-    childAgent = fakePi();
-    registerExtension!(childAgent.pi as never);
-    const childResultContext = fakeAgentContext([
-      {
-        type: "custom",
-        customType: "pi-herdsman-agent-definition",
-        data: {
-          sessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-          definition: "child",
-          label: process.env.PI_HERDSMAN_LABEL ?? "child",
-        },
-      },
-    ]);
-    childResultContext.sessionManager.getSessionId = () => child.piSessionId;
-    childResultContext.sessionManager.getSessionFile = () =>
-      child.piSessionFile!;
-    await childAgent.events.get("session_start")![0](
-      undefined,
-      childResultContext,
-    );
-    assert.ok(parentReply);
-    assert.equal(readAgentState(childMailbox)?.activeRequestId, childRequestId);
-    assert.equal(
-      readAgentState(childMailbox)?.pendingAskId,
-      childWaiting.pendingAskId,
-    );
-    assert.ok(readPendingAsk(childMailbox, readAgentState(childMailbox)!));
-    writeRequest(childMailbox, parentReply!);
-    assert.equal(
-      childAgent.events.get("input")![0](
-        { text: controlMarker(parentReply!.requestId) },
-        childResultContext,
-      ).action,
-      "transform",
-    );
-    assert.equal(readAgentState(childMailbox)?.activeRequestId, childRequestId);
-    assert.equal(readAgentState(childMailbox)?.pendingAskId, undefined);
-    childAgent.events.get("message_end")![0](
-      { message: { role: "assistant", content: "ALPHA" } },
-      childResultContext,
-    );
-    await childAgent.events.get("agent_settled")![0](
-      undefined,
-      childResultContext,
-    );
-    assert.equal(readResult(childMailbox, childRequestId)?.text, "ALPHA");
-    assert.equal(
-      readAgentState(childMailbox)?.completedRequestId,
-      childRequestId,
-    );
-    childAgent.events.get("session_shutdown")?.[0]();
-
-    setNestedAgentEnv(parentLabel, LEAD_SESSION_ID, "agent", ["child"]);
-    parentAgent = fakePi({ exec: parentBase });
-    registerExtension!(parentAgent.pi as never);
-    const parentResultEntries: unknown[] = [
-      {
-        type: "custom",
-        customType: "pi-herdsman-agent-definition",
-        data: {
-          sessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-          definition: "agent",
-          label: process.env.PI_HERDSMAN_LABEL ?? "agent",
-        },
-      },
-      {
-        customType: "pi-herdsman-agent-result",
-        details: resultEntryDetails(child, childRequestId),
-      },
-    ];
-    const parentResultContext = fakeAgentContext(parentResultEntries);
-    for (const handler of parentAgent.events.get("session_start") ?? [])
-      await handler(undefined, parentResultContext);
-    parentAgent.events.get("message_end")![0](
-      { message: { role: "assistant", content: "Parent completed." } },
-      parentResultContext,
-    );
-    await parentAgent.events.get("agent_settled")![0](
-      undefined,
-      parentResultContext,
-    );
-    assert.equal(
-      readResult(parentMailbox, parentRequestId)?.text,
-      "Parent completed.",
-    );
-    assert.equal(
-      readAgentState(parentMailbox)?.completedRequestId,
-      parentRequestId,
-    );
-    assert.deepEqual(
-      listAgentStates()
-        .filter(({ state }) =>
-          [parentLabel, childLabel].includes(state.agentLabel),
-        )
-        .map(({ state }) => state.activeRequestId ?? state.completedRequestId)
-        .sort(),
-      [childRequestId, parentRequestId].sort(),
-    );
-    parentAgent.events.get("session_shutdown")?.[0]();
-  } finally {
-    stopChildConsumer?.();
-    childAgent?.events.get("session_shutdown")?.[0]();
-    parentAgent?.events.get("session_shutdown")?.[0]();
-    leadAgent?.events.get("session_shutdown")?.[0]();
-    resetAgentMailbox(parentMailbox);
-    resetAgentMailbox(childMailbox);
-    assert.equal(readAgentState(parentMailbox), undefined);
-    assert.equal(readAgentState(childMailbox), undefined);
-    realFs.unlinkSync(childDefinition);
-    setLeadEnvironment();
-  }
-});
-
 test("one failed child recovery does not clear valid sibling runtimes", async () => {
   setAgentEnvironment("recovery-parent", ["child"]);
   process.env.PI_HERDSMAN_AGENT_DEFINITION = "parent";
@@ -2916,37 +2503,36 @@ test("one failed child recovery does not clear valid sibling runtimes", async ()
       },
     },
   ];
+  // The daemon's observation is the only place presence comes from now: the
+  // failed child's pane reports another session first, and then disappears.
   let replaced = true;
-  const base = agentControllerExecutor(parent, [badChild, goodChild]);
-  const pi = fakePi({
-    entries,
-    exec: (command, args, options) => {
-      const result = base(command, args, options);
-      if (command === "herdr" && isApiSnapshot(args)) {
-        const value = JSON.parse(result.stdout);
-        const bad = value.result.snapshot.agents.find(
-          (agent: any) => agent.pane_id === badChild.paneId,
-        );
-        if (bad && replaced)
-          bad.agent_session = {
-            source: "herdr:pi",
-            agent: "pi",
-            kind: "id",
+  radarDaemon.observeInventory = () => {
+    const fleet = radarObservedFleet() as {
+      workspaces: unknown[];
+      tabs: unknown[];
+      panes: Array<{ location: { pane_id: string } }>;
+      agents: Array<{ location: { pane_id: string }; session?: unknown }>;
+    };
+    if (replaced) {
+      for (const agent of fleet.agents)
+        if (agent.location.pane_id === badChild.paneId)
+          agent.session = {
+            kind: "uuid",
             value: "22222222-2222-4222-8222-222222222222",
           };
-        if (!replaced) {
-          value.result.snapshot.agents = value.result.snapshot.agents.filter(
-            (agent: any) => agent.pane_id !== badChild.paneId,
-          );
-          value.result.snapshot.panes = value.result.snapshot.panes.filter(
-            (pane: any) => pane.pane_id !== badChild.paneId,
-          );
-        }
-        return { ...result, stdout: JSON.stringify(value) };
-      }
-      return result;
-    },
-  });
+      return fleet;
+    }
+    return {
+      ...fleet,
+      panes: fleet.panes.filter(
+        (pane) => pane.location.pane_id !== badChild.paneId,
+      ),
+      agents: fleet.agents.filter(
+        (agent) => agent.location.pane_id !== badChild.paneId,
+      ),
+    };
+  };
+  const pi = fakePi({ entries });
   registerExtension!(pi.pi as never);
   const context = fakeAgentContext(entries);
   try {
@@ -2960,38 +2546,14 @@ test("one failed child recovery does not clear valid sibling runtimes", async ()
       context,
     );
     assert.equal(listed.details.ok, true, JSON.stringify(listed.details));
-    await new Promise((resolve) => setImmediate(resolve));
-    const reports = pi.calls.filter(
-      (args) => args[0] === "pane" && args[1] === "report-metadata",
-    );
     const good = listed.details.agents.find(
       (agent: any) => agent.agent === goodChild.agentLabel,
     );
-    assert.ok(
-      reports.some(
-        (args) =>
-          args[2] === goodChild.paneId &&
-          args.includes(`pi-herdsman:owner:${goodChild.runId}`) &&
-          args.includes(`pi_herdsman_state=${good.state}`),
-      ),
-      JSON.stringify(reports),
-    );
-    assert.equal(
-      reports.some(
-        (args) =>
-          args[2] === badChild.paneId &&
-          args.includes(`pi-herdsman:owner:${badChild.runId}`),
-      ),
-      false,
-      "a replaced pane must not receive the old owner's state",
-    );
-    assert.equal(
-      pi.calls.some(
-        (args) =>
-          args.includes("report-agent") || args.includes("report-session"),
-      ),
-      false,
-    );
+    assert.ok(good, JSON.stringify(listed.details));
+    // A pane whose occupant reports another session is not this child, but it is
+    // also not gone: the sibling's runtime is untouched either way.
+    assert.notEqual(good.state, "lost");
+    assert.ok(readAgentState(goodMailbox));
     replaced = false;
     const lost = await registeredAgentTool(pi, "list").execute(
       "lost",
@@ -3006,43 +2568,19 @@ test("one failed child recovery does not clear valid sibling runtimes", async ()
       ).state,
       "lost",
     );
-    await new Promise((resolve) => setImmediate(resolve));
-    const lossReport = pi.calls.find(
-      (args) =>
-        args[2] === badChild.paneId &&
-        args.includes(`pi-herdsman:owner:${badChild.runId}`) &&
-        args.includes("pi_herdsman_state=lost"),
+    assert.ok(readAgentState(goodMailbox), "a failed child must not clear a valid sibling");
+    assert.notEqual(
+      lost.details.agents.find(
+        (agent: any) => agent.agent === goodChild.agentLabel,
+      ).state,
+      "lost",
     );
-    assert.ok(lossReport);
-    assert.equal(lossReport[lossReport.indexOf("--ttl-ms") + 1], "30000");
-    assert.equal(
-      lossReport.includes("--title") || lossReport.includes("--display-agent"),
-      false,
-    );
-    resetAgentMailbox(badMailbox);
-    await registeredAgentTool(pi, "list").execute(
-      "removed",
-      {},
-      undefined,
-      undefined,
-      context,
-    );
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.ok(
-      pi.calls.some(
-        (args) =>
-          args[2] === badChild.paneId &&
-          args.includes(`pi-herdsman:owner:${badChild.runId}`) &&
-          args.includes("--clear-token") &&
-          args.includes("pi_herdsman_state"),
-      ),
-    );
-
     assert.deepEqual(
       listed.details.agents.map((agent: any) => agent.agent).sort(),
       [goodChild.agentLabel, badChild.agentLabel].sort(),
     );
   } finally {
+    delete radarDaemon.observeInventory;
     for (const handler of pi.events.get("session_shutdown") ?? []) handler();
     for (const mailbox of [parentMailbox, badMailbox, goodMailbox])
       resetAgentMailbox(mailbox);
@@ -3189,13 +2727,7 @@ test("exact requested session IDs remain busy when persisted paths are stale", a
       ownedSessionContext(session.id, `${name}-agent`),
     );
     assert.equal(result.details.error.category, "agent_busy");
-    assert.equal(
-      pi.calls.some(
-        (args) =>
-          args[0] === "agent" && ["start", "prompt"].includes(args[1] ?? ""),
-      ),
-      false,
-    );
+    assert.equal(radarDaemon.spawns.length, 0);
   } finally {
     pi.events.get("session_shutdown")?.[0]();
     nativeSessions.delete(session.id);
@@ -3237,16 +2769,18 @@ test("concurrent session activation permits one generation", async () => {
   let startEntered!: () => void;
   const entered = new Promise<void>((resolve) => (startEntered = resolve));
   const gate = new Promise<void>((resolve) => (release = resolve));
-  const pi = fakePi({
-    exec: async (command, args, options) => {
-      if (command === "herdr" && args[0] === "agent" && args[1] === "start") {
-        startEntered();
-        await gate;
-      }
-      return startup.exec(command, args, options);
-    },
-  });
+  // The launch holds the session reservation from the moment it reaches the
+  // daemon, so a second activation for the same session must be refused there.
+  radarDaemon.onChildStart = async () => {
+    startEntered();
+    await gate;
+  };
+  const pi = fakePi({ exec: startup.exec });
   registerExtension!(pi.pi as never);
+  // A launch is created under this process's own registration, so the fixture
+  // session starts first: the concurrent activation this proves is about the
+  // session reservation, not about a process that never registered.
+  await startRadarSession(pi);
   try {
     const first = registeredAgentTool(pi, "continue").execute(
       "first",
@@ -3354,329 +2888,37 @@ test("a failed continue releases the session activation reservation", async () =
   }
 });
 
-test("concurrent continues of an idle retained worker serialize on the reservation", async () => {
-  setLeadEnvironment();
-  updateConfig("retainWorkers", true);
-  const name = `warm-concurrent-${randomUUID().slice(0, 8)}`;
-  const label = `${name}-agent`;
-  const definitionPath = join(PI_AGENTS_DIR, `${name}.md`);
-  const sessionPath = join(PI_AGENT_ROOT, `${name}-session.jsonl`);
-  realFs.writeFileSync(definitionPath, `---\nname: ${name}\n---\nwarm body\n`);
-  realFs.writeFileSync(sessionPath, "{}", "utf8");
-  const session = {
-    id: DEFAULT_PI_SESSION_ID,
-    path: sessionPath,
-    cwd: "/tmp",
-    entries: [
-      {
-        type: "custom",
-        customType: "pi-herdsman-agent-definition",
-        data: { sessionId: DEFAULT_PI_SESSION_ID, definition: name, label },
-      },
-    ],
-  };
-  nativeSessions.set(session.id, session);
-  const mailbox = agentMailboxPath(WORKSPACE, label);
-  const startup = startupExecutor(label, () => session.id);
-  let snapshotCalls = 0;
-  let gating = false;
-  let snapshotEntered!: () => void;
-  const entered = new Promise<void>((resolve) => (snapshotEntered = resolve));
-  let release!: () => void;
-  const gate = new Promise<void>((resolve) => (release = resolve));
-  const pi = fakePi({
-    exec: async (command, args, options) => {
-      if (command === "herdr" && args[0] === "api" && args[1] === "snapshot") {
-        snapshotCalls += 1;
-        // The first call is the pre-claim inventory; the second is the
-        // identity snapshot inside the reservation.
-        if (gating && snapshotCalls === 2) {
-          gating = false;
-          snapshotEntered();
-          await gate;
-        }
-      }
-      return startup.exec(command, args, options);
-    },
-  });
-  const entries: unknown[] = [];
-  registerExtension!(pi.pi as never);
-  const context = fakeContext(entries);
-  const state = {
-    ...managedState(label, undefined, {
-      paneId: "startup-pane",
-      tabId: "startup-tab",
-      piSessionId: session.id,
-      piSessionFile: sessionPath,
-    }),
-    completedRequestId: randomUUID(),
-  };
-  try {
-    for (const handler of pi.events.get("session_start") ?? [])
-      await handler(undefined, context);
-    resetAgentMailbox(mailbox);
-    writeAgentState(mailbox, state);
-    entries.push(
-      {
-        type: "custom_message",
-        message: {
-          customType: "pi-herdsman-agent-result",
-          details: {
-            piSessionId: session.id,
-            piSessionFile: sessionPath,
-            ownerSessionId: LEAD_SESSION_ID,
-            runId: state.runId,
-            requestId: state.completedRequestId,
-            agentLabel: label,
-            agentDefinition: name,
-            status: "completed",
-          },
-        },
-      },
-      {
-        type: "custom",
-        customType: "pi-herdsman-worker-launch",
-        data: {
-          runId: state.runId,
-          label,
-          fingerprint: agentLaunchFingerprint(
-            resolveAgentLaunchInputs(
-              {
-                name,
-                path: definitionPath,
-                frontmatter: { name },
-                body: "warm body",
-              },
-              { cwd: "/tmp" },
-            ),
-          ),
-        },
-      },
-    );
-    // Arm the gate only for this continue: its pre-claim inventory is the
-    // first snapshot call, its identity snapshot is the second.
-    snapshotCalls = 0;
-    gating = true;
-    const first = registeredAgentTool(pi, "continue").execute(
-      "first",
-      { session: sessionPath, task: "first assignment" },
-      undefined,
-      undefined,
-      context,
-    );
-    await entered;
-    const second = await registeredAgentTool(pi, "continue").execute(
-      "second",
-      { session: session.id, task: "second assignment" },
-      undefined,
-      undefined,
-      context,
-    );
-    assert.equal(
-      second.details.error.category,
-      "agent_busy",
-      JSON.stringify(second.details),
-    );
-    release();
-    const firstResult = await first;
-    assert.equal(
-      firstResult.details.ok,
-      true,
-      JSON.stringify(firstResult.details),
-    );
-    assert.equal(firstResult.details.reused, true);
-  } finally {
-    release();
-    pi.events.get("session_shutdown")?.[0]();
-    nativeSessions.delete(session.id);
-    resetAgentMailbox(startup.mailbox);
-    realFs.rmSync(definitionPath, { force: true });
-    realFs.rmSync(sessionPath, { force: true });
-  }
-});
-
-test("session assignment reports a pane mismatch from the agent state producer", async () => {
+test("session assignment never adopts a child that claims another pane", async () => {
   const label = "agent";
   const producerMismatchPath = join(testTmpRoot, "producer-mismatch.jsonl");
-  const registeredAgentPath = join(testTmpRoot, "registered-agent.jsonl");
-  const mailbox = setAgentEnvironment(label);
-  const agent = fakePi();
-  registerExtension!(agent.pi as never);
-  const agentStart = agent.events.get("session_start")![0];
-  const paneEnvironment: Record<string, string> = {};
+  setAgentEnvironment(label);
   nativeSessions.set("dddddddd-dddd-4ddd-8ddd-dddddddddddd", {
     id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
     path: producerMismatchPath,
     cwd: "/tmp",
   });
   realFs.writeFileSync(producerMismatchPath, "{}", "utf8");
-  realFs.writeFileSync(registeredAgentPath, "{}", "utf8");
   setLeadEnvironment();
-  const lead = fakePi({
-    exec: async (command, args) => {
-      if (command === "herdr" && args[0] === "--version")
-        return { stdout: "0.8.0", stderr: "", code: 0 };
-      if (command !== "herdr") return { stdout: "{}", stderr: "", code: 0 };
-      if (isTabList(args))
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              tabs: [],
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      if (args[0] === "tab" && args[1] === "create")
-        for (let i = 0; i < args.length - 1; i++) {
-          if (args[i] !== "--env") continue;
-          const assignment = args[i + 1]!;
-          const separator = assignment.indexOf("=");
-          if (separator > 0)
-            paneEnvironment[assignment.slice(0, separator)] = assignment.slice(
-              separator + 1,
-            );
-        }
-      if (args[0] === "tab" && args[1] === "create")
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              tab: {
-                tab_id: "producer-tab",
-                label: "agents",
-                workspace_id: WORKSPACE,
-              },
-              root_pane: {
-                pane_id: "helper-pane",
-                terminal_id: "helper-terminal",
-              },
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      if (isPaneList(args))
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              panes: [
-                {
-                  pane_id: "helper-pane",
-                  tab_id: "producer-tab",
-                  workspace_id: WORKSPACE,
-                  terminal_id: "helper-terminal",
-                  cwd: "/tmp",
-                  foreground_cwd: "/tmp",
-                  agent_status: "unknown",
-                },
-              ],
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      if (args[0] === "pane" && args[1] === "process-info")
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              process_info: {
-                pane_id: "helper-pane",
-                shell_pid: 123,
-                foreground_process_group_id: 123,
-                foreground_processes: [{ pid: 123, argv0: "/bin/zsh" }],
-              },
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      if (
-        args[0] === "pane" &&
-        (args[1] === "run" || args[1] === "wait-output")
-      ) {
-        if (args[1] === "run")
-          for (const match of (args.at(-1) ?? "").matchAll(
-            /([A-Z][A-Z0-9_]*)='([^']*)'/g,
-          ))
-            paneEnvironment[match[1]] = match[2];
-        return { stdout: "{}", stderr: "", code: 0 };
-      }
-      if (isApiSnapshot(args))
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              snapshot: {
-                agents: JSON.parse(listResponse(label, "idle", null)).agents,
-                panes: [
-                  {
-                    pane_id: "registered-pane",
-                    workspace_id: WORKSPACE,
-                    cwd: "/tmp",
-                  },
-                ],
-              },
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      const previous = { ...process.env };
-      Object.assign(process.env, paneEnvironment, {
-        HERDR_PANE_ID: "agent-pane",
-      });
-      await agentStart(undefined, fakeAgentContext(agent.entries));
-      for (const key of Object.keys(process.env))
-        if (!(key in previous)) delete process.env[key];
-      Object.assign(process.env, previous);
-      return {
-        stdout: JSON.stringify({
-          id: AGENT_ID,
-          result: {
-            agent: {
-              name: runScopedHerdrAlias(
-                WORKSPACE,
-                label,
-                paneEnvironment.PI_HERDSMAN_RUN_ID ?? AGENT_ID,
-              ),
-              pane_id: "agent-pane",
-              tab_id: "producer-tab",
-              workspace_id: WORKSPACE,
-              cwd: "/tmp",
-              agent_session: {
-                source: "herdr:pi",
-                agent: "pi",
-                kind: "id",
-                value: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-              },
-            },
-          },
-          runtime_identity: {
-            herdr_agent: runScopedHerdrAlias(
-              WORKSPACE,
-              label,
-              paneEnvironment.PI_HERDSMAN_RUN_ID ?? AGENT_ID,
-            ),
-            herdr_kind: "pi",
-            agent_definition: "agent",
-            model: null,
-            thinking: null,
-            cwd: "/tmp",
-            resumed: true,
-            session_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-            session_name: null,
-          },
-        }),
-        stderr: "",
-        code: 0,
-      };
-    },
-  });
+  const startup = startupExecutor(
+    label,
+    () => "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+    undefined,
+    undefined,
+    false,
+    undefined,
+    "/tmp",
+    AGENT_ID,
+    false,
+    true,
+  );
+  // The child runs in the pane its own state names, and that pane is not the
+  // one the launch created for it: the launch proves the pane it made rather
+  // than adopting whatever the child says.
+  radarDaemon.options.childPane = "helper-pane";
+  process.env.PI_HERDSMAN_RADAR_LAUNCH_TIMEOUT_MS = "500";
+  const lead = fakePi({ exec: startup.exec });
   registerExtension!(lead.pi as never);
+  await startRadarSession(lead, ownedSessionContext(DEFAULT_PI_SESSION_ID, label));
   try {
     const result = await registeredAgentTool(lead, "continue").execute(
       "id",
@@ -3688,17 +2930,28 @@ test("session assignment reports a pane mismatch from the agent state producer",
       undefined,
       ownedSessionContext(DEFAULT_PI_SESSION_ID, label),
     );
-    assert.equal(result.details.ok, false);
-    assert.match(result.details.error.message, /paneId/);
-    assert.match(result.details.error.message, /agent-pane/);
+    assert.equal(result.details.ok, false, JSON.stringify(result.details));
+    assert.equal(result.details.error.category, "pane_not_ready");
+    // The refusal names the pane the child claims and the pane the launch
+    // created, so an operator can tell which process occupies which.
     assert.match(result.details.error.message, /helper-pane/);
+    assert.match(result.details.error.message, /startup-pane/);
+    // The launch's record keeps the daemon's pane and never the pane the child
+    // claims: a child's own state cannot rewrite where its launch put it, and the
+    // disagreement is what leaves it with no location to prove.
+    const bound = lead.entries.filter(
+      (entry: any) => entry.customType === "pi-herdsman-radar-spawn",
+    );
+    assert.equal(bound.length, 2);
+    assert.equal(bound.at(-1)!.data.stage, "bound");
+    assert.equal(bound.at(-1)!.data.paneId, "startup-pane");
+    assert.equal(bound.at(-1)!.data.agentId, radarDaemon.spawns[0]!.agent_id);
   } finally {
     lead.events.get("session_shutdown")?.[0]();
-    agent.events.get("session_shutdown")?.[0]();
     nativeSessions.clear();
-    resetAgentMailbox(mailbox);
+    resetAgentMailbox(startup.mailbox);
+    delete process.env.PI_HERDSMAN_RADAR_LAUNCH_TIMEOUT_MS;
     realFs.rmSync(producerMismatchPath, { force: true });
-    realFs.rmSync(registeredAgentPath, { force: true });
   }
 });
 
@@ -3836,18 +3089,14 @@ test("a fresh delegation stores the child session under the operator cwd", async
   }
 });
 
-/** The `--env` assignments Herdsman passed to the pane it created for a launch. */
+/**
+ * The environment overlay this test's launches carried. A launch used to pass
+ * its overlay as `--env` on the pane it created; Radar spawn carries the same
+ * overlay in the request, so this reads the spawn the daemon accepted.
+ */
 const paneEnvironmentAssignments = (
-  pi: ReturnType<typeof fakePi>,
-): string[] => {
-  const assignments: string[] = [];
-  for (const args of pi.calls) {
-    if (args[0] !== "tab" || args[1] !== "create") continue;
-    for (let index = 0; index < args.length - 1; index++)
-      if (args[index] === "--env") assignments.push(args[index + 1]!);
-  }
-  return assignments;
-};
+  _pi?: ReturnType<typeof fakePi>,
+): string[] => spawnedEnvironmentAssignments(radarDaemon);
 
 /** A real executable for `PI_HERDSMAN_CHILD_COMMAND`, outside the repository. */
 const tempChildCommand = (suffix: string): string => {
@@ -3910,8 +3159,12 @@ test("a configured child command reaches the child pane environment exactly once
   }
 });
 
-test("an unconfigured child command leaves the pane environment unchanged", async () => {
+test("an unconfigured child command refuses a fresh launch before any effect", async () => {
   setLeadEnvironment();
+  // Radar spawn execs an absolute path this process resolved. Without a
+  // configured child command there is no executable to name, and inventing one
+  // from the pane's shell is exactly the fallback the launch must not take.
+  delete process.env.PI_HERDSMAN_CHILD_COMMAND;
   const name = `child-command-unset-${randomUUID().slice(0, 8)}`;
   const label = name;
   const definitionPath = join(PI_AGENTS_DIR, `${name}.md`);
@@ -3931,9 +3184,10 @@ test("an unconfigured child command leaves the pane environment unchanged", asyn
       undefined,
       fakeContext(),
     );
-    assert.equal(result.details.ok, true, JSON.stringify(result.details));
-    assert.deepEqual(childCommandAssignments(pi), []);
-    assert.ok(paneEnvironmentAssignments(pi).includes("PI_SUBAGENT_CHILD=1"));
+    assert.equal(result.details.ok, false, JSON.stringify(result.details));
+    assert.equal(result.details.error.category, "invalid_request");
+    assert.match(result.details.error.message, /PI_HERDSMAN_CHILD_COMMAND/);
+    assert.equal(radarDaemon.spawns.length, 0);
   } finally {
     pi.events.get("session_shutdown")?.[0]();
     resetAgentMailbox(startup.mailbox);
@@ -4047,13 +3301,9 @@ test("a nested worker keeps the same child directory as its owner", async () => 
   const nested = { ...parent, piSessionFile: parentSessionPath };
   writeAgentState(parentMailbox, nested);
   const lifecycle = delegatedLifecycleExecutor(nested);
-  const starts: string[][] = [];
+  const starts = (): string[][] => spawnedArgvs(radarDaemon);
   const pi = fakePi({
-    exec: (command, args) => {
-      if (command === "herdr" && args[0] === "agent" && args[1] === "start")
-        starts.push([...args]);
-      return lifecycle.exec(command, args);
-    },
+    exec: (command, args) => lifecycle.exec(command, args),
   });
   registerExtension!(pi.pi as never);
   const context = fakeAgentContext([
@@ -4082,11 +3332,11 @@ test("a nested worker keeps the same child directory as its owner", async () => 
       context,
     );
     assert.equal(started.details.ok, true, JSON.stringify(started.details));
-    assert.equal(starts.length, 1);
+    assert.equal(starts().length, 1);
     assert.deepEqual(
-      starts[0]!.slice(
-        starts[0]!.indexOf("--session-dir"),
-        starts[0]!.indexOf("--session-dir") + 2,
+      starts()[0]!.slice(
+        starts()[0]!.indexOf("--session-dir"),
+        starts()[0]!.indexOf("--session-dir") + 2,
       ),
       ["--session-dir", "/tmp/.pi/sessions/children"],
       "the owner's own session directory does not add another children level",
@@ -4174,17 +3424,15 @@ test("startup failure cleans private prompt snapshots", async () => {
     false,
     (args) => launched.push(promptLaunchPaths(args)),
   );
-  const pi = fakePi({
-    exec: (command, args, options) => {
-      const result = startup.exec(command, args, options);
-      if (command === "herdr" && args[0] === "agent" && args[1] === "start")
-        throw new Error("injected startup failure");
-      return result;
-    },
-  });
+  // The launch cannot complete because the child it started never acknowledges
+  // the launch, so the prompt snapshots it wrote are the only thing left.
+  radarDaemon.options.acknowledge = false;
+  process.env.PI_HERDSMAN_RADAR_LAUNCH_TIMEOUT_MS = "500";
+  const pi = fakePi({ exec: startup.exec });
   registerExtension!(pi.pi as never);
   try {
     const context = fakeContext();
+    await startRadarSession(pi, context);
     await pi.events.get("agent_start")![0](undefined, context);
     const result = await registeredAgentTool(pi, "delegate").execute(
       "id",
@@ -4208,6 +3456,7 @@ test("startup failure cleans private prompt snapshots", async () => {
     for (const path of launched[0])
       assert.equal(realFs.existsSync(path), false, `prompt leaked: ${path}`);
   } finally {
+    delete process.env.PI_HERDSMAN_RADAR_LAUNCH_TIMEOUT_MS;
     pi.events.get("session_shutdown")?.[0]();
     resetAgentMailbox(startup.mailbox);
     realFs.rmSync(definitionPath, { force: true });
@@ -4466,7 +3715,7 @@ test("assigning a parent with a disabled child fails with an explicit reason", a
       /references disabled agent definition disabled-child/,
     );
     assert.equal(
-      pi.calls.some((args) => args[0] === "agent" && args[1] === "start"),
+      radarDaemon.spawns.length > 0,
       false,
     );
   } finally {
@@ -4570,6 +3819,159 @@ test("session continuation starts a new agent generation with current prompt con
     realFs.rmSync(definitionPath, { force: true });
     realFs.rmSync(promptPath, { force: true });
     realFs.rmSync(session.path, { force: true });
+  }
+});
+
+test("agent_list advertises a saved session until a generation represents it", async () => {
+  setLeadEnvironment();
+  const name = `saved-list-${randomUUID().slice(0, 8)}`;
+  const sessionId = DEFAULT_PI_SESSION_ID;
+  const definitionPath = join(PI_AGENTS_DIR, `${name}.md`);
+  const session = {
+    id: sessionId,
+    path: join(PI_AGENT_ROOT, `${name}-session.jsonl`),
+    cwd: "/tmp",
+    entries: [
+      {
+        type: "custom",
+        customType: "pi-herdsman-agent-definition",
+        data: {
+          sessionId,
+          definition: name,
+          label: name,
+        },
+      },
+    ],
+  };
+  realFs.writeFileSync(
+    definitionPath,
+    `---\nname: ${name}\n---\nsaved session body\n`,
+    "utf8",
+  );
+  realFs.writeFileSync(session.path, "{}", "utf8");
+  nativeSessions.set(session.id, session);
+  const startup = startupExecutor(name, () => session.id);
+  const pi = fakePi({ exec: startup.exec });
+  registerExtension!(pi.pi as never);
+  const list = async () =>
+    (
+      await registeredAgentTool(pi, "list").execute(
+        "id",
+        {},
+        undefined,
+        undefined,
+        ownedSessionContext(session.id, name),
+      )
+    ).details;
+  try {
+    const [saved] = (await list()).saved_sessions as any[];
+    assert.equal(saved.state, "saved");
+    assert.equal(saved.agent, name);
+    assert.equal(saved.agent_definition, name);
+    assert.equal(saved.pi_session_id, session.id);
+    assert.equal(saved.pi_session_path, realFs.realpathSync(session.path));
+    assert.equal(saved.last_result.status, "completed");
+    assert.ok(saved.last_result.request_id);
+
+    const continued = await registeredAgentTool(pi, "continue").execute(
+      "id",
+      { session: saved.pi_session_id, task: "resume the saved session" },
+      undefined,
+      undefined,
+      ownedSessionContext(session.id, name),
+    );
+    assert.equal(continued.details.ok, true, JSON.stringify(continued.details));
+    assert.equal(continued.details.agent, name);
+    assert.equal(continued.details.session_id, session.id);
+    assert.equal(
+      (continued.details as any).relaunched,
+      undefined,
+      "a closed generation relaunch reports no recovery reason",
+    );
+
+    assert.deepEqual(
+      (await list()).saved_sessions,
+      [],
+      "the new generation's representation supersedes the advertisement",
+    );
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    nativeSessions.delete(session.id);
+    resetAgentMailbox(startup.mailbox);
+    realFs.rmSync(definitionPath, { force: true });
+    realFs.rmSync(session.path, { force: true });
+  }
+});
+
+test("an advertised saved session path continues when the recording was a symlink", async () => {
+  setLeadEnvironment();
+  const name = `saved-link-${randomUUID().slice(0, 8)}`;
+  const sessionId = DEFAULT_PI_SESSION_ID;
+  const definitionPath = join(PI_AGENTS_DIR, `${name}.md`);
+  const realPath = join(PI_AGENT_ROOT, `${name}-real-session.jsonl`);
+  const linkPath = join(PI_AGENT_ROOT, `${name}-link-session.jsonl`);
+  const session = {
+    id: sessionId,
+    path: realPath,
+    cwd: "/tmp",
+    entries: [
+      {
+        type: "custom",
+        customType: "pi-herdsman-agent-definition",
+        data: {
+          sessionId,
+          definition: name,
+          label: name,
+        },
+      },
+    ],
+  };
+  realFs.writeFileSync(
+    definitionPath,
+    `---\nname: ${name}\n---\nsymlinked session body\n`,
+    "utf8",
+  );
+  realFs.writeFileSync(realPath, "{}", "utf8");
+  realFs.symlinkSync(realPath, linkPath);
+  nativeSessions.set(sessionId, session);
+  const startup = startupExecutor(name, () => sessionId);
+  const pi = fakePi({ exec: startup.exec });
+  registerExtension!(pi.pi as never);
+  const callerContext = () => ownedSessionContext(sessionId, name, linkPath);
+  try {
+    const [saved] = (
+      await registeredAgentTool(pi, "list").execute(
+        "id",
+        {},
+        undefined,
+        undefined,
+        callerContext(),
+      )
+    ).details.saved_sessions as any[];
+    assert.equal(saved.pi_session_path, realFs.realpathSync(linkPath));
+    assert.notEqual(
+      saved.pi_session_path,
+      linkPath,
+      "the recorded path really was a symlink",
+    );
+
+    const continued = await registeredAgentTool(pi, "continue").execute(
+      "id",
+      { session: saved.pi_session_path, task: "resume through the symlink" },
+      undefined,
+      undefined,
+      callerContext(),
+    );
+    assert.equal(continued.details.ok, true, JSON.stringify(continued.details));
+    assert.equal(continued.details.agent, name);
+    assert.equal(continued.details.session_id, sessionId);
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    nativeSessions.delete(sessionId);
+    resetAgentMailbox(startup.mailbox);
+    realFs.rmSync(linkPath, { force: true });
+    realFs.rmSync(realPath, { force: true });
+    realFs.rmSync(definitionPath, { force: true });
   }
 });
 
@@ -4704,7 +4106,7 @@ test("fabricated session metadata cannot authorize continuation", async () => {
     assert.equal(result.details.error.category, "invalid_request");
     assert.match(result.details.error.message, /proven session ownership tree/);
     assert.equal(
-      pi.calls.some((args) => args[0] === "agent" && args[1] === "start"),
+      radarDaemon.spawns.length > 0,
       false,
       "no generation is launched for an unowned session",
     );
@@ -4795,7 +4197,7 @@ test("session continuation ignores an unrelated missing live session path", asyn
     assert.equal(result.details.ok, true, JSON.stringify(result.details));
     assert.equal(result.details.session_id, session.id);
     assert.equal(
-      pi.calls.some((args) => args[0] === "agent" && args[1] === "start"),
+      radarDaemon.spawns.length > 0,
       true,
     );
   } finally {
@@ -4804,286 +4206,6 @@ test("session continuation ignores an unrelated missing live session path", asyn
     resetAgentMailbox(staleMailbox);
     resetAgentMailbox(startup.mailbox);
     realFs.rmSync(definitionPath, { force: true });
-    realFs.rmSync(staleExpectedPath, { force: true });
-    realFs.rmSync(sessionPath, { force: true });
-  }
-});
-
-test("session continuation keeps an exact live ID busy despite a missing path observation", async () => {
-  setLeadEnvironment();
-  const name = `stale-secondary-resume-${randomUUID().slice(0, 8)}`;
-  const definitionPath = join(PI_AGENTS_DIR, `${name}.md`);
-  const sessionPath = join(PI_AGENT_ROOT, `${name}-session.jsonl`);
-  const staleObservedPath = join(PI_AGENT_ROOT, `${name}-deleted.jsonl`);
-  const staleLabel = `${name}-stale`;
-  const session = {
-    id: DEFAULT_PI_SESSION_ID,
-    path: sessionPath,
-    cwd: "/tmp",
-    entries: [
-      {
-        type: "custom",
-        customType: "pi-herdsman-agent-definition",
-        data: {
-          sessionId: DEFAULT_PI_SESSION_ID,
-          definition: name,
-          label: name,
-        },
-      },
-    ],
-  };
-  const staleState = managedState(staleLabel, undefined, {
-    ...recoveryIdentity(staleLabel),
-    piSessionId: "11111111-1111-4111-8111-111111111111",
-    piSessionFile: join(PI_AGENT_ROOT, `${name}-stale.jsonl`),
-  });
-  const staleAgent = {
-    ...agentFromState(staleState),
-    agent_session: {
-      source: "herdr:pi",
-      agent: "pi",
-      kind: "id",
-      value: session.id,
-    },
-    session_path: staleObservedPath,
-  };
-  const staleMailbox = agentMailboxPath(WORKSPACE, staleLabel);
-  realFs.writeFileSync(
-    definitionPath,
-    `---\nname: ${name}\n---\nexact live ID with stale path test\n`,
-  );
-  realFs.writeFileSync(sessionPath, "{}", "utf8");
-  resetAgentMailbox(staleMailbox);
-  writeAgentState(staleMailbox, staleState);
-  nativeSessions.set(session.id, session);
-  const startup = startupExecutor(name, () => session.id);
-  const pi = fakePi({
-    exec: (command, args, options) => {
-      if (command === "herdr" && isApiSnapshot(args))
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: { snapshot: { agents: [staleAgent], panes: [] } },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      return startup.exec(command, args, options);
-    },
-  });
-  registerExtension!(pi.pi as never);
-  try {
-    const result = await registeredAgentTool(pi, "continue").execute(
-      "id",
-      { session: sessionPath, task: "must wait" },
-      undefined,
-      undefined,
-      ownedSessionContext(session.id, name),
-    );
-    assert.equal(result.details.error.category, "agent_busy");
-    assert.equal(
-      pi.calls.some(
-        (args) =>
-          args[0] === "agent" && ["start", "prompt"].includes(args[1] ?? ""),
-      ),
-      false,
-    );
-  } finally {
-    pi.events.get("session_shutdown")?.[0]();
-    nativeSessions.delete(session.id);
-    resetAgentMailbox(staleMailbox);
-    resetAgentMailbox(startup.mailbox);
-    realFs.rmSync(definitionPath, { force: true });
-    realFs.rmSync(sessionPath, { force: true });
-  }
-});
-
-test("session continuation keeps an exact live ID busy despite contradictory live observations", async () => {
-  setLeadEnvironment();
-  const name = `contradictory-${randomUUID().slice(0, 8)}`;
-  const definitionPath = join(PI_AGENTS_DIR, `${name}.md`);
-  const sessionPath = join(PI_AGENT_ROOT, `${name}-session.jsonl`);
-  const unrelatedObservedPath = join(PI_AGENT_ROOT, `${name}-other.jsonl`);
-  const staleLabel = `${name}-stale`;
-  const session = {
-    id: DEFAULT_PI_SESSION_ID,
-    path: sessionPath,
-    cwd: "/tmp",
-    entries: [
-      {
-        type: "custom",
-        customType: "pi-herdsman-agent-definition",
-        data: {
-          sessionId: DEFAULT_PI_SESSION_ID,
-          definition: name,
-          label: name,
-        },
-      },
-    ],
-  };
-  const staleState = managedState(staleLabel, undefined, {
-    ...recoveryIdentity(staleLabel),
-    piSessionId: "11111111-1111-4111-8111-111111111111",
-    piSessionFile: join(PI_AGENT_ROOT, `${name}-stale.jsonl`),
-  });
-  const staleAgent = {
-    ...agentFromState(staleState),
-    agent_session: {
-      source: "herdr:pi",
-      agent: "pi",
-      kind: "id",
-      value: session.id,
-    },
-    session_id: "22222222-2222-4222-8222-222222222222",
-    session_path: unrelatedObservedPath,
-  };
-  const staleMailbox = agentMailboxPath(WORKSPACE, staleLabel);
-  realFs.writeFileSync(
-    definitionPath,
-    `---\nname: ${name}\n---\nexact live ID with contradictory observations test\n`,
-  );
-  realFs.writeFileSync(sessionPath, "{}", "utf8");
-  realFs.writeFileSync(unrelatedObservedPath, "{}", "utf8");
-  resetAgentMailbox(staleMailbox);
-  writeAgentState(staleMailbox, staleState);
-  nativeSessions.set(session.id, session);
-  const startup = startupExecutor(name, () => session.id);
-  const pi = fakePi({
-    exec: (command, args, options) => {
-      if (command === "herdr" && isApiSnapshot(args))
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: { snapshot: { agents: [staleAgent], panes: [] } },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      return startup.exec(command, args, options);
-    },
-  });
-  registerExtension!(pi.pi as never);
-  try {
-    const result = await registeredAgentTool(pi, "continue").execute(
-      "id",
-      { session: sessionPath, task: "must wait" },
-      undefined,
-      undefined,
-      ownedSessionContext(session.id, name),
-    );
-    assert.equal(
-      result.details.error.category,
-      "agent_busy",
-      JSON.stringify(result.details),
-    );
-    assert.equal(
-      pi.calls.some(
-        (args) =>
-          args[0] === "agent" && ["start", "prompt"].includes(args[1] ?? ""),
-      ),
-      false,
-    );
-  } finally {
-    pi.events.get("session_shutdown")?.[0]();
-    nativeSessions.delete(session.id);
-    resetAgentMailbox(staleMailbox);
-    resetAgentMailbox(startup.mailbox);
-    realFs.rmSync(definitionPath, { force: true });
-    realFs.rmSync(unrelatedObservedPath, { force: true });
-    realFs.rmSync(sessionPath, { force: true });
-  }
-});
-
-test("session continuation ignores removed secondary session fields", async () => {
-  setLeadEnvironment();
-  const name = `error-live-resume-${randomUUID().slice(0, 8)}`;
-  const definitionPath = join(PI_AGENTS_DIR, `${name}.md`);
-  const sessionPath = join(PI_AGENT_ROOT, `${name}-session.jsonl`);
-  const notDirectoryPath = join(PI_AGENT_ROOT, `${name}-not-directory`);
-  const staleObservedPath = `${notDirectoryPath}/deleted.jsonl`;
-  const staleExpectedPath = join(PI_AGENT_ROOT, `${name}-stale.jsonl`);
-  const staleLabel = `${name}-stale`;
-  const session = {
-    id: DEFAULT_PI_SESSION_ID,
-    path: sessionPath,
-    cwd: "/tmp",
-    entries: [
-      {
-        type: "custom",
-        customType: "pi-herdsman-agent-definition",
-        data: {
-          sessionId: DEFAULT_PI_SESSION_ID,
-          definition: name,
-          label: name,
-        },
-      },
-    ],
-  };
-  const staleState = managedState(staleLabel, undefined, {
-    ...recoveryIdentity(staleLabel),
-    piSessionId: "11111111-1111-4111-8111-111111111111",
-    piSessionFile: staleExpectedPath,
-  });
-  const staleAgent = {
-    ...agentFromState(staleState),
-    agent_session: {
-      source: "herdr:pi",
-      agent: "pi",
-      kind: "id",
-      value: session.id,
-    },
-    session_path: staleObservedPath,
-  };
-  const staleMailbox = agentMailboxPath(WORKSPACE, staleLabel);
-  realFs.writeFileSync(
-    definitionPath,
-    `---\nname: ${name}\n---\nlive session path error test\n`,
-  );
-  realFs.writeFileSync(sessionPath, "{}", "utf8");
-  realFs.writeFileSync(notDirectoryPath, "not a directory", "utf8");
-  realFs.writeFileSync(staleExpectedPath, "{}", "utf8");
-  resetAgentMailbox(staleMailbox);
-  writeAgentState(staleMailbox, staleState);
-  nativeSessions.set(session.id, session);
-  const startup = startupExecutor(name, () => session.id);
-  let started = false;
-  const pi = fakePi({
-    exec: (command, args, options) => {
-      if (command === "herdr" && isApiSnapshot(args) && !started)
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: { snapshot: { agents: [staleAgent], panes: [] } },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      if (command === "herdr" && args[0] === "agent" && args[1] === "start")
-        started = true;
-      return startup.exec(command, args, options);
-    },
-  });
-  registerExtension!(pi.pi as never);
-  try {
-    const result = await registeredAgentTool(pi, "continue").execute(
-      "id",
-      { session: sessionPath, task: "must wait" },
-      undefined,
-      undefined,
-      ownedSessionContext(session.id, name),
-    );
-    assert.equal(result.details.error.category, "agent_busy");
-    assert.equal(
-      pi.calls.some((args) => args[0] === "agent" && args[1] === "start"),
-      false,
-    );
-  } finally {
-    pi.events.get("session_shutdown")?.[0]();
-    nativeSessions.delete(session.id);
-    resetAgentMailbox(staleMailbox);
-    resetAgentMailbox(startup.mailbox);
-    realFs.rmSync(definitionPath, { force: true });
-    realFs.rmSync(notDirectoryPath, { force: true });
     realFs.rmSync(staleExpectedPath, { force: true });
     realFs.rmSync(sessionPath, { force: true });
   }
@@ -5158,13 +4280,7 @@ test("session continuation fails closed on an unrelated malformed persisted mail
         return true;
       },
     );
-    assert.equal(
-      pi.calls.some(
-        (args) =>
-          args[0] === "agent" && ["start", "prompt"].includes(args[1] ?? ""),
-      ),
-      false,
-    );
+    assert.equal(radarDaemon.spawns.length, 0);
   } finally {
     pi.events.get("session_shutdown")?.[0]();
     nativeSessions.delete(session.id);
@@ -5208,7 +4324,7 @@ test("rejects known generated-label envelope overflow before startup", async () 
     assert.equal(startup.getCount(), 0);
     assert.equal(realFs.existsSync(startup.mailbox), false);
     assert.equal(
-      pi.calls.some((args) => args[0] === "agent" && args[1] === "start"),
+      radarDaemon.spawns.length > 0,
       false,
     );
   } finally {
@@ -5270,11 +4386,7 @@ test("revalidates automatic-label collision sizing before startup", async () => 
     );
     assert.equal(result.details.error.category, "invalid_request");
     assert.notEqual(result.details.error.rollbackOccurred, true);
-    assert.equal(
-      pi.calls.filter((args) => args[0] === "agent" && args[1] === "start")
-        .length,
-      0,
-    );
+    assert.equal(radarDaemon.spawns.length, 0);
     assert.equal(realFs.existsSync(replacementMailbox), false);
     assert.equal(
       readFileSync(`${occupiedMailbox}/state.json`, "utf8"),
@@ -5582,11 +4694,21 @@ test("rejects an invalid generated collision label after releasing its claim", a
     assert.equal(result.details.error.rollbackOccurred, false);
     assert.match(result.details.error.message, /Agent label must start/);
     assert.equal(realFs.existsSync(join(mailbox, ".starting")), false);
-    assert.equal(
-      pi.calls.some((args) => args[0] === "pane"),
-      false,
+    // A rejected label is rejected before any effect: no Herdr topology is
+    // created or closed, and the daemon is never asked to spawn.
+    assert.deepEqual(
+      pi.calls.filter(
+        (args) =>
+          (args[0] === "pane" &&
+            ["split", "run", "close"].includes(args[1] ?? "")) ||
+          (args[0] === "tab" && args[1] === "create") ||
+          (args[0] === "agent" &&
+            ["start", "rename", "close"].includes(args[1] ?? "")),
+      ),
+      [],
       "generated-label rejection must not mutate Herdr topology",
     );
+    assert.equal(radarDaemon.spawns.length, 0);
   } finally {
     pi.events.get("session_shutdown")?.[0]();
     realFs.rmSync(mailbox, { recursive: true, force: true });
@@ -5595,99 +4717,75 @@ test("rejects an invalid generated collision label after releasing its claim", a
   }
 });
 
-test("assignment launch handles delayed official Pi session identity", async () => {
-  const expectedSession = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
-  const cases = [
-    {
-      label: "delayed-session-agent",
-      task: "delayed identity",
-      session: (count: number) => (count < 3 ? null : expectedSession),
-      expectedCount: 4,
-      retry: false,
-    },
-    {
-      label: "null-session-agent",
-      task: "retry null identity",
-      session: (count: number) => (count === 1 ? null : expectedSession),
-      expectedCount: 3,
-      retry: true,
-    },
-  ];
-
-  for (const { label, task, session, expectedCount, retry } of cases) {
-    setLeadEnvironment();
-    const startup = startupExecutor(
-      label,
-      session,
-      undefined,
-      undefined,
-      retry,
-    );
-    const pi = fakePi({ exec: startup.exec });
-    registerExtension!(pi.pi as never);
-    try {
-      const result = await registeredAgentTool(pi, "delegate").execute(
-        "id",
-        { definition: "agent", label, task },
-        undefined,
-        undefined,
-        fakeContext(),
-      );
-      assert.equal(result.details.ok, true, JSON.stringify(result.details));
-      assert.equal(startup.getCount(), expectedCount);
-      assert.equal(result.details.session_id, expectedSession);
-      if (!retry)
-        assert.equal(
-          pi.calls.some((args) => isPreservePaneStop(args)),
-          false,
-        );
-    } finally {
-      pi.events.get("session_shutdown")?.[0]();
-      resetAgentMailbox(startup.mailbox);
-    }
-  }
-});
-
-test("managed startup accepts matching mailbox state after five seconds", async (t) => {
+test("a launched child's session identity comes from its own state, not a pane record", async () => {
   setLeadEnvironment();
-  const label = "delayed-mailbox-startup";
-  const startup = startupExecutor(label, () => DEFAULT_PI_SESSION_ID);
-  let delayedState: ManagedAgentState | undefined;
-  const pi = fakePi({
-    exec: async (command, args, options) => {
-      const result = await startup.exec(command, args, options);
-      if (command === "herdr" && args[0] === "agent" && args[1] === "start") {
-        delayedState = readAgentState(startup.mailbox);
-        assert.ok(delayedState);
-        realFs.rmSync(startup.mailbox, { recursive: true, force: true });
-        setTimeout(
-          () => writeAgentState(startup.mailbox, delayedState!),
-          6_000,
-        );
-      }
-      return result;
-    },
-  });
+  const label = "delayed-session-agent";
+  const startup = startupExecutor(
+    label,
+    () => "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+    undefined,
+    undefined,
+    false,
+    undefined,
+    "/tmp",
+    AGENT_ID,
+    false,
+    false,
+  );
+  const pi = fakePi({ exec: startup.exec });
   registerExtension!(pi.pi as never);
-  try {
-    const resultPromise = registeredAgentTool(pi, "delegate").execute(
-      "id",
-      { definition: "agent", label, task: "wait for delayed mailbox state" },
-      undefined,
-      undefined,
-      fakeContext(),
-    );
-    await t.waitFor(() => assert.ok(delayedState, "agent start did not run"));
-    const result = await resultPromise;
-    assert.equal(result.details.ok, true, JSON.stringify(result.details));
-  } finally {
-    pi.events.get("session_shutdown")?.[0]();
-    resetAgentMailbox(startup.mailbox);
-  }
+  await startRadarSession(pi);
+  const result = await registeredAgentTool(pi, "delegate").execute(
+    "id",
+    { definition: "agent", label, task: "identity from the child" },
+    undefined,
+    undefined,
+    fakeContext(),
+  );
+  assert.equal(result.details.ok, true, JSON.stringify(result.details));
+  // The launch never asks a pane record for the child's session: the Radar
+  // spawn binds the edge by token, and the child's own startup state names the
+  // session it runs, so no mux polling is part of readiness any more.
+  assert.equal(startup.getCount(), 0);
+  const state = readAgentState(startup.mailbox);
+  assert.equal(state?.piSessionId, "dddddddd-dddd-4ddd-8ddd-dddddddddddd");
+  assert.equal(state?.piSessionFile, "/tmp/registered-agent.jsonl");
+  pi.events.get("session_shutdown")?.[0]();
+  resetAgentMailbox(startup.mailbox);
 });
-
+test("managed startup accepts a child whose own state arrives late", async (t) => {
+  setLeadEnvironment();
+  const label = "slow-startup-agent";
+  const startup = startupExecutor(label, () => DEFAULT_PI_SESSION_ID);
+  radarDaemon.onChildState = async () => {
+    // The child exists, but its startup acknowledgment is still to come: the
+    // launch waits for the child rather than reading the wait as failure.
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  };
+  const pi = fakePi({ exec: startup.exec });
+  registerExtension!(pi.pi as never);
+  await startRadarSession(pi);
+  const delegated = registeredAgentTool(pi, "delegate").execute(
+    "id",
+    { definition: "agent", label, task: "slow but present startup" },
+    undefined,
+    undefined,
+    fakeContext(),
+  );
+  await t.waitFor(() =>
+    assert.ok(
+      radarDaemon.spawns.length > 0,
+      "the launch did not reach the daemon",
+    ),
+  );
+  const result = await delegated;
+  assert.equal(result.details.ok, true, JSON.stringify(result.details));
+  assert.ok(readAgentState(startup.mailbox));
+  pi.events.get("session_shutdown")?.[0]();
+  resetAgentMailbox(startup.mailbox);
+});
 test(
-  "pane-not-ready failure retains bounded startup diagnostic and rolls back",
+  "a launch whose child never acknowledges keeps its record and closes nothing",
   { timeout: 40_000 },
   async () => {
     setLeadEnvironment();
@@ -5702,67 +4800,20 @@ test(
       "/tmp",
       AGENT_ID,
       false,
-      true,
+      false,
     );
-    const diagnostic = "startup diagnostic\n".repeat(500);
-    const operationController = new AbortController();
-    let processInfoTimeout: number | undefined;
-    let processInfoSignal: AbortSignal | undefined;
-    let paneReadSeen = false;
-    let diagnosticProcessAttempted = false;
-    const pi = fakePi({
-      exec: async (command, args, options) => {
-        if (
-          command === "herdr" &&
-          args[0] === "pane" &&
-          args[1] === "process-info" &&
-          paneReadSeen &&
-          !diagnosticProcessAttempted
-        ) {
-          diagnosticProcessAttempted = true;
-          processInfoTimeout = options?.timeout;
-          processInfoSignal = options?.signal;
-          return {
-            stdout: JSON.stringify({
-              id: 1,
-              result: {
-                process_info: {
-                  pane_id: args[3],
-                  shell_pid: 123,
-                  foreground_processes: [
-                    {
-                      pid: 123,
-                      argv0: "/bin/zsh",
-                      state: "running",
-                      cmdline: "secret argument",
-                      arbitrary: "must not escape",
-                    },
-                  ],
-                },
-              },
-            }),
-            stderr: "",
-            code: 0,
-            killed: false,
-          };
-        }
-        const result = await startup.exec(command, args, options);
-        if (command === "herdr" && args[0] === "agent" && args[1] === "start")
-          realFs.rmSync(startup.mailbox, { recursive: true, force: true });
-        if (command === "herdr" && args[0] === "pane" && args[1] === "read") {
-          paneReadSeen = true;
-          operationController.abort();
-          return { stdout: diagnostic, stderr: "", code: 0, killed: false };
-        }
-        return result;
-      },
-    });
+    // The daemon creates the pane and runs the command, and the child it starts
+    // never acknowledges the launch: it can never become ready.
+    radarDaemon.options.acknowledge = false;
+    process.env.PI_HERDSMAN_RADAR_LAUNCH_TIMEOUT_MS = "500";
+    const pi = fakePi({ exec: startup.exec });
     registerExtension!(pi.pi as never);
+    await startRadarSession(pi);
     try {
       const result = await registeredAgentTool(pi, "delegate").execute(
         "id",
-        { definition: "agent", label, task: "capture startup diagnostics" },
-        operationController.signal,
+        { definition: "agent", label, task: "capture the unresolved launch" },
+        undefined,
         undefined,
         fakeContext(),
       );
@@ -5771,394 +4822,819 @@ test(
         "pane_not_ready",
         JSON.stringify(result.details),
       );
-      const attachedDiagnostic = result.details.error.details.startupDiagnostic;
-      assert.ok(Buffer.byteLength(attachedDiagnostic) <= 4096);
-      assert.ok(attachedDiagnostic.endsWith("startup diagnostic"));
-      const processSnapshot = result.details.error.details.startupProcess;
-      assert.deepEqual(processSnapshot, {
-        pane_id: result.details.error.ids.paneId,
-        shell_pid: 123,
-        foreground_processes: [{ argv0: "/bin/zsh", state: "running" }],
-      });
-      assert.equal(processInfoTimeout, 2_000);
-      assert.equal(operationController.signal.aborted, true);
-      assert.equal(processInfoSignal, undefined);
-      assert.equal(diagnosticProcessAttempted, true);
-      const reads = pi.calls.filter(
-        (args) => args[0] === "pane" && args[1] === "read",
+      // The record is the diagnostic now: it names the one edge this process
+      // may have created, so the launch stays accountable after it fails.
+      const attempt = result.details.error.details.radarSpawn;
+      assert.match(attempt.requestId, /^[0-9a-f-]{36}$/);
+      assert.match(attempt.generation, /^[0-9a-f-]{36}$/);
+      assert.equal(attempt.unresolved, true);
+      assert.equal(result.details.error.rollbackOccurred, false);
+      assert.equal(result.details.error.retryAttempted, false);
+      // The durable record outlives the unknown outcome: it still names the one
+      // edge this process authored, so nothing can be replayed under a new id.
+      const recorded = pi.entries.filter(
+        (entry: any) => entry.customType === "pi-herdsman-radar-spawn",
       );
-      assert.equal(reads.length, 1);
-      assert.deepEqual(reads[0]?.slice(-2), ["--lines", "40"]);
-      assert.equal(
-        pi.calls.some(
+      assert.equal(recorded.length, 2);
+      assert.deepEqual(
+        recorded.map((entry: any) => entry.data.stage),
+        ["requested", "bound"],
+      );
+      assert.deepEqual(
+        {
+          requestId: recorded.at(-1)!.data.requestId,
+          generation: recorded.at(-1)!.data.generation,
+          // The daemon's own binding, recorded before the launch waited for
+          // readiness: the subject it registered and the pane it created are what
+          // a reload in this window holds the child by, not the child's mailbox.
+          agentId: recorded.at(-1)!.data.agentId,
+          paneId: recorded.at(-1)!.data.paneId,
+        },
+        {
+          requestId: attempt.requestId,
+          generation: attempt.generation,
+          agentId: radarDaemon.spawns[0]!.agent_id,
+          paneId: radarDaemon.spawns[0]!.pane,
+        },
+      );
+      // Readiness stays separate from it: the child registered and wrote its own
+      // state, and that state carries no acknowledgment for the launch that
+      // created it.
+      const state = readAgentState(startup.mailbox);
+      assert.equal(state?.piSessionId, DEFAULT_PI_SESSION_ID);
+      assert.equal(state?.startupAck, undefined);
+      assert.equal(radarDaemon.spawns.length, 1);
+      // The binding outlives the reload this window ends in: the returning session
+      // reads the daemon's own subject and pane out of its record rather than
+      // inferring a location from the mailbox, and still closes nothing.
+      for (const handler of pi.events.get("session_shutdown") ?? [])
+        await handler(undefined, fakeContext());
+      for (const handler of pi.events.get("session_start") ?? [])
+        await handler(undefined, fakeContext());
+      const reloaded = pi.entries.filter(
+        (entry: any) => entry.customType === "pi-herdsman-radar-spawn",
+      );
+      assert.equal(reloaded.length, 2);
+      assert.equal(reloaded.at(-1)!.data.stage, "bound");
+      assert.equal(reloaded.at(-1)!.data.agentId, radarDaemon.spawns[0]!.agent_id);
+      assert.equal(reloaded.at(-1)!.data.paneId, radarDaemon.spawns[0]!.pane);
+      assert.equal(radarDaemon.closes.size, 0);
+      // Nothing is closed and nothing is re-dispatched: the pane and the edge
+      // belong to the daemon, and a second spawn would create a second child.
+      assert.deepEqual(
+        pi.calls.filter(
           (args) =>
-            isPreservePaneStop(args) || isPaneClose(args) || isTabClose(args),
+            isPreservePaneStop(args) ||
+            isPaneClose(args) ||
+            isTabClose(args) ||
+            (args[0] === "pane" && args[1] === "split") ||
+            (args[0] === "agent" && args[1] === "start"),
         ),
-        true,
+        [],
       );
-      assert.equal(readAgentState(startup.mailbox), undefined);
     } finally {
+      delete process.env.PI_HERDSMAN_RADAR_LAUNCH_TIMEOUT_MS;
       pi.events.get("session_shutdown")?.[0]();
       resetAgentMailbox(startup.mailbox);
     }
   },
 );
+test("a late daemon recovers a pending location without replacing the identity", async () => {
+  setLeadEnvironment();
+  // Nothing is listening on this socket yet, so this process cannot learn where
+  // it is. That is a gap in the evidence, not a process without a pane: an
+  // immutable registration written from it could never acquire one, and the
+  // session would be unable to place a fresh worker for its whole life.
+  process.env.RADAR_CONTROL_SOCKET = join(tmpdir(), "absent-radar-late.sock");
+  const pi = fakePi();
+  registerExtension!(pi.pi as never);
+  const context = fakeContext();
+  for (const handler of pi.events.get("session_start") ?? [])
+    await handler(undefined, context);
+  assert.equal(radarDaemon.registerCalls.length, 0);
+  assert.equal(radarDaemon.spawns.length, 0);
+  const refused = await registeredAgentTool(pi, "delegate").execute(
+    "late",
+    { definition: "agent", label: "late-child", task: "late" },
+    undefined,
+    undefined,
+    context,
+  );
+  assert.equal(refused.details.ok, false, JSON.stringify(refused.details));
+  assert.equal(refused.details.error.category, "invalid_request");
+  assert.match(refused.details.error.message, /topology yet/);
+  // The daemon answers now, and the same process registers once, with the pane
+  // the observation reports - no second incarnation and no rewritten record.
+  await ensureRadarDaemon();
+  const started = await registeredAgentTool(pi, "delegate").execute(
+    "late",
+    { definition: "agent", label: "late-child", task: "late" },
+    undefined,
+    undefined,
+    context,
+  );
+  assert.equal(started.details.ok, true, JSON.stringify(started.details));
+  const registrations = radarDaemon.registerCalls.filter(
+    (call) => call.params.source === RADAR_SUBJECT_SOURCE,
+  );
+  assert.equal(registrations.length, 1, JSON.stringify(registrations));
+  assert.equal(
+    (registrations[0]!.params.location as { pane?: string }).pane,
+    process.env.HERDR_PANE_ID,
+  );
+  const incarnation = registrations[0]!.params.incarnation;
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
+  assert.equal(
+    radarDaemon.registerCalls.filter(
+      (call) => call.params.source === RADAR_SUBJECT_SOURCE,
+    ).length,
+    1,
+  );
+  assert.equal(radarDaemon.registerCalls[0]!.params.incarnation, incarnation);
+});
 
-test(
-  "pane process diagnostic failure is optional and does not prevent rollback",
-  { timeout: 40_000 },
-  async () => {
-    setLeadEnvironment();
-    const label = "pane-not-ready-process-failure";
-    const startup = startupExecutor(
-      label,
-      () => DEFAULT_PI_SESSION_ID,
+test("a launch whose binding cannot be recorded is unresolved and closes nothing", async () => {
+  setLeadEnvironment();
+  const label = "binding-record-refused";
+  const startup = startupExecutor(
+    label,
+    () => DEFAULT_PI_SESSION_ID,
+    undefined,
+    undefined,
+    false,
+    undefined,
+    "/tmp",
+    AGENT_ID,
+    false,
+    false,
+  );
+  process.env.PI_HERDSMAN_RADAR_LAUNCH_TIMEOUT_MS = "500";
+  const pi = fakePi({ exec: startup.exec });
+  registerExtension!(pi.pi as never);
+  await startRadarSession(pi);
+  // The session's own entry store refuses the daemon's binding. The launch has
+  // then created a child it cannot hold: it reports that edge unresolved rather
+  // than assigning work to a child no reload could prove.
+  const appendEntry = pi.pi.appendEntry.bind(pi.pi);
+  pi.pi.appendEntry = ((customType: string, data: any) => {
+    if (customType === "pi-herdsman-radar-spawn" && data.stage === "bound")
+      throw new Error("the session entry store refused the record");
+    appendEntry(customType, data);
+  }) as typeof pi.pi.appendEntry;
+  try {
+    const result = await registeredAgentTool(pi, "delegate").execute(
+      "id",
+      { definition: "agent", label, task: "record the binding" },
       undefined,
       undefined,
-      false,
-      undefined,
-      "/tmp",
-      AGENT_ID,
-      false,
-      true,
+      fakeContext(),
     );
-    let paneReadSeen = false;
-    let diagnosticProcessAttempted = false;
-    const pi = fakePi({
-      exec: async (command, args, options) => {
-        if (
-          command === "herdr" &&
-          args[0] === "pane" &&
-          args[1] === "process-info" &&
-          paneReadSeen &&
-          !diagnosticProcessAttempted
-        ) {
-          diagnosticProcessAttempted = true;
-          return { stdout: "", stderr: "unavailable", code: 1, killed: false };
-        }
-        const result = await startup.exec(command, args, options);
-        if (command === "herdr" && args[0] === "agent" && args[1] === "start")
-          realFs.rmSync(startup.mailbox, { recursive: true, force: true });
-        if (command === "herdr" && args[0] === "pane" && args[1] === "read") {
-          paneReadSeen = true;
-          return { stdout: "pane output", stderr: "", code: 0, killed: false };
-        }
-        return result;
-      },
-    });
-    registerExtension!(pi.pi as never);
-    try {
-      const result = await registeredAgentTool(pi, "delegate").execute(
-        "id",
-        { definition: "agent", label, task: "optional process diagnostic" },
-        undefined,
-        undefined,
-        fakeContext(),
-      );
-      assert.equal(result.details.error.category, "pane_not_ready");
-      assert.equal(
-        result.details.error.message,
-        "Agent did not initialize its mailbox",
-      );
-      assert.equal(
-        result.details.error.details.startupDiagnostic,
-        "pane output",
-      );
-      assert.equal("startupProcess" in result.details.error.details, false);
-      assert.equal(diagnosticProcessAttempted, true);
-      assert.equal(
-        pi.calls.some(
-          (args) =>
-            isPreservePaneStop(args) || isPaneClose(args) || isTabClose(args),
-        ),
-        true,
-      );
-    } finally {
-      pi.events.get("session_shutdown")?.[0]();
-      resetAgentMailbox(startup.mailbox);
-    }
-  },
-);
-
-test("empty early launch cleans exact resources and same-label retry creates one agent", async () => {
+    assert.equal(
+      result.details.error.category,
+      "pane_not_ready",
+      JSON.stringify(result.details),
+    );
+    assert.equal(result.details.error.details.radarSpawn.unresolved, true);
+    // No durable record names the child, so the failure names only the request
+    // the daemon was handed.
+    assert.equal(result.details.error.details.radarSpawn.agentId, undefined);
+    assert.equal(result.details.error.details.radarSpawn.paneId, undefined);
+    assert.deepEqual(
+      pi.entries
+        .filter((entry: any) => entry.customType === "pi-herdsman-radar-spawn")
+        .map((entry: any) => entry.data.stage),
+      ["requested"],
+    );
+    // The child the daemon bound is left alone: nothing here may close or
+    // re-dispatch a child this process could not record.
+    assert.equal(radarDaemon.closes.size, 0);
+    assert.deepEqual(
+      pi.calls.filter(
+        (args) =>
+          isPreservePaneStop(args) || isPaneClose(args) || isTabClose(args),
+      ),
+      [],
+    );
+  } finally {
+    pi.pi.appendEntry = appendEntry;
+    delete process.env.PI_HERDSMAN_RADAR_LAUNCH_TIMEOUT_MS;
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(startup.mailbox);
+  }
+});
+test("an unresolved launch cleans its own resources and a same-label retry reaches one child", async () => {
   setLeadEnvironment();
   const label = "agent";
   const startup = startupExecutor(
     label,
     () => "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
   );
-  let starts = 0;
-  let splits = 0;
-  let closes = 0;
-  let tabCloses = 0;
-  let panePresent = false;
-  let closeProvedByList = false;
-  const pi = fakePi({
-    exec: (command, args, options) => {
-      if (command === "herdr" && isPaneList(args)) {
-        if ((closes > 0 || tabCloses > 0) && !panePresent)
-          closeProvedByList = true;
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              panes: [
-                ...(panePresent
-                  ? [
-                      {
-                        pane_id: "startup-pane",
-                        tab_id: "startup-tab",
-                        workspace_id: WORKSPACE,
-                        terminal_id: "startup-terminal",
-                        cwd: "/tmp",
-                        foreground_cwd: "/tmp",
-                        agent_status: "unknown",
-                      },
-                    ]
-                  : []),
-              ],
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      }
-      if (command === "herdr" && args[0] === "tab" && args[1] === "create") {
-        panePresent = true;
-        return startup.exec(command, args, options);
-      }
-      if (command === "herdr" && args[0] === "pane" && args[1] === "split") {
-        assert.equal(panePresent, false);
-        panePresent = true;
-        splits++;
-        return startup.exec(command, args, options);
-      }
-      if (command === "herdr" && isPaneClose(args)) {
-        assert.equal(panePresent, true);
-        assert.equal(args[2], "startup-pane");
-        panePresent = false;
-        closes++;
-        return { stdout: "{}", stderr: "", code: 0 };
-      }
-      if (command === "herdr" && args[0] === "tab" && args[1] === "close") {
-        assert.equal(panePresent, true);
-        panePresent = false;
-        tabCloses++;
-        return { stdout: "{}", stderr: "", code: 0 };
-      }
-      if (command === "herdr" && isTabList(args) && tabCloses > 0)
-        return {
-          stdout: JSON.stringify({ id: AGENT_ID, result: { tabs: [] } }),
-          stderr: "",
-          code: 0,
-        };
-      if (
-        command === "herdr" &&
-        args[0] === "pane" &&
-        args[1] === "process-info"
-      )
-        return {
-          stdout: JSON.stringify({
-            id: AGENT_ID,
-            result: {
-              process_info: {
-                pane_id: args[3],
-                shell_pid: 123,
-                foreground_process_group_id: 123,
-                foreground_processes: [{ pid: 123, argv0: "/bin/zsh" }],
-              },
-            },
-          }),
-          stderr: "",
-          code: 0,
-        };
-      if (command === "herdr" && args[0] === "agent" && args[1] === "start") {
-        starts++;
-        if (starts === 1) return { stdout: "", stderr: "", code: 0 };
-      }
-      if (command === "herdr" && args[0] === "pane" && args[1] === "read")
-        return {
-          stdout: "Unknown extension: /tmp/broken-extension.ts",
-          stderr: "",
-          code: 0,
-          killed: false,
-        };
-      return startup.exec(command, args, options);
-    },
-  });
-  registerExtension!(pi.pi as never);
-  const tool = registeredAgentTool(pi, "delegate");
-  const context = fakeContext();
-  const failed = await tool.execute(
-    "id",
-    { definition: "agent", label, task: "first attempt" },
-    undefined,
-    undefined,
-    context,
-  );
-  assert.equal(failed.details.error.category, "internal_failure");
-  assert.equal(failed.details.error.details.stage, "agent_start");
-  assert.equal(failed.details.error.details.result.classification, "empty");
-  assert.equal(failed.details.error.details.paneSnapshotAttempted, true);
-  assert.equal(failed.details.error.details.paneSnapshotStatus, "captured");
-  assert.equal(failed.details.error.details.paneSnapshotReason, undefined);
-  assert.ok(failed.details.error.details.paneSnapshot.length <= 8192);
-  assert.match(
-    failed.details.error.message,
-    /Unknown extension.*broken-extension/,
-  );
-  assert.equal(failed.details.error.ids.paneId, "startup-pane");
-  assert.equal(failed.details.error.ids.tabId, "startup-tab");
-  assert.equal(readAgentState(startup.mailbox), undefined);
-  assert.equal(
-    pi.calls.filter((args) => args[0] === "pane" && args[1] === "read").length,
-    1,
-  );
-  assert.equal(tabCloses, 1);
-  assert.equal(closeProvedByList, true);
-  assert.equal(panePresent, false);
-
-  const listed = await registeredAgentTool(pi, "list").execute(
-    "id",
-    {},
-    undefined,
-    undefined,
-    context,
-  );
-  assert.deepEqual(listed.details.agents, []);
-  const retried = await tool.execute(
-    "id",
-    {
-      definition: "agent",
-      task: "corrected attempt",
-    },
-    undefined,
-    undefined,
-    context,
-  );
-  assert.equal(retried.details.ok, true);
-  assert.equal(starts, 2);
-  assert.equal(splits, 0);
-  assert.equal(panePresent, true);
-  assert.equal(readAgentState(startup.mailbox)?.agentLabel, label);
-  pi.events.get("session_shutdown")?.[0]();
-  resetAgentMailbox(startup.mailbox);
-});
-
-test("assignment launch bounds missing official Pi session identity grace", async () => {
-  setLeadEnvironment();
-  const label = "agent";
-  const startup = startupExecutor(
-    label,
-    () => null,
-    undefined,
-    undefined,
-    false,
-    undefined,
-    "/tmp",
-    AGENT_ID,
-    false,
-    true,
-    true,
-  );
+  radarDaemon.options.bind = false;
+  process.env.PI_HERDSMAN_RADAR_LAUNCH_TIMEOUT_MS = "1200";
   const pi = fakePi({ exec: startup.exec });
   registerExtension!(pi.pi as never);
-  const result = await registeredAgentTool(pi, "delegate").execute(
-    "id",
-    {
-      definition: "agent",
-      task: "missing identity",
-    },
-    undefined,
-    undefined,
-    fakeContext(),
-  );
-  assert.equal(startup.getCount(), 11);
-  assert.equal(result.details.error.category, "invalid_request");
-  assert.match(
-    result.details.error.message,
-    /official Pi integration did not report its session identity/,
-  );
-  assert.equal(result.details.error.retryAttempted, true);
-  assert.equal(pi.calls.filter((args) => isPreservePaneStop(args)).length, 1);
-  assert.equal(
-    pi.calls.filter((args) => isPaneClose(args) || isTabClose(args)).length,
-    1,
-  );
-  pi.events.get("session_shutdown")?.[0]();
-});
+  await startRadarSession(pi);
+  const tool = registeredAgentTool(pi, "delegate");
+  const context = fakeContext();
+  try {
+    const failed = await tool.execute(
+      "id",
+      { definition: "agent", label, task: "first attempt" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(
+      failed.details.error.category,
+      "pane_not_ready",
+      JSON.stringify(failed.details),
+    );
+    assert.equal(readAgentState(startup.mailbox), undefined);
+    assert.equal(realFs.existsSync(join(startup.mailbox, ".starting")), false);
+    assert.equal(radarDaemon.spawns.length, 1);
+    const listed = await registeredAgentTool(pi, "list").execute(
+      "id",
+      {},
+      undefined,
+      undefined,
+      context,
+    );
+    assert.deepEqual(listed.details.agents, []);
 
-test("assignment integration grace aborts without a later lookup or timer", async () => {
+    radarDaemon.options.bind = true;
+    const retried = await tool.execute(
+      "id",
+      { definition: "agent", task: "corrected attempt" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(retried.details.ok, true, JSON.stringify(retried.details));
+    // The retry is its own launch: the failed one is never re-sent, and only
+    // one child is bound across both attempts.
+    assert.equal(radarDaemon.spawns.length, 2);
+    assert.equal(
+      radarDaemon.spawns.filter((spawn) => spawn.agent_id !== undefined).length,
+      1,
+    );
+    assert.equal(readAgentState(startup.mailbox)?.agentLabel, label);
+    const afterRetry = await registeredAgentTool(pi, "list").execute(
+      "id",
+      {},
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(afterRetry.details.agents.length, 1);
+  } finally {
+    delete process.env.PI_HERDSMAN_RADAR_LAUNCH_TIMEOUT_MS;
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(startup.mailbox);
+  }
+});
+test("an aborted launch ends without a later lookup or timer", async () => {
   setLeadEnvironment();
   const controller = new AbortController();
   const label = "aborted-session-agent";
   const startup = startupExecutor(
     label,
-    () => null,
-    (count) => {
-      if (count === 1) setTimeout(() => controller.abort(), 10);
-    },
+    () => DEFAULT_PI_SESSION_ID,
+    undefined,
     undefined,
     false,
     undefined,
     "/tmp",
     AGENT_ID,
     false,
-    true,
-  );
-  const pi = fakePi({
-    exec: (command, args, options) => {
-      if (options?.signal?.aborted) throw new Error("aborted executor signal");
-      return startup.exec(command, args, options);
-    },
-  });
-  registerExtension!(pi.pi as never);
-  const startedAt = Date.now();
-  const result = await registeredAgentTool(pi, "delegate").execute(
-    "id",
-    { definition: "agent", label, task: "abort identity" },
-    controller.signal,
-    undefined,
-    fakeContext(),
-  );
-  assert.ok(Date.now() - startedAt < 2500);
-  assert.equal(result.details.error.category, "internal_failure");
-  assert.equal(startup.getCount(), 1);
-  const cleanupCalls = pi.calls.filter(
-    (args) =>
-      isPreservePaneStop(args) ||
-      isPaneClose(args) ||
-      isTabClose(args) ||
-      isHerdrList(args),
-  );
-  assert.equal(
-    cleanupCalls.some((args) => isTabClose(args) || isPaneClose(args)),
-    true,
-  );
-  assert.equal(
-    cleanupCalls.some((args) => isPreservePaneStop(args)),
-    true,
-  );
-  const firstCleanupIndex = pi.calls.findIndex((args) =>
-    isPreservePaneStop(args),
-  );
-  assert.equal(
-    pi.execOptions
-      .filter((_options, index) => {
-        if (index < firstCleanupIndex) return false;
-        const args = pi.calls[index];
-        return (
-          isPreservePaneStop(args) ||
-          isPaneClose(args) ||
-          isTabClose(args) ||
-          isHerdrList(args)
-        );
-      })
-      .some((options) => options.signal?.aborted === true),
     false,
   );
-  assert.equal(readAgentState(startup.mailbox), undefined);
-  await new Promise((resolve) => setTimeout(resolve, 20));
-  assert.equal(startup.getCount(), 1);
-  pi.events.get("session_shutdown")?.[0]();
+  radarDaemon.onChildState = () => new Promise<void>(() => undefined);
+  process.env.PI_HERDSMAN_RADAR_LAUNCH_TIMEOUT_MS = "5000";
+  const pi = fakePi({ exec: startup.exec });
+  registerExtension!(pi.pi as never);
+  await startRadarSession(pi);
+  try {
+    const startedAt = Date.now();
+    const delegated = registeredAgentTool(pi, "delegate").execute(
+      "id",
+      { definition: "agent", label, task: "abort the launch" },
+      controller.signal,
+      undefined,
+      fakeContext(),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    controller.abort();
+    const result = await delegated;
+    assert.ok(Date.now() - startedAt < 2_500, "the abort did not end the wait");
+    assert.equal(
+      result.details.error.category,
+      "pane_not_ready",
+      JSON.stringify(result.details),
+    );
+    assert.match(
+      result.details.error.details.radarSpawn.requestId,
+      /^[0-9a-f-]{36}$/,
+    );
+    // One dispatch, and no further work after the abort: the daemon keeps the
+    // edge it created, and the launch does not chase it.
+    assert.equal(radarDaemon.spawns.length, 1);
+    const callsAfterAbort = pi.calls.length;
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal(pi.calls.length, callsAfterAbort);
+  } finally {
+    delete process.env.PI_HERDSMAN_RADAR_LAUNCH_TIMEOUT_MS;
+    radarDaemon.onChildState = undefined;
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(startup.mailbox);
+  }
+});
+
+type WaitFor = { waitFor: (fn: () => Promise<void>) => Promise<void> };
+
+/**
+ * A Radar child this process did not launch: an edge the daemon created, a child
+ * that wrote its own binding and state, and the durable record a launch persists
+ * before it dials the daemon. It is the shortest state in which a child is
+ * closable without delegating a task to it.
+ */
+async function radarChildForClose(
+  t: WaitFor,
+  pi: ReturnType<typeof fakePi>,
+  context: ReturnType<typeof fakeContext>,
+  label: string,
+): Promise<{ mailbox: string; paneId: string; agentId: string; requestId: string }> {
+  const mailbox = agentMailboxPath(WORKSPACE, label);
+  const runId = randomUUID();
+  const generation = randomUUID();
+  const requestId = randomUUID();
+  const client = createRadarClient({ env: process.env });
+  const spawned = await client.spawn({
+    request_id: requestId,
+    generation,
+    parent: randomUUID(),
+    parent_session_id: LEAD_SESSION_ID,
+    executable: "/usr/bin/pi",
+    argv: [],
+    cwd: "/tmp",
+    env: {
+      PI_HERDSMAN_LAUNCH_GENERATION: generation,
+      PI_HERDSMAN_MAILBOX: mailbox,
+      PI_HERDSMAN_RUN_ID: runId,
+      PI_HERDSMAN_OWNER_SESSION_ID: LEAD_SESSION_ID,
+      PI_HERDSMAN_WORKSPACE_ID: WORKSPACE,
+      PI_HERDSMAN_LABEL: label,
+      PI_HERDSMAN_AGENT_DEFINITION: "agent",
+    },
+  });
+  assert.equal(spawned.ok, true, JSON.stringify(spawned));
+  if (!spawned.ok) throw new Error("the daemon refused the spawn");
+  const paneId = spawned.value.location?.pane;
+  assert.ok(paneId, JSON.stringify(spawned.value));
+  let agentId: string | undefined;
+  await t.waitFor(async () => {
+    const edge = await client.spawnGet(requestId);
+    assert.equal(edge.ok, true, JSON.stringify(edge));
+    if (edge.ok) agentId = edge.value.edge.bound?.agent_id;
+    assert.ok(agentId, "the child never bound to its launch");
+  });
+  pi.entries.push({
+    type: "custom",
+    customType: "pi-herdsman-radar-spawn",
+    data: {
+      stage: "bound",
+      requestId,
+      generation,
+      runId,
+      label,
+      ownerSessionId: LEAD_SESSION_ID,
+      workspaceId: WORKSPACE,
+      mailbox,
+      agentId,
+      paneId,
+    },
+  });
+  return { mailbox, paneId: paneId!, agentId: agentId!, requestId };
+}
+
+type RadarCloseRecord = { stage: string; requestId: string };
+
+function closeEntries(pi: ReturnType<typeof fakePi>): RadarCloseRecord[] {
+  return pi.entries
+    .filter((entry) => entry.customType === "pi-herdsman-radar-close")
+    .map((entry) => entry.data as RadarCloseRecord);
+}
+
+test("an unresolved launch holds its label against a second same-label delegation", async () => {
+  setLeadEnvironment();
+  // Each of these tests drives the fixture daemon directly, so it starts from a
+  // daemon without the previous test's spawns and children.
+  radarDaemon.reset();
+  const label = "held-label";
+  const startup = startupExecutor(label, () => DEFAULT_PI_SESSION_ID);
+  process.env.PI_HERDSMAN_RADAR_LAUNCH_TIMEOUT_MS = "1200";
+  const pi = fakePi({ exec: startup.exec });
+  registerExtension!(pi.pi as never);
+  // The durable launch record is a session entry, so the context has to be the
+  // session this process appends to.
+  const context = fakeContext(pi.entries);
+  try {
+    await startRadarSession(pi, context);
+    // The unbound daemon is set once the session's own daemon exists: a setting
+    // changed before that becomes part of the daemon's creation state, which a
+    // later reset would restore for every test that follows.
+    radarDaemon.options.bind = false;
+    const tool = registeredAgentTool(pi, "delegate");
+    const first = await tool.execute(
+      "id",
+      { definition: "agent", label, task: "first attempt" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(
+      first.details.error.category,
+      "pane_not_ready",
+      JSON.stringify(first.details),
+    );
+    assert.equal(radarDaemon.spawns.length, 1);
+    // The edge may have produced a child that has not registered or written state
+    // yet, which is exactly what no read of the mailbox can rule out. The label
+    // stays held by that launch, so the second attempt has to reconcile it
+    // instead of starting a second child in the same mailbox.
+    radarDaemon.options.bind = true;
+    const second = await tool.execute(
+      "id",
+      { definition: "agent", label, task: "second attempt" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(second.details.ok, false, JSON.stringify(second.details));
+    assert.equal(second.details.error.category, "agent_label_exists");
+    assert.match(
+      second.details.error.message,
+      /unresolved Radar launch/,
+      JSON.stringify(second.details),
+    );
+    assert.equal(radarDaemon.spawns.length, 1);
+    // The record is the session's, not this process's memory: a reload reads the
+    // same launch and still refuses to create a second child.
+    pi.events.get("session_shutdown")?.[0]();
+    await startRadarSession(pi, context);
+    const third = await tool.execute(
+      "id",
+      { definition: "agent", label, task: "third attempt" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(third.details.error.category, "agent_label_exists");
+    assert.equal(radarDaemon.spawns.length, 1);
+  } finally {
+    delete process.env.PI_HERDSMAN_RADAR_LAUNCH_TIMEOUT_MS;
+    radarDaemon.options.bind = true;
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(startup.mailbox);
+    radarDaemon.reset();
+  }
+});
+
+test("a launch the daemon refused frees its label for the next attempt", async () => {
+  setLeadEnvironment();
+  radarDaemon.reset();
+  const label = "refused-launch";
+  const startup = startupExecutor(label, () => DEFAULT_PI_SESSION_ID);
+  const pi = fakePi({ exec: startup.exec });
+  registerExtension!(pi.pi as never);
+  const context = fakeContext(pi.entries);
+  try {
+    await startRadarSession(pi, context);
+    // Set once the daemon exists, so the refusal is this test's and not a
+    // creation setting a later reset would restore.
+    radarDaemon.options.refuseSpawn = {
+      code: "refused",
+      message: "this daemon will not create that child",
+    };
+    const tool = registeredAgentTool(pi, "delegate");
+    const refused = await tool.execute(
+      "id",
+      { definition: "agent", label, task: "first attempt" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(refused.details.ok, false, JSON.stringify(refused.details));
+    assert.equal(radarDaemon.spawns.length, 0);
+    // A refusal is the one ending that proves no child was created, so the label
+    // is free: the next attempt is its own launch rather than a reconciliation of
+    // an edge that may hold a child.
+    delete radarDaemon.options.refuseSpawn;
+    const retried = await tool.execute(
+      "id",
+      { definition: "agent", label, task: "second attempt" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(retried.details.ok, true, JSON.stringify(retried.details));
+    assert.equal(radarDaemon.spawns.length, 1);
+  } finally {
+    delete radarDaemon.options.refuseSpawn;
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(startup.mailbox);
+    radarDaemon.reset();
+  }
+});
+
+test("a fresh Radar assignment is addressed to the process its launch bound", async (t) => {
+  setLeadEnvironment();
+  radarDaemon.reset();
+  const label = "fresh-addressed";
+  const startup = startupExecutor(label, () => DEFAULT_PI_SESSION_ID);
+  const pi = fakePi({ exec: startup.exec });
+  registerExtension!(pi.pi as never);
+  const context = fakeContext(pi.entries);
+  await startRadarSession(pi, context);
+  try {
+    const result = await registeredAgentTool(pi, "delegate").execute(
+      "id",
+      { definition: "agent", label, task: "the first task is addressed" },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(result.details.ok, true, JSON.stringify(result.details));
+    const state = readAgentState(startup.mailbox);
+    assert.ok(state?.activeRequestId, JSON.stringify(state));
+    const spawn = radarDaemon.spawns[0]!;
+    // The child's own acknowledgment is the durable record of what it accepted:
+    // an identity echo exists only for an addressed request, and the fixture
+    // child accepts one only when the address names its own incarnation.
+    await t.waitFor(() => {
+      const ack = readAgentState(startup.mailbox)?.lastAck;
+      assert.equal(ack?.requestId, state.activeRequestId);
+      assert.equal(ack?.accepted, true, JSON.stringify(ack));
+    });
+    assert.deepEqual(readAgentState(startup.mailbox)?.lastAck?.identity, {
+      subject: spawn.agent_id,
+      source: RADAR_SUBJECT_SOURCE,
+      incarnation: spawn.incarnation,
+      generation: spawn.env.PI_HERDSMAN_LAUNCH_GENERATION,
+    });
+  } finally {
+    delete process.env.PI_HERDSMAN_RADAR_LAUNCH_TIMEOUT_MS;
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(startup.mailbox);
+    radarDaemon.reset();
+  }
+});
+test("a lost close reply reconciles the same request after the pane is gone", async (t) => {
+  setLeadEnvironment();
+  radarDaemon.reset();
+  const label = "lost-close-child";
+  const pi = fakePi({});
+  registerExtension!(pi.pi as never);
+  const context = fakeContext(pi.entries);
+  try {
+    await startRadarSession(pi, context);
+    const { mailbox } = await radarChildForClose(t, pi, context, label);
+    radarDaemon.options.dropCloseReply = true;
+    const first = await registeredAgentTool(pi, "close").execute(
+      "id",
+      { agent: label },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(first.details.ok, false, JSON.stringify(first.details));
+    const dispatched = closeEntries(pi).at(-1)!;
+    assert.equal(dispatched.stage, "unknown");
+    // The daemon applied the close and this process never learned it, so nothing
+    // was torn down: a pane that is gone is not the close this process asked for.
+    assert.notEqual(readAgentState(mailbox), undefined);
+    radarDaemon.options.dropCloseReply = false;
+    const retried = await registeredAgentTool(pi, "close").execute(
+      "id",
+      { agent: label },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(retried.details.ok, true, JSON.stringify(retried.details));
+    const closes = closeEntries(pi);
+    // One request, replayed: the daemon answered the close it already held, and
+    // the mailbox was retired only after that answer.
+    assert.deepEqual(
+      [...new Set(closes.map((entry) => entry.requestId))],
+      [dispatched.requestId],
+    );
+    assert.equal(closes.at(-1)!.stage, "completed");
+    assert.equal(radarDaemon.closes.size, 1);
+    assert.equal(readAgentState(mailbox), undefined);
+  } finally {
+    radarDaemon.options.dropCloseReply = false;
+    pi.events.get("session_shutdown")?.[0]();
+    radarDaemon.reset();
+  }
+});
+
+test("a close whose completion could not be recorded stays reconcilable", async (t) => {
+  setLeadEnvironment();
+  radarDaemon.reset();
+  const label = "unrecorded-close-child";
+  const pi = fakePi({});
+  registerExtension!(pi.pi as never);
+  const context = fakeContext(pi.entries);
+  const appendEntry = pi.pi.appendEntry.bind(pi.pi);
+  try {
+    await startRadarSession(pi, context);
+    const { mailbox } = await radarChildForClose(t, pi, context, label);
+    pi.pi.appendEntry = (customType: string, data: unknown) => {
+      if (
+        customType === "pi-herdsman-radar-close" &&
+        (data as { stage?: string }).stage === "completed"
+      )
+        throw new Error("the session could not record the close");
+      appendEntry(customType, data);
+    };
+    const first = await registeredAgentTool(pi, "close").execute(
+      "id",
+      { agent: label },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(first.details.ok, false, JSON.stringify(first.details));
+    // The daemon applied the close; only this process's record of the outcome is
+    // missing, which is what leaves the dispatched request the way back in.
+    assert.equal(closeEntries(pi).at(-1)!.stage, "dispatched");
+    assert.notEqual(readAgentState(mailbox), undefined);
+    pi.pi.appendEntry = appendEntry;
+    const retried = await registeredAgentTool(pi, "close").execute(
+      "id",
+      { agent: label },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(retried.details.ok, true, JSON.stringify(retried.details));
+    assert.equal(closeEntries(pi).at(-1)!.stage, "completed");
+    assert.equal(readAgentState(mailbox), undefined);
+  } finally {
+    pi.pi.appendEntry = appendEntry;
+    pi.events.get("session_shutdown")?.[0]();
+    radarDaemon.reset();
+  }
+});
+
+test("a confirmed close resumes its own cleanup after a cleanup failure", async (t) => {
+  setLeadEnvironment();
+  radarDaemon.reset();
+  const label = "confirmed-close-cleanup";
+  const pi = fakePi({});
+  registerExtension!(pi.pi as never);
+  const context = fakeContext(pi.entries);
+  try {
+    await startRadarSession(pi, context);
+    const { mailbox } = await radarChildForClose(t, pi, context, label);
+    const state = readAgentState(mailbox)!;
+    // The child is not consuming assignments, so the request this mailbox is
+    // still carrying survives for local cleanup to remove.
+    radarDaemon.options.acceptAssignments = false;
+    writeRequest(mailbox, {
+      version: 5,
+      runId: state.runId,
+      requestId: randomUUID(),
+      ownerSessionId: state.ownerSessionId,
+      workspaceId: state.workspaceId,
+      agentLabel: state.agentLabel,
+      paneId: state.paneId,
+      kind: "task",
+      text: "the assignment this mailbox still owes",
+      createdAt: Date.now(),
+    });
+    support.failNextRequestRemoval = true;
+    const first = await registeredAgentTool(pi, "close").execute(
+      "id",
+      { agent: label },
+      undefined,
+      undefined,
+      context,
+    );
+    // The daemon closed the pane and this process recorded that; only its own
+    // mailbox cleanup failed, so the label's state stays as cleanup left it.
+    assert.equal(first.details.ok, true, JSON.stringify(first.details));
+    assert.match(String(first.details.cleanup_error), /cleanup failed/);
+    assert.equal(closeEntries(pi).at(-1)!.stage, "completed");
+    assert.equal(radarDaemon.closes.size, 1);
+    assert.ok(readAgentState(mailbox));
+    const recorded = closeEntries(pi).at(-1)!.requestId;
+    // Cache loss: the retry holds this session's durable entries and no runtime
+    // for the launch whose pane is gone.
+    for (const handler of pi.events.get("session_shutdown") ?? [])
+      await handler(undefined, context);
+    for (const handler of pi.events.get("session_start") ?? [])
+      await handler(undefined, context);
+    const retried = await registeredAgentTool(pi, "close").execute(
+      "id",
+      { agent: label },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(retried.details.ok, true, JSON.stringify(retried.details));
+    assert.equal(retried.details.cleanup_error, undefined);
+    assert.equal(readAgentState(mailbox), undefined);
+    assert.equal(realFs.existsSync(mailbox), false);
+    // One physical close, recorded once: the retry finished local cleanup.
+    assert.equal(radarDaemon.closes.size, 1);
+    assert.deepEqual(
+      [...new Set(closeEntries(pi).map((entry) => entry.requestId))],
+      [recorded],
+    );
+  } finally {
+    support.failNextRequestRemoval = false;
+    pi.events.get("session_shutdown")?.[0]();
+    radarDaemon.reset();
+  }
+});
+
+test("a confirmed close is never resumed over the generation that replaced it", async (t) => {
+  setLeadEnvironment();
+  radarDaemon.reset();
+  const label = "confirmed-close-replaced";
+  const pi = fakePi({});
+  registerExtension!(pi.pi as never);
+  const context = fakeContext(pi.entries);
+  try {
+    await startRadarSession(pi, context);
+    const gone = await radarChildForClose(t, pi, context, label);
+    const goneState = readAgentState(gone.mailbox)!;
+    // The generation before this one was closed and its completion recorded,
+    // while its own cleanup never ran.
+    pi.entries.push({
+      type: "custom",
+      customType: "pi-herdsman-radar-close",
+      data: {
+        stage: "completed",
+        requestId: randomUUID(),
+        spawnRequestId: gone.requestId,
+        source: RADAR_SUBJECT_SOURCE,
+        incarnation: radarDaemon.spawns.at(-1)!.incarnation,
+        intent: "complete",
+        runId: goneState.runId,
+        label,
+        ownerSessionId: goneState.ownerSessionId,
+        mailbox: gone.mailbox,
+      },
+    });
+    const recorded = closeEntries(pi).at(-1)!;
+    // The label is now held by a new generation: its own run, its own bound
+    // pane, and a state the previous run's record does not describe.
+    const replacement = await radarChildForClose(t, pi, context, label);
+    const replacedRun = readAgentState(replacement.mailbox)!.runId;
+    assert.equal(replacement.mailbox, gone.mailbox);
+    assert.notEqual(replacedRun, goneState.runId);
+    // The replacement's own presence cannot be established, and the generation
+    // that is gone is not evidence about this one: the close refuses and leaves
+    // the replacement where it is.
+    radarDaemon.options.locationEvidence = "absent";
+    const refused = await registeredAgentTool(pi, "close").execute(
+      "id",
+      { agent: label },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(refused.details.ok, false, JSON.stringify(refused.details));
+    assert.equal(refused.details.error.category, "target_ambiguous");
+    assert.equal(radarDaemon.closes.size, 0);
+    assert.equal(readAgentState(replacement.mailbox)!.runId, replacedRun);
+    assert.equal(closeEntries(pi).length, 1);
+    // With the replacement's own presence established, the close acts on its own
+    // launch. The recorded close of the generation before it is still not the
+    // authority for this one: resuming it would have retired the mailbox without
+    // closing this pane.
+    radarDaemon.options.locationEvidence = "present";
+    const closed = await registeredAgentTool(pi, "close").execute(
+      "id",
+      { agent: label },
+      undefined,
+      undefined,
+      context,
+    );
+    assert.equal(closed.details.ok, true, JSON.stringify(closed.details));
+    assert.deepEqual(
+      [...radarDaemon.closes.values()].map((close) => close.pane),
+      [replacement.paneId],
+    );
+    assert.equal(closeEntries(pi)[0]!.requestId, recorded.requestId);
+    assert.equal(closeEntries(pi)[0]!.stage, "completed");
+    assert.equal(closeEntries(pi).at(-1)!.runId, replacedRun);
+    assert.notEqual(closeEntries(pi).at(-1)!.requestId, recorded.requestId);
+    assert.equal(readAgentState(replacement.mailbox), undefined);
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    radarDaemon.reset();
+  }
 });

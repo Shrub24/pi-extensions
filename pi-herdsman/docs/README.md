@@ -13,13 +13,10 @@ Start with [Getting started](getting-started.md).
 It covers installation, the first asynchronous Agent delegation, `/agents`,
 configuration, and where to go next.
 
-## Orchestrate project work
-
-Use [Project orchestration](guides/project-orchestration.md) to coordinate
-independent branch-based work through Manager and multiple Leads.
+## Supervise Leads
 
 Read [Coordination](concepts/coordination.md) when you need the underlying role,
-authority, project-scope, and ownership model.
+authority, and ownership model.
 
 ## Understand Agents
 
@@ -48,7 +45,6 @@ references for exact contracts:
 - [Supervisor tools](reference/supervisor.md)
 - [Peer tools](reference/peer.md)
 - [Agent states](reference/agent-states.md)
-- [Pane metadata and hierarchy](reference/pane-metadata.md)
 - [Session organization and metadata](reference/session-organization.md)
 - [Herdsman control](reference/herdsman-control.md)
 - [Errors](reference/errors.md)
@@ -92,6 +88,9 @@ implementation, including the upstream behavior a fork decision supersedes.
 - [0030 Prove a live managed generation by a claimed alias](adr/0030-prove-a-live-managed-generation-by-a-claimed-alias.md)
 - [0031 Publish agent facts to the Radar daemon registry](adr/0031-publish-agent-facts-to-the-radar-daemon-registry.md)
 - [0032 Do not hold settlement on an unretrieved result](adr/0032-do-not-hold-settlement-on-an-unretrieved-result.md)
+- [0033 Focus panes through the Radar daemon](adr/0033-focus-a-supervised-lead-through-the-radar-daemon.md)
+- [0034 Remove Manager orchestration](adr/0034-remove-manager-orchestration.md)
+- [0035 Decide relaunch and retirement by process proof](adr/0035-decide-relaunch-and-retirement-by-process-proof.md)
 
 The repository directories are organized by content type. The index is
 task-first so readers do not need to understand that structure before finding

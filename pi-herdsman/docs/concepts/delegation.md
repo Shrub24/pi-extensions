@@ -128,17 +128,19 @@ Do not:
 - continue work that depends on an active agent result;
 - inspect, transcript, list, or steer active agents merely to check progress or completion.
 
-Each unresolved unit of work has exactly one executor.
+Each unresolved assignment has exactly one execution owner.
 
-Delegating a scope transfers execution ownership of that scope to the delegated
-agent until the assignment resolves. The delegator retains responsibility for
-coordination and may continue work it still owns, but it does not execute the
-delegated scope or assign substantially overlapping work elsewhere.
+Delegating transfers implementation and investigation ownership of the assigned
+scope to the delegated agent until the assignment resolves. Delegation does not
+transfer architectural or acceptance responsibility: the delegator keeps
+coordination, integration and final decisions. The delegator must not duplicate
+the worker's active work (no competing edits, no overlapping investigation). It
+may reason about interfaces, dependencies and integration, and must verify
+delivered results before accepting them.
 
-After delegation succeeds, the delegated scope is no longer part of the
-controller's execution scope. The controller may continue only concrete,
-necessary work clearly outside that scope that it still owns; otherwise it ends
-the turn and waits for automatic result or attention delivery.
+The controller may continue only concrete, necessary work clearly outside the
+delegated scope that it still owns; otherwise it ends the turn and waits for
+automatic result or attention delivery.
 
 After the assignment resolves, the delegator may integrate, validate,
 synthesize, or assign follow-up work from the result.

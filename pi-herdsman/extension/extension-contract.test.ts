@@ -13,7 +13,6 @@ import { DELEGATION_BRIEF_EXAMPLES } from "./briefs.ts";
 import {
   COORDINATION_MESSAGE_KINDS,
   claimChiefLease,
-  claimManagerLease,
   listCoordinationMessagePaths,
   invalidateLeadCoordinationState,
   listChiefMessagePaths,
@@ -38,9 +37,7 @@ import type {
 } from "./mailbox.ts";
 import { OperationError } from "./errors.ts";
 import support, {
-  CHILD_SESSION_ID,
   DEFAULT_PI_SESSION_ID,
-  PARENT_SESSION_ID,
   PI_AGENT_ROOT,
   PI_AGENTS_DIR,
   REQUEST_ID,
@@ -61,12 +58,14 @@ import support, {
   readAgentState,
   realFs,
   recoveryIdentity,
+  radarDaemon,
+  radarObservedFleet,
   registerExtension,
   resetAgentMailbox,
+  startRadarSession,
   setLeadEnvironment,
   setAgentEnvironment,
   testGate,
-  skillBlock,
   startupExecutor,
   testTmpRoot,
   agentMailboxPath,
@@ -125,10 +124,6 @@ const REGISTERED_ROLE_TOOLS = [
     "staff_inspect",
     "staff_transcript",
     "staff_message",
-    "staff_delegate",
-    "staff_stop",
-    "staff_complete",
-    "staff_discard",
   ].map((name) => ({ name })),
 ];
 
@@ -332,10 +327,6 @@ test("semantic coordination tools expose exact strict object contracts", () => {
       "staff_inspect",
       "staff_transcript",
       "staff_message",
-      "staff_delegate",
-      "staff_stop",
-      "staff_complete",
-      "staff_discard",
     ].sort(),
   );
   for (const name of [
@@ -343,10 +334,6 @@ test("semantic coordination tools expose exact strict object contracts", () => {
     "staff_inspect",
     "staff_transcript",
     "staff_message",
-    "staff_delegate",
-    "staff_stop",
-    "staff_complete",
-    "staff_discard",
   ]) {
     const tool = tools.get(name)!;
     assert.equal(tool.defaultActive, false);
@@ -458,8 +445,6 @@ test("Chief activation exposes only semantic staff tools", async () => {
         `${name} cross-operation input`,
       );
     }
-    for (const name of ["staff_delegate", "staff_stop", "staff_discard"])
-      assert.equal(tools.get(name)?.exposure, "model-only", name);
   } finally {
     await chief.events.get("session_shutdown")?.[0]();
     delete process.env.HERDR_PANE_ID;
@@ -496,6 +481,9 @@ test("Herdr preflight gates minimum client version and server compatibility", as
     setLeadEnvironment();
     const label = `preflight-${randomUUID().slice(0, 8)}`;
     const startup = startupExecutor(label, () => DEFAULT_PI_SESSION_ID);
+    // The launch fixture owns a fleet that is empty before it launches, so the
+    // daemon observes the fleet this session's own mailboxes model instead.
+    radarDaemon.observeInventory = radarObservedFleet;
     const pi = fakePi({
       exec: startup.exec,
       status: {
@@ -588,12 +576,7 @@ test("registered lead and unmanaged roles expose the correct surface", async () 
   );
   const leadContext = fakeContext() as any;
   await lead.events.get("session_start")![0](undefined, leadContext);
-  assert.deepEqual(lead.commands.sort(), [
-    "agents",
-    "chief",
-    "herdsman",
-    "manager",
-  ]);
+  assert.deepEqual(lead.commands.sort(), ["agents", "chief", "herdsman"]);
   assert.deepEqual(
     lead.pi.getActiveTools().sort(),
     [
@@ -630,10 +613,6 @@ test("registered lead and unmanaged roles expose the correct surface", async () 
       "staff_inspect",
       "staff_transcript",
       "staff_message",
-      "staff_delegate",
-      "staff_stop",
-      "staff_complete",
-      "staff_discard",
     ].sort(),
   );
   assert.equal(
@@ -1605,10 +1584,8 @@ test("staff transcript advertises persisted candidates and revalidates the lead"
   setLeadEnvironment();
   process.env.HERDR_PANE_ID = "chief-pane";
   process.env.HERDR_TAB_ID = "chief-tab";
-  process.env.HERDR_SOCKET_PATH = join(
-    tmpdir(),
-    `supervision-transcript-${randomUUID()}.sock`,
-  );
+  // Names the runtime directory that holds lead coordination state; the Lead itself is read from Radar.
+  process.env.HERDR_SOCKET_PATH = join(tmpdir(), `transcript-runtime-${randomUUID()}.sock`);
   const chiefId = randomUUID();
   const leadId = randomUUID();
   const sessionRoot = realFs.realpathSync(
@@ -1699,67 +1676,42 @@ test("staff transcript advertises persisted candidates and revalidates the lead"
     "utf8",
   );
   nativeSessions.set(leadPath, { id: leadId, path: leadPath, entries: [] });
-  let leadAgent: any = {
-    agent_session: {
-      source: "herdr:pi",
-      agent: "pi",
-      kind: "path",
-      value: leadPath,
-    },
-    pane_id: "lead-pane",
-    tab_id: "lead-tab",
-    workspace_id: WORKSPACE,
-    cwd: "/tmp",
-    agent_status: "idle",
-  };
-  const chiefAgent = {
-    agent_session: {
-      source: "herdr:pi",
-      agent: "pi",
-      kind: "id",
-      value: chiefId,
-    },
-    pane_id: "chief-pane",
-    tab_id: "chief-tab",
-    workspace_id: WORKSPACE,
-    cwd: "/tmp",
-    agent_status: "idle",
-  };
+  // This input form follows the current path rule (a reported herdr:pi session whose file header carries the id); it changes with the Herdr slice that retargets that rule.
+  let leadPane = "lead-pane";
+  let observations = 0;
   let mutateLeadDuringTranscript = false;
-  let snapshotCalls = 0;
-  const exec = (_command: string, args: string[]) => {
-    if (isApiSnapshot(args)) {
-      snapshotCalls++;
-      if (mutateLeadDuringTranscript && snapshotCalls > 1) {
-        leadAgent = { ...leadAgent, pane_id: "changed-pane" };
-        mutateLeadDuringTranscript = false;
-      }
-      return {
-        stdout: JSON.stringify({
-          id: AGENT_ID,
-          result: {
-            snapshot: {
-              agents: [leadAgent, chiefAgent],
-              panes: [leadAgent, chiefAgent],
-            },
-          },
-        }),
-        stderr: "",
-        code: 0,
-      };
+  radarDaemon.observeInventory = () => {
+    observations++;
+    if (mutateLeadDuringTranscript && observations > 1) {
+      leadPane = "changed-pane";
+      mutateLeadDuringTranscript = false;
     }
-    if (args[0] === "agent" && args[1] === "get")
-      return {
-        stdout: JSON.stringify({
-          id: AGENT_ID,
-          result: {
-            agent: args[2] === leadAgent.pane_id ? leadAgent : chiefAgent,
+    const place = (pane: string) => ({
+      workspace_id: WORKSPACE,
+      tab_id: `${pane}-tab`,
+      pane_id: pane,
+    });
+    return {
+      workspaces: [{ workspace_id: WORKSPACE }],
+      tabs: [
+        { tab_id: "lead-pane-tab", workspace_id: WORKSPACE },
+        { tab_id: "chief-pane-tab", workspace_id: WORKSPACE },
+      ],
+      panes: [{ location: place(leadPane) }, { location: place("chief-pane") }],
+      agents: [
+        {
+          location: place(leadPane),
+          session: {
+            kind: "reported",
+            value: { source: "herdr:pi", value: leadPath },
           },
-        }),
-        stderr: "",
-        code: 0,
-      };
-    return { stdout: "{}", stderr: "", code: 0 };
+        },
+        {
+          location: place("chief-pane"),
+          session: { kind: "uuid", value: chiefId },
+        },
+      ],
+    };
   };
   const entries = [
     {
@@ -1771,7 +1723,7 @@ test("staff transcript advertises persisted candidates and revalidates the lead"
       },
     },
   ];
-  const pi = fakePi({ entries, exec, allTools: REGISTERED_ROLE_TOOLS });
+  const pi = fakePi({ entries, allTools: REGISTERED_ROLE_TOOLS });
   const context = fakeContext(entries) as any;
   context.sessionManager = {
     ...context.sessionManager,
@@ -1832,6 +1784,7 @@ test("staff transcript advertises persisted candidates and revalidates the lead"
       assert.doesNotMatch(transcript.details?.transcript, new RegExp(hidden));
     assert.doesNotMatch(transcript.details?.transcript, /__PI_HERDSMAN/);
 
+    // A header that no longer carries the Lead's id means the path is not proven, so the Lead is not listed.
     writeFileSync(
       leadPath,
       JSON.stringify({ ...header, id: randomUUID() }) + "\n",
@@ -1861,53 +1814,14 @@ test("staff transcript advertises persisted candidates and revalidates the lead"
       ),
       /Lead target was not found or is no longer eligible/,
     );
-    const { SessionManager } = await import("@earendil-works/pi-coding-agent");
-    const sessionManager = SessionManager as any;
-    const originalFindById = Object.getOwnPropertyDescriptor(
-      sessionManager,
-      "findById",
-    );
-    const originalSession = leadAgent.agent_session;
-    sessionManager.findById = (cwd: string, id: string) =>
-      cwd === leadAgent.cwd && id === leadId ? leadPath : undefined;
-    leadAgent.agent_session = { ...originalSession, kind: "id", value: leadId };
-    try {
-      const mismatched = await listTool.execute(
-        "list",
-        {},
-        undefined,
-        undefined,
-        context,
-      );
-      assertToolResult(mismatched);
-      const mismatchedLead = (mismatched.details?.reports as any[]).find(
-        (report) => report.session === leadId,
-      );
-      assert.ok(mismatchedLead);
-      assert.ok(mismatchedLead.available_actions.includes("transcript"));
-      await assert.rejects(
-        tool.execute(
-          "transcript",
-          { session: leadId },
-          undefined,
-          undefined,
-          context,
-        ),
-        /Persisted Pi session is missing a matching current session header/,
-      );
-    } finally {
-      leadAgent.agent_session = originalSession;
-      if (originalFindById)
-        Object.defineProperty(sessionManager, "findById", originalFindById);
-      else delete sessionManager.findById;
-    }
+
     writeFileSync(
       leadPath,
       transcriptEntries.map((entry) => JSON.stringify(entry)).join("\n") + "\n",
       "utf8",
     );
 
-    snapshotCalls = 0;
+    observations = 0;
     mutateLeadDuringTranscript = true;
     await assert.rejects(
       tool.execute(
@@ -1924,6 +1838,7 @@ test("staff transcript advertises persisted candidates and revalidates the lead"
     invalidateLeadCoordinationState(supervisionRuntime(), leadId);
     nativeSessions.delete(leadPath);
     realFs.rmSync(sessionRoot, { recursive: true, force: true });
+    radarDaemon.observeInventory = radarObservedFleet;
     delete process.env.HERDR_TAB_ID;
     delete process.env.HERDR_SOCKET_PATH;
     setLeadEnvironment();
@@ -2096,10 +2011,8 @@ test("a replacement chief never falls back to the previous session supervision",
   setLeadEnvironment();
   process.env.HERDR_PANE_ID = "chief-pane";
   process.env.HERDR_TAB_ID = "chief-tab";
-  process.env.HERDR_SOCKET_PATH = join(
-    tmpdir(),
-    `supervision-replacement-context-${randomUUID()}.sock`,
-  );
+  // Names the runtime directory that holds lead coordination state; the refresh itself reads Radar.
+  process.env.HERDR_SOCKET_PATH = join(tmpdir(), `replacement-runtime-${randomUUID()}.sock`);
   const entries = [
     {
       type: "custom",
@@ -2112,45 +2025,29 @@ test("a replacement chief never falls back to the previous session supervision",
   ];
   const chiefA = `chief-a-${randomUUID()}`;
   const chiefB = `chief-b-${randomUUID()}`;
-  const leadId = `lead-${randomUUID()}`;
+  const leadId = randomUUID();
   let sessionId = chiefA;
-  let failRefresh = false;
-  const leadAgent = {
-    agent: "pi",
-    agent_session: {
-      source: "herdr:pi",
-      agent: "pi",
-      kind: "id",
-      value: leadId,
-    },
-    workspace_id: WORKSPACE,
-    pane_id: "lead-pane",
-    tab_id: "lead-tab",
-    cwd: "/tmp",
-  };
-  const pi = fakePi({
-    entries,
-    allTools: REGISTERED_ROLE_TOOLS,
-    exec: (_command, args) => {
-      if (failRefresh && isApiSnapshot(args))
-        throw new Error("supervision unavailable");
-      return isApiSnapshot(args)
-        ? {
-            stdout: JSON.stringify({
-              id: AGENT_ID,
-              result: {
-                snapshot: {
-                  agents: [leadAgent],
-                  panes: [leadAgent],
-                },
-              },
-            }),
-            stderr: "",
-            code: 0,
-          }
-        : { stdout: "{}", stderr: "", code: 0 };
-    },
+  writeLeadCoordinationState(supervisionRuntime(), {
+    version: 1,
+    role: "lead",
+    instanceId: randomUUID(),
+    piSessionId: leadId,
+    updatedAt: Date.now(),
   });
+  radarDaemon.observeInventory = () => ({
+    workspaces: [{ workspace_id: WORKSPACE }],
+    tabs: [{ tab_id: "lead-tab", workspace_id: WORKSPACE }],
+    panes: [
+      { location: { workspace_id: WORKSPACE, tab_id: "lead-tab", pane_id: "lead-pane" } },
+    ],
+    agents: [
+      {
+        location: { workspace_id: WORKSPACE, tab_id: "lead-tab", pane_id: "lead-pane" },
+        session: { kind: "uuid", value: leadId },
+      },
+    ],
+  });
+  const pi = fakePi({ entries, allTools: REGISTERED_ROLE_TOOLS });
   registerExtension!(pi.pi as never);
   const context = fakeContext(entries) as any;
   context.sessionManager = {
@@ -2158,7 +2055,7 @@ test("a replacement chief never falls back to the previous session supervision",
     getSessionId: () => sessionId,
   };
   const sessionStart = pi.events.get("session_start")![0];
-  const beforeStart = () =>
+  const beforeStart = (): any =>
     pi.events.get("before_agent_start")![0](
       { systemPromptOptions: { contextFiles: [] } },
       context,
@@ -2169,9 +2066,10 @@ test("a replacement chief never falls back to the previous session supervision",
     assert.equal(first?.message?.customType, "pi-herdsman-supervision-context");
     assert.equal(first?.message?.display, false);
     assert.match(String(first?.message?.content), /status="fresh"/);
+    assert.match(String(first?.message?.content), new RegExp(leadId));
 
     sessionId = chiefB;
-    failRefresh = true;
+    radarDaemon.options.observeUnavailable = true;
     await sessionStart(undefined, context);
     const message = (await beforeStart())?.message;
     assert.equal(message?.customType, "pi-herdsman-supervision-context");
@@ -2181,6 +2079,7 @@ test("a replacement chief never falls back to the previous session supervision",
     assert.doesNotMatch(String(message?.content), new RegExp(leadId));
   } finally {
     pi.events.get("session_shutdown")?.[0]();
+    radarDaemon.options.observeUnavailable = false;
     delete process.env.HERDR_PANE_ID;
     delete process.env.HERDR_TAB_ID;
     delete process.env.HERDR_SOCKET_PATH;
@@ -2192,10 +2091,8 @@ test("an obsolete background supervision refresh cannot publish after chief tran
   setLeadEnvironment();
   process.env.HERDR_PANE_ID = "chief-pane";
   process.env.HERDR_TAB_ID = "chief-tab";
-  process.env.HERDR_SOCKET_PATH = join(
-    tmpdir(),
-    `supervision-background-context-${randomUUID()}.sock`,
-  );
+  // Names the runtime directory that holds lead coordination state; the refresh itself reads Radar.
+  process.env.HERDR_SOCKET_PATH = join(tmpdir(), `obsolete-runtime-${randomUUID()}.sock`);
   const entries = [
     {
       type: "custom",
@@ -2208,66 +2105,36 @@ test("an obsolete background supervision refresh cannot publish after chief tran
   ];
   const chiefA = `chief-a-${randomUUID()}`;
   const chiefB = `chief-b-${randomUUID()}`;
-  const leadId = `lead-${randomUUID()}`;
+  const leadId = randomUUID();
   let sessionId = chiefA;
-  let failRefresh = false;
-  let blockNextRefresh = false;
-  let releaseBlocked!: () => void;
-  const leadAgent = {
-    agent: "pi",
-    agent_session: {
-      source: "herdr:pi",
-      agent: "pi",
-      kind: "id",
-      value: leadId,
-    },
-    workspace_id: WORKSPACE,
-    pane_id: "lead-pane",
-    tab_id: "lead-tab",
-    cwd: "/tmp",
-  };
-  const pi = fakePi({
-    entries,
-    allTools: REGISTERED_ROLE_TOOLS,
-    exec: async (_command, args) => {
-      if (isApiSnapshot(args) && blockNextRefresh) {
-        blockNextRefresh = false;
-        return new Promise((resolve) => {
-          releaseBlocked = () =>
-            resolve({
-              stdout: JSON.stringify({
-                id: AGENT_ID,
-                result: {
-                  snapshot: {
-                    agents: [leadAgent],
-                    panes: [leadAgent],
-                  },
-                },
-              }),
-              stderr: "",
-              code: 0,
-            });
-        });
-      }
-      if (failRefresh && isApiSnapshot(args))
-        throw new Error("supervision unavailable");
-      return isApiSnapshot(args)
-        ? {
-            stdout: JSON.stringify({
-              id: AGENT_ID,
-              result: {
-                snapshot: {
-                  agents: [leadAgent],
-                  panes: [leadAgent],
-                },
-              },
-            }),
-            stderr: "",
-            code: 0,
-          }
-        : { stdout: "{}", stderr: "", code: 0 };
-    },
+  writeLeadCoordinationState(supervisionRuntime(), {
+    version: 1,
+    role: "lead",
+    instanceId: randomUUID(),
+    piSessionId: leadId,
+    updatedAt: Date.now(),
   });
+  let arrived!: () => void;
+  const readArrived = new Promise<void>((resolve) => {
+    arrived = resolve;
+  });
+  radarDaemon.observeInventory = () => {
+    arrived();
+    return {
+      workspaces: [{ workspace_id: WORKSPACE }],
+      tabs: [{ tab_id: "lead-tab", workspace_id: WORKSPACE }],
+      panes: [
+        { location: { workspace_id: WORKSPACE, tab_id: "lead-tab", pane_id: "lead-pane" } },
+      ],
+      agents: [
+        {
+          location: { workspace_id: WORKSPACE, tab_id: "lead-tab", pane_id: "lead-pane" },
+          session: { kind: "uuid", value: leadId },
+        },
+      ],
+    };
+  };
+  const pi = fakePi({ entries, allTools: REGISTERED_ROLE_TOOLS });
   registerExtension!(pi.pi as never);
   const context = fakeContext(entries) as any;
   context.mode = "rpc";
@@ -2287,16 +2154,18 @@ test("an obsolete background supervision refresh cannot publish after chief tran
     assert.equal(first?.message?.customType, "pi-herdsman-supervision-context");
     assert.equal(first?.message?.display, false);
     assert.match(String(first?.message?.content), /status="fresh"/);
-    blockNextRefresh = true;
+
+    // The background refresh is held in flight across the chief transition.
+    const held = radarDaemon.holdNextObserve();
     const command = pi.commandOptions.get("chief");
     assert.ok(command);
     const background = command.handler("", context);
-    await t.waitFor(() => assert.ok(releaseBlocked, "refresh did not start"));
+    await readArrived;
 
     sessionId = chiefB;
+    radarDaemon.options.observeUnavailable = true;
     await sessionStart(undefined, context);
-    failRefresh = true;
-    releaseBlocked();
+    held.release();
     await background;
     const message = (await beforeStart())?.message;
     assert.equal(message?.customType, "pi-herdsman-supervision-context");
@@ -2306,6 +2175,7 @@ test("an obsolete background supervision refresh cannot publish after chief tran
     assert.doesNotMatch(String(message?.content), new RegExp(leadId));
   } finally {
     pi.events.get("session_shutdown")?.[0]();
+    radarDaemon.options.observeUnavailable = false;
     delete process.env.HERDR_PANE_ID;
     delete process.env.HERDR_TAB_ID;
     delete process.env.HERDR_SOCKET_PATH;
@@ -2421,53 +2291,6 @@ test("Chief supervision context is persistent, deduplicated, and compaction-awar
   }
 });
 
-test("lead metadata omits coordination state and follows session names", async (t) => {
-  setLeadEnvironment();
-  process.env.HERDR_PANE_ID = "lead-pane";
-  const pi = fakePi({ sessionName: "first name" });
-  registerExtension!(pi.pi as never);
-  const context = fakeContext() as any;
-  await pi.events.get("session_start")![0](undefined, context);
-  await t.waitFor(() =>
-    assert.ok(
-      pi.calls.some(
-        (args) => args[0] === "pane" && args[1] === "report-metadata",
-      ),
-    ),
-  );
-  const metadata = pi.calls.find(
-    (args) => args[0] === "pane" && args[1] === "report-metadata",
-  );
-  assert.ok(metadata);
-  assert.ok(metadata.includes("pi_herdsman_role=lead"));
-  assert.ok(
-    !metadata.some((value) => value.includes("pi_herdsman_availability")),
-  );
-  assert.ok(metadata.includes("pi_herdsman_name=first name"));
-  await pi.events.get("session_info_changed")![0]({ name: "renamed" }, context);
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.ok(pi.calls.some((args) => args.includes("pi_herdsman_name=renamed")));
-  pi.events.get("session_shutdown")?.[0]();
-  delete process.env.HERDR_PANE_ID;
-  const selfReports = pi.calls.filter(
-    (args) =>
-      args.includes("pi-herdsman:lead") && !args.includes("--clear-title"),
-  );
-  assert.ok(
-    selfReports.some((args) =>
-      args.includes(
-        `pi_herdsman_session=${context.sessionManager.getSessionId()}`,
-      ),
-    ),
-  );
-  assert.equal(
-    selfReports.some((args) =>
-      args.some((arg) => arg.startsWith("pi_herdsman_parent_session=")),
-    ),
-    false,
-  );
-});
-
 test("malformed persisted role fails closed without authoritative lead state", async () => {
   setLeadEnvironment();
   process.env.HERDR_PANE_ID = "lead-pane";
@@ -2522,10 +2345,10 @@ test("malformed definitions do not abort ordinary lead startup", async () => {
   const context = fakeContext() as any;
   try {
     await pi.events.get("session_start")![0](undefined, context);
-    assert.ok(
-      pi.calls.some((args) => isApiSnapshot(args)),
-      "agent recovery must still run after roster discovery fails",
-    );
+    // Startup completes rather than aborting: the malformed definition is
+    // reported on the session's own log instead of ending it. No mux inventory
+    // is read for this - nothing has a mailbox yet, so no child's presence has to
+    // be proved - which is why this no longer looks for a snapshot call.
     assert.ok(
       pi.entries.some(
         (entry: any) =>
@@ -2634,19 +2457,21 @@ test("definition roster matches live list and rejects stale sessions", async () 
   );
   assert.match(prompt?.systemPrompt ?? "", /## Available agent definitions/);
   assert.match(prompt?.systemPrompt ?? "", /<agent_definitions>/);
-  const roster = JSON.parse(
-    prompt.systemPrompt.match(
-      /<agent_definitions>\n([\s\S]*?)\n<\/agent_definitions>/,
-    )[1],
-  );
+  const roster = prompt.systemPrompt.match(
+    /<agent_definitions>\n([\s\S]*?)\n<\/agent_definitions>/,
+  )[1];
   const listResult = await pi.tools
     .find((tool) => tool.name === "agent_list")!
     .execute("list", {}, undefined, undefined, context);
+  const listed = listResult.details.agent_definitions.filter(
+    (definition: Record<string, unknown>) => definition.enabled !== false,
+  );
   assert.deepEqual(
-    roster,
-    listResult.details.agent_definitions,
+    roster.split("\n").map((line: string) => line.split(":")[0]),
+    listed.map((definition: Record<string, unknown>) => `- ${definition.name}`),
     JSON.stringify(listResult.details),
   );
+  assert.doesNotMatch(roster, /"tools"|"skills"/);
   sessionId = randomUUID();
   const stalePrompt = await pi.events.get("before_agent_start")![0](
     { systemPrompt: "base" },
@@ -2697,21 +2522,22 @@ test("delegating agents receive only their allowed definition roster", async () 
     context,
   );
   assert.match(prompt?.systemPrompt ?? "", /<agent_definitions>/);
-  const roster = JSON.parse(
-    prompt.systemPrompt.match(
-      /<agent_definitions>\n([\s\S]*?)\n<\/agent_definitions>/,
-    )[1],
-  );
+  const roster = prompt.systemPrompt.match(
+    /<agent_definitions>\n([\s\S]*?)\n<\/agent_definitions>/,
+  )[1];
   assert.deepEqual(
-    roster.map((definition: Record<string, unknown>) => definition.name),
-    ["scout"],
+    roster.split("\n").map((line: string) => line.split(":")[0]),
+    ["- scout"],
   );
+  assert.doesNotMatch(roster, /"tools"|"skills"/);
   const listResult = await pi.tools
     .find((tool) => tool.name === "agent_list")!
     .execute("list", {}, undefined, undefined, context);
   assert.deepEqual(
-    roster,
-    listResult.details.agent_definitions,
+    listResult.details.agent_definitions.map(
+      (definition: Record<string, unknown>) => definition.name,
+    ),
+    ["scout"],
     JSON.stringify(listResult.details),
   );
   const agentListTool = pi.tools.find((tool) => tool.name === "agent_list")!;
@@ -2781,11 +2607,11 @@ test("delegating agents receive only their allowed definition roster", async () 
   assert.match(description, /Own the assigned objective/);
   assert.match(
     description,
-    /execution scope is limited to the non-delegated remainder/,
+    /do not execute or duplicate their delegated scope/,
   );
   assert.match(
     description,
-    /Each unresolved unit of work has one executor\. Using agent_delegate transfers that assignment's execution ownership to the Agent until it resolves\. After delegation succeeds, stop executing, inspecting, or analyzing that delegated scope locally; do not assign overlapping work\. Continue only concrete, necessary work clearly outside the delegated scope that you still own\./,
+    /Each unresolved assignment has one execution owner\. Using agent_delegate transfers that assignment's implementation and investigation ownership to the Agent until it resolves\. Delegation does not transfer architectural or acceptance responsibility\. Do not duplicate the worker's active work: make no competing edits and start no overlapping investigation\./,
   );
   assert.match(
     sharedGuidance,
@@ -2882,10 +2708,15 @@ test("first failed chief supervision refresh is explicitly unavailable", async (
   setLeadEnvironment();
   process.env.HERDR_PANE_ID = "chief-pane";
   process.env.HERDR_TAB_ID = "chief-tab";
-  process.env.HERDR_SOCKET_PATH = join(
-    tmpdir(),
-    `supervision-unavailable-${randomUUID()}.sock`,
-  );
+  process.env.HERDR_SOCKET_PATH = join(tmpdir(), `unavailable-runtime-${randomUUID()}.sock`);
+  writeLeadCoordinationState(supervisionRuntime(), {
+    version: 1,
+    role: "lead",
+    instanceId: randomUUID(),
+    piSessionId: randomUUID(),
+    updatedAt: Date.now(),
+  });
+  radarDaemon.options.observeUnavailable = true;
   const entries = [
     {
       type: "custom",
@@ -2896,113 +2727,29 @@ test("first failed chief supervision refresh is explicitly unavailable", async (
       },
     },
   ];
-  const pi = fakePi({
-    entries,
-    allTools: REGISTERED_ROLE_TOOLS,
-    exec: () => {
-      throw new Error("supervision unavailable");
-    },
-  });
+  const pi = fakePi({ entries, allTools: REGISTERED_ROLE_TOOLS });
   registerExtension!(pi.pi as never);
   const context = fakeContext(entries) as any;
-  await pi.events.get("session_start")![0](undefined, context);
-  const result = await pi.events.get("before_agent_start")![0](
-    { systemPromptOptions: { contextFiles: [] } },
-    context,
-  );
-  assert.equal(result?.message?.customType, "pi-herdsman-supervision-context");
-  assert.equal(result?.message?.display, false);
-  assert.match(String(result?.message?.content), /status="unavailable"/);
-  assert.match(
-    String(result?.message?.content),
-    /Current supervision state could not be established/,
-  );
-  pi.events.get("session_shutdown")?.[0]();
-  delete process.env.HERDR_SOCKET_PATH;
-  delete process.env.HERDR_PANE_ID;
-  delete process.env.HERDR_TAB_ID;
-  setLeadEnvironment();
-});
-
-test("lead metadata reports preserve session event order", async () => {
-  setLeadEnvironment();
-  process.env.HERDR_PANE_ID = "lead-pane";
-  let releaseFirst!: () => void;
-  const firstReport = new Promise<void>((resolve) => (releaseFirst = resolve));
-  let reportCount = 0;
-  const pi = fakePi({
-    sessionName: "first name",
-    exec: async (command, args) => {
-      if (
-        command === "herdr" &&
-        args[0] === "pane" &&
-        args[1] === "report-metadata"
-      ) {
-        reportCount++;
-        if (reportCount === 1) await firstReport;
-      }
-      return { stdout: "{}", stderr: "", code: 0 };
-    },
-  });
-  registerExtension!(pi.pi as never);
-  const context = fakeContext() as any;
-  const started = pi.events.get("session_start")![0](undefined, context);
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  await pi.events.get("session_info_changed")![0](
-    { name: "new name" },
-    context,
-  );
-  releaseFirst();
-  await started;
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  const reports = pi.calls.filter(
-    (args) => args[0] === "pane" && args[1] === "report-metadata",
-  );
-  assert.equal(reports.length, 2);
-  assert.ok(reports[0].includes("pi_herdsman_name=first name"));
-  assert.ok(reports[1].includes("pi_herdsman_name=new name"));
-  pi.events.get("session_shutdown")?.[0]();
-  delete process.env.HERDR_PANE_ID;
-});
-
-test("lead metadata failures do not escape the serialized queue", async (t) => {
-  setLeadEnvironment();
-  process.env.HERDR_PANE_ID = "lead-pane";
-  process.env.HERDR_SOCKET_PATH = join(
-    tmpdir(),
-    `metadata-${randomUUID()}.sock`,
-  );
-  let metadataCalls = 0;
-  const pi = fakePi({
-    exec: async (command, args) => {
-      if (
-        command === "herdr" &&
-        args[0] === "pane" &&
-        args[1] === "report-metadata"
-      ) {
-        metadataCalls++;
-        if (metadataCalls === 1) throw new Error("metadata unavailable");
-      }
-      return { stdout: "{}", stderr: "", code: 0 };
-    },
-  });
-  const unhandled: unknown[] = [];
-  const onUnhandled = (reason: unknown) => unhandled.push(reason);
-  process.on("unhandledRejection", onUnhandled);
   try {
-    registerExtension!(pi.pi as never);
-    const context = fakeContext() as any;
     await pi.events.get("session_start")![0](undefined, context);
-    assert.ok(pi.tools.some((tool) => tool.name === "supervisor_message"));
-    await pi.events.get("session_info_changed")![0]({ name: "retry" }, context);
-    await t.waitFor(() => assert.equal(metadataCalls, 2));
-    assert.equal(unhandled.length, 0);
-    assert.equal(metadataCalls, 2);
+    const result = await pi.events.get("before_agent_start")![0](
+      { systemPromptOptions: { contextFiles: [] } },
+      context,
+    );
+    assert.equal(result?.message?.customType, "pi-herdsman-supervision-context");
+    assert.equal(result?.message?.display, false);
+    assert.match(String(result?.message?.content), /status="unavailable"/);
+    assert.match(
+      String(result?.message?.content),
+      /Current supervision state could not be established/,
+    );
   } finally {
-    process.removeListener("unhandledRejection", onUnhandled);
     pi.events.get("session_shutdown")?.[0]();
+    radarDaemon.options.observeUnavailable = false;
     delete process.env.HERDR_PANE_ID;
+    delete process.env.HERDR_TAB_ID;
     delete process.env.HERDR_SOCKET_PATH;
+    setLeadEnvironment();
   }
 });
 
@@ -3102,6 +2849,98 @@ test("invalid mailbox-intent agent environment reports the exact field", async (
   assert.match(errorEntry.data.error, /HERDR_PANE_ID missing/);
   resetAgentMailbox(mailbox);
   setLeadEnvironment();
+});
+
+/**
+ * The registration this daemon accepted, once the publication reaches it: the
+ * adapter registers in the background, so a test waits for the call rather than
+ * assuming a tick.
+ */
+
+/**
+ * The registration that names one exact pane. A process registers on its first
+ * publish, which may land before or after another test step reset the daemon's
+ * call log, so the registration is found by what it says about itself rather
+ * than by the position it happened to arrive in.
+ */
+async function registeredSubjectForPane(pane: string): Promise<{
+  agent_id: string;
+  params: Record<string, unknown>;
+}> {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const call = radarDaemon.registerCalls.find(
+      (candidate) =>
+        (candidate.params.location as { pane?: string } | undefined)?.pane ===
+        pane,
+    );
+    if (call) return call;
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+  }
+  throw new Error(`no Radar registration named ${pane}`);
+}
+
+test("a launched child that inherited its parent's pane is not a managed agent", async () => {
+  const mailbox = setAgentEnvironment();
+  process.env.PI_HERDSMAN_LAUNCH_GENERATION = randomUUID();
+  // A launched child inherits the environment of the pane it was created in, so
+  // coordinates naming the pane it was created beside are the parent's.
+  process.env.PI_HERDSMAN_PARENT_PANE_ID = process.env.HERDR_PANE_ID;
+  const child = fakePi();
+  registerExtension!(child.pi as never);
+  assert.equal(child.tools.length, 0);
+  assert.equal(readAgentState(mailbox), undefined);
+  const starts = child.events.get("session_start") ?? [];
+  assert.equal(starts.length, 1);
+  await starts[0](undefined, fakeAgentContext(child.entries));
+  const errorEntry = child.entries.find(
+    (entry: any) => entry.customType === "pi_herdsman_state_error",
+  ) as any;
+  assert.ok(errorEntry);
+  assert.match(
+    errorEntry.data.error,
+    /HERDR_PANE_ID names the pane this launch was created beside/,
+  );
+  resetAgentMailbox(mailbox);
+  setLeadEnvironment();
+});
+
+test("a launched child publishes the pane it reads and never its parent's", async () => {
+  setAgentEnvironment();
+  process.env.PI_HERDSMAN_LAUNCH_GENERATION = randomUUID();
+  process.env.PI_HERDSMAN_PARENT_PANE_ID = "another-pane";
+  const child = fakePi();
+  registerExtension!(child.pi as never);
+  await startRadarSession(child);
+  const childRegistration = await registeredSubjectForPane("registered-pane");
+
+  // Radar types its launch line into the pane it created, so a launched child
+  // reads that pane's own environment - the same fact a lead publishes. The one
+  // value that cannot be its own is the pane the launch was created beside.
+  // The backend is the daemon's own negotiated fact, and the pane and workspace
+  // are this process's own.
+  assert.equal(
+    childRegistration.params.location.pane,
+    "registered-pane",
+    "a launched child publishes the pane it reads",
+  );
+  assert.equal(childRegistration.params.spawn_token, undefined);
+
+  setLeadEnvironment();
+  const lead = fakePi();
+  registerExtension!(lead.pi as never);
+  await startRadarSession(lead);
+  // The fixture's own reset clears the daemon's call log, so this process's
+  // registration is the first one this daemon has seen again.
+  const leadRegistration = await registeredSubjectForPane("lead-pane");
+  // The lead keeps publishing its own pane: the child's rule is about which
+  // pane a process may claim, not about who may publish one. The containment
+  // and the backend are the daemon's own reported facts.
+  assert.equal(leadRegistration.params.location.pane, "lead-pane");
+  assert.equal(leadRegistration.params.location.workspace, WORKSPACE);
+  assert.equal(
+    leadRegistration.params.location.backend,
+    radarDaemon.options.backend,
+  );
 });
 
 test("managed non-TUI agents do not receive the widget", async () => {
@@ -3334,6 +3173,7 @@ test("registered delegate embeds text and references binary evidence", async () 
       submittedRequest = request;
     },
   );
+  radarDaemon.observeInventory = radarObservedFleet;
   const pi = fakePi({ exec: startup.exec });
   registerExtension!(pi.pi as never);
   try {
@@ -3544,47 +3384,6 @@ test("a legacy worker identity without a verified owner stays unclassified", asy
   }
 });
 
-test("unreadable current metadata is diagnosed without classifying or breaking the session", async () => {
-  setLeadEnvironment();
-  const entries: unknown[] = [
-    {
-      type: "custom",
-      customType: "pi-herdsman-session-metadata",
-      data: { version: 9, sessionId: LEAD_SESSION_ID },
-    },
-  ];
-  const pi = fakePi({
-    entries,
-    activeTools: REGISTERED_ROLE_TOOLS.map(({ name }) => name),
-    allTools: REGISTERED_ROLE_TOOLS,
-  });
-  registerExtension!(pi.pi as never);
-  const seeded = structuredClone(entries);
-  try {
-    await pi.events.get("session_start")![0](
-      undefined,
-      fakeContext(entries) as any,
-    );
-    const diagnoses = (entries as any[]).filter(
-      (entry) => entry.customType === "pi_herdsman_session_metadata_error",
-    );
-    assert.equal(diagnoses.length, 1, JSON.stringify(entries));
-    assert.match(diagnoses[0].data.error, /pi-herdsman-session-metadata/);
-    assert.deepEqual(
-      sessionMetadataRecords(entries),
-      seeded,
-      "nothing is written over an unreadable record",
-    );
-    assert.ok(
-      pi.tools.some((tool) => tool.name === "agent_delegate"),
-      "the live session stays usable",
-    );
-  } finally {
-    await pi.events.get("session_shutdown")![0]();
-    setLeadEnvironment();
-  }
-});
-
 test("managed startup records its direct owner and follows an owner change", async () => {
   const label = "metadata-owner-agent";
   const mailbox = setAgentEnvironment(label);
@@ -3642,121 +3441,6 @@ test("managed startup records its direct owner and follows an owner change", asy
     await sessionShutdown();
     process.env.PI_HERDSMAN_OWNER_SESSION_ID = firstOwner;
     resetAgentMailbox(mailbox);
-  }
-});
-
-test("a session replacement clears the queued supervision rerun instead of running it", async (t) => {
-  setLeadEnvironment();
-  process.env.HERDR_PANE_ID = "chief-pane";
-  process.env.HERDR_TAB_ID = "chief-tab";
-  process.env.HERDR_SOCKET_PATH = join(
-    tmpdir(),
-    `supervision-queued-rerun-${randomUUID()}.sock`,
-  );
-  const entries = [
-    {
-      type: "custom",
-      customType: "pi-herdsman-role",
-      data: {
-        role: "chief",
-        leadTools: REGISTERED_ROLE_TOOLS.map(({ name }) => name),
-      },
-    },
-  ];
-  const chiefA = `chief-a-${randomUUID()}`;
-  const chiefB = `chief-b-${randomUUID()}`;
-  let sessionId = chiefA;
-  // A supervision refresh enters the loop with a herdrSessionSnapshot whose
-  // immediate caller is refreshSupervisionOnce; its later reads go through
-  // directReports. Counting only the entry frames isolates loop iterations
-  // from the snapshot fan-out inside a single refresh.
-  const isRefreshEntry = (stack: string | undefined): boolean => {
-    const lines = (stack ?? "").split("\n");
-    const index = lines.findIndex((line) => line.includes("herdrSessionSnapshot"));
-    return index >= 0 && lines[index + 1]?.includes("refreshSupervisionOnce") === true;
-  };
-  let entriesSeen = 0;
-  let blockNext = false;
-  let releaseBlocked!: () => void;
-  const snapshotResult = () => ({
-    stdout: JSON.stringify({
-      id: AGENT_ID,
-      result: { snapshot: { agents: [], panes: [] } },
-    }),
-    stderr: "",
-    code: 0,
-  });
-  const pi = fakePi({
-    entries,
-    allTools: REGISTERED_ROLE_TOOLS,
-    exec: async (_command, args) => {
-      if (!isApiSnapshot(args)) return { stdout: "{}", stderr: "", code: 0 };
-      if (isRefreshEntry(new Error("snapshot").stack)) entriesSeen++;
-      if (blockNext) {
-        blockNext = false;
-        await new Promise<void>((resolve) => {
-          releaseBlocked = resolve;
-        });
-      }
-      return snapshotResult();
-    },
-  });
-  registerExtension!(pi.pi as never);
-  const context = fakeContext(entries) as any;
-  context.mode = "rpc";
-  context.isIdle = () => false;
-  context.sessionManager = {
-    ...context.sessionManager,
-    getSessionId: () => sessionId,
-  };
-  const sessionStart = pi.events.get("session_start")![0];
-  const beforeStart = () =>
-    pi.events.get("before_agent_start")![0](
-      { systemPromptOptions: { contextFiles: [] } },
-      context,
-    );
-  try {
-    await sessionStart(undefined, context);
-    await beforeStart();
-    const baseEntries = entriesSeen;
-    assert.equal(baseEntries, 1, "the initial refresh did not enter the loop");
-
-    blockNext = true;
-    const inFlight = beforeStart();
-    await t.waitFor(() => assert.ok(releaseBlocked, "refresh did not start"));
-    assert.equal(entriesSeen - baseEntries, 1, "the in-flight refresh did not start");
-    const queued = beforeStart();
-    assert.equal(
-      entriesSeen - baseEntries,
-      1,
-      "the queued rerun ran before the in-flight refresh finished",
-    );
-
-    sessionId = chiefB;
-    await sessionStart(undefined, context);
-
-    releaseBlocked();
-    const stale = await inFlight;
-    await queued;
-    for (let index = 0; index < 10; index++)
-      await new Promise<void>((resolve) => setImmediate(resolve));
-
-    assert.equal(
-      entriesSeen - baseEntries,
-      1,
-      "the queued supervision rerun ran after the session was replaced",
-    );
-    assert.equal(
-      stale?.message,
-      undefined,
-      "the superseded refresh published a stale supervision context",
-    );
-  } finally {
-    pi.events.get("session_shutdown")?.[0]();
-    delete process.env.HERDR_PANE_ID;
-    delete process.env.HERDR_TAB_ID;
-    delete process.env.HERDR_SOCKET_PATH;
-    setLeadEnvironment();
   }
 });
 

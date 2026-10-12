@@ -32,10 +32,8 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import type {
   CoordinationMessageKind,
-  ProjectWorkSnapshot,
+  SupervisedLead,
   SupervisionSnapshot,
-  SupervisionPresentationSnapshot,
-  SupervisedManager,
 } from "./supervision.ts";
 import { herdsmanTempRoot, resultPath, resultRef } from "./storage.ts";
 
@@ -543,19 +541,10 @@ export function formatStatusCounts(agents: readonly StatusAgent[]): string {
 
 /** A presentation-only snapshot supplied by the supervision runtime. */
 export type SupervisedLeadSnapshot = Readonly<{
-  role?: "lead" | "manager";
   lead: string;
   displayName: string;
   branch?: string;
   project?: string;
-  leadCounts?: Readonly<{ active: number; blocked: number; total: number }>;
-  leads?: readonly Readonly<{
-    session: string;
-    branch?: string;
-    display_name: string;
-    runtime_state: LifecyclePresentationState;
-    agent_counts: Readonly<{ active: number; blocked: number; total: number }>;
-  }>[];
   workspaceLabel?: string;
   runtimeState: LifecyclePresentationState;
   availableActions?: readonly string[];
@@ -566,51 +555,18 @@ export type SupervisedLeadSnapshot = Readonly<{
   }>;
 }>;
 
-function managerPresentationSnapshot(
-  manager: SupervisedManager,
-): SupervisedLeadSnapshot {
-  return {
-    role: "manager",
-    lead: manager.session,
-    displayName: manager.displayName,
-    project: manager.project,
-    workspaceId: manager.workspaceId,
-    runtimeState: manager.runtimeState,
-    agentCounts: manager.agentCounts,
-    leadCounts: manager.leadCounts,
-    availableActions: manager.availableActions,
-    leads: manager.leads.map((lead) => ({
-      session: lead.session,
-      branch: "branch" in lead ? lead.branch : undefined,
-      display_name: lead.displayName,
-      runtime_state: lead.runtimeState,
-      agent_counts: lead.agentCounts,
-    })),
-  };
-}
-
 export function supervisionPresentationReports(
-  snapshot: SupervisionPresentationSnapshot | undefined,
-): SupervisedLeadSnapshot[] {
-  if (!snapshot) return [];
-  if ("managers" in snapshot) {
-    const directLeads = "leads" in snapshot ? snapshot.leads : [];
-    return [
-      ...snapshot.managers.map(managerPresentationSnapshot),
-      ...directLeads.map((lead) => ({ ...lead, role: "lead" as const })),
-    ];
-  }
-  return snapshot.leads.map((lead) => ({ ...lead, role: "lead" as const }));
+  snapshot: SupervisionSnapshot | undefined,
+): SupervisedLead[] {
+  return snapshot?.leads ?? [];
 }
 
 function presentationReports(
-  reports: readonly SupervisedLeadSnapshot[] | SupervisionPresentationSnapshot,
+  reports: readonly SupervisedLeadSnapshot[] | SupervisionSnapshot,
 ): readonly SupervisedLeadSnapshot[] {
   return Array.isArray(reports)
-    ? reports.map((report) => ({ ...report, role: report.role ?? "lead" }))
-    : supervisionPresentationReports(
-        reports as SupervisionPresentationSnapshot,
-      );
+    ? reports
+    : supervisionPresentationReports(reports as SupervisionSnapshot);
 }
 
 export type SupervisedLeadDisplay = SupervisedLeadSnapshot &
@@ -776,48 +732,10 @@ function safeLine(text: string, width: number): string {
   return truncateToWidth(text, Math.max(0, width), "…");
 }
 
-function supervisionCountLabel(managers: number, directLeads: number): string {
-  return (
-    [
-      managers ? `${managers} manager${managers === 1 ? "" : "s"}` : "",
-      directLeads
-        ? `${directLeads} direct lead${directLeads === 1 ? "" : "s"}`
-        : "",
-    ]
-      .filter(Boolean)
-      .join(" · ") || "no reports"
-  );
-}
-
-export type ManagerSupervisionItem =
-  | { kind: "work"; work: ProjectWorkSnapshot; lead?: SupervisedLeadDisplay }
-  | { kind: "lead"; lead: SupervisedLeadDisplay };
-
-/** The single ordered relationship projection used by Manager views. */
-export function managerSupervisionItems(
-  snapshot: SupervisionSnapshot,
-): ManagerSupervisionItem[] {
-  const leads = orderedSupervisionLeads(
-    supervisionPresentationReports(snapshot).filter(
-      (lead) => lead.role === "lead",
-    ),
-  );
-  const bySession = new Map(leads.map((lead) => [lead.lead, lead]));
-  const work = snapshot.work ?? [];
-  const assigned = new Set(work.map((item) => item.session));
-  return [
-    ...work.map((item) => ({
-      kind: "work" as const,
-      work: item,
-      lead: bySession.get(item.session),
-    })),
-    ...leads
-      .filter((lead) => !assigned.has(lead.lead))
-      .map((lead) => ({
-        kind: "lead" as const,
-        lead,
-      })),
-  ];
+function supervisionCountLabel(directLeads: number): string {
+  return directLeads
+    ? `${directLeads} direct lead${directLeads === 1 ? "" : "s"}`
+    : "no reports";
 }
 
 function supervisionLeadMarker(lead: SupervisedLeadDisplay): string {
@@ -829,79 +747,25 @@ function supervisionLeadMarker(lead: SupervisedLeadDisplay): string {
 
 /** Renders the bounded ambient lead rows. */
 export function renderSupervisionLeads(
-  reports: readonly SupervisedLeadSnapshot[] | SupervisionPresentationSnapshot,
+  reports: readonly SupervisedLeadSnapshot[] | SupervisionSnapshot,
   width: number,
   options: {
     status?: SupervisionContextStatus;
     ordinaryCap?: number;
-    role?: "chief" | "manager";
   } = {},
   selectedLead?: string,
 ): string[] {
   const status = options.status ?? "fresh";
-  const role = options.role ?? "chief";
   if (status === "unavailable")
-    return [safeLine(`● ${role} · unavailable`, width)];
+    return [safeLine("● chief · unavailable", width)];
   const displays = orderedSupervisionLeads(presentationReports(reports));
   const groups = groupOrderedSupervisedLeads(displays);
   const ordinary = SUPERVISION_GROUPS.flatMap((group) => groups.get(group)!);
   const cap = options.ordinaryCap ?? 6;
   const shown = ordinary.slice(0, Math.max(0, cap));
   const hidden = ordinary.length - Math.min(ordinary.length, Math.max(0, cap));
-  const managers = displays.filter((report) => report.role !== "lead").length;
-  const leads = displays.length - managers;
-  const managerSnapshot =
-    role === "manager" && !Array.isArray(reports)
-      ? (reports as SupervisionPresentationSnapshot)
-      : undefined;
-  const project =
-    managerSnapshot && "project" in managerSnapshot
-      ? managerSnapshot.project
-      : undefined;
-  const header =
-    role === "manager"
-      ? `● manager${project ? ` · ${project}` : ""}${status === "stale" ? " · stale" : ""}`
-      : `● chief · ${supervisionCountLabel(managers, leads)}${status === "stale" ? " · stale" : ""}`;
-  if (
-    managerSnapshot &&
-    "leads" in managerSnapshot &&
-    !("managers" in managerSnapshot)
-  ) {
-    const items = managerSupervisionItems(managerSnapshot);
-    const visible = items.slice(0, Math.max(0, cap));
-    const remaining = items.length - visible.length;
-    const workMarkers = {
-      active: "●",
-      paused: "○",
-      conflict: "!",
-    };
-    return [
-      safeLine(header, width),
-      ...visible.map((item, index) => {
-        const branch = index === visible.length - 1 && !remaining ? "└─" : "├─";
-        const lead = item.lead;
-        const navigation = lead && lead.lead === selectedLead ? ">" : "";
-        if (item.kind === "lead")
-          return safeLine(
-            `${branch} ${navigation}${supervisionLeadMarker(item.lead)} ${item.lead.branch ?? item.lead.displayName} · Lead`,
-            width,
-          );
-        const marker =
-          item.work.status === "active" && lead
-            ? `${lead.runtimeState === "blocked" ? "!" : ""}${supervisionLeadMarker(lead)}`
-            : workMarkers[item.work.status];
-        const prefix = `${branch} ${navigation}${marker} `;
-        const suffix = ` · ${item.work.status}`;
-        return safeLine(
-          `${prefix}${safeLine(item.work.branch, width - visibleWidth(prefix) - visibleWidth(suffix))}${suffix}`,
-          width,
-        );
-      }),
-      ...(remaining
-        ? [safeLine(`└─ … ${remaining} more · /manager`, width)]
-        : []),
-    ];
-  }
+  const header = `● chief · ${supervisionCountLabel(displays.length)}${status === "stale" ? " · stale" : ""}`;
+
   return [
     safeLine(header, width),
     ...shown.flatMap((lead, index) => {
@@ -909,43 +773,30 @@ export function renderSupervisionLeads(
       const marker = supervisionLeadMarker(lead);
       const navigation = lead.lead === selectedLead ? ">" : "";
       const indicators = navigation;
-      const counts = lead.leadCounts;
       const row = safeLine(
-        `${branch} ${indicators}${marker} ${lead.displayName}${counts?.total ? ` · ${counts.total} lead${counts.total === 1 ? "" : "s"}` : ""}${lead.agentCounts?.total ? ` · ${lead.agentCounts.total} agent${lead.agentCounts.total === 1 ? "" : "s"}` : ""}`,
+        `${branch} ${indicators}${marker} ${lead.displayName}${lead.agentCounts?.total ? ` · ${lead.agentCounts.total} agent${lead.agentCounts.total === 1 ? "" : "s"}` : ""}`,
         width,
       );
-      return [
-        row,
-        ...(lead.leads ?? [])
-          .slice(0, 3)
-          .map((child) =>
-            safeLine(
-              `   ${child.branch ?? child.display_name} · ${child.runtime_state}${child.agent_counts.total ? ` · ${child.agent_counts.total} agent${child.agent_counts.total === 1 ? "" : "s"}` : ""}`,
-              width,
-            ),
-          ),
-      ];
+      return [row];
     }),
-    ...(hidden > 0 ? [safeLine(`└─ … ${hidden} more · /${role}`, width)] : []),
+    ...(hidden > 0 ? [safeLine(`└─ … ${hidden} more · /chief`, width)] : []),
   ];
 }
 
 /** Bounded notification text; unlike TUI renderers it has no terminal width assumption. */
 export function formatSupervisionNotification(
-  reports: readonly SupervisedLeadSnapshot[] | SupervisionPresentationSnapshot,
+  reports: readonly SupervisedLeadSnapshot[] | SupervisionSnapshot,
   status: SupervisionContextStatus = "fresh",
 ): string {
   if (status === "unavailable") return "Pi Herdsman · unavailable";
   const ordered = orderedSupervisionLeads(presentationReports(reports));
-  const managers = ordered.filter((report) => report.role !== "lead").length;
-  const leads = ordered.length - managers;
   const lines = [
-    `Pi Herdsman · ${supervisionCountLabel(managers, leads)}${status === "stale" ? " · stale" : ""}`,
+    `Pi Herdsman · ${supervisionCountLabel(ordered.length)}${status === "stale" ? " · stale" : ""}`,
     ...ordered
       .slice(0, 8)
       .map(
         (lead) =>
-          `${lead.role === "lead" ? "direct lead · " : "manager · "}${classifySupervisedLead(lead).toLowerCase()}: ${lead.displayName}${lead.leadCounts?.total ? ` · ${lead.leadCounts.total} lead${lead.leadCounts.total === 1 ? "" : "s"}` : ""}${lead.agentCounts?.total ? ` · ${leadAgentCounts(lead)}` : ""}`,
+          `direct lead · ${classifySupervisedLead(lead).toLowerCase()}: ${lead.displayName}${lead.agentCounts?.total ? ` · ${leadAgentCounts(lead)}` : ""}`,
       ),
   ];
   if (ordered.length > 8) lines.push(`… ${ordered.length - 8} more · /chief`);
@@ -967,15 +818,14 @@ function supervisionValue(value: unknown): string {
     .replaceAll(">", "\\u003e");
 }
 
-/** Formats validated supervision for hidden persistent Chief or Manager context. */
+/** Formats validated supervision for hidden persistent Chief context. */
 export function formatSupervisionContext(
-  snapshot: SupervisionPresentationSnapshot | undefined,
-  options: { status: SupervisionContextStatus; role?: "chief" | "manager" },
+  snapshot: SupervisionSnapshot | undefined,
+  options: { status: SupervisionContextStatus },
 ): string {
-  const role = options.role ?? "chief";
   const header = [
     `<supervision_state status="${options.status}">`,
-    `Latest validated ${role === "chief" ? "Chief" : "Manager"} supervision snapshot.`,
+    "Latest validated Chief supervision snapshot.",
     "Persisted hidden model context. Later supervision_state blocks supersede earlier snapshots.",
     "An identical refresh may be omitted to avoid duplicate context.",
     "This is not a new user instruction or authorization.",
@@ -989,9 +839,7 @@ export function formatSupervisionContext(
       ...header,
       "",
       "Current supervision state could not be established.",
-      role === "chief"
-        ? "Do not infer that there are zero managers or direct Leads."
-        : "Do not infer that there are zero direct Leads.",
+      "Do not infer that there are zero direct Leads.",
       "Use staff_list if current supervision state is required.",
       "</supervision_state>",
     ].join("\n");
@@ -1017,14 +865,7 @@ export function formatSupervisionContext(
           "",
         ]
       : []),
-    ...(role === "chief"
-      ? [
-          `managers: ${reports.filter((report) => report.role === "manager").length}`,
-          `unclaimed_direct_leads: ${reports.filter((report) => report.role === "lead").length}`,
-        ]
-      : [
-          `direct_leads: ${reports.filter((report) => report.role === "lead").length}`,
-        ]),
+    `unclaimed_direct_leads: ${reports.length}`,
   ];
   const sections: string[] = [];
   if (snapshot?.diagnostics?.length)
@@ -1036,42 +877,7 @@ export function formatSupervisionContext(
         ),
       ].join("\n"),
     );
-  if (
-    role === "manager" &&
-    snapshot &&
-    "openWorkspaces" in snapshot &&
-    snapshot.openWorkspaces?.length
-  ) {
-    sections.push("open_workspaces:");
-    sections.push(
-      ...snapshot.openWorkspaces.map((workspace) => {
-        const branch = workspace.branch
-          ? `${supervisionValue(workspace.branch)} · `
-          : "";
-        const relation = workspace.linked ? "linked" : "primary";
-        return (
-          `  ${branch}workspace=${supervisionValue(workspace.workspaceId)}` +
-          ` · ${relation}`
-        );
-      }),
-    );
-  }
-  if (
-    role === "manager" &&
-    snapshot &&
-    "work" in snapshot &&
-    snapshot.work?.length
-  ) {
-    sections.push("project_work:");
-    sections.push(
-      ...snapshot.work.map(
-        (work) =>
-          `  ${supervisionValue(work.branch)} · ${supervisionValue(work.status)}` +
-          `${work.runtimeState ? ` · runtime=${supervisionValue(work.runtimeState)}` : ""}` +
-          `${work.issue ? ` · ${supervisionValue(work.issue)}` : ""}`,
-      ),
-    );
-  }
+
   for (const displayed of orderedSupervisionLeads(reports)) {
     const lead = leads.get(displayed.lead);
     if (!lead) continue;
@@ -1093,17 +899,6 @@ export function formatSupervisionContext(
     lines.push(
       `  agent_counts: active=${supervisionValue(lead.agentCounts.active)} blocked=${supervisionValue(lead.agentCounts.blocked)} total=${supervisionValue(lead.agentCounts.total)}`,
     );
-    if (lead.leadCounts)
-      lines.push(
-        `  lead_counts: active=${lead.leadCounts.active} blocked=${lead.leadCounts.blocked} total=${lead.leadCounts.total}`,
-      );
-    if (lead.leads?.length) {
-      lines.push("  descendant_leads (observation only; no staff actions):");
-      for (const child of lead.leads.slice(0, 32))
-        lines.push(
-          `    ${supervisionValue(child.display_name)} · ${supervisionValue(child.runtime_state)} · session=${supervisionValue(child.session)} · agents=${supervisionValue(child.agent_counts.total)}`,
-        );
-    }
     sections.push(lines.join("\n"));
   }
   const closing = "</supervision_state>";
@@ -1130,17 +925,14 @@ export function formatSupervisionContext(
 
 /** Width-aware compact widget for the ambient status area. */
 export function createSupervisionWidget(
-  getLeads: () =>
-    readonly SupervisedLeadSnapshot[] | SupervisionPresentationSnapshot,
+  getLeads: () => readonly SupervisedLeadSnapshot[] | SupervisionSnapshot,
   getStatus: () => SupervisionContextStatus,
-  role: "chief" | "manager" = "chief",
 ): { render(width: number): string[]; invalidate(): void } {
   return {
     render(width) {
       return renderSupervisionLeads(getLeads(), width, {
         status: getStatus(),
         ordinaryCap: 6,
-        role,
       }).filter((line) => line.length > 0);
     },
     invalidate() {},
@@ -1214,31 +1006,6 @@ export function renderSupervisionPeek(
     for (const line of renderProcessEvidence(evidence.process))
       if (!add(line)) break;
   return lines;
-}
-
-export function retainSupervisionSelection(
-  selected: string | undefined,
-  leads: readonly SupervisedLeadSnapshot[],
-): string | undefined {
-  const ordered = orderedSupervisionLeads(leads);
-  return ordered.some((lead) => lead.lead === selected)
-    ? selected
-    : ordered[0]?.lead;
-}
-
-export function moveSupervisionSelection(
-  selected: string | undefined,
-  leads: readonly SupervisedLeadSnapshot[],
-  delta: number,
-): string | undefined {
-  const ordered = orderedSupervisionLeads(leads);
-  if (!ordered.length) return undefined;
-  const index = Math.max(
-    0,
-    ordered.findIndex((lead) => lead.lead === selected),
-  );
-  const next = Math.min(ordered.length - 1, Math.max(0, index + delta));
-  return ordered[next]!.lead;
 }
 
 function value(v: unknown): string {
@@ -1353,6 +1120,32 @@ export function formatSkills(definition: Record<string, unknown>): string {
   if (!discovered) return skills.length ? skills.join(", ") : "none";
   return skills.length ? `default + ${skills.join(", ")}` : "default";
 }
+
+/**
+ * Saved sessions are durable history, not current control eligibility, so they
+ * render separately from live agents and carry no `available_tools`.
+ */
+function savedSessionLines(sessions: readonly unknown[]): string[] {
+  return sessions.flatMap((session) => {
+    if (!session || typeof session !== "object") return [];
+    const saved = session as Record<string, unknown>;
+    const definition = value(saved.agent_definition);
+    const result =
+      saved.last_result && typeof saved.last_result === "object"
+        ? (saved.last_result as Record<string, unknown>)
+        : {};
+    const status = value(result.status);
+    const selector = value(saved.pi_session_id) || value(saved.pi_session_path);
+    return [
+      `  ${value(saved.agent) || "unknown"} · ${[
+        ...(definition ? [`definition ${definition}`] : []),
+        ...(status ? [`last result ${status}`] : []),
+      ].join(" · ")}`,
+      ...(selector ? [`    session: ${selector}`] : []),
+    ];
+  });
+}
+
 export function formatAgentDefinitions(
   definitions: Record<string, unknown>[],
 ): string[] {
@@ -1811,6 +1604,9 @@ export function formatToolModelResult(
     const definitions = Array.isArray(v.agent_definitions)
       ? (v.agent_definitions as Record<string, unknown>[])
       : [];
+    const savedSessions = Array.isArray(v.saved_sessions)
+      ? v.saved_sessions
+      : [];
     const roots = agents.filter((agent) => !value(agent.parent_label));
     const children = (parent: Record<string, unknown>) => {
       const parentLabel = value(parent.agent);
@@ -1882,6 +1678,13 @@ export function formatToolModelResult(
         ? [
             "Unmatched ancestry (recovery only):",
             ...fallbackAgents.flatMap((agent) => agentLines(agent, "  ", true)),
+            "",
+          ]
+        : []),
+      ...(savedSessions.length
+        ? [
+            "Saved sessions (continue with agent_continue):",
+            ...savedSessionLines(savedSessions),
             "",
           ]
         : []),
@@ -2399,6 +2202,13 @@ function expandedResultLines(
     lines.push(
       "",
       ...agentHierarchy(details),
+      ...(Array.isArray(details.saved_sessions) && details.saved_sessions.length
+        ? [
+            "",
+            "Saved sessions (continue with agent_continue):",
+            ...savedSessionLines(details.saved_sessions),
+          ]
+        : []),
       ...(Array.isArray(details.agent_definitions) &&
       details.agent_definitions.length
         ? [
@@ -2654,15 +2464,12 @@ export function renderCoordinationResult(
         lead?.runtime_state === "settling" ||
         lead?.runtime_state === "starting",
     ).length;
-    const role = value(
-      (details.self as Record<string, unknown> | undefined)?.role,
-    );
     return new WidthSafeText(
       humanText(
         theme,
         "toolTitle",
         [
-          `staff ${reports.length} ${role === "chief" ? "managers" : "leads"}`,
+          `staff ${reports.length} leads`,
           active ? `${active} active` : "",
         ]
           .filter(Boolean)
@@ -2857,14 +2664,12 @@ export function renderCoordinationMessage(
     details?: {
       fromSessionId?: string;
       leadSessionId?: string;
-      branch?: string;
     };
   },
   options: { expanded?: boolean; outputPad?: number },
   theme: any,
 ): TuiBox {
   const d = message.details;
-  const branch = d?.branch ?? "project work";
   let heading: string;
   let prefix: string | undefined;
   switch (kind) {
@@ -2876,17 +2681,9 @@ export function renderCoordinationMessage(
       heading = "Chief message";
       if (d?.fromSessionId) prefix = `From chief ${d.fromSessionId}: `;
       break;
-    case "manager_message":
-      heading = "Manager message";
-      if (d?.fromSessionId) prefix = `From manager ${d.fromSessionId}: `;
-      break;
     case "peer_message":
       heading = "Peer message";
       if (d?.fromSessionId) prefix = `Peer message from ${d.fromSessionId}: `;
-      break;
-    case "project_assignment":
-      heading = statusLine(theme, "accent", "→", `${branch} assigned`);
-      if (d?.branch) prefix = `Project assignment for branch ${d.branch}:\n\n`;
       break;
   }
   let body = message.content ?? "";
@@ -2894,14 +2691,8 @@ export function renderCoordinationMessage(
   const content = new Container();
   content.addChild(new WidthSafeText(heading, 0, 0));
   if (options.expanded) {
-    const session =
-      kind === "project_assignment"
-        ? undefined
-        : (d?.fromSessionId ?? d?.leadSessionId);
-    const metadata = [
-      ...(d?.branch ? [`branch: ${d.branch}`] : []),
-      ...(session ? [`session: ${session}`] : []),
-    ];
+    const session = d?.fromSessionId ?? d?.leadSessionId;
+    const metadata = session ? [`session: ${session}`] : [];
     if (metadata.length) {
       content.addChild(new Spacer(1));
       content.addChild(new WidthSafeText(metadata.join("\n"), 0, 0));
@@ -3228,16 +3019,18 @@ export function renderAgentLostMessage(
         ...(value(details.paneId) ? [`pane: ${value(details.paneId)}`] : []),
         "",
         ...(closeAvailable
-          ? ["Close this lost generation before replacing or continuing it."]
+          ? [
+              "Continue this lost generation with agent_continue and its exact session, or close it with agent_close to abandon the assignment.",
+            ]
           : [
-              "Close is not currently available; resolve the condition blocking its close preflight before replacing or continuing it.",
+              "Close is not currently available; resolve the condition blocking its close preflight before abandoning this generation. Continuing it with agent_continue does not depend on it.",
             ]),
       ]
     : [
         statusLine(theme, "error", "×", `${label} lost`),
         closeAvailable
-          ? "  assignment remains unresolved · close before replacing or continuing"
-          : "  assignment remains unresolved · close unavailable; resolve the blocking close-preflight condition first",
+          ? "  assignment remains unresolved · continue with agent_continue or close"
+          : "  assignment remains unresolved · close unavailable; continue with agent_continue instead",
       ];
   return renderMessageBox(
     new WidthSafeText(lines.join("\n"), 0, 0),

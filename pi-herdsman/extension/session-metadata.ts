@@ -12,7 +12,7 @@ import { isDeepStrictEqual } from "node:util";
  */
 export const SESSION_METADATA_ENTRY = "pi-herdsman-session-metadata";
 export const SESSION_METADATA_VERSION = 1;
-export const OPERATOR_ROLES = ["lead", "manager", "chief"] as const;
+export const OPERATOR_ROLES = ["lead", "chief"] as const;
 
 export type OperatorRole = (typeof OPERATOR_ROLES)[number];
 export type OperatorSessionMetadata = {
@@ -89,7 +89,8 @@ function parseSessionMetadata(
   if (data.kind === "operator") {
     if (!sameKeys(keys, OPERATOR_KEYS))
       return invalid(`unexpected operator fields ${keys.join(", ")}`);
-    const role = text(data.role);
+    // A persisted `manager` role predates Manager removal and reads as Lead.
+    const role = text(data.role) === "manager" ? "lead" : text(data.role);
     if (!role || !(OPERATOR_ROLES as readonly string[]).includes(role))
       return invalid(`unknown operator role ${JSON.stringify(data.role)}`);
     return {

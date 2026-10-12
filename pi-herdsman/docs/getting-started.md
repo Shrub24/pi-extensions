@@ -109,25 +109,18 @@ API.
 See [Status widget](reference/status-widget.md) and
 [Agents and identity](concepts/agents.md).
 
-## 7. Scale to project orchestration
+## 7. Supervise Leads from Chief
 
-When one Lead and its Agent tree are no longer the right coordination boundary,
-an eligible Lead in the primary workspace can enter Manager mode:
+An eligible Lead can enter Chief mode to supervise its ordinary Leads directly:
 
 ```text
-/manager
+/chief
 ```
 
-Manager coordinates durable branch-based work across Leads. It does not own
-their Agents or implement through an Agent tree of its own. No prior chat turn
-or existing linked worktree is required in an ordinary Git primary workspace.
-
-Continue with [Project orchestration](guides/project-orchestration.md). For the
-role and authority model, read [Coordination](concepts/coordination.md).
+For the role and authority model, read [Coordination](concepts/coordination.md).
 
 ## Next steps
 
 - Keep delegating naturally through the Lead conversation.
-- Use [Project orchestration](guides/project-orchestration.md) for independent branch-based work.
 - Use [Coordination API](coordination-api.md) when you need exact model-facing interfaces.
 - Use [Recovery](guides/recovery.md) only when normal coordination cannot converge safely.

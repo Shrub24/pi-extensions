@@ -25,7 +25,7 @@ schema is:
 
 ```json
 {
-  "spawnPlacement": "subtree",
+  "spawnPlacement": "split",
   "contextRetirement": false,
   "retainWorkers": true,
   "softTimeoutMs": 300000,
@@ -42,7 +42,7 @@ An absent file means these defaults:
 
 | Field                        |            Default | Allowed values                                    |
 | ---------------------------- | -----------------: | ------------------------------------------------- |
-| `spawnPlacement`             |          `subtree` | `tab`, `subtree`, `split`                         |
+| `spawnPlacement`             |            `split` | `tab`, `subtree`, `split`                         |
 | `contextRetirement`          |              false | boolean                                           |
 | `retainWorkers`              |               true | boolean                                           |
 | `softTimeoutMs`              |          `300000`  | integer from 0 (disabled) through 2147483647      |
@@ -57,9 +57,11 @@ Malformed JSON, a non-object root, unknown fields, and invalid known values
 are errors. Reads do not create the directory or file. Configuration changes
 through `/agents` update this single file atomically.
 
-`spawnPlacement: "split"` keeps children in the caller's tab. The first child
-splits to the right by default; later children split the largest existing agent
-pane vertically, keeping the lead wide instead of adding narrow columns.
+`spawnPlacement` asks for the layout a fresh managed worker is placed in. The
+shipped default is `split`: the Radar daemon spawns a worker beside its parent's
+registered pane, which is the one placement it creates. `tab` and `subtree`
+describe layouts the daemon cannot create yet, so an explicit setting of either
+refuses before anything starts rather than silently taking a different pane.
 
 `inlineAttachmentLimitBytes` applies per file. Eligible complete strict UTF-8
 files are embedded only when the exact serialized mailbox record fits; other
@@ -114,7 +116,8 @@ delivers the next assignment into the same live process. A failure, including a
 rejected answer or a model error, therefore never costs the pane or its context;
 the owner can steer, continue or retry it. Release an `idle` worker with
 `agent_close` or the `/agents` → `Clear idle` action. Set `false` for one-shot
-workers that are cleaned up after delivery.
+workers whose process and pane are cleaned up after delivery; their Pi sessions
+remain continuable through `agent_continue`.
 
 `disabledDefinitions` takes definition names out of the offered roster. A
 named definition disappears from the lead roster, the `/agents` menu, and every
@@ -152,7 +155,8 @@ definition governs the model a grandchild inherits.
 Placement affects future starts, not existing agents. `tab` uses one lead-owned
 agents tab, `subtree` gives each lead-direct agent its own tab, and `split`
 splits from the caller's pane. Nested delegation always splits in its owner's
-current tab.
+current tab. Under Radar spawn only `split` is transportable: a `tab` or
+`subtree` placement refuses before any effect rather than taking another pane.
 
 ## Reset
 

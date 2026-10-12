@@ -14,6 +14,7 @@ import test from "node:test";
 import {
 	RADAR_MAX_LINE_BYTES,
 	createRadarClient,
+	watchRadarEvents,
 	untrustedControlSocket,
 	type RadarClient,
 	type RadarClientOptions,
@@ -45,12 +46,13 @@ function materialise(value: unknown): any {
 
 /**
  * The daemon contract fixture vendored byte-for-byte from agent-radar at commit
- * `da0ba99a09643736e39c44903d69ffdc1e5df65b`
- * (`docs/reference/agent-registration.fixture.jsonl`). Vendored rather than
- * fetched so the wire this client encodes stays pinned to a reviewable revision.
- * The mutable-context feature pin is `4e37697826c2ba4a28c92a93e22747df2bc7097e`;
- * `a46f27ae` added a replacement example, and `da0ba99a` makes the daemon validator
- * assert full response equality after substituting only generated values.
+ * `f87348032a808967c50a4e84b7e1c766a64ebfe3`
+ * (`docs/agent-registration.fixture.jsonl`). Vendored rather than fetched so the
+ * wire this client encodes stays pinned to a reviewable revision. That revision
+ * is the protocol-2 clean break: every envelope is version 2, the removed
+ * version-1 method names are gone, a spawn edge's public projection is flattened
+ * into `spawn.get`/`spawn.list`, and the spawn/close exchanges the pinned daemon
+ * itself asserts are the appendix to this file.
  * The vendor fixture's own request/response pairs, in file order.
  */
 function fixtureExchanges(): Array<{ request: any; response: any }> {
@@ -169,10 +171,500 @@ function cleanup(fixture: Fixture): void {
 	if (fixture.server.listening) fixture.server.close();
 }
 
+const OBSERVED_AGENTS = [
+	{
+		location: { workspace_id: "wA", tab_id: "wA:t1", pane_id: "wA:p1" },
+		name: "pi",
+		session: { kind: "uuid", value: UUID_A },
+	},
+	{
+		location: { workspace_id: "wA", tab_id: "wA:t1", pane_id: "wA:p2" },
+		session: {
+			kind: "reported",
+			value: { source: "herdr:pi", value: "/tmp/session.jsonl" },
+		},
+	},
+	{
+		location: { workspace_id: "wA", tab_id: "wA:t1", pane_id: "wA:p3" },
+		session: null,
+	},
+	{ location: { workspace_id: "wA", tab_id: "wA:t1", pane_id: "wA:p4" } },
+];
+
+const OBSERVED_INVENTORY = {
+	workspaces: [{ workspace_id: "wA", label: "main", number: 1 }],
+	tabs: [{ tab_id: "wA:t1", workspace_id: "wA" }],
+	panes: [
+		{ location: { workspace_id: "wA", tab_id: "wA:t1", pane_id: "wA:p1" }, title: "pi" },
+		{ location: { workspace_id: "wA", tab_id: "wA:t1", pane_id: "wA:p2" } },
+	],
+	agents: OBSERVED_AGENTS,
+};
+
+test("observe decodes the whole canonical fleet inventory", async () => {
+	const fixture = makeFixture((request) => {
+		if (request.method === "daemon.ping")
+			return reply(request, {
+				protocol: 2,
+				capabilities: ["registry.v1", "mux.observe"],
+			});
+		assert.equal(request.method, "mux.observe");
+		assert.deepEqual(request.params, {});
+		return reply(request, { inventory: OBSERVED_INVENTORY });
+	});
+	try {
+		await listen(fixture);
+		assert.deepEqual(await fixture.client().observe(), {
+			ok: true,
+			value: {
+				workspaces: [{ workspace_id: "wA" }],
+				tabs: [{ tab_id: "wA:t1", workspace_id: "wA" }],
+				panes: [
+					{ workspace_id: "wA", tab_id: "wA:t1", pane_id: "wA:p1" },
+					{ workspace_id: "wA", tab_id: "wA:t1", pane_id: "wA:p2" },
+				],
+				agents: [
+					{
+						workspace_id: "wA",
+						tab_id: "wA:t1",
+						pane_id: "wA:p1",
+						name: "pi",
+						session: { kind: "uuid", value: UUID_A },
+					},
+					{
+						workspace_id: "wA",
+						tab_id: "wA:t1",
+						pane_id: "wA:p2",
+						session: {
+							kind: "reported",
+							value: "/tmp/session.jsonl",
+							source: "herdr:pi",
+						},
+					},
+					{ workspace_id: "wA", tab_id: "wA:t1", pane_id: "wA:p3" },
+					{ workspace_id: "wA", tab_id: "wA:t1", pane_id: "wA:p4" },
+				],
+			},
+		});
+	} finally {
+		cleanup(fixture);
+	}
+});
+
+test("observe preserves a managed label, run and an unrecognized status", async () => {
+	const fixture = makeFixture((request) => {
+		if (request.method === "daemon.ping")
+			return reply(request, {
+				protocol: 2,
+				capabilities: ["registry.v1", "mux.observe"],
+			});
+		return reply(request, {
+			inventory: {
+				workspaces: [],
+				tabs: [],
+				panes: [],
+				agents: [
+					{
+						location: { workspace_id: "wA", tab_id: "wA:t1", pane_id: "wA:p1" },
+						status: { other: "compacting" },
+						facts: { label: "worker", run: "run-1" },
+					},
+				],
+			},
+		});
+	});
+	try {
+		await listen(fixture);
+		const answer = await fixture.client().observe();
+		assert.equal(answer.ok, true, JSON.stringify(answer));
+		assert.deepEqual(answer.ok ? answer.value.agents[0] : undefined, {
+			workspace_id: "wA",
+			tab_id: "wA:t1",
+			pane_id: "wA:p1",
+			status: "compacting",
+			managed_label: "worker",
+			managed_run: "run-1",
+		});
+	} finally {
+		cleanup(fixture);
+	}
+});
+
+test("an inventory missing any canonical array is a malformed observation", async () => {
+	// A tmux-backed daemon reports panes and no agents at all, so an absent array
+	// is a broken observation rather than an empty fleet.
+	const fixture = makeFixture((request) => {
+		if (request.method === "daemon.ping")
+			return reply(request, {
+				protocol: 2,
+				capabilities: ["registry.v1", "mux.observe"],
+			});
+		return reply(request, {
+			inventory: { workspaces: [], tabs: [], agents: [] },
+		});
+	});
+	try {
+		await listen(fixture);
+		const answer = await fixture.client().observe();
+		assert.equal(answer.ok, false);
+		assert.equal(answer.ok ? "" : answer.code, "protocol");
+	} finally {
+		cleanup(fixture);
+	}
+});
+
+test("observe negotiates its capability and decodes observed locations and sessions", async () => {
+	const fixture = makeFixture((request) => {
+		if (request.method === "daemon.ping")
+			return reply(request, {
+				protocol: 2,
+				capabilities: ["registry.v1", "mux.observe"],
+			});
+		assert.equal(request.method, "mux.observe");
+		assert.deepEqual(request.params, {});
+		return reply(request, {
+			inventory: {
+				workspaces: [],
+				tabs: [],
+				panes: [],
+				agents: OBSERVED_AGENTS,
+			},
+		});
+	});
+	try {
+		await listen(fixture);
+		const answer = await fixture.client().observe();
+		assert.equal(answer.ok, true, JSON.stringify(answer));
+		assert.deepEqual(answer.ok ? answer.value.agents : undefined, [
+			{
+				workspace_id: "wA",
+				tab_id: "wA:t1",
+				pane_id: "wA:p1",
+				name: "pi",
+				session: { kind: "uuid", value: UUID_A },
+			},
+			{
+				workspace_id: "wA",
+				tab_id: "wA:t1",
+				pane_id: "wA:p2",
+				session: {
+					kind: "reported",
+					value: "/tmp/session.jsonl",
+					source: "herdr:pi",
+				},
+			},
+			{ workspace_id: "wA", tab_id: "wA:t1", pane_id: "wA:p3" },
+			{ workspace_id: "wA", tab_id: "wA:t1", pane_id: "wA:p4" },
+		]);
+	} finally {
+		cleanup(fixture);
+	}
+});
+
+test("observe refuses an inventory it cannot decode exactly", async () => {
+	for (const agents of [
+		[{ location: { workspace_id: "wA", tab_id: "wA:t1" } }],
+		[
+			{
+				location: { workspace_id: "wA", tab_id: "wA:t1", pane_id: "wA:p1" },
+				session: { kind: "reported", value: "/tmp/session.jsonl" },
+			},
+		],
+		[
+			{
+				location: { workspace_id: "wA", tab_id: "wA:t1", pane_id: "wA:p1" },
+				session: { kind: "session", value: "not-a-uuid" },
+			},
+		],
+	]) {
+		const fixture = makeFixture((request) =>
+			request.method === "daemon.ping"
+				? reply(request, {
+						protocol: 2,
+						capabilities: ["registry.v1", "mux.observe"],
+					})
+				: reply(request, { inventory: { agents } }),
+		);
+		try {
+			await listen(fixture);
+			const result = await fixture.client().observe();
+			assert.equal(result.ok, false);
+			assert.equal(result.ok ? "" : result.code, "protocol");
+		} finally {
+			cleanup(fixture);
+		}
+	}
+});
+
+test("observe without its capability is an explicit refusal that dispatches nothing", async () => {
+	const fixture = makeFixture((request) =>
+		reply(request, { protocol: 2, capabilities: ["registry.v1"] }),
+	);
+	try {
+		await listen(fixture);
+		const result = await fixture.client().observe();
+		assert.equal(result.ok === true ? "" : result.code, "unsupported");
+		assert.match(result.ok === true ? "" : result.message, /does not provide `mux\.observe`/);
+		assert.deepEqual(
+			fixture.requests.map((request) => request.method),
+			["daemon.ping"],
+		);
+	} finally {
+		cleanup(fixture);
+	}
+});
+
+test("focus dispatches one pane target and keeps the caller's operation UUID", async () => {
+	const fixture = makeFixture((request) => {
+		if (request.method === "daemon.ping")
+			return reply(request, {
+				protocol: 2,
+				capabilities: ["registry.v1", "mux.focus"],
+			});
+		assert.equal(request.method, "mux.focus");
+		assert.equal(request.id, UUID_A);
+		assert.deepEqual(request.params, {
+			target: "wA:p1",
+			target_kind: "pane",
+			requester: "pi-herdsman",
+		});
+		return reply(request, {
+			request: {
+				id: UUID_A,
+				method: "mux.focus",
+				state: "completed",
+				outcome: "completed",
+				effects: ["mux.focus"],
+			},
+		});
+	});
+	try {
+		await listen(fixture);
+		assert.deepEqual(
+			await fixture.client().focus({ request_id: UUID_A, pane_id: "wA:p1" }),
+			{ ok: true, value: { request_id: UUID_A } },
+		);
+	} finally {
+		cleanup(fixture);
+	}
+});
+
+test("focus requires a canonical operation UUID and dials nothing without one", async () => {
+	const fixture = makeFixture(() => undefined);
+	try {
+		const result = await fixture.client().focus({
+			request_id: "not-a-uuid",
+			pane_id: "wA:p1",
+		});
+		assert.equal(result.ok === true ? "" : result.code, "bad_params");
+		assert.equal(fixture.dialled, 0);
+		assert.deepEqual(fixture.requests, []);
+	} finally {
+		cleanup(fixture);
+	}
+});
+
+test("focus without its capability is an explicit refusal that dispatches nothing", async () => {
+	const fixture = makeFixture((request) =>
+		reply(request, { protocol: 2, capabilities: ["registry.v1", "mux.observe"] }),
+	);
+	try {
+		await listen(fixture);
+		const result = await fixture.client().focus({
+			request_id: UUID_A,
+			pane_id: "wA:p1",
+		});
+		assert.equal(result.ok === true ? "" : result.code, "unsupported");
+		assert.match(result.ok === true ? "" : result.message, /does not provide `mux\.focus`/);
+		assert.deepEqual(
+			fixture.requests.map((request) => request.method),
+			["daemon.ping"],
+		);
+	} finally {
+		cleanup(fixture);
+	}
+});
+
+test("a refused focus record is a refusal, never an unresolved operation", async () => {
+	const fixture = makeFixture((request) =>
+		request.method === "daemon.ping"
+			? reply(request, {
+					protocol: 2,
+					capabilities: ["registry.v1", "mux.focus"],
+				})
+			: reply(request, {
+					request: {
+						id: UUID_A,
+						method: "mux.focus",
+						state: "completed",
+						outcome: "refused",
+						message: "the backend refused to focus the pane",
+					},
+				}),
+	);
+	try {
+		await listen(fixture);
+		const result = await fixture.client().focus({
+			request_id: UUID_A,
+			pane_id: "wA:p1",
+		});
+		assert.equal(result.ok === true ? "" : result.code, "refused");
+		assert.equal(
+			result.ok === true ? "" : result.message,
+			"the backend refused to focus the pane",
+		);
+	} finally {
+		cleanup(fixture);
+	}
+});
+
+test("a lost focus reply is read back by its exact UUID and never resent", async () => {
+	for (const record of [
+		{
+			id: UUID_A,
+			method: "mux.focus",
+			state: "completed",
+			outcome: "unknown",
+		},
+		{ id: UUID_A, method: "mux.focus", state: "started" },
+		undefined,
+	]) {
+		let lost = false;
+		const fixture = makeFixture((request) => {
+			if (request.method === "daemon.ping")
+				return reply(request, {
+					protocol: 2,
+					capabilities: ["registry.v1", "mux.focus"],
+				});
+			if (request.method === "mux.focus") {
+				lost = true;
+				return undefined;
+			}
+			assert.equal(request.method, "mux.request.get");
+			assert.deepEqual(request.params, { id: UUID_A });
+			if (record === undefined) return refuse(request, "not_found", "no request");
+			return reply(request, { request: record });
+		});
+		try {
+			await listen(fixture);
+			const result = await fixture
+				.client({ timeoutMs: 20 })
+				.focus({ request_id: UUID_A, pane_id: "wA:p1" });
+			assert.ok(lost);
+			assert.equal(result.ok === true ? "" : result.code, "unknown");
+			assert.match(result.ok === true ? "" : result.message, new RegExp(UUID_A));
+			assert.deepEqual(
+				fixture.requests.map((request) => [request.method, request.id]),
+				[
+					["daemon.ping", fixture.requests[0]!.id],
+					["mux.focus", UUID_A],
+					["mux.request.get", fixture.requests[2]!.id],
+				],
+			);
+		} finally {
+			cleanup(fixture);
+		}
+	}
+});
+
+test("a lost focus reply whose record completed settles as completed", async () => {
+	const fixture = makeFixture((request) => {
+		if (request.method === "daemon.ping")
+			return reply(request, {
+				protocol: 2,
+				capabilities: ["registry.v1", "mux.focus"],
+			});
+		if (request.method === "mux.focus") return undefined;
+		return reply(request, {
+			request: {
+				id: UUID_A,
+				method: "mux.focus",
+				state: "completed",
+				outcome: "completed",
+				effects: ["mux.focus"],
+			},
+		});
+	});
+	try {
+		await listen(fixture);
+		assert.deepEqual(
+			await fixture.client({ timeoutMs: 20 }).focus({
+				request_id: UUID_A,
+				pane_id: "wA:p1",
+			}),
+			{ ok: true, value: { request_id: UUID_A } },
+		);
+		assert.deepEqual(
+			fixture.requests
+				.filter((request) => request.method === "mux.focus")
+				.map((request) => request.id),
+			[UUID_A],
+		);
+	} finally {
+		cleanup(fixture);
+	}
+});
+
+test("an internal focus failure is unresolved rather than a refusal", async () => {
+	const fixture = makeFixture((request) => {
+		if (request.method === "daemon.ping")
+			return reply(request, {
+				protocol: 2,
+				capabilities: ["registry.v1", "mux.focus"],
+			});
+		if (request.method === "mux.focus") return refuse(request, "internal", "boom");
+		assert.equal(request.method, "mux.request.get");
+		assert.deepEqual(request.params, { id: UUID_A });
+		return reply(request, {
+			request: { id: UUID_A, method: "mux.focus", state: "started" },
+		});
+	});
+	try {
+		await listen(fixture);
+		const result = await fixture.client().focus({
+			request_id: UUID_A,
+			pane_id: "wA:p1",
+		});
+		assert.equal(result.ok === true ? "" : result.code, "unknown");
+	} finally {
+		cleanup(fixture);
+	}
+});
+
+test("a focus reply carrying no operation record is unresolved, never success", async () => {
+	const fixture = makeFixture((request) => {
+		if (request.method === "daemon.ping")
+			return reply(request, {
+				protocol: 2,
+				capabilities: ["registry.v1", "mux.focus"],
+			});
+		if (request.method === "mux.focus") return reply(request, {});
+		return refuse(request, "unknown_method", "unexpected method");
+	});
+	try {
+		await listen(fixture);
+		const result = await fixture.client().focus({
+			request_id: UUID_A,
+			pane_id: "wA:p1",
+		});
+		assert.equal(result.ok === true ? "" : result.code, "unknown");
+		assert.match(
+			result.ok === true ? "" : result.message,
+			/returned no operation record/u,
+		);
+	} finally {
+		cleanup(fixture);
+	}
+});
+
 test("child.close sends the exact spawn edge and accepts only confirmed pane closure", async () => {
 	const fixture = makeFixture((request) => {
-		if (request.method === "ping") return reply(request, { protocol: 1, capabilities: ["agent_registry"] });
-		assert.equal(request.method, "child.close");
+		if (request.method === "daemon.ping")
+			return reply(request, {
+				protocol: 2,
+				capabilities: ["registry.v1", "spawn.close.v1"],
+			});
+		assert.equal(request.method, "spawn.close");
 		assert.deepEqual(request.params, {
 			spawn_request_id: UUID_A,
 			source: "herdsman-child",
@@ -193,9 +685,51 @@ test("child.close sends the exact spawn edge and accepts only confirmed pane clo
 	} finally { cleanup(fixture); }
 });
 
+test("agent.get decodes each process verdict exactly as the daemon names it", async () => {
+	for (const verification of ["verified", "absent", "mismatched", "unavailable"]) {
+		const fixture = makeFixture((request) =>
+			request.method === "daemon.ping"
+				? reply(request, { protocol: 2, capabilities: ["registry.v1"] })
+				: reply(request, { agent: { registration: {}, process: { claimed: true, verification } } }),
+		);
+		try {
+			await listen(fixture);
+			assert.deepEqual(await fixture.client().agentGet(UUID_A), {
+				ok: true,
+				value: { claimed: true, verification },
+			});
+			const read = fixture.requests.find((request) => request.method === "agent.get");
+			assert.deepEqual(read.params, { agent_id: UUID_A });
+		} finally { cleanup(fixture); }
+	}
+});
+
+test("agent.get refuses a reply with no known verdict and passes not_found through", async () => {
+	const malformed = makeFixture((request) =>
+		request.method === "daemon.ping"
+			? reply(request, { protocol: 2, capabilities: ["registry.v1"] })
+			: reply(request, { agent: { process: { claimed: true, verification: "probably_gone" } } }),
+	);
+	const missing = makeFixture((request) =>
+		request.method === "daemon.ping"
+			? reply(request, { protocol: 2, capabilities: ["registry.v1"] })
+			: refuse(request, "not_found", "unknown agent"),
+	);
+	try {
+		await listen(malformed);
+		const verdict = await malformed.client().agentGet(UUID_A);
+		assert.equal(verdict.ok, false);
+		assert.equal(verdict.ok ? "" : verdict.code, "protocol");
+		await listen(missing);
+		const absent = await missing.client().agentGet(UUID_A);
+		assert.equal(absent.ok, false);
+		assert.equal(absent.ok ? "" : absent.code, "not_found");
+	} finally { cleanup(malformed); cleanup(missing); }
+});
+
 test("child.close unknown outcome is preserved as failure", async () => {
-	const fixture = makeFixture((request) => request.method === "ping"
-		? reply(request, { protocol: 1, capabilities: ["agent_registry"] })
+	const fixture = makeFixture((request) => request.method === "daemon.ping"
+		? reply(request, { protocol: 2, capabilities: ["registry.v1", "spawn.close.v1"] })
 		: refuse(request, "backend_unavailable", "managed child close outcome is unknown"));
 	try {
 		await listen(fixture);
@@ -233,15 +767,15 @@ test("an untrusted control socket is refused without dialling", async () => {
 	}
 });
 
-test("ping requires protocol 1 and the agent_registry capability", async () => {
+test("daemon.ping requires protocol 2 and the registry.v1 contract", async () => {
 	const answers = [
 		(request: any) =>
-			reply(request, { protocol: 2, capabilities: ["agent_registry"] }),
+			reply(request, { protocol: 1, capabilities: ["registry.v1"] }),
 		(request: any) =>
 			reply(request, {
-				protocol: 1,
+				protocol: 2,
 				backend: "sqlite",
-				capabilities: ["agent_registry"],
+				capabilities: ["registry.v1"],
 			}),
 	];
 	const fixture = makeFixture((request) => answers.shift()?.(request));
@@ -255,11 +789,32 @@ test("ping requires protocol 1 and the agent_registry capability", async () => {
 		assert.deepEqual(capable, {
 			ok: true,
 			value: {
-				protocol: 1,
+				protocol: 2,
 				backend: "sqlite",
-				capabilities: ["agent_registry"],
+				capabilities: ["registry.v1"],
 			},
 		});
+	} finally {
+		cleanup(fixture);
+	}
+});
+
+test("a handshake carries the instance the backend addresses", async () => {
+	// The server a tmux daemon drives is its own fact, and a client that has to
+	// name a pane of that server reads it here rather than from its environment.
+	const fixture = makeFixture((request) =>
+		reply(request, {
+			protocol: 2,
+			backend: "tmux",
+			instance: "work",
+			capabilities: ["registry.v1"],
+		}),
+	);
+	try {
+		await listen(fixture);
+		const ready = await fixture.client().ping();
+		assert.equal(ready.ok, true, JSON.stringify(ready));
+		assert.equal(ready.ok ? ready.value.instance : undefined, "work");
 	} finally {
 		cleanup(fixture);
 	}
@@ -268,11 +823,11 @@ test("ping requires protocol 1 and the agent_registry capability", async () => {
 test("failed registry negotiation is retried on the same client", async () => {
 	let negotiations = 0;
 	const fixture = makeFixture((request) => {
-		if (request.method === "ping") {
+		if (request.method === "daemon.ping") {
 			negotiations += 1;
 			return negotiations === 1
 				? undefined
-				: reply(request, { protocol: 1, capabilities: ["agent_registry"] });
+				: reply(request, { protocol: 2, capabilities: ["registry.v1"] });
 		}
 		return reply(request, { registration: { agent_id: UUID_A } });
 	});
@@ -293,14 +848,14 @@ test("failed registry negotiation is retried on the same client", async () => {
 
 test("ping refuses a daemon that cannot register agents", async () => {
 	const fixture = makeFixture((request) =>
-		reply(request, { protocol: 1, capabilities: ["presence"] }),
+		reply(request, { protocol: 2, capabilities: ["presence"] }),
 	);
 	try {
 		await listen(fixture);
 		const result = await fixture.client().ping();
 		assert.equal(result.ok, false);
 		assert.equal(result.ok ? "" : result.code, "unsupported");
-		assert.match(result.ok ? "" : result.message, /agent_registry/);
+		assert.match(result.ok ? "" : result.message, /registry\.v1/);
 	} finally {
 		cleanup(fixture);
 	}
@@ -388,7 +943,7 @@ test("daemon refusals pass through and unknown codes do not", async () => {
 
 test("unsupported daemons are never sent registry methods", async () => {
 	const fixture = makeFixture((request) =>
-		reply(request, { protocol: 1, capabilities: ["presence"] }),
+		reply(request, { protocol: 2, capabilities: ["presence"] }),
 	);
 	try {
 		await listen(fixture);
@@ -397,7 +952,7 @@ test("unsupported daemons are never sent registry methods", async () => {
 			(await unsupported.register({ source: "herdsman-pi", incarnation: UUID_A })).ok,
 			false,
 		);
-		assert.deepEqual(fixture.requests.map(({ method }) => method), ["ping"]);
+		assert.deepEqual(fixture.requests.map(({ method }) => method), ["daemon.ping"]);
 	} finally {
 		cleanup(fixture);
 	}
@@ -406,8 +961,8 @@ test("unsupported daemons are never sent registry methods", async () => {
 test("registry calls put only the contract's own fields on the wire", async () => {
 	const fixture = makeFixture((request) => {
 		switch (request.method) {
-			case "ping":
-				return reply(request, { protocol: 1, capabilities: ["agent_registry"] });
+			case "daemon.ping":
+				return reply(request, { protocol: 2, capabilities: ["registry.v1"] });
 			case "agent.register":
 				return reply(request, { registration: { agent_id: UUID_A } });
 			case "agent.acquire":
@@ -470,15 +1025,15 @@ test("registry calls put only the contract's own fields on the wire", async () =
 		assert.deepEqual(
 			fixture.requests.map(({ version, method }) => [version, method]),
 			[
-				[1, "ping"],
-				[1, "agent.register"],
-				[1, "agent.acquire"],
-				[1, "agent.publish"],
-				[1, "agent.retire"],
+				[2, "daemon.ping"],
+				[2, "agent.register"],
+				[2, "agent.acquire"],
+				[2, "agent.publish"],
+				[2, "agent.retire"],
 			],
 		);
 		assert.deepEqual(
-			fixture.requests.filter(({ method }) => method !== "ping").map(({ method, params }) => [
+			fixture.requests.filter(({ method }) => method !== "daemon.ping").map(({ method, params }) => [
 				method,
 				params,
 			]),
@@ -535,8 +1090,8 @@ test("registry calls put only the contract's own fields on the wire", async () =
 
 test("an ambivalent registration reply is not a registration", async () => {
 	const fixture = makeFixture((request) =>
-		request.method === "ping"
-			? reply(request, { protocol: 1, capabilities: ["agent_registry"] })
+		request.method === "daemon.ping"
+			? reply(request, { protocol: 2, capabilities: ["registry.v1"] })
 			: reply(request, { registration: { agent_id: "not-a-uuid" } }),
 	);
 	try {
@@ -553,8 +1108,8 @@ test("an ambivalent registration reply is not a registration", async () => {
 
 test("the context channel carries only the session and keeps the returned binding", async () => {
 	const fixture = makeFixture((request) =>
-		request.method === "ping"
-			? reply(request, { protocol: 1, capabilities: ["agent_registry"] })
+		request.method === "daemon.ping"
+			? reply(request, { protocol: 2, capabilities: ["registry.v1"] })
 			: reply(request, {
 					writer: {
 						handle: FIXTURE_WRITER,
@@ -643,8 +1198,8 @@ test("the vendored daemon contract round-trips through this client", async () =>
 	const byMethod = (method: string) =>
 		exchanges.find((entry) => entry.method === method)!.request;
 	const fixture = makeFixture((request) => {
-		if (request.method === "ping")
-			return reply(request, { protocol: 1, capabilities: ["agent_registry"] });
+		if (request.method === "daemon.ping")
+			return reply(request, { protocol: 2, capabilities: ["registry.v1"] });
 		const exchange = pending
 			.get(`${request.method}\u0000${JSON.stringify(request.params)}`)
 			?.shift();
@@ -782,16 +1337,16 @@ test("the vendored daemon contract round-trips through this client", async () =>
 				request.params,
 			]),
 			[
-				[1, "ping", {}],
-				[1, "agent.register", registration],
-				[1, "agent.acquire", acquire],
-				[1, "agent.publish", publish],
-				[1, "agent.context", firstContext],
-				[1, "agent.context", switchedContext],
-				[1, "agent.context", switchedContext],
-				[1, "agent.context", nullContext],
-				[1, "agent.context", replacementContext],
-				[1, "agent.retire", retire],
+				[2, "daemon.ping", {}],
+				[2, "agent.register", registration],
+				[2, "agent.acquire", acquire],
+				[2, "agent.publish", publish],
+				[2, "agent.context", firstContext],
+				[2, "agent.context", switchedContext],
+				[2, "agent.context", switchedContext],
+				[2, "agent.context", nullContext],
+				[2, "agent.context", replacementContext],
+				[2, "agent.retire", retire],
 			],
 		);
 		// The vendor fixture's private-path sentinel never reaches the wire.
@@ -816,5 +1371,298 @@ test("the control socket path follows the environment", async () => {
 		);
 	} finally {
 		cleanup(fixture);
+	}
+});
+
+const EVENTS_CAPABLE = { protocol: 2, capabilities: ["registry.v1", "events.v1"] };
+
+/** Wait until `done` holds or the deadline passes, then return what it saw. */
+async function until(done: () => boolean, ms = 2_000): Promise<void> {
+	const deadline = Date.now() + ms;
+	while (!done() && Date.now() < deadline)
+		await new Promise((resolve) => setTimeout(resolve, 5));
+}
+
+test("events without the events.v1 capability is an explicit refusal that dispatches nothing", async () => {
+	const fixture = makeFixture((request) =>
+		reply(request, { protocol: 2, capabilities: ["registry.v1"] }),
+	);
+	try {
+		await listen(fixture);
+		const result = await fixture.client().events({ after: 0, wait_ms: 0 });
+		assert.equal(result.ok === true ? "" : result.code, "unsupported");
+		assert.match(
+			result.ok === true ? "" : result.message,
+			/does not provide `events\.v1`/,
+		);
+		assert.deepEqual(
+			fixture.requests.map((request) => request.method),
+			["daemon.ping"],
+		);
+	} finally {
+		cleanup(fixture);
+	}
+});
+
+test("events decodes a page to the last delivered sequence, not the journal tail", async () => {
+	const fixture = makeFixture((request) =>
+		request.method === "daemon.ping"
+			? reply(request, EVENTS_CAPABLE)
+			: reply(request, {
+					epoch: "e1",
+					events: [{ seq: 4, kind: "publication" }, { seq: 5, kind: "spawn" }],
+					cursor: { epoch: "e1", sequence: 5 },
+					tail: 9,
+					more: true,
+					earliest: 1,
+				}),
+	);
+	try {
+		await listen(fixture);
+		const result = await fixture.client().events({ after: 3, wait_ms: 0 });
+		assert.deepEqual(result, {
+			ok: true,
+			value: { kind: "page", epoch: "e1", sequence: 5, more: true },
+		});
+	} finally {
+		cleanup(fixture);
+	}
+});
+
+test("events decodes cursor_expired to the new epoch and the journal's cursor", async () => {
+	const fixture = makeFixture((request) =>
+		request.method === "daemon.ping"
+			? reply(request, EVENTS_CAPABLE)
+			: reply(request, {
+					cursor_expired: {
+						epoch: "e2",
+						cursor: { epoch: "e2", sequence: 12 },
+						earliest: 10,
+					},
+				}),
+	);
+	try {
+		await listen(fixture);
+		const result = await fixture.client().events({ after: 3, epoch: "e1", wait_ms: 0 });
+		assert.deepEqual(result, {
+			ok: true,
+			value: { kind: "expired", epoch: "e2", sequence: 12 },
+		});
+		const read = fixture.requests.find((request) => request.method === "events.read");
+		assert.equal(read.params.epoch, "e1");
+	} finally {
+		cleanup(fixture);
+	}
+});
+
+test("a malformed events reply is a protocol failure, never a silent page", async () => {
+	const fixture = makeFixture((request) =>
+		request.method === "daemon.ping"
+			? reply(request, EVENTS_CAPABLE)
+			: reply(request, { epoch: "e1", events: "not-a-list", more: false }),
+	);
+	try {
+		await listen(fixture);
+		const result = await fixture.client().events({ after: 0, wait_ms: 0 });
+		assert.equal(result.ok === true ? "" : result.code, "protocol");
+	} finally {
+		cleanup(fixture);
+	}
+});
+
+test("watchRadarEvents wakes on a page and drains a backlog from the last delivered sequence", async () => {
+	const requests: Array<{ after: number; wait_ms: number }> = [];
+	const pages = [
+		{ ok: true as const, value: { kind: "page" as const, epoch: "e1", sequence: 2, more: true } },
+		{ ok: true as const, value: { kind: "page" as const, epoch: "e1", sequence: 3, more: false } },
+	];
+	const client: Pick<RadarClient, "events"> = {
+		events: async (request) => {
+			requests.push({ after: request.after, wait_ms: request.wait_ms });
+			return pages.shift() ?? new Promise(() => {});
+		},
+	};
+	const controller = new AbortController();
+	let wakes = 0;
+	const diagnoses: string[] = [];
+	try {
+		watchRadarEvents(client, controller.signal, {
+			wake: () => (wakes += 1),
+			diagnose: (message) => diagnoses.push(message),
+		});
+		await until(() => wakes === 2);
+		assert.deepEqual(diagnoses, []);
+		assert.equal(wakes, 2);
+		assert.deepEqual(requests.slice(0, 3), [
+			{ after: 0, wait_ms: 1000 },
+			{ after: 2, wait_ms: 0 },
+			{ after: 3, wait_ms: 1000 },
+		]);
+	} finally {
+		controller.abort();
+	}
+});
+
+test("a cursor_expired read wakes once and adopts the new epoch without replaying", async () => {
+	const requests: Array<{ after: number; epoch?: string }> = [];
+	const replies: Array<any> = [
+		{ ok: true, value: { kind: "page", epoch: "e1", sequence: 4, more: false } },
+		{ ok: true, value: { kind: "expired", epoch: "e2", sequence: 9 } },
+	];
+	const client: Pick<RadarClient, "events"> = {
+		events: async (request) => {
+			requests.push({ after: request.after, epoch: request.epoch });
+			return replies.shift() ?? new Promise(() => {});
+		},
+	};
+	const controller = new AbortController();
+	let wakes = 0;
+	const diagnoses: string[] = [];
+	try {
+		watchRadarEvents(client, controller.signal, {
+			wake: () => (wakes += 1),
+			diagnose: (message) => diagnoses.push(message),
+		});
+		await until(() => requests.length === 3);
+		assert.deepEqual(diagnoses, []);
+		assert.equal(wakes, 2);
+		assert.deepEqual(requests[2], { after: 9, epoch: "e2" });
+	} finally {
+		controller.abort();
+	}
+});
+
+test("a refused events contract warns once per outage, then once more after it is restored and lost again", async () => {
+	// Three refusals in one outage, a restored contract, then a second outage.
+	const replies: Array<any> = [
+		{ ok: false, code: "unsupported", message: "no events.v1" },
+		{ ok: false, code: "unsupported", message: "no events.v1" },
+		{ ok: false, code: "unsupported", message: "no events.v1" },
+		{ ok: true, value: { kind: "page", epoch: "e1", sequence: 0, more: false } },
+		{ ok: false, code: "unsupported", message: "no events.v1" },
+	];
+	let calls = 0;
+	const client: Pick<RadarClient, "events"> = {
+		events: async () => {
+			calls += 1;
+			return replies.shift() ?? new Promise(() => {});
+		},
+	};
+	const controller = new AbortController();
+	let wakes = 0;
+	const diagnoses: string[] = [];
+	try {
+		watchRadarEvents(client, controller.signal, {
+			wake: () => (wakes += 1),
+			diagnose: (message) => diagnoses.push(message),
+		});
+		await until(() => calls === 6, 6_000);
+		assert.equal(calls, 6);
+		assert.deepEqual(diagnoses, ["no events.v1", "no events.v1"]);
+		assert.equal(wakes, 0);
+	} finally {
+		controller.abort();
+	}
+});
+
+test("a page after cursor_expired delivers its wake once and reads from the new cursor", async () => {
+	const requests: Array<{ after: number; epoch?: string }> = [];
+	const replies: Array<any> = [
+		{ ok: true, value: { kind: "page", epoch: "e1", sequence: 4, more: false } },
+		{ ok: true, value: { kind: "expired", epoch: "e2", sequence: 9 } },
+		{ ok: true, value: { kind: "page", epoch: "e2", sequence: 11, more: false } },
+	];
+	const client: Pick<RadarClient, "events"> = {
+		events: async (request) => {
+			requests.push({ after: request.after, epoch: request.epoch });
+			return replies.shift() ?? new Promise(() => {});
+		},
+	};
+	const controller = new AbortController();
+	let wakes = 0;
+	try {
+		watchRadarEvents(client, controller.signal, {
+			wake: () => (wakes += 1),
+			diagnose: () => assert.fail("no diagnostic expected"),
+		});
+		await until(() => requests.length === 4);
+		assert.equal(wakes, 3, "one wake per reply: page, resync, page");
+		assert.deepEqual(requests[2], { after: 9, epoch: "e2" });
+		assert.deepEqual(requests[3], { after: 11, epoch: "e2" });
+	} finally {
+		controller.abort();
+	}
+});
+
+test("a throwing wake is diagnosed once per run of failures and never ends the watcher", async () => {
+	const pages = [1, 2, 3, 4, 5].map((sequence) => ({
+		ok: true as const,
+		value: { kind: "page" as const, epoch: "e1", sequence, more: false },
+	}));
+	const client: Pick<RadarClient, "events"> = {
+		events: async () => pages.shift() ?? new Promise(() => {}),
+	};
+	// Fails, fails, recovers, fails, recovers: two runs of failures.
+	const outcomes = ["throw", "throw", "ok", "throw", "ok"];
+	let wakeCalls = 0;
+	const diagnoses: string[] = [];
+	const controller = new AbortController();
+	try {
+		watchRadarEvents(client, controller.signal, {
+			wake: () => {
+				const outcome = outcomes[wakeCalls++];
+				if (outcome === "throw") throw new Error("boom");
+			},
+			diagnose: (message) => diagnoses.push(message),
+		});
+		await until(() => wakeCalls === 5);
+		assert.equal(wakeCalls, 5, "the loop read on past every throw");
+		assert.deepEqual(diagnoses, ["event wake failed: Error: boom", "event wake failed: Error: boom"]);
+	} finally {
+		controller.abort();
+	}
+});
+
+test("a rejected events read is diagnosed once and does not escape as an unhandled rejection", async () => {
+	const client: Pick<RadarClient, "events"> = {
+		events: async () => {
+			throw new Error("dial failed");
+		},
+	};
+	const controller = new AbortController();
+	const diagnoses: string[] = [];
+	try {
+		watchRadarEvents(client, controller.signal, {
+			wake: () => assert.fail("a failed read must not wake"),
+			diagnose: (message) => diagnoses.push(message),
+		});
+		await until(() => diagnoses.length === 1);
+		assert.deepEqual(diagnoses, ["event watch stopped: Error: dial failed"]);
+	} finally {
+		controller.abort();
+	}
+});
+
+test("a throwing diagnose is contained: the refusal does not end the watcher", async () => {
+	const replies: Array<any> = [
+		{ ok: false, code: "unsupported", message: "no events.v1" },
+		{ ok: true, value: { kind: "page", epoch: "e1", sequence: 1, more: false } },
+	];
+	const client: Pick<RadarClient, "events"> = {
+		events: async () => replies.shift() ?? new Promise(() => {}),
+	};
+	const controller = new AbortController();
+	let wakes = 0;
+	try {
+		watchRadarEvents(client, controller.signal, {
+			wake: () => (wakes += 1),
+			diagnose: () => {
+				throw new Error("stale extension context");
+			},
+		});
+		await until(() => wakes === 1, 3_000);
+		assert.equal(wakes, 1, "the page after the refusal still wakes");
+	} finally {
+		controller.abort();
 	}
 });
