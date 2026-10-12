@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import type { HealthStore } from "./health-store";
+import { PROVIDER_KEY_ONLY } from "./codexbar-config";
 
 /** Source-neutral quota observations. Missing or stale data is unknown, never zero or available. */
 export interface QuotaWindow { slot: "primary" | "secondary" | "tertiary"; label: string; usedPercent: number; resetsAt?: number; windowMinutes?: number }
@@ -109,10 +110,10 @@ export async function refreshQuota(
   try {
     const started = store.revision();
     const args = ["usage", "--provider", source.provider, "--format", "json"];
-    // Named accounts are labelled in the generated CodexBar config (router id by default); default-auth
-    // providers query CodexBar's own logged-in account, so no label is passed.
+    // Named accounts are labelled in the generated CodexBar config (router id by default). Default-auth
+    // and key-only providers take no label: CodexBar rejects --account for them.
     const label = source.account ?? scope.account;
-    if (label !== undefined) args.push("--account", label);
+    if (label !== undefined && !PROVIDER_KEY_ONLY.has(source.provider)) args.push("--account", label);
     let raw: string;
     try { raw = await run(args, QUOTA_TIMEOUT_MS); }
     catch (error) {

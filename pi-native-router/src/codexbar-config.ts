@@ -22,7 +22,7 @@ type Document = Record<string, unknown> & { providers?: ProviderEntry[] };
  * Providers CodexBar takes as one provider-level `apiKey` rather than `tokenAccounts`
  * (`codexbar config validate` reports token accounts as unused for these).
  */
-const PROVIDER_KEY_ONLY = new Set(["commandcode"]);
+export const PROVIDER_KEY_ONLY = new Set(["commandcode"]);
 
 /** Stable token-account id derived from the router account id, so regeneration does not churn ids. */
 export function stableUuid(seed: string): string {

@@ -146,7 +146,7 @@ test("generated config is written 0600 and never overwrites without an explicit 
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test("refresh always selects the mapped CodexBar account, defaulting to the router account id", async () => {
+test("refresh selects the mapped CodexBar account for multi-account providers; key-only providers take none", async () => {
   const root = dir();
   try {
     const store = new HealthStore(join(root, "h.sqlite"), () => NOW);
@@ -154,7 +154,7 @@ test("refresh always selects the mapped CodexBar account, defaulting to the rout
     const run = async (args: string[]) => { seen.push(args); return goOutput.replace('"source":"local+api"', '"source":"api"'); };
     await refreshQuota(store, { provider: "commandcode", account: "commandcode-a" }, { source: "codexbar", provider: "commandcode", enforce: false }, run, () => NOW, "h1");
     await refreshQuota(store, { provider: "opencode-go", account: "go-a" }, { source: "codexbar", provider: "opencodego", account: "go-a", enforce: false }, run, () => NOW, "h1");
-    expect(seen[0]).toEqual(expect.arrayContaining(["--provider", "commandcode", "--account", "commandcode-a"]));
+    expect(seen[0]).not.toContain("--account");
     expect(seen[1]).toEqual(expect.arrayContaining(["--provider", "opencodego", "--account", "go-a"]));
     store.close();
   } finally { rmSync(root, { recursive: true, force: true }); }
