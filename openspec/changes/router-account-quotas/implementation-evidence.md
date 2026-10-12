@@ -24,3 +24,13 @@
 
 ## Enforcement
 - Enforcement is enabled per account by `"enforce": true` in router settings. The live setting lives in the owner's Nix-managed settings, which this change does not edit.
+
+## Go source check (task 3.1)
+- Question: are CodexBar `local+api` percentages account-wide?
+- Answer: blocking never uses a `local+api` reading. `/quotas-config` writes provider sources as `api`, and only authoritative readings (`api`, `web`, `oauth` with exact confidence) can block. Operator confirmed the meters are account-wide.
+- Live state at recording: `opencode-go#go-a` exhausted until 2026-10-22, `opencode-go#go-b` until 2026-11-01. The operator confirmed these are genuine exhausted quotas awaiting the provider's refresh, so enforcement stays on for them.
+- Source of the answer: operator confirmation plus the router's authority rule; no new CodexBar probe was run for this record.
+
+## Documentation (task 3.3, documentation part only)
+- README now states the no-ranking rule and the per-account rollback (`enforce: false` or remove the mapping).
+- Typecheck, tests and strict validation for 3.3 are not yet run; the task stays open until they pass.

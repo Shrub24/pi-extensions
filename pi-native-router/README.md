@@ -123,10 +123,14 @@ An account may map to a CodexBar provider so `/quotas` can show its windows:
 - `/quotas-config [--replace] [path]` writes CodexBar's config from the quota-mapped accounts: each becomes a token account labelled with its quota account (or router id) and its key read from the same environment variable. Providers are set to `source: "api"` so their meters are account-authoritative rather than device-local. The file is written 0600 via a temporary file and rename, and an existing file is refused unless `--replace` is given. Accounts whose key variable is unset are reported and skipped.
 - Refresh runs on session start and every five minutes. The shared store is the gate: any process reuses an account's last CodexBar attempt (success or failure) if it is under four minutes old, so all Pi processes on the machine run CodexBar at most once per gate per account. `/quotas` reuses that fetch; `/quotas refresh` forces a new one. Dispatch never waits for CodexBar.
 - Snapshots are authoritative only when the tracker reports server meters (`source` api, web or oauth, or an explicit authoritative confidence). A `local+api` blend or estimate never enforces a block.
+- **No ranking.** Quota snapshots only block an exhausted account until its window resets. The router never ranks candidates by remaining headroom, so an account with more quota is not preferred over an account with less; candidate order and health decide.
+- **Rollback:** set `enforce` to `false` (or remove the `quota` mapping) per account to stop blocking. Removing the mapping also stops refresh. Existing tracker causes expire at their reset, or clear with `/native-router-health` reset.
 
 ## Model pricing (estimates)
 
 `/pricing refresh` downloads models.dev (provider-specific records) and LiteLLM's price map, validates them, and keeps the last valid snapshot at `$PI_CODING_AGENT_DIR/pi-native-router/pricing.json` (`0600`). Refresh runs only on demand; nothing is fetched during dispatch. Redirects and non-200 responses are refused.
+
+**Rollback of the catalog backup:** delete `pricing.json`. A missing snapshot is treated as no catalog, so backfill stops and Pi's recorded cost stands. Overrides in configuration are separate and must be removed from settings. DeepSeek peak doubling is not controlled by the snapshot and has no configuration switch; disabling it needs a change to the router.
 
 - `/pricing show <provider>/<model>` prints the rates in USD per million tokens, labelled as a **list-price estimate**, with its source.
 - Lookup is exact on provider and model. models.dev wins; LiteLLM fills only a physical model models.dev lacks, under the same provider and id.

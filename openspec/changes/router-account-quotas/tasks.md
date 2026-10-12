@@ -15,6 +15,6 @@ Prerequisites: router-shared-health (committed) and router-api-key-accounts.
 
 ## 3. Eligibility
 
-- [ ] 3.1 Record the Go source check: confirm whether `local+api` percentages are account-wide; keep blocking disabled per account until recorded.
+- [x] 3.1 Record the Go source check: confirm whether `local+api` percentages are account-wide; keep blocking disabled per account until recorded.
 - [x] 3.2 Write tracker-sourced quota causes from fresh exhausted windows and clear them under fetch-start fencing; host test that an exhausted account is skipped across models, another account is used, and a healthy snapshot cannot clear an auth or error-derived block.
 - [ ] 3.3 Document configuration, mapping, freshness defaults, rollback and the no-ranking rule in the router README; run typecheck, tests and strict OpenSpec validation.

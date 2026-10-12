@@ -18,3 +18,8 @@
 - No catalog provenance is exported yet (task 4.1).
 - Peak adjustment has not been checked on live traffic (task 5.1).
 - Registry-level price application was rejected (design, Context). No host seam is used.
+
+## Rollback documentation (task 4.3, documentation part only)
+- Catalog backup: deleting `$PI_CODING_AGENT_DIR/pi-native-router/pricing.json` stops backfill; Pi's recorded cost stands. Documented in the router README.
+- DeepSeek peak doubling is not gated by the snapshot and has no configuration switch. Disabling it requires a router change; this is an open decision, not a documented rollback.
+- The check that disabled or unmapped configurations preserve costs is still open (4.3 stays unchecked).
