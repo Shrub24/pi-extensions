@@ -66,8 +66,12 @@ test("the route's declared capacity and this request's need exclude undersized m
   // A route declaring more capacity than its candidates provide has no dispatchable target.
   const wide = parseConfig({ routes: { work: { contextWindow: 400_000, candidates: [{ provider: "a", id: "one" }] } } }).routes.work;
   expect(choose(wide, models, health, 10)).toBeUndefined();
-  // This request alone needs more room than a 300k window with a 16k output reserve leaves.
+  // This request alone needs more room than a 300k window with an 8k route reserve leaves.
   expect(choose(config, models, health, 299_999)).toBeUndefined();
+  // A large provider max output is not a required reserve; the route explicitly asks for only 8k output room.
+  const largeOutput = [{ ...models[0], model: { ...models[0].model, contextWindow: 272_000, maxTokens: 128_000 } }];
+  expect(choose(config, largeOutput, health, 158_000)).toBeDefined();
+  expect(choose(config, largeOutput, health, 264_001)).toBeUndefined();
   expect(choose(config, models, health, 10, "b/one")?.model.provider).toBe("b");
   const changed = models.filter(c => c.model.provider !== "b");
   expect(choose(config, changed, health, 10, "b/one")?.model.provider).toBe("a");

@@ -137,7 +137,7 @@ export interface Resolved { candidate: Candidate; model: Model<Api> }
  * must be able to honour it. Nothing here is carried across a virtual-model switch.
  */
 export function requiredContext(route: RouteConfig, model: { maxTokens: number }, tokens: number): number {
-  return Math.max(route.contextWindow, tokens + Math.max(route.outputReserve, model.maxTokens));
+  return Math.max(route.contextWindow, tokens + route.outputReserve);
 }
 /** Candidates that are healthy and fit this request, in route order. */
 export function eligibleCandidates(route: RouteConfig, available: Resolved[], health: Health, tokens: number): Resolved[] {

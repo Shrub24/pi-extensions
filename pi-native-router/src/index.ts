@@ -154,7 +154,11 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     const resolve = async (request: ModelRouteRequest<State>, ctx: ExtensionContext): Promise<ModelRoute<State>> => {
       request.signal?.throwIfAborted();
       const candidates = available(route, ctx, config);
-      const estimate = Math.max(tokens(request.messages), request.reason === "direct" ? 0 : ctx.getContextUsage()?.tokens ?? 0);
+      // Pi's usage-aware context estimate (also shown in the footer) is authoritative for routed session turns.
+      // Use the message heuristic only for direct calls or when Pi has no context usage yet.
+      const estimate = request.reason === "direct"
+        ? tokens(request.messages)
+        : ctx.getContextUsage()?.tokens ?? tokens(request.messages);
       if (request.reason === "direct") {
         const selected = choose(route, await activeOnly(candidates, ctx, config), health, estimate);
         if (!selected) throw exhausted(role, route, ctx, config);
