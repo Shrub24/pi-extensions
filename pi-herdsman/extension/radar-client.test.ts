@@ -45,8 +45,8 @@ function materialise(value: unknown): any {
 }
 
 /**
- * The daemon contract fixture vendored byte-for-byte from agent-radar at commit
- * `f87348032a808967c50a4e84b7e1c766a64ebfe3`
+ * The daemon contract fixture vendored byte-for-byte from agent-radar at the pinned
+ * commit `a0a7f97f40a8fd76c4beb49461e7b25e154acf53` (`docs/agent-registration.fixture.jsonl`).
  * (`docs/agent-registration.fixture.jsonl`). Vendored rather than fetched so the
  * wire this client encodes stays pinned to a reviewable revision. That revision
  * is the protocol-2 clean break: every envelope is version 2, the removed

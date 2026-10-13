@@ -51,7 +51,7 @@
     "runtime": {
       "pi": "1.1.0",
       "radar": {
-        "commit": "55ff25d5d77c7f4a0dd02d62aaede38f6abba447",
+        "commit": "a0a7f97f40a8fd76c4beb49461e7b25e154acf53",
         "protocol": 2
       }
     }
