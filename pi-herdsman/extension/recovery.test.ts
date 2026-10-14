@@ -16,7 +16,6 @@ import { RADAR_SUBJECT_SOURCE } from "pi-radar/execution";
 import type { ExecHandler, FixtureIdentity } from "./support.ts";
 import { claimProcessLock } from "./lock.ts";
 import { resultPath, resultRef } from "./storage.ts";
-import { IDLE_WAKE_PROMPT } from "./idle-wake.ts";
 import { WAKE_CONSUMER_OFFER } from "./advisory-wake.ts";
 import support, {
   CHILD_SESSION_ID,
@@ -746,7 +745,17 @@ test("recovery retries one failed delivery", async (t) => {
   assert.equal(successful, 1);
   for (let index = 0; index < 5; index++)
     await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.deepEqual(recovering.sentUsers, [IDLE_WAKE_PROMPT]);
+  assert.deepEqual(recovering.sentUsers, []);
+  assert.ok(
+    recovering.sentMessageCalls.some(
+      (call) =>
+        (call.message as { customType?: string }).customType ===
+          "pi-herdsman-agent-result" &&
+        (call.options as { triggerTurn?: boolean } | undefined)?.triggerTurn ===
+          true,
+    ),
+    "the recovered result wakes through Pi's native triggerTurn path",
+  );
   assert.match(
     delivered,
     new RegExp(

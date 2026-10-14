@@ -403,7 +403,8 @@ export default function (pi: ExtensionAPI): void {
   // ----------------------------------------------------------- agent flow
   pi.on("before_agent_start", async (event, ctx) => {
     lastCtx = ctx;
-    tracker?.startInteraction(event.prompt);
+    if (event.messageType === "custom") tracker?.ensureInteraction();
+    else tracker?.startInteraction(event.prompt);
     tracker?.noteSystemPrompt(event.systemPrompt);
   });
 

@@ -387,23 +387,17 @@ test("a long-running notice is checked in on, and the finding wakes the orchestr
 	expect(state.child_work?.agent).toBe("reviewer");
 	expect(state.child_work?.role?.name).toBe("reviewer");
 
-	// The finding is delivered as a wake, not a steer: an idle orchestrator has
-	// no tool batch for a steer to land after. The nudge is appended without a
-	// trigger and a short user prompt starts the run, so the wake goes through
-	// the prompt lifecycle (`before_agent_start`) instead of `triggerTurn`,
-	// which would start an unprepared run (pi#5581, #10267).
+	// The idle wake keeps its native follow-up trigger; Pi 1.2.0 prepares that
+	// custom run through before_agent_start.
 	expect(host.sent).toHaveLength(1);
 	const sent = host.sent[0] as { message?: { content?: string }; options?: { deliverAs?: string; triggerTurn?: boolean } };
-	expect(sent.options).toBeUndefined();
-	expect(host.userSent).toHaveLength(1);
-	expect((host.userSent[0] as { message?: unknown }).message).toContain("nudge above");
+	expect(sent.options).toEqual({ deliverAs: "followUp", triggerTurn: true });
+	expect(host.userSent).toHaveLength(0);
 	expect(sent.message?.content).toContain("orchestrator.intent_alignment");
 });
 
 test("a busy orchestrator is steered, not woken through a user prompt", async () => {
-	// The mirror of the wake above: the same finding while a turn runs must keep
-	// its steer, since a `sendUserMessage` there would queue a second turn and
-	// the running run already carries prepared system-prompt options.
+	// The same finding while a turn runs keeps its follow-up delivery mode.
 	const host = fakeHost({ branch: branchWith({ instruction: "fix the parser" }), isIdle: () => false });
 	const jev = fakeJevClient({
 		"orchestrator.intent_alignment": noul(0.05),

@@ -4721,7 +4721,7 @@ async function deliverResultUnsafe(
   if (!hasDeliveredResult(entries, resultDeliveryExpectation(runtime, result.requestId)) &&
       !resultDeliveryEvidence.has(evidenceKey)) {
     const delegationStatus = delegationStatusForResult(runtime, result.requestId, entries);
-    sendWakeMessage(pi, ctx, {
+    sendWakeMessage(pi, {
       customType: "pi-herdsman-agent-result",
       content: [
         `Agent completion available · agent=${result.agentLabel} · status=${result.status}`,
@@ -5154,7 +5154,6 @@ function deliverAskUnsafe(
   // Message failures are retryable, and ask.json remains the durable anchor.
   sendWakeMessage(
     pi,
-    ctx,
     {
       customType: "pi-herdsman-agent-ask",
       content: `Agent ${ask.agentLabel} needs your input:\n\n${ask.question}\n\nUse agent_reply with agent="${ask.agentLabel}" to answer this question.`,
@@ -6514,7 +6513,6 @@ function resolveAbandonedAssignment(
   try {
     sendWakeMessage(
       pi,
-      ctx,
       {
         customType: "pi-herdsman-agent-result",
         content: [
@@ -10502,7 +10500,6 @@ export default function (pi: ExtensionAPI): void {
               );
             await sendWakeMessage(
               pi,
-              ctx,
               message as Parameters<ExtensionAPI["sendMessage"]>[0],
               options,
             );
@@ -13634,7 +13631,6 @@ export default function (pi: ExtensionAPI): void {
         const closeAvailable = availableActions.includes("close");
         sendWakeMessage(
           pi,
-          ctx,
           {
             customType: "pi-herdsman-agent-lost",
             content: [
@@ -13751,7 +13747,6 @@ export default function (pi: ExtensionAPI): void {
             if (!ctx.isIdle()) continue;
             sendWakeMessage(
               pi,
-              ctx,
               {
                 customType: "pi-herdsman-agent-attention",
                 content: [
@@ -13817,7 +13812,6 @@ export default function (pi: ExtensionAPI): void {
             if (!ctx.isIdle()) continue;
             sendWakeMessage(
               pi,
-              ctx,
               {
                 customType: "pi-herdsman-agent-attention",
                 content: [
@@ -13888,7 +13882,6 @@ export default function (pi: ExtensionAPI): void {
               if (!ctx.isIdle()) continue;
               sendWakeMessage(
                 pi,
-                ctx,
                 {
                   customType: "pi-herdsman-agent-ask",
                   content: [
@@ -13945,7 +13938,6 @@ export default function (pi: ExtensionAPI): void {
             if (!ctx.isIdle()) continue;
             sendWakeMessage(
               pi,
-              ctx,
               {
                 customType: "pi-herdsman-agent-attention",
                 content: [
@@ -14012,7 +14004,6 @@ export default function (pi: ExtensionAPI): void {
               continue;
             sendWakeMessage(
               pi,
-              ctx,
               {
                 customType: "pi-herdsman-agent-attention",
                 content: [
@@ -14195,7 +14186,6 @@ export default function (pi: ExtensionAPI): void {
             return;
           sendWakeMessage(
             pi,
-            ctx,
             {
               customType: "pi-herdsman-agent-stale",
               content: [
@@ -14345,7 +14335,6 @@ export default function (pi: ExtensionAPI): void {
       try {
         sendWakeMessage(
           pi,
-          ctx,
           {
             customType: SOFT_DEADLINE_MESSAGE,
             content: [
@@ -14871,7 +14860,6 @@ export default function (pi: ExtensionAPI): void {
             try {
               sendWakeMessage(
                 pi,
-                ctx,
                 {
                   customType: "pi-herdsman-delegation-guidance",
                   content: `${AGENT_EXECUTION_OWNERSHIP_GUIDANCE} ${AGENT_UNRESOLVED_GUIDANCE}`,
