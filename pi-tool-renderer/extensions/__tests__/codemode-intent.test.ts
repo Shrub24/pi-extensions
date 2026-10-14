@@ -193,10 +193,10 @@ test("the wrapped native codemode renderer is the one that builds the row", () =
 	};
 	const renderCall = withCodemodePurpose(nativeRenderCall as never);
 	const component = renderCall({ code: "// intent: inspect the log\nreturn 1" }, theme, {});
-	// Pi's renderer received the call's own code: no argument was added or rewritten.
-	expect(calls).toEqual([{ code: "// intent: inspect the log\nreturn 1" }]);
+	// Pi's renderer receives the script without its purpose line; the title carries the purpose.
+	expect(calls).toEqual([{ code: "return 1" }]);
 	expect(component.render(80).join("\n")).toContain("codemode — inspect the log");
-	expect(component.render(80).join("\n")).toContain("// intent: inspect the log");
+	expect(component.render(80).join("\n")).not.toContain("// intent:");
 });
 
 test("the intent schema and the codemode purpose share one length bound", () => {

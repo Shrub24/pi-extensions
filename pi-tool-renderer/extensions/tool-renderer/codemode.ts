@@ -1,4 +1,4 @@
-import { codemodePurpose } from "./intent.js";
+import { codemodePurpose, codemodeScriptWithoutPurpose } from "./intent.js";
 
 /**
  * Root codemode row presentation: the script's leading `// intent: ...` purpose
@@ -46,9 +46,15 @@ export function attachCodemodePurpose(component: any, args: any, theme: any): an
 	return component;
 }
 
-/** Wrap Pi's native codemode call renderer with the purpose presentation. */
+/**
+ * Wrap Pi's native codemode call renderer with the purpose presentation. The
+ * native renderer receives the script without its purpose line, so the code
+ * preview does not repeat what the row already shows as the intent.
+ */
 export function withCodemodePurpose(renderCall: (args: any, theme: any, context: any) => any) {
 	return function renderCodemodeCallWithPurpose(this: any, args: any, theme: any, context: any): any {
-		return attachCodemodePurpose(renderCall.call(this, args, theme, context), args, theme);
+		const purpose = codemodePurpose(args);
+		const nativeArgs = purpose && typeof args?.code === "string" ? { ...args, code: codemodeScriptWithoutPurpose(args.code) } : args;
+		return attachCodemodePurpose(renderCall.call(this, nativeArgs, theme, context), args, theme);
 	};
 }

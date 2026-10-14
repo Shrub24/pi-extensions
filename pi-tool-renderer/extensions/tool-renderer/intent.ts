@@ -192,16 +192,26 @@ export const INTENT_MAX_LENGTH = 200;
  * Nothing here evaluates or parses the script.
  */
 export function parseCodemodePurpose(code: unknown): string | undefined {
+	return findCodemodePurpose(code)?.purpose;
+}
+
+/** The leading purpose comment: its text and its line index in the script. */
+interface CodemodePurposeLine {
+	purpose: string;
+	line: number;
+}
+
+function findCodemodePurpose(code: unknown): CodemodePurposeLine | undefined {
 	if (typeof code !== "string") return undefined;
 	const lines = code.replace(/\r\n?/g, "\n").split("\n");
 	let seenOptions = false;
-	let purpose: string | undefined;
-	for (const rawLine of lines) {
-		const line = rawLine.trim();
+	let found: CodemodePurposeLine | undefined;
+	for (let index = 0; index < lines.length; index++) {
+		const line = lines[index].trim();
 		if (line.length === 0) continue;
 		if (CODEMODE_OPTIONS_LINE.test(line)) {
 			// The options header is only native as the very first line.
-			if (seenOptions || purpose !== undefined) break;
+			if (seenOptions || found !== undefined) break;
 			seenOptions = true;
 			continue;
 		}
@@ -209,12 +219,27 @@ export function parseCodemodePurpose(code: unknown): string | undefined {
 		if (!match) break;
 		// A second leading purpose comment makes the purpose ambiguous: refuse
 		// rather than silently pick one.
-		if (purpose !== undefined) return undefined;
+		if (found !== undefined) return undefined;
 		const text = (match[1] ?? "").trim();
 		if (text.length < INTENT_MIN_LENGTH || text.length > INTENT_MAX_LENGTH) return undefined;
-		purpose = text;
+		found = { purpose: text, line: index };
 	}
-	return purpose;
+	return found;
+}
+
+/**
+ * The script as the row's code preview shows it: the purpose line is removed,
+ * because the row already shows it as the intent. Every other line, including
+ * a `// @options:` header, is kept. A script with no purpose is returned as is.
+ */
+export function codemodeScriptWithoutPurpose(code: string): string {
+	const found = findCodemodePurpose(code);
+	if (!found) return code;
+	return code
+		.replace(/\r\n?/g, "\n")
+		.split("\n")
+		.filter((_line, index) => index !== found.line)
+		.join("\n");
 }
 
 /** The purpose declared on a codemode call, or undefined when it declared none. */
