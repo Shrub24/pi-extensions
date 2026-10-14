@@ -1667,27 +1667,12 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		maxWakes: Math.max(0, Math.floor(settingNumber("outputWakeBudgetMaxWakes", DEFAULT_OUTPUT_WAKE_BUDGET_MAX_WAKES, cwd))),
 	});
 
-	/**
-	 * How a wake reads whether the session is idle and wakes it through the
-	 * prompt lifecycle. Pi skips `before_agent_start` for a `triggerTurn` run
-	 * (pi#5581, #10267), so an idle wake is started by a short user prompt.
-	 */
 	const wakeSend = {
 		advisoryBus: pi.events as unknown as import("./wake-consumer.js").WakeConsumerEventBus,
 		sessionId: () => activeSessionId ?? undefined,
 		isCurrent: (task: ManagedTask) => !shuttingDown && tasks.get(task.id) === task,
 		onAdvisoryError: (reason: string, task: ManagedTask) => logBackgroundDiagnostic("advisory wake", { reason: reason.slice(0, 160), taskId: task.id, timestamp: Date.now() }),
-		isIdle: (): boolean => {
-			try {
-				return activeCtx?.isIdle() === true;
-			} catch {
-				return false;
-			}
-		},
 		sendMessage: (message: Record<string, unknown>, options: Record<string, unknown>): void => pi.sendMessage(message as never, options as never),
-		// Absent when the host has no `sendUserMessage`; the wake helper then keeps
-		// the `triggerTurn` delivery rather than waking through a prompt it cannot.
-		...(typeof pi.sendUserMessage === "function" ? { sendUserMessage: (content: string): void => pi.sendUserMessage(content) } : {}),
 	};
 
 	const announceWakeBudgetExhausted = (task: ManagedTask) => {

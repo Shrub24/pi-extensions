@@ -761,10 +761,9 @@ describe("end-to-end over real HTTP OTLP (JSON protocol)", () => {
     assert.equal(attempts[1]!["pi.attempt.reason"], "post_compaction");
   });
 
-  test("an extension-triggered turn on an idle session opens an agent-origin interaction", async () => {
-    // sendCustomMessage({triggerTurn: true}) calls _runAgentPrompt directly:
-    // agent_start with no before_agent_start and no user prompt. The run must
-    // get an interaction span (agent origin), full span tree, and no prompt count.
+  test("a custom triggerTurn run reaching before_agent_start stays agent-origin", async () => {
+    // Pi 1.2.0 emits before_agent_start for triggerTurn runs, but that does not
+    // make the custom message a user prompt or count it as one.
     resetReceived();
     process.env.OTEL_EXPORTER_OTLP_ENDPOINT = ENDPOINT;
     const { pi, handlers, ctx } = fakePi();
@@ -776,7 +775,11 @@ describe("end-to-end over real HTTP OTLP (JSON protocol)", () => {
     };
 
     await emit("session_start", { reason: "startup" });
-    // Idle session: an extension fires a custom message with triggerTurn.
+    await emit("before_agent_start", {
+      messageType: "custom",
+      message: { customType: "wake", content: "wake" },
+      systemPrompt: "prepared system prompt",
+    });
     await emit("agent_start", {});
     await emit("turn_start", { turnIndex: 0, timestamp: Date.now() });
     await emit("before_provider_request", { payload: {} });

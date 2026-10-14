@@ -177,15 +177,10 @@ refusals, plus carried-background-result settlement contract tests. No live reco
     prove the same generation without the alias, and an existing test leaves a mailbox in a
     `${WORKSPACE}-replacement` workspace that `clearTestMailboxes()` does not remove, which can skew any
     future test that filters global states by session id.
-13. The Pi type pin has drifted behind the deployed runtime. `pi-herdsman` and `pi-bash-processes` pin
-    `@earendil-works/pi-{ai,coding-agent,tui}` at 0.99.2 in devDependencies while the deployed pi-bolt is
-    Pi 1.1.0 (Pi-Bolt 0.7.2, adopted 2026-10-08). The installed types cannot catch fields added since
-    0.99.2: `AgentSettledEvent` carries no `aborted` at 0.99.2 and gains it at 1.1.0, and our handlers are
-    typed `(event: unknown)`, so a wrong new field name still compiles — which is why the 1.1.0 migration
-    (`043bb041`) had to pin the read with a test rather than rely on the type. Bumping the pin is its own
-    change, because it moves every type assertion in the suites at once. The session-header surface the
-    fork ownership check reads is stable across both tags (`parentSession`, `getSessionId`, `getHeader`),
-    so that check does not depend on the bump.
+13. **Resolved for the Pi 1.2.0 upgrade (2026-10-15).** The exact Pi development pins in `pi-herdsman`,
+    `pi-native-router`, and `pi-otel`, plus Herdsman's runtime metadata, now target 1.2.0. `bun.lock` and
+    the maintained npm lockfiles are aligned. Pi-bash-processes uses wildcard Pi peer dependencies, not
+    dev pins. Install the matching Pi 1.2.0 runtime through the Nix input before deploying these changes.
 14. `pi-subagents` was retired from this workspace. Its abort-recovery follow-up is no longer in scope
     unless the package is reintroduced.
 

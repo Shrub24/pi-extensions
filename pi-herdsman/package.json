@@ -49,7 +49,7 @@
   },
   "piHerdsman": {
     "runtime": {
-      "pi": "1.1.0",
+      "pi": "1.2.0",
       "radar": {
         "commit": "a0a7f97f40a8fd76c4beb49461e7b25e154acf53",
         "protocol": 2
@@ -72,14 +72,14 @@
     "typebox": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "1.1.0",
-    "@earendil-works/pi-coding-agent": "1.1.0",
-    "@earendil-works/pi-tui": "1.1.0",
+    "@earendil-works/pi-ai": "1.2.0",
+    "@earendil-works/pi-coding-agent": "1.2.0",
+    "@earendil-works/pi-tui": "1.2.0",
     "esbuild": "^0.28.2",
     "typebox": "^1.3.7"
   },
   "overrides": {
-    "@earendil-works/pi-codemode": "1.1.0"
+    "@earendil-works/pi-codemode": "1.2.0"
   },
   "engines": {
     "node": ">=22.19.0"

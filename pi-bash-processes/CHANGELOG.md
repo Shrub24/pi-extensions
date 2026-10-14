@@ -4,6 +4,8 @@
 
 ### Unreleased
 
+- Idle background-task wakes now use Pi's native `triggerTurn` path. Pi 1.2.0 runs these through `before_agent_start`, so the extra user-prompt wake workaround is no longer needed.
+- The managed-bash `outputSchema` metadata now matches Pi 1.2.0's built-in bash definition exactly; the structured result shape is unchanged.
 - An exit during a run that Pi started without `before_agent_start` (a queued follow-up, or another extension's trigger-turn wake) is now held until the run settles, and reading or stopping the task consumes it. Previously such an exit was sent immediately as a follow-up the agent had already acted on, which surfaced as a stale "Background task finished" turn after a `get` or `stop`. A `stop` of a task that had already ended renders as "already <outcome>" instead of reading like a failed stop, and exit wakes no longer tell the agent to `bg_task stop` a task that has finished.
 - Managed bash no longer rewrites a trailing `| head` / `| tail`: the command reaches the shell exactly as written, and the "applied to the completed output" footer is gone. The agent contract now says plainly not to trim output (`| tail`, `| head`, `2>/dev/null`) because oversized results are already bounded and saved in full and a trim hides failures and forces re-runs; the guidance is in `instructions.md` and the `bash` tool guidelines.
 - Bash and zsh shells started by the extension now run with `pipefail`, so a failing pipeline stage fails the command. A producer cut off by `head` can therefore exit 141 (SIGPIPE); set `managedShellPipefail` to `false` to restore the previous exit codes.

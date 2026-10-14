@@ -2,14 +2,8 @@ import { afterAll, expect, test } from "bun:test";
 
 import { startExtensionHost } from "./fixtures/extension-host.js";
 
-// A wake that starts an idle run must go through the prompt lifecycle.
-// `pi.sendMessage(..., { triggerTurn: true })` starts that run without
-// `before_agent_start` (earendil-works/pi#5581, #10267), so the run is never
-// prepared with the system-prompt options every extension contributed and its
-// second request rebuilds the prompt from base options, dropping those sections
-// mid-run and re-billing the whole prompt. An idle session is therefore woken by
-// a short user prompt, which runs `prompt()`; a busy session keeps its steer,
-// where the run already carries prepared options.
+// Pi 1.2.0 runs triggerTurn wakes through before_agent_start, so idle and busy
+// deliveries can use the same native message path.
 //
 // One host per file: the host environment is process-wide, so the idle state is
 // flipped in place for the busy control instead of starting a second host.
@@ -36,19 +30,14 @@ async function runToExit(command: string): Promise<string> {
 	return id;
 }
 
-test("an idle completion wake is appended, and a user prompt starts the run", async () => {
+test("an idle completion wake starts a prepared triggerTurn run", async () => {
 	const id = await runToExit("printf 'idle-wake\\n'");
 	const exit = exitFor(id)!;
-	// Appended with no delivery options: neither `triggerTurn` (which would skip
-	// `before_agent_start`) nor a steer.
-	expect(exit[1]).toStrictEqual({});
-	// The run is started by the short user prompt, which goes through `prompt()`.
-	expect(host.userMessages).toHaveLength(1);
-	expect(String(host.userMessages[0]?.[0])).toContain("background task notification");
-	expect(host.userMessages[0]?.[1]).toBeUndefined();
+	expect(exit[1]).toMatchObject({ triggerTurn: true });
+	expect(host.userMessages).toHaveLength(0);
 });
 
-test("a busy session keeps the triggerTurn steer and starts no user prompt", async () => {
+test("a busy session keeps its existing triggerTurn delivery", async () => {
 	host.setIdle(() => false);
 	try {
 		const before = host.userMessages.length;
