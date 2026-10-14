@@ -165,16 +165,16 @@ async function main() {
 
   const ping = await request("daemon.ping", {});
   if (ping.protocol !== 2) problems.push(`protocol ${ping.protocol}`);
+  if (!Number.isInteger(ping.revision) || ping.revision < 1) problems.push(`wire revision ${ping.revision}`);
   if (ping.backend !== "tmux") problems.push(`backend ${ping.backend}`);
   if (ping.instance !== "herdsman") problems.push(`instance ${ping.instance}`);
-  for (const capability of [
-    "mux.observe",
+  for (const contract of [
     "registry.v1",
     "spawn.v1",
     "spawn.close.v1",
     "spawn.launch_context.v1",
   ]) {
-    if (!(ping.capabilities ?? []).includes(capability)) problems.push(`capability ${capability}`);
+    if (!(ping.contracts ?? []).includes(contract)) problems.push(`contract ${contract}`);
   }
 
   const observed = await request("mux.observe", {});

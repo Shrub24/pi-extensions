@@ -141,7 +141,7 @@ async function runAcceptance() {
 			ping.ok &&
 			ping.value.backend === "tmux" &&
 			ping.value.instance === server &&
-			["spawn.v1", "spawn.close.v1", "events.v1", "registry.v1"].every((c) => ping.value.capabilities.includes(c));
+			["spawn.v1", "spawn.close.v1", "events.v1", "registry.v1"].every((c) => ping.value.contracts.includes(c));
 		record("handshake", pingOk ? "passed" : "failed", pingOk ? `backend=tmux instance=${server}` : JSON.stringify(ping));
 
 		// Parent: a registered operator located on its own pane, with published session context.

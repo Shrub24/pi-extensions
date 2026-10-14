@@ -27,8 +27,8 @@ inability to confirm — `Radar could not confirm the lead from a fresh
 observation; reopen staff.` — because the daemon resolves duplicate pane records
 itself and a refusal there does not establish that anything changed.
 
-Typed `observe` and `focus` methods on `extension/radar-client.ts` serve these
-consumers; no other mux methods are added. `focus` success means the daemon
+Typed `observe` and `focus` methods from the published `pi-radar` client serve
+these consumers; no other mux methods are added. `focus` success means the daemon
 performed a focus. It is never evidence of process liveness, startup readiness or
 assignment completion.
 

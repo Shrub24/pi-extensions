@@ -1,7 +1,6 @@
 import {
   createRadarClient,
   radarLifecycleState,
-  RADAR_OBSERVE_CAPABILITY,
   RADAR_SPAWN_CLOSE_CONTRACT,
   RADAR_SPAWN_CONTRACT,
   RADAR_SPAWN_LAUNCH_CONTEXT_CONTRACT,
@@ -13,20 +12,21 @@ import {
   type RadarLocation,
   type RadarObservedAgent,
   type RadarObservedSession,
+  type RadarAssignmentSnapshot,
   type RadarSnapshot,
   type RadarSpawnExitObservation,
-} from "./radar-client.ts";
+} from "pi-radar/client";
 import {
   radarLocalPane,
   radarPaneHandle,
   resolveRadarProcessLocation,
   type RadarLocationResolution,
-} from "./radar-location.ts";
+} from "pi-radar/location";
 import {
   createRadarExecutionAdapter,
   radarLocalRegistration,
   type RadarExecutionEventApi,
-} from "./radar-execution.ts";
+} from "pi-radar/execution";
 import {
   launchRadarWorker,
   observeRadarChild,
@@ -36,8 +36,8 @@ import {
   type RadarWorkerLaunched,
   readProcessGone,
   relaunchRefusalForChild,
-} from "./radar-launch.ts";
-import { radarBindingKey, type RadarPublication } from "./radar-publication.ts";
+} from "pi-radar/launch";
+import { radarBindingKey, type RadarPublication } from "pi-radar/publication";
 import {
   SESSION_METADATA_ENTRY,
   readSessionMetadata,
@@ -149,6 +149,7 @@ import {
   resetAgentMailbox,
   unacknowledgedRequestExists,
   waitForState,
+  startupAckMatches,
   agentMailboxPath,
   agentStatePath,
   writeAsk,
@@ -237,7 +238,7 @@ import {
 } from "./response-validation.ts";
 import { CHILD_COMMAND_ENV, resolveChildCommand } from "./child-command.ts";
 import { sameCwd } from "./cwd.ts";
-import { inspectRadarChild, provedRead } from "./radar-inspection.ts";
+import { inspectRadarChild, provedRead } from "pi-radar/inspection";
 import {
   acquireProcessLock,
   claimProcessLock,
@@ -1384,7 +1385,7 @@ function acknowledgeRadarLaunch(
 export function assignmentSnapshot(
   state: ManagedAgentState,
   projection: unknown,
-): RadarSnapshot {
+): RadarAssignmentSnapshot {
   const waitingReason = state.pendingAskId
     ? "questionnaire"
     : state.backgroundWaiting?.taskIds?.length
@@ -1395,10 +1396,18 @@ export function assignmentSnapshot(
     : !state.activeRequestId && state.completedRequestId
       ? { result: "delivered" }
       : undefined;
+  // Interim bridge until the assignment extension is owned by the daemon: the
+  // request in flight and the background tasks it is waiting on. Assignment text
+  // and questions stay out of Radar for now.
+  const awaited = state.backgroundWaiting?.taskIds ?? [];
   return {
     activity: typeof projection === "string" ? projection : "unknown",
     ...(waitingReason !== undefined ? { waiting_reason: waitingReason } : {}),
     ...(outcome !== undefined ? { last_outcome: outcome } : {}),
+    ...(state.activeRequestId !== undefined
+      ? { request: state.activeRequestId }
+      : {}),
+    ...(awaited.length > 0 ? { awaited: [...awaited] } : {}),
   };
 }
 let publishOwnerView:
@@ -2655,8 +2664,7 @@ async function radarPreflight(): Promise<void> {
     RADAR_SPAWN_CONTRACT,
     RADAR_SPAWN_CLOSE_CONTRACT,
     RADAR_SPAWN_LAUNCH_CONTEXT_CONTRACT,
-    RADAR_OBSERVE_CAPABILITY,
-  ].find((name) => !ready.value.capabilities.includes(name));
+  ].find((name) => !ready.value.contracts.includes(name));
   if (missing !== undefined)
     fail(
       "invalid_request",
@@ -6601,7 +6609,10 @@ async function launchRadarChild(
     sessionArgs: string[];
   },
   report: RadarLaunchReport,
-): Promise<{ spawn: RadarSpawnEntry; launch: RadarWorkerLaunched }> {
+): Promise<{
+  spawn: RadarSpawnEntry;
+  launch: RadarWorkerLaunched<ManagedAgentState>;
+}> {
   const { operation, runId, owner, label, workspaceId, mailbox, launchPlan } =
     input;
   const client = radarClient;
@@ -6643,6 +6654,7 @@ async function launchRadarChild(
   let spawn = requested;
   const launch = await launchRadarWorker({
     client,
+    readers: { readState: readAgentState, waitForState, startupAckMatches },
     timeoutMs: radarLaunchTimeoutMs(),
     signal: input.signal,
     launch: {

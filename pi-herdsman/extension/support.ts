@@ -30,7 +30,7 @@ import {
 } from "./support-radar.ts";
 
 export { spawnedArgvs, spawnedEnvironmentAssignments, spawnedLabels };
-import { radarProcessSlot } from "./radar-publication.ts";
+import { radarProcessSlot } from "pi-radar/publication";
 import { herdsmanDataRoot } from "./storage.ts";
 import { DEFAULT_RESPONSE_CONTRACT } from "./response-contracts.ts";
 import { claimProcessLock } from "./lock.ts";

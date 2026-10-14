@@ -21,7 +21,7 @@ import {
   type ProcessLockClaim,
 } from "./lock.ts";
 import { herdsmanDataRoot } from "./storage.ts";
-import { isUuid, radarControlSocketPath } from "./radar-client.ts";
+import { isUuid, radarControlSocketPath } from "pi-radar/client";
 
 // Authority edges: Chief -> Lead -> Agent. Only Lead sessions may be peers.
 export type SessionRole = "lead" | "chief";

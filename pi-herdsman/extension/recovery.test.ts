@@ -12,7 +12,7 @@ import type {
   ResultRecord,
   ManagedAgentState,
 } from "./mailbox.ts";
-import { RADAR_SUBJECT_SOURCE } from "./radar-execution.ts";
+import { RADAR_SUBJECT_SOURCE } from "pi-radar/execution";
 import type { ExecHandler, FixtureIdentity } from "./support.ts";
 import { claimProcessLock } from "./lock.ts";
 import { resultPath, resultRef } from "./storage.ts";

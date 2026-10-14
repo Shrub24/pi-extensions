@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { createRadarClient } from "./radar-client.ts";
+import { createRadarClient } from "pi-radar/client";
 import { chmodSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
@@ -13,7 +13,7 @@ import type {
   ResultRecord,
   ManagedAgentState,
 } from "./mailbox.ts";
-import { RADAR_SUBJECT_SOURCE } from "./radar-execution.ts";
+import { RADAR_SUBJECT_SOURCE } from "pi-radar/execution";
 import {
   FIXTURE_LEAD_PANE,
   FIXTURE_TMUX_SERVER,
@@ -521,7 +521,7 @@ test("a fresh launch refuses when the daemon does not serve the spawn contract",
   process.env.RADAR_CONTROL_SOCKET = radarDaemon.socketPath;
   // A daemon that answers, but is not a build that serves managed spawn: the
   // client refuses locally before dialing, so nothing is created for it either.
-  radarDaemon.options.capabilities = ["registry.v1", "mux.observe"];
+  radarDaemon.options.contracts = ["registry.v1"];
   const pi = fakePi({});
   registerExtension!(pi.pi as never);
   const context = fakeContext(pi.entries);

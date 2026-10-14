@@ -40,6 +40,9 @@
     "pi-herdsman": {
       "name": "pi-herdsman",
       "version": "0.18.0",
+      "dependencies": {
+        "pi-radar": "0.1.0",
+      },
       "devDependencies": {
         "@earendil-works/pi-ai": "1.1.0",
         "@earendil-works/pi-coding-agent": "1.1.0",
@@ -457,6 +460,8 @@
     "pi-herdsman": ["pi-herdsman@workspace:pi-herdsman"],
 
     "pi-otel": ["pi-otel@workspace:pi-otel"],
+
+    "pi-radar": ["pi-radar@0.1.0", "", {}, "sha512-9baj9YvynilcmDNDs16B1qtioqvpQ2VY6EhOydwUwUwkhebyBhD/ERmQk9Q8go2vyZvIANWtL7GMOh1nq4TAoA=="],
 
     "pi-reqcap": ["pi-reqcap@workspace:pi-reqcap"],
 

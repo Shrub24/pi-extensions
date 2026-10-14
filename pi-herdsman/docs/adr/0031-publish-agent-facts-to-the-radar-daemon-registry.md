@@ -6,9 +6,8 @@ Herdsman publishes three records to Agent Radar's control-socket registry (contr
 version 1): Pi execution facts on the `execution` channel, authored by the running
 process; owner assignment facts on the `assignment` channel, authored by the
 Herdsman that owns the assignment; and that process's current Pi session as the
-registry's mutable context record, authored by the same running process. Publisher
-code lives in `extension/radar-client.ts`, `extension/radar-publication.ts` and
-`extension/radar-execution.ts`, wired from `extension/index.ts`. The generic
+registry's mutable context record, authored by the same running process. The `pi-radar` package in `agent-radar/pi-radar` provides the client and
+publication code; Herdsman wires it from `extension/index.ts`. The generic
 execution adapter is role-independent: it also reports an ordinary or
 operator-owned Pi session that merely loads Herdsman, and it omits owner, run and
 label when no assignment exists rather than inventing one.

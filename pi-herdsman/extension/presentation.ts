@@ -18,7 +18,7 @@ import {
   visibleWidth,
 } from "@earendil-works/pi-tui";
 import type { Box as TuiBox, Component } from "@earendil-works/pi-tui";
-import type { RadarForeground } from "./radar-client.ts";
+import type { RadarForeground } from "pi-radar/client";
 import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,

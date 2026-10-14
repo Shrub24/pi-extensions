@@ -7,21 +7,19 @@ import {
   type RadarChannel,
   type RadarErrorCode,
   RADAR_EVENTS_CONTRACT,
-  RADAR_FOCUS_CAPABILITY,
-  RADAR_OBSERVE_CAPABILITY,
-  RADAR_OUTPUT_CAPABILITY,
-  RADAR_PROCESS_INFO_CAPABILITY,
+  RADAR_MINIMUM_REVISION,
   RADAR_PROTOCOL_VERSION,
   RADAR_REGISTRY_CONTRACT,
+  RADAR_REGISTRY_FACTS_CONTRACT,
   RADAR_SPAWN_CLOSE_CONTRACT,
   RADAR_SPAWN_CONTRACT,
   RADAR_SPAWN_LAUNCH_CONTEXT_CONTRACT,
-} from "./radar-client.ts";
+} from "pi-radar/client";
 import {
   RADAR_PUBLICATION_VERSION,
   radarBindingKey,
-} from "./radar-publication.ts";
-import { RADAR_SUBJECT_SOURCE } from "./radar-execution.ts";
+} from "pi-radar/publication";
+import { RADAR_SUBJECT_SOURCE } from "pi-radar/execution";
 import type {
   ManagedAgentState,
   RequestAddress,
@@ -171,8 +169,8 @@ export type RadarFakeOptions = {
    * would: the pane is gone and this process never learned that it is.
    */
   dropCloseReply: boolean;
-  /** The capabilities this daemon advertises. */
-  capabilities: string[];
+  /** The public contracts this daemon advertises. */
+  contracts: string[];
   /** Throw inside the daemon while answering `spawn`. */
   crashSpawn: boolean;
 };
@@ -351,15 +349,12 @@ const DEFAULTS: RadarFakeOptions = {
   instance: FIXTURE_TMUX_SERVER,
   exitObservation: "unknown",
   closeOutcome: "completed",
-  capabilities: [
+  contracts: [
     RADAR_REGISTRY_CONTRACT,
+    RADAR_REGISTRY_FACTS_CONTRACT,
     RADAR_SPAWN_CONTRACT,
-    RADAR_SPAWN_LAUNCH_CONTEXT_CONTRACT,
-    RADAR_OBSERVE_CAPABILITY,
-    RADAR_FOCUS_CAPABILITY,
-    RADAR_OUTPUT_CAPABILITY,
-    RADAR_PROCESS_INFO_CAPABILITY,
     RADAR_SPAWN_CLOSE_CONTRACT,
+    RADAR_SPAWN_LAUNCH_CONTEXT_CONTRACT,
     RADAR_EVENTS_CONTRACT,
   ],
   crashSpawn: false,
@@ -900,10 +895,11 @@ export async function startFakeRadarDaemon(
         return {
           result: {
             protocol: RADAR_PROTOCOL_VERSION,
+            revision: RADAR_MINIMUM_REVISION,
             backend: settings.backend,
             instance: settings.instance,
-            capabilities: settings.capabilities,
-            uid: process.getuid?.() ?? 0,
+            contracts: settings.contracts,
+            tasks: { available: true, error: null },
           },
         };
       case "agent.register": {
@@ -1075,7 +1071,7 @@ export async function startFakeRadarDaemon(
         // The daemon's own rule: a backend that cannot observe the pane's
         // foreground process, or cannot close it, refuses here rather than being
         // trusted on pane presence alone.
-        if (!settings.capabilities.includes(RADAR_SPAWN_CLOSE_CONTRACT))
+        if (!settings.contracts.includes(RADAR_SPAWN_CLOSE_CONTRACT))
           return {
             error: {
               code: "backend_unavailable",

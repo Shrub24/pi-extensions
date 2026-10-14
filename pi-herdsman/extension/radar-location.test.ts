@@ -1,12 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { radarDaemon, resetRadarState, WORKSPACE } from "./support.ts";
-import { createRadarClient } from "./radar-client.ts";
+import { createRadarClient } from "pi-radar/client";
 import {
   radarLocalPane,
   resolveRadarProcessLocation,
   tmuxServerName,
-} from "./radar-location.ts";
+} from "pi-radar/location";
 
 /**
  * A canonical observation of one pane, exactly as the tmux daemon reports it.

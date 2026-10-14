@@ -2377,10 +2377,17 @@ const observedFleet = (agents: unknown[]) => {
 };
 
 const radarPing = (
-  capabilities: string[],
+  contracts: string[],
   backend = "herdr",
 ) => ({
-  result: { protocol: 2, backend, instance: null, capabilities },
+  result: {
+    protocol: 2,
+    revision: 1,
+    backend,
+    instance: null,
+    contracts,
+    tasks: { available: true, error: null },
+  },
 });
 
 const focusRecord = (request: any) => ({

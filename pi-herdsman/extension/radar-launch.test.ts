@@ -2,21 +2,31 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { test } from "node:test";
 import {
-  RADAR_OBSERVE_CAPABILITY,
   RADAR_REGISTRY_CONTRACT,
   RADAR_SPAWN_CONTRACT,
   createRadarClient,
-} from "./radar-client.ts";
+} from "pi-radar/client";
 import {
   launchRadarWorker,
   observeRadarChild,
   type RadarWorkerLaunch,
-} from "./radar-launch.ts";
+} from "pi-radar/launch";
 import { managedAgentPresence } from "./index.ts";
-import { readAgentState } from "./mailbox.ts";
-import { RADAR_SUBJECT_SOURCE } from "./radar-execution.ts";
+import {
+  readAgentState,
+  startupAckMatches,
+  waitForState,
+} from "./mailbox.ts";
+import { RADAR_SUBJECT_SOURCE } from "pi-radar/execution";
 import { WORKSPACE, agentMailboxPath, resetRadarState } from "./support.ts";
 import { FIXTURE_CHILD_PANE, startFakeRadarDaemon } from "./support-radar.ts";
+
+/** Herdsman's own mailbox readers, the same ones the production launch receives. */
+const mailboxReaders = {
+  readState: readAgentState,
+  waitForState,
+  startupAckMatches,
+};
 
 /**
  * One launch's inputs: a mailbox, the identity its child must repeat, and the
@@ -82,6 +92,7 @@ test("a spawn the daemon completes and its child acknowledges is ready", async (
     const launch = launchInputs();
     const outcome = await launchRadarWorker({
       client: clientFor(daemon),
+      readers: mailboxReaders,
       launch,
       timeoutMs: 2_000,
       pollMs: 10,
@@ -120,6 +131,7 @@ test("a child that never registers leaves the launch unresolved", async () => {
     const launch = launchInputs();
     const outcome = await launchRadarWorker({
       client: clientFor(daemon),
+      readers: mailboxReaders,
       launch,
       timeoutMs: 400,
       pollMs: 10,
@@ -137,6 +149,7 @@ test("a bound child that never acknowledges its launch stays unresolved", async 
     const launch = launchInputs();
     const outcome = await launchRadarWorker({
       client: clientFor(daemon),
+      readers: mailboxReaders,
       launch,
       timeoutMs: 400,
       pollMs: 10,
@@ -159,6 +172,7 @@ test("the daemon's binding is recorded before the child acknowledges readiness",
     const launch = launchInputs({ onBound: (value) => bound.push(value) });
     const outcome = await launchRadarWorker({
       client: clientFor(daemon),
+      readers: mailboxReaders,
       launch,
       timeoutMs: 400,
       pollMs: 10,
@@ -183,6 +197,7 @@ test("a binding that cannot be recorded leaves the launch unresolved", async () 
     });
     const outcome = await launchRadarWorker({
       client: clientFor(daemon),
+      readers: mailboxReaders,
       launch,
       timeoutMs: 2_000,
       pollMs: 10,
@@ -204,6 +219,7 @@ test("a daemon refusal is a launch that never began", async () => {
     async (daemon) => {
       const outcome = await launchRadarWorker({
         client: clientFor(daemon),
+        readers: mailboxReaders,
         launch: launchInputs(),
         timeoutMs: 400,
         pollMs: 10,
@@ -221,6 +237,7 @@ test("a lost spawn reply is read back under the same request id", async () => {
     const launch = launchInputs();
     const outcome = await launchRadarWorker({
       client: clientFor(daemon),
+      readers: mailboxReaders,
       launch,
       timeoutMs: 2_000,
       pollMs: 10,
@@ -235,6 +252,7 @@ test("a parent registration without a pane is refused before any spawn", async (
   await withDaemon({}, async (daemon) => {
     const outcome = await launchRadarWorker({
       client: clientFor(daemon),
+      readers: mailboxReaders,
       launch: launchInputs({ parent: { agent_id: randomUUID() } }),
       timeoutMs: 400,
       pollMs: 10,
@@ -250,6 +268,7 @@ test("a child whose published binding names another subject is not ready", async
   await withDaemon({}, async (daemon) => {
     const outcome = await launchRadarWorker({
       client: clientFor(daemon),
+      readers: mailboxReaders,
       launch: launchInputs({ observedChildAgent: () => randomUUID() }),
       timeoutMs: 400,
       pollMs: 10,
@@ -271,6 +290,7 @@ test("a child that claims its parent's pane instead of the pane it was created i
     const launch = launchInputs();
     const outcome = await launchRadarWorker({
       client: clientFor(daemon),
+      readers: mailboxReaders,
       launch,
       timeoutMs: 400,
       pollMs: 10,
@@ -291,6 +311,7 @@ test("a launch whose recorded pane the daemon no longer reports is unresolved", 
     const launch = launchInputs();
     const outcome = await launchRadarWorker({
       client: clientFor(daemon),
+      readers: mailboxReaders,
       launch,
       timeoutMs: 400,
       pollMs: 10,
@@ -309,6 +330,7 @@ test("child.close carries the caller's own id and replays without a second effec
     const launch = launchInputs();
     const outcome = await launchRadarWorker({
       client: clientFor(daemon),
+      readers: mailboxReaders,
       launch,
       timeoutMs: 2_000,
       pollMs: 10,
@@ -350,6 +372,7 @@ test("child.close replays refuse different content under the same id", async () 
     const launch = launchInputs();
     const outcome = await launchRadarWorker({
       client: clientFor(daemon),
+      readers: mailboxReaders,
       launch,
       timeoutMs: 2_000,
       pollMs: 10,
@@ -385,6 +408,7 @@ test("child.close refuses a child the edge is not bound to", async () => {
     const launch = launchInputs();
     const outcome = await launchRadarWorker({
       client: clientFor(daemon),
+      readers: mailboxReaders,
       launch,
       timeoutMs: 2_000,
       pollMs: 10,
@@ -412,6 +436,7 @@ test("child.close reports a refusal as an outcome and never a second attempt", a
     const launch = launchInputs();
     const outcome = await launchRadarWorker({
       client: clientFor(daemon),
+      readers: mailboxReaders,
       launch,
       timeoutMs: 2_000,
       pollMs: 10,
@@ -438,12 +463,8 @@ test("child.close reports a refusal as an outcome and never a second attempt", a
 });
 
 test("spawn.close without the close contract is refused before any pane effect", async () => {
-  const capabilities = [
-    RADAR_REGISTRY_CONTRACT,
-    RADAR_SPAWN_CONTRACT,
-    RADAR_OBSERVE_CAPABILITY,
-  ];
-  await withDaemon({ capabilities }, async (daemon) => {
+  const contracts = [RADAR_REGISTRY_CONTRACT, RADAR_SPAWN_CONTRACT];
+  await withDaemon({ contracts }, async (daemon) => {
     const refused = await clientFor(daemon).childClose({
       request_id: randomUUID(),
       spawn_request_id: randomUUID(),
@@ -474,6 +495,7 @@ async function readyLaunch(
   const launch = launchInputs();
   const outcome = await launchRadarWorker({
     client: clientFor(daemon),
+    readers: mailboxReaders,
     launch,
     timeoutMs: 2_000,
     pollMs: 10,
@@ -598,6 +620,7 @@ test("a child whose launch never bound a subject is unproved", async () => {
     const launch = launchInputs();
     await launchRadarWorker({
       client: clientFor(daemon),
+      readers: mailboxReaders,
       launch,
       timeoutMs: 300,
       pollMs: 10,

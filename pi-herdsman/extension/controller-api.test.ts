@@ -13,10 +13,10 @@ import type {
   ManagedAgentState,
 } from "./mailbox.ts";
 import { OperationError } from "./errors.ts";
-import { createRadarClient } from "./radar-client.ts";
+import { createRadarClient } from "pi-radar/client";
 import { classifySupervisedLead } from "./presentation.ts";
-import { readProcessBirth } from "./radar-publication.ts";
-import { RADAR_SUBJECT_SOURCE } from "./radar-execution.ts";
+import { readProcessBirth } from "pi-radar/publication";
+import { RADAR_SUBJECT_SOURCE } from "pi-radar/execution";
 import { resultPath, resultRef } from "./storage.ts";
 import {
   listChiefMessagePaths,
