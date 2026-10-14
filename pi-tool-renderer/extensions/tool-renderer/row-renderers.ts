@@ -9,9 +9,9 @@
  * - the cbmem adapter's tools;
  * - tools that have no renderer from anyone, drawn with the generic row.
  *
- * Renderers another extension already supplies are returned unchanged, so the
- * resolver never restyles a row it does not adopt. Pi before 1.0.1 has no
- * resolver seam; there the rows keep Pi's own renderers.
+ * Existing renderers are preserved; the resolver opts their row into this
+ * package's shell so toolChrome applies consistently. Pi before 1.0.1 has no
+ * resolver seam, so rows keep Pi's own shell.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -47,7 +47,9 @@ export function installRowRenderers(pi: ExtensionAPI): void {
 			);
 		}
 		const base = next();
-		if (base?.renderCall || base?.renderResult) return base;
+		if (base?.renderCall || base?.renderResult) {
+			return base.renderShell === "self" ? base : { ...base, renderShell: "self" };
+		}
 		if (!settingBoolean("genericToolRenderers", true, cwd)) return base;
 		return rowRenderers(
 			(args, theme, context) => renderGenericToolCall(toolName, args, theme, context),

@@ -171,9 +171,9 @@ interface UserMessagePatchState {
 }
 
 /**
- * Timestamp per user message component. Live messages are queued on
- * message_start and claimed oldest-first by the renderer; replayed history has
- * no event, so those messages simply render unstamped.
+ * User message components do not retain their source message timestamp. Seed
+ * the active branch at session start and append live messages on message_start;
+ * components claim timestamps in transcript order.
  */
 const userStampTimes = new WeakMap<object, number>();
 const pendingUserStamps: number[] = [];
@@ -367,8 +367,15 @@ export function installUserMessageRenderer(pi: ExtensionAPI, UserMessageComponen
 
 	pi.on("session_start", (_event: any, ctx: ExtensionContext) => {
 		state!.activeCtx = ctx;
+		pendingUserStamps.length = 0;
+		for (const entry of ctx?.sessionManager?.getBranch?.() ?? []) {
+			if (entry.type === "message" && entry.message.role === "user" && typeof entry.message.timestamp === "number") {
+				pendingUserStamps.push(entry.message.timestamp);
+			}
+		}
 	});
 	pi.on("session_shutdown", () => {
+		pendingUserStamps.length = 0;
 		if (prototype[USER_MESSAGE_PATCH_SYMBOL] === state) {
 			prototype.render = state!.originalRender as unknown;
 			if (state!.invalidatePatched) {

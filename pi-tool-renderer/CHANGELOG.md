@@ -4,7 +4,8 @@
 
 ### Unreleased
 
-- Requires Pi 1.0.1 or later. Rows are drawn through Pi's tool renderer resolver, so the search tools keep this extension's row style when fff's override mode replaces `grep` and `find`. fff's `ffgrep`/`fffind` and the cbmem tools are drawn through the same resolver, and a tool that no extension draws gets the generic row. Renderers another extension supplies are left as they are.
+- Restored user messages now receive inline timestamps from their active session branch; live user messages continue to use `message_start` timestamps.
+- Requires Pi 1.0.1 or later. Rows are drawn through Pi's tool renderer resolver, so the search tools keep this extension's row style when fff's override mode replaces `grep` and `find`. fff's `ffgrep`/`fffind` and the cbmem tools are drawn through the same resolver, and a tool that no extension draws gets the generic row. Existing tool renderers are preserved and wrapped in this extension's shell.
 - With the compact renderers on, the system prompt lists `read`, `bash`, `grep`, `find` and `ls` under Available tools again and keeps Pi's guidelines for them, such as using `read` instead of `cat`. With `renderMutationTools` on, `edit` and `write` keep their entries and guidelines too.
 - `/renderdebug memory` reports process memory and the live sizes of the renderer's strong stores; `/renderdebug memory gc` also runs a forced collection and prints the reclaimed JavaScript heap. The existing `/renderdebug` output is unchanged.
 

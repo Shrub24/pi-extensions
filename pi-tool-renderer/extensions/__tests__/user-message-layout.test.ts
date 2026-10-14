@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
-import { __test, installUserMessageRenderer } from "../tool-renderer/messages.js";
+import { __stampTest, __test, installUserMessageRenderer } from "../tool-renderer/messages.js";
 import { useWorld } from "./helpers/world.js";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -26,7 +26,7 @@ test("user Markdown reuses one layout and invalidates for width, content, themes
 	const component = new Message();
 	const draw = (width = 60) => component.render(width);
 	try {
-		handlers.get("session_start")!({}, { cwd: world().cwd, hasUI: true, ui });
+		handlers.get("session_start")!({}, { cwd: world().cwd, hasUI: true, ui, sessionManager: { getBranch: () => [] } });
 		const first = draw();
 		const count = highlights;
 		expect(first.join("\n")).toContain("first");
@@ -64,6 +64,34 @@ test("user Markdown reuses one layout and invalidates for width, content, themes
 		expect(component.render()).toEqual(["upstream"]);
 	} finally {
 		handlers.get("session_shutdown")!();
+	}
+});
+
+test("restored user messages get inline stamps from the active session branch", () => {
+	const timestamp = new Date(2024, 0, 2, 3, 4, 5).getTime();
+	const theme = { fg: (_token: string, text: string) => text };
+	const handlers = new Map<string, (...args: any[]) => void>();
+	class Message {
+		text = "restored user message";
+		markdownTheme = getMarkdownTheme();
+		render(_width = 60) { return ["upstream"]; }
+	}
+	__stampTest.pendingUserStamps.length = 0;
+	writeFileSync(join(world().agent, "settings.json"), JSON.stringify({ kendex: { extensionManager: { config: { "@vanillagreen/pi-tool-renderer": { compactUserMessages: true, messageStamps: "inline", messageStampFormat: "24h", messageStampSeconds: true } } } } }));
+	clearPackageConfigCache();
+	installUserMessageRenderer({ on: (event: string, handler: (...args: any[]) => void) => handlers.set(event, handler) } as never, Message);
+	const component = new Message();
+	try {
+		handlers.get("session_start")!({}, {
+			cwd: world().cwd,
+			hasUI: true,
+			ui: { theme },
+			sessionManager: { getBranch: () => [{ type: "message", message: { role: "user", timestamp } }] },
+		});
+		expect(component.render(60).join("\n")).toContain("03:04:05");
+	} finally {
+		handlers.get("session_shutdown")!();
+		__stampTest.pendingUserStamps.length = 0;
 	}
 });
 

@@ -39,11 +39,15 @@ test("the resolver draws our grep row even when another extension owns the name"
 	expect(drawn.renderResult).not.toBe(foreign().renderResult);
 });
 
-test("the resolver leaves renderers another extension supplies on unadopted tools", () => {
+test("the resolver keeps another extension's renderers and adds our chrome shell", () => {
 	const { pi, state } = fakePi();
 	installRowRenderers(pi);
-	const base = { renderShell: "default", ...foreign() };
-	expect(state.resolver!("some_other_tool", () => base)).toBe(base);
+	const base = foreign();
+	const drawn = state.resolver!("todo", () => base);
+	expect(drawn).not.toBe(base);
+	expect(drawn.renderShell).toBe("self");
+	expect(drawn.renderCall).toBe(base.renderCall);
+	expect(drawn.renderResult).toBe(base.renderResult);
 });
 
 test("a tool with no renderer from anyone gets the generic row", () => {
