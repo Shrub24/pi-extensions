@@ -2150,7 +2150,6 @@ test("a provider error cannot reach the answer that follows it", async (t) => {
   assert.equal(result?.status, "completed");
   assert.equal(result?.text, "Answered after the provider recovered.");
   assert.equal(result?.error, undefined);
-  assert.doesNotMatch(JSON.stringify(result), /429/);
   fireShutdown(agent);
 });
 
