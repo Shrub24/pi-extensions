@@ -69,10 +69,10 @@ import support, {
   writeResult,
   writeAgentState,
 } from "./support.ts";
-const { updateConfig } = await import("./config.ts");
+const { setConfigField } = await import("./support-config.ts");
 // These suites cover the one-shot lifecycle; retained workers are the default,
 // and the tests that exercise retention opt in or out explicitly.
-beforeEach(() => updateConfig("retainWorkers", false));
+beforeEach(() => setConfigField("retainWorkers", false));
 const agentTool = (pi: ReturnType<typeof fakePi>, name: string) => {
   const tool = pi.tools.find(
     (candidate) => candidate.name === `agent_${name}`,
@@ -96,6 +96,75 @@ const agentTool = (pi: ReturnType<typeof fakePi>, name: string) => {
     },
   };
 };
+
+test("fresh Radar child launch passes the current Lead subject ID as managed parent metadata", async () => {
+  setLeadEnvironment();
+  const pi = fakePi({});
+  registerExtension!(pi.pi as never);
+  await startRadarSession(pi);
+  const label = "subject-bound-child";
+  try {
+    await delegateRadarChild(pi, label);
+    assert.equal(radarDaemon.spawns.length, 1);
+    assert.equal(
+      radarDaemon.spawns[0].managed?.parent_subject_id,
+      process.env.PI_RADAR_MANAGED_SUBJECT_ID,
+    );
+    assert.equal(
+      radarDaemon.spawns[0].env.PI_RADAR_MANAGED_PARENT_SUBJECT_ID,
+      process.env.PI_RADAR_MANAGED_SUBJECT_ID,
+    );
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(agentMailboxPath(WORKSPACE, label));
+  }
+});
+
+test("fresh Radar child launch refuses when the Lead has no managed subject ID", async () => {
+  setLeadEnvironment();
+  delete process.env.PI_RADAR_MANAGED_SUBJECT_ID;
+  const pi = fakePi({});
+  registerExtension!(pi.pi as never);
+  await startRadarSession(pi);
+  try {
+    const result = await agentTool(pi, "delegate").execute(
+      "delegate-missing-parent-subject",
+      { definition: "agent", label: "missing-parent-subject-child", task: "Do the task." },
+      undefined,
+      undefined,
+      fakeContext(pi.entries),
+    );
+    assert.equal(result.details.ok, false);
+    assert.match(JSON.stringify(result.details), /managed subject identity/);
+    assert.equal(radarDaemon.spawns.length, 0);
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(agentMailboxPath(WORKSPACE, "missing-parent-subject-child"));
+  }
+});
+
+test("fresh Radar child launch refuses a malformed parent subject ID", async () => {
+  setLeadEnvironment();
+  process.env.PI_RADAR_MANAGED_SUBJECT_ID = "not-a-canonical-uuid";
+  const pi = fakePi({});
+  registerExtension!(pi.pi as never);
+  await startRadarSession(pi);
+  try {
+    const result = await agentTool(pi, "delegate").execute(
+      "delegate-malformed-parent-subject",
+      { definition: "agent", label: "malformed-parent-subject-child", task: "Do the task." },
+      undefined,
+      undefined,
+      fakeContext(pi.entries),
+    );
+    assert.equal(result.details.ok, false);
+    assert.match(JSON.stringify(result.details), /valid managed subject identity/);
+    assert.equal(radarDaemon.spawns.length, 0);
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(agentMailboxPath(WORKSPACE, "malformed-parent-subject-child"));
+  }
+});
 
 test("combined status reports a completed agent as pending, not active", async () => {
   setAgentEnvironment("status-pending-parent", ["child"]);
@@ -2422,7 +2491,7 @@ test("result delivery identifies retired sessions and honors the disabled settin
     });
     registerExtension!(pi.pi as never);
     try {
-      updateConfig("contextRetirement", enabled);
+      setConfigField("contextRetirement", enabled);
       await pi.events.get("session_start")![0](undefined, fakeContext(entries));
       return delivered;
     } finally {
@@ -2454,7 +2523,7 @@ test("result delivery identifies retired sessions and honors the disabled settin
     );
     assert.equal(ordinary.details.sessionRetired, false);
   } finally {
-    updateConfig("contextRetirement", undefined);
+    setConfigField("contextRetirement", undefined);
   }
 });
 
@@ -2665,7 +2734,7 @@ test("retained delivery keeps the worker, pane, and mailbox without the result",
       false,
     );
   } finally {
-    updateConfig("retainWorkers", undefined);
+    setConfigField("retainWorkers", undefined);
     pi.events.get("session_shutdown")?.[0]();
     radarDaemon.reset();
     resetAgentMailbox(mailbox);
@@ -2723,7 +2792,7 @@ test("disabled retention still tears the delivered worker down", async () => {
       "a closed generation names its exact saved session",
     );
   } finally {
-    updateConfig("retainWorkers", undefined);
+    setConfigField("retainWorkers", undefined);
     pi.events.get("session_shutdown")?.[0]();
     radarDaemon.reset();
     resetAgentMailbox(mailbox);
@@ -3018,7 +3087,7 @@ test("unresolved background work remains active with retention enabled or disabl
   t.mock.timers.enable({ apis: ["setTimeout"] });
 
   for (const retainWorkers of [true, false]) {
-    updateConfig("retainWorkers", retainWorkers);
+    setConfigField("retainWorkers", retainWorkers);
     const label = `waiting-retention-${retainWorkers}`;
     const mailbox = agentMailboxPath(WORKSPACE, label);
     resetAgentMailbox(mailbox);
@@ -3064,7 +3133,7 @@ test("unresolved background work remains active with retention enabled or disabl
         false,
       );
     } finally {
-      updateConfig("retainWorkers", undefined);
+      setConfigField("retainWorkers", undefined);
       pi.events.get("session_shutdown")?.[0]();
       resetAgentMailbox(mailbox);
     }
@@ -3073,7 +3142,7 @@ test("unresolved background work remains active with retention enabled or disabl
 
 test("repeated delivered-result cleanup after recovery retains and never closes", async (t) => {
   setLeadEnvironment();
-  updateConfig("retainWorkers", true);
+  setConfigField("retainWorkers", true);
   const label = "retained-recovery-agent";
   const mailbox = agentMailboxPath(WORKSPACE, label);
   resetAgentMailbox(mailbox);
@@ -3111,7 +3180,7 @@ test("repeated delivered-result cleanup after recovery retains and never closes"
       false,
     );
   } finally {
-    updateConfig("retainWorkers", undefined);
+    setConfigField("retainWorkers", undefined);
     pi.events.get("session_shutdown")?.[0]();
     resetAgentMailbox(mailbox);
   }
@@ -3119,7 +3188,7 @@ test("repeated delivered-result cleanup after recovery retains and never closes"
 
 test("a delivered worker with a live pane projects idle with its exact tools", async (t) => {
   setLeadEnvironment();
-  updateConfig("retainWorkers", true);
+  setConfigField("retainWorkers", true);
   const label = "retained-idle-listed";
   const identity = recoveryIdentity(label);
   writeFileSync(identity.piSessionFile, "{}", "utf8");
@@ -3164,7 +3233,7 @@ test("a delivered worker with a live pane projects idle with its exact tools", a
     assert.equal(record.recovery_only, undefined);
     assert.equal(listed.details.cleanup_errors, undefined);
   } finally {
-    updateConfig("retainWorkers", undefined);
+    setConfigField("retainWorkers", undefined);
     pi.events.get("session_shutdown")?.[0]();
     resetAgentMailbox(mailbox);
     realFs.rmSync(identity.piSessionFile, { force: true });
@@ -3173,7 +3242,7 @@ test("a delivered worker with a live pane projects idle with its exact tools", a
 
 test("a restart reuses a retained worker in its existing process", async (t) => {
   setLeadEnvironment();
-  updateConfig("retainWorkers", true);
+  setConfigField("retainWorkers", true);
   const name = `recovered-${randomUUID().slice(0, 8)}`;
   const label = `${name}-agent`;
   const definitionPath = join(PI_AGENTS_DIR, `${name}.md`);
@@ -3328,7 +3397,7 @@ test("a restart reuses a retained worker in its existing process", async (t) => 
       generation: launch.generation,
     });
   } finally {
-    updateConfig("retainWorkers", undefined);
+    setConfigField("retainWorkers", undefined);
     pi.events.get("session_shutdown")?.[0]();
     radarDaemon.reset();
     nativeSessions.delete(DEFAULT_PI_SESSION_ID);
@@ -3340,7 +3409,7 @@ test("a restart reuses a retained worker in its existing process", async (t) => 
 
 test("an idle retained worker produces no attention or digest while it waits", async (t) => {
   setLeadEnvironment();
-  updateConfig("retainWorkers", true);
+  setConfigField("retainWorkers", true);
   let now = Date.now();
   t.mock.method(Date, "now", () => now);
   const label = "retained-idle-quiet";
@@ -3395,7 +3464,7 @@ test("an idle retained worker produces no attention or digest while it waits", a
       "an idle retained worker must not wake its owner",
     );
   } finally {
-    updateConfig("retainWorkers", undefined);
+    setConfigField("retainWorkers", undefined);
     pi.events.get("session_shutdown")?.[0]();
     resetAgentMailbox(mailbox);
   }
@@ -6457,7 +6526,7 @@ async function radarChildFixture(
 ) {
   setLeadEnvironment();
   if (options.retainWorkers !== undefined)
-    updateConfig("retainWorkers", options.retainWorkers);
+    setConfigField("retainWorkers", options.retainWorkers);
   let entries: unknown[] = [];
   const pi = fakePi({
     sendMessage: (message) => {
@@ -6565,7 +6634,7 @@ test("agent_list offers agent_extend only for a windowed live assignment", async
   ]);
 
   // The same live record without a configured window offers no extension.
-  updateConfig("softTimeoutMs", 0);
+  setConfigField("softTimeoutMs", 0);
   assert.equal(
     (await tools()).includes("agent_extend"),
     false,
@@ -6588,7 +6657,7 @@ test("agent_list offers agent_extend only for a windowed live assignment", async
     0,
     "a refused extension records no window",
   );
-  updateConfig("softTimeoutMs", undefined);
+  setConfigField("softTimeoutMs", undefined);
   assert.equal((await tools()).includes("agent_extend"), true);
 
   pi.events.get("session_shutdown")?.[0]();
@@ -6933,7 +7002,7 @@ test("an unrecorded window falls back to the durable acknowledgement time", asyn
 
 test("softTimeoutMs of zero delivers no digest for an overdue window", async (t) => {
   setLeadEnvironment();
-  updateConfig("softTimeoutMs", 0);
+  setConfigField("softTimeoutMs", 0);
   let now = Date.now();
   t.mock.method(Date, "now", () => now);
   const { pi, mailbox, entries } = softWindowFixture("soft-window-off", {
@@ -6948,7 +7017,7 @@ test("softTimeoutMs of zero delivers no digest for an overdue window", async (t)
   t.mock.timers.tick(30_000);
   await settleUntil(() => softDigests(pi).length === 0);
   assert.equal(softDigests(pi).length, 0);
-  updateConfig("softTimeoutMs", undefined);
+  setConfigField("softTimeoutMs", undefined);
   pi.events.get("session_shutdown")?.[0]();
   resetAgentMailbox(mailbox);
 });
@@ -7818,7 +7887,7 @@ function foreignOccupantFleet(paneId: string) {
 
 test("an unclaimed managed alias is unknown rather than idle and closable", async () => {
   setLeadEnvironment();
-  updateConfig("retainWorkers", true);
+  setConfigField("retainWorkers", true);
   const label = "unclaimed-alias";
   const identity = recoveryIdentity(label);
   const mailbox = agentMailboxPath(WORKSPACE, label);
@@ -7860,7 +7929,7 @@ test("an unclaimed managed alias is unknown rather than idle and closable", asyn
     );
     assert.equal(closed.details.error.category, "target_ambiguous");
   } finally {
-    updateConfig("retainWorkers", undefined);
+    setConfigField("retainWorkers", undefined);
     pi.events.get("session_shutdown")?.[0]();
     resetAgentMailbox(mailbox);
   }

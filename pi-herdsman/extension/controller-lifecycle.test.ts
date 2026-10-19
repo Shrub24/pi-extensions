@@ -159,10 +159,10 @@ const registeredAgentTool = (
     },
   };
 };
-const { updateConfig } = await import("./config.ts");
+const { setConfigField } = await import("./support-config.ts");
 // These suites cover the one-shot lifecycle; retained workers are the default,
 // and the tests that exercise retention opt in or out explicitly.
-beforeEach(() => updateConfig("retainWorkers", false));
+beforeEach(() => setConfigField("retainWorkers", false));
 const { agentLaunchFingerprint, resolveAgentLaunchInputs } =
   await import("./agent-definitions.ts");
 
@@ -969,7 +969,7 @@ test("worker launches store one launch fingerprint of the resolved definition", 
 
 test("continuation reuses an idle retained worker in its existing process", async () => {
   setLeadEnvironment();
-  updateConfig("retainWorkers", true);
+  setConfigField("retainWorkers", true);
   const name = `warm-${randomUUID().slice(0, 8)}`;
   const label = `${name}-agent`;
   const definitionPath = join(PI_AGENTS_DIR, `${name}.md`);
@@ -1120,7 +1120,7 @@ test("continuation reuses an idle retained worker in its existing process", asyn
     assert.deepEqual(after?.lastAck?.identity, retainedLaunchAddress(launch));
     assert.equal((await listedLabel())?.state, "working");
   } finally {
-    updateConfig("retainWorkers", undefined);
+    setConfigField("retainWorkers", undefined);
     pi.events.get("session_shutdown")?.[0](undefined, context);
     radarDaemon.reset();
     nativeSessions.delete(session.id);
@@ -1142,7 +1142,7 @@ async function retainedRadarWorker(
   link: (daemon: FakeRadarDaemon) => void = () => undefined,
 ) {
   setLeadEnvironment();
-  updateConfig("retainWorkers", true);
+  setConfigField("retainWorkers", true);
   const name = `${prefix}-${randomUUID().slice(0, 8)}`;
   const label = `${name}-agent`;
   const definitionPath = join(PI_AGENTS_DIR, `${name}.md`);
@@ -1271,7 +1271,7 @@ async function retainedRadarWorker(
       ),
     dispose: () => {
       radarDaemon.onChildRequest = undefined;
-      updateConfig("retainWorkers", undefined);
+      setConfigField("retainWorkers", undefined);
       pi.events.get("session_shutdown")?.[0](undefined, context);
       radarDaemon.reset();
       nativeSessions.delete(session.id);

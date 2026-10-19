@@ -32,6 +32,8 @@ export const FIXTURE_TMUX_SERVER = "herdsman-fixture";
 export const FIXTURE_WORKSPACE = "herdsman-fixture";
 export const FIXTURE_TMUX_ENV = `${FIXTURE_TMUX_SERVER},1,0`;
 export const FIXTURE_LEAD_PANE = "%1";
+export const FIXTURE_LEAD_SUBJECT_ID = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+export const FIXTURE_AGENT_SUBJECT_ID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
 
 
 /**
@@ -66,6 +68,7 @@ export type RadarFakeSpawn = {
   argv: string[];
   cwd?: string;
   env: Record<string, string>;
+  managed?: { parent_subject_id?: string };
   pane: string;
   incarnation: string;
   agent_id?: string;
@@ -457,6 +460,14 @@ export async function startFakeRadarDaemon(
   };
   restartJournal("journal-1");
   const registerCalls: Array<{ agent_id: string; params: Record<string, unknown> }> = [];
+  // Presence claims, as the daemon keeps them: one live grant per session, every
+  // decision recorded by claim so a repeat replays it, and released claims that
+  // can never be granted again.
+  const presenceHolders = new Map<
+    string,
+    { registration_id: string; claim_id: string; subject_id: string }
+  >();
+  const presenceAnswers = new Map<string, Record<string, unknown>>();
   const closeContents = new Map<string, string>();
   const mailboxes = new Map<string, () => void>();
   /** Every simulated child this daemon started, ended by `reset`. */
@@ -494,6 +505,69 @@ export async function startFakeRadarDaemon(
     channel,
   });
 
+  // One session holds at most one grant. A session's subject is stable across
+  // claims, so a granted holder that reports again keeps the same subject.
+  const presence = (
+    params: Record<string, unknown>,
+  ): { result?: unknown; error?: { code: string; message: string } } => {
+    const claimId = String(params.claim_id);
+    const replayed = presenceAnswers.get(claimId);
+    if (replayed !== undefined) return { result: replayed };
+    const sessionId = String(params.session_id);
+    const registrationId =
+      typeof params.registration_id === "string"
+        ? params.registration_id
+        : subjectId(String(params.source), String(params.incarnation));
+    const holder = presenceHolders.get(sessionId);
+    let answer: Record<string, unknown>;
+    if (holder === undefined || holder.registration_id === registrationId) {
+      const grant = {
+        registration_id: registrationId,
+        claim_id: claimId,
+        subject_id: holder?.subject_id ?? subjectId("session", sessionId),
+      };
+      presenceHolders.set(sessionId, grant);
+      answer = { ...grant, standing: "granted" };
+    } else {
+      answer = {
+        claim_id: claimId,
+        registration_id: registrationId,
+        standing: "duplicate",
+      };
+    }
+    presenceAnswers.set(claimId, answer);
+    subjects.set(registrationId, {
+      ...subjects.get(registrationId),
+      session: sessionId,
+      location: params.location,
+    });
+    return { result: answer };
+  };
+
+  // Release frees the grant only for the claim that holds it. A superseded or
+  // unknown claim is refused, and repeating a completed release is a no-op.
+  const release = (
+    params: Record<string, unknown>,
+  ): { result?: unknown; error?: { code: string; message: string } } => {
+    const claimId = String(params.claim_id);
+    const recorded = presenceAnswers.get(claimId);
+    if (recorded?.standing === "released") return { result: recorded };
+    const sessionId = [...presenceHolders].find(
+      ([, grant]) => grant.claim_id === claimId,
+    )?.[0];
+    if (sessionId === undefined)
+      return { error: { code: "refused", message: "claim does not hold the grant" } };
+    const grant = presenceHolders.get(sessionId)!;
+    presenceHolders.delete(sessionId);
+    const answer = {
+      claim_id: claimId,
+      registration_id: grant.registration_id,
+      standing: "released",
+    };
+    presenceAnswers.set(claimId, answer);
+    return { result: answer };
+  };
+
   // A child's location is the pane the daemon created for it, on the server it runs.
   const locationOf = (spawn: RadarFakeSpawn) => ({
     backend: settings.backend,
@@ -516,7 +590,7 @@ export async function startFakeRadarDaemon(
             bound: {
               source: RADAR_SUBJECT_SOURCE,
               incarnation: spawn.incarnation,
-              agent_id: spawn.agent_id,
+              registration_id: spawn.agent_id,
             },
           }
         : {}),
@@ -751,7 +825,7 @@ export async function startFakeRadarDaemon(
       join(bindings, `${radarBindingKey(runId, ownerSessionId, agentLabel)}.json`),
       `${JSON.stringify({
         version: RADAR_PUBLICATION_VERSION,
-        agent_id: spawn.agent_id,
+        registration_id: spawn.agent_id,
         incarnation: spawn.incarnation,
         run: runId,
         owner: ownerSessionId,
@@ -927,11 +1001,11 @@ export async function startFakeRadarDaemon(
           spawn.agent_id = agentId;
           bound.add(spawn.request_id);
         }
-        return { result: { registration: { agent_id: agentId } } };
+        return { result: { registration: { registration_id: agentId } } };
       }
       case "agent.acquire":
       case "agent.context": {
-        const agentId = String(params.agent_id);
+        const agentId = String(params.registration_id);
         if (!subjects.has(agentId))
           return { error: { code: "not_found", message: "unknown agent" } };
         return {
@@ -941,7 +1015,7 @@ export async function startFakeRadarDaemon(
         };
       }
       case "agent.publish": {
-        const agentId = String(params.agent_id);
+        const agentId = String(params.registration_id);
         published.push({
           agent_id: agentId,
           channel: String(params.channel) as RadarChannel,
@@ -960,6 +1034,10 @@ export async function startFakeRadarDaemon(
       }
       case "agent.retire":
         return { result: { retired: true } };
+      case "agent.presence":
+        return presence(params);
+      case "agent.release":
+        return release(params);
       case "spawn.create": {
         if (settings.crashSpawn) throw new Error("daemon crashed mid-spawn");
         const request = params.request as Record<string, unknown>;
@@ -975,10 +1053,22 @@ export async function startFakeRadarDaemon(
           executable: String(request.executable),
           argv: (request.argv as string[]) ?? [],
           ...(request.cwd !== undefined ? { cwd: String(request.cwd) } : {}),
+          ...(typeof request.managed === "object" && request.managed !== null
+            ? {
+                managed: {
+                  ...(typeof (request.managed as Record<string, unknown>).parent_subject_id === "string"
+                    ? { parent_subject_id: String((request.managed as Record<string, unknown>).parent_subject_id) }
+                    : {}),
+                },
+              }
+            : {}),
           pane,
           // tmux sets TMUX_PANE in every pane it creates: the child's raw pane.
           env: {
             ...((request.env ?? {}) as Record<string, string>),
+            ...(typeof (request.managed as Record<string, unknown> | undefined)?.parent_subject_id === "string"
+              ? { PI_RADAR_MANAGED_PARENT_SUBJECT_ID: String((request.managed as Record<string, unknown>).parent_subject_id) }
+              : {}),
             TMUX_PANE: pane.slice(pane.lastIndexOf(":") + 1),
           },
           incarnation: randomUUID(),
@@ -1002,7 +1092,7 @@ export async function startFakeRadarDaemon(
       case "spawn.list":
         return { result: { spawns: spawns.map((spawn) => topology(spawn)) } };
       case "agent.get": {
-        const agentId = String(params.agent_id);
+        const agentId = String(params.registration_id);
         const registration = subjects.get(agentId);
         if (registration === undefined)
           return { error: { code: "not_found", message: "unknown agent" } };
@@ -1034,7 +1124,7 @@ export async function startFakeRadarDaemon(
                   ? null
                   : {
                       version: 1,
-                      agent_id: agentId,
+                      registration_id: agentId,
                       context: {
                         freshness: "fresh",
                         session: registration.contextSession ?? registration.session,

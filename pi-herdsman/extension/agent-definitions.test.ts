@@ -1162,6 +1162,17 @@ test("writes ordered private prompt snapshots with private permissions", () => {
   }
 });
 
+test("parses per-agent extension exclusions from frontmatter", () => {
+  const definition = discoverAgentDefinitionsWithContents(
+    `---
+name: custom
+excludeExtensions: ["npm:debug"]
+---
+`,
+  ).find(({ name }) => name === "custom")!;
+  assert.deepEqual(definition.frontmatter.excludeExtensions, ["npm:debug"]);
+});
+
 test("builds exact Pi capability launch arguments", () => {
   const agent = {
     name: "delegate",
@@ -1206,6 +1217,94 @@ test("builds exact Pi capability launch arguments", () => {
     "--extension",
     "/extensions/shared.ts",
   ]);
+});
+
+test("applies the common child extension set with per-agent additions and exclusions", () => {
+  const definition = {
+    name: "worker",
+    path: "/agents/worker.md",
+    frontmatter: {
+      name: "worker",
+      extensions: ["npm:worker-tool", "npm:shared"],
+      excludeExtensions: ["npm:debug"],
+    },
+    body: "",
+  };
+  const commonChildExtensions = ["npm:provider", "npm:debug", "npm:shared"];
+  const args = agentLaunchArgs(definition, {
+    commonChildExtensions,
+    modelDecision: {
+      kind: "use",
+      model: "extension-provider/model",
+      extensionDiscovery: true,
+    },
+  });
+  assert.equal(args.includes("--no-extensions"), true);
+  assert.deepEqual(
+    args.flatMap((arg, index) =>
+      arg === "--extension" ? [args[index + 1]] : [],
+    ),
+    ["npm:provider", "npm:shared", "npm:worker-tool"],
+  );
+
+  const launch = resolveAgentLaunchInputs(definition, {
+    cwd: "/tmp",
+    commonChildExtensions,
+  });
+  assert.equal(launch.noExtensions, true);
+  assert.deepEqual(launch.extensions, [
+    "npm:provider",
+    "npm:shared",
+    "npm:worker-tool",
+  ]);
+  assert.notEqual(
+    agentLaunchFingerprint(launch),
+    agentLaunchFingerprint(
+      resolveAgentLaunchInputs(definition, {
+        cwd: "/tmp",
+        commonChildExtensions: [...commonChildExtensions, "npm:another"],
+      }),
+    ),
+  );
+  assert.equal(SUPPORTED_FIELDS.has("excludeExtensions"), true);
+  assert.throws(
+    () =>
+      agentLaunchArgs(
+        {
+          name: "worker",
+          path: "/agents/worker.md",
+          frontmatter: { excludeExtensions: ["npm:debug"] },
+          body: "",
+        },
+        {},
+      ),
+    /explicit child extension set/,
+  );
+
+  const legacyExplicit = agentLaunchArgs(
+    {
+      ...definition,
+      frontmatter: {
+        ...definition.frontmatter,
+        noExtensions: true,
+        extensions: ["npm:provider", "npm:worker-tool", "npm:shared"],
+      },
+    },
+    {
+      modelDecision: {
+        kind: "use",
+        model: "extension-provider/model",
+        extensionDiscovery: true,
+      },
+    },
+  );
+  assert.equal(legacyExplicit.includes("--no-extensions"), true);
+  assert.deepEqual(
+    legacyExplicit.flatMap((arg, index) =>
+      arg === "--extension" ? [legacyExplicit[index + 1]] : [],
+    ),
+    ["npm:provider", "npm:worker-tool", "npm:shared"],
+  );
 });
 
 test("appends preloaded skill prompt files after the body and before context files", () => {

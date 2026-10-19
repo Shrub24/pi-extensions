@@ -75,12 +75,6 @@ export function persistCompletion(
   result: ResultRecord,
   source: Pick<Completion, "cwd" | "definition" | "piSessionId" | "piSessionFile">,
 ): Completion {
-  const existing = readCompletion(result.ownerSessionId, result.requestId);
-  if (existing) {
-    if (existing.runId !== result.runId || existing.agentLabel !== result.agentLabel)
-      throw new Error("Completion identity changed");
-    return existing;
-  }
   const report = result.status === "completed" ? result.text ?? "" : result.error?.message ?? "Agent failed";
   const summary = report.split(/\n\s*\n/u).find((paragraph) => paragraph.trim() && !/^\s*#/u.test(paragraph))
     ?.replace(/\s+/gu, " ").trim().slice(0, 600) || `${result.agentLabel}: ${result.status}`;
@@ -91,16 +85,52 @@ export function persistCompletion(
     agentLabel: result.agentLabel, paneId: result.paneId,
     status: result.status, completedAt: result.completedAt, summary,
   };
-  mkdirSync(completionDirectory(result.ownerSessionId, result.requestId), { recursive: true, mode: 0o700 });
-  atomicWrite(handoffPath(completion), [
+  const handoff = [
     `# ${result.agentLabel} completion`,
     `Completion: ${result.requestId}\nOutcome: ${result.status}\nSession: ${source.piSessionId ?? "unknown"}`,
     `## Summary\n\n${summary}`, `## Handoff\n\n${report}`,
     ...(result.responseValidation ? [`## Validation\n\n\`\`\`json\n${JSON.stringify(result.responseValidation, null, 2)}\n\`\`\``] : []),
-  ].join("\n\n") + "\n");
+  ].join("\n\n") + "\n";
+  const existing = readCompletion(result.ownerSessionId, result.requestId);
+  if (existing) {
+    if (existing.runId !== result.runId || existing.agentLabel !== result.agentLabel ||
+        existing.status !== result.status || existing.completedAt !== result.completedAt ||
+        existing.summary !== summary ||
+        readFileSync(handoffPath(existing), "utf8") !== handoff)
+      throw new Error("Completion identity or report changed");
+    return existing;
+  }
+  mkdirSync(completionDirectory(result.ownerSessionId, result.requestId), { recursive: true, mode: 0o700 });
+  atomicWrite(handoffPath(completion), handoff);
   saveCompletion(completion);
   return completion;
 }
+
+/**
+ * Record a retrieved Radar report verbatim. The stored handoff is the report
+ * bytes, so an identical retrieval is a no-op and a changed one is refused.
+ */
+export function persistSealedCompletion(
+  identity: Pick<Completion, "requestId" | "ownerSessionId" | "runId" | "workspaceId" | "agentLabel" | "paneId" | "cwd" | "definition" | "piSessionId" | "piSessionFile">,
+  report: { status: "completed" | "failed"; summary: string; content: string },
+  completedAt: number,
+): Completion {
+  const existing = readCompletion(identity.ownerSessionId, identity.requestId);
+  if (existing) {
+    if (existing.runId !== identity.runId || readFileSync(handoffPath(existing), "utf8") !== report.content)
+      throw new Error("Completion identity or report changed");
+    return existing;
+  }
+  const completion: Completion = {
+    version: 1, ...identity, status: report.status, completedAt, summary: report.summary,
+  };
+  mkdirSync(completionDirectory(identity.ownerSessionId, identity.requestId), { recursive: true, mode: 0o700 });
+  atomicWrite(handoffPath(completion), report.content);
+  saveCompletion(completion);
+  return completion;
+}
+
+/** Legacy-only: builds a handoff from a pre-Radar result's chat text. New completions never take this path. */
 export function listCompletions(owner: string): Completion[] {
   const directory = completionDirectory(owner);
   let ids: string[];
@@ -133,7 +163,7 @@ export function readPreparationResult(owner: string, id: string): WrapupOutcome 
   }
 }
 
-export function waitForPreparation(owner: string, id: string, signal?: AbortSignal): Promise<WrapupOutcome> {
+export function waitForPreparation(owner: string, id: string, signal?: AbortSignal, timeoutMs = 30_000): Promise<WrapupOutcome> {
   const path = join(completionDirectory(owner), `wrapup-${id}.json`);
   return new Promise((resolve, reject) => {
     const finish = (outcome?: WrapupOutcome, error?: unknown) => {
@@ -150,7 +180,7 @@ export function waitForPreparation(owner: string, id: string, signal?: AbortSign
     };
     const abort = () => finish(undefined, new Error("Completion preparation interrupted; retry the same completion"));
     const timer = setTimeout(() => finish(undefined,
-      new Error("Wrapup is unresolved; worker kept live. Retry the same completion")), 10 * 60_000);
+      new Error("Wrapup is unresolved; worker kept live. Retry the same completion")), timeoutMs);
     if (signal?.aborted) { abort(); return; }
     signal?.addEventListener("abort", abort, { once: true });
     watchFile(path, { interval: 100 }, check);

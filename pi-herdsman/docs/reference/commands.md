@@ -20,7 +20,6 @@ diagnostic that includes the running Pi Herdsman package version.
 /agents
 /agents stats
 /agents definitions
-/agents placement [tab|subtree|split]
 /agents stop
 /chief
 /chief leave
@@ -28,13 +27,10 @@ diagnostic that includes the running Pi Herdsman package version.
 
 The plain command opens a native Pi selection menu titled with the running
 Pi Herdsman package version for both `/agents` and `/herdsman`, with `Running`,
-`Session stats`, `Definitions`, `Layout`, `Context retirement  on|off`,
-`Retain workers  on|off`, `Soft timeout  <value>`, `Message limits`, `Clear idle…`,
-and `Stop all…` destinations. The
-Message limits view edits the user-wide inline attachment and mailbox payload
-limits. It is available only to a lead Pi session with UI. Current
-values and presets show a rough token equivalent using four UTF-8 bytes per
-token. The enforced limits are bytes, not tokens.
+`Session stats`, `Definitions`, `Clear idle…`, and `Stop all…` destinations.
+Runtime settings such as retention, soft timeouts, placement and message limits
+are declared in the rendered configuration file, not in this menu. See
+[Configuration](configuration.md).
 
 ## `/agents stats`
 
@@ -129,32 +125,16 @@ then asks the Agent Radar daemon to focus that pane; see
 [Focus actions](#focus-actions). If the agent changed, or the daemon cannot
 confirm that exact session at the pane, nothing is focused.
 
-## `/agents placement`
-
-Selecting Layout opens a native selector showing the effective setting.
-When unset, the effective setting is `subtree`.
-Explicit values continue to set directly:
-
-```text
-/agents placement tab
-/agents placement subtree
-/agents placement split
-```
-
-See [Configuration](configuration.md).
-
 ## `/agents` retention and soft timeout
 
-`Retain workers  on|off` toggles `retainWorkers`. Enabled, a delivered worker
+`retainWorkers` (set in the rendered configuration) decides retention. Enabled, a delivered worker
 keeps its verified live process, pane, label, and mailbox and stays in the
 public `idle` state until a later `agent_continue` reuses it. Disabled, each
 worker's process and pane are cleaned up after its result is delivered, and its
 Pi session stays continuable through `agent_continue`. See
 [Configuration](configuration.md) and [Handoffs and files](../guides/handoffs.md).
 
-`Soft timeout  <value>` edits `softTimeoutMs` from `2 min`, `5 min`, `10 min`,
-`Off`, `Custom…`, or `Reset`. `Off` writes `0`, `Reset` restores the default,
-and `Custom…` accepts an integer number of minutes. The value is the advisory
+`softTimeoutMs` sets the window in milliseconds; `0` turns it off. The value is the advisory
 soft-deadline window armed for each accepted assignment; expiry sends the idle
 controller one digest and never aborts, steers, or closes an agent.
 

@@ -295,11 +295,6 @@ removes only the selected field, fresh definition delegations inherit the
 spawning controller's current value, continuations restore the saved session's
 value, and running agents are not mutated.
 
-### `/agents placement`
-
-Open the native selector, change to the alternate value, verify, then restore
-the original value.
-
 ### `/agents stop`
 
 With disposable owned agents, verify the owned tree closes while an unrelated

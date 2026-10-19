@@ -1,10 +1,8 @@
 import assert from "node:assert/strict";
 import * as realFs from "node:fs";
-import { basename, dirname } from "node:path";
 import { mock, test } from "node:test";
 
 let deleteBeforeRead = false;
-let failConfigRename = false;
 let configPath: string | undefined;
 const testAgentDir =
   process.env.PI_CODING_AGENT_DIR ?? "/tmp/pi-herdsman-config-test";
@@ -37,23 +35,7 @@ mock.module("node:fs", {
     },
     readSync: realFs.readSync,
     realpathSync: realFs.realpathSync,
-    renameSync: (from: string, to: string) => {
-      if (
-        failConfigRename &&
-        configPath !== undefined &&
-        dirname(from) === dirname(configPath) &&
-        basename(from).startsWith(`.${basename(configPath)}.`) &&
-        !basename(from).startsWith(`.${basename(configPath)}.lock.`)
-      ) {
-        failConfigRename = false;
-        const error = new Error(
-          "injected config rename failure",
-        ) as NodeJS.ErrnoException;
-        error.code = "EIO";
-        throw error;
-      }
-      return realFs.renameSync(from, to);
-    },
+    renameSync: realFs.renameSync,
     readdirSync: realFs.readdirSync,
     rmdirSync: realFs.rmdirSync,
     statSync: realFs.statSync,
@@ -73,20 +55,25 @@ const {
   MIN_BYTE_LIMIT,
   MIN_WORKER_CONTEXT_BUDGET_TOKENS,
   readConfig,
-  updateConfig,
   validByteLimit,
   validDisabledDefinitions,
+  validCommonChildExtensions,
   validModelPattern,
   validModelScopes,
   validSoftTimeout,
   validWorkerContextBudget,
 } = await import("./config.ts");
 const { herdsmanConfigPath, herdsmanDataRoot } = await import("./storage.ts");
-const { claimProcessLock } = await import("./lock.ts");
 configPath = herdsmanConfigPath();
 
 function resetConfig(): void {
   realFs.rmSync(herdsmanDataRoot(), { recursive: true, force: true });
+}
+
+// Nix renders config.json; the extension only reads it, so tests render it too.
+function renderConfig(record: Record<string, unknown>): void {
+  realFs.mkdirSync(herdsmanDataRoot(), { recursive: true });
+  realFs.writeFileSync(herdsmanConfigPath(), `${JSON.stringify(record, null, 2)}\n`);
 }
 
 test.afterEach(resetConfig);
@@ -108,6 +95,28 @@ test("documented soft-deadline, retention, and worker-budget defaults match", ()
   assert.equal(DEFAULT_WORKER_CONTEXT_BUDGET_TOKENS, 200_000);
   assert.equal(readConfig().workerContextBudgetTokens, 200_000);
   assert.equal(readConfig().workerCompaction, true);
+});
+
+test("common child extensions are an optional validated exact set", () => {
+  realFs.mkdirSync(herdsmanDataRoot(), { recursive: true });
+  realFs.writeFileSync(
+    herdsmanConfigPath(),
+    JSON.stringify({ commonChildExtensions: ["/extensions/base.ts", "npm:tool"] }),
+  );
+  assert.deepEqual(readConfig().commonChildExtensions, [
+    "/extensions/base.ts",
+    "npm:tool",
+  ]);
+  assert.equal(validCommonChildExtensions([]), true);
+  assert.equal(validCommonChildExtensions(["/extension.ts"]), true);
+  assert.equal(validCommonChildExtensions(["/extension.ts", "/extension.ts"]), false);
+  assert.equal(validCommonChildExtensions([" "]), false);
+
+  realFs.writeFileSync(
+    herdsmanConfigPath(),
+    JSON.stringify({ commonChildExtensions: ["/extension.ts", "/extension.ts"] }),
+  );
+  assert.throws(() => readConfig(), /commonChildExtensions/);
 });
 
 test("soft-timeout and retain-workers overlays accept only valid values", () => {
@@ -146,14 +155,14 @@ test("soft-timeout and retain-workers overlays accept only valid values", () => 
 
 test("saved-session cap accepts nonnegative integers and rejects invalid limits", () => {
   assert.equal(readConfig().savedSessionLimit, 10);
-  updateConfig("savedSessionLimit", 0);
+  renderConfig({ savedSessionLimit: 0 });
   assert.equal(readConfig().savedSessionLimit, 0);
-  updateConfig("savedSessionLimit", 7);
+  renderConfig({ savedSessionLimit: 7 });
   assert.equal(readConfig().savedSessionLimit, 7);
   for (const invalid of [-1, 1.5, NaN, Infinity, "10"]) {
-    assert.throws(() => updateConfig("savedSessionLimit", invalid as never), /savedSessionLimit/);
+    renderConfig({ savedSessionLimit: invalid });
+    assert.throws(() => readConfig(), /savedSessionLimit/);
   }
-  updateConfig("savedSessionLimit", undefined);
 });
 
 test("partial and complete valid configs overlay defaults", () => {
@@ -268,127 +277,23 @@ test("invalid values, malformed JSON, non-object roots, and unknown keys fail cl
   assert.equal(validModelPattern(1), false);
 });
 
-test("updates preserve configured keys, reset one key, and delete the final config", () => {
-  updateConfig("spawnPlacement", "tab");
-  updateConfig("contextRetirement", false);
-  updateConfig("retainWorkers", false);
-  updateConfig("softTimeoutMs", 0);
-  updateConfig("workerContextBudgetTokens", 180_000);
-  updateConfig("workerCompaction", false);
-  updateConfig("mailboxPayloadLimitBytes", 64 * 1024);
-  assert.deepEqual(
-    JSON.parse(realFs.readFileSync(herdsmanConfigPath(), "utf8")),
-    {
-      spawnPlacement: "tab",
-      contextRetirement: false,
-      retainWorkers: false,
-      softTimeoutMs: 0,
-      workerContextBudgetTokens: 180_000,
-      workerCompaction: false,
-      mailboxPayloadLimitBytes: 64 * 1024,
-    },
-  );
-  assert.equal(readConfig().spawnPlacement, "tab");
-  assert.equal(readConfig().contextRetirement, false);
-  assert.equal(readConfig().retainWorkers, false);
-  assert.equal(readConfig().softTimeoutMs, 0);
-  assert.equal(readConfig().workerContextBudgetTokens, 180_000);
-  assert.equal(readConfig().workerCompaction, false);
-  updateConfig("spawnPlacement", undefined);
-  assert.deepEqual(
-    JSON.parse(realFs.readFileSync(herdsmanConfigPath(), "utf8")),
-    {
-      contextRetirement: false,
-      retainWorkers: false,
-      softTimeoutMs: 0,
-      workerContextBudgetTokens: 180_000,
-      workerCompaction: false,
-      mailboxPayloadLimitBytes: 64 * 1024,
-    },
-  );
-  updateConfig("retainWorkers", undefined);
-  assert.equal(readConfig().retainWorkers, true);
-  updateConfig("softTimeoutMs", undefined);
-  assert.equal(readConfig().softTimeoutMs, DEFAULT_SOFT_TIMEOUT_MS);
-  updateConfig("workerContextBudgetTokens", undefined);
-  assert.equal(
-    readConfig().workerContextBudgetTokens,
-    DEFAULT_WORKER_CONTEXT_BUDGET_TOKENS,
-  );
-  updateConfig("workerCompaction", undefined);
-  assert.equal(readConfig().workerCompaction, true);
-  updateConfig("mailboxPayloadLimitBytes", undefined);
-  updateConfig("contextRetirement", undefined);
-  assert.equal(realFs.existsSync(herdsmanConfigPath()), false);
-  assert.deepEqual(readConfig(), DEFAULT_CONFIG);
-});
-
-test("update rejects invalid retain-workers, soft-timeout, context-budget, and compaction values", () => {
-  resetConfig();
-  assert.throws(
-    () => updateConfig("retainWorkers", "true" as never),
-    /Invalid Pi Herdsman config field retainWorkers/,
-  );
-  assert.throws(
-    () => updateConfig("workerCompaction", "false" as never),
-    /Invalid Pi Herdsman config field workerCompaction/,
-  );
-  assert.throws(
-    () => updateConfig("softTimeoutMs", -1),
-    /Invalid Pi Herdsman config field softTimeoutMs/,
-  );
-  assert.throws(
-    () => updateConfig("workerContextBudgetTokens", 1),
-    /Invalid Pi Herdsman config field workerContextBudgetTokens/,
-  );
-  assert.throws(
-    () => updateConfig("workerContextBudgetTokens", 1.5),
-    /Invalid Pi Herdsman config field workerContextBudgetTokens/,
-  );
-  assert.throws(
-    () => updateConfig("softTimeoutMs", 1.5),
-    /Invalid Pi Herdsman config field softTimeoutMs/,
-  );
-  assert.throws(
-    () => updateConfig("softTimeoutMs", "300000" as never),
-    /Invalid Pi Herdsman config field softTimeoutMs/,
-  );
-  assert.equal(realFs.existsSync(herdsmanConfigPath()), false);
+test("rendered retain-workers, soft-timeout, context-budget, and compaction values are validated on read", () => {
+  for (const [record, field] of [
+    [{ retainWorkers: "true" }, "retainWorkers"],
+    [{ workerCompaction: "false" }, "workerCompaction"],
+    [{ softTimeoutMs: -1 }, "softTimeoutMs"],
+    [{ softTimeoutMs: 1.5 }, "softTimeoutMs"],
+    [{ softTimeoutMs: "300000" }, "softTimeoutMs"],
+    [{ workerContextBudgetTokens: 1 }, "workerContextBudgetTokens"],
+    [{ workerContextBudgetTokens: 1.5 }, "workerContextBudgetTokens"],
+  ] as const) {
+    renderConfig(record);
+    assert.throws(() => readConfig(), new RegExp(`Invalid Pi Herdsman config field ${field}`));
+  }
 });
 
 test("a read racing with final reset treats ENOENT as absent", () => {
-  updateConfig("spawnPlacement", "tab");
+  renderConfig({ spawnPlacement: "tab" });
   deleteBeforeRead = true;
   assert.deepEqual(readConfig(), DEFAULT_CONFIG);
-});
-
-test("failed atomic replacement preserves the old config and cleans its temporary file", () => {
-  updateConfig("spawnPlacement", "tab");
-  const before = realFs.readFileSync(herdsmanConfigPath(), "utf8");
-  failConfigRename = true;
-  assert.throws(
-    () => updateConfig("inlineAttachmentLimitBytes", 64 * 1024),
-    /injected config rename failure/,
-  );
-  assert.equal(realFs.readFileSync(herdsmanConfigPath(), "utf8"), before);
-  assert.deepEqual(
-    realFs
-      .readdirSync(herdsmanDataRoot())
-      .filter((entry) => entry.startsWith(".config.json.")),
-    [],
-  );
-});
-
-test("config updates honor the shared process lock", () => {
-  const release = claimProcessLock(`${herdsmanConfigPath()}.lock`, {
-    name: "Pi Herdsman config update",
-  });
-  try {
-    assert.throws(
-      () => updateConfig("spawnPlacement", "split"),
-      /Pi Herdsman config update is in progress/,
-    );
-  } finally {
-    release();
-  }
 });

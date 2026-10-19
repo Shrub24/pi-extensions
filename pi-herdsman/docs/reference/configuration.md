@@ -51,11 +51,19 @@ An absent file means these defaults:
 | `inlineAttachmentLimitBytes` | `131072` (128 KiB) | integer from 1024 (1 KiB) through 1048576 (1 MiB) |
 | `mailboxPayloadLimitBytes`   | `131072` (128 KiB) | integer from 1024 (1 KiB) through 1048576 (1 MiB) |
 | `disabledDefinitions`        |                `[]` | unique definition names, at most 64              |
+| `commonChildExtensions`       |          not set | optional explicit child extension base, at most 64 |
 | `modelScopes`                |                `{}` | `allow` and `agents` lists of model patterns     |
 
+`commonChildExtensions` is optional and omitted from the defaults. When
+configured (including as an empty array), it becomes the common explicit
+extension set for managed children: Herdsman passes `--no-extensions` and loads
+only this set plus each definition's additions, minus its exclusions. The
+Herdsman extension itself is injected separately and is not part of this list.
+If the field is absent, existing extension-discovery behavior is unchanged.
+
 Malformed JSON, a non-object root, unknown fields, and invalid known values
-are errors. Reads do not create the directory or file. Configuration changes
-through `/agents` update this single file atomically.
+are errors. Reads do not create the directory or file. Nix renders this file;
+the extension only reads it, so no runtime path writes it.
 
 `spawnPlacement` asks for the layout a fresh managed worker is placed in. The
 shipped default is `split`: the Radar daemon spawns a worker beside its parent's
@@ -88,7 +96,7 @@ window is checked on the health-reconciliation cadence, so delivery can lag
 expiry by up to one scan interval. `agent_extend` replaces one worker's next
 window with a longer one. The window never aborts, steers, or closes anything,
 and `0` disables soft windows entirely. Set the value from the
-`/agents` → `Soft timeout` item or the config file.
+`softTimeoutMs` in this file.
 
 `workerContextBudgetTokens` is the context budget of a managed worker. When a
 worker's reported context reaches it at the end of a turn that called a tool,
@@ -142,12 +150,13 @@ launch, naming the definition, the model, whether it was pinned or inherited,
 and the scope that rejected it; no model is substituted. An absent
 `modelScopes` leaves resolution exactly as it was.
 
-A definition that pins a model whose provider an extension registers while also
-setting `noExtensions: true` fails immediately: the child cannot resolve a model
-it is denied the extension for. Remove the denial, or pin a model a built-in
-provider serves. Without this check the failure surfaces about two seconds later
-as `Model "<id>" not found`, which reads as a missing model rather than as a
-conflicting definition.
+A pinned model whose provider is supplied by an extension needs that provider's
+extension in the selected child set. If `noExtensions: true` or
+`commonChildExtensions` selects an empty set, Herdsman refuses a pinned
+extension-provided model before launch. Include the provider extension in the
+common or per-agent set; Herdsman cannot infer which providers arbitrary
+extension specifiers register, so a wrong non-empty set can still fail with
+`Model "<id>" not found`.
 
 A nested agent inherits its managed parent's model, so a scope on the parent's
 definition governs the model a grandchild inherits.

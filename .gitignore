@@ -6,3 +6,6 @@ node_modules/
 
 # Pi hindsight runtime state (queues, cursors, receipts)
 .pi/hindsight/
+
+# Herdsman local notes and runtime artifacts (evidence, handoffs); not repo docs
+.pi-herdsman/

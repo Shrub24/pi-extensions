@@ -148,7 +148,7 @@ function fakeChiefPi(options: Parameters<typeof fakePi>[0] = {}) {
   });
   return fixture;
 }
-const { updateConfig } = await import("./config.ts");
+const { setConfigField } = await import("./support-config.ts");
 function testBrief(task: string, profile: keyof typeof DELEGATION_BRIEF_EXAMPLES): string {
   return `${DELEGATION_BRIEF_EXAMPLES[profile].trimEnd()}\n\nAssignment-specific detail:\n${task}`;
 }
@@ -1645,12 +1645,12 @@ test("context retirement rejects managed session continuation only when enabled"
     }),
   ]);
   try {
-    updateConfig("contextRetirement", true);
+    setConfigField("contextRetirement", true);
     assert.throws(
       () => resolveAssignmentSession(context, session.path),
       /retired after context pressure/,
     );
-    updateConfig("contextRetirement", false);
+    setConfigField("contextRetirement", false);
     assert.deepEqual(resolveAssignmentSession(context, session.path), {
       path: session.path,
       id: sessionId,
@@ -1659,7 +1659,7 @@ test("context retirement rejects managed session continuation only when enabled"
       cwd: resolve("/tmp"),
     });
   } finally {
-    updateConfig("contextRetirement", undefined);
+    setConfigField("contextRetirement", undefined);
     nativeSessions.clear();
     realFs.rmSync(session.path, { force: true });
   }
@@ -3731,7 +3731,7 @@ test("agent_extend rejects extra fields and every windowless worker", async () =
 
 test("softTimeoutMs of zero arms no window for an accepted assignment", async () => {
   setLeadEnvironment();
-  updateConfig("softTimeoutMs", 0);
+  setConfigField("softTimeoutMs", 0);
   const label = "soft-window-disabled";
   const pi = fakePi({});
   registerExtension!(pi.pi as never);
@@ -3752,7 +3752,7 @@ test("softTimeoutMs of zero arms no window for an accepted assignment", async ()
       [],
     );
   } finally {
-    updateConfig("softTimeoutMs", undefined);
+    setConfigField("softTimeoutMs", undefined);
     pi.events.get("session_shutdown")?.[0]();
     resetAgentMailbox(agentMailboxPath(WORKSPACE, label));
   }

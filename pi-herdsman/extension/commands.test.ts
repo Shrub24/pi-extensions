@@ -87,7 +87,8 @@ import support, {
   writeAgentState,
 } from "./support.ts";
 import { DELEGATION_BRIEF_EXAMPLES } from "./briefs.ts";
-const { readConfig, updateConfig } = await import("./config.ts");
+const { readConfig } = await import("./config.ts");
+const { setConfigField } = await import("./support-config.ts");
 const agentTool = (pi: ReturnType<typeof fakePi>, name: string) =>
   pi.tools.find((candidate) => candidate.name === `agent_${name}`)!;
 test("session stats sums Pi usage entries and proven nested sessions once", async () => {
@@ -1785,10 +1786,8 @@ test("lead agents command uses native completion and exact human grammar", async
   context.ui.notify = (message: string) => notices.push(message);
   await command.handler("", context);
   await command.handler("agents extra", context);
-  await command.handler("placement invalid", context);
   assert.deepEqual(notices, [
-    "Usage: /agents stats | definitions | placement [tab|subtree|split] | stop",
-    "Usage: /agents placement [tab|subtree|split]",
+    "Usage: /agents stats | definitions | stop",
   ]);
 });
 
@@ -1815,35 +1814,6 @@ test("a configured disable list removes a definition from the offered roster", a
     );
   } finally {
     realFs.rmSync(configDir, { recursive: true, force: true });
-  }
-});
-
-test("/agents placement subtree writes flat config outside project settings", async () => {
-  setLeadEnvironment();
-  const projectRoot = join(PI_AGENT_ROOT, "placement-project");
-  const configPath = join(PI_AGENT_ROOT, "pi-herdsman", "config.json");
-  realFs.mkdirSync(join(projectRoot, ".pi"), { recursive: true });
-  const pi = fakePi();
-  registerExtension!(pi.pi as never);
-  const context = fakeContext() as any;
-  context.cwd = projectRoot;
-  context.hasUI = true;
-  try {
-    await pi.commandOptions.get("agents").handler("placement subtree", context);
-    assert.equal(
-      JSON.parse(realFs.readFileSync(configPath, "utf8")).spawnPlacement,
-      "subtree",
-    );
-    assert.equal(
-      realFs.existsSync(join(projectRoot, ".pi", "settings.json")),
-      false,
-    );
-  } finally {
-    realFs.rmSync(projectRoot, { recursive: true, force: true });
-    realFs.rmSync(join(PI_AGENT_ROOT, "pi-herdsman"), {
-      recursive: true,
-      force: true,
-    });
   }
 });
 
@@ -3340,197 +3310,9 @@ test("TUI Model picker fuzzy-filters models and cancels in place", async () => {
   }
 });
 
-test("message limits use flat config and one rough token formatter", async () => {
-  setLeadEnvironment();
-  const pi = fakePi();
-  registerExtension!(pi.pi as never);
-  const command = pi.commandOptions.get("agents");
-  const prompts: { label: string; options: string[] }[] = [];
-  const notices: string[] = [];
-  const context = fakeContext() as any;
-  context.hasUI = true;
-  context.mode = "rpc";
-  context.ui.notify = (message: string) => notices.push(message);
-  context.ui.select = async (label: string, options: string[]) => {
-    prompts.push({ label, options });
-    if (prompts.length === 1) return "Message limits";
-    if (prompts.length === 2) return options[0];
-    if (prompts.length === 3) return options[1];
-    return undefined;
-  };
-  await command.handler("", context);
-  assert.equal(prompts[1]?.label, "Message limits");
-  assert.match(prompts[1]?.options[0] ?? "", /≈32,768 tokens/);
-  assert.match(prompts[1]?.options[1] ?? "", /≈32,768 tokens/);
-  assert.ok(prompts.every(({ label }) => label !== "Scope"));
-  assert.deepEqual(prompts[2]?.options, [
-    "1 KiB · ≈256 tokens",
-    "4 KiB · ≈1,024 tokens",
-    "16 KiB · ≈4,096 tokens",
-    "64 KiB · ≈16,384 tokens",
-    "128 KiB · ≈32,768 tokens",
-    "Custom…",
-    "Reset",
-  ]);
-  assert.match(notices.at(-1) ?? "", /4 KiB · ≈1,024 tokens/);
-  await pi.events.get("session_shutdown")?.[0]();
-});
-
-test("main agents menu toggles context retirement", async () => {
-  setLeadEnvironment();
-  updateConfig("contextRetirement", undefined);
-  const pi = fakePi();
-  registerExtension!(pi.pi as never);
-  const context = fakeContext() as any;
-  context.hasUI = true;
-  context.mode = "rpc";
-  const menus: string[][] = [];
-  const notices: string[] = [];
-  context.ui.select = async (_title: string, options: string[]) => {
-    menus.push(options);
-    return menus.length === 1
-      ? options.find((option) => option.includes("Context retirement"))
-      : undefined;
-  };
-  context.ui.notify = (message: string) => notices.push(message);
-  try {
-    await pi.commandOptions.get("agents").handler("", context);
-    assert.match(
-      menus[0]?.find((option) => option.includes("Context retirement")) ?? "",
-      /Context retirement  off/,
-    );
-    assert.equal(readConfig().contextRetirement, true);
-    assert.deepEqual(notices, ["context retirement: on"]);
-    await pi.commandOptions.get("agents").handler("", context);
-    assert.match(
-      menus.at(-1)?.find((option) => option.includes("Context retirement")) ??
-        "",
-      /Context retirement  on/,
-    );
-  } finally {
-    updateConfig("contextRetirement", undefined);
-    await pi.events.get("session_shutdown")?.[0]();
-  }
-});
-
-test("main agents menu toggles retain workers", async () => {
-  setLeadEnvironment();
-  // Retention is on by default; start from the opt-out to see the toggle turn it on.
-  updateConfig("retainWorkers", false);
-  const pi = fakePi();
-  registerExtension!(pi.pi as never);
-  const context = fakeContext() as any;
-  context.hasUI = true;
-  context.mode = "rpc";
-  const menus: string[][] = [];
-  const notices: string[] = [];
-  context.ui.select = async (_title: string, options: string[]) => {
-    menus.push(options);
-    return menus.length === 1
-      ? options.find((option) => option.includes("Retain workers"))
-      : undefined;
-  };
-  context.ui.notify = (message: string) => notices.push(message);
-  try {
-    await pi.commandOptions.get("agents").handler("", context);
-    assert.match(
-      menus[0]?.find((option) => option.includes("Retain workers")) ?? "",
-      /Retain workers  off/,
-    );
-    assert.equal(readConfig().retainWorkers, true);
-    assert.deepEqual(notices, ["retain workers: on"]);
-    await pi.commandOptions.get("agents").handler("", context);
-    assert.match(
-      menus.at(-1)?.find((option) => option.includes("Retain workers")) ?? "",
-      /Retain workers  on/,
-    );
-    assert.equal(readConfig().retainWorkers, true);
-  } finally {
-    updateConfig("retainWorkers", undefined);
-    await pi.events.get("session_shutdown")?.[0]();
-  }
-});
-
-test("main agents menu sets the soft timeout from presets, off, custom, and reset", async () => {
-  setLeadEnvironment();
-  updateConfig("softTimeoutMs", undefined);
-  const pi = fakePi();
-  registerExtension!(pi.pi as never);
-  const context = fakeContext() as any;
-  context.hasUI = true;
-  context.mode = "rpc";
-  const prompts: { label: string; options: string[] }[] = [];
-  const notices: string[] = [];
-  const choices = ["10 min", "Off", "Custom…", "Reset", "Custom…"];
-  let choice = 0;
-  const inputs: (string | undefined)[] = ["7", "abc"];
-  let rootPending = false;
-  context.ui.input = async () => inputs.shift();
-  context.ui.select = async (label: string, options: string[]) => {
-    prompts.push({ label, options });
-    if (rootPending) {
-      rootPending = false;
-      return options.find((option) => option.includes("Soft timeout"));
-    }
-    if (label !== "Soft timeout") return undefined;
-    const next = choices[choice++];
-    return next
-      ? (options.find((option) => option === next) ?? undefined)
-      : undefined;
-  };
-  context.ui.notify = (message: string, kind?: string) =>
-    notices.push(kind ? `${kind}: ${message}` : message);
-  const rootLabel = (index: number) =>
-    prompts[index]?.options.find((option) => option.includes("Soft timeout")) ??
-    "";
-  const open = () => {
-    rootPending = true;
-    return pi.commandOptions.get("agents").handler("", context);
-  };
-  try {
-    await open();
-    assert.match(rootLabel(0), /Soft timeout  5 min/);
-    assert.equal(prompts[1]?.label, "Soft timeout");
-    assert.deepEqual(prompts[1]?.options, [
-      "2 min",
-      "5 min",
-      "10 min",
-      "Off",
-      "Custom…",
-      "Reset",
-    ]);
-    assert.equal(readConfig().softTimeoutMs, 10 * 60_000);
-    assert.equal(notices.at(-1), "soft timeout: 10 min");
-    assert.match(rootLabel(2), /Soft timeout  10 min/);
-
-    await open();
-    assert.equal(readConfig().softTimeoutMs, 0);
-    assert.equal(notices.at(-1), "soft timeout: off");
-    assert.match(rootLabel(5), /Soft timeout  off/);
-
-    await open();
-    assert.equal(readConfig().softTimeoutMs, 7 * 60_000);
-    assert.equal(notices.at(-1), "soft timeout: 7 min");
-
-    await open();
-    assert.equal(readConfig().softTimeoutMs, 5 * 60_000);
-    assert.equal(notices.at(-1), "soft timeout: reset");
-
-    await open();
-    assert.equal(readConfig().softTimeoutMs, 5 * 60_000);
-    assert.equal(
-      notices.at(-1),
-      "error: Enter an integer from 0 through 35791 minutes",
-    );
-  } finally {
-    updateConfig("softTimeoutMs", undefined);
-    await pi.events.get("session_shutdown")?.[0]();
-  }
-});
-
 test("clear idle closes exactly the directly owned idle workers", async () => {
   setLeadEnvironment();
-  updateConfig("retainWorkers", true);
+  setConfigField("retainWorkers", true);
   const labels = [
     "clear-idle-one-agent",
     "clear-idle-two-agent",
@@ -3644,7 +3426,7 @@ test("clear idle closes exactly the directly owned idle workers", async () => {
       "a foreign-owned idle worker is preserved",
     );
   } finally {
-    updateConfig("retainWorkers", undefined);
+    setConfigField("retainWorkers", undefined);
     pi.events.get("session_shutdown")?.[0]();
     for (const label of labels)
       resetAgentMailbox(agentMailboxPath(WORKSPACE, label));
@@ -3653,58 +3435,6 @@ test("clear idle closes exactly the directly owned idle workers", async () => {
   }
 });
 
-test("message limit edits stay in the submenu with the edited field selected", async () => {
-  setLeadEnvironment();
-  const pi = fakePi();
-  registerExtension!(pi.pi as never);
-  const context = fakeContext() as any;
-  context.hasUI = true;
-  context.mode = "tui";
-  const renders: string[][] = [];
-  let customCalls = 0;
-  context.ui.custom = async (factory: any) =>
-    new Promise((resolve) => {
-      const component = factory(
-        { requestRender: () => undefined },
-        {
-          fg: (_color: string, text: string) => text,
-          bold: (text: string) => text,
-        },
-        {},
-        resolve,
-      );
-      renders.push(component.render(200));
-      switch (customCalls++) {
-        case 0:
-          for (let i = 0; i < 4; i++) component.handleInput("\u001b[B");
-          component.handleInput("\r");
-          break;
-        case 1:
-        case 3:
-          component.handleInput("\r");
-          break;
-        case 2:
-          for (let i = 0; i < 3; i++) component.handleInput("\u001b[B");
-          component.handleInput("\r");
-          break;
-        case 4:
-        case 5:
-        case 6:
-          component.handleInput("\u001b");
-          break;
-      }
-    });
-  try {
-    await pi.commandOptions.get("agents").handler("", context);
-    assert.ok(renders[3]?.some((line) => line.includes("Inline attachments")));
-    assert.match(
-      renders[3]?.find((line) => line.includes("Inline attachments")) ?? "",
-      /^→/u,
-    );
-  } finally {
-    await pi.events.get("session_shutdown")?.[0]();
-  }
-});
 
 test("Running uses compact native options and focuses the freshly verified pane", async () => {
   setLeadEnvironment();

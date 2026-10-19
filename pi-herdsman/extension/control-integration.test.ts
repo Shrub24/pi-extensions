@@ -34,9 +34,9 @@ import {
 } from "./control.ts";
 import support from "./support.ts";
 
-const { updateConfig } = await import("./config.ts");
+const { setConfigField } = await import("./support-config.ts");
 // These suites drive retained workers; a test opts in per fixture.
-beforeEach(() => updateConfig("retainWorkers", false));
+beforeEach(() => setConfigField("retainWorkers", false));
 // ---- Herdsman control (owner side) ----
 //
 // These tests drive the real owner path: a request file is written into the
@@ -91,7 +91,7 @@ const agentTool = (pi: ReturnType<typeof fakePi>, operation: string) =>
  */
 const controlWorkerFixture = (suffix: string) => {
   setLeadEnvironment();
-  updateConfig("retainWorkers", true);
+  setConfigField("retainWorkers", true);
   const name = `ctl-${suffix}`;
   const label = `${name}-agent`;
   const definitionPath = join(PI_AGENTS_DIR, `${name}.md`);
@@ -248,7 +248,7 @@ const controlWorkerFixture = (suffix: string) => {
         handler(undefined, context);
     },
     shutdown() {
-      updateConfig("retainWorkers", undefined);
+      setConfigField("retainWorkers", undefined);
       this.stopOwner();
       nativeSessions.delete(session.id);
       resetAgentMailbox(mailbox);

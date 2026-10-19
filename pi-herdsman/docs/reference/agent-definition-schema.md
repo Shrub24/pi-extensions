@@ -121,8 +121,9 @@ available actions; disabling a definition does not mutate that assignment.
 | `inheritSkills`         | boolean                                                               | does not enable by itself unless `true`                                | `true` changes the omitted `noSkills` default so native skills remain available. An `inheritSkills` this file sets also beats a `noSkills` inherited from the definition it overlays, so an overlay that opts in is not defeated by a bundled default. |
 | `skills`                | array of non-empty strings                                            | no explicit skill arguments                                            | Each value is a Pi skill path or a bare skill name: a name is resolved against the project, user, package and settings skill roots, a path is used as written, and a value that resolves to nothing fails the launch. |
 | `preloadedSkills`       | array of non-empty strings                                            | no preloaded skills                                                    | Each value resolves like a `skills` value, then the skill's body is inlined into the child's system prompt after the definition body. A skill named in both fields is inlined and not advertised. Costs its tokens on every request. |
-| `noExtensions`          | boolean                                                               | Pi normal extension policy                                             | `true` emits `--no-extensions`, except when the launched model needs extension discovery. Launcher-injected herdr infrastructure remains. |
-| `extensions`            | array of non-empty strings                                            | no extra extension arguments                                           | Each value is passed unchanged to Pi.                                                                                                     |
+| `noExtensions`          | boolean                                                               | Pi normal extension policy                                             | `true` requests `--no-extensions`; an explicitly configured `commonChildExtensions` set always disables discovery for managed children. Herdsman infrastructure remains injected. |
+| `extensions`            | array of non-empty strings                                            | no extra extension arguments                                           | Adds exact Pi extension specifiers to the common set when configured; otherwise each value is passed unchanged to Pi.                    |
+| `excludeExtensions`     | array of non-empty strings                                            | no exclusions                                                          | Removes exact specifiers from the explicit common-plus-added set; requires `commonChildExtensions` or `noExtensions: true` and keeps discovery disabled. |
 | `agents`                | array of unique non-empty definition names                            | no direct agents                                                       | Names direct definitions this agent may delegate to; every name must exist.                                                               |
 | `inheritProjectContext` | boolean                                                               | `true` only for definition name `delegate`; otherwise `false`          | Controls project context-file inheritance.                                                                                                |
 | `inheritGlobalContext`  | boolean                                                               | follows effective `inheritProjectContext`                              | Controls global context-file inheritance.                                                                                                 |
@@ -181,23 +182,20 @@ provider presentation boundary.
 Tools with the same name are not independently permissionable by source, and
 the winner for a name collision is not a supported ordering contract.
 
-`noExtensions` disables ordinary extension discovery, but launcher-injected
-Pi Herdsman agent and Herdr-state extensions remain mandatory infrastructure.
-Explicit `extensions` entries remain separate launch inputs and are passed to
-Pi normally. Launcher-injected infrastructure remains separate from the
-definition's extension and tool policy.
+`noExtensions` disables ordinary extension discovery, but the launcher-injected
+Pi Herdsman extension remains mandatory infrastructure. Explicit `extensions`
+entries are passed to Pi separately from Herdsman's injected extension.
 
-One launch-derived exception applies, and only to an inherited model. Fresh
-delegation inherits the spawning controller's model, and when that model's
-provider is registered by an extension, discovery stays available for that
-launch even when `noExtensions` is `true`, because a child denied discovery
-cannot resolve a model whose provider only an extension supplies. A model
-pinned in the definition is passed to Pi as written and keeps the definition's
-own extension policy. With `noExtensions: true`, an extension-provided pin
-requires a non-empty explicit `extensions` list. Include the provider entry in
-that list; Herdsman does not infer which providers arbitrary extensions register,
-so an incorrect list can still fail with Pi's `Model not found` error. An empty
-list is rejected before launch. Alternatively, set `noExtensions: false`.
+When `commonChildExtensions` is unset, an inherited model whose provider is
+registered by an extension keeps the existing discovery behavior, even when
+`noExtensions` is `true`. When a common set is configured, or a definition uses
+`excludeExtensions`, the child instead runs with discovery disabled and loads
+the explicit common-plus-added-minus-excluded set. If that model needs an
+extension provider, include its extension specifier in the selected set. For a
+pinned extension-provided model, Herdsman rejects an empty selected set before
+launch; it cannot infer which providers arbitrary extension specifiers
+register, so an incorrect non-empty set can still fail with Pi's `Model not
+found` error.
 
 For a thin worker, list required built-ins explicitly too: for example,
 `builtin:mcp` supplies MCP tools when discovery is disabled.

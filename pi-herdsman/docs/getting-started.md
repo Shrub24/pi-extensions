@@ -81,8 +81,8 @@ layout, message limits, context-retirement configuration, and emergency cleanup.
 Use `Running` to focus a verified live Agent. Use `Session stats` to inspect
 Pi-native token usage and cost for the current Pi session plus transitively
 owned managed-Agent sessions. Use `Definitions` to inspect or override the
-effective bundled, project, and global roster. Use `Layout` to choose placement
-for future Lead-direct Agents.
+effective bundled, project, and global roster. Placement and the other runtime
+settings are set in the rendered configuration, not from this menu.
 
 See [Commands](reference/commands.md) for the exact human-facing behavior.
 

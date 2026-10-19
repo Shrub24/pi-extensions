@@ -27,8 +27,8 @@ const { DEFAULT_RESPONSE_CONTRACT } = await import("./response-contracts.ts");
 const { createAcceptedAssignmentContract } = await import(
   "./response-validation.ts"
 );
-const { radarProcessIncarnation } = await import("./radar-publication.ts");
-const { updateConfig } = await import("./config.ts");
+const { radarProcessIncarnation } = await import("pi-radar/publication");
+const { setConfigField } = await import("./support-config.ts");
 const { controlMarker, parseControlMarkerVersion } = await import("./mailbox.ts");
 const {
   fakeAgentContext,
@@ -40,8 +40,8 @@ const {
   startRadarSession,
 } = await import("./support.ts");
 const support = await import("./support.ts");
-const { writeRequest, readRequest, readResult } = await import("./mailbox.ts");
-const { readPreparationResult, readCompletion } = await import("./completions.ts");
+const { writeRequest, readRequest, readResult, removeResult } = await import("./mailbox.ts");
+const { readPreparationResult, readCompletion, saveCompletion } = await import("./completions.ts");
 import type { RequestAddress, RequestRecord } from "./mailbox.ts";
 import type { FakeRadarDaemon } from "./support-radar.ts";
 
@@ -53,7 +53,7 @@ function fireShutdown(agent: {
   for (const listener of agent.events.get("session_shutdown") ?? []) listener();
 }
 
-beforeEach(() => updateConfig("retainWorkers", false));
+beforeEach(() => setConfigField("retainWorkers", false));
 
 /**
  * The worker's own address, assembled the way the daemon sees the process: the
@@ -114,15 +114,18 @@ function assignmentRequest(
   };
 }
 
-async function startedWorker(label: string) {
+async function startedWorker(
+  label: string,
+  sendUserMessage?: (content: unknown, options?: unknown) => void | Promise<void>,
+) {
   const mailbox = setAgentEnvironment(label);
   let context: ReturnType<typeof fakeAgentContext>;
   // Pi delivers what the worker sends itself, so the pump's marker reaches the
   // worker's own input handler - the acceptance path under test.
   const worker = fakePi({
-    sendUserMessage(content) {
+    sendUserMessage: sendUserMessage ?? ((content) => {
       worker.events.get("input")![0]({ text: content }, context);
-    },
+    }),
   });
   registerExtension!(worker.pi as never);
   context = fakeAgentContext(worker.entries);
@@ -169,6 +172,70 @@ test("the addressed worker runs wrapup without a model turn and acknowledges its
     // Re-delivering the marker does not re-run context preparation.
     await worker.events.get("input")![0]({ text: controlMarker(request.requestId, 6) }, context);
     assert.equal(wraps, 1);
+  } finally { fireShutdown(worker); resetAgentMailbox(mailbox); }
+});
+
+test("a delivered completion blocks new work until agent_complete explicitly keeps the worker", async (t) => {
+  const { mailbox, daemon, worker, context } = await startedWorker("completion-gated-worker");
+  try {
+    const assignment = assignmentRequest(mailbox, await workerAddress(daemon));
+    writeRequest(mailbox, assignment);
+    await t.waitFor(() => assert.equal(readAgentState(mailbox)?.activeRequestId, assignment.requestId));
+    for (const listener of worker.events.get("message_end") ?? [])
+      await listener({ message: { role: "assistant", content: "Completed assignment." } }, context);
+    for (const listener of worker.events.get("agent_settled") ?? []) await listener(undefined, context);
+    const state = readAgentState(mailbox)!;
+    const completion = readCompletion(state.ownerSessionId, assignment.requestId)!;
+    removeResult(mailbox, assignment.requestId);
+
+    const premature = assignmentRequest(mailbox, await workerAddress(daemon));
+    writeRequest(mailbox, premature);
+    await t.waitFor(() => assert.equal(readAgentState(mailbox)?.lastAck?.requestId, premature.requestId));
+    assert.equal(readAgentState(mailbox)?.lastAck?.accepted, false);
+    assert.match(readAgentState(mailbox)?.lastAck?.message ?? "", /agent_complete/);
+    assert.equal(readAgentState(mailbox)?.activeRequestId, undefined);
+
+    assert.equal(readRequest(mailbox, premature.requestId), undefined);
+  } finally { fireShutdown(worker); resetAgentMailbox(mailbox); }
+});
+
+test("an explicitly kept completion permits the next assignment", async (t) => {
+  const { mailbox, daemon, worker, context } = await startedWorker("kept-completion-worker");
+  try {
+    const assignment = assignmentRequest(mailbox, await workerAddress(daemon));
+    writeRequest(mailbox, assignment);
+    await t.waitFor(() => assert.equal(readAgentState(mailbox)?.activeRequestId, assignment.requestId));
+    for (const listener of worker.events.get("message_end") ?? [])
+      await listener({ message: { role: "assistant", content: "Completed assignment." } }, context);
+    for (const listener of worker.events.get("agent_settled") ?? []) await listener(undefined, context);
+    const state = readAgentState(mailbox)!;
+    const completion = readCompletion(state.ownerSessionId, assignment.requestId)!;
+    removeResult(mailbox, assignment.requestId);
+    completion.disposition = "keep";
+    saveCompletion(completion);
+
+    const kept = assignmentRequest(mailbox, await workerAddress(daemon));
+    writeRequest(mailbox, kept);
+    await t.waitFor(() => assert.equal(readAgentState(mailbox)?.lastAck?.requestId, kept.requestId));
+    assert.equal(readAgentState(mailbox)?.lastAck?.accepted, true, readAgentState(mailbox)?.lastAck?.message);
+    assert.equal(readAgentState(mailbox)?.activeRequestId, kept.requestId);
+  } finally { fireShutdown(worker); resetAgentMailbox(mailbox); }
+});
+
+test("an asynchronous Pi input-delivery failure is surfaced and leaves the request retryable", async (t) => {
+  const { mailbox, daemon, worker } = await startedWorker(
+    "input-delivery-failure",
+    async () => { throw new Error("Pi rejected idle input"); },
+  );
+  try {
+    const request = assignmentRequest(mailbox, await workerAddress(daemon));
+    writeRequest(mailbox, request);
+    await t.waitFor(() => assert.ok(worker.entries.some((entry: any) =>
+      entry?.customType === "pi_herdsman_state_error" &&
+      String(entry.data?.error).includes("Pi rejected idle input"),
+    )));
+    assert.equal(readAgentState(mailbox)?.activeRequestId, undefined);
+    assert.equal(readRequest(mailbox, request.requestId)?.requestId, request.requestId);
   } finally { fireShutdown(worker); resetAgentMailbox(mailbox); }
 });
 

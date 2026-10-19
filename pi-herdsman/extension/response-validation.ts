@@ -505,7 +505,13 @@ function markdownHeadings(text: string): ReadonlySet<string> {
   return headings;
 }
 
-function validateMetadata(text: string, schema: "handoff/v1", artifactPath?: string): void {
+const MAX_HANDOFF_SUMMARY_CHARS = 600;
+
+function validateMetadata(
+  text: string,
+  schema: "handoff/v1",
+  artifactPath?: string,
+): { title: string; summary: string } {
   let frontmatter: unknown;
   try {
     frontmatter = parsePiFrontmatter<Record<string, unknown>>(text).frontmatter;
@@ -529,6 +535,16 @@ function validateMetadata(text: string, schema: "handoff/v1", artifactPath?: str
       throwDiagnostic(code, `metadata.${field}`, `Markdown frontmatter requires ${field}`, artifactPath);
     }
   }
+  const summary = frontmatter.summary as string;
+  if ([...summary].length > MAX_HANDOFF_SUMMARY_CHARS) {
+    throwDiagnostic(code, "metadata.summary", `Handoff summary exceeds ${MAX_HANDOFF_SUMMARY_CHARS} characters`, artifactPath);
+  }
+  // Reserved for Herdsman's failure records (radar-handoff.ts FAILURE_TITLE_PREFIX),
+  // so a worker's own report can never be read back as a failure.
+  if ((frontmatter.title as string).startsWith("Failed: ")) {
+    throwDiagnostic(code, "metadata.title", "The 'Failed:' title prefix is reserved for Herdsman failure records", artifactPath);
+  }
+  return { title: frontmatter.title as string, summary };
 }
 
 function validateMarkdown(
@@ -536,8 +552,8 @@ function validateMarkdown(
   contract: ResponseContract,
   code: ResponseErrorCode,
   artifactPath?: string,
-): void {
-  if (contract.format !== "markdown") return;
+): { title: string; summary: string } | undefined {
+  if (contract.format !== "markdown") return undefined;
   const headings = markdownHeadings(text);
   for (const section of contract.requiredSections) {
     if (!headings.has(section.trim())) {
@@ -545,8 +561,9 @@ function validateMarkdown(
     }
   }
   if (contract.metadataSchema === "handoff/v1") {
-    validateMetadata(text, "handoff/v1", artifactPath);
+    return validateMetadata(text, "handoff/v1", artifactPath);
   }
+  return undefined;
 }
 
 export interface ValidateResponseOptions {
@@ -558,9 +575,18 @@ export interface ValidateResponseOptions {
   readonly maxArtifactBytes: number;
 }
 
+export interface ValidatedHandoff {
+  readonly title: string;
+  readonly summary: string;
+  readonly content: string;
+  readonly sha256: string;
+  readonly bytes: number;
+}
+
 export interface ValidatedResponse {
   readonly contractHash: string;
   readonly artifacts: readonly ArtifactDescriptor[];
+  readonly handoff?: ValidatedHandoff;
 }
 
 /** Validate actual inline Markdown and safely observe any declared artifact. */
@@ -580,13 +606,22 @@ export function validateResponse(
   }
 
   const artifacts: ArtifactDescriptor[] = [];
+  let handoff: ValidatedHandoff | undefined;
   if (contract.target !== "inline") {
     const baseline = options.baseline;
     if (!baseline || baseline.path !== contract.path) {
       throwDiagnostic("artifact_error", "artifact.baseline", "Accepted artifact baseline is missing", contract.path);
     }
     const observation = artifactSnapshot(contract.path, options.cwd, options.maxArtifactBytes);
-    validateMarkdown(observation.text, contract, "artifact_error", contract.path);
+    const metadata = validateMarkdown(observation.text, contract, "artifact_error", contract.path);
+    if (metadata !== undefined) {
+      handoff = Object.freeze({
+        ...metadata,
+        content: observation.text,
+        sha256: observation.sha256,
+        bytes: observation.bytes,
+      });
+    }
     const reused = baseline.exists && baseline.sha256 === observation.sha256;
     if (reused && !contract.allowExistingArtifact) {
       throwDiagnostic("artifact_error", "artifact.identity", "Artifact is unchanged from the pre-assignment file", contract.path);
@@ -604,5 +639,6 @@ export function validateResponse(
   return Object.freeze({
     contractHash: responseContractHash(contract),
     artifacts: Object.freeze(artifacts),
+    ...(handoff === undefined ? {} : { handoff }),
   });
 }

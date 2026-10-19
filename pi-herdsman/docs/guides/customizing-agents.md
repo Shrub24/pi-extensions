@@ -163,9 +163,11 @@ An explicit `tools` list controls selection even when `noTools` or
 over the list. Managed agents retain `ask_owner` as mandatory infrastructure
 and remove it from explicit exclusions; this exception does not apply to
 unmanaged Pi launches. Same-named tools cannot be permissioned by source, and
-collision winner ordering is not promised. Launcher-injected agent and
-Herdr-state extensions are separate from definition extensions and remain
-available when `noExtensions` disables ordinary discovery.
+collision winner ordering is not promised. The launcher-injected Herdsman extension is separate from definition
+extensions and remains available when `noExtensions` disables discovery. When
+`commonChildExtensions` is configured, it becomes the managed-child base;
+frontmatter `extensions` adds to it and `excludeExtensions` removes exact
+specifiers. See the [extension-selection reference](agent-definitions.md#child-extension-selection).
 
 For an integration-level smoke check, load the repository's
 `scripts/tool-policy-diagnostic.mjs` extension and set `POLICY_EVIDENCE`,

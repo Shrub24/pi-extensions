@@ -95,6 +95,6 @@
     "registry": "https://registry.npmjs.org/"
   },
   "dependencies": {
-    "pi-radar": "0.2.0"
+    "pi-radar": "0.5.1"
   }
 }
