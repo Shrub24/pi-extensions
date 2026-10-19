@@ -15,7 +15,7 @@
 ## 3. Selection and dispatch integration
 
 - [x] 3.1 Add choice evaluation and ordered/sticky fallback over the same eligible set; verify a custom choice can displace a healthy incumbent, invalid/ineligible IDs and throws fall back, promises are rejected safely, and an empty set uses exhaustion without invocation.
-- [x] 3.2 Integrate the evaluator into session and direct dispatch while retaining recovery and admitted transient-retry precedence; represent pins as preferences beneath a healthy incumbent; extend the host harness to verify the actual dispatched model/account, direct-call restrictions and unsafe partial-output refusal rather than testing a disconnected helper.
+- [x] 3.2 Integrate the evaluator into session and direct dispatch while retaining recovery and admitted transient-retry precedence; treat a fresh user pin as a one-shot override and persistent pins as automatic-selection context; extend the host harness to verify the actual dispatched model/account, direct-call restrictions and unsafe partial-output refusal rather than testing a disconnected helper.
 - [x] 3.3 Integrate admission-retry exclusions and remaining transition budgets; verify a denied lease cannot cause repeated selection of the same target, and a custom switch cannot bypass the awaited flush or verified activation. Reuse existing recovery/activation tests where they already prove unchanged behavior.
 
 ## 4. Preview, operator evidence and policy example

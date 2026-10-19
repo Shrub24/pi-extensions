@@ -631,6 +631,31 @@ test("a denied shared recovery lease is passed as an exclusion before strategy r
   } finally { h.close(); }
 });
 
+test("a new pin or cycle overrides incumbent stickiness once, then the selected model stays sticky", async () => {
+  const h = await host(["ok", "ok", "ok", "ok"]);
+  const statuses = new Map<string, string | undefined>();
+  const ui = { select: async () => undefined, notify: () => {}, setStatus: (key: string, value: string | undefined) => statuses.set(key, value) };
+  const ctx = { hasUI: true, model: h.runtime.getModel("route", "worker"), modelRegistry: {
+    find: (provider: string, id: string) => h.runtime.getModel(provider, id), hasConfiguredAuth: () => true, runtime: h.runtime,
+  }, sessionManager: h.manager, getContextUsage: () => ({ tokens: 0 }), thinkingLevel: "off", ui } as never;
+  try {
+    await h.session.prompt("initial automatic target");
+    expect(h.dispatches.map(d => d.physical)).toEqual(["fake-a"]);
+
+    const pin = h.commands.get("route-pin") as { handler: (args: string, context: never) => Promise<void> };
+    await pin.handler("fake-b/model", ctx);
+    expect(statuses.get(FOOTER_KEYS.model)).toContain("fake-b");
+    await h.session.prompt("explicit pin should switch away from the healthy incumbent");
+    await h.session.prompt("the selected target should now stay sticky");
+    expect(h.dispatches.map(d => d.physical)).toEqual(["fake-a", "fake-b", "fake-b"]);
+
+    const cycle = h.shortcuts.get("ctrl+shift+m") as { handler: (context: never) => Promise<void> };
+    await cycle.handler(ctx);
+    await h.session.prompt("cycling is another explicit one-shot override");
+    expect(h.dispatches.map(d => d.physical)).toEqual(["fake-a", "fake-b", "fake-b", "fake-c"]);
+  } finally { h.close(); }
+});
+
 test("a pin cannot pull the route back to a recovered failed candidate while the fallback stays healthy", async () => {
   const h = await host(["ok", 429, "ok", "ok", "quota", "ok"]);
   const notices: string[] = [];

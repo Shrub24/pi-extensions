@@ -76,16 +76,25 @@ Quoted model rates SHALL NOT be labelled verified spend or converted into a subs
 
 ### Requirement: Router safety and explicit preferences precede strategies
 
-Bounded same-target transient retries and explicit recovery targets SHALL retain precedence over automatic strategies. A manual pin SHALL be included in the strategy context as a preference; it SHALL NOT displace an eligible current target under ordered selection or bypass eligibility. A custom strategy MAY choose another eligible target using the supplied pin, current-target and request context. Strategies SHALL NOT bypass authentication, context fit, quota/health blocks, probe leases, activation verification, retry replay safety, transition budgets or awaited Magic Context flushes.
+A newly changed manual pin SHALL override incumbent stickiness and automatic strategy selection once on the next route resolution, if eligible. After that resolution, ordered selection SHALL keep the selected eligible target sticky; a still-stored pin is preferred when the incumbent is unavailable. Without a fresh override, bounded same-target retries and explicit recovery targets retain precedence over automatic strategies. Custom strategies receive persistent pin and current-target context and MAY choose among eligible targets. No pin or strategy may bypass authentication, context fit, quota/health blocks, probe leases, activation verification, retry replay safety, transition budgets or awaited Magic Context flushes.
 
-#### Scenario: Current target and pin under ordered selection
-- **WHEN** an eligible current target differs from the pin and no custom strategy is configured
+#### Scenario: Fresh pin overrides an eligible current target once
+- **WHEN** the user changes a pin to a different eligible target
+- **THEN** the next resolution selects the pinned target even if the incumbent is healthy
+- **AND** subsequent ordered selection keeps the selected target sticky
+
+#### Scenario: Persistent pin under ordered selection
+- **WHEN** an eligible current target differs from a stored pin with no fresh user override
 - **THEN** ordered selection keeps the current target sticky
 - **AND** the pin remains preferred over configured order if the current target becomes ineligible
 
-#### Scenario: Custom strategy receives pin
-- **WHEN** an eligible pin and current target are supplied to a custom strategy
-- **THEN** the strategy chooses among eligible targets using the pin as context, without the router bypassing its selection
+#### Scenario: Custom strategy receives persistent pin
+- **WHEN** an eligible pin and current target are supplied to a custom strategy with no fresh override
+- **THEN** the strategy chooses among eligible targets using the pin as context
+
+#### Scenario: Fresh manual pin precedes a strategy
+- **WHEN** the user changes the pin to another eligible target
+- **THEN** that target is selected once before automatic strategy evaluation
 
 #### Scenario: Dormant pin
 - **WHEN** a pin is ineligible

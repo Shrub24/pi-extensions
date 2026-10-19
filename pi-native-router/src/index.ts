@@ -81,11 +81,18 @@ const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhi
 /** The user's physical pin per route, persisted on the branch: a candidate identity, or null for auto. Last entry wins. */
 const PIN_ENTRY = "@vanillagreen/pi-native-router/physical-pin";
 type ShortcutKey = Parameters<ExtensionAPI["registerShortcut"]>[0];
+function pinEntry(ctx: ExtensionContext, role: string) {
+  return ctx.sessionManager.getBranch().findLast(e => e.type === "custom" && e.customType === PIN_ENTRY && (e.data as { role?: string })?.role === role);
+}
 function pinOf(ctx: ExtensionContext, role: string): string | null | undefined {
-  const entry = ctx.sessionManager.getBranch().findLast(e => e.type === "custom" && e.customType === PIN_ENTRY && (e.data as { role?: string })?.role === role);
+  const entry = pinEntry(ctx, role);
   if (entry?.type !== "custom") return undefined;
   const pinned = (entry.data as { identity?: unknown }).identity;
   return typeof pinned === "string" ? pinned : null;
+}
+function pinOverrideOf(ctx: ExtensionContext, role: string): boolean {
+  const entry = pinEntry(ctx, role);
+  return entry?.type === "custom" && (entry.data as { override?: unknown }).override === true;
 }
 function isPinned(ctx: ExtensionContext, role: string): boolean {
   return typeof pinOf(ctx, role) === "string";
@@ -160,7 +167,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     strategyLoads.set(role, loadStrategy(route.strategy).catch(() => { strategyLoadFailed.add(role); return undefined; }));
   }
   const strategyContext = (role: string, route: RouteConfig, ctx: ExtensionContext, candidates: Resolved[], estimate: number,
-    input: { mode: RoutingContext["mode"]; reason: RoutingContext["reason"]; state?: State; current?: string; pin?: string; recovery?: string; priorityTarget?: string; priority?: "recovery" | "retry" | "pin"; excluded?: ReadonlySet<string>; failed?: string; failureKind?: string }): RoutingContext => {
+    input: { mode: RoutingContext["mode"]; reason: RoutingContext["reason"]; state?: State; current?: string; pin?: string; recovery?: string; priorityTarget?: string; priority?: "recovery" | "retry" | "pin"; forcePin?: boolean; excluded?: ReadonlySet<string>; failed?: string; failureKind?: string }): RoutingContext => {
     const now = options.now?.() ?? Date.now();
     const eligible = eligibleCandidates(route, candidates, health, estimate).filter(({ model, candidate }) => {
       const target = identity(model, candidate.account);
@@ -229,10 +236,9 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     const isExcluded = (target: string) => typeof exclude === "string" ? exclude === target : exclude?.has(target) === true;
     const eligible = eligibleCandidates(route, selectable, health, estimate).filter(value => !isExcluded(identity(value.model, value.candidate.account)));
     const currentEligible = input.current !== undefined && eligible.some(value => identity(value.model, value.candidate.account) === input.current);
-    // A pin reorders automatic choices; it does not eject a healthy current target. Once the incumbent
-    // is ineligible (including a failed/excluded request), the eligible pin is promoted ahead of route order.
-    const preferredTarget = input.priority === "pin" && currentEligible ? undefined : input.priorityTarget;
-    const fallbackPreferred = input.priority === "pin" && currentEligible ? input.current : preferred;
+    // A newly set pin overrides incumbent stickiness once; afterward the selected physical target stays sticky.
+    const preferredTarget = input.priority === "pin" && currentEligible && !input.forcePin ? undefined : input.priorityTarget;
+    const fallbackPreferred = input.priority === "pin" && currentEligible && !input.forcePin ? input.current : preferred;
     const fallback = () => choose(route, selectable, health, estimate, fallbackPreferred, exclude);
     if (preferredTarget) {
       const preferredCandidate = eligible.find(value => identity(value.model, value.candidate.account) === preferredTarget);
@@ -288,7 +294,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
         const selected = selection.selected;
         reportStrategyFallback(role, ctx, { ...selection, selected });
         if (!selected) throw exhausted(role, route, ctx, config);
-        publishRoute(ctx, selected.model, selected.candidate.account, selected.candidate.thinkingLevel, undefined, false);
+        publishRoute(ctx, role, selected.model, selected.candidate.account, selected.candidate.thinkingLevel, undefined, false);
         return { model: selected.model, thinkingLevel: selected.candidate.thinkingLevel };
       }
       const old = restore(request.state);
@@ -331,8 +337,9 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       // Admit one recovery probe per expired scope on the chosen target, or move to the next target.
       const skipped = new Set<string>(exclude ? [exclude] : []);
       const pin = pinOf(ctx, role);
-      const priorityTarget = state.next ?? (typeof pin === "string" ? pin : stayRetry ? state.physical : undefined);
-      const priority = state.next ? "recovery" as const : typeof pin === "string" ? "pin" as const : stayRetry ? "retry" as const : undefined;
+      const forcePin = typeof pin === "string" && pinOverrideOf(ctx, role);
+      const priorityTarget = forcePin ? pin : state.next ?? (typeof pin === "string" ? pin : stayRetry ? state.physical : undefined);
+      const priority = forcePin ? "pin" as const : state.next ? "recovery" as const : typeof pin === "string" ? "pin" as const : stayRetry ? "retry" as const : undefined;
       const preferred = typeof pin === "string" ? pin : state.physical;
       let selected: Resolved | undefined;
       let selection: Awaited<ReturnType<typeof chooseWithStrategy>>;
@@ -340,7 +347,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
         const reason: RoutingContext["reason"] = request.failed ? "failover" : skipped.size > 0 ? "admission-retry" : state.physical ? "continuation" : "initial";
         selection = await chooseWithStrategy(role, route, candidates, health, estimate, preferred, skipped, ctx,
           { mode: "dispatch", reason, state, current: state.physical || undefined, ...(typeof pin === "string" ? { pin } : {}),
-            ...(state.next ? { recovery: state.next } : {}), ...(priorityTarget ? { priorityTarget } : {}), ...(priority ? { priority } : {}),
+            ...(state.next ? { recovery: state.next } : {}), ...(priorityTarget ? { priorityTarget } : {}), ...(priority ? { priority } : {}), ...(forcePin ? { forcePin: true } : {}),
             excluded: skipped, ...(exclude ? { failed: exclude } : {}), ...(request.failed ? { failureKind: classify(request.failed.message, options.now?.()).kind } : {}) });
         selected = selection.selected;
         reportStrategyFallback(role, ctx, { ...selection, selected });
@@ -428,13 +435,14 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
         }
         pi.events.emit("native-router:account-active", { provider: selected.candidate.provider, account: selected.candidate.account });
       }
+      if (forcePin) pi.appendEntry(PIN_ENTRY, { role, identity: pin, override: false });
       state.physical = physical;
       delete state.next;
       const unchanged = old && JSON.stringify(old) === JSON.stringify(state);
       // An explicit user choice on this route overrides the candidate default; reasoning-less models keep theirs.
       const explicit = userThinking(ctx, role);
       const thinkingLevel = routeLevel(selected.model, selected.candidate.thinkingLevel, explicit) as ModelThinkingLevel;
-      publishRoute(ctx, selected.model, selected.candidate.account, thinkingLevel, explicit, isPinned(ctx, role));
+      publishRoute(ctx, role, selected.model, selected.candidate.account, thinkingLevel, explicit, isPinned(ctx, role));
       return { model: selected.model, thinkingLevel, state: unchanged ? request.state : state };
     };
     pi.on("message_end", (event, ctx) => {
@@ -496,6 +504,13 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
   // segment is left out of the layout so the level is never shown twice.
   // The route's physical model and peak are only known when a request resolves, so a route shows the candidate its
   // next request will try (the pin, else the last served physical, else route order) until then.
+  const displayGeneration = new Map<string, number>();
+  const nextDisplayGeneration = (ctx: ExtensionContext) => {
+    const sessionId = ctx.sessionManager.getSessionId();
+    const generation = (displayGeneration.get(sessionId) ?? 0) + 1;
+    displayGeneration.set(sessionId, generation);
+    return { sessionId, generation };
+  };
   const displayed = async (ctx: ExtensionContext, role: string): Promise<Resolved | undefined> => {
     const route = config.routes[role];
     const state = branchState(ctx, role);
@@ -503,7 +518,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     const preferred = typeof pin === "string" ? pin : state?.physical;
     const selection = await chooseWithStrategy(role, route, available(route, ctx, config), health, ctx.getContextUsage()?.tokens ?? 0, preferred, undefined, ctx,
       { mode: "preview", reason: state?.physical ? "continuation" : "initial", state, current: state?.physical || undefined,
-        ...(state?.next ? { recovery: state.next, priorityTarget: state.next, priority: "recovery" as const } : typeof pin === "string" ? { pin, priorityTarget: pin, priority: "pin" as const } : {}) });
+        ...(typeof pin === "string" && pinOverrideOf(ctx, role) ? { pin, priorityTarget: pin, priority: "pin" as const, forcePin: true } : state?.next ? { recovery: state.next, priorityTarget: state.next, priority: "recovery" as const } : typeof pin === "string" ? { pin, priorityTarget: pin, priority: "pin" as const } : {}) });
     reportStrategyFallback(role, ctx, { ...selection, selected: selection.selected }, false);
     return selection.selected;
   };
@@ -519,7 +534,9 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
   // `choice` is the route's thinking choice: undefined reads it from the branch, null means no choice.
   const previewRoute = async (ctx: ExtensionContext, role: string, choice: string | null | undefined = userThinking(ctx, role)) => {
     if (!ctx.hasUI) return;
+    const { sessionId, generation } = nextDisplayGeneration(ctx);
     const shown = await displayed(ctx, role);
+    if (displayGeneration.get(sessionId) !== generation || ctx.model?.provider !== "route" || ctx.model.id !== role) return;
     if (!shown) { clearRoute(ctx); return; }
     const { model, candidate } = shown;
     setPhysical(ctx, model, candidate.account, isPinned(ctx, role));
@@ -530,14 +547,16 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
   };
   const publishSelection = async (ctx: ExtensionContext, model: Model<Api> | undefined) => {
     if (!ctx.hasUI) return;
+    nextDisplayGeneration(ctx);
     if (model?.provider === "route" && config.routes[model.id]) { await previewRoute(ctx, model.id); return; }
     setPhysical(ctx, undefined, undefined, false);
     ctx.ui.setStatus(FOOTER_KEYS.peak, undefined);
     ctx.ui.setStatus(FOOTER_KEYS.thinking, model?.reasoning && ctx.thinkingLevel ? thinkingText(ctx.thinkingLevel, undefined) : undefined);
   };
   // The physical model, peak and effective thinking level of a request this route has just resolved.
-  const publishRoute = (ctx: ExtensionContext, model: Model<Api>, account: string | undefined, effective: string, requested: string | undefined, pinned: boolean) => {
-    if (!ctx.hasUI) return;
+  const publishRoute = (ctx: ExtensionContext, role: string, model: Model<Api>, account: string | undefined, effective: string, requested: string | undefined, pinned: boolean) => {
+    if (!ctx.hasUI || ctx.model?.provider !== "route" || ctx.model.id !== role) return;
+    nextDisplayGeneration(ctx);
     setPhysical(ctx, model, account, pinned);
     ctx.ui.setStatus(FOOTER_KEYS.peak, peakText(model.provider, model.id, options.now?.() ?? Date.now()));
     ctx.ui.setStatus(FOOTER_KEYS.thinking, model.reasoning ? thinkingText(effective, requested) : undefined);
@@ -665,12 +684,12 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     // A pin on the candidate auto already picks changes nothing, so it is stored as auto instead.
     const matchesAuto = requested !== null && requested === await autoChoice(ctx, role);
     const choice = matchesAuto ? null : requested;
-    pi.appendEntry(PIN_ENTRY, { role, identity: choice });
+    pi.appendEntry(PIN_ENTRY, { role, identity: choice, override: choice !== null });
     recordDecision(decisionLogPath, { at: new Date(options.now?.() ?? Date.now()).toISOString(), session: ctx.sessionManager.getSessionId(), logical: `route/${role}`, physical: choice === null ? "auto" : physicalOf(choice), ...(choice && accountOf(choice) ? { account: accountOf(choice) } : {}), reason: "manual" }, degrade);
     await previewRoute(ctx, role);
     if (matchesAuto) { ctx.ui.notify(`native-router: ${role} already follows auto on ${requested}; pin cleared`, "info"); return; }
     const note = choice === null ? `native-router: ${role} follows automatic selection` : `native-router: ${role} prefers ${choice}`;
-    ctx.ui.notify(`${note}; a healthy current model stays sticky, and switching candidates rebuilds the route's cache`, "info");
+    ctx.ui.notify(`${note}; an eligible new pin applies on the next request, then the selected model stays sticky`, "info");
   };
   const cyclePin = async (ctx: ExtensionContext) => {
     const model = ctx.model;

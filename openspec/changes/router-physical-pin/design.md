@@ -6,13 +6,7 @@ A pin is a custom branch entry, `native-router:physical-pin`, with data `{ role,
 
 ## Selection
 
-`choose()` takes a preferred identity and falls back to the first usable candidate. Ordered selection keeps an eligible current physical model sticky. When there is no eligible incumbent, preference order is:
-
-- `state.next` (explicit recovery) when set;
-- an eligible pin when set;
-- the configured automatic selection (route order by default).
-
-A pin cannot pull the route away from a healthy current target after failover cooldown expires. If the incumbent becomes unavailable, the still-stored pin is promoted again. A pin that cannot serve is skipped for that request and is not cleared.
+`choose()` takes a preferred identity and falls back to the first usable candidate. A newly written pin entry carries a one-shot override bit: the next resolution tries that eligible target before current-target stickiness or automatic recovery preference. The router consumes the bit only after it has prepared a dispatch, then keeps the chosen physical target sticky. The pin identity remains stored; if the incumbent later becomes unavailable, the pin is preferred again. If the pin is ineligible on the override request, the existing health/context/route fallback applies and the override is consumed once a fallback dispatch is prepared.
 
 ## Cycling
 
@@ -30,4 +24,4 @@ The physical item gets a pin mark (`⚑`) while a pin is set. A pin that is dorm
 
 ## Cache
 
-Setting a pin does not itself switch the physical model. When selection changes candidates because the incumbent is unavailable, the existing transition path flushes Magic Context before replacement dispatch. The command explains that a healthy incumbent stays sticky; the ordinary failover notice reports an actual cache rebuild.
+Setting a pin does not dispatch immediately. The next route resolution honors an eligible new pin even when the incumbent is healthy, using the existing transition path and awaited Magic Context flush before replacement dispatch. After selection the target stays sticky. The command explains this one-shot override; the ordinary transition notice reports the actual cache rebuild.

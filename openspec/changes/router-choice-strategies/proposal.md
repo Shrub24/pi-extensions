@@ -8,7 +8,7 @@ The router currently chooses by configured order and stickiness. Operators need 
 
 - Add an opt-in, per-route TypeScript strategy module: a synchronous function receives a versioned, immutable routing snapshot and strategy options, then returns one eligible target ID and a bounded explanation.
 - Expose physical/account identity, configured order, quota windows and provenance, pricing and peak state, cache activity, effective thinking, request estimates, selection mode and exclusions without exposing credentials or prompts.
-- Retain ordered/sticky selection as the default and fallback. A custom strategy owns automatic stickiness; bounded transient retries and explicit recovery targets retain precedence. A manual pin is a preference beneath a healthy incumbent for ordered selection, and is included in custom-strategy context.
+- Retain ordered/sticky selection as the default and fallback. A custom strategy owns automatic stickiness; bounded transient retries and explicit recovery targets retain precedence unless the user has just made a one-shot pin override. A fresh pin switches to its eligible target on the next request, then the selected model stays sticky; persistent pins remain context/preferences for automatic selection.
 - Validate every choice and reapply existing admission, activation, transition and flush safeguards. Reselect after exclusion without bypassing retry safety or budgets.
 - Use the same selection module for route preview and dispatch, and explain strategy decisions and fallback in existing diagnostics.
 - Document the trusted-code loading contract and provide an illustrative peak/quota-aware TS strategy rather than introducing a built-in scoring engine.

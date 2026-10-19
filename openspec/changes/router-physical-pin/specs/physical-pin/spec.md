@@ -18,22 +18,29 @@ The router SHALL store a physical pin per route as a session branch entry. The l
 - **WHEN** the user selects `auto`
 - **THEN** the route clears the manual pin and uses its configured automatic selection (route order when no custom strategy is configured) from the next request
 
-### Requirement: Pin as a preference beneath a healthy incumbent
+### Requirement: User pin overrides stickiness once
 
-The router SHALL preserve an eligible current physical target for stickiness, even when another candidate is pinned. When there is no eligible current target, the router SHALL prefer an eligible pinned candidate before configured automatic selection. Recovery targets and bounded same-target retries retain their existing priority.
+A newly set physical pin SHALL override the current target and automatic recovery preference for the next route resolution, if the pin is eligible. After that resolution, the dispatched physical target SHALL remain sticky while eligible; a still-stored pin SHALL be preferred when the incumbent becomes unavailable. An ineligible pin SHALL use the existing fallback selection and SHALL NOT bypass health, fit, transition, activation or flush safeguards.
 
-#### Scenario: Healthy incumbent and different pin
-- **WHEN** a pin names a different candidate and the current physical target remains eligible
-- **THEN** the router continues using the current physical target
-- **AND** the pin remains stored as a preference
+#### Scenario: New pin overrides a healthy incumbent once
+- **WHEN** the user sets or cycles to an eligible candidate different from the current physical target
+- **THEN** the next route resolution selects that candidate
+- **AND** the override is consumed after selection
+- **AND** later requests stay on the selected target while it remains eligible
+
+#### Scenario: Stored pin does not reclaim a healthy fallback
+- **WHEN** the pinned candidate becomes eligible again after failover, while the current fallback remains eligible
+- **THEN** the router keeps the current fallback sticky
+- **AND** the pin remains stored for when the incumbent becomes unavailable
 
 #### Scenario: No eligible incumbent
 - **WHEN** a pin is set and there is no eligible current physical target
 - **THEN** the router tries the pinned candidate before configured route order
 
-#### Scenario: Recovery keeps priority
-- **WHEN** a recovery target is pending and a pin is set
-- **THEN** the recovery target is tried first
+#### Scenario: Manual choice supersedes recovery preference
+- **WHEN** the user sets a new pin while a recovery target is pending
+- **THEN** the eligible pinned candidate is selected for the next resolution
+- **AND** normal retry safety and dispatch safeguards still apply
 
 ### Requirement: Dormant pin
 
@@ -82,8 +89,8 @@ The physical footer item SHALL show a pin mark while a pin is set, and each manu
 
 ### Requirement: Pin preference notice
 
-A manual change SHALL explain that a healthy current target remains sticky and that an actual physical switch rebuilds the route's cache.
+A manual change SHALL explain that an eligible new pin applies on the next request and that the selected target remains sticky afterward.
 
 #### Scenario: Change notice
 - **WHEN** the user changes the pin
-- **THEN** the notification describes the pin as a preference beneath current-target stickiness
+- **THEN** the notification describes the one-shot override and subsequent stickiness

@@ -76,8 +76,8 @@ Cache projection includes logical/physical/account identity, last successful act
 Automatic selection order:
 
 1. Apply existing auth/key capability checks, health/quota causes, context/output fit and current-attempt exclusions. When a transition budget is exhausted, automatic alternatives requiring a transition are not selectable.
-2. Honor an eligible explicit recovery target, an admitted bounded same-target transient retry, then an eligible manual pin. Preserve the existing direct-call path's active-only credential behavior and absence of session pin semantics.
-3. Invoke the configured strategy; default strategy uses last served target then configured order. Custom strategies see the current target but are not overridden by its ordinary stickiness.
+2. Honor a fresh eligible manual pin override for one resolution, then explicit recovery targets and admitted bounded same-target transient retries. Persistent pins are automatic-selection context, not an override of the healthy incumbent under ordered selection. Preserve the existing direct-call path's active-only credential behavior and absence of session pin semantics.
+3. Invoke the configured strategy; default strategy uses last served target then configured order. Custom strategies see current and persistent-pin context but are not overridden by ordinary incumbent stickiness.
 4. Validate the choice, or fall back to default selection over the same eligible set.
 5. Perform existing shared probe admission, awaited transition/cache flush and verified credential activation. Strategy code cannot mutate those operations.
 
@@ -89,7 +89,7 @@ Do not add a second global stickiness/hysteresis layer. Policy authors control t
 
 Route preview, pin normalization and dispatch use the same snapshot builder and choice evaluator. Preview uses cached data and records no probe/credential/cache activity. Its `mode` is explicit; the result remains tentative because time, quota and admission may change. Do not promise byte-identical snapshots at different times.
 
-Cycling retains configured eligible order. Pin-to-auto normalization evaluates custom automatic choice without the pin, avoiding recursion. Existing per-candidate thinking resolution supplies both preview and dispatch fields; thinking preference behavior does not change. The overflow-recovery selection path must use the same explicit recovery precedence rather than accidentally invoking custom strategy in place of recovery.
+Cycling retains configured eligible order. Pin-to-auto normalization evaluates custom automatic choice without the pin, avoiding recursion. Existing per-candidate thinking resolution supplies both preview and dispatch fields; thinking preference behavior does not change. The overflow-recovery selection path must use the same explicit precedence; a fresh user pin may override automatic recovery preference, but not eligibility or transition safeguards.
 
 ### 6. Diagnostics and example policy
 
