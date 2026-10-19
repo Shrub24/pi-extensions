@@ -37,7 +37,7 @@ export function classify(message: Pick<AssistantMessage, "stopReason" | "content
   else if (modelAccess) kind = "auth";
   else if (status === 401 || status === 403 || /unauthorized|invalid.api.key|authentication|permission.denied/i.test(text)) kind = "auth";
   else if (status === 429 || /rate.limit|too many requests/i.test(text)) kind = "rate";
-  else if ((typeof status === "number" && status >= 500 && status <= 599) || /\b50[0-9]\b|overloaded|server.error|service.unavailable|timeout|timed out|ECONNRESET|ECONNREFUSED|fetch failed/i.test(text)) kind = "transient";
+  else if ((typeof status === "number" && status >= 500 && status <= 599) || /\b50[0-9]\b|overloaded|server.error|service.unavailable|timeout|timed out|ECONNRESET|ECONNREFUSED|fetch failed|stream ended without finish_reason/i.test(text)) kind = "transient";
   if (kind === "unsafe") return unsafe;
   const base = { transient: 30_000, rate: 60_000, quota: 300_000, auth: 300_000 }[kind];
   // resetAt must be epoch milliseconds; anything earlier than 2001 is an ambiguous unit and stays unknown.

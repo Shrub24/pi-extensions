@@ -94,8 +94,8 @@ function pinOverrideOf(ctx: ExtensionContext, role: string): boolean {
   const entry = pinEntry(ctx, role);
   return entry?.type === "custom" && (entry.data as { override?: unknown }).override === true;
 }
-function isPinned(ctx: ExtensionContext, role: string): boolean {
-  return typeof pinOf(ctx, role) === "string";
+function isPinned(ctx: ExtensionContext, role: string, physical: string): boolean {
+  return pinOf(ctx, role) === physical;
 }
 
 /** The latest explicit route thinking choice on this branch, if the user made one. */
@@ -442,7 +442,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       // An explicit user choice on this route overrides the candidate default; reasoning-less models keep theirs.
       const explicit = userThinking(ctx, role);
       const thinkingLevel = routeLevel(selected.model, selected.candidate.thinkingLevel, explicit) as ModelThinkingLevel;
-      publishRoute(ctx, role, selected.model, selected.candidate.account, thinkingLevel, explicit, isPinned(ctx, role));
+      publishRoute(ctx, role, selected.model, selected.candidate.account, thinkingLevel, explicit, isPinned(ctx, role, physical));
       return { model: selected.model, thinkingLevel, state: unchanged ? request.state : state };
     };
     pi.on("message_end", (event, ctx) => {
@@ -539,7 +539,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     if (displayGeneration.get(sessionId) !== generation || ctx.model?.provider !== "route" || ctx.model.id !== role) return;
     if (!shown) { clearRoute(ctx); return; }
     const { model, candidate } = shown;
-    setPhysical(ctx, model, candidate.account, isPinned(ctx, role));
+    setPhysical(ctx, model, candidate.account, isPinned(ctx, role, identity(model, candidate.account)));
     ctx.ui.setStatus(FOOTER_KEYS.peak, peakText(model.provider, model.id, options.now?.() ?? Date.now()));
     const explicit = choice ?? undefined;
     const level = routeLevel(model, candidate.thinkingLevel, explicit);

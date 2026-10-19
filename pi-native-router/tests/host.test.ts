@@ -18,7 +18,7 @@ import { nativeHttpError } from "./native-error";
 type Routing = { accounts: string[]; candidates: Array<{ provider: string; account?: string }> };
 /** Synthetic env name for a test account; keys are set by each test and never printed. */
 const accountEnv = (id: string) => `NATIVE_ROUTER_TEST_KEY_${id.replace(/-/g, "_").toUpperCase()}`;
-type Outcome = "ok" | "quota" | "transient" | "partial" | "abort" | "tool" | "bad" | 401 | 403 | 429;
+type Outcome = "ok" | "quota" | "transient" | "stream-ended" | "partial" | "abort" | "tool" | "bad" | 401 | 403 | 429;
 async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateThinking?: "off" | "low" | "medium" | "high"; retry?: boolean; flush?: "failed" | "absent"; maxRecoveries?: number; maxTransitions?: number; smaller?: number; manager?: SessionManager; packaged?: boolean; unauthedFirst?: boolean; ttl?: number; startTime?: number; clock?: { value: number }; accounts?: boolean; providerKeys?: boolean; healthPath?: string; decisionLogPath?: string; heldProbe?: boolean; routing?: Routing; runtimeKeys?: "absent" | "inert"; wide?: boolean; contextWindow?: number; maxTokens?: number; strategy?: "prefer-b" | "missing" } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "native-router-"));
   const settings = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: opts.retry ?? false, maxRetries: 3, baseDelayMs: 1 }, cacheWarming: "off" });
@@ -47,7 +47,7 @@ async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateT
         const outcome = outcomes.shift() ?? "ok";
         dispatches.push({ physical: model.provider, context: JSON.stringify(context), thinking: (streamOptions as { reasoning?: string } | undefined)?.reasoning });
         order.push(`dispatch:${model.provider}`);
-        const errorMessage = typeof outcome === "number" ? nativeHttpError(outcome) : outcome === "quota" ? "insufficient_quota" : outcome === "transient" ? "503 overloaded" : outcome === "partial" ? "insufficient_quota" : outcome === "bad" ? "invalid request" : undefined;
+        const errorMessage = typeof outcome === "number" ? nativeHttpError(outcome) : outcome === "quota" ? "insufficient_quota" : outcome === "transient" ? "503 overloaded" : outcome === "stream-ended" ? "Stream ended without finish_reason" : outcome === "partial" ? "insufficient_quota" : outcome === "bad" ? "invalid request" : undefined;
         const message: AssistantMessage = {
           role: "assistant", api: model.api, provider: model.provider, model: model.id,
           timestamp: now(), usage,
@@ -248,6 +248,14 @@ test("native retry stays once, then migrates and consumes flush flags in the ret
     expect(h.dispatches.map(d => d.physical)).toEqual(["fake-a", "fake-a", "fake-b"]);
     expect(h.dispatches[2].context).toContain("MATERIALIZED DROP RESULT");
     expect(h.order.filter(x => x === "flush")).toHaveLength(1);
+  } finally { h.close(); }
+});
+
+test("empty premature streams retry safely once then migrate through the native fallback path", async () => {
+  const h = await host(["stream-ended", "stream-ended", "ok"], { retry: true });
+  try {
+    await h.session.prompt("provider ended the stream before finish_reason");
+    expect(h.dispatches.map(d => d.physical)).toEqual(["fake-a", "fake-a", "fake-b"]);
   } finally { h.close(); }
 });
 
@@ -645,6 +653,7 @@ test("a new pin or cycle overrides incumbent stickiness once, then the selected 
     const pin = h.commands.get("route-pin") as { handler: (args: string, context: never) => Promise<void> };
     await pin.handler("fake-b/model", ctx);
     expect(statuses.get(FOOTER_KEYS.model)).toContain("fake-b");
+    expect(statuses.get(FOOTER_KEYS.model)).toContain("⚑");
     await h.session.prompt("explicit pin should switch away from the healthy incumbent");
     await h.session.prompt("the selected target should now stay sticky");
     expect(h.dispatches.map(d => d.physical)).toEqual(["fake-a", "fake-b", "fake-b"]);
@@ -657,9 +666,10 @@ test("a new pin or cycle overrides incumbent stickiness once, then the selected 
 });
 
 test("a pin cannot pull the route back to a recovered failed candidate while the fallback stays healthy", async () => {
-  const h = await host(["ok", 429, "ok", "ok", "quota", "ok"]);
+  const h = await host(["ok", 429, "ok", "ok", "ok", "quota", "ok"]);
   const notices: string[] = [];
-  const ui = { select: async () => undefined, notify: (message: string) => notices.push(message), setStatus: () => undefined };
+  const statuses = new Map<string, string | undefined>();
+  const ui = { select: async () => undefined, notify: (message: string) => notices.push(message), setStatus: (key: string, value: string | undefined) => statuses.set(key, value) };
   const ctx = { hasUI: true, model: h.runtime.getModel("route", "worker"), modelRegistry: {
     find: (provider: string, id: string) => h.runtime.getModel(provider, id), hasConfiguredAuth: () => true, runtime: h.runtime,
   }, sessionManager: h.manager, getContextUsage: () => ({ tokens: 0 }), thinkingLevel: "off", ui } as never;
@@ -669,6 +679,9 @@ test("a pin cannot pull the route back to a recovered failed candidate while the
     await h.session.prompt("pinned target succeeds");
     await h.session.prompt("pinned target rate-limited; fallback selected");
     expect(h.dispatches.map(d => d.physical)).toEqual(["fake-b", "fake-b", "fake-a"]);
+    await pin.handler("fake-b/model", ctx);
+    expect(statuses.get(FOOTER_KEYS.model)).not.toContain("⚑");
+    await h.session.prompt("ineligible pin falls back and consumes its one-shot override");
 
     h.clock.value += 61_000;
     await h.session.prompt("rate cooldown expired, but healthy fallback remains sticky");

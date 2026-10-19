@@ -31,6 +31,8 @@ test("classification distinguishes account failures, rate limits, model transpor
   expect(classify(error("401 unauthorized"))).toMatchObject({ kind: "auth", scope: "provider" });
   expect(classify(error("rate limit exceeded"))).toMatchObject({ kind: "rate", scope: "model" });
   expect(classify(error("503 overloaded"))).toMatchObject({ kind: "transient", scope: "model" });
+  expect(classify(error("Stream ended without finish_reason"))).toMatchObject({ kind: "transient", scope: "model" });
+  expect(classify(error("Stream ended without finish_reason", [{ type: "text", text: "partial output" }])).kind).toBe("unsafe");
   for (const text of ["context window exceeded", "invalid request", "extension failed", "cancelled"])
     expect(classify(error(text)).kind).toBe("unsafe");
   expect(classify(error("insufficient_quota", [{ type: "text", text: "partial" }])).kind).toBe("unsafe");
