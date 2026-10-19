@@ -144,7 +144,7 @@ export interface AskRecord {
   createdAt: number;
 }
 export interface ResultRecord {
-  version: 4 | 5;
+  version: 4 | 5 | 6;
   runId: string;
   requestId: string;
   ownerSessionId: string;
@@ -161,6 +161,14 @@ export interface ResultRecord {
       | "invalid_response"
       | "artifact_error";
     message: string;
+  };
+  handoff?: {
+    title: string;
+    summary: string;
+    content: string;
+    sha256: string;
+    bytes: number;
+    published: boolean;
   };
   responseValidation?: {
     contractHash: string;
@@ -495,6 +503,7 @@ function validate(
               "text",
               "error",
               "responseValidation",
+              "handoff",
               "contextUsage",
               "completedAt",
             ];
@@ -882,7 +891,25 @@ function validate(
       if (v.text !== undefined)
         throw new Error("Failed result cannot contain text");
     }
-    if (v.responseValidation !== undefined) {
+    if (v.handoff !== undefined) {
+        const handoff = v.handoff as Record<string, unknown>;
+        if (
+          v.version !== 6 || v.status !== "completed" ||
+          Object.keys(handoff).some((key) => !["title", "summary", "content", "sha256", "bytes", "published"].includes(key)) ||
+          typeof handoff.title !== "string" || !handoff.title.trim() || handoff.title.length > 512 ||
+          typeof handoff.summary !== "string" || !handoff.summary.trim() || [...handoff.summary].length > 600 ||
+          typeof handoff.content !== "string" || Buffer.byteLength(handoff.content, "utf8") > 384 * 1024 ||
+          typeof handoff.sha256 !== "string" || !/^[0-9a-f]{64}$/u.test(handoff.sha256) ||
+          typeof handoff.bytes !== "number" || !Number.isSafeInteger(handoff.bytes) ||
+          handoff.bytes !== Buffer.byteLength(handoff.content, "utf8") ||
+          typeof handoff.published !== "boolean"
+        ) throw new Error("Invalid staged handoff");
+      }
+      if (v.version === 6 && v.status === "completed" && v.handoff === undefined)
+        throw new Error("Completed v6 result requires a staged handoff");
+      if (v.version !== 6 && v.handoff !== undefined)
+        throw new Error("Legacy result cannot carry a sealed handoff");
+      if (v.responseValidation !== undefined) {
       const response = v.responseValidation as Record<string, unknown>;
       if (
         !response ||

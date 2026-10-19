@@ -120,14 +120,26 @@ test("park can become retire without another close, retirement is final, and the
   assert.ok(realFs.existsSync(w.state.piSessionFile));
 });
 
-test("failed wrapup is reported separately and does not discard the completed handoff", async (t) => {
+test("failed wrapup leaves the worker live and the completion retryable", async (t) => {
   const w = await worker(t);
   w.preparation({ status: "failed", reason: "historian error" });
-  const result = await w.complete();
-  assert.equal(result.status, "completed");
-  assert.equal(result.disposition, "park");
-  assert.equal(result.wrapup.status, "failed");
-  assert.ok(realFs.existsSync(result.handoff_path));
+  const failed = await w.complete();
+  assert.equal(failed.action_outcome, "unresolved");
+  assert.equal(failed.disposition, null);
+  assert.equal(failed.closed, false);
+  assert.equal(failed.wrapup.status, "failed");
+  assert.ok(readAgentState(w.mailbox));
+  assert.ok(realFs.existsSync(failed.handoff_path));
+
+  const retryState = readCompletion(LEAD_SESSION_ID, w.completion.requestId)!;
+  retryState.wrapup = undefined;
+  retryState.preparationId = undefined;
+  saveCompletion(retryState);
+  w.preparation({ status: "success" });
+  const retried = await w.complete();
+  assert.equal(retried.disposition, "park");
+  assert.equal(retried.closed, true);
+  assert.equal(retried.wrapup.status, "success");
 });
 
 test("another ongoing wrapup keeps the worker live and the completion retryable", async (t) => {

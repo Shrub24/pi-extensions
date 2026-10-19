@@ -32,6 +32,8 @@ export const FIXTURE_TMUX_SERVER = "herdsman-fixture";
 export const FIXTURE_WORKSPACE = "herdsman-fixture";
 export const FIXTURE_TMUX_ENV = `${FIXTURE_TMUX_SERVER},1,0`;
 export const FIXTURE_LEAD_PANE = "%1";
+export const FIXTURE_LEAD_SUBJECT_ID = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+export const FIXTURE_AGENT_SUBJECT_ID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
 
 
 /**
@@ -66,6 +68,7 @@ export type RadarFakeSpawn = {
   argv: string[];
   cwd?: string;
   env: Record<string, string>;
+  managed?: { parent_subject_id?: string };
   pane: string;
   incarnation: string;
   agent_id?: string;
@@ -975,10 +978,22 @@ export async function startFakeRadarDaemon(
           executable: String(request.executable),
           argv: (request.argv as string[]) ?? [],
           ...(request.cwd !== undefined ? { cwd: String(request.cwd) } : {}),
+          ...(typeof request.managed === "object" && request.managed !== null
+            ? {
+                managed: {
+                  ...(typeof (request.managed as Record<string, unknown>).parent_subject_id === "string"
+                    ? { parent_subject_id: String((request.managed as Record<string, unknown>).parent_subject_id) }
+                    : {}),
+                },
+              }
+            : {}),
           pane,
           // tmux sets TMUX_PANE in every pane it creates: the child's raw pane.
           env: {
             ...((request.env ?? {}) as Record<string, string>),
+            ...(typeof (request.managed as Record<string, unknown> | undefined)?.parent_subject_id === "string"
+              ? { PI_RADAR_MANAGED_PARENT_SUBJECT_ID: String((request.managed as Record<string, unknown>).parent_subject_id) }
+              : {}),
             TMUX_PANE: pane.slice(pane.lastIndexOf(":") + 1),
           },
           incarnation: randomUUID(),

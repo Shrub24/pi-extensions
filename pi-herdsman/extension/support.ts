@@ -23,7 +23,9 @@ import {
   spawnedArgvs,
   spawnedEnvironmentAssignments,
   spawnedLabels,
+  FIXTURE_AGENT_SUBJECT_ID,
   FIXTURE_LEAD_PANE,
+  FIXTURE_LEAD_SUBJECT_ID,
   FIXTURE_TMUX_ENV,
   FIXTURE_TMUX_SERVER,
   startFakeRadarDaemon,
@@ -934,7 +936,7 @@ export function fakePi(
   options: {
     exec?: ExecHandler;
     sendMessage?: (message: unknown) => void | Promise<void>;
-    sendUserMessage?: (content: unknown, options?: unknown) => void;
+    sendUserMessage?: (content: unknown, options?: unknown) => void | Promise<void>;
     entries?: unknown[];
     activeTools?: string[] | (() => string[]);
     autoActivateRegisteredTools?: boolean;
@@ -1060,7 +1062,7 @@ export function fakePi(
     sendUserMessage(content: unknown, sendOptions?: unknown) {
       sentUsers.push(content);
       sentUserCalls.push({ content, options: sendOptions });
-      options.sendUserMessage?.(content, sendOptions);
+      return options.sendUserMessage?.(content, sendOptions);
     },
   };
   return {
@@ -1243,11 +1245,13 @@ export function setLeadEnvironment(): void {
     "PI_HERDSMAN_CHILD_COMMAND",
     "PI_HERDSMAN_LAUNCH_GENERATION",
     "PI_HERDSMAN_PARENT_PANE_ID",
+      "PI_RADAR_MANAGED_SUBJECT_ID",
   ])
     delete process.env[key];
   configureSupportedLaunch();
   process.env.TMUX = FIXTURE_TMUX_ENV;
   process.env.TMUX_PANE = FIXTURE_LEAD_PANE;
+    process.env.PI_RADAR_MANAGED_SUBJECT_ID = FIXTURE_LEAD_SUBJECT_ID;
 }
 
 export function setAgentEnvironment(
@@ -1275,6 +1279,7 @@ export function setAgentEnvironment(
   process.env.PI_HERDSMAN_LABEL = label;
   process.env.PI_HERDSMAN_WORKSPACE_ID = workspace;
   process.env.PI_HERDSMAN_AGENT_DEFINITION = "agent";
+  process.env.PI_RADAR_MANAGED_SUBJECT_ID = FIXTURE_AGENT_SUBJECT_ID;
   process.env.PI_HERDSMAN_BRIEF_PROFILE = "common";
   process.env.TMUX = FIXTURE_TMUX_ENV;
   process.env.TMUX_PANE = FIXTURE_LEAD_PANE;

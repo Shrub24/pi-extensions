@@ -76,6 +76,7 @@ const {
   updateConfig,
   validByteLimit,
   validDisabledDefinitions,
+  validCommonChildExtensions,
   validModelPattern,
   validModelScopes,
   validSoftTimeout,
@@ -108,6 +109,28 @@ test("documented soft-deadline, retention, and worker-budget defaults match", ()
   assert.equal(DEFAULT_WORKER_CONTEXT_BUDGET_TOKENS, 200_000);
   assert.equal(readConfig().workerContextBudgetTokens, 200_000);
   assert.equal(readConfig().workerCompaction, true);
+});
+
+test("common child extensions are an optional validated exact set", () => {
+  realFs.mkdirSync(herdsmanDataRoot(), { recursive: true });
+  realFs.writeFileSync(
+    herdsmanConfigPath(),
+    JSON.stringify({ commonChildExtensions: ["/extensions/base.ts", "npm:tool"] }),
+  );
+  assert.deepEqual(readConfig().commonChildExtensions, [
+    "/extensions/base.ts",
+    "npm:tool",
+  ]);
+  assert.equal(validCommonChildExtensions([]), true);
+  assert.equal(validCommonChildExtensions(["/extension.ts"]), true);
+  assert.equal(validCommonChildExtensions(["/extension.ts", "/extension.ts"]), false);
+  assert.equal(validCommonChildExtensions([" "]), false);
+
+  realFs.writeFileSync(
+    herdsmanConfigPath(),
+    JSON.stringify({ commonChildExtensions: ["/extension.ts", "/extension.ts"] }),
+  );
+  assert.throws(() => readConfig(), /commonChildExtensions/);
 });
 
 test("soft-timeout and retain-workers overlays accept only valid values", () => {

@@ -64,6 +64,7 @@ const ARRAY_FIELDS = new Set([
   "skills",
   "preloadedSkills",
   "extensions",
+  "excludeExtensions",
   "agents",
 ]);
 export const SUPPORTED_FIELDS = new Set([
@@ -103,6 +104,7 @@ export type Frontmatter = {
   preloadedSkills?: string[];
   noExtensions?: boolean;
   extensions?: string[];
+  excludeExtensions?: string[];
   agents?: string[];
   inheritGlobalContext?: boolean;
   [key: string]: FrontmatterValue | undefined;
@@ -302,7 +304,8 @@ function validateDefinition(
         value.some(
           (entry) => typeof entry !== "string" || entry.trim().length === 0,
         ) ||
-        (field === "agents" && new Set(value).size !== value.length))
+        ((field === "agents" || field === "excludeExtensions") &&
+            new Set(value).size !== value.length))
     )
       invalid(
         field,
@@ -612,6 +615,9 @@ export function agentDefinitionMetadata(
     ...(frontmatter.extensions === undefined
       ? {}
       : { extensions: frontmatter.extensions }),
+    ...(frontmatter.excludeExtensions === undefined
+      ? {}
+      : { excludeExtensions: frontmatter.excludeExtensions }),
     ...(frontmatter.agents === undefined ? {} : { agents: frontmatter.agents }),
   };
 }
@@ -828,14 +834,14 @@ export function modelPolicyError(input: {
 }
 
 /**
- * A definition that pins an extension-provided model, disables discovery, and
- * names no explicit extensions cannot resolve it: Pi starts, finds no such model
- * and exits about two seconds later with a message that reads as a missing model
- * rather than as a conflicting definition. Catch it before the launch.
+ * An extension-provided model cannot resolve when discovery is disabled and
+ * the selected child set contains no explicit extension. Catch that conflict
+ * before Pi exits later with a misleading missing-model error.
  */
 export function deniedDiscoveryModelError(input: {
   agent: string;
   model: string;
+  modelOrigin?: "pinned" | "inherited";
   noExtensions: boolean;
   extensions?: readonly string[];
   isForeignProvider: (providerId: string) => boolean;
@@ -844,10 +850,11 @@ export function deniedDiscoveryModelError(input: {
   const provider = input.model.split("/")[0] ?? "";
   if (provider.length === 0 || !input.isForeignProvider(provider))
     return undefined;
+  const modelVerb = input.modelOrigin === "inherited" ? "inherits" : "pins";
   return (
-    `agent ${input.agent} pins model ${input.model}, whose provider ${provider} an extension registers, ` +
-    `but the definition sets noExtensions: true so the child cannot resolve it. ` +
-    "List the provider extension in extensions, remove noExtensions: true, or pin a model a built-in provider serves."
+    `agent ${input.agent} ${modelVerb} model ${input.model}, whose provider ${provider} an extension registers, ` +
+    "but the explicit child extension set is empty, so it cannot resolve the model. Include the provider extension in the selected set, " +
+    "or allow extension discovery when no common child set is configured."
   );
 }
 
@@ -935,6 +942,8 @@ export function agentDefinitionDelegationEnabled(
 }
 
 export type AgentLaunchOptions = {
+  /** If set, managed children use this explicit base instead of extension discovery. */
+  commonChildExtensions?: readonly string[];
   bodyPromptPath?: string;
   sharedPromptPath?: string;
   cwd?: string;
@@ -1056,6 +1065,33 @@ function bodyFileDigests(body: string, cwd: string): string[] {
   });
 }
 
+export type ChildExtensionSelection = {
+  noExtensions: boolean;
+  extensions: string[];
+};
+
+/** Resolve a common child set with definition-local additions and exclusions. */
+export function resolveChildExtensions(
+  agent: AgentDefinition,
+  commonChildExtensions?: readonly string[],
+): ChildExtensionSelection {
+  const { frontmatter } = agent;
+  const noExtensions =
+    commonChildExtensions !== undefined || frontmatter.noExtensions === true;
+  if (frontmatter.excludeExtensions?.length && !noExtensions)
+    throw new Error(
+      `agent ${agent.name} uses excludeExtensions without an explicit child extension set`,
+    );
+  const excluded = new Set(frontmatter.excludeExtensions ?? []);
+  const extensions = [
+    ...new Set([
+      ...(commonChildExtensions ?? []),
+      ...(frontmatter.extensions ?? []),
+    ]),
+  ].filter((extension) => !excluded.has(extension));
+  return { noExtensions, extensions };
+}
+
 /**
  * The definition's launch configuration for a managed worker. Resolution mirrors
  * `agentLaunchArgs`, so a fingerprint change means the next process would start
@@ -1071,7 +1107,11 @@ function bodyFileDigests(body: string, cwd: string): string[] {
  */
 export function resolveAgentLaunchInputs(
   agent: AgentDefinition,
-  options: { cwd?: string; launchCommand?: string } = {},
+  options: {
+    cwd?: string;
+    launchCommand?: string;
+    commonChildExtensions?: readonly string[];
+  } = {},
 ): AgentLaunchInputs {
   const { frontmatter } = agent;
   const cwd = options.cwd ?? process.cwd();
@@ -1081,6 +1121,10 @@ export function resolveAgentLaunchInputs(
   const inheritGlobalContext =
     frontmatter.inheritGlobalContext ?? inheritProjectContext;
   const thinking = configuredThinking(agent);
+  const childExtensions = resolveChildExtensions(
+    agent,
+    options.commonChildExtensions,
+  );
   return {
     body: agent.body,
     bodyFiles: bodyFileDigests(agent.body, cwd),
@@ -1097,8 +1141,8 @@ export function resolveAgentLaunchInputs(
     noSkills: skillDiscoveryDisabled(agent),
     skills: [...(frontmatter.skills ?? [])],
     preloadedSkills: [...(frontmatter.preloadedSkills ?? [])],
-    noExtensions: frontmatter.noExtensions === true,
-    extensions: [...(frontmatter.extensions ?? [])],
+    noExtensions: childExtensions.noExtensions,
+    extensions: childExtensions.extensions,
     inheritProjectContext,
     inheritGlobalContext,
     ...(options.launchCommand ? { launchCommand: options.launchCommand } : {}),
@@ -1225,14 +1269,21 @@ export function agentLaunchArgs(
   for (const skill of options.resolvedSkills ?? frontmatter.skills ?? [])
     args.push("--skill", skill);
 
-  // A model whose provider comes from an extension cannot resolve inside a
-  // child denied extension discovery, so the model's needs outrank the
-  // definition's preference to stay lean.
+  const childExtensions = resolveChildExtensions(
+    agent,
+    options.commonChildExtensions,
+  );
   const extensionDiscovery =
     decision.kind === "use" && decision.extensionDiscovery;
-  if (frontmatter.noExtensions && !extensionDiscovery)
+  const explicitExclusions = (frontmatter.excludeExtensions?.length ?? 0) > 0;
+  if (
+    childExtensions.noExtensions &&
+    (!extensionDiscovery ||
+      options.commonChildExtensions !== undefined ||
+      explicitExclusions)
+  )
     args.push("--no-extensions");
-  for (const extension of frontmatter.extensions ?? [])
+  for (const extension of childExtensions.extensions)
     args.push("--extension", extension);
   return args;
 }

@@ -70,6 +70,13 @@ const { writePrivatePromptSnapshots } = await import(
 const { updateConfig, DEFAULT_WORKER_CONTEXT_BUDGET_TOKENS } = await import(
   "./config.ts",
 );
+const { readCompletion, saveCompletion } = await import("./completions.ts");
+function keepCompletion(owner: string, id: string): void {
+  const completion = readCompletion(owner, id);
+  assert.ok(completion, `completion ${id} exists`);
+  completion.disposition = "keep";
+  saveCompletion(completion);
+}
 // These suites cover the one-shot lifecycle; retained workers are the default,
 // and the tests that exercise retention opt in or out explicitly.
 beforeEach(() => updateConfig("retainWorkers", false));
@@ -2170,8 +2177,9 @@ test("a provider error cannot reach the next assignment", async (t) => {
   await errorTurn();
   assert.equal(readResult(mailbox, REQUEST_ID)?.status, "failed");
 
-  // Retrieving the result admits the next assignment on this retained worker.
+  // Retrieval alone does not release the worker; the lead explicitly keeps it.
   removeResult(mailbox, REQUEST_ID);
+  keepCompletion(readAgentState(mailbox)!.ownerSessionId, REQUEST_ID);
   const nextRequestId = "cccccccc-cccc-4ccc-8ccc-cccccccccccf";
   const started = readAgentState(mailbox)!;
   writeRequest(mailbox, {
@@ -2611,6 +2619,7 @@ test("invalid final responses publish one typed failure with diagnostics", async
   await answer("## Outcome\nFixed.");
   assert.equal(readResult(mailbox, requestId)?.status, "completed");
   removeResult(mailbox, requestId);
+  keepCompletion(started.ownerSessionId, requestId);
   agent.sentUsers.length = 0;
 
   // A worker that never satisfies the contract fails once, after two corrections.
@@ -2643,6 +2652,7 @@ test("invalid final responses publish one typed failure with diagnostics", async
   assert.equal(result?.responseValidation?.diagnostics?.[0]?.field, "requiredSections");
   assert.equal(result?.responseValidation?.diagnostics?.[0]?.message, "Missing Markdown heading: Outcome");
   removeResult(mailbox, stubbornId);
+  keepCompletion(started.ownerSessionId, stubbornId);
 
   // The owner repairs through an ordinary new assignment with its own contract.
   removeResult(mailbox, requestId);
@@ -2812,7 +2822,7 @@ test("recovery fails closed when accepted context snapshots have changed", async
   }
 });
 
-test("a retained worker accepts a second assignment once its result is gone", async () => {
+test("a retained worker accepts a second assignment only after agent_complete keeps it", async () => {
   const mailbox = setAgentEnvironment("retained-worker-agent");
   const agent = fakePi();
   const context = fakeContext();
@@ -2893,9 +2903,10 @@ test("a retained worker accepts a second assignment once its result is gone", as
   assert.equal(afterRefusal.lastAck?.code, "busy");
   assert.equal(readRequest(mailbox, held.requestId), undefined);
 
-  // The controller removes a result only after it delivered it; that absence is
-  // what makes the retained worker reusable for one new assignment.
+  // Delivery alone does not make the worker reusable. The lead explicitly keeps
+  // this completion after retrieving it.
   removeResult(mailbox, first.requestId);
+  keepCompletion(started.ownerSessionId, first.requestId);
   const second = requestFor(randomUUID(), "second assignment");
   writeRequest(mailbox, second);
   assert.deepEqual(
@@ -4803,9 +4814,9 @@ test("a compaction hold does not outlive the settlement that ends its run", asyn
     "answered on the compacted session",
   );
 
-  // The next assignment on this retained worker is aborted with no compaction
-  // behind it, so its answer settles as the answer it is.
+  // The lead explicitly keeps this completed assignment before starting the next.
   removeResult(mailbox, REQUEST_ID);
+  keepCompletion(readAgentState(mailbox)!.ownerSessionId, REQUEST_ID);
   const nextRequestId = "cccccccc-cccc-4ccc-8ccc-cccccccccccf";
   const started = readAgentState(mailbox)!;
   writeRequest(mailbox, {
@@ -4964,11 +4975,10 @@ test("a continuation is withheld once its assignment has settled", async (t) => 
     },
   );
 
-  // The hold that request installed does not follow the next assignment on the
-  // same retained worker: once the owner has retrieved the delivered result
-  // (which removes its file), that assignment is admissible and settles on its
-  // own answer.
+  // The hold that request installed does not follow the next assignment. The
+  // lead must explicitly keep the worker after receiving the completed result.
   removeResult(mailbox, REQUEST_ID);
+  keepCompletion(readAgentState(mailbox)!.ownerSessionId, REQUEST_ID);
   const nextRequestId = "cccccccc-cccc-4ccc-8ccc-ccccccccccce";
   const started = readAgentState(mailbox)!;
   writeRequest(mailbox, {

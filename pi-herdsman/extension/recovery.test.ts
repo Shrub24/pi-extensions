@@ -97,6 +97,75 @@ const agentTool = (pi: ReturnType<typeof fakePi>, name: string) => {
   };
 };
 
+test("fresh Radar child launch passes the current Lead subject ID as managed parent metadata", async () => {
+  setLeadEnvironment();
+  const pi = fakePi({});
+  registerExtension!(pi.pi as never);
+  await startRadarSession(pi);
+  const label = "subject-bound-child";
+  try {
+    await delegateRadarChild(pi, label);
+    assert.equal(radarDaemon.spawns.length, 1);
+    assert.equal(
+      radarDaemon.spawns[0].managed?.parent_subject_id,
+      process.env.PI_RADAR_MANAGED_SUBJECT_ID,
+    );
+    assert.equal(
+      radarDaemon.spawns[0].env.PI_RADAR_MANAGED_PARENT_SUBJECT_ID,
+      process.env.PI_RADAR_MANAGED_SUBJECT_ID,
+    );
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(agentMailboxPath(WORKSPACE, label));
+  }
+});
+
+test("fresh Radar child launch refuses when the Lead has no managed subject ID", async () => {
+  setLeadEnvironment();
+  delete process.env.PI_RADAR_MANAGED_SUBJECT_ID;
+  const pi = fakePi({});
+  registerExtension!(pi.pi as never);
+  await startRadarSession(pi);
+  try {
+    const result = await agentTool(pi, "delegate").execute(
+      "delegate-missing-parent-subject",
+      { definition: "agent", label: "missing-parent-subject-child", task: "Do the task." },
+      undefined,
+      undefined,
+      fakeContext(pi.entries),
+    );
+    assert.equal(result.details.ok, false);
+    assert.match(JSON.stringify(result.details), /managed subject identity/);
+    assert.equal(radarDaemon.spawns.length, 0);
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(agentMailboxPath(WORKSPACE, "missing-parent-subject-child"));
+  }
+});
+
+test("fresh Radar child launch refuses a malformed parent subject ID", async () => {
+  setLeadEnvironment();
+  process.env.PI_RADAR_MANAGED_SUBJECT_ID = "not-a-canonical-uuid";
+  const pi = fakePi({});
+  registerExtension!(pi.pi as never);
+  await startRadarSession(pi);
+  try {
+    const result = await agentTool(pi, "delegate").execute(
+      "delegate-malformed-parent-subject",
+      { definition: "agent", label: "malformed-parent-subject-child", task: "Do the task." },
+      undefined,
+      undefined,
+      fakeContext(pi.entries),
+    );
+    assert.equal(result.details.ok, false);
+    assert.match(JSON.stringify(result.details), /valid managed subject identity/);
+    assert.equal(radarDaemon.spawns.length, 0);
+  } finally {
+    pi.events.get("session_shutdown")?.[0]();
+    resetAgentMailbox(agentMailboxPath(WORKSPACE, "malformed-parent-subject-child"));
+  }
+});
+
 test("combined status reports a completed agent as pending, not active", async () => {
   setAgentEnvironment("status-pending-parent", ["child"]);
   process.env.PI_HERDSMAN_AGENT_DEFINITION = "parent";

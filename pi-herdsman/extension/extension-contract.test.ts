@@ -3031,7 +3031,11 @@ test("an assignment snapshot adds waiting evidence without redefining activity",
       }),
       "waiting",
     ),
-    { activity: "waiting", waiting_reason: "questionnaire" },
+    {
+      activity: "waiting",
+      waiting_reason: "questionnaire",
+      awaited: ["task-1"],
+    },
   );
   assert.deepEqual(
     assignmentSnapshot(
@@ -3046,7 +3050,20 @@ test("an assignment snapshot adds waiting evidence without redefining activity",
       }),
       "waiting",
     ),
-    { activity: "waiting", waiting_reason: "background-work" },
+    {
+      activity: "waiting",
+      waiting_reason: "background-work",
+      awaited: ["task-1"],
+    },
+  );
+  // The request in flight and what it waits on are the interim bridge fields;
+  // assignment text and questions are never part of this snapshot.
+  assert.deepEqual(
+    assignmentSnapshot(
+      state({ activeRequestId: "req-2", backgroundWaiting: undefined }),
+      "working",
+    ),
+    { activity: "working", request: "req-2" },
   );
 
   // A result waiting to be read is an outcome, not a reason for activity to say

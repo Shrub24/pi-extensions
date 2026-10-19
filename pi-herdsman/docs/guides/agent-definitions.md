@@ -53,6 +53,28 @@ agent directory's `agents/` subdirectory.
 A project or global definition whose `name` matches a lower-precedence
 definition overlays it. An unmatched definition is standalone.
 
+### Child extension selection
+
+The optional user-wide `commonChildExtensions` list in
+[`pi-herdsman/config.json`](../reference/configuration.md) is the managed-child
+base. When set, Pi starts children with extension discovery disabled. A
+definition's `extensions` adds explicit Pi `--extension` specifiers, and
+`excludeExtensions` removes exact specifiers from the common-plus-added set:
+
+```yaml
+extensions:
+  - npm:example-tool
+excludeExtensions:
+  - /path/to/common-debug-extension.ts
+```
+
+The Herdsman extension is injected separately. Include a provider extension in
+the selected set when the child's model depends on it. `excludeExtensions`
+requires either the common set or `noExtensions: true`; without an explicit set,
+Pi's discovered extensions cannot be selectively removed. If
+`commonChildExtensions` is absent, current discovery and `noExtensions` behavior
+is preserved.
+
 ### Permission-aware extensions
 
 Agent definitions may include a `permission:` mapping for compatible

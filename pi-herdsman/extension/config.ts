@@ -28,6 +28,8 @@ export const DEFAULT_WORKER_CONTEXT_BUDGET_TOKENS = 200_000;
 export const MIN_WORKER_CONTEXT_BUDGET_TOKENS = 16_384;
 export const MAX_WORKER_CONTEXT_BUDGET_TOKENS = 1_000_000;
 export const MAX_DISABLED_DEFINITIONS = 64;
+export const MAX_CHILD_EXTENSIONS = 64;
+export const MAX_EXTENSION_SPEC_LENGTH = 4096;
 export const MAX_MODEL_PATTERNS = 64;
 export const MAX_MODEL_PATTERN_LENGTH = 128;
 
@@ -55,6 +57,8 @@ export type HerdsmanConfig = {
   inlineAttachmentLimitBytes: number;
   mailboxPayloadLimitBytes: number;
   disabledDefinitions: string[];
+  /** When set, managed children load only this common set plus definition additions. */
+  commonChildExtensions?: string[];
   modelScopes: ModelScopes;
 };
 
@@ -95,6 +99,23 @@ export function validDisabledDefinitions(value: unknown): value is string[] {
   for (const entry of value) {
     if (typeof entry !== "string" || entry.trim().length === 0) return false;
     if (seen.has(entry)) return false;
+    seen.add(entry);
+  }
+  return true;
+}
+
+export function validCommonChildExtensions(value: unknown): value is string[] {
+  if (!Array.isArray(value) || value.length > MAX_CHILD_EXTENSIONS)
+    return false;
+  const seen = new Set<string>();
+  for (const entry of value) {
+    if (
+      typeof entry !== "string" ||
+      entry.trim().length === 0 ||
+      entry.length > MAX_EXTENSION_SPEC_LENGTH ||
+      seen.has(entry)
+    )
+      return false;
     seen.add(entry);
   }
   return true;
@@ -185,6 +206,7 @@ const CONFIG_KEYS = new Set<ConfigKey>([
   "inlineAttachmentLimitBytes",
   "mailboxPayloadLimitBytes",
   "disabledDefinitions",
+  "commonChildExtensions",
   "modelScopes",
 ]);
 
@@ -245,6 +267,13 @@ function parseRawConfig(content: string): Partial<HerdsmanConfig> {
     if (!validDisabledDefinitions(record.disabledDefinitions))
       throw new Error("Invalid Pi Herdsman config field disabledDefinitions");
     result.disabledDefinitions = [...record.disabledDefinitions];
+  }
+  if ("commonChildExtensions" in record) {
+    if (!validCommonChildExtensions(record.commonChildExtensions))
+      throw new Error(
+        "Invalid Pi Herdsman config field commonChildExtensions",
+      );
+    result.commonChildExtensions = [...record.commonChildExtensions];
   }
   for (const key of [
     "inlineAttachmentLimitBytes",

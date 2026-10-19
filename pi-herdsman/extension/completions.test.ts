@@ -93,3 +93,11 @@ test("preparation cancellation remains unresolved and a later durable reply can 
   writePreparationResult(owner, id, { status: "success" });
   assert.deepEqual(await waitForPreparation(owner, id), { status: "success" });
 });
+
+test("preparation wait times out promptly but leaves the same ID recoverable", async () => {
+  const owner = randomUUID();
+  const id = randomUUID();
+  await assert.rejects(waitForPreparation(owner, id, undefined, 5), /worker kept live/);
+  writePreparationResult(owner, id, { status: "success" });
+  assert.deepEqual(await waitForPreparation(owner, id), { status: "success" });
+});

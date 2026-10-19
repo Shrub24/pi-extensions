@@ -198,6 +198,34 @@ export function normalizeResponseContract(value: unknown): ResponseContract {
   return contract;
 }
 
+/** Sections every sealed completion handoff must contain. */
+export const HANDOFF_REQUIRED_SECTIONS = [
+  "Outcome",
+  "Changes and findings",
+  "Evidence",
+  "Decisions",
+  "Caveats",
+  "Remaining work",
+  "Relevant artifacts",
+] as const;
+
+/**
+ * The response a Radar-delegated worker must give: a validated handoff file at a
+ * per-request path inside its workspace. The framework seals that file; the chat
+ * reply is only an acknowledgement and is never used as the report.
+ */
+export function handoffResponseContract(requestId: string): ResponseContract {
+  return normalizeResponseContract({
+    schema: "response-contract/v1",
+    target: "artifact",
+    format: "markdown",
+    requiredSections: [...HANDOFF_REQUIRED_SECTIONS],
+    path: `.pi-herdsman/handoffs/${requestId}.md`,
+    allowExistingArtifact: false,
+    metadataSchema: "handoff/v1",
+  });
+}
+
 /**
  * Resolve a response contract: the role default is validated even when an
  * override is supplied (an override must not conceal a malformed default),

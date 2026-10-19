@@ -16,6 +16,7 @@ import {
   type RadarSnapshot,
   type RadarSpawnExitObservation,
 } from "pi-radar/client";
+import { createRadarHandoffPort, type RadarHandoffPort } from "pi-radar/communication";
 import {
   radarLocalPane,
   radarPaneHandle,
@@ -107,11 +108,16 @@ import {
 } from "./storage.ts";
 import { Type } from "typebox";
 import {
-  handoffPath, listCompletions, persistCompletion, readCompletion,
+  handoffPath, listCompletions, persistCompletion, persistSealedCompletion, readCompletion,
   readPreparationResult, saveCompletion, sessionManuallyRetired,
   waitForPreparation, wrapupContext, writePreparationResult,
   type Completion, type Disposition,
 } from "./completions.ts";
+import {
+  persistAndAcknowledgeCompletion,
+  publishCompletionHandoff,
+  sealedCompletionFor,
+} from "./radar-handoff.ts";
 import {
   Container,
   fuzzyFilter,
@@ -203,6 +209,7 @@ import {
   expandAgentBodyFiles,
   projectAgentDefinition,
   resolveAgentLaunchInputs,
+  resolveChildExtensions,
   modelPolicyError,
   resolveChildModel,
   updateAgentOverride,
@@ -236,6 +243,7 @@ import {
   type AcceptedContextSnapshot,
   type ResponseDiagnostic,
 } from "./response-validation.ts";
+import { handoffResponseContract } from "./response-contracts.ts";
 import { CHILD_COMMAND_ENV, resolveChildCommand } from "./child-command.ts";
 import { sameCwd } from "./cwd.ts";
 import { inspectRadarChild, provedRead } from "pi-radar/inspection";
@@ -1027,6 +1035,7 @@ const askDeliveryRetries = new Map<string, ReturnType<typeof setTimeout>>();
 let radarPublication: RadarPublication | undefined;
 let radarExecution: ReturnType<typeof createRadarExecutionAdapter> | undefined;
 let radarClient: RadarClient | undefined;
+let radarCommunication: RadarHandoffPort | undefined;
 /**
  * This process's own location, resolved on demand.
  *
@@ -1137,6 +1146,7 @@ async function initializeRadarPublication(pi: ExtensionAPI): Promise<void> {
     },
   );
   radarPublication = radarExecution.publication;
+  radarCommunication = createRadarHandoffPort(client, radarExecution.publication);
 }
 
 /**
@@ -1150,7 +1160,7 @@ async function initializeRadarPublication(pi: ExtensionAPI): Promise<void> {
  * its own environment.
  */
 async function radarSpawnParent(paneId: string): Promise<
-  | { ok: true; parent: { agent_id: string; location: RadarLocation } }
+  | { ok: true; parent: { registration_id: string; subject_id: string; location: RadarLocation } }
   | { ok: false; message: string }
 > {
   const subject = await radarPublication?.subject();
@@ -1159,6 +1169,13 @@ async function radarSpawnParent(paneId: string): Promise<
       ok: false,
       message:
         "This process has no Radar registration, so a fresh worker cannot be spawned under it",
+    };
+  const subjectId = subject.subject_id;
+  if (!isUuid(subjectId))
+    return {
+      ok: false,
+      message:
+        "This process's Radar registration has no valid managed subject identity, so a fresh worker cannot be spawned under it",
     };
   const location = subject.location;
   if (location?.pane === undefined || location.pane === "")
@@ -1172,7 +1189,10 @@ async function radarSpawnParent(paneId: string): Promise<
       ok: false,
       message: `This process's Radar registration places it in pane ${location.pane}, not in the pane this launch would split`,
     };
-  return { ok: true, parent: { agent_id: subject.agent_id, location } };
+  return {
+    ok: true,
+    parent: { registration_id: subject.registration_id, subject_id: subjectId, location },
+  };
 }
 
 /**
@@ -1330,7 +1350,7 @@ function retireRadarSubject(
   state: Pick<ManagedAgentState, "runId" | "ownerSessionId" | "agentLabel">,
 ): void {
   const binding = radarChildBinding(state);
-  if (binding) radarPublication?.retireAssignment(binding.agent_id);
+  if (binding) radarPublication?.retireAssignment(binding.registration_id);
 }
 
 /**
@@ -1802,7 +1822,7 @@ async function radarLeadIdentity(): Promise<
   if (subject === undefined || subject.location?.pane !== location.pane)
     return undefined;
   return {
-    agentId: subject.agent_id,
+    agentId: subject.registration_id,
     location: { ...location, tab: location.tab, workspace: location.workspace, pane: location.pane },
   };
 }
@@ -2696,7 +2716,7 @@ function validateRadarChild(runtime: Runtime, operation: string): void {
     ownerSessionId: runtime.ownerSessionId,
     agentLabel: runtime.label,
   });
-  if (binding?.agent_id !== bound)
+  if (binding?.registration_id !== bound)
     fail(
       "target_not_found",
       `Agent ${runtime.label} no longer names the child this launch bound`,
@@ -3773,6 +3793,8 @@ function prepareManagedWorkerLaunch(
     // The operator's model policy, then the one contradiction the policy
     // exists to surface: a pinned model whose provider only an extension
     // supplies, in a child the definition denies extensions to.
+    const config = readConfig();
+    const commonChildExtensions = config.commonChildExtensions;
     if (childModel.kind === "use") {
       const pinnedValue = configuredModel(definition.frontmatter);
       const pinned =
@@ -3780,7 +3802,11 @@ function prepareManagedWorkerLaunch(
           ? pinnedValue
           : undefined;
       const origin = pinned === undefined ? "inherited" : "pinned";
-      const scopes = readConfig().modelScopes;
+      const scopes = config.modelScopes;
+      const extensionSelection = resolveChildExtensions(
+        definition,
+        commonChildExtensions,
+      );
       const agentAllow = scopes.agents?.[definition.name]?.allow;
       const violation = modelPolicyError({
         agent: definition.name,
@@ -3790,12 +3816,18 @@ function prepareManagedWorkerLaunch(
         ...(agentAllow === undefined ? {} : { agentAllow }),
       });
       if (violation !== undefined) throw new Error(violation);
-      if (origin === "pinned") {
+      const explicitSelectionBlocksProviderDiscovery =
+        extensionSelection.noExtensions &&
+        (commonChildExtensions !== undefined ||
+          (definition.frontmatter.excludeExtensions?.length ?? 0) > 0) &&
+        childModel.extensionDiscovery;
+      if (origin === "pinned" || explicitSelectionBlocksProviderDiscovery) {
         const denied = deniedDiscoveryModelError({
           agent: definition.name,
           model: childModel.model,
-          noExtensions: definition.frontmatter.noExtensions === true,
-          extensions: definition.frontmatter.extensions,
+          modelOrigin: origin,
+          noExtensions: extensionSelection.noExtensions,
+          extensions: extensionSelection.extensions,
           isForeignProvider: (providerId) =>
             registeredProviderIds.has(providerId),
         });
@@ -3813,6 +3845,7 @@ function prepareManagedWorkerLaunch(
       approveProject: inputs.projectTrusted && sameCwd(inputs.cwd, ctx.cwd),
       ...(!inputs.resumed ? { inheritedThinking: pi.getThinkingLevel() } : {}),
       modelDecision: childModel,
+      commonChildExtensions,
       resolvedSkills: skillResolution.advertised,
     });
     // A fresh managed session is stored in its target cwd's child directory, so
@@ -3832,6 +3865,7 @@ function prepareManagedWorkerLaunch(
       resolveAgentLaunchInputs(inputs.fingerprintDefinition, {
         cwd: inputs.cwd,
         launchCommand: childCommandIdentity(),
+        commonChildExtensions,
       }),
     );
     return {
@@ -3897,6 +3931,7 @@ function recordedLaunchMatches(
       resolveAgentLaunchInputs(currentDefinition, {
         cwd: record.listed.cwd ?? state.cwd,
         launchCommand: childCommandIdentity(),
+        commonChildExtensions: readConfig().commonChildExtensions,
       }),
     );
     return fingerprint !== undefined && fingerprint === current;
@@ -4078,7 +4113,7 @@ function radarChildProvenance(
 ): {
   request_id: string;
   pane_id: string | undefined;
-  agent_id: string | undefined;
+  registration_id: string | undefined;
   session_id: string | undefined;
 } {
   const binding = radarChildBinding({
@@ -4104,9 +4139,9 @@ function radarChildProvenance(
         : spawn.paneId,
     // The child's own binding is the subject; a launch that recorded another one
     // makes the two witnesses disagree, and neither is then evidence.
-    agent_id:
-      recorded === undefined || binding?.agent_id === recorded
-        ? binding?.agent_id
+    registration_id:
+      recorded === undefined || binding?.registration_id === recorded
+        ? binding?.registration_id
         : undefined,
     // The session the mailbox records for this run: the child's own claim, which
     // the daemon's published context must match before the child is live.
@@ -4706,6 +4741,44 @@ function resolveMessageFiles(
     (file) => resolveResultReference(file, branch, operation) ?? file,
   );
 }
+async function recoverRadarCompletions(ctx: ExtensionContext, onlyId?: string): Promise<void> {
+  const port = radarCommunication;
+  if (!port) return;
+  const inbox = await port.inbox();
+  if (inbox.ok === false) throw new Error(`${inbox.code}: ${inbox.message}`);
+  const owner = ctx.sessionManager.getSessionId();
+  const spawns = [...radarSpawnFromEntries(ctx.sessionManager.getEntries()).values()];
+  for (const id of inbox.value.handoff_ids) {
+    if (onlyId !== undefined && id !== onlyId) continue;
+    const response = await port.get(id);
+    if (response.ok === false) throw new Error(`${response.code}: ${response.message}`);
+    const handoff = response.value.handoff;
+    const spawn = spawns.find((entry) => entry.stage === "bound" &&
+      entry.ownerSessionId === owner && entry.runId === handoff.correlation_id &&
+      entry.agentId === handoff.sender.registration_id);
+    if (!spawn || !spawn.agentId) continue;
+    if (handoff.id !== id)
+      throw new Error("Radar inbox returned a different completion ID");
+    // Local completion/handoff files are a cache of the broker record. Persist
+    // them before receipt acknowledgement so an ack can never lose the payload.
+    await persistAndAcknowledgeCompletion(port, handoff, {
+      runId: spawn.runId, agentId: spawn.agentId,
+    }, (report) => {
+      // The worker's identity comes from its mailbox; the report bytes come from Radar.
+      const mailbox = agentMailboxPath(spawn.workspaceId, spawn.label);
+      const state = readAgentState(mailbox);
+      if (!state || state.runId !== spawn.runId || state.ownerSessionId !== owner)
+        throw new Error("Worker identity is unavailable; the completion stays unacknowledged");
+      persistSealedCompletion({
+        requestId: report.requestId, ownerSessionId: owner, runId: state.runId,
+        workspaceId: state.workspaceId, agentLabel: state.agentLabel, paneId: state.paneId,
+        cwd: state.cwd, definition: stateAgentDefinition(state),
+        piSessionId: state.piSessionId, piSessionFile: state.piSessionFile,
+      }, report, Date.now());
+    });
+  }
+}
+
 async function deliverResultUnsafe(
   pi: ExtensionAPI, runtime: Runtime, ctx: ExtensionContext,
   result: ResultRecord, signal?: AbortSignal,
@@ -4715,11 +4788,24 @@ async function deliverResultUnsafe(
       result.workspaceId !== runtime.workspaceId || result.agentLabel !== runtime.label ||
       result.paneId !== runtime.paneId ||
       result.requestId !== (runtime.activeRequestId ?? runtime.completedRequestId)) return;
-  const completion = persistCompletion(result, {
-    cwd: runtime.cwd, definition: runtime.agentDefinition,
-    piSessionId: runtime.piSessionId, piSessionFile: runtime.piSessionFile,
-  });
   const entries = ctx.sessionManager.getEntries();
+  const spawn = radarSpawnFromEntries(entries).get(`${runtime.mailboxPath}\0${result.runId}`);
+  let completion: Completion | undefined;
+  if (spawn?.stage === "bound" && spawn.agentId) {
+    try {
+      await recoverRadarCompletions(ctx, result.requestId);
+    } catch (error) {
+      appendDurableError(pi, ctx, "pi_herdsman_handoff_recovery_error", error);
+      return;
+    }
+    completion = readCompletion(result.ownerSessionId, result.requestId);
+    if (!completion) return;
+  } else {
+    completion = persistCompletion(result, {
+      cwd: runtime.cwd, definition: runtime.agentDefinition,
+      piSessionId: runtime.piSessionId, piSessionFile: runtime.piSessionFile,
+    });
+  }
   const evidenceKey = resultDeliveryEvidenceKey(runtime, result.requestId);
   if (!hasDeliveredResult(entries, resultDeliveryExpectation(runtime, result.requestId)) &&
       !resultDeliveryEvidence.has(evidenceKey)) {
@@ -4805,10 +4891,9 @@ async function finalizeDeliveredRoot(
         current.completedRequestId !== requestId || newerMailboxWorkExists(mailbox, current, requestId))
       throw new Error("Managed agent changed before result cleanup");
     const result = readResult(mailbox, requestId);
-    if (result) persistCompletion(result, {
-      cwd: current.cwd, definition: stateAgentDefinition(current),
-      piSessionId: current.piSessionId, piSessionFile: current.piSessionFile,
-    });
+    // The retrieved Radar report is the completion; cleanup may only follow its durable record.
+    if (result && !readCompletion(current.ownerSessionId, requestId))
+      throw new Error("Completion is not durable before result cleanup");
     removeResult(mailbox, requestId);
     if (current.legacyAcceptedRequestIds?.includes(requestId)) {
       writeAgentState(mailbox, { ...current,
@@ -6067,7 +6152,7 @@ async function closeRadarChild(
       const launched = radarSpawnFromEntries(ctx.sessionManager.getEntries()).get(
         `${mailbox}\0${current.runId}`,
       );
-      const agentId = evidence?.agent_id ?? launched?.agentId;
+      const agentId = evidence?.registration_id ?? launched?.agentId;
       const refusal =
         agentId === undefined || radarClient === undefined
           ? "the registered child is not known to this process"
@@ -6106,16 +6191,18 @@ async function closeRadarChild(
     if (current.piSessionId && current.piSessionFile) {
       const requestId = current.activeRequestId ?? current.completedRequestId;
       if (requestId) {
-        const completion = readCompletion(current.ownerSessionId, requestId) ?? persistCompletion({
+        const completion = readCompletion(current.ownerSessionId, requestId) ?? persistSealedCompletion({
+          requestId, ownerSessionId: current.ownerSessionId, runId: current.runId,
+          workspaceId: current.workspaceId, agentLabel: current.agentLabel, paneId: current.paneId,
+          cwd: current.cwd, definition: stateAgentDefinition(current),
+          piSessionId: current.piSessionId, piSessionFile: current.piSessionFile,
+        }, sealedCompletionFor({
           version: 5, runId: current.runId, requestId,
           ownerSessionId: current.ownerSessionId, workspaceId: current.workspaceId,
           agentLabel: current.agentLabel, paneId: current.paneId,
           status: "failed", completedAt: Date.now(),
           error: { code: "empty_result", message: "Worker closed before producing a completion. Its interrupted session remains resumable." },
-        }, {
-          cwd: current.cwd, definition: stateAgentDefinition(current),
-          piSessionId: current.piSessionId, piSessionFile: current.piSessionFile,
-        });
+        }), Date.now());
         completion.closed = true;
         if (current.activeRequestId) completion.wrapup = { status: "skipped", reason: "interrupted-assignment" };
         saveCompletion(completion);
@@ -6682,7 +6769,7 @@ async function launchRadarChild(
       // edge's bound id is this launch's child.
       observedChildAgent: () =>
         radarChildBinding({ runId, ownerSessionId: owner, agentLabel: label })
-          ?.agent_id,
+          ?.registration_id,
       // The daemon's binding is written before readiness is awaited, so a
       // reload in the pre-ready window reads the exact subject and pane this
       // launch created rather than inferring a location from the child's
@@ -6692,7 +6779,7 @@ async function launchRadarChild(
         const record: RadarSpawnEntry = {
           ...requested,
           stage: "bound",
-          agentId: bound.agent_id,
+          agentId: bound.registration_id,
           paneId: bound.pane_id,
         };
         pi.appendEntry(RADAR_SPAWN_ENTRY, record);
@@ -6841,7 +6928,10 @@ async function restartIdleManagedWorker(
       workspaceId: state.workspaceId,
       briefProfile:
         state.briefProfile ??
-        resolveAgentLaunchInputs(targetDefinition, { cwd }).briefProfile,
+        resolveAgentLaunchInputs(targetDefinition, {
+              cwd,
+              commonChildExtensions: readConfig().commonChildExtensions,
+            }).briefProfile,
       allowedAgentDefinitions: agentDefinitionDelegationEnabled(
         targetDefinition,
       )
@@ -7833,17 +7923,22 @@ function askRecordBytesFor(
 
 async function completeAgent(
   pi: ExtensionAPI, ctx: ExtensionContext, id: string,
-  disposition: Disposition, signal?: AbortSignal,
+  disposition: Disposition, signal?: AbortSignal, retrieve = false,
 ): Promise<Record<string, unknown>> {
   if (!isUuid(id) || !["keep", "park", "retire"].includes(disposition))
     fail("invalid_request", "complete requires an exact completion_id and keep, park or retire disposition", "complete");
   const owner = ctx.sessionManager.getSessionId();
+  await recoverRadarCompletions(ctx, id);
   const completion = readCompletion(owner, id);
   if (!completion) fail("target_not_found", "No owned completion matched", "complete");
+  // The sealed report is returned on first consumption and on explicit retrieval;
+  // repeated calls stay short so the lead does not re-ingest a large report.
+  const includeHandoff = retrieve || completion.providedAt === undefined;
   const response = (extra: Record<string, unknown> = {}) => ({
     ok: true, action: "complete", completion_id: id, agent: completion.agentLabel,
     status: completion.status, summary: completion.summary,
-    handoff_path: handoffPath(completion), disposition: completion.disposition ?? null,
+    handoff: includeHandoff ? readFileSync(handoffPath(completion), "utf8") : null,
+    disposition: completion.disposition ?? null,
     session: completion.piSessionId, wrapup: completion.wrapup,
     closed: completion.closed === true, ...extra,
   });
@@ -7879,6 +7974,11 @@ async function completeAgent(
           saveCompletion(completion);
           return response();
         }
+        if (disposition === "park" && completion.wrapup?.status === "failed") {
+          completion.wrapup = undefined;
+          completion.preparationId = undefined;
+          saveCompletion(completion);
+        }
         if (disposition === "park" && !completion.wrapup) {
           const queued = readUnacknowledgedRequest(mailbox, state);
           if (queued && queued.requestId !== completion.preparationId)
@@ -7896,7 +7996,7 @@ async function completeAgent(
               agentLabel: state.agentLabel, paneId: state.paneId,
               kind: "wrapup", text: id, createdAt: Date.now(),
               address: {
-                subject: observation.evidence.agent_id,
+                subject: observation.evidence.registration_id,
                 source: observation.evidence.source, incarnation: observation.evidence.incarnation,
                 generation: radarSpawnFromEntries(ctx.sessionManager.getEntries()).get(`${mailbox}\0${state.runId}`)!.generation,
               },
@@ -7910,6 +8010,8 @@ async function completeAgent(
           }
           completion.wrapup = outcome;
           saveCompletion(completion);
+          if (outcome.status === "failed")
+            throw new Error(`Wrapup failed (${outcome.reason ?? "unspecified"}); worker kept live, retry completion`);
         }
         state = readAgentState(mailbox);
         if (!state || state.runId !== completion.runId || state.activeRequestId || state.completedRequestId !== id)
@@ -7947,7 +8049,7 @@ async function actionUnsafe(
       fail("invalid_request", "continue requires session", p.action);
   }
   if (p.action === "complete")
-    return completeAgent(pi, ctx, p.completion_id, p.disposition ?? "park", signal);
+    return completeAgent(pi, ctx, p.completion_id, p.disposition ?? "park", signal, p.retrieve === true);
   if (p.action === "close")
     return closeAgentByIdentity(pi, ctx, p.agent, { signal, scope });
   if (p.action === "transcript") {
@@ -8068,12 +8170,18 @@ async function actionUnsafe(
       bytes: file.bytes,
       sha256: createHash("sha256").update(file.text, "utf8").digest("hex"),
     }));
+    if (brief.response !== "role-defaults")
+      fail(
+        "invalid_request",
+        "Delegated workers always answer with a sealed handoff; a response-contract override is not allowed",
+        operation,
+      );
     let provisional: AcceptedAssignmentContract;
     try {
       provisional = createAcceptedAssignmentContract(
         requestId,
         brief,
-        roleInputs.responseContract,
+        handoffResponseContract(requestId),
         workCwd,
         MAX_RESPONSE_ARTIFACT_BYTES,
         descriptors,
@@ -8140,6 +8248,7 @@ async function actionUnsafe(
     const acceptedTaskText = p.task;
     const roleLaunchInputs = resolveAgentLaunchInputs(definition, {
       cwd: agentCwd,
+      commonChildExtensions: readConfig().commonChildExtensions,
     });
     let brief: DelegationBrief;
     try {
@@ -8636,7 +8745,7 @@ async function actionUnsafe(
           piSessionId: state.piSessionId,
           piSessionFile: state.piSessionFile,
           agentDefinition,
-          radarAgentId: launch.agent_id,
+          radarAgentId: launch.registration_id,
           radarLaunchGeneration: spawn.generation,
           // The process the daemon bound this edge to, from the same answer that
           // named the child: the first task is addressed to it exactly as a
@@ -9062,7 +9171,10 @@ async function actionUnsafe(
     try {
       roleLaunchInputs = resolveAgentLaunchInputs(
         discoverAgent(runtime.agentDefinition, { projectRoot: ctx.cwd }),
-        { cwd: runtime.cwd },
+        {
+          cwd: runtime.cwd,
+          commonChildExtensions: readConfig().commonChildExtensions,
+        },
       );
     } catch (error) {
       fail(
@@ -9211,7 +9323,7 @@ export default function (pi: ExtensionAPI): void {
       )
         continue;
       radarPublication
-        .assignment(binding.agent_id, owner)
+        .assignment(binding.registration_id, owner)
         .update(assignmentSnapshot(state, projection));
     }
   };
@@ -9384,6 +9496,7 @@ export default function (pi: ExtensionAPI): void {
   const agentCompleteParameters = Type.Object({
     completion_id: Type.String({ pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" }),
     disposition: Type.Optional(StringEnum(["keep", "park", "retire"])),
+  retrieve: Type.Optional(Type.Boolean({ description: "Return the full sealed handoff again on a repeat call." })),
   }, { additionalProperties: false });
   const agentDelegateParameters = Type.Object(
     {
@@ -11912,7 +12025,7 @@ export default function (pi: ExtensionAPI): void {
         hint: "reopen Running.",
         agentId:
           child?.presence.kind === "radar"
-            ? child.presence.evidence.agent_id
+            ? child.presence.evidence.registration_id
             : undefined,
         paneId: target.paneId,
         session: target.sessionId,
@@ -14443,6 +14556,7 @@ export default function (pi: ExtensionAPI): void {
       const generation = ++healthGeneration;
       let healthInFlight = false;
       let healthRescanRequested = false;
+      let handoffRecoveryError: string | undefined;
       const requestHealthScan = (): void => {
         healthRescanRequested = true;
         if (healthInFlight || signal.aborted) return;
@@ -14450,6 +14564,15 @@ export default function (pi: ExtensionAPI): void {
         void (async () => {
           while (healthRescanRequested && !signal.aborted) {
             healthRescanRequested = false;
+            try {
+              await recoverRadarCompletions(ctx);
+              handoffRecoveryError = undefined;
+            } catch (error) {
+              const message = errorMessage(error);
+              if (message !== handoffRecoveryError)
+                ctx.ui.notify(`Radar completion recovery delayed: ${message}`, "warning");
+              handoffRecoveryError = message;
+            }
             await scanAgentHealth(ctx, signal, generation);
           }
         })()
@@ -15114,7 +15237,7 @@ export default function (pi: ExtensionAPI): void {
       ...agentTool,
       name: "agent_complete",
       label: "agent complete",
-      description: "Retrieve an exact owned completion's handoff file and apply its disposition. Defaults to park (wrapup, close, keep session resumable); keep leaves the worker live, retire explicitly ends resumability. Repeating a disposition returns the recorded outcome without repeating effects. An old completion cannot act on newer work.",
+      description: "Return an exact owned completion's sealed handoff and apply its disposition. Defaults to park (wrapup, close, keep session resumable); keep leaves the worker live, retire explicitly ends resumability. Repeating a disposition returns the recorded outcome without repeating effects. An old completion cannot act on newer work.",
       parameters: agentCompleteParameters,
       promptSnippet: "Retrieve a worker handoff and park, keep or retire its generation",
       promptGuidelines: undefined,
@@ -15515,10 +15638,10 @@ export default function (pi: ExtensionAPI): void {
     const generation = RADAR_LAUNCH_GENERATION;
     if (generation === undefined || state === undefined) return undefined;
     const binding = radarChildBinding(state);
-    if (binding === undefined || !isUuid(binding.agent_id)) return undefined;
+    if (binding === undefined || !isUuid(binding.registration_id)) return undefined;
     const registration = radarLocalRegistration();
     return {
-      subject: binding.agent_id,
+      subject: binding.registration_id,
       source: registration.source,
       incarnation: registration.incarnation,
       generation,
@@ -15623,8 +15746,13 @@ export default function (pi: ExtensionAPI): void {
         acknowledgementErrorReported = false;
         return;
       }
-      pi.sendUserMessage(controlMarker(request.requestId, request.version), {
+      void Promise.resolve(pi.sendUserMessage(controlMarker(request.requestId, request.version), {
         deliverAs: "steer",
+      })).catch((error) => {
+        if (!requestPumpErrorReported) {
+          requestPumpErrorReported = true;
+          appendDurableError(pi, ctx, "pi_herdsman_state_error", error);
+        }
       });
     } catch (error) {
       if (!requestPumpErrorReported) {
@@ -16119,13 +16247,17 @@ export default function (pi: ExtensionAPI): void {
       preparationInFlight = id;
       void (async () => {
         try {
-          const outcome = await wrapupContext(pi.events, ctx.sessionManager.getSessionId());
-          if (!acknowledge(id, true)) throw new Error("Could not acknowledge context preparation");
+          let outcome: WrapupOutcome;
+          try {
+            outcome = await wrapupContext(pi.events, ctx.sessionManager.getSessionId());
+          } catch (error) {
+            outcome = { status: "failed", reason: errorMessage(error).slice(0, 240) };
+          }
           writePreparationResult(state!.ownerSessionId, id, outcome);
+          if (!acknowledge(id, true)) throw new Error("Could not acknowledge context preparation");
           removeRequest(process.env.PI_HERDSMAN_MAILBOX!, id);
         } catch (error) {
-          // No terminal reply: the historian may still be running. Keep the request
-          // unresolved rather than authorizing a close on timeout.
+          // A missing durable outcome remains unresolved; the owner must not close on it.
           appendDurableError(pi, ctx, "pi_herdsman_state_error", error);
         } finally { preparationInFlight = undefined; }
       })();
@@ -16263,19 +16395,21 @@ export default function (pi: ExtensionAPI): void {
       );
       return { action: "handled" };
     }
-    // A retained worker's previous assignment is delivered once its result file
-    // is gone: the controller removes it only after delivery, so that absence is
-    // a durable, child-readable fact that makes the next task admissible.
+    // A delivered preview is not a lifecycle decision. Only an explicit
+    // `agent_complete keep` makes this completed generation eligible again.
     const deliveredRequestId = state.completedRequestId;
-    const deliveredAssignment =
-      deliveredRequestId !== undefined &&
-      !pendingResultExists(
-        process.env.PI_HERDSMAN_MAILBOX!,
-        deliveredRequestId,
-      );
+    let completionKept = false;
+    if (deliveredRequestId !== undefined) {
+      try {
+        completionKept =
+          readCompletion(state.ownerSessionId, deliveredRequestId)?.disposition === "keep";
+      } catch (error) {
+        appendDurableError(pi, ctx, "pi_herdsman_state_error", error);
+      }
+    }
     if (
       request.kind === "task" &&
-      ((state.completedRequestId !== undefined && !deliveredAssignment) ||
+      ((state.completedRequestId !== undefined && !completionKept) ||
         !taskAcceptanceAllowed(
           ctx.isIdle(),
           state.activeRequestId,
@@ -16288,9 +16422,9 @@ export default function (pi: ExtensionAPI): void {
         ctx,
         "busy",
         state.completedRequestId
-          ? deliveredAssignment
-            ? "Agent assignment is still settling"
-            : "Agent assignment is already complete"
+          ? completionKept
+            ? "Agent assignment is already complete"
+            : "Retrieve and disposition the prior completion with agent_complete before new work"
           : "Agent already has an active assignment",
       );
       return { action: "handled" };
@@ -16978,6 +17112,7 @@ export default function (pi: ExtensionAPI): void {
     let resultText: string | undefined;
     let resultError: ResultRecord["error"];
     let responseValidation: ResultRecord["responseValidation"];
+    let sealedHandoff: ResultRecord["handoff"];
     const accepted = state.acceptedAssignment;
     if (accepted) {
       try {
@@ -16992,9 +17127,14 @@ export default function (pi: ExtensionAPI): void {
         if (validated.contractHash !== accepted.responseContractHash)
           throw new Error("Validated response contract identity changed");
         resultStatus = "completed";
-        resultText = latest.trim()
-          ? latest
-          : `Artifact validated: ${validated.artifacts[0]!.path}`;
+        if (validated.handoff) {
+          // The sealed artifact is the report; the chat reply is only an acknowledgement.
+          sealedHandoff = { ...validated.handoff, published: false };
+        } else {
+          resultText = latest.trim()
+            ? latest
+            : `Artifact validated: ${validated.artifacts[0]!.path}`;
+        }
         responseValidation = {
           contractHash: validated.contractHash,
           briefHash: accepted.briefHash,
@@ -17059,7 +17199,7 @@ export default function (pi: ExtensionAPI): void {
           ),
       };
     const result: ResultRecord = {
-      version: 5,
+      version: sealedHandoff ? 6 : 5,
       runId: state.runId,
       requestId: state.activeRequestId,
       ownerSessionId: state.ownerSessionId,
@@ -17068,6 +17208,7 @@ export default function (pi: ExtensionAPI): void {
       paneId: state.paneId,
       status: resultStatus,
       ...(resultText ? { text: resultText } : {}),
+      ...(sealedHandoff ? { handoff: sealedHandoff } : {}),
       ...(resultError ? { error: resultError } : {}),
       ...(responseValidation ? { responseValidation } : {}),
       contextUsage: boundedContextUsage(ctx.getContextUsage()),
@@ -17076,11 +17217,12 @@ export default function (pi: ExtensionAPI): void {
     pendingResult = result;
     resultWriteAttempts = 0;
     resultErrorReported = false;
-    const flush = (assignmentLockHeld = false) => {
+    const flush = async (assignmentLockHeld = false) => {
       let current = pendingResult;
       if (!current) return;
       const mailbox = process.env.PI_HERDSMAN_MAILBOX!;
       let release: (() => void) | undefined;
+      let handoffPublishing = false;
       try {
         if (!assignmentLockHeld) {
           release = tryClaimAssignmentLock(mailbox);
@@ -17236,18 +17378,32 @@ export default function (pi: ExtensionAPI): void {
         }
         resultWriteAttempts++;
         writeResult(mailbox, current);
-        persistCompletion(current, {
+        const source = {
           cwd: ctx.cwd, definition: stateAgentDefinition(state!),
           piSessionId: ctx.sessionManager.getSessionId(),
           piSessionFile: ctx.sessionManager.getSessionFile(),
-        });
+        };
+        if (RADAR_SPAWN_TOKEN !== undefined) {
+          handoffPublishing = true;
+          resultWriteAttempts = 0;
+          if (!radarCommunication || !process.env.PI_RADAR_MANAGED_PARENT_SUBJECT_ID)
+            throw new Error("Managed worker has no Radar handoff destination");
+          await publishCompletionHandoff(radarCommunication, current);
+        } else {
+          persistCompletion(current, source);
+        }
         pendingResult = undefined;
         if (retryTimer) clearInterval(retryTimer);
         retryTimer = undefined;
         finalizeStateTransition(ctx, true);
+        // If publication succeeded but the process died before durable state
+        // settlement, keep the staged result so restart recovery can finish it.
+        if (RADAR_SPAWN_TOKEN !== undefined && state?.activeRequestId === undefined &&
+            state?.completedRequestId === current.requestId)
+          removeResult(mailbox, current.requestId);
       } catch (error) {
         if (
-          current.status === "completed" &&
+          !handoffPublishing && current.status === "completed" &&
           String(error).toLowerCase().includes("too large")
         ) {
           pendingResult = {
@@ -17261,7 +17417,7 @@ export default function (pi: ExtensionAPI): void {
             },
           };
           resultWriteAttempts = 0;
-          flush(true);
+          await flush(true);
           return;
         }
         if (resultWriteAttempts >= RESULT_WRITE_MAX_ATTEMPTS) {
@@ -17325,8 +17481,8 @@ export default function (pi: ExtensionAPI): void {
         release?.();
       }
     };
-    flush();
-    if (pendingResult && !retryTimer) retryTimer = setInterval(flush, 250);
+    void flush();
+    if (pendingResult && !retryTimer) retryTimer = setInterval(() => void flush(), 250);
   };
   // A held assignment must not depend on the provider's wake arriving. This
   // bounded backstop re-queries the provider while the assignment is held, so a
