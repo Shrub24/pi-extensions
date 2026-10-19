@@ -20,8 +20,11 @@ export interface ProviderConfig {
   accounts: Record<string, Account>;
 }
 export interface Candidate { provider: string; id: string; thinkingLevel: ModelThinkingLevel; cacheTtlMs?: number; account?: string }
+export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
+export interface RouteStrategyConfig { module: string; options: Record<string, JsonValue> }
 export interface RouteConfig {
   candidates: Candidate[];
+  strategy?: RouteStrategyConfig;
   contextWindow: number;
   outputReserve: number;
   stayRetries: number;
@@ -58,6 +61,20 @@ function nonEmpty(label: string, value: unknown): string {
   if (typeof value !== "string" || !value.trim()) throw new Error(`${label} must be a non-empty string`);
   return value.trim();
 }
+function jsonObject(value: unknown, label: string): Record<string, JsonValue> {
+  const seen = new WeakSet<object>();
+  const visit = (item: unknown): item is JsonValue => {
+    if (item === null || typeof item === "string" || typeof item === "boolean") return true;
+    if (typeof item === "number") return Number.isFinite(item);
+    if (typeof item !== "object" || seen.has(item)) return false;
+    seen.add(item);
+    if (Array.isArray(item)) return item.every(visit);
+    if (Object.getPrototypeOf(item) !== Object.prototype && Object.getPrototypeOf(item) !== null) return false;
+    return Object.values(item as Record<string, unknown>).every(visit);
+  };
+  if (!visit(value)) throw new Error(`${label} must contain only JSON-compatible values`);
+  return JSON.parse(JSON.stringify(value)) as Record<string, JsonValue>;
+}
 /** Parses exactly one key source from `value`; `label` names the setting in errors. */
 function parseKeySource(label: string, value: Record<string, unknown>): KeySource {
   const hasEnv = value.apiKeyEnv !== undefined;
@@ -67,7 +84,7 @@ function parseKeySource(label: string, value: Record<string, unknown>): KeySourc
   if (hasEnv && (typeof value.apiKeyEnv !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(value.apiKeyEnv))) throw new Error(`Invalid ${label}: apiKeyEnv must be an environment variable name, not a key`);
   return hasFile ? { apiKeyFile: value.apiKeyFile as string } : { apiKeyEnv: value.apiKeyEnv as string };
 }
-/** Strict CodexBar quota mapping. Enforcement is opt-in until the source is verified as authoritative. */
+/** Strict CodexBar quota mapping. Enforcement is opt-in; only fresh authoritative exhaustion blocks a target. */
 function parseQuota(where: string, value: unknown): QuotaSource {
   const q = record(value);
   keys(q, ["source", "provider", "account", "enforce"]);
@@ -144,7 +161,7 @@ export function parseConfig(raw: unknown): Config {
   for (const [role, value] of Object.entries(record(config.routes ?? {}))) {
     if (!/^[a-z][a-z0-9-]*$/.test(role)) throw new Error(`Invalid route role: ${role}`);
     const r = record(value);
-    keys(r, ["candidates", "contextWindow", "outputReserve", "stayRetries", "maxTransitions", "maxRecoveries"]);
+    keys(r, ["candidates", "strategy", "contextWindow", "outputReserve", "stayRetries", "maxTransitions", "maxRecoveries"]);
     if (!Array.isArray(r.candidates) || r.candidates.length === 0 || r.candidates.length > 32) throw new Error(`Route ${role} needs 1..32 candidates`);
     // A candidate without an account on a provider with accounts expands to one candidate per account, in
     // configured order. Each expansion keeps its own health, stickiness and cache epoch.
@@ -164,8 +181,16 @@ export function parseConfig(raw: unknown): Config {
     });
     if (candidates.length > 32) throw new Error(`Route ${role} expands to more than 32 candidates`);
     if (new Set(candidates.map(c => JSON.stringify([c.provider, c.id, c.account ?? null]))).size !== candidates.length) throw new Error(`Duplicate candidates in ${role}`);
+    const strategy = r.strategy === undefined ? undefined : (() => {
+      const value = record(r.strategy);
+      keys(value, ["module", "options"]);
+      if (typeof value.module !== "string" || !value.module.startsWith("/") || value.module.trim() !== value.module || !/\.m?ts$/.test(value.module)) throw new Error(`routes.${role}.strategy.module must be an absolute TypeScript file path`);
+      const options = value.options === undefined ? {} : jsonObject(value.options, `routes.${role}.strategy.options`);
+      return { module: value.module, options };
+    })();
     routes[role] = {
       candidates,
+      ...(strategy === undefined ? {} : { strategy }),
       contextWindow: integer(r.contextWindow, 200_000, 1, 10_000_000),
       outputReserve: integer(r.outputReserve, 8192, 1, 1_000_000),
       stayRetries: integer(r.stayRetries, 1, 0, 10),

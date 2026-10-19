@@ -4,7 +4,8 @@
   "type": "module",
   "description": "Sticky native Pi virtual routes with bounded provider recovery",
   "pi": { "extensions": ["./src/index.ts"] },
-  "files": ["src", "README.md"],
+  "exports": { "./strategy": "./src/strategy.ts" },
+  "files": ["src", "examples", "README.md"],
   "scripts": { "test": "bun test tests", "typecheck": "tsc --noEmit" },
   "peerDependencies": { "@earendil-works/pi-coding-agent": ">=1.1.0" },
   "devDependencies": {

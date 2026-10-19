@@ -7,7 +7,7 @@ import { homedir } from "node:os";
  * Holds identities and reasons only: never keys, accounts' secrets, prompts or responses.
  */
 /** `manual` records a user pin change; its `physical` is the pinned candidate, or `auto` when the pin is cleared. */
-export type DecisionReason = "initial" | "direct" | "sticky" | "failover" | "recovery" | "cache-expiry" | "probe" | "manual";
+export type DecisionReason = "initial" | "direct" | "sticky" | "failover" | "recovery" | "cache-expiry" | "probe" | "manual" | "strategy";
 
 export interface DecisionEntry {
   at: string;
@@ -20,6 +20,12 @@ export interface DecisionEntry {
   contextTokens?: number;
   /** Minimum context window a candidate had to provide for this dispatch: the route's capacity or this request's need. */
   requiredContext?: number;
+  strategyId?: string;
+  selectionOrigin?: "strategy" | "default" | "pin" | "retry" | "recovery" | "direct";
+  explanation?: string;
+  fallback?: string;
+  quotaObservedAt?: number;
+  pricingObservedAt?: number;
 }
 
 export function defaultDecisionLogPath(): string {

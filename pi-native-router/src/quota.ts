@@ -59,9 +59,10 @@ export function parseCodexbar(raw: string, account: string, provider: string, no
   }
   if (windows.length === 0) return { error: "tracker entry has no windows" };
   const sourceLabel = typeof entry.source === "string" ? entry.source : "unknown";
-  // `local+api` and `local` mix or replace server meters with device history, so only pure server sources qualify.
-  // CodexBar marks complete server meters `exact` and partial ones `estimated`; only server sources qualify.
-  const authoritative = ["api", "web", "oauth"].includes(sourceLabel) && usage.dataConfidence !== "estimated";
+  // Fresh, structurally valid readings are trusted by default; explicitly estimated or local-derived data is not.
+  // CLI (including Claude's PTY usage command) is a provider reading, not device-local usage history.
+  const localDerived = /local|codexbar-app/i.test(sourceLabel);
+  const authoritative = usage.dataConfidence !== "estimated" && !localDerived;
   return { snapshot: { provider, account, source: sourceLabel, authoritative, observedAt, windows } };
 }
 

@@ -18,7 +18,12 @@ test("configuration is opt-in and invalid paid-route definitions fail rather tha
     { flushTimeoutMs: -1 }, { unknownSetting: true },
     { routes: { work: { candidates: [{ provider: "a", id: "one", cacheTtlMs: 0 }] } } },
     { routes: { work: { candidates: [{ provider: "a", id: "one", cacheTtlMs: 1.5 }] } } },
+    { routes: { work: { candidates: [{ provider: "a", id: "one" }], strategy: { module: "relative.ts" } } } },
+    { routes: { work: { candidates: [{ provider: "a", id: "one" }], strategy: { module: "/tmp/strategy.js" } } } },
+    { routes: { work: { candidates: [{ provider: "a", id: "one" }], strategy: { module: "/tmp/strategy.ts", options: { nested: undefined } } } } },
   ]) expect(() => parseConfig(raw)).toThrow();
+  expect(parseConfig({ routes: { work: { candidates: [{ provider: "a", id: "one" }], strategy: { module: "/tmp/strategy.ts", options: { horizon: 30 } } } } }).routes.work.strategy)
+    .toEqual({ module: "/tmp/strategy.ts", options: { horizon: 30 } });
 });
 
 test("classification distinguishes account failures, rate limits, model transport errors and unsafe errors", () => {

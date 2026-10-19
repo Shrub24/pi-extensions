@@ -1,5 +1,7 @@
 import { test, expect } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { admissionKeys, cacheExpiry } from "../src/policy";
+import { HealthStore } from "../src/health-store";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,8 +11,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream, type AssistantMessage } from "@earendil-works/pi-ai";
 import { installRouter } from "../src/index";
-import { HealthStore } from "../src/health-store";
-import { cacheExpiry } from "../src/policy";
+import { FOOTER_KEYS } from "../src/footer";
 import { parseConfig } from "../src/config";
 import { nativeHttpError } from "./native-error";
 
@@ -18,7 +19,7 @@ type Routing = { accounts: string[]; candidates: Array<{ provider: string; accou
 /** Synthetic env name for a test account; keys are set by each test and never printed. */
 const accountEnv = (id: string) => `NATIVE_ROUTER_TEST_KEY_${id.replace(/-/g, "_").toUpperCase()}`;
 type Outcome = "ok" | "quota" | "transient" | "partial" | "abort" | "tool" | "bad" | 401 | 403 | 429;
-async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateThinking?: "off" | "low" | "medium" | "high"; retry?: boolean; flush?: "failed" | "absent"; maxRecoveries?: number; maxTransitions?: number; smaller?: number; manager?: SessionManager; packaged?: boolean; unauthedFirst?: boolean; ttl?: number; startTime?: number; clock?: { value: number }; accounts?: boolean; providerKeys?: boolean; healthPath?: string; routing?: Routing; runtimeKeys?: "absent" | "inert"; wide?: boolean; contextWindow?: number; maxTokens?: number } = {}) {
+async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateThinking?: "off" | "low" | "medium" | "high"; retry?: boolean; flush?: "failed" | "absent"; maxRecoveries?: number; maxTransitions?: number; smaller?: number; manager?: SessionManager; packaged?: boolean; unauthedFirst?: boolean; ttl?: number; startTime?: number; clock?: { value: number }; accounts?: boolean; providerKeys?: boolean; healthPath?: string; decisionLogPath?: string; heldProbe?: boolean; routing?: Routing; runtimeKeys?: "absent" | "inert"; wide?: boolean; contextWindow?: number; maxTokens?: number; strategy?: "prefer-b" | "missing" } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "native-router-"));
   const settings = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: opts.retry ?? false, maxRetries: 3, baseDelayMs: 1 }, cacheWarming: "off" });
   const runtime = await ModelRuntime.create({ authPath: join(dir, "auth.json"), modelsPath: null, refreshOnCreate: false });
@@ -32,6 +33,8 @@ async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateT
   const clock = opts.clock ?? { value: opts.startTime ?? 1000 };
   const now = () => clock.value;
   let api: ExtensionAPI;
+  const commands = new Map<string, unknown>();
+  const shortcuts = new Map<string, unknown>();
   const usage = { input: 10, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 11, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
   // `fake-d/wide` is registered but belongs to no route: it stands in for a model from another route.
   const providers = [["fake-a", opts.contextWindow ?? 300_000], ["fake-b", opts.smaller ?? 300_000], ["fake-c", 300_000], ...(opts.wide ? [["fake-d", 1_000_000] as const] : [])] as const;
@@ -71,14 +74,37 @@ async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateT
     sharedProviders[provider] = { accounts: { ...sharedProviders[provider]?.accounts, [id]: { apiKeyEnv: accountEnv(id) } } };
   }
   else if (opts.accounts) for (const provider of ["fake-a", "fake-b", "fake-c"]) sharedProviders[provider] = { accounts: { [`acct-${provider}`]: { apiKeyEnv: `NATIVE_ROUTER_TEST_KEY_${provider.replace("-", "_").toUpperCase()}` } } };
-  const raw = { flushTimeoutMs: 10, providers: sharedProviders, routes: { worker: { candidates: routed ? routed.candidates.map(c => ({ provider: c.provider, id: "model", thinkingLevel: opts.candidateThinking ?? "off", ...(opts.ttl ? { cacheTtlMs: opts.ttl } : {}), ...(c.account ? { account: c.account } : {}) })) : ["fake-a", "fake-b", "fake-c"].map(provider => ({ provider, id: "model", thinkingLevel: opts.candidateThinking ?? "off", ...(opts.ttl ? { cacheTtlMs: opts.ttl } : {}), ...(opts.accounts ? { account: `acct-${provider}` } : {}) })), maxRecoveries: opts.maxRecoveries ?? 2, maxTransitions: opts.maxTransitions ?? 3 } } };
+  const healthPath = opts.healthPath ?? join(dir, "health.sqlite");
+  if (opts.heldProbe) {
+    const seeded = new HealthStore(healthPath, now);
+    const keys = admissionKeys({ provider: "fake-b", id: "model" });
+    seeded.mark(keys[0], "quota", now(), "fixture-expired-quota");
+    expect(seeded.admitProbe(keys, "another-process")).toBeDefined();
+    seeded.close();
+  }
+  const strategyPath = opts.strategy ? join(dir, "strategy.ts") : undefined;
+  if (strategyPath && opts.strategy === "prefer-b") writeFileSync(strategyPath, 'export default { version: 1, choose: (context: { currentTargetId?: string; eligibleTargetIds: string[]; excludedTargetIds: string[]; targets: { account?: string; pricing: { status: string }; switchingCost: { status: string }; targetId: string }[] }) => { if (!Object.isFrozen(context) || Object.keys(context).some(key => /message|credential|apiKey|secret/i.test(key)) || context.targets.length !== 3 || context.targets.some(t => (t.account !== undefined && !t.targetId.endsWith(`#${t.account}`)) || t.pricing.status === "complete" || t.switchingCost.status !== (t.targetId === context.currentTargetId ? "same-target" : "unknown") || Object.keys(t).some(key => /key|secret|credential/i.test(key)))) throw new Error("unsafe or fabricated snapshot"); const target = context.currentTargetId?.startsWith("fake-b/") || context.excludedTargetIds.some(id => id.startsWith("fake-b/")) ? "fake-c/" : "fake-b/"; return { targetId: context.eligibleTargetIds.find(id => id.startsWith(target))!, reason: `test strategy selects ${target}` }; } };');
+  const raw = { flushTimeoutMs: 10, providers: sharedProviders, routes: { worker: { ...(strategyPath ? { strategy: { module: strategyPath, options: {} } } : {}), candidates: routed ? routed.candidates.map(c => ({ provider: c.provider, id: "model", thinkingLevel: opts.candidateThinking ?? "off", ...(opts.ttl ? { cacheTtlMs: opts.ttl } : {}), ...(c.account ? { account: c.account } : {}) })) : ["fake-a", "fake-b", "fake-c"].map(provider => ({ provider, id: "model", thinkingLevel: opts.candidateThinking ?? "off", ...(opts.ttl ? { cacheTtlMs: opts.ttl } : {}), ...(opts.accounts ? { account: `acct-${provider}` } : {}) })), maxRecoveries: opts.maxRecoveries ?? 2, maxTransitions: opts.maxTransitions ?? 3 } } };
   const config = parseConfig(raw);
+  const decisionLogPath = opts.decisionLogPath ?? join(dir, "decisions.jsonl");
   runtime.registerVirtualModel({ provider: "route", id: "worker", name: "placeholder", route: () => { throw new Error("Adapter not installed"); } });
   const loader = new DefaultResourceLoader({
     cwd: dir, agentDir: dir, settingsManager: settings, noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
     additionalExtensionPaths: opts.packaged ? [fileURLToPath(new URL("../src/index.ts", import.meta.url))] : [],
     extensionFactories: [pi => {
       api = pi;
+      const instrumented = new Proxy(pi, { get(target, property) {
+        if (property === "registerCommand") return (name: string, command: unknown) => {
+          commands.set(name, command);
+          return (Reflect.get(target, property, target) as (...args: unknown[]) => unknown).call(target, name, command);
+        };
+        if (property === "registerShortcut") return (key: string, shortcut: unknown) => {
+          shortcuts.set(key, shortcut);
+          return (Reflect.get(target, property, target) as (...args: unknown[]) => unknown).call(target, key, shortcut);
+        };
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      } });
       if (opts.flush !== "absent") pi.events.on("magic-context:flush", (payload: unknown) => {
         const { sessionId } = payload as { sessionId: string };
         order.push("flush");
@@ -92,7 +118,7 @@ async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateT
         if (pending) { pending = false; materialized = true; order.push("materialized"); }
         return materialized ? { messages: [...event.messages, { role: "user", content: "MATERIALIZED DROP RESULT", timestamp: 1 }] } : undefined;
       });
-      if (!opts.packaged) installRouter(pi, config, { now, healthPath: opts.healthPath ?? join(dir, "health.sqlite") });
+      if (!opts.packaged) installRouter(instrumented, config, { now, healthPath, decisionLogPath });
       pi.events.on("native-router:transition", () => order.push("transition"));
     }],
   });
@@ -109,7 +135,7 @@ async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateT
   }
   const manager = opts.manager ?? SessionManager.inMemory(dir);
   const { session } = await createAgentSession({ cwd: dir, agentDir: dir, modelRuntime: runtime, model: runtime.getModel("route", "worker")!, thinkingLevel: "off", settingsManager: settings, resourceLoader: loader, sessionManager: manager, tools: ["owned_tool"], customTools: [{ name: "owned_tool", label: "Owned", description: "Count owned executions", parameters: { type: "object", properties: {} } as never, execute: async () => { toolRuns++; return { content: [{ type: "text", text: "tool finished" }], details: {} }; } }] });
-  return { session, runtime, manager, dispatches, order, api: api!, clock, get toolRuns() { return toolRuns; }, close() { session.dispose(); rmSync(dir, { recursive: true, force: true }); } };
+  return { session, runtime, manager, dispatches, order, api: api!, commands, shortcuts, clock, decisionLogPath, get toolRuns() { return toolRuns; }, close() { session.dispose(); rmSync(dir, { recursive: true, force: true }); } };
 }
 
 test("initial selection skips an unconfigured native provider without flushing", async () => {
@@ -236,10 +262,14 @@ test("native continuation does not replay completed tools during terminal failov
   } finally { h.close(); }
 });
 
-for (const outcome of ["partial", "abort", "bad"] as const) test(`${outcome} settles without migration`, async () => {
-  const h = await host([outcome, "ok"]);
-  try { await h.session.prompt("safe refusal"); expect(h.dispatches).toHaveLength(1); expect(h.order).not.toContain("flush"); }
-  finally { h.close(); }
+for (const outcome of ["partial", "abort", "bad"] as const) test(`${outcome} settles without migration${outcome === "partial" ? " under a custom strategy" : ""}`, async () => {
+  const h = await host([outcome, "ok"], { strategy: outcome === "partial" ? "prefer-b" : undefined });
+  try {
+    await h.session.prompt("safe refusal");
+    expect(h.dispatches).toHaveLength(1);
+    expect(h.dispatches[0].physical).toBe(outcome === "partial" ? "fake-b" : "fake-a");
+    expect(h.order).not.toContain("flush");
+  } finally { h.close(); }
 });
 
 test("zero transition budget stops native retry migration without a flush", async () => {
@@ -338,15 +368,15 @@ test("branch restore/fork retains the fallback selection in a fresh adapter proc
   } finally { first.close(); }
 });
 
-test("native direct routing does not change branch state or trigger session flush", async () => {
-  const h = await host(["ok", "ok"]);
+test("native direct routing uses the strategy without changing branch state or triggering a session flush", async () => {
+  const h = await host(["ok", "ok"], { strategy: "prefer-b" });
   try {
     const before = h.manager.getBranch();
     await h.runtime.completeSimple(h.runtime.getModel("route", "worker")!, { messages: [{ role: "user", content: "auxiliary", timestamp: 1 }] });
     expect(h.manager.getBranch()).toEqual(before);
     expect(h.order).not.toContain("flush");
     await h.session.prompt("session");
-    expect(h.dispatches.map(d => d.physical)).toEqual(["fake-a", "fake-a"]);
+    expect(h.dispatches.map(d => d.physical)).toEqual(["fake-b", "fake-b"]);
   } finally { h.close(); }
 });
 
@@ -562,5 +592,102 @@ test("a model switch into a route does not turn the physical model's thinking le
     await h.session.setModel(h.runtime.getModel("route", "worker")!);
     await h.session.prompt("after switching into the route");
     expect(h.dispatches.at(-1)?.thinking).toBe("low");
+  } finally { h.close(); }
+});
+
+test("the configured TS strategy chooses and explains the actual physical dispatch target", async () => {
+  const keys = { NATIVE_ROUTER_TEST_KEY_FAKE_A: "synthetic-key-a", NATIVE_ROUTER_TEST_KEY_FAKE_B: "synthetic-key-b", NATIVE_ROUTER_TEST_KEY_FAKE_C: "synthetic-key-c" };
+  for (const [name, value] of Object.entries(keys)) process.env[name] = value;
+  const h = await host(["ok"], { strategy: "prefer-b", accounts: true });
+  try {
+    await h.session.prompt("strategy-selected target");
+    await h.session.prompt("strategy may override stickiness");
+    expect(h.dispatches.map(d => d.physical)).toEqual(["fake-b", "fake-c"]);
+    expect(h.order.indexOf("flush")).toBeLessThan(h.order.indexOf("dispatch:fake-c"));
+    expect(h.order.indexOf("transition")).toBeLessThan(h.order.indexOf("dispatch:fake-c"));
+    expect(readFileSync(h.decisionLogPath, "utf8")).toContain('"selectionOrigin":"strategy"');
+    expect(readFileSync(h.decisionLogPath, "utf8")).toContain("test strategy selects fake-b/");
+    expect(readFileSync(h.decisionLogPath, "utf8")).toContain("test strategy selects fake-c/");
+  } finally { h.close(); for (const name of Object.keys(keys)) delete process.env[name]; }
+});
+
+test("a strategy chooses the target for terminal recovery and keeps its explanation through dispatch", async () => {
+  const keys = { NATIVE_ROUTER_TEST_KEY_FAKE_A: "synthetic-key-a", NATIVE_ROUTER_TEST_KEY_FAKE_B: "synthetic-key-b", NATIVE_ROUTER_TEST_KEY_FAKE_C: "synthetic-key-c" };
+  for (const [name, value] of Object.entries(keys)) process.env[name] = value;
+  const h = await host([401, "ok"], { strategy: "prefer-b", accounts: true });
+  try {
+    await h.session.prompt("recover through the strategy");
+    expect(h.dispatches.map(d => d.physical)).toEqual(["fake-b", "fake-c"]);
+    expect(readFileSync(h.decisionLogPath, "utf8")).toContain('"selectionOrigin":"strategy"');
+    expect(readFileSync(h.decisionLogPath, "utf8")).toContain("test strategy selects fake-c/");
+  } finally { h.close(); for (const name of Object.keys(keys)) delete process.env[name]; }
+});
+
+test("a denied shared recovery lease is passed as an exclusion before strategy reselection", async () => {
+  const h = await host(["ok"], { strategy: "prefer-b", heldProbe: true });
+  try {
+    await h.session.prompt("probe lease belongs to another process");
+    expect(h.dispatches.map(d => d.physical)).toEqual(["fake-c"]);
+  } finally { h.close(); }
+});
+
+test("a pin cannot pull the route back to a recovered failed candidate while the fallback stays healthy", async () => {
+  const h = await host(["ok", 429, "ok", "ok", "quota", "ok"]);
+  const notices: string[] = [];
+  const ui = { select: async () => undefined, notify: (message: string) => notices.push(message), setStatus: () => undefined };
+  const ctx = { hasUI: true, model: h.runtime.getModel("route", "worker"), modelRegistry: {
+    find: (provider: string, id: string) => h.runtime.getModel(provider, id), hasConfiguredAuth: () => true, runtime: h.runtime,
+  }, sessionManager: h.manager, getContextUsage: () => ({ tokens: 0 }), thinkingLevel: "off", ui } as never;
+  try {
+    const pin = h.commands.get("route-pin") as { handler: (args: string, context: never) => Promise<void> };
+    await pin.handler("fake-b/model", ctx);
+    await h.session.prompt("pinned target succeeds");
+    await h.session.prompt("pinned target rate-limited; fallback selected");
+    expect(h.dispatches.map(d => d.physical)).toEqual(["fake-b", "fake-b", "fake-a"]);
+
+    h.clock.value += 61_000;
+    await h.session.prompt("rate cooldown expired, but healthy fallback remains sticky");
+    expect(h.dispatches.at(-1)?.physical).toBe("fake-a");
+
+    await h.session.prompt("fallback fails, so eligible pin returns to preference");
+    expect(h.dispatches.slice(-2).map(d => d.physical)).toEqual(["fake-a", "fake-b"]);
+    expect(h.manager.getBranch().some(entry => entry.type === "custom" && entry.customType === "@vanillagreen/pi-native-router/physical-pin" &&
+      (entry.data as { identity?: string | null }).identity === "fake-b/model")).toBe(true);
+  } finally { h.close(); }
+});
+
+test("route-pin preview normalizes a redundant strategy choice to auto and cycling follows configured order", async () => {
+  const h = await host(["ok"], { strategy: "prefer-b" });
+  const statuses = new Map<string, string | undefined>();
+  const notices: string[] = [];
+  const ui = {
+    select: async (_prompt: string, choices: string[]) => { expect(choices).toEqual(["auto", "fake-a/model", "fake-b/model", "fake-c/model"]); return "fake-b/model"; },
+    notify: (message: string) => notices.push(message),
+    setStatus: (key: string, value: string | undefined) => statuses.set(key, value),
+  };
+  const ctx = { hasUI: true, model: h.runtime.getModel("route", "worker"), modelRegistry: { find: (provider: string, id: string) => h.runtime.getModel(provider, id), hasConfiguredAuth: () => true, runtime: h.runtime },
+    sessionManager: h.manager, getContextUsage: () => ({ tokens: 0 }), thinkingLevel: "off", ui } as never;
+  try {
+    const pin = h.commands.get("route-pin") as { handler: (args: string, context: never) => Promise<void> };
+    await pin.handler("", ctx);
+    expect(h.manager.getBranch().some(entry => entry.type === "custom" && entry.customType === "@vanillagreen/pi-native-router/physical-pin" &&
+      (entry.data as { role?: string; identity?: string | null }).identity === null)).toBe(true);
+    expect(notices.some(message => message.includes("pin cleared"))).toBe(true);
+    expect(statuses.has(FOOTER_KEYS.model)).toBe(true);
+
+    const cycle = h.shortcuts.get("ctrl+shift+m") as { handler: (context: never) => Promise<void> };
+    await cycle.handler(ctx);
+    expect(h.manager.getBranch().some(entry => entry.type === "custom" && entry.customType === "@vanillagreen/pi-native-router/physical-pin" &&
+      (entry.data as { identity?: string | null }).identity === "fake-c/model")).toBe(true);
+    expect(h.order).not.toContain("flush");
+  } finally { h.close(); }
+});
+
+test("a missing configured strategy falls back to ordered dispatch without disabling the route", async () => {
+  const h = await host(["ok"], { strategy: "missing" });
+  try {
+    await h.session.prompt("strategy module missing");
+    expect(h.dispatches.map(d => d.physical)).toEqual(["fake-a"]);
+    expect(readFileSync(h.decisionLogPath, "utf8")).toContain('"fallback":"strategy module could not be loaded"');
   } finally { h.close(); }
 });

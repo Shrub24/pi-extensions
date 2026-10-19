@@ -18,9 +18,11 @@ import { codexbarRunner, formatRemaining, formatUsed, QUOTA_FRESH_MS, quotaScope
 import { codexbarConfigPath, generateCodexbarConfig, readCodexbarConfig, writeCodexbarConfig } from "./codexbar-config";
 import { defaultPricingPath, loadSnapshot, refreshSnapshot, saveSnapshot } from "./pricing/cache";
 import { lookup } from "./pricing/catalog";
-import { applyPeak, backfillCost, labelRecordedPeak, type CostUsage } from "./pricing/reconcile";
-import { accountOf, admissionKeys, cacheExpiry, choose, cycleTarget, classify, clampLevel, Health, identity, observe, partialOutput, physicalOf, requiredContext, restore, THINKING_ORDER, type Resolved, type State } from "./policy";
+import { applyPeak, backfillCost, isPeakPriced, isPeakRecorded, labelRecordedPeak, type CostUsage } from "./pricing/reconcile";
+import { accountOf, admissionKeys, cacheExpiry, choose, cycleTarget, classify, clampLevel, eligibleCandidates, Health, identity, observe, partialOutput, physicalOf, requiredContext, restore, THINKING_ORDER, type Resolved, type State } from "./policy";
 import { beforeTransition, flushBridge, type FlushHook, type TransitionHook } from "./transition";
+import { evaluateStrategy, loadStrategy, type LoadedStrategy, type RoutingContext, type StrategyTarget } from "./strategy";
+import { projectQuotaObservation, projectStrategyPrice } from "./strategy-projection";
 
 function tokens(messages: readonly Message[]): number {
   const canonical = messages.reduce((n, m) => n + estimateTokens(m), 0);
@@ -150,6 +152,126 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     try { return await current; }
     finally { if (queues.get(sessionId) === current) queues.delete(sessionId); }
   }
+  const strategyLoads = new Map<string, Promise<LoadedStrategy | undefined>>();
+  const strategyLoadFailed = new Set<string>();
+  const strategyFallbackNotices = new Set<string>();
+  const strategyFallbackLogs = new Set<string>();
+  for (const [role, route] of Object.entries(config.routes)) if (route.strategy) {
+    strategyLoads.set(role, loadStrategy(route.strategy).catch(() => { strategyLoadFailed.add(role); return undefined; }));
+  }
+  const strategyContext = (role: string, route: RouteConfig, ctx: ExtensionContext, candidates: Resolved[], estimate: number,
+    input: { mode: RoutingContext["mode"]; reason: RoutingContext["reason"]; state?: State; current?: string; pin?: string; recovery?: string; priorityTarget?: string; priority?: "recovery" | "retry" | "pin"; excluded?: ReadonlySet<string>; failed?: string; failureKind?: string }): RoutingContext => {
+    const now = options.now?.() ?? Date.now();
+    const eligible = eligibleCandidates(route, candidates, health, estimate).filter(({ model, candidate }) => {
+      const target = identity(model, candidate.account);
+      return !input.excluded?.has(target) && (input.state === undefined || !input.current || target === input.current || input.state.transitions < route.maxTransitions);
+    });
+    const loaded = new Map(candidates.map(value => [identity(value.model, value.candidate.account), value]));
+    const eligibleIds = new Set(eligible.map(value => identity(value.model, value.candidate.account)));
+    const currentActivity = input.state?.cacheActivity;
+    const targets: StrategyTarget[] = route.candidates.map((candidate, configuredOrder) => {
+      const targetId = identity(candidate, candidate.account);
+      const found = loaded.get(targetId);
+      const model = found?.model ?? ctx.modelRegistry.find(candidate.provider, candidate.id);
+      const rejectionReasons: string[] = [];
+      if (!model || model.api === "pi-virtual") rejectionReasons.push("not-registered");
+      else if (!found) {
+        const source = keyOf(candidate, config);
+        if (candidate.account && !source) rejectionReasons.push("unknown-account");
+        else if (source && !runtimeKeysAvailable(ctx)) rejectionReasons.push("runtime-key-activation-unavailable");
+        else if (source && readKey(source) === undefined) rejectionReasons.push("credential-unavailable");
+        else rejectionReasons.push(model && ctx.modelRegistry.hasConfiguredAuth(model) ? "provider-unavailable" : "no-configured-auth");
+      }
+      if (model && model.api !== "pi-virtual") {
+        const blocked = health.blockedReason(model, candidate.account);
+        if (blocked) rejectionReasons.push(`health-${blocked.kind}`);
+        if (model.contextWindow < requiredContext(route, model, estimate) || model.maxTokens < route.outputReserve) rejectionReasons.push("context-fit");
+      }
+      if (input.excluded?.has(targetId)) rejectionReasons.push("excluded-this-attempt");
+      if (input.state && input.state.transitions >= route.maxTransitions && targetId !== input.current) rejectionReasons.push("transition-budget");
+      const eligibleNow = Boolean(model && model.api !== "pi-virtual" && eligibleIds.has(targetId));
+      const providerConfig = config.providers[candidate.provider];
+      const quotaConfig = candidate.account ? providerConfig?.accounts[candidate.account]?.quota : providerConfig?.quota;
+      let quota = projectQuotaObservation(undefined, quotaConfig !== undefined, now, QUOTA_FRESH_MS);
+      if (quotaConfig && store) {
+        try { quota = projectQuotaObservation(store.getSnapshot(quotaScopeKey(candidate.provider, candidate.account)), true, now, QUOTA_FRESH_MS); }
+        catch { quota = { status: "unavailable", error: "snapshot unavailable", windows: [] }; }
+      }
+      const snapshot = loadSnapshot(defaultPricingPath());
+      const catalog = lookup(snapshot, candidate.provider, candidate.id, config.pricingOverrides);
+      const native = model?.cost;
+      const pricing = projectStrategyPrice(native ? { input: native.input, output: native.output, cacheRead: native.cacheRead, cacheWrite: native.cacheWrite } : undefined,
+        catalog, snapshot?.retrievedAt);
+      const active = isPeakPriced(candidate.provider, candidate.id, now) || isPeakRecorded(candidate.provider, candidate.id, now);
+      const cacheKnown = currentActivity?.physical === targetId && currentActivity.logical === `route/${role}`;
+      return { targetId, provider: candidate.provider, model: candidate.id, ...(candidate.account ? { account: candidate.account } : {}), configuredOrder,
+        registered: Boolean(model && model.api !== "pi-virtual"), eligible: eligibleNow, rejectionReasons,
+        ...(model?.name ? { displayName: model.name } : {}), ...(model ? { contextWindow: model.contextWindow, maxTokens: model.maxTokens } : {}),
+        thinkingLevel: candidate.thinkingLevel, ...(model ? { effectiveThinkingLevel: routeLevel(model, candidate.thinkingLevel, userThinking(ctx, role)) } : {}), quota, pricing,
+        peak: { active, multiplier: active ? 2 : 1, costTreatment: active ? isPeakPriced(candidate.provider, candidate.id, now) ? "router-applies" : "provider-recorded" : "none" }, cache: cacheKnown ? { status: "known", lastSuccessfulAt: currentActivity.at,
+          ...(candidate.cacheTtlMs === undefined ? {} : { estimatedExpiresAt: currentActivity.at + candidate.cacheTtlMs }), source: "session activity estimate" } : { status: "unknown" },
+          switchingCost: input.current === targetId ? { status: "same-target" } : { status: "unknown", reason: "no per-target cache-token replay estimate" } };
+    });
+    return { version: 1, now, mode: input.mode, reason: input.reason, options: route.strategy?.options ?? {},
+      route: { role, contextWindow: route.contextWindow, outputReserve: route.outputReserve, stayRetries: route.stayRetries, maxTransitions: route.maxTransitions,
+        maxRecoveries: route.maxRecoveries, configuredOrder: route.candidates.map(candidate => identity(candidate, candidate.account)) },
+      targets, eligibleTargetIds: [...eligibleIds], ...(input.current ? { currentTargetId: input.current } : {}), ...(input.pin ? { pinnedTargetId: input.pin } : {}),
+      ...(input.recovery ? { recoveryTargetId: input.recovery } : {}), excludedTargetIds: [...(input.excluded ?? [])],
+      ...(input.failed ? { failure: { kind: input.failureKind ?? "unknown", failedTargetId: input.failed } } : {}),
+      budgets: { retriesRemaining: Math.max(0, route.stayRetries - (input.state?.retries ?? 0)),
+        transitionsRemaining: Math.max(0, route.maxTransitions - (input.state?.transitions ?? 0)), recoveriesRemaining: Math.max(0, route.maxRecoveries - (input.state?.recoveries ?? 0)) },
+      request: { contextTokens: estimate, estimateSource: input.reason !== "direct" && ctx.getContextUsage()?.tokens !== undefined ? "pi-usage" : "message-heuristic",
+        outputReserve: route.outputReserve, ...(ctx.thinkingLevel ? { thinkingLevel: ctx.thinkingLevel } : {}) } };
+  };
+  const chooseWithStrategy = async (role: string, route: RouteConfig, candidates: Resolved[], health: Health, estimate: number, preferred: string | undefined,
+    exclude: string | ReadonlySet<string> | undefined, ctx: ExtensionContext, input: Parameters<typeof strategyContext>[5]): Promise<{ selected?: Resolved; strategyId: string; reason: string; fallback?: string; quotaObservedAt?: number; pricingObservedAt?: number }> => {
+    const selectable = route.strategy ? candidates.filter(value => input.state === undefined || !input.current || identity(value.model, value.candidate.account) === input.current || input.state.transitions < route.maxTransitions) : candidates;
+    const isExcluded = (target: string) => typeof exclude === "string" ? exclude === target : exclude?.has(target) === true;
+    const eligible = eligibleCandidates(route, selectable, health, estimate).filter(value => !isExcluded(identity(value.model, value.candidate.account)));
+    const currentEligible = input.current !== undefined && eligible.some(value => identity(value.model, value.candidate.account) === input.current);
+    // A pin reorders automatic choices; it does not eject a healthy current target. Once the incumbent
+    // is ineligible (including a failed/excluded request), the eligible pin is promoted ahead of route order.
+    const preferredTarget = input.priority === "pin" && currentEligible ? undefined : input.priorityTarget;
+    const fallbackPreferred = input.priority === "pin" && currentEligible ? input.current : preferred;
+    const fallback = () => choose(route, selectable, health, estimate, fallbackPreferred, exclude);
+    if (preferredTarget) {
+      const preferredCandidate = eligible.find(value => identity(value.model, value.candidate.account) === preferredTarget);
+      if (preferredCandidate) {
+        const selectedStrategy = input.priority === "recovery" && input.state?.nextSelection?.strategy && route.strategy;
+        return { selected: preferredCandidate, strategyId: selectedStrategy ? route.strategy!.module : input.priority ?? "default",
+          reason: selectedStrategy ? input.state!.nextSelection!.reason : `eligible ${input.priority ?? "default"} target` };
+      }
+    }
+    if (eligible.length === 0) return { strategyId: "ordered", reason: "no eligible targets" };
+    const custom = route.strategy ? await strategyLoads.get(role) : undefined;
+    if (!custom) {
+      const selected = fallback();
+      return { selected, strategyId: route.strategy ? "ordered" : "ordered", reason: "configured order or current target",
+        ...(route.strategy && strategyLoadFailed.has(role) ? { fallback: "strategy module could not be loaded" } : {}) };
+    }
+    const context = strategyContext(role, route, ctx, candidates, estimate, input);
+    const choice = evaluateStrategy(custom, context, () => { const value = fallback(); return value ? identity(value.model, value.candidate.account) : undefined; });
+    const selected = selectable.find(value => identity(value.model, value.candidate.account) === choice.targetId && context.eligibleTargetIds.includes(choice.targetId));
+    const observed = context.targets.find(value => value.targetId === choice.targetId);
+    return { selected, strategyId: choice.strategyId, reason: choice.reason, ...(choice.fallback ? { fallback: choice.fallback } : {}),
+      ...(observed?.quota.observedAt ? { quotaObservedAt: observed.quota.observedAt } : {}), ...(observed?.pricing.asOf ? { pricingObservedAt: observed.pricing.asOf } : {}) };
+  };
+  const reportStrategyFallback = (role: string, ctx: ExtensionContext, selection: { fallback?: string; strategyId: string; reason: string; selected?: Resolved }, persist = true) => {
+    if (!selection.fallback) return;
+    const fallback = selection.fallback;
+    const key = `${role}:${fallback}`;
+    if (!strategyFallbackNotices.has(key)) {
+      strategyFallbackNotices.add(key);
+      pi.events.emit("native-router:strategy-fallback", { role, reason: fallback });
+      if (ctx.hasUI) ctx.ui.notify(`native-router: ${role} strategy unavailable; using ordered selection (${fallback})`, "warning");
+    }
+    if (persist && !strategyFallbackLogs.has(key)) {
+      strategyFallbackLogs.add(key);
+      recordDecision(decisionLogPath, { at: new Date(options.now?.() ?? Date.now()).toISOString(), session: ctx.sessionManager.getSessionId(), logical: `route/${role}`,
+      physical: selection.selected ? identity(selection.selected.model, selection.selected.candidate.account) : "none", reason: "strategy", strategyId: selection.strategyId,
+      selectionOrigin: "default", explanation: selection.reason, fallback }, degrade);
+    }
+  };
   for (const [role, route] of Object.entries(config.routes)) {
     const resolve = async (request: ModelRouteRequest<State>, ctx: ExtensionContext): Promise<ModelRoute<State>> => {
       request.signal?.throwIfAborted();
@@ -160,9 +282,13 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
         ? tokens(request.messages)
         : ctx.getContextUsage()?.tokens ?? tokens(request.messages);
       if (request.reason === "direct") {
-        const selected = choose(route, await activeOnly(candidates, ctx, config), health, estimate);
+        const activeCandidates = await activeOnly(candidates, ctx, config);
+        const selection = await chooseWithStrategy(role, route, activeCandidates, health, estimate, undefined, undefined, ctx,
+          { mode: "dispatch", reason: "direct" });
+        const selected = selection.selected;
+        reportStrategyFallback(role, ctx, { ...selection, selected });
         if (!selected) throw exhausted(role, route, ctx, config);
-        publishRoute(ctx, selected.model, selected.candidate.account, selected.candidate.thinkingLevel, undefined, isPinned(ctx, role));
+        publishRoute(ctx, selected.model, selected.candidate.account, selected.candidate.thinkingLevel, undefined, false);
         return { model: selected.model, thinkingLevel: selected.candidate.thinkingLevel };
       }
       const old = restore(request.state);
@@ -173,8 +299,9 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       const turn = turnKey(ctx);
       const state: State = old ? { ...old } : { version: 1, physical: "", turn, retries: 0, transitions: 0, recoveries: 0 };
       if (activity) state.cacheActivity = activity;
-      if (state.turn !== turn) Object.assign(state, { turn, retries: 0, transitions: 0, recoveries: 0, next: undefined });
+      if (state.turn !== turn) Object.assign(state, { turn, retries: 0, transitions: 0, recoveries: 0, next: undefined, nextSelection: undefined });
       let exclude: string | undefined;
+      let stayRetry = false;
       if (admissions.has(activityKey)) settleAdmission(activityKey, { recovered: false });
       if (request.failed) {
         const failure = classify(request.failed.message, options.now?.());
@@ -196,16 +323,27 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
           exclude = failedTarget;
           const blocked = health.blockedReason(request.failed.model, failedAccount);
           if (ctx.hasUI) ctx.ui.notify(`native-router: ${failedTarget} ${failure.kind} failure${blocked ? `; cooling down until ${new Date(blocked.until).toISOString()}` : ""}`, "warning");
-        } else if (ctx.hasUI) ctx.ui.notify(`native-router: ${failedTarget} transient failure; retrying (${state.retries}/${route.stayRetries})`, "info");
+        } else {
+        stayRetry = true;
+        if (ctx.hasUI) ctx.ui.notify(`native-router: ${failedTarget} transient failure; retrying (${state.retries}/${route.stayRetries})`, "info");
+      }
       }
       // Admit one recovery probe per expired scope on the chosen target, or move to the next target.
       const skipped = new Set<string>(exclude ? [exclude] : []);
-      // A pin is preferred after recovery and ahead of the current physical model; a dormant pin falls back to route order.
       const pin = pinOf(ctx, role);
-      const preferred = state.next ?? (typeof pin === "string" ? pin : state.physical);
+      const priorityTarget = state.next ?? (typeof pin === "string" ? pin : stayRetry ? state.physical : undefined);
+      const priority = state.next ? "recovery" as const : typeof pin === "string" ? "pin" as const : stayRetry ? "retry" as const : undefined;
+      const preferred = typeof pin === "string" ? pin : state.physical;
       let selected: Resolved | undefined;
+      let selection: Awaited<ReturnType<typeof chooseWithStrategy>>;
       for (;;) {
-        selected = choose(route, candidates, health, estimate, preferred, skipped);
+        const reason: RoutingContext["reason"] = request.failed ? "failover" : skipped.size > 0 ? "admission-retry" : state.physical ? "continuation" : "initial";
+        selection = await chooseWithStrategy(role, route, candidates, health, estimate, preferred, skipped, ctx,
+          { mode: "dispatch", reason, state, current: state.physical || undefined, ...(typeof pin === "string" ? { pin } : {}),
+            ...(state.next ? { recovery: state.next } : {}), ...(priorityTarget ? { priorityTarget } : {}), ...(priority ? { priority } : {}),
+            excluded: skipped, ...(exclude ? { failed: exclude } : {}), ...(request.failed ? { failureKind: classify(request.failed.message, options.now?.()).kind } : {}) });
+        selected = selection.selected;
+        reportStrategyFallback(role, ctx, { ...selection, selected });
         if (!selected) break;
         const target = identity(selected.model, selected.candidate.account);
         if (!store) break;
@@ -244,8 +382,13 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       const physical = identity(selected.model, selected.candidate.account);
       const key = keyOf(selected.candidate, config);
       if (state.physical !== physical) {
-        const reason: DecisionReason = !old || !state.physical ? "initial" : request.failed ? "failover" : "sticky";
-        recordDecision(decisionLogPath, { at: new Date(options.now?.() ?? Date.now()).toISOString(), session: ctx.sessionManager.getSessionId(), logical: `route/${role}`, ...(state.physical ? { previous: state.physical } : {}), physical, ...(selected.candidate.account ? { account: selected.candidate.account } : {}), reason, contextTokens: estimate, requiredContext: requiredContext(route, selected.model, estimate) }, degrade);
+        const selectionOrigin = selection.strategyId === "pin" || selection.strategyId === "retry" || selection.strategyId === "recovery"
+          ? selection.strategyId : route.strategy && selection.strategyId !== "ordered" && !selection.fallback ? "strategy" : "default";
+        const reason: DecisionReason = selectionOrigin === "strategy" ? "strategy" : !old || !state.physical ? "initial" : request.failed ? "failover" : "sticky";
+        recordDecision(decisionLogPath, { at: new Date(options.now?.() ?? Date.now()).toISOString(), session: ctx.sessionManager.getSessionId(), logical: `route/${role}`, ...(state.physical ? { previous: state.physical } : {}), physical, ...(selected.candidate.account ? { account: selected.candidate.account } : {}), reason,
+          strategyId: selection.strategyId, selectionOrigin, explanation: selection.reason, ...(selection.fallback ? { fallback: selection.fallback } : {}),
+          ...(selection.quotaObservedAt ? { quotaObservedAt: selection.quotaObservedAt } : {}), ...(selection.pricingObservedAt ? { pricingObservedAt: selection.pricingObservedAt } : {}),
+          contextTokens: estimate, requiredContext: requiredContext(route, selected.model, estimate) }, degrade);
       }
       const now = options.now?.() ?? Date.now();
       const logical = `route/${role}`;
@@ -344,20 +487,25 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
   // The model that was active before the latest switch. Pi applies the thinking level for a switch before
   // it emits model_select, so a thinking change counts as a user choice only when the model did not just change.
   const activeModel = new Map<string, string>();
-  pi.on("session_start", (_event, ctx) => {
+  pi.on("session_start", async (_event, ctx) => {
     if (ctx.model) activeModel.set(ctx.sessionManager.getSessionId(), `${ctx.model.provider}/${ctx.model.id}`);
-    publishSelection(ctx, ctx.model);
+    await publishSelection(ctx, ctx.model);
   });
   // The footer's thinking item is the one thinking state shown: the level that will run. A direct model shows its
   // session level; a route shows its user choice (marked with the pencil glyph) or else the candidate default. Pi's built-in thinking
   // segment is left out of the layout so the level is never shown twice.
   // The route's physical model and peak are only known when a request resolves, so a route shows the candidate its
   // next request will try (the pin, else the last served physical, else route order) until then.
-  const displayed = (ctx: ExtensionContext, role: string): Resolved | undefined => {
+  const displayed = async (ctx: ExtensionContext, role: string): Promise<Resolved | undefined> => {
     const route = config.routes[role];
+    const state = branchState(ctx, role);
     const pin = pinOf(ctx, role);
-    const preferred = typeof pin === "string" ? pin : branchState(ctx, role)?.physical;
-    return choose(route, available(route, ctx, config), health, ctx.getContextUsage()?.tokens ?? 0, preferred);
+    const preferred = typeof pin === "string" ? pin : state?.physical;
+    const selection = await chooseWithStrategy(role, route, available(route, ctx, config), health, ctx.getContextUsage()?.tokens ?? 0, preferred, undefined, ctx,
+      { mode: "preview", reason: state?.physical ? "continuation" : "initial", state, current: state?.physical || undefined,
+        ...(state?.next ? { recovery: state.next, priorityTarget: state.next, priority: "recovery" as const } : typeof pin === "string" ? { pin, priorityTarget: pin, priority: "pin" as const } : {}) });
+    reportStrategyFallback(role, ctx, { ...selection, selected: selection.selected }, false);
+    return selection.selected;
   };
   const setPhysical = (ctx: ExtensionContext, model: Model<Api> | undefined, account: string | undefined, pinned: boolean) => {
     ctx.ui.setStatus(FOOTER_KEYS.provider, model === undefined ? undefined : providerText(model.provider, account, config.display));
@@ -369,9 +517,9 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     ctx.ui.setStatus(FOOTER_KEYS.thinking, undefined);
   };
   // `choice` is the route's thinking choice: undefined reads it from the branch, null means no choice.
-  const previewRoute = (ctx: ExtensionContext, role: string, choice: string | null | undefined = userThinking(ctx, role)) => {
+  const previewRoute = async (ctx: ExtensionContext, role: string, choice: string | null | undefined = userThinking(ctx, role)) => {
     if (!ctx.hasUI) return;
-    const shown = displayed(ctx, role);
+    const shown = await displayed(ctx, role);
     if (!shown) { clearRoute(ctx); return; }
     const { model, candidate } = shown;
     setPhysical(ctx, model, candidate.account, isPinned(ctx, role));
@@ -380,9 +528,9 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     const level = routeLevel(model, candidate.thinkingLevel, explicit);
     ctx.ui.setStatus(FOOTER_KEYS.thinking, model.reasoning ? thinkingText(level, explicit) : undefined);
   };
-  const publishSelection = (ctx: ExtensionContext, model: Model<Api> | undefined) => {
+  const publishSelection = async (ctx: ExtensionContext, model: Model<Api> | undefined) => {
     if (!ctx.hasUI) return;
-    if (model?.provider === "route" && config.routes[model.id]) { previewRoute(ctx, model.id); return; }
+    if (model?.provider === "route" && config.routes[model.id]) { await previewRoute(ctx, model.id); return; }
     setPhysical(ctx, undefined, undefined, false);
     ctx.ui.setStatus(FOOTER_KEYS.peak, undefined);
     ctx.ui.setStatus(FOOTER_KEYS.thinking, model?.reasoning && ctx.thinkingLevel ? thinkingText(ctx.thinkingLevel, undefined) : undefined);
@@ -394,11 +542,11 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     ctx.ui.setStatus(FOOTER_KEYS.peak, peakText(model.provider, model.id, options.now?.() ?? Date.now()));
     ctx.ui.setStatus(FOOTER_KEYS.thinking, model.reasoning ? thinkingText(effective, requested) : undefined);
   };
-  pi.on("model_select", (event, ctx) => {
+  pi.on("model_select", async (event, ctx) => {
     activeModel.set(ctx.sessionManager.getSessionId(), `${event.model.provider}/${event.model.id}`);
-    publishSelection(ctx, event.model);
+    await publishSelection(ctx, event.model);
   });
-  pi.on("thinking_level_select", (event, ctx) => {
+  pi.on("thinking_level_select", async (event, ctx) => {
     const model = ctx.model;
     if (!model || model.provider !== "route" || !config.routes[model.id]) {
       if (ctx.hasUI) ctx.ui.setStatus(FOOTER_KEYS.thinking, model?.reasoning ? thinkingText(event.level, undefined) : undefined);
@@ -409,12 +557,12 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     const known = activeModel.get(ctx.sessionManager.getSessionId());
     if (known !== undefined && known !== `route/${model.id}`) return;
     // A choice that runs at the shown candidate's default changes nothing, so it is stored as no choice (like a pin on auto).
-    const shown = displayed(ctx, model.id);
+    const shown = await displayed(ctx, model.id);
     const matchesDefault = shown !== undefined && clampLevel(shown.model, event.level) === clampLevel(shown.model, shown.candidate.thinkingLevel);
     const choice = matchesDefault ? null : event.level;
     pi.appendEntry(THINKING_CHOICE_ENTRY, { role: model.id, level: choice });
     // The next request clamps this choice to the physical candidate; the footer shows the clamped level now.
-    previewRoute(ctx, model.id, choice);
+    await previewRoute(ctx, model.id, choice);
   });
   pi.on("session_start", () => {
     if (quotaScopes.length === 0 || !store) return;
@@ -505,30 +653,33 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     },
   });
   // The candidate auto would pick now: the last served one, else the first usable in route order.
-  const autoChoice = (ctx: ExtensionContext, role: string): string | undefined => {
+  const autoChoice = async (ctx: ExtensionContext, role: string): Promise<string | undefined> => {
     const route = config.routes[role];
-    const shown = choose(route, available(route, ctx, config), health, ctx.getContextUsage()?.tokens ?? 0, branchState(ctx, role)?.physical);
-    return shown && identity(shown.model, shown.candidate.account);
+    const state = branchState(ctx, role);
+    const selection = await chooseWithStrategy(role, route, available(route, ctx, config), health, ctx.getContextUsage()?.tokens ?? 0, state?.physical, undefined, ctx,
+      { mode: "preview", reason: state?.physical ? "continuation" : "initial", state, current: state?.physical || undefined,
+        ...(state?.next ? { recovery: state.next, priorityTarget: state.next, priority: "recovery" as const } : {}) });
+    return selection.selected && identity(selection.selected.model, selection.selected.candidate.account);
   };
-  const pinRoute = (ctx: ExtensionContext, role: string, requested: string | null) => {
+  const pinRoute = async (ctx: ExtensionContext, role: string, requested: string | null) => {
     // A pin on the candidate auto already picks changes nothing, so it is stored as auto instead.
-    const matchesAuto = requested !== null && requested === autoChoice(ctx, role);
+    const matchesAuto = requested !== null && requested === await autoChoice(ctx, role);
     const choice = matchesAuto ? null : requested;
     pi.appendEntry(PIN_ENTRY, { role, identity: choice });
     recordDecision(decisionLogPath, { at: new Date(options.now?.() ?? Date.now()).toISOString(), session: ctx.sessionManager.getSessionId(), logical: `route/${role}`, physical: choice === null ? "auto" : physicalOf(choice), ...(choice && accountOf(choice) ? { account: accountOf(choice) } : {}), reason: "manual" }, degrade);
-    previewRoute(ctx, role);
+    await previewRoute(ctx, role);
     if (matchesAuto) { ctx.ui.notify(`native-router: ${role} already follows auto on ${requested}; pin cleared`, "info"); return; }
-    const note = choice === null ? `native-router: ${role} follows route order` : `native-router: ${role} pinned to ${choice}`;
-    ctx.ui.notify(`${note}; the route's cache rebuilds on the next request`, "info");
+    const note = choice === null ? `native-router: ${role} follows automatic selection` : `native-router: ${role} prefers ${choice}`;
+    ctx.ui.notify(`${note}; a healthy current model stays sticky, and switching candidates rebuilds the route's cache`, "info");
   };
-  const cyclePin = (ctx: ExtensionContext) => {
+  const cyclePin = async (ctx: ExtensionContext) => {
     const model = ctx.model;
     if (!model || model.provider !== "route" || !config.routes[model.id]) { ctx.ui.notify("native-router: select a route first", "warning"); return; }
     const role = model.id;
-    const shown = displayed(ctx, role);
+    const shown = await displayed(ctx, role);
     const target = cycleTarget(config.routes[role], available(config.routes[role], ctx, config), health, ctx.getContextUsage()?.tokens ?? 0, shown && identity(shown.model, shown.candidate.account));
     if (!target) { ctx.ui.notify(`native-router: no eligible candidate for ${role}; pin unchanged`, "warning"); return; }
-    pinRoute(ctx, role, identity(target.model, target.candidate.account));
+    await pinRoute(ctx, role, identity(target.model, target.candidate.account));
   };
   pi.registerCommand("route-pin", {
     description: "Pin this route to one candidate, or auto: /route-pin [candidate|auto]",
@@ -548,12 +699,12 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       } else if (requested === "auto") choice = null;
       else if (labels.includes(requested)) choice = requested;
       else { ctx.ui.notify(`native-router: ${requested} is not a candidate of ${role}; use auto or one of: ${labels.join(", ")}`, "error"); return; }
-      pinRoute(ctx, role, choice);
+      await pinRoute(ctx, role, choice);
     },
   });
   pi.registerShortcut((config.shortcuts?.cyclePin ?? DEFAULT_CYCLE_PIN) as ShortcutKey, {
     description: "Cycle this route's physical pin to the next eligible candidate",
-    handler: ctx => cyclePin(ctx),
+    handler: async ctx => await cyclePin(ctx),
   });
   pi.registerCommand("route-thinking", {
     description: "Clear this route's thinking choice so candidate defaults apply again: /route-thinking default",
@@ -615,7 +766,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     if (!changed) return;
     return { message: { ...message, usage } as typeof event.message };
   });
-  pi.on("agent_before_settle", (event, ctx) => {
+  pi.on("agent_before_settle", async (event, ctx) => {
     if (event.outcome !== "error" || ctx.signal?.aborted || ctx.model?.provider !== "route" || ctx.hasPendingMessages()) return;
     const role = ctx.model.id;
     const route = config.routes[role];
@@ -631,14 +782,20 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     settleAdmission(`${ctx.sessionManager.getSessionId()}:${role}`, { recovered: false });
     if (observed.kind !== "unsafe") health.mark(failed, observed, accountOf(state.physical));
     if (failure.kind === "unsafe") return;
-    const selected = choose(route, available(route, ctx, config), health, Math.max(tokens(event.context.llmMessages), ctx.getContextUsage()?.tokens ?? 0), undefined, state.physical);
+    const estimate = Math.max(tokens(event.context.llmMessages), ctx.getContextUsage()?.tokens ?? 0);
+    const failedTarget = identity(failed, accountOf(state.physical));
+    const selection = await chooseWithStrategy(role, route, available(route, ctx, config), health, estimate, state.physical, state.physical, ctx,
+      { mode: "dispatch", reason: "failover", state, current: state.physical, failed: failedTarget, failureKind: failure.kind, excluded: new Set([state.physical]) });
+    reportStrategyFallback(role, ctx, { ...selection, selected: selection.selected });
+    const selected = selection.selected;
     if (!selected) return;
     const before = event.context.contextMessages.slice(0, -1);
     if (!before.some(m => m.role !== "system") || before.at(-1)?.role === "assistant") return;
     return {
       entries: [
         { type: "context_edit", targetId: last!.sourceEntry.id, replacement: null },
-        { type: "custom", customType: VIRTUAL_MODEL_STATE_ENTRY, data: { provider: "route", modelId: role, state: { ...state, next: identity(selected.model, selected.candidate.account), recoveries: state.recoveries + 1 } } },
+        { type: "custom", customType: VIRTUAL_MODEL_STATE_ENTRY, data: { provider: "route", modelId: role, state: { ...state, next: identity(selected.model, selected.candidate.account),
+          ...(route.strategy && selection.strategyId !== "ordered" && !selection.fallback ? { nextSelection: { strategy: true, reason: selection.reason } } : { nextSelection: undefined }), recoveries: state.recoveries + 1 } } },
       ],
       continue: true,
     };

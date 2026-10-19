@@ -11,7 +11,7 @@ const models: Resolved[] = config.candidates.map(candidate => ({
 }));
 const block = (health: Health, index: number) => health.mark(models[index].model, classify({ stopReason: "error", errorMessage: "insufficient_quota", content: [] } as never, 1000));
 
-test("an eligible pin is chosen ahead of the current physical model", () => {
+test("an explicitly preferred candidate is selected ahead of configured route order", () => {
   const health = new Health();
   expect(choose(config, models, health, 10, identity(models[2].model))?.model.provider).toBe("b");
 });

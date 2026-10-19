@@ -6,11 +6,13 @@ A pin is a custom branch entry, `native-router:physical-pin`, with data `{ role,
 
 ## Selection
 
-`choose()` already takes a preferred identity and falls back to the first usable candidate. The pin is passed as the preferred identity on every resolution, ahead of the current physical model:
+`choose()` takes a preferred identity and falls back to the first usable candidate. Ordered selection keeps an eligible current physical model sticky. When there is no eligible incumbent, preference order is:
 
-- preferred = `state.next` (recovery) when set, else the pin when set, else the current physical model.
+- `state.next` (explicit recovery) when set;
+- an eligible pin when set;
+- the configured automatic selection (route order by default).
 
-Recovery keeps priority so a failed pinned candidate still fails over normally. The pin becomes preferred again on the next request after the candidate is eligible. A pin that is unusable for a request is simply not chosen; route order decides, and the pin is not cleared.
+A pin cannot pull the route away from a healthy current target after failover cooldown expires. If the incumbent becomes unavailable, the still-stored pin is promoted again. A pin that cannot serve is skipped for that request and is not cleared.
 
 ## Cycling
 
@@ -28,4 +30,4 @@ The physical item gets a pin mark (`⚑`) while a pin is set. A pin that is dorm
 
 ## Cache
 
-Changing the physical model goes through the existing transition path, which flushes Magic Context before the next dispatch. The command and hotkey say that the route's cache rebuilds on the next request.
+Setting a pin does not itself switch the physical model. When selection changes candidates because the incumbent is unavailable, the existing transition path flushes Magic Context before replacement dispatch. The command explains that a healthy incumbent stays sticky; the ordinary failover notice reports an actual cache rebuild.

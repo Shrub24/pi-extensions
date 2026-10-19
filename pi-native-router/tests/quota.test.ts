@@ -257,13 +257,16 @@ test("reset times render as remaining time", () => {
   expect(formatRemaining(now - 1, now)).toBe("due");
 });
 
-test("exact server meters from the OAuth or API source are authoritative; estimated and local blends are not", () => {
+test("fresh valid readings are authoritative by default; estimates and local-derived sources are not", () => {
   const base = { rateWindowLabels: {}, usage: { updatedAt: "2026-10-11T13:58:57Z", primary: { usedPercent: 10 } } };
   const now = Date.parse("2026-10-11T14:00:00Z");
-  const parse = (source: string, dataConfidence?: string) => parseCodexbar(JSON.stringify([{ ...base, provider: "codex", source, usage: { ...base.usage, ...(dataConfidence ? { dataConfidence } : {}) } }]), "codex", "codex", now);
+  const parse = (source?: string, dataConfidence?: string) => parseCodexbar(JSON.stringify([{ ...base, provider: "codex", ...(source ? { source } : {}), usage: { ...base.usage, ...(dataConfidence ? { dataConfidence } : {}) } }]), "codex", "codex", now);
   expect(parse("oauth", "exact")).toMatchObject({ snapshot: { authoritative: true } });
+  expect(parse("cli")).toMatchObject({ snapshot: { authoritative: true, source: "cli" } });
+  expect(parse(undefined)).toMatchObject({ snapshot: { authoritative: true, source: "unknown" } });
   expect(parse("oauth", "estimated")).toMatchObject({ snapshot: { authoritative: false } });
   expect(parse("local+api", "exact")).toMatchObject({ snapshot: { authoritative: false } });
+  expect(parse("codexbar-app")).toMatchObject({ snapshot: { authoritative: false } });
 });
 
 test("a recent shared fetch is reused by every process; only a forced or stale refresh runs CodexBar", async () => {

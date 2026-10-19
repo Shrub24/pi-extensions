@@ -113,12 +113,14 @@ export interface State {
   transitions: number;
   recoveries: number;
   next?: string;
+  nextSelection?: { strategy: boolean; reason: string };
   cacheActivity?: CacheActivity;
 }
 export function restore(raw: unknown): State | undefined {
   if (!raw || typeof raw !== "object") return;
   const s = raw as State;
   if (s.version !== 1 || typeof s.physical !== "string" || typeof s.turn !== "string" || (s.next !== undefined && typeof s.next !== "string")) return;
+  if (s.nextSelection !== undefined && (!s.nextSelection || typeof s.nextSelection.strategy !== "boolean" || typeof s.nextSelection.reason !== "string" || s.nextSelection.reason.length > 512)) return;
   // Entries written before the capacity floor was removed still carry it; unknown fields are ignored.
   if (![s.retries, s.transitions, s.recoveries].every(n => Number.isSafeInteger(n) && n >= 0)) return;
   if (s.cacheActivity !== undefined) {

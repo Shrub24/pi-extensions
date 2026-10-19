@@ -38,6 +38,25 @@ IDs must resolve to physical models with configured credentials in the native re
 
 Defaults per route: `contextWindow:200000`, `outputReserve:8192`, `stayRetries:1`, `maxTransitions:3`, `maxRecoveries:2`. A candidate fits when its context window is at least `max(route.contextWindow, currentContextTokens + route.outputReserve)` and its max output is at least the route reserve. Routed turns use Pi's usage-aware context count (the same count shown in the footer); direct calls fall back to estimating their request messages. Transition/recovery limits may be zero. Timeout is 1–60000ms; routes have 1–32 unique candidates. Disable **native Pi** automatic compaction separately as shown; the router does not invoke it. Magic Context must remain loaded with its own compaction/materialization enabled (its `compaction-off` flush refusal blocks transitions).
 
+### Optional TypeScript choice strategy
+
+By default the router uses existing ordered/sticky selection. A route may instead load a trusted local TypeScript module to choose among the router's eligible physical targets:
+
+```json
+"strategy": {
+  "module": "/home/operator/.config/pi/routing/peak-quota-strategy.ts",
+  "options": { "resetHorizonMinutes": 120 }
+}
+```
+
+The module default-exports `{ version: 1, choose(context) }` and returns `{ targetId, reason }`. Import the public types with `import type { RoutingContext, RoutingStrategy } from "@vanillagreen/pi-native-router/strategy"`. See `examples/peak-quota-strategy.ts` for one small policy that prefers fresh authoritative quota near reset, then avoids peak windows, then keeps the incumbent or configured order. Its ordering is illustrative, not an economic guarantee.
+
+The snapshot contains eligible candidates and rejection reasons, account-scoped quota windows and cache evidence, pricing/peak facts, request estimate, current/pinned target and retry/transition budgets. Cache-switch cost is explicitly `unknown` unless the target is already current; no saved tokens or dollar savings are fabricated from TTL alone. Missing, stale and non-authoritative quota and incomplete/unknown prices remain explicit; list prices are not subscription marginal cost. `peak.costTreatment` distinguishes router-adjusted OpenCode Go cost from Command Code cost already calculated by its provider, so a custom strategy can avoid double-counting. The snapshot contains no prompts, keys, key paths, host objects or mutable router handles. The router performs no tracker/catalog fetch in the strategy call.
+
+This is trusted code, not a sandbox: a strategy can read local files or block the Pi process. Keep `choose` synchronous, deterministic from its supplied snapshot and free of I/O. The router validates that it returns an eligible target and bounded explanation; errors or invalid results fall back to ordered/sticky selection and are reported. It cannot add models, bypass health/context/auth checks, or dispatch requests. Recovery targets and bounded same-target retries retain precedence; under the built-in ordered policy a pin is a preference beneath a healthy incumbent. Custom strategies receive the pin as context and can choose among eligible targets. An ineligible pin stays dormant; `/route-pin` cycling remains configured-order based.
+
+The host's native TS module loader caches the module once per absolute path for the Pi process lifetime. Restart Pi after editing the strategy source; reload the extension after changing route settings/options. To roll back, remove `routes.<role>.strategy` and reload; existing pin, quota, health and cache state is unchanged. Routes without the setting retain existing behavior.
+
 ## Providers
 
 One `providers` map (user settings only) holds everything the router knows about a provider. Shared settings sit on the provider: an optional `name` (footer label) and a single key or quota. The optional `accounts` map is for multi-account providers only: each account has its own key and quota and is named in routes as `account`.
@@ -116,13 +135,13 @@ Account and provider causes are shared across Pi processes of the same user on o
 A provider or account may map to a CodexBar provider so `/quotas` can show its windows; the mapping sits beside its key (see Providers):
 
 - `/quotas` runs `codexbar usage --provider <provider> [--account <label>] --format json` with a 15 s deadline and a 64 KiB output cap, under a per-account refresh lease, and prints each window with a fill bar, its usage to two decimals, reset and observation age. Missing binary, timeout or unrecognised output is shown as unknown and never counts as capacity or as a generation failure.
-- `enforce: true` writes a tracker-sourced cause that skips the account until its exhausted window resets. It is **off by default**; enable it per account once the account's CodexBar source is authoritative (`api`, `web` or `oauth`).
+- `enforce: true` writes a tracker-sourced cause that skips the account until its exhausted window resets. It is **off by default**; enable it per account when you want valid CodexBar quota readings enforced.
 - **Default-auth providers** (Pi's own login, such as `openai-codex` and `anthropic`) have no key or accounts; their quota sits on the provider. CodexBar reads the logged-in account for these, so no label is passed. An exhausted window blocks every model on that provider until its reset. A provider with `accounts` puts its quota on each account instead.
 - A healthy snapshot clears only tracker-sourced causes. Auth, rate, outage and error-derived quota causes are unaffected.
 - `/quotas-config [--replace] [path]` writes CodexBar's config from the quota mappings: each account becomes a token account labelled with its quota account (or router id); a single-key provider's key goes on the provider as `apiKey`, as CodexBar requires. Providers are set to `source: "api"` so their meters are account-authoritative rather than device-local. The file is written 0600 via a temporary file and rename, and an existing file is refused unless `--replace` is given. Accounts whose key variable is unset are reported and skipped.
 - Refresh runs on session start and every five minutes. The shared store is the gate: any process reuses an account's last CodexBar attempt (success or failure) if it is under four minutes old, so all Pi processes on the machine run CodexBar at most once per gate per account. `/quotas` reuses that fetch; `/quotas refresh` forces a new one. Dispatch never waits for CodexBar.
-- Snapshots are authoritative only when the tracker reports server meters (`source` api, web or oauth, or an explicit authoritative confidence). A `local+api` blend or estimate never enforces a block.
-- **No ranking.** Quota snapshots only block an exhausted account until its window resets. The router never ranks candidates by remaining headroom, so an account with more quota is not preferred over an account with less; candidate order and health decide.
+- Fresh, structurally valid snapshots are authoritative by default, including CodexBar's CLI source. Explicitly estimated readings and local-derived sources (`local`, `local+api`, or cached `codexbar-app`) remain advisory and never enforce a block.
+- **Default strategy: no quota ranking.** Quota snapshots only block an exhausted account until its window resets. Without a custom route strategy, the router does not rank candidates by remaining headroom; configured order and health decide. An opted-in trusted TypeScript strategy may explicitly use quota observations to express operator preference.
 - **Rollback:** set `enforce` to `false` (or remove the `quota` mapping) per account to stop blocking. Removing the mapping also stops refresh. Existing tracker causes expire at their reset, or clear with `/native-router-health` reset.
 
 ## Model pricing (estimates)
@@ -160,16 +179,16 @@ The model part of `provider/model` is Pi's own model name, so model labels come 
 
 ## Physical pin
 
-`/route-pin` chooses which candidate a route tries first. With no argument it opens a picker of `auto` and the route's candidates; `/route-pin <candidate>` (for example `opencode-go/deepseek-v4.1-flash#go-c`) or `/route-pin auto` sets it directly, and completion offers the labels. The hotkey cycles the pin to the next eligible candidate in route order and wraps; set it under `shortcuts.cyclePin` (default `ctrl+shift+m`, which Pi leaves unbound; `ctrl+shift+p` is taken by `app.model.cycleBackward`).
+`/route-pin` sets a preferred candidate without removing the route's fallbacks. A healthy current physical model stays sticky; when it is unavailable, the pin is tried before configured route order. With no argument it opens a picker of `auto` and the route's candidates; `/route-pin <candidate>` (for example `opencode-go/deepseek-v4.1-flash#go-c`) or `/route-pin auto` sets it directly, and completion offers the labels. The hotkey cycles the pin to the next eligible candidate in route order and wraps; set it under `shortcuts.cyclePin` (default `ctrl+shift+m`, which Pi leaves unbound; `ctrl+shift+p` is taken by `app.model.cycleBackward`).
 
 - The pin is stored per route on the session branch, so resume and fork restore it. It is never shared across sessions.
-- A pinned candidate is tried first when it is healthy and fits the request. Recovery targets still take priority.
-- A pin that cannot serve (cooldown, exhausted quota, or too small for the request) is dormant: that request uses route order, and the pin applies again once the candidate is eligible.
-- `auto` clears the pin. So does picking the candidate that auto would already pick now (the last served one, else the first in route order): the pin is stored as auto, because it would change nothing.
+- An eligible current physical model stays sticky, even if another candidate is pinned. When there is no eligible incumbent, recovery targets take priority, then the eligible pin, then automatic selection.
+- A pin that cannot serve (cooldown, exhausted quota, or too small for the request) is dormant: that request uses the route's automatic selection, and the pin becomes a preference again once the incumbent is unavailable.
+- `auto` clears the pin. So does picking the candidate that automatic selection would already pick now; without a custom strategy this is the last served candidate, else the first in route order.
 - The physical footer item shows `⚑` while a pin is set. Each manual change is logged with reason `manual`.
-- Every manual change notifies that the route's cache rebuilds on the next request.
+- A pin change reports that the current model stays sticky; an actual physical switch uses the normal cache-rebuild notice.
 
-Selecting a route shows the candidate its next request would try (the pin, else the last served model, else route order), so cycling starts from what the route will do. Failures surface as notices: a candidate that fails with a quota, auth, or rate error warns with its cooldown deadline, and a failover warns with the old and new candidates. Transient errors retried on the same candidate are shown as info.
+Selecting a route shows its next candidate (healthy current model, then eligible pin, then configured automatic selection), so cycling starts from what the route will do. Failures surface as notices: a candidate that fails with a quota, auth, or rate error warns with its cooldown deadline, and a failover warns with the old and new candidates. Transient errors retried on the same candidate are shown as info.
 
 ## Decision log
 
