@@ -681,6 +681,7 @@ test("a pin cannot pull the route back to a recovered failed candidate while the
     expect(h.dispatches.map(d => d.physical)).toEqual(["fake-b", "fake-b", "fake-a"]);
     await pin.handler("fake-b/model", ctx);
     expect(statuses.get(FOOTER_KEYS.model)).not.toContain("⚑");
+    expect(statuses.get(FOOTER_KEYS.pinHealth)).toBe("⚠");
     await h.session.prompt("ineligible pin falls back and consumes its one-shot override");
 
     h.clock.value += 61_000;

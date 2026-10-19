@@ -8,6 +8,7 @@ import { isPeakPriced, isPeakRecorded } from "./pricing/reconcile";
 export const FOOTER_KEYS = {
   provider: "native-router-provider",
   model: "native-router-model",
+  pinHealth: "native-router-pin-health",
   peak: "native-router-peak",
   thinking: "native-router-thinking",
 } as const;

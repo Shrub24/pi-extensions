@@ -522,12 +522,21 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     reportStrategyFallback(role, ctx, { ...selection, selected: selection.selected }, false);
     return selection.selected;
   };
+  const pinHealthText = (ctx: ExtensionContext, role: string): string | undefined => {
+    const pin = pinOf(ctx, role);
+    if (typeof pin !== "string") return undefined;
+    const candidate = config.routes[role].candidates.find(value => identity(value, value.account) === pin);
+    if (!candidate) return undefined;
+    const model = ctx.modelRegistry.find(candidate.provider, candidate.id);
+    return model && health.blockedReason(model, candidate.account) ? "⚠" : undefined;
+  };
   const setPhysical = (ctx: ExtensionContext, model: Model<Api> | undefined, account: string | undefined, pinned: boolean) => {
     ctx.ui.setStatus(FOOTER_KEYS.provider, model === undefined ? undefined : providerText(model.provider, account, config.display));
     ctx.ui.setStatus(FOOTER_KEYS.model, model === undefined ? undefined : modelText(model.name, pinned));
   };
   const clearRoute = (ctx: ExtensionContext) => {
     setPhysical(ctx, undefined, undefined, false);
+    ctx.ui.setStatus(FOOTER_KEYS.pinHealth, undefined);
     ctx.ui.setStatus(FOOTER_KEYS.peak, undefined);
     ctx.ui.setStatus(FOOTER_KEYS.thinking, undefined);
   };
@@ -540,6 +549,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     if (!shown) { clearRoute(ctx); return; }
     const { model, candidate } = shown;
     setPhysical(ctx, model, candidate.account, isPinned(ctx, role, identity(model, candidate.account)));
+    ctx.ui.setStatus(FOOTER_KEYS.pinHealth, pinHealthText(ctx, role));
     ctx.ui.setStatus(FOOTER_KEYS.peak, peakText(model.provider, model.id, options.now?.() ?? Date.now()));
     const explicit = choice ?? undefined;
     const level = routeLevel(model, candidate.thinkingLevel, explicit);
@@ -550,6 +560,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     nextDisplayGeneration(ctx);
     if (model?.provider === "route" && config.routes[model.id]) { await previewRoute(ctx, model.id); return; }
     setPhysical(ctx, undefined, undefined, false);
+    ctx.ui.setStatus(FOOTER_KEYS.pinHealth, undefined);
     ctx.ui.setStatus(FOOTER_KEYS.peak, undefined);
     ctx.ui.setStatus(FOOTER_KEYS.thinking, model?.reasoning && ctx.thinkingLevel ? thinkingText(ctx.thinkingLevel, undefined) : undefined);
   };
@@ -558,6 +569,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     if (!ctx.hasUI || ctx.model?.provider !== "route" || ctx.model.id !== role) return;
     nextDisplayGeneration(ctx);
     setPhysical(ctx, model, account, pinned);
+    ctx.ui.setStatus(FOOTER_KEYS.pinHealth, pinHealthText(ctx, role));
     ctx.ui.setStatus(FOOTER_KEYS.peak, peakText(model.provider, model.id, options.now?.() ?? Date.now()));
     ctx.ui.setStatus(FOOTER_KEYS.thinking, model.reasoning ? thinkingText(effective, requested) : undefined);
   };
