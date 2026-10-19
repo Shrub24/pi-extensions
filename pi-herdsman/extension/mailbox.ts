@@ -257,14 +257,16 @@ const LIMITS = {
 };
 // Keep the storage path stable: record envelopes migrate V4 state and its exact
 // accepted assignment artifacts in place, rather than abandoning live mailboxes.
-const root = join(herdsmanDataRoot(), "runtime", "mailboxes-v4");
+function mailboxRoot(): string {
+  return join(herdsmanDataRoot(), "runtime", "mailboxes-v4");
+}
 
 export function agentMailboxPath(
   workspaceId: string,
   agentLabel: string,
 ): string {
   return join(
-    root,
+    mailboxRoot(),
     createHash("sha256")
       .update(`${workspaceId}\0${agentLabel}`)
       .digest("hex")
@@ -291,6 +293,7 @@ export function scanAgentStates(): {
   states: Array<{ path: string; state: ManagedAgentState }>;
   issues: ManagedAgentStateIssue[];
 } {
+  const root = mailboxRoot();
   if (!existsSync(root)) return { states: [], issues: [] };
   const states: Array<{ path: string; state: ManagedAgentState }> = [];
   const issues: ManagedAgentStateIssue[] = [];
@@ -1070,7 +1073,7 @@ export function claimAgentMailbox(
   path: string,
   hooks: { afterStaleOwnerRemoved?: () => void } = {},
 ): () => void {
-  ensure(root);
+  ensure(mailboxRoot());
   ensure(path);
   try {
     return claimProcessLock(file(path, ".starting"), {
@@ -1085,7 +1088,7 @@ export function claimAgentMailbox(
   }
 }
 export function resetAgentMailbox(path: string): void {
-  ensure(root);
+  ensure(mailboxRoot());
   ensure(path);
   for (const name of [
     "state.json",

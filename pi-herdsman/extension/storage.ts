@@ -1,12 +1,19 @@
 import { tmpdir } from "node:os";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 
 const RESULT_PREFIX = "result:";
 const RESULT_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 export function herdsmanDataRoot(): string {
+  const configuredRoot = process.env.PI_HERDSMAN_DATA_DIR?.trim();
+  if (configuredRoot) {
+    if (!isAbsolute(configuredRoot)) {
+      throw new Error("PI_HERDSMAN_DATA_DIR must be an absolute path");
+    }
+    return configuredRoot;
+  }
   return join(getAgentDir(), "pi-herdsman");
 }
 

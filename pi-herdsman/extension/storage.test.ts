@@ -32,6 +32,37 @@ test("recoverable Herdsman state lives under Pi agent data", () => {
   assert.notEqual(herdsmanTempRoot().startsWith(root), true);
 });
 
+test("an explicit Herdsman data root is shared across Pi agent directories", () => {
+  const previousRoot = process.env.PI_HERDSMAN_DATA_DIR;
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const sharedRoot = "/tmp/pi-herdsman-shared";
+  process.env.PI_HERDSMAN_DATA_DIR = sharedRoot;
+  process.env.PI_CODING_AGENT_DIR = "/tmp/pi-role-agent";
+  try {
+    assert.equal(herdsmanDataRoot(), sharedRoot);
+    assert.equal(
+      dirname(agentMailboxPath("workspace", "agent")),
+      join(sharedRoot, "runtime", "mailboxes-v4"),
+    );
+  } finally {
+    if (previousRoot === undefined) delete process.env.PI_HERDSMAN_DATA_DIR;
+    else process.env.PI_HERDSMAN_DATA_DIR = previousRoot;
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+  }
+});
+
+test("PI_HERDSMAN_DATA_DIR must be absolute", () => {
+  const previousRoot = process.env.PI_HERDSMAN_DATA_DIR;
+  process.env.PI_HERDSMAN_DATA_DIR = "relative/path";
+  try {
+    assert.throws(() => herdsmanDataRoot(), /must be an absolute path/);
+  } finally {
+    if (previousRoot === undefined) delete process.env.PI_HERDSMAN_DATA_DIR;
+    else process.env.PI_HERDSMAN_DATA_DIR = previousRoot;
+  }
+});
+
 test("result references use canonical request UUIDs", () => {
   const requestId = "550e8400-e29b-41d4-a716-446655440000";
   const ref = resultRef(requestId);

@@ -3736,6 +3736,9 @@ function prepareManagedWorkerLaunch(
       ...(process.env.PI_CODING_AGENT_DIR
         ? [`PI_CODING_AGENT_DIR=${process.env.PI_CODING_AGENT_DIR}`]
         : []),
+      ...(process.env.PI_HERDSMAN_DATA_DIR
+        ? [`PI_HERDSMAN_DATA_DIR=${process.env.PI_HERDSMAN_DATA_DIR}`]
+        : []),
       "PI_OFFLINE=1",
       "PI_OTEL_RUN_KIND=child",
       "MAGIC_CONTEXT_PROFILE=subagent",
