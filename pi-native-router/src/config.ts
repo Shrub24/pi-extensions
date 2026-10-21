@@ -4,7 +4,7 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { QuotaSource } from "./quota";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 
-export const PACKAGE_ID = "@vanillagreen/pi-native-router";
+export const PACKAGE_ID = "pi-native-router";
 /** Exactly one key source: an environment variable name or an absolute file path (e.g. a sops-nix secret). */
 export type KeySource = { apiKeyEnv: string; apiKeyFile?: undefined } | { apiKeyFile: string; apiKeyEnv?: undefined };
 /** One key of a multi-account provider. Its id is what routes, the footer and telemetry show. */
@@ -216,5 +216,5 @@ export function readConfig(): Config {
   try { text = readFileSync(join(getAgentDir(), "settings.json"), "utf8"); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return parseConfig({}); throw error; }
   const settings = JSON.parse(text);
-  return parseConfig(settings.kendex?.extensionManager?.config?.[PACKAGE_ID] ?? {});
+  return parseConfig(settings[PACKAGE_ID] ?? {});
 }

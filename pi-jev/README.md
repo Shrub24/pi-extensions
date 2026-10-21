@@ -1,4 +1,4 @@
-# @vanillagreen/pi-jev
+# pi-jev
 
 A substrate for [Jev](https://typesafe.ai/) decisions in the Pi coding agent, plus two consumers that use it.
 
@@ -31,7 +31,7 @@ Set `orchestratorCheckInMs` (0 disables; env `PI_JEV_CHECK_IN_MS`) to the cadenc
 
 ## Install
 
-- npm: `pi install npm:@vanillagreen/pi-jev` (both entries load).
+- In this repo: a Bun workspace package named `pi-jev` (both entries load).
 - From this repo: `pi -e /path/to/pi-jev/extensions/permission-authorizer.ts -e /path/to/pi-jev/extensions/tool-intent.ts`. Either entry alone works.
 
 For the permission link, name it in the permission system's configuration:
@@ -131,7 +131,7 @@ Every question names the blocks it reads, and only those are built and sent. The
 
 ## Settings
 
-Open `/extensions:settings`; values live under `kendex.extensionManager.config["@vanillagreen/pi-jev"]` in `~/.pi/agent/settings.json`. Only the user file is read: a project must not be able to put the judge into `live`, move a band edge, or redirect its decision log.
+Values live under the `pi-jev` key in `~/.pi/agent/settings.json`, written by hand or by Nix; nothing writes them from inside a session. Only the user file is read: a project must not be able to put the judge into `live`, move a band edge, or redirect its decision log.
 
 - `mode`: `shadow` (default), `advisory`, or `live`. `shadow` records and defers every ask to you; `advisory` allows every ask and steers instead — the judge's objection becomes a sentence to the agent, never a prompt or a refusal, and only material harm can refuse; `live` enforces the composition as written.
 - `watcherMode`: whether Jev judges optional advisory wakes — background-task soft reminders and Herdsman soft-deadline checkpoints. `off` (default) does not listen, so every wake stays exactly as its producer sent it; `shadow` asks the judge for each offer and records the reading without claiming it, so the wake is never delayed or suppressed; `advisory` claims the offer and may skip the reminder. Independent of `mode`, because judging an advisory spends a request per offer rather than deciding anything about your permissions.

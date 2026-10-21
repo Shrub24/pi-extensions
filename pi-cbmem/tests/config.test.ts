@@ -135,13 +135,7 @@ test("settings are read from the user settings file only", () => {
 	mkdirSync(dir, { recursive: true });
 	writeFileSync(
 		`${dir}/settings.json`,
-		JSON.stringify({
-			kendex: {
-				extensionManager: {
-					config: { "@vanillagreen/pi-cbmem": { adminTools: true, binary: "/pinned/cbm" } },
-				},
-			},
-		}),
+		JSON.stringify({ "pi-cbmem": { adminTools: true, binary: "/pinned/cbm" } }),
 	);
 	try {
 		const settings = readSettingsFile({ PI_CODING_AGENT_DIR: dir } as NodeJS.ProcessEnv);

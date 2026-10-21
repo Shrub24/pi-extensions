@@ -21,13 +21,11 @@ const events = new Map<string, (event: unknown, ctx: ExtensionContext) => unknow
 // The session the next event runs in; a forked session sets both.
 let sessionId = "retention-session";
 let branch: unknown[] = [];
-const ctx = {
-	cwd: process.cwd(), hasUI: false, isProjectTrusted: () => true,
+const ctx = { cwd: process.cwd(), hasUI: false, isProjectTrusted: () => true,
 	sessionManager: { getSessionId: () => sessionId, getSessionFile: () => join(process.cwd(), `${sessionId}.jsonl`), getBranch: () => branch, getEntries: () => branch },
 	ui: { notify() {}, setWidget() {} },
 } as unknown as ExtensionContext;
-const pi = {
-	events: createEventBus(),
+const pi = { events: createEventBus(),
 	registerTool(tool: Tool) { tools.set(tool.name, tool); },
 	registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {},
 	on(event: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) { events.set(event, handler); },
@@ -39,7 +37,7 @@ const execute = async (params: Record<string, unknown>) => await tools.get("bg_t
 // A small output buffer, so a finished task's log is longer than what is read back.
 const settingsPath = join(process.env.PI_CODING_AGENT_DIR!, "settings.json");
 const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
-settings.kendex.extensionManager.config["@vanillagreen/pi-background-tasks"].outputBufferMaxChars = 64;
+settings["pi-bash-processes"].outputBufferMaxChars = 64;
 writeFileSync(settingsPath, JSON.stringify(settings));
 
 // Two lanes a previous run left: one whose worktree is gone, one whose log is
@@ -79,26 +77,21 @@ symlinkSync(victim, join(lanes, "planted"));
 const { default: backgroundTasks } = await import("../../extensions/background-tasks.js");
 backgroundTasks(pi);
 await dispatch("session_start");
-const pruned = {
-	goneLane: existsSync(goneLane),
+const pruned = { goneLane: existsSync(goneLane),
 	oldLane: readdirSync(oldLane).sort(),
 	foreign: readdirSync(foreign).sort(),
 	unmarked: readdirSync(unmarked).sort(),
 	victim: readdirSync(victim).sort(),
 };
 
-const waitForExit = async (id: string) => {
-	const deadline = Date.now() + 10_000;
+const waitForExit = async (id: string) => { const deadline = Date.now() + 10_000;
 	// A real child exits on its own; poll until its close event finalized it.
-	while ((await execute({ action: "log", id })).details.task!.status === "running") {
-		if (Date.now() > deadline) throw new Error(`retention_fixture.task_running=${id}`);
-		await new Promise((resolve) => setTimeout(resolve, 10));
-	}
+	while ((await execute({ action: "log", id })).details.task!.status === "running") { if (Date.now() > deadline) throw new Error(`retention_fixture.task_running=${id}`);
+		await new Promise((resolve) => setTimeout(resolve, 10)); }
 };
 
 const spawned = MAX_FINISHED_TASKS + 5;
-for (let i = 1; i <= spawned; i++) {
-	await execute({ action: "spawn", command: `printf out-${i}`, notifyOnExit: false });
+for (let i = 1; i <= spawned; i++) { await execute({ action: "spawn", command: `printf out-${i}`, notifyOnExit: false });
 	await waitForExit(`bg-${i}`);
 }
 const listedTasks = (await execute({ action: "list" })).details.tasks as unknown as Record<string, unknown>[] | { counts: { tasks: number } };
@@ -139,8 +132,7 @@ const listedAfterShutdown = (await execute({ action: "list" })).content[0]!.text
 // The bound at session_start and a clear in the fork forget them, and the
 // logs stay.
 const parentLogs: string[] = [];
-branch = Array.from({ length: MAX_FINISHED_TASKS + 1 }, (_, i) => {
-	const logFile = join(laneDir, `bg-${100 + i}-parent.log`);
+branch = Array.from({ length: MAX_FINISHED_TASKS + 1 }, (_, i) => { const logFile = join(laneDir, `bg-${100 + i}-parent.log`);
 	writeFileSync(logFile, "parent-output");
 	parentLogs.push(logFile);
 	const task = { ...parentTask, id: `bg-${100 + i}`, logFile, updatedAt: (parentTask.updatedAt as number) + i };
@@ -150,16 +142,14 @@ sessionId = "fork-session";
 await dispatch("session_start");
 const forkListed = ((await execute({ action: "list" })).details.tasks as unknown as unknown[]).length;
 await execute({ action: "clear" });
-const fork = {
-	taskSession: parentTask.sessionId,
+const fork = { taskSession: parentTask.sessionId,
 	listed: forkListed,
 	logsKept: parentLogs.filter((logFile) => existsSync(logFile)).length,
 	listedAfterClear: (await execute({ action: "list" })).content[0]!.text,
 };
 await dispatch("session_shutdown");
 
-process.stdout.write(JSON.stringify({
-	pruned,
+process.stdout.write(JSON.stringify({ pruned,
 	spawned,
 	listed: listedCount,
 	logInLane: (newest.logFile as string).startsWith(`${laneDir}/`),

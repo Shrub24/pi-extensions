@@ -89,14 +89,16 @@ let
   };
 
   # Its package.json export map is what pi-bash-processes imports it by, so a
-  # dependency link there resolves without either plugin being rewritten.
+  # dependency link there resolves without either plugin being rewritten. The
+  # dependency is optional: without the renderer the row falls back to its own
+  # presentation.
   tool-renderer = buildPiBoltPlugin {
     pname = "pi-tool-renderer";
     version = versionOf "pi-tool-renderer";
     src = checkout "pi-tool-renderer";
     entry = "extensions/tool-renderer.ts";
     pluginName = "tool-renderer";
-    packageName = "@vanillagreen/pi-tool-renderer";
+    packageName = "pi-tool-renderer";
   };
 
   bash-processes = buildPiBoltPlugin {

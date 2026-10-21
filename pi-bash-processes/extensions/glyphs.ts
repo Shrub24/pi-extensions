@@ -3,8 +3,10 @@ import { readPackageConfig } from "./package-config.js";
 export type GlyphStyle = "unicode" | "ascii";
 export type GlobalGlyphStyleOverride = "inherit" | GlyphStyle;
 
-const LOCAL_CONFIG_ID = "@vanillagreen/pi-background-tasks";
-const GLOBAL_CONFIG_ID = "@vanillagreen/pi-tool-renderer";
+const LOCAL_CONFIG_ID = "pi-bash-processes";
+// The global glyph override is the renderer's setting to own; it moves when
+// that package's own config namespace does.
+const GLOBAL_CONFIG_ID = "pi-tool-renderer";
 
 function asGlyphStyle(value: unknown): GlyphStyle | undefined {
 	return value === "unicode" || value === "ascii" ? value : undefined;

@@ -8,8 +8,8 @@ import { openLaneDir, pruneLanes } from "../scripts/lane-retention.js";
 import { expandHome, installSettingsCacheRefresh, piUserDir, readPackageConfig, recordProjectTrust } from "./package-config.js";
 
 const INSTALL_SYMBOL = Symbol.for("kendex.pi-output-policy.installed");
-const CONFIG_ID = "@vanillagreen/pi-output-policy";
-const BACKGROUND_TASKS_CONFIG_ID = "@vanillagreen/pi-background-tasks";
+const CONFIG_ID = "pi-output-policy";
+const BACKGROUND_TASKS_CONFIG_ID = "pi-bash-processes";
 const DEFAULT_MINIMIZER_MAX_CAPTURE_BYTES = 1024 * 1024;
 const DEFAULT_SHELL_MINIMIZER_ENABLED = true;
 const DEFAULT_MODEL_OUTPUT_MAX_CHARS = 96_000;

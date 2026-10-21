@@ -1,4 +1,4 @@
-# @vanillagreen/pi-background-tasks
+# pi-bash-processes
 
 ## Advisory wake contract
 
@@ -24,19 +24,11 @@ only while the session and work are still current.
 
 A Pi extension for shell commands that run while the conversation continues. It supports builds, development servers and log monitors.
 
-![Spawning background tasks](https://raw.githubusercontent.com/vanillagreencom/kendex/main/pi-extensions/pi-background-tasks/assets/spawn-tasks.png) ![Inline mini-dashboard](https://raw.githubusercontent.com/vanillagreencom/kendex/main/pi-extensions/pi-background-tasks/assets/inline-dashboard.png)
-
-> Extracted from [vanillagreencom/kendex](https://github.com/vanillagreencom/kendex) (import commit `b146363`); maintained here independently since.
+> Forked from, and maintained independently of, kendex's `pi-extensions/pi-background-tasks` (import commit `b146363`).
 
 ## Install
 
-- npm: `pi install npm:@vanillagreen/pi-background-tasks`.
-- kendex: add the declaration below to the project's `kendex.toml`, or to `~/.config/kendex/kendex.toml` for user scope. Run `kendex update-pi`.
-
-```toml
-[pi-extensions."@vanillagreen/pi-background-tasks"]
-source = "kendex"
-```
+- In this repo: a Bun workspace package, installed by name (`pi-bash-processes`). The Nix plugins build is what deployed configurations use.
 
 Restart Pi after installation. Use `kendex update-pi --check` to preview the installation.
 
@@ -230,9 +222,13 @@ about one per second.
 
 ## Settings
 
-The settings editor writes project values to `.pi/settings.json`. The default user file is `~/.pi/agent/settings.json`. `PI_CODING_AGENT_DIR` changes the user directory. Package values are stored under `kendex.extensionManager.config["@vanillagreen/pi-background-tasks"]`.
+Settings are files, not a menu. This package reads its own top-level key in Pi's settings files: `~/.pi/agent/settings.json` for user scope, and `.pi/settings.json` for project scope, which applies only after Pi marks the workspace trusted. `PI_CODING_AGENT_DIR` changes the user directory. Nothing writes these files from inside a session, so a Nix-managed or hand-edited file is the source of truth.
 
-Open `/extensions:settings`; settings appear under the **Background Tasks** tab. Project settings in `.pi/settings.json` apply only after Pi marks the workspace trusted.
+```json
+{ "pi-bash-processes": { "outputAlertMaxChars": 4000, "showWidget": false } }
+```
+
+Session-local choices, such as showing or hiding the widget for this run, stay in memory and are not written back.
 
 - `enabled`: package toggle; `glyphStyle` picks Unicode or ASCII symbols, and `pi-tool-renderer`'s global override wins when set.
 - Tool surface: the interactive TUI declares `bg_task` (`spawn`, `get`, `stop`, `list`, `extend`) and no `bg_status`; `print`, `json`, `rpc` and any unrecognized mode keep the compatibility surface (bounded `wait`, `bg_status`). There is nothing to configure — the mode Pi reports decides it.
@@ -243,7 +239,7 @@ Open `/extensions:settings`; settings appear under the **Background Tasks** tab.
 - Shortcuts: `backgroundBashShortcut`, `widgetToggleShortcut`, `dashboardShortcut`; `none` disables one, and a change takes effect on restart.
 - Storage: `taskDir`; the `PI_BG_TASK_DIR` environment variable overrides it.
 
-Maintainer notes are in [DEVELOPMENT.md](DEVELOPMENT.md). The package is kendex's own, based on the MIT-licensed `@ifi/pi-background-tasks`; see `THIRD_PARTY_NOTICES.md`.
+Maintainer notes are in [DEVELOPMENT.md](DEVELOPMENT.md). The package began as kendex's, itself based on the MIT-licensed `@ifi/pi-background-tasks`; see `THIRD_PARTY_NOTICES.md`.
 
 - `wakeMessageStyle`: `line` (default) renders each wake as one dim line, `card` restores the ruled banner, `hidden` renders nothing (the agent is still woken).
 

@@ -9,10 +9,7 @@ Load this package through Pi package/extension discovery in **both parent and wo
 ```json
 {
   "compaction": { "enabled": false },
-  "kendex": {
-    "extensionManager": {
-      "config": {
-        "@vanillagreen/pi-native-router": {
+  "pi-native-router": {
           "flushTimeoutMs": 5000,
           "routes": {
             "worker": {
@@ -27,9 +24,6 @@ Load this package through Pi package/extension discovery in **both parent and wo
               ]
             }
           }
-        }
-      }
-    }
   }
 }
 ```

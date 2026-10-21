@@ -15,7 +15,7 @@ import { startExtensionHost, type HostTool } from "./fixtures/extension-host.js"
 // `intentMode` is read, and the schema is built when the extension registers its
 // tools. One host per test file, as the fixture requires.
 const host = await startExtensionHost({
-	packageConfig: { "@vanillagreen/pi-tool-renderer": { intentMode: "required" } },
+	packageConfig: { "pi-bash-processes": { intentMode: "required" } },
 });
 afterAll(() => host.dispose());
 

@@ -1,7 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-import { clearPackageConfigCache, SETTINGS_CHANGED_EVENT } from "./package-config.js";
-import { CONFIG_ID } from "./settings.js";
+import { clearPackageConfigCache } from "./package-config.js";
 import { invalidateRenderCaches } from "./settings-revision.js";
 
 interface ToolExecutionUi {
@@ -23,11 +22,6 @@ let componentRefs = new Set<WeakRef<TrackedToolExecutionComponent>>();
  *  It doubles past the live count after each prune, so pruning stays amortized. */
 const MIN_PRUNE_AT = 64;
 let pruneAt = MIN_PRUNE_AT;
-
-interface ExtensionSettingChange {
-	extensionId?: unknown;
-	key?: unknown;
-}
 
 export function trackToolExecutionComponent(component: unknown): void {
 	if (!component || typeof component !== "object") return;
@@ -77,15 +71,15 @@ export function clearTrackedToolExecutionComponents(): void {
 }
 
 export function installLiveSettingsRefresh(pi: ExtensionAPI): void {
-	const unsubscribe = pi.events.on(SETTINGS_CHANGED_EVENT, (data: unknown) => {
+	pi.on("session_start", () => {
+		// Settings are file-managed: a change applies on the next read window, so
+		// the lifecycle is the only point this process can be sure of a fresh
+		// answer, and the tracked components are dropped with the session.
 		clearPackageConfigCache();
-		const change = data as ExtensionSettingChange | undefined;
-		if (change?.extensionId !== CONFIG_ID || change.key !== "showReadImages") return;
-		refreshToolExecutionComponents();
+		clearTrackedToolExecutionComponents();
 	});
-	pi.on("session_start", clearTrackedToolExecutionComponents);
 	pi.on("session_shutdown", () => {
-		unsubscribe();
+		clearPackageConfigCache();
 		clearTrackedToolExecutionComponents();
 	});
 }

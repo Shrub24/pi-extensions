@@ -16,7 +16,7 @@
  * The `project` argument is therefore optional everywhere: when the model
  * omits it the session project is filled in, so no project ids have to be
  * remembered. Config lives in the user settings file under
- * `kendex.extensionManager.config["@vanillagreen/pi-cbmem"]`.
+ * `pi-cbmem` key of the user settings file.
  */
 
 import { execFile } from "node:child_process";
@@ -151,7 +151,7 @@ function registerStatusCommand(
 			const lines: string[] = [];
 			lines.push(`pi-cbmem: ${config.enabled ? "enabled" : "disabled"}`);
 			if (!config.enabled) {
-				lines.push("Set kendex.extensionManager.config[\"@vanillagreen/pi-cbmem\"].enabled to true.");
+				lines.push("Set the pi-cbmem key in the user settings file: { \"pi-cbmem\": { \"enabled\": true } }.");
 				notifyLines(ctx, lines);
 				return;
 			}

@@ -5,8 +5,7 @@ import { join } from "node:path";
 
 import { resetCapabilitiesCache, setCapabilities } from "@earendil-works/pi-tui";
 
-import {
-	clearTrackedToolExecutionComponents,
+import { clearTrackedToolExecutionComponents,
 	installLiveSettingsRefresh,
 	trackToolExecutionComponent,
 } from "../tool-renderer/live-settings.js";
@@ -19,28 +18,19 @@ const imageData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+
 
 type ReadImageSetting = "off" | "always" | "on" | boolean;
 
-afterEach(() => {
-	resetCapabilitiesCache();
+afterEach(() => { resetCapabilitiesCache();
 	clearTrackedToolExecutionComponents();
 	for (const dir of createdDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 	clearPackageConfigCache();
 });
 
-function writeSettings(cwd: string, config: Record<string, unknown>): void {
-	writeFileSync(
+function writeSettings(cwd: string, config: Record<string, unknown>): void { writeFileSync(
 		join(cwd, ".pi", "settings.json"),
-		JSON.stringify({
-			kendex: {
-				extensionManager: {
-					config: { "@vanillagreen/pi-tool-renderer": config },
-				},
-			},
-		}),
+		JSON.stringify({ "pi-tool-renderer": config , }),
 	);
 }
 
-function tempCwd(showReadImages?: ReadImageSetting, overrides: Record<string, unknown> = {}): string {
-	const cwd = mkdtempSync(join(tmpdir(), "pi-tool-renderer-read-images-"));
+function tempCwd(showReadImages?: ReadImageSetting, overrides: Record<string, unknown> = {}): string { const cwd = mkdtempSync(join(tmpdir(), "pi-tool-renderer-read-images-"));
 	createdDirs.push(cwd);
 	mkdirSync(join(cwd, ".pi"), { recursive: true });
 	const config = { ...overrides };
@@ -50,24 +40,14 @@ function tempCwd(showReadImages?: ReadImageSetting, overrides: Record<string, un
 	return cwd;
 }
 
-function writeImageMode(cwd: string, showReadImages: ReadImageSetting): void {
-	writeSettings(cwd, { showReadImages });
+function writeImageMode(cwd: string, showReadImages: ReadImageSetting): void { writeSettings(cwd, { showReadImages });
 }
 
-function readRenderer(cwd: string): any {
-	let definition: any;
-	const pi = {
-		registerTool(tool: any) {
-			definition = tool;
-		},
-	};
-	const agent = {
-		createReadTool: () => ({
-			description: "read",
+function readRenderer(cwd: string): any { let definition: any;
+	const pi = { registerTool(tool: any) { definition = tool; }, };
+	const agent = { createReadTool: () => ({ description: "read",
 			parameters: {},
-			execute: async () => ({ content: [] }),
-		}),
-	};
+			execute: async () => ({ content: [] }), }), };
 	registerRead(pi as any, agent, cwd);
 	return definition;
 }
@@ -79,22 +59,17 @@ function renderImageResult(
 	showImages: boolean,
 	state: Record<string, unknown> = {},
 	overlayCheck?: () => boolean,
-): string[] {
-	const context: any = {
-		args: { path: "image.png" },
+): string[] { const context: any = { args: { path: "image.png" },
 		cwd,
 		invalidate() {},
 		showImages,
-		state,
-	};
+		state, };
 	if (overlayCheck) context[TOOL_RENDER_OVERLAY_CHECK_SYMBOL] = overlayCheck;
 	const component = definition.renderResult(
-		{
-			content: [
+		{ content: [
 				{ type: "text", text: "Read image file [image/png]" },
 				{ type: "image", data: imageData, mimeType: "image/png" },
-			],
-		},
+			], },
 		{ expanded, isPartial: false },
 		{ bold: (text: string) => text, fg: (_token: string, text: string) => text },
 		context,
@@ -102,13 +77,10 @@ function renderImageResult(
 	return component.render(40);
 }
 
-function hasTerminalImage(lines: string[]): boolean {
-	return lines.some((line) => line.includes("\x1b_G"));
+function hasTerminalImage(lines: string[]): boolean { return lines.some((line) => line.includes("\x1b_G"));
 }
 
-describe("read image rendering", () => {
-	test("on follows expanded state across repeated toggles", () => {
-		const cwd = tempCwd("on");
+describe("read image rendering", () => { test("on follows expanded state across repeated toggles", () => { const cwd = tempCwd("on");
 		const definition = readRenderer(cwd);
 		const state = {};
 		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
@@ -116,71 +88,34 @@ describe("read image rendering", () => {
 		expect(hasTerminalImage(renderImageResult(definition, cwd, false, false, state))).toBe(false);
 		expect(hasTerminalImage(renderImageResult(definition, cwd, true, false, state))).toBe(true);
 		expect(hasTerminalImage(renderImageResult(definition, cwd, false, false, state))).toBe(false);
-		expect(hasTerminalImage(renderImageResult(definition, cwd, true, false, state))).toBe(true);
-	});
+		expect(hasTerminalImage(renderImageResult(definition, cwd, true, false, state))).toBe(true); });
 
-	test("always shows images in collapsed and expanded output even when read text is hidden", () => {
-		const cwd = tempCwd("always", { readOutputMode: "hidden" });
+	test("always shows images in collapsed and expanded output even when read text is hidden", () => { const cwd = tempCwd("always", { readOutputMode: "hidden" });
 		const definition = readRenderer(cwd);
 		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
 
 		expect(hasTerminalImage(renderImageResult(definition, cwd, false, false))).toBe(true);
-		expect(hasTerminalImage(renderImageResult(definition, cwd, true, false))).toBe(true);
-	});
+		expect(hasTerminalImage(renderImageResult(definition, cwd, true, false))).toBe(true); });
 
-	test("extension settings events refresh always and off immediately", () => {
-		const cwd = tempCwd("off");
-		const definition = readRenderer(cwd);
-		const state = {};
-		const settingsHandlers = new Set<(data: unknown) => void>();
+	test("a settings rewrite applies at the next session start", () => { const cwd = tempCwd("off");
 		const lifecycleHandlers = new Map<string, Array<() => void>>();
-		const pi = {
-			events: {
-				on(channel: string, handler: (data: unknown) => void) {
-					if (channel === "kendex:extension-settings-changed") settingsHandlers.add(handler);
-					return () => settingsHandlers.delete(handler);
-				},
-			},
-			on(event: string, handler: () => void) {
-				const handlers = lifecycleHandlers.get(event) ?? [];
-				handlers.push(handler);
-				lifecycleHandlers.set(event, handlers);
-			},
-		};
+		const pi = { on(event: string, handler: () => void) { const handlers = lifecycleHandlers.get(event) ?? [];
+					handlers.push(handler);
+					lifecycleHandlers.set(event, handlers); }, };
 		installLiveSettingsRefresh(pi as any);
 		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
 
-		let lines = renderImageResult(definition, cwd, false, false, state);
-		let renderRequests = 0;
-		trackToolExecutionComponent({
-			invalidate() {
-				lines = renderImageResult(definition, cwd, false, false, state);
-			},
-			ui: {
-				requestRender() {
-					renderRequests++;
-				},
-			},
-		});
-		const emitSetting = (value: ReadImageSetting) => {
-			writeImageMode(cwd, value);
-			for (const handler of settingsHandlers) {
-				handler({ extensionId: "@vanillagreen/pi-tool-renderer", key: "showReadImages", value });
-			}
-		};
+		// Settings are file-managed: the file is the input, and a session start is
+		// where the memo drops. A rewrite inside the window is not seen until then.
+		expect(hasTerminalImage(renderImageResult(readRenderer(cwd), cwd, false, false, {}))).toBe(false);
+		writeImageMode(cwd, "always");
+		expect(hasTerminalImage(renderImageResult(readRenderer(cwd), cwd, false, false, {}))).toBe(false);
+		for (const handler of lifecycleHandlers.get("session_start") ?? []) handler();
+		expect(hasTerminalImage(renderImageResult(readRenderer(cwd), cwd, false, false, {}))).toBe(true);
 
-		expect(hasTerminalImage(lines)).toBe(false);
-		emitSetting("always");
-		expect(hasTerminalImage(lines)).toBe(true);
-		emitSetting("off");
-		expect(hasTerminalImage(lines)).toBe(false);
-		expect(renderRequests).toBe(2);
+		for (const handler of lifecycleHandlers.get("session_shutdown") ?? []) handler(); });
 
-		for (const handler of lifecycleHandlers.get("session_shutdown") ?? []) handler();
-	});
-
-	test("floating overlays hide images without removing their reserved rows", () => {
-		const cwd = tempCwd("always");
+	test("floating overlays hide images without removing their reserved rows", () => { const cwd = tempCwd("always");
 		const definition = readRenderer(cwd);
 		const state = {};
 		let overlayActive = false;
@@ -197,33 +132,24 @@ describe("read image rendering", () => {
 		expect(hiddenLines).toHaveLength(visibleLines.length);
 		expect(hiddenLines.some((line) => line.includes(RESERVED_IMAGE_ROW_MARKER))).toBe(true);
 		expect(hasTerminalImage(restoredLines)).toBe(true);
-		expect(restoredLines).toHaveLength(visibleLines.length);
-	});
+		expect(restoredLines).toHaveLength(visibleLines.length); });
 
-	test("off and an unset setting keep custom images hidden", () => {
-		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
-		for (const setting of ["off", undefined] as const) {
-			const cwd = tempCwd(setting);
+	test("off and an unset setting keep custom images hidden", () => { setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
+		for (const setting of ["off", undefined] as const) { const cwd = tempCwd(setting);
 			const definition = readRenderer(cwd);
 			expect(hasTerminalImage(renderImageResult(definition, cwd, false, false))).toBe(false);
-			expect(hasTerminalImage(renderImageResult(definition, cwd, true, false))).toBe(false);
-		}
-	});
+			expect(hasTerminalImage(renderImageResult(definition, cwd, true, false))).toBe(false); } });
 
-	test("keeps boolean true compatible with expanded-only behavior", () => {
-		const cwd = tempCwd(true);
+	test("keeps boolean true compatible with expanded-only behavior", () => { const cwd = tempCwd(true);
 		const definition = readRenderer(cwd);
 		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
 
 		expect(hasTerminalImage(renderImageResult(definition, cwd, false, false))).toBe(false);
-		expect(hasTerminalImage(renderImageResult(definition, cwd, true, false))).toBe(true);
-	});
+		expect(hasTerminalImage(renderImageResult(definition, cwd, true, false))).toBe(true); });
 
-	test("does not duplicate Pi's built-in image rendering", () => {
-		const cwd = tempCwd("always");
+	test("does not duplicate Pi's built-in image rendering", () => { const cwd = tempCwd("always");
 		const definition = readRenderer(cwd);
 		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
 
-		expect(hasTerminalImage(renderImageResult(definition, cwd, true, true))).toBe(false);
-	});
+		expect(hasTerminalImage(renderImageResult(definition, cwd, true, true))).toBe(false); });
 });

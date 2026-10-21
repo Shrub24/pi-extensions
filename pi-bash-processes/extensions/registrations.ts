@@ -6,7 +6,6 @@
 // module stays free of cross-module mutable state.
 
 import { StringEnum } from "@earendil-works/pi-ai";
-import { getIntent, intentHardRequired, intentModeFor, intentParameters, intentPrepare, intentSuffix, stripIntent, withIntentParameter } from "@vanillagreen/pi-tool-renderer/intent";
 import type {
 	AgentToolResult,
 	ExtensionAPI,
@@ -17,6 +16,7 @@ import { Type } from "typebox";
 
 import { BG_COMMAND } from "./constants.js";
 import { duplicateTaskNote } from "./auto-background.js";
+import { getIntent, intentHardRequired, intentModeFor, intentParameters, intentPrepare, intentSuffix, stripIntent, withIntentParameter } from "./intent.js";
 export {
 	COMPAT_BG_TASK_ACTIONS,
 	TUI_BG_TASK_ACTIONS,

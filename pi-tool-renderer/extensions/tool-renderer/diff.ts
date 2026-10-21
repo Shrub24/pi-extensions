@@ -1,5 +1,5 @@
 import { getLanguageFromPath, highlightCode } from "@earendil-works/pi-coding-agent";
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 
 import {
@@ -965,7 +965,12 @@ export function readTextForDiff(pathValue: unknown, cwd: string): string | undef
 	if (typeof pathValue !== "string" || !pathValue.trim()) return undefined;
 	const target = resolve(cwd, pathValue);
 	try {
-		if (!existsSync(target)) return undefined;
+		// Size first: a mutation row renders on every edit and write, and reading
+		// a file only to refuse it costs its full size in IO and heap. The read
+		// stays gated too, because a file's byte size and its UTF-8 byte length
+		// can differ once invalid sequences are replaced.
+		const info = statSync(target);
+		if (!info.isFile() || info.size > MAX_DIFF_INPUT_BYTES) return undefined;
 		const text = readFileSync(target, "utf8");
 		return Buffer.byteLength(text, "utf8") <= MAX_DIFF_INPUT_BYTES ? text : undefined;
 	} catch {

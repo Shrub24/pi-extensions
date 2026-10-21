@@ -6,7 +6,7 @@ import { join } from "node:path";
 // unavailable, exactly as it is in a deployment whose bundle did not carry it, so
 // the extension's own lazy import fails. The regression is about what that costs:
 // the rich row, never the row itself.
-const PRESENTATION = "@vanillagreen/pi-tool-renderer/managed-bash";
+const PRESENTATION = "pi-tool-renderer/managed-bash";
 const input: { command?: string; output?: string } = JSON.parse(await Bun.stdin.text());
 mock.module(PRESENTATION, () => { throw new Error(`Cannot find package '${PRESENTATION}'`); });
 

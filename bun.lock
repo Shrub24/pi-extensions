@@ -10,21 +10,20 @@
       },
     },
     "pi-bash-processes": {
-      "name": "@vanillagreen/pi-background-tasks",
+      "name": "pi-bash-processes",
       "version": "2.1.1",
-      "dependencies": {
-        "@vanillagreen/pi-tool-renderer": "workspace:*",
-      },
       "peerDependencies": {
         "@earendil-works/pi-ai": "*",
         "@earendil-works/pi-coding-agent": "*",
         "@earendil-works/pi-tui": "*",
+        "pi-tool-renderer": "*",
         "typebox": "*",
       },
       "optionalPeers": [
         "@earendil-works/pi-ai",
         "@earendil-works/pi-coding-agent",
         "@earendil-works/pi-tui",
+        "pi-tool-renderer",
       ],
     },
     "pi-cbmem": {
@@ -41,7 +40,7 @@
       "name": "pi-herdsman",
       "version": "0.18.0",
       "dependencies": {
-        "pi-radar": "0.2.0",
+        "pi-radar": "0.5.1",
       },
       "devDependencies": {
         "@earendil-works/pi-ai": "1.2.0",
@@ -128,7 +127,7 @@
       },
     },
     "pi-tool-renderer": {
-      "name": "@vanillagreen/pi-tool-renderer",
+      "name": "pi-tool-renderer",
       "version": "2.0.9",
       "peerDependencies": {
         "@earendil-works/pi-coding-agent": ">=1.0.1",
@@ -343,8 +342,6 @@
 
     "@typesafe-ai/sdk": ["@typesafe-ai/sdk@0.6.0", "", {}, "sha512-IddX+Q0XM+VagOUZFeP7wZjaO4SHMdvnh2zEBdrZZnXedWI3BNK1lKhMx3ayrkFWvVLbVcUHJy6AVZlY+e6Jaw=="],
 
-    "@vanillagreen/pi-background-tasks": ["@vanillagreen/pi-background-tasks@workspace:pi-bash-processes"],
-
     "@vanillagreen/pi-cbmem": ["@vanillagreen/pi-cbmem@workspace:pi-cbmem"],
 
     "@vanillagreen/pi-jev": ["@vanillagreen/pi-jev@workspace:pi-jev"],
@@ -352,8 +349,6 @@
     "@vanillagreen/pi-native-router": ["@vanillagreen/pi-native-router@workspace:pi-native-router"],
 
     "@vanillagreen/pi-output-policy": ["@vanillagreen/pi-output-policy@workspace:pi-output-policy"],
-
-    "@vanillagreen/pi-tool-renderer": ["@vanillagreen/pi-tool-renderer@workspace:pi-tool-renderer"],
 
     "agent-base": ["agent-base@9.0.0", "", {}, "sha512-TQf59BsZnytt8GdJKLPfUZ54g/iaUL2OWDSFCCvMOhsHduDQxO8xC4PNeyIkVcA5KwL2phPSv0douC0fgWzmnA=="],
 
@@ -475,13 +470,17 @@
 
     "path-key": ["path-key@3.1.1", "", {}, "sha512-ojmeN0qd+y0jszEtoY48r0Peq5dwMEkIlCOu6Q5f41lfkswXuKtYrhgoTpLnyIcHm24Uhqx+5Tqm2InSwLhE6Q=="],
 
+    "pi-bash-processes": ["pi-bash-processes@workspace:pi-bash-processes"],
+
     "pi-herdsman": ["pi-herdsman@workspace:pi-herdsman"],
 
     "pi-otel": ["pi-otel@workspace:pi-otel"],
 
-    "pi-radar": ["pi-radar@0.2.0", "", {}, "sha512-91uezCVJCU2NeRoYPNd+8740ZS30l08DGOywqhkYF7al0fzxGHGZquTKzYGWrdMxTpbceK6qqGtgojg4EW6pSQ=="],
+    "pi-radar": ["pi-radar@0.5.1", "", {}, "sha512-VZKxHqehBtIV80ZizTKXeBTQx+q6w2djmFdvvhrNqHQ02N58qc2D6abbTr5QYM6BxfiDVku4TKqnChuwC3yGyA=="],
 
     "pi-reqcap": ["pi-reqcap@workspace:pi-reqcap"],
+
+    "pi-tool-renderer": ["pi-tool-renderer@workspace:pi-tool-renderer"],
 
     "pi-typesafe": ["pi-typesafe@0.7.4", "", { "dependencies": { "@typesafe-ai/sdk": "^0.6.0", "typebox": "^1.3.31" }, "peerDependencies": { "@earendil-works/pi-coding-agent": ">=0.85.1 <1", "@earendil-works/pi-tui": ">=0.85.1 <1" }, "optionalPeers": ["@earendil-works/pi-coding-agent", "@earendil-works/pi-tui"] }, "sha512-yNtRXtkP7dJuZwIcvZM69mEWqQvAAkdzFAk7VvuEidctJojjS8nas+8MKBEIq6YXh8JuQAP5ZACK13fwJ3+voA=="],
 

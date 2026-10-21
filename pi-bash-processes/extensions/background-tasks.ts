@@ -69,6 +69,7 @@ import {
 	formatShortcutHint,
 	normalizedCommand,
 	parseOutputMatcher,
+	patternMatchWindow,
 	summarizeTaskStatus,
 	tailText,
 	taskDisplayName,
@@ -99,13 +100,13 @@ import { applyTaskToolSurface, bashPromptGuidelines, registerAll, type Registrat
 import { closeTaskLifecycle, replayMissedExitsLifecycle, sendExitWakeLifecycle, type LifecycleHooks } from "./lifecycle.js";
 import { taskLogs } from "./log-writer.js";
 import { BASH_OUTPUT_SCHEMA, buildManagedBashEnv, createForegroundWaiter, formatManagedBashCompletionText, formatManagedBashRunningText, isCodemodeCall, normalizeManagedBashTimeoutSeconds, settleForegroundWaiter, STRUCTURED_OUTPUT_MAX_BYTES, structuredOutputFor, structuredOutputOmittedMarker } from "./managed-bash.js";
-import type * as ManagedBashPresentation from "@vanillagreen/pi-tool-renderer/managed-bash";
-import { getIntent, intentModeFor, intentParameters, intentPrepare, intentSuffix, stripIntent, withIntentParameter, installIntentGuard } from "@vanillagreen/pi-tool-renderer/intent";
+import type * as ManagedBashPresentation from "pi-tool-renderer/managed-bash";
+import { getIntent, intentModeFor, intentParameters, intentPrepare, intentSuffix, stripIntent, withIntentParameter, installIntentGuard } from "./intent.js";
 let managedBashPresentation: typeof ManagedBashPresentation | undefined;
 async function loadManagedBashPresentation(): Promise<void> {
 	if (managedBashPresentation) return;
 	try {
-		managedBashPresentation = await import("@vanillagreen/pi-tool-renderer/managed-bash");
+		managedBashPresentation = await import("pi-tool-renderer/managed-bash");
 	} catch {
 		managedBashPresentation = undefined;
 	}
@@ -1829,7 +1830,10 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 				refreshUi();
 				return;
 			}
-			const patternMatched = task.matcher ? (task.matcher(unseenOutput) || task.matcher(output)) : true;
+			// The gate sees the unseen delta plus a short overlap, never the whole
+			// captured buffer: a buffer-wide re-scan below the delta would cost its
+			// full length on every chunk and could only re-report an older match.
+			const patternMatched = task.matcher ? task.matcher(patternMatchWindow(output, task.lastAnnouncedLength)) : true;
 			if (!patternMatched) {
 				persistScheduledOutputDrop(task, pending, "notify-pattern-no-match", { matchedPattern: task.notifyPattern });
 				return;

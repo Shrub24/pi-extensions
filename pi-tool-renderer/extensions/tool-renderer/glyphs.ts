@@ -3,8 +3,8 @@ import { readPackageConfig } from "./package-config.js";
 export type GlyphStyle = "unicode" | "ascii";
 export type GlobalGlyphStyleOverride = "inherit" | GlyphStyle;
 
-const LOCAL_CONFIG_ID = "@vanillagreen/pi-tool-renderer";
-const GLOBAL_CONFIG_ID = "@vanillagreen/pi-tool-renderer";
+const LOCAL_CONFIG_ID = "pi-tool-renderer";
+const GLOBAL_CONFIG_ID = "pi-tool-renderer";
 
 function asGlyphStyle(value: unknown): GlyphStyle | undefined {
 	return value === "unicode" || value === "ascii" ? value : undefined;

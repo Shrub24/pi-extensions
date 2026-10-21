@@ -12,10 +12,8 @@ for (const row of [
 	// Pi returns failed outcomes for blocked, unknown, and invalid child calls.
 	{ name: "SDK child refusal", calls: [{ tool: "read" }], max: 8, executeTool: async () => ({ result: { content: [{ type: "text", text: "child=refused" }] }, isError: true }), expected: "child=refused", failed: 1, isError: true },
 	{ name: "execution API error", calls: [{ tool: "read" }], max: 8, executeTool: async () => { throw new TypeError("upstream-payload"); }, expected: "batch_error=TypeError", failed: 1, isError: true },
-]) {
-	test(`tool_batch refusal: ${row.name}`, async () => {
-		const { cwd } = world();
-		writeFileSync(join(cwd, ".pi", "settings.json"), JSON.stringify({ kendex: { extensionManager: { config: { "@vanillagreen/pi-tool-renderer": { batchMaxCalls: row.max } } } } }));
+]) { test(`tool_batch refusal: ${row.name}`, async () => { const { cwd } = world();
+		writeFileSync(join(cwd, ".pi", "settings.json"), JSON.stringify({ "pi-tool-renderer": { batchMaxCalls: row.max } }));
 		let definition: { execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }>; isError?: boolean; details: { failed: number; items: Array<{ resultText: string }> } }>; renderResult: (...args: any[]) => { render: (width: number) => string[] } } | undefined;
 		registerToolBatch({ registerTool: (tool: typeof definition) => { definition = tool; } } as never, cwd);
 		expect(definition).toBeDefined();
@@ -23,9 +21,6 @@ for (const row of [
 		expect(result.isError).toBe(row.isError);
 		expect(result.details.failed).toBe(row.failed);
 		expect((result.details.items[0]?.resultText ?? result.content[0]!.text).split("\n")[0]).toBe(row.expected);
-		if (result.details.items.length === 0) {
-			const rendered = definition!.renderResult(result, { expanded: false, isPartial: false }, { bold: (text: string) => text, fg: (_token: string, text: string) => text }, { cwd }).render(100);
-			expect(rendered[0]).toBe(row.expected);
-		}
-	});
+		if (result.details.items.length === 0) { const rendered = definition!.renderResult(result, { expanded: false, isPartial: false }, { bold: (text: string) => text, fg: (_token: string, text: string) => text }, { cwd }).render(100);
+			expect(rendered[0]).toBe(row.expected); } });
 }

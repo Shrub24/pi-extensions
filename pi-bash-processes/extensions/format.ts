@@ -93,6 +93,22 @@ export function parseOutputMatcher(pattern: string | undefined): ((text: string)
 }
 
 /**
+ * How much already-seen output a notification gate may re-read.
+ *
+ * The gate runs once per output chunk, so it is fed the unseen delta plus a
+ * short overlap. The overlap catches a match that spans the chunk boundary;
+ * the bound keeps every check proportional to the chunk instead of to the
+ * whole captured buffer. It replaces the buffer-wide re-scan rather than
+ * complementing it.
+ */
+export const OUTPUT_MATCH_OVERLAP_CHARS = 4_096;
+
+export function patternMatchWindow(output: string, fromIndex: number): string {
+	const from = Math.max(0, Math.min(fromIndex, output.length) - OUTPUT_MATCH_OVERLAP_CHARS);
+	return output.slice(from);
+}
+
+/**
  * Model-facing text for a `get`/`stop` result. Reports the task's identity,
  * state, outcome, the output it is handing over, and — separately — whether that
  * output is a complete result. A short capture is never described as a settled

@@ -6,20 +6,20 @@ import { CONFIG_ID } from "./constants.js";
 import { expandHome, piUserDir, readPackageConfig } from "./package-config.js";
 import { installDeclaredCli } from "./cli-install.js";
 import { BRIDGE_SOCKET_SUFFIX } from "./bridge.js";
-import type { kendexConfig } from "./types.js";
+import type { PackageSettings } from "./types.js";
 
-export function readkendexConfig(cwd?: string): kendexConfig {
-	return readPackageConfig(CONFIG_ID, cwd) as kendexConfig;
+export function readPackageSettings(cwd?: string): PackageSettings {
+	return readPackageConfig(CONFIG_ID, cwd) as PackageSettings;
 }
 
 export function settingNumber(key: string, fallback: number, cwd?: string): number {
-	const value = readkendexConfig(cwd)[key];
+	const value = readPackageSettings(cwd)[key];
 	const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
 	return Number.isFinite(parsed) ? parsed : fallback;
 }
 
 export function settingBoolean(key: string, fallback: boolean, cwd?: string): boolean {
-	const value = readkendexConfig(cwd)[key];
+	const value = readPackageSettings(cwd)[key];
 	return typeof value === "boolean" ? value : fallback;
 }
 
@@ -35,12 +35,12 @@ export function pipefailShellArgs(shell: string, args: string[], cwd?: string): 
 }
 
 export function settingString(key: string, fallback: string, cwd?: string): string {
-	const value = readkendexConfig(cwd)[key];
+	const value = readPackageSettings(cwd)[key];
 	return typeof value === "string" && value.trim().length > 0 ? value.trim() : fallback;
 }
 
 export function settingEnum<T extends string>(key: string, allowed: readonly T[], fallback: T, cwd?: string): T {
-	const value = readkendexConfig(cwd)[key];
+	const value = readPackageSettings(cwd)[key];
 	return typeof value === "string" && (allowed as readonly string[]).includes(value) ? (value as T) : fallback;
 }
 

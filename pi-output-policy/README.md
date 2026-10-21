@@ -1,18 +1,10 @@
-# @vanillagreen/pi-output-policy
+# pi-output-policy
 
 A Pi extension that limits large tool results and repeated model output. It saves full tool output to files so the agent can read it when needed.
 
-![Output Policy settings panel](https://raw.githubusercontent.com/vanillagreencom/kendex/main/pi-extensions/pi-output-policy/assets/settings-panel.png)
-
 ## Install
 
-- npm: `pi install npm:@vanillagreen/pi-output-policy`.
-- kendex: add the declaration below to the project's `kendex.toml`, or to `~/.config/kendex/kendex.toml` for user scope. Run `kendex update-pi`.
-
-```toml
-[pi-extensions."@vanillagreen/pi-output-policy"]
-source = "kendex"
-```
+- In this repo: a Bun workspace package named `pi-output-policy`; deployed configurations load it through the Nix plugins build.
 
 Restart Pi after installation. Use `kendex update-pi --check` to preview the installation.
 
@@ -33,9 +25,9 @@ At session start, the extension deletes saved full outputs whose recorded workin
 
 ## Settings
 
-The settings editor writes project values to `.pi/settings.json`. The default user file is `~/.pi/agent/settings.json`. `PI_CODING_AGENT_DIR` changes the user directory. Package values are stored under `kendex.extensionManager.config["@vanillagreen/pi-output-policy"]`.
+Settings are files. This package reads its own top-level key, `pi-output-policy`, in `~/.pi/agent/settings.json` and, for project scope, `.pi/settings.json`. `PI_CODING_AGENT_DIR` changes the user directory. Nothing writes these files from inside a session.
 
-Open `/extensions:settings`; settings appear under the **Output Policy** tab. Project settings in `.pi/settings.json` apply only after Pi marks the workspace trusted.
+Project settings in `.pi/settings.json` apply only after Pi marks the workspace trusted.
 
 - `enabled`: package toggle; disabling it is the only way to get verbatim inline output, since `compat` still spills above its caps.
 - `policyMode`: `balanced`, `compact` or `compat`.

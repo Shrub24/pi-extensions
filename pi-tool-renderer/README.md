@@ -1,22 +1,14 @@
-# @vanillagreen/pi-tool-renderer
+# pi-tool-renderer
 
 Tool and message displays for Pi. It provides compact output, optional file diffs and a tool for grouped read operations.
 
-![tool_batch composite result with Read/grep/Bash rows](https://raw.githubusercontent.com/vanillagreencom/kendex/main/pi-extensions/pi-tool-renderer/assets/tool-batch.png) ![Edit tool with side-by-side diff renderer](https://raw.githubusercontent.com/vanillagreencom/kendex/main/pi-extensions/pi-tool-renderer/assets/edit-diff.png)
-
-> Extracted from [vanillagreencom/kendex](https://github.com/vanillagreencom/kendex). Reference remotes: `upstream` (kendex), `hisence` (credited efficiency patches); neither is tracked.
+> Forked from, and maintained independently of, kendex's `pi-extensions/pi-tool-renderer`. Reference remotes: `upstream` (kendex), `hisence` (credited efficiency patches); neither is tracked.
 
 ## Install
 
 Requires Pi 0.99.0 or later for guarded batch execution.
 
-- npm: `pi install npm:@vanillagreen/pi-tool-renderer`.
-- kendex: add the declaration below to the project's `kendex.toml`, or to `~/.config/kendex/kendex.toml` for user scope. Run `kendex update-pi`.
-
-```toml
-[pi-extensions."@vanillagreen/pi-tool-renderer"]
-source = "kendex"
-```
+- In this repo: a Bun workspace package named `pi-tool-renderer`. Deployed configurations load it through the Nix plugins build.
 
 Restart Pi after installation. Use `kendex update-pi --check` to preview the installation.
 
@@ -52,9 +44,9 @@ The per-row render caches are `WeakMap`s keyed by Pi's own components. JavaScrip
 
 ## Settings
 
-The settings editor writes project values to `.pi/settings.json`. The default user file is `~/.pi/agent/settings.json`. `PI_CODING_AGENT_DIR` changes the user directory. Package values are stored under `kendex.extensionManager.config["@vanillagreen/pi-tool-renderer"]`.
+Settings are files. This package reads its own top-level key, `pi-tool-renderer`, in `~/.pi/agent/settings.json` and, for project scope, `.pi/settings.json`. `PI_CODING_AGENT_DIR` changes the user directory. Nothing writes these files from inside a session.
 
-Open `/extensions:settings`; settings appear under the **Tool Renderer** tab. Project settings in `.pi/settings.json` apply only after Pi marks the workspace trusted.
+Project settings in `.pi/settings.json` apply only after Pi marks the workspace trusted.
 
 - `enabled`: package toggle.
 - `glyphStyle`, `globalGlyphStyleOverride`, `treeStyle`: Unicode or ASCII symbols. The global override forces one style across every kendex Pi extension and leaves tool, model and user content alone.

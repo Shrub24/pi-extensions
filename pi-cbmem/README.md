@@ -62,9 +62,8 @@ generated.
 
 ## Configuration
 
-Settings live in the user settings file under
-`kendex.extensionManager.config["@vanillagreen/pi-cbmem"]` and are rendered by
-`@vanillagreen/pi-extension-manager`. Project-scope settings are never read: the
+Settings live in the user settings file under the `pi-cbmem` key, written by
+hand or by Nix. Project-scope settings are never read: the
 binary path and the project decide where the agent looks, so a repository must not
 be able to set them.
 

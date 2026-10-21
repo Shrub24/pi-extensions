@@ -10,16 +10,12 @@ afterEach(() => jest.useRealTimers());
 for (const row of [
 	{ name: "configured deadline with successful siblings", timeout: 1000, calls: [{ tool: "bash", args: {} }, { tool: "read", args: { path: "wedged.md" } }, { tool: "grep", args: { pattern: "foo" } }], succeeded: 2 },
 	{ name: "minimum deadline", timeout: 1, calls: [{ tool: "read", args: { path: "x" } }], succeeded: 0 },
-]) {
-	test(`tool_batch: ${row.name}`, async () => {
-		const { cwd } = world();
-		writeFileSync(join(cwd, ".pi", "settings.json"), JSON.stringify({ kendex: { extensionManager: { config: { "@vanillagreen/pi-tool-renderer": { batchCallTimeoutMs: row.timeout } } } } }));
+]) { test(`tool_batch: ${row.name}`, async () => { const { cwd } = world();
+		writeFileSync(join(cwd, ".pi", "settings.json"), JSON.stringify({ "pi-tool-renderer": { batchCallTimeoutMs: row.timeout } }));
 		jest.useFakeTimers();
 		let aborts = 0;
 		const executeTool = (name: string, _args: unknown, { signal }: { signal: AbortSignal }) => name === "read"
-			? new Promise<never>((_resolve, reject) => {
-				signal.addEventListener("abort", () => { aborts++; reject(new DOMException("", "AbortError")); }, { once: true });
-			})
+			? new Promise<never>((_resolve, reject) => { signal.addEventListener("abort", () => { aborts++; reject(new DOMException("", "AbortError")); }, { once: true }); })
 			: Promise.resolve({ result: { content: [{ type: "text", text: `ok-${name}` }] }, isError: false });
 		let definition: { execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }>; isError?: boolean; details: { total: number; failed: number; succeeded: number; items: Array<{ toolName: string; isError: boolean; resultText: string }> } }> } | undefined;
 		registerToolBatch({ registerTool: (tool: typeof definition) => { definition = tool; } } as never, cwd);
@@ -40,10 +36,7 @@ for (const row of [
 		expect(result.details.failed).toBe(1);
 		expect(result.isError).toBe(true);
 		expect(result.content[0]!.text.split("\n")[0]).toBe(`batch_succeeded=${row.succeeded} batch_total=${row.calls.length}`);
-		for (const item of result.details.items) {
-			expect(item.isError).toBe(item.toolName === "read");
-			expect(item.resultText.split("\n")[0]).toBe(item.toolName === "read" ? "batch_timeout_ms=1000 tool=read" : `ok-${item.toolName}`);
-		}
-		expect(jest.getTimerCount()).toBe(0);
-	});
+		for (const item of result.details.items) { expect(item.isError).toBe(item.toolName === "read");
+			expect(item.resultText.split("\n")[0]).toBe(item.toolName === "read" ? "batch_timeout_ms=1000 tool=read" : `ok-${item.toolName}`); }
+		expect(jest.getTimerCount()).toBe(0); });
 }

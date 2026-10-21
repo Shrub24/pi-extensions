@@ -16,8 +16,7 @@ import * as agent from "@earendil-works/pi-coding-agent";
 
 import { attachCodemodePurpose, withCodemodePurpose } from "../tool-renderer/codemode.js";
 import { clearPackageConfigCache } from "../tool-renderer/package-config.js";
-import {
-	codemodePurposeRefusal,
+import { codemodePurposeRefusal,
 	installIntentGuard,
 	missingIntentRefusal,
 	parseCodemodePurpose,
@@ -28,30 +27,24 @@ import { registerRead } from "../tool-renderer/tools.js";
 import { useWorld } from "./helpers/world.js";
 
 const world = useWorld();
-const theme = {
-	bold: (text: string) => text,
+const theme = { bold: (text: string) => text,
 	fg: (_color: string, text: string) => text,
 } as never;
 
 /** Write this package's settings for the test world, then drop the memoized read. */
-function configure(config: Record<string, unknown>): void {
-	const { agent } = world();
-	writeFileSync(join(agent, "settings.json"), JSON.stringify({
-		kendex: { extensionManager: { config: { [CONFIG_ID]: { enabled: true, ...config } } } },
-	}));
+function configure(config: Record<string, unknown>): void { const { agent } = world();
+	writeFileSync(join(agent, "settings.json"), JSON.stringify({ [CONFIG_ID]: { enabled: true, ...config } , }));
 	clearPackageConfigCache();
 }
 
 /** The `tool_call` handler the extension installs, on a fake `pi`. */
-function guardHandler(options: { tools: string[]; codemodePurpose?: boolean }) {
-	const handlers: ((event: IntentGuardCallEvent, ctx?: { cwd?: string }) => unknown)[] = [];
+function guardHandler(options: { tools: string[]; codemodePurpose?: boolean }) { const handlers: ((event: IntentGuardCallEvent, ctx?: { cwd?: string }) => unknown)[] = [];
 	installIntentGuard({ on: (event, handler) => { if (event === "tool_call") handlers.push(handler as never); } }, options);
 	expect(handlers.length).toBe(1);
 	return handlers[0]!;
 }
 
-test("a purpose is the one leading comment, after the native options line when present", () => {
-	expect(parseCodemodePurpose("// intent: check the failing build\nawait tools.bash({ command: \"x\" })")).toBe("check the failing build");
+test("a purpose is the one leading comment, after the native options line when present", () => { expect(parseCodemodePurpose("// intent: check the failing build\nawait tools.bash({ command: \"x\" })")).toBe("check the failing build");
 	// The native `// @options:` header stays first and its line is still the tool's.
 	expect(parseCodemodePurpose("// @options: {\"maxCalls\":2}\n// intent: gather failures\nreturn 1")).toBe("gather failures");
 	// A leading blank line is not executable code.
@@ -60,8 +53,7 @@ test("a purpose is the one leading comment, after the native options line when p
 	expect(parseCodemodePurpose("//   Intent:  Mixed marker  \nreturn 1")).toBe("Mixed marker");
 });
 
-test("a purpose-looking string, a late comment, or an ambiguous pair is not a purpose", () => {
-	expect(parseCodemodePurpose("const note = \"// intent: not a comment\";\nawait tools.bash({})")).toBeUndefined();
+test("a purpose-looking string, a late comment, or an ambiguous pair is not a purpose", () => { expect(parseCodemodePurpose("const note = \"// intent: not a comment\";\nawait tools.bash({})")).toBeUndefined();
 	expect(parseCodemodePurpose("await tools.bash({});\n// intent: too late")).toBeUndefined();
 	expect(parseCodemodePurpose("// intent: first\n// intent: second\nreturn 1")).toBeUndefined();
 	expect(parseCodemodePurpose("// intent:\nreturn 1")).toBeUndefined();
@@ -70,8 +62,7 @@ test("a purpose-looking string, a late comment, or an ambiguous pair is not a pu
 	expect(parseCodemodePurpose(undefined)).toBeUndefined();
 });
 
-test("the intent argument is optional in a registered tool's schema, for every mode", () => {
-	const { cwd } = world();
+test("the intent argument is optional in a registered tool's schema, for every mode", () => { const { cwd } = world();
 	configure({ intentMode: "required" });
 	const tools: { name: string; parameters: { required?: string[]; properties: Record<string, unknown> } }[] = [];
 	registerRead({ registerTool: (definition: never) => tools.push(definition) } as never, agent, cwd);
@@ -83,18 +74,15 @@ test("the intent argument is optional in a registered tool's schema, for every m
 	expect(parameters.required ?? []).not.toContain("intent");
 });
 
-test("the guard refuses only a model-issued call that omits a required intent", () => {
-	const { cwd } = world();
+test("the guard refuses only a model-issued call that omits a required intent", () => { const { cwd } = world();
 	configure({ intentMode: "required" });
 	const handler = guardHandler({ tools: ["read"], codemodePurpose: true });
 	const call = (overrides: Partial<IntentGuardCallEvent> & { input?: unknown }): IntentGuardCallEvent =>
 		({ toolName: "read", toolCallId: "call-1", ...overrides });
 
 	// The model's own call, with and without the intent.
-	expect(handler(call({ input: { path: "a.ts" } }), { cwd })).toEqual({
-		block: true,
-		reason: expect.stringContaining("missing its required \"intent\""),
-	});
+	expect(handler(call({ input: { path: "a.ts" } }), { cwd })).toEqual({ block: true,
+		reason: expect.stringContaining("missing its required \"intent\""), });
 	expect(handler(call({ input: { path: "a.ts", intent: "read the failing test" } }), { cwd })).toBeUndefined();
 	// A call another tool made: nothing wrote these arguments but the tool.
 	expect(handler(call({ toolCallId: "cm-1/1", parentToolCallId: "cm-1", input: { path: "a.ts" } }), { cwd })).toBeUndefined();
@@ -102,8 +90,7 @@ test("the guard refuses only a model-issued call that omits a required intent", 
 	expect(handler({ toolName: "bash", toolCallId: "call-2", input: { command: "x" } }, { cwd })).toBeUndefined();
 });
 
-test("optional and off modes never refuse an ordinary call", () => {
-	const { cwd } = world();
+test("optional and off modes never refuse an ordinary call", () => { const { cwd } = world();
 	const handler = guardHandler({ tools: ["read"], codemodePurpose: true });
 	configure({ intentMode: "optional" });
 	expect(handler({ toolName: "read", toolCallId: "call-1", input: { path: "a.ts" } }, { cwd })).toBeUndefined();
@@ -114,16 +101,13 @@ test("optional and off modes never refuse an ordinary call", () => {
 	expect(handler({ toolName: "read", toolCallId: "call-3", input: { path: "a.ts" } }, { cwd })).toMatchObject({ block: true });
 });
 
-test("a root codemode call needs its purpose only in required mode, and only from the model", () => {
-	const { cwd } = world();
+test("a root codemode call needs its purpose only in required mode, and only from the model", () => { const { cwd } = world();
 	const handler = guardHandler({ tools: ["read"], codemodePurpose: true });
 	const root = (input: unknown): IntentGuardCallEvent => ({ toolName: "codemode", toolCallId: "cm-1", input });
 
 	configure({ intentMode: "required" });
-	expect(handler(root({ code: "await tools.bash({ command: \"x\" })" }), { cwd })).toEqual({
-		block: true,
-		reason: expect.stringContaining("missing its purpose"),
-	});
+	expect(handler(root({ code: "await tools.bash({ command: \"x\" })" }), { cwd })).toEqual({ block: true,
+		reason: expect.stringContaining("missing its purpose"), });
 	expect(handler(root({ code: "// intent: run the check\nawait tools.bash({ command: \"x\" })" }), { cwd })).toBeUndefined();
 	// A script made this call: exempt, like any other tool-issued call.
 	expect(handler({ toolName: "codemode", toolCallId: "cm-1/1", parentToolCallId: "cm-1", input: { code: "return 1" } }, { cwd })).toBeUndefined();
@@ -134,8 +118,7 @@ test("a root codemode call needs its purpose only in required mode, and only fro
 	expect(handler(root({ code: "return 1" }), { cwd })).toBeUndefined();
 });
 
-test("the guard's host only owns the tools it registered and the codemode purpose it presents", () => {
-	const { cwd } = world();
+test("the guard's host only owns the tools it registered and the codemode purpose it presents", () => { const { cwd } = world();
 	configure({ intentMode: "required" });
 	// Tool-package host: it does not present the codemode row, so it does not judge it.
 	const handler = guardHandler({ tools: ["bash"] });
@@ -143,8 +126,7 @@ test("the guard's host only owns the tools it registered and the codemode purpos
 	expect(handler({ toolName: "bash", toolCallId: "b-1", input: { command: "x" } }, { cwd })).toMatchObject({ block: true });
 });
 
-test("a clean event set stays clean: the exemption is provenance, not stored ancestry", () => {
-	const { cwd } = world();
+test("a clean event set stays clean: the exemption is provenance, not stored ancestry", () => { const { cwd } = world();
 	configure({ intentMode: "required" });
 	const handler = guardHandler({ tools: ["read"], codemodePurpose: true });
 	// Interleaved concurrent calls cannot contaminate each other: the decision
@@ -161,8 +143,7 @@ test("a clean event set stays clean: the exemption is provenance, not stored anc
 	expect(codemodePurposeRefusal({ toolName: "codemode", toolCallId: "cm-a", input: { code: "return 1" } }, cwd)).toMatchObject({ block: true });
 });
 
-test("the codemode row shows the purpose as its intent and keeps the native code row", () => {
-	// The shape Pi's codemode renderer builds: a title line, then the script.
+test("the codemode row shows the purpose as its intent and keeps the native code row", () => { // The shape Pi's codemode renderer builds: a title line, then the script.
 	const native = new Container();
 	native.addChild(new Text("codemode", 0, 0));
 	native.addChild(new Text("await tools.bash({ command: \"x\" })", 0, 0));
@@ -174,23 +155,19 @@ test("the codemode row shows the purpose as its intent and keeps the native code
 	expect(withPurpose.render(80).join("\n")).toContain("await tools.bash({ command: \"x\" })");
 });
 
-test("a codemode call without a purpose leaves the native row untouched", () => {
-	const native = new Container();
+test("a codemode call without a purpose leaves the native row untouched", () => { const native = new Container();
 	native.addChild(new Text("codemode", 0, 0));
 	const rendered = attachCodemodePurpose(native, { code: "await tools.bash({ command: \"x\" })" }, theme);
 	expect(rendered).toBe(native);
 	expect(rendered.render(80).join("\n")).not.toContain("—");
 });
 
-test("the wrapped native codemode renderer is the one that builds the row", () => {
-	const calls: unknown[] = [];
-	const nativeRenderCall = (args: { code?: string }) => {
-		calls.push(args);
+test("the wrapped native codemode renderer is the one that builds the row", () => { const calls: unknown[] = [];
+	const nativeRenderCall = (args: { code?: string }) => { calls.push(args);
 		const component = new Container();
 		component.addChild(new Text("codemode", 0, 0));
 		component.addChild(new Text(args.code ?? "", 0, 0));
-		return component;
-	};
+		return component; };
 	const renderCall = withCodemodePurpose(nativeRenderCall as never);
 	const component = renderCall({ code: "// intent: inspect the log\nreturn 1" }, theme, {});
 	// Pi's renderer receives the script without its purpose line; the title carries the purpose.
@@ -199,8 +176,7 @@ test("the wrapped native codemode renderer is the one that builds the row", () =
 	expect(component.render(80).join("\n")).not.toContain("// intent:");
 });
 
-test("the intent schema and the codemode purpose share one length bound", () => {
-	const schema = withIntentParameter({ type: "object", properties: {} } as never) as unknown as { properties: { intent: { maxLength: number; minLength: number } } };
+test("the intent schema and the codemode purpose share one length bound", () => { const schema = withIntentParameter({ type: "object", properties: {} } as never) as unknown as { properties: { intent: { maxLength: number; minLength: number } } };
 	expect(schema.properties.intent.maxLength).toBe(INTENT_MAX_LENGTH);
 	const atLimit = "a".repeat(INTENT_MAX_LENGTH);
 	expect(parseCodemodePurpose(`// intent: ${atLimit}\nreturn 1`)).toBe(atLimit);

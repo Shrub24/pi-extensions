@@ -22,7 +22,7 @@ function runFallback(): FallbackResult {
 
 test("a missing presentation module costs the rich row, not the row", () => {
 	const result = runFallback();
-	expect(result.presentationImportError, "the fixture must be the missing-module path").toContain("Cannot find package '@vanillagreen/pi-tool-renderer/managed-bash'");
+	expect(result.presentationImportError, "the fixture must be the missing-module path").toContain("Cannot find package 'pi-tool-renderer/managed-bash'");
 	expect(result.bashRegistered).toBe(true);
 
 	const call = result.call.join("\n");

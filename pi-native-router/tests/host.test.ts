@@ -125,7 +125,7 @@ async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateT
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   if (opts.packaged) {
     // Settings hold the raw user shape, exactly as the packaged entry will read it.
-    writeFileSync(join(dir, "settings.json"), JSON.stringify({ kendex: { extensionManager: { config: { "@vanillagreen/pi-native-router": raw } } } }));
+    writeFileSync(join(dir, "settings.json"), JSON.stringify({ "pi-native-router": raw }));
     process.env.PI_CODING_AGENT_DIR = dir;
   }
   try { await loader.reload(); }

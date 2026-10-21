@@ -1,6 +1,6 @@
 import { readPackageConfig } from "./package-config.js";
 
-export const CONFIG_ID = "@vanillagreen/pi-tool-renderer";
+export const CONFIG_ID = "pi-tool-renderer";
 
 export type kendexConfig = Record<string, unknown>;
 

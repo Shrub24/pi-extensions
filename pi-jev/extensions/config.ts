@@ -5,7 +5,7 @@
  * repository must not be able to put the judge into `live`, raise its own
  * question thresholds, or redirect the decision log, because all three decide
  * whether a `ask` is answered without a human. `@vanillagreen/pi-extension-manager`
- * renders these keys from the `kendex.extensionManager.settings` block in
+ * renders these keys from the `pi-jev` block in
  * package.json.
  *
  * Environment overrides exist for tests and headless runs and are read after
@@ -17,7 +17,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
 
-export const CONFIG_ID = "@vanillagreen/pi-jev";
+export const CONFIG_ID = "pi-jev";
 
 /**
  * Questions one request may carry. The existing transport ceiling is 32; this stays under
@@ -198,15 +198,13 @@ function userSettingsPath(env: NodeJS.ProcessEnv): string {
 	return join(agentDir(env), "settings.json");
 }
 
-/** The `kendex.extensionManager.config[CONFIG_ID]` block, or an empty record. */
+/** The `[CONFIG_ID]` block of the user settings file, or an empty record. */
 export function readSettingsFile(env: NodeJS.ProcessEnv = process.env): Record<string, unknown> {
 	const path = userSettingsPath(env);
 	if (!existsSync(path)) return {};
 	try {
-		const parsed = JSON.parse(readFileSync(path, "utf8")) as {
-			kendex?: { extensionManager?: { config?: Record<string, unknown> } };
-		};
-		const config = parsed?.kendex?.extensionManager?.config?.[CONFIG_ID];
+		const parsed = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+		const config = parsed[CONFIG_ID];
 		return config && typeof config === "object" && !Array.isArray(config)
 			? (config as Record<string, unknown>)
 			: {};

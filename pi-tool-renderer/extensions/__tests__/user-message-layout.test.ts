@@ -8,25 +8,21 @@ import { clearPackageConfigCache } from "../tool-renderer/package-config.js";
 
 const world = useWorld();
 
-test("user Markdown reuses one layout and invalidates for width, content, themes and host invalidation", () => {
-	let highlights = 0;
+test("user Markdown reuses one layout and invalidates for width, content, themes and host invalidation", () => { let highlights = 0;
 	let highlightSuffix = "";
 	const markdownTheme = { ...getMarkdownTheme(), codeBlockBorder: (text: string) => text, codeBlock: (text: string) => text, highlightCode(code: string) { highlights++; return code.split("\n").map((line) => line + highlightSuffix); } };
 	const theme = { fg: (_token: string, text: string) => text };
 	const ui = { theme };
-	class Message {
-		text = "```typescript\nconst first = true;\n```";
+	class Message { text = "```typescript\nconst first = true;\n```";
 		markdownTheme = markdownTheme;
 		invalidations = 0;
 		invalidate() { this.invalidations++; }
-		render(_width = 60) { return ["upstream"]; }
-	}
+		render(_width = 60) { return ["upstream"]; } }
 	const handlers = new Map<string, (...args: unknown[]) => void>();
 	installUserMessageRenderer({ on: (event: string, handler: (...args: unknown[]) => void) => handlers.set(event, handler) } as never, Message);
 	const component = new Message();
 	const draw = (width = 60) => component.render(width);
-	try {
-		handlers.get("session_start")!({}, { cwd: world().cwd, hasUI: true, ui, sessionManager: { getBranch: () => [] } });
+	try { handlers.get("session_start")!({}, { cwd: world().cwd, hasUI: true, ui, sessionManager: { getBranch: () => [] } });
 		const first = draw();
 		const count = highlights;
 		expect(first.join("\n")).toContain("first");
@@ -54,49 +50,36 @@ test("user Markdown reuses one layout and invalidates for width, content, themes
 		draw();
 		expect(highlights).toBeGreaterThan(beforeMarkdownTheme);
 		const beforeSettings = highlights;
-		writeFileSync(join(world().agent, "settings.json"), JSON.stringify({ kendex: { extensionManager: { config: { "@vanillagreen/pi-tool-renderer": { styledCodeBlocks: false } } } } }));
+		writeFileSync(join(world().agent, "settings.json"), JSON.stringify({ "pi-tool-renderer": { styledCodeBlocks: false } }));
 		clearPackageConfigCache();
 		draw();
 		expect(highlights).toBeGreaterThan(beforeSettings);
 		const beforeShutdown = __test.renderRawUserMessageLines(component, 60, ui.theme, world().cwd);
 		handlers.get("session_shutdown")!();
 		expect(__test.renderRawUserMessageLines(component, 60, ui.theme, world().cwd)).not.toBe(beforeShutdown);
-		expect(component.render()).toEqual(["upstream"]);
-	} finally {
-		handlers.get("session_shutdown")!();
-	}
+		expect(component.render()).toEqual(["upstream"]); } finally { handlers.get("session_shutdown")!(); }
 });
 
-test("restored user messages get inline stamps from the active session branch", () => {
-	const timestamp = new Date(2024, 0, 2, 3, 4, 5).getTime();
+test("restored user messages get inline stamps from the active session branch", () => { const timestamp = new Date(2024, 0, 2, 3, 4, 5).getTime();
 	const theme = { fg: (_token: string, text: string) => text };
 	const handlers = new Map<string, (...args: any[]) => void>();
-	class Message {
-		text = "restored user message";
+	class Message { text = "restored user message";
 		markdownTheme = getMarkdownTheme();
-		render(_width = 60) { return ["upstream"]; }
-	}
+		render(_width = 60) { return ["upstream"]; } }
 	__stampTest.pendingUserStamps.length = 0;
-	writeFileSync(join(world().agent, "settings.json"), JSON.stringify({ kendex: { extensionManager: { config: { "@vanillagreen/pi-tool-renderer": { compactUserMessages: true, messageStamps: "inline", messageStampFormat: "24h", messageStampSeconds: true } } } } }));
+	writeFileSync(join(world().agent, "settings.json"), JSON.stringify({ "pi-tool-renderer": { compactUserMessages: true, messageStamps: "inline", messageStampFormat: "24h", messageStampSeconds: true } }));
 	clearPackageConfigCache();
 	installUserMessageRenderer({ on: (event: string, handler: (...args: any[]) => void) => handlers.set(event, handler) } as never, Message);
 	const component = new Message();
-	try {
-		handlers.get("session_start")!({}, {
-			cwd: world().cwd,
+	try { handlers.get("session_start")!({}, { cwd: world().cwd,
 			hasUI: true,
 			ui: { theme },
-			sessionManager: { getBranch: () => [{ type: "message", message: { role: "user", timestamp } }] },
-		});
-		expect(component.render(60).join("\n")).toContain("03:04:05");
-	} finally {
-		handlers.get("session_shutdown")!();
-		__stampTest.pendingUserStamps.length = 0;
-	}
+			sessionManager: { getBranch: () => [{ type: "message", message: { role: "user", timestamp } }] }, });
+		expect(component.render(60).join("\n")).toContain("03:04:05"); } finally { handlers.get("session_shutdown")!();
+		__stampTest.pendingUserStamps.length = 0; }
 });
 
-test("user layouts bypass oversized content and drop old component layouts at the count bound", () => {
-	const theme = { fg: (_token: string, text: string) => text };
+test("user layouts bypass oversized content and drop old component layouts at the count bound", () => { const theme = { fg: (_token: string, text: string) => text };
 	const component = { text: "first", markdownTheme: getMarkdownTheme() };
 	const first = __test.renderRawUserMessageLines(component, 80, theme);
 	for (let index = 0; index < 256; index++) __test.renderRawUserMessageLines({ text: "next", markdownTheme: component.markdownTheme }, 80, theme);

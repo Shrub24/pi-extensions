@@ -4,9 +4,10 @@
  * the copies equal: change one, then copy it over every other
  * `package-config.ts` in the tree.
  *
- * It owns the Pi user directory, the project-trust registry and the
- * `kendex.extensionManager.config` walk, and it provides the default
- * settings-file order, `piSettingsPaths`. A package that finds its own project
+ * It owns the Pi user directory, the project-trust registry and the read of a
+ * package's own top-level key in the settings files, and it provides the default
+ * settings-file order, `piSettingsPaths`. Settings are file-managed: a package
+ * reads its own key, and nothing writes settings from inside a session. A package that finds its own project
  * root, such as pi-hooks, passes its own path list to `readPackageConfigAt`.
  * Widgets and renderers read settings many times per frame; going to the disk
  * on each read kept every lane's render loop busy. A memoized answer is served
@@ -19,9 +20,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-
-/** What pi-extension-manager emits on `pi.events` after it writes a setting. */
-export const SETTINGS_CHANGED_EVENT = "kendex:extension-settings-changed";
 
 /** How long a memoized answer is served before its inputs are read again. */
 export const SETTINGS_RECHECK_MS = 1000;
@@ -330,13 +328,12 @@ function readSettingsFilesAt(paths: readonly string[], now: number): readonly Se
 	);
 }
 
-/** `packageId`'s object under `kendex.extensionManager.config` in one parsed
- * settings document, or `undefined` where it holds none. */
+/** `packageId`'s own object in one parsed settings document, or `undefined`
+ * where it holds none. Settings are file-managed: each package reads a
+ * top-level key named after itself in Pi's user and project settings files,
+ * and nothing inside a session writes them. */
 export function packageConfigIn(settings: Readonly<SettingsRecord>, packageId: string): Readonly<SettingsRecord> | undefined {
-	const kendex = settings.kendex;
-	const manager = isRecord(kendex) ? kendex.extensionManager : undefined;
-	const config = isRecord(manager) ? manager.config : undefined;
-	const own = isRecord(config) ? config[packageId] : undefined;
+	const own = settings[packageId];
 	return isRecord(own) ? own : undefined;
 }
 
@@ -422,24 +419,19 @@ export function readPackageConfig(packageId: string, cwd = process.cwd()): Reado
 export interface SettingsRefreshHost {
 	on(event: "session_start", handler: () => void): unknown;
 	on(event: "session_shutdown", handler: () => void): unknown;
-	events: { on(channel: string, handler: (data: unknown) => void): () => void };
 }
 
 /**
  * Drops every memoized answer when a session starts, which is where the cwd
- * and the project's trust can change, and whenever pi-extension-manager
- * announces a settings change. The subscription lives from `session_start` to
- * `session_shutdown`, as Pi asks of any listener.
+ * and the project's trust can change, and at shutdown. No writer announces an
+ * edit: the read window (`SETTINGS_RECHECK_MS`) is what applies a file change
+ * without a restart.
  */
 export function installSettingsCacheRefresh(pi: SettingsRefreshHost): void {
-	let unsubscribe: (() => void) | undefined;
 	pi.on("session_start", () => {
 		clearPackageConfigCache();
-		unsubscribe ??= pi.events.on(SETTINGS_CHANGED_EVENT, () => clearPackageConfigCache());
 	});
 	pi.on("session_shutdown", () => {
-		unsubscribe?.();
-		unsubscribe = undefined;
 		clearPackageConfigCache();
 	});
 }

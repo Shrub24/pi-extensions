@@ -10,7 +10,7 @@ function writeSettings(config: Record<string, unknown>): NodeJS.ProcessEnv {
 	mkdirSync(dir, { recursive: true });
 	writeFileSync(
 		join(dir, "settings.json"),
-		JSON.stringify({ kendex: { extensionManager: { config: { "@vanillagreen/pi-jev": config } } } }),
+		JSON.stringify({ "pi-jev": config }),
 		"utf8",
 	);
 	return { PI_CODING_AGENT_DIR: dir } as NodeJS.ProcessEnv;

@@ -123,7 +123,7 @@ export interface kendexModalLock {
 	depth: number;
 }
 
-export type kendexConfig = Record<string, unknown>;
+export type PackageSettings = Record<string, unknown>;
 
 export interface BackgroundTaskSnapshot {
 	id: string;
