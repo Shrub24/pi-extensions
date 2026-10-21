@@ -297,6 +297,9 @@ export function installUserMessageRenderer(pi: ExtensionAPI, UserMessageComponen
 			state.invalidatePatched = true;
 			state.originalInvalidate = prototype.invalidate as UserMessagePatchState["originalInvalidate"];
 			prototype.invalidate = function invalidateUserMessageLayout(this: object): void {
+			// A host invalidation is how a theme change arrives, and a highlight made
+			// under the old colours must not outlive it.
+			codeHighlightCache.clear();
 				const layout = userMessageLayouts.get(this);
 				if (layout) {
 					layout.lines = undefined;
@@ -876,7 +879,10 @@ function padAnsiLine(line: string, width: number): string {
 	return `${line}${" ".repeat(Math.max(0, width - visibleWidth(line)))}`;
 }
 
-const codeHighlightCache = new Map<string, string[]>();
+/** A highlight belongs to the Markdown theme that produced it: the same code under
+ * another theme's highlighter is a different answer, so an entry is served only to
+ * the theme that wrote it and is replaced when another theme asks. */
+const codeHighlightCache = new Map<string, { markdownTheme: unknown; lines: string[] }>();
 const CODE_HIGHLIGHT_CACHE_MAX = 120;
 
 /**
@@ -889,7 +895,7 @@ const CODE_HIGHLIGHT_CACHE_MAX = 120;
 export function codeHighlightCacheStats(): { entries: number; keyChars: number; valueChars: number } {
 	let keyChars = 0;
 	let valueChars = 0;
-	for (const [key, lines] of codeHighlightCache) {
+	for (const [key, { lines }] of codeHighlightCache) {
 		keyChars += key.length;
 		for (const line of lines) valueChars += line.length;
 	}
@@ -899,16 +905,17 @@ export function codeHighlightCacheStats(): { entries: number; keyChars: number; 
 function highlightCodeCached(markdownTheme: any, code: string, lang: string | undefined): string[] {
 	const key = `${lang ?? ""}\u0000${code}`;
 	const cached = codeHighlightCache.get(key);
-	if (cached) {
+	if (cached?.markdownTheme === markdownTheme) {
 		// Refresh recency: Map preserves insertion order, so re-insert on hit.
 		codeHighlightCache.delete(key);
 		codeHighlightCache.set(key, cached);
-		return cached;
+		return cached.lines;
 	}
 	const highlighted = markdownTheme?.highlightCode
 		? markdownTheme.highlightCode(code, lang)
 		: code.split("\n").map((line: string) => (markdownTheme?.codeBlock ? markdownTheme.codeBlock(line) : line));
-	codeHighlightCache.set(key, highlighted);
+	codeHighlightCache.delete(key);
+	codeHighlightCache.set(key, { markdownTheme, lines: highlighted });
 	while (codeHighlightCache.size > CODE_HIGHLIGHT_CACHE_MAX) {
 		const oldest = codeHighlightCache.keys().next().value;
 		if (oldest === undefined) break;

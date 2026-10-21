@@ -38,4 +38,18 @@ describe("styled markdown code blocks", () => {
 		expect(rendered[0]!).toContain("\x1b[48;5;236m");
 		expect(visibleWidth(rendered[0]!)).toBe(19);
 	});
+
+	test("a second theme gets its own highlight of the same code, and a repeat under one theme is served from cache", () => {
+		const code = { type: "code", lang: "text", text: "same_code_under_two_themes" };
+		let calls = 0;
+		const themed = (tag: string) => ({ highlightCode: (text: string) => { calls++; return [`${text}:${tag}`]; } });
+		const first = themed("first");
+		const second = themed("second");
+
+		expect(stripControl(__test.renderStyledCodeBlock(code, 60, first)[0]!)).toContain(":first");
+		expect(stripControl(__test.renderStyledCodeBlock(code, 60, second)[0]!)).toContain(":second");
+		const afterTwoThemes = calls;
+		__test.renderStyledCodeBlock(code, 60, second);
+		expect(calls, "the repeat under the same theme is a cache hit").toBe(afterTwoThemes);
+	});
 });

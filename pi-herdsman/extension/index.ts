@@ -3404,7 +3404,7 @@ async function managedAgentSnapshots(
   signal?: AbortSignal,
   proveLead = false,
   allWorkspaces = false,
-  allowTranscriptDefinitionFallback = true,
+  allowTranscriptDefinitionFallback = false,
 ): Promise<{
   agents: ManagedAgentSnapshot[];
   mailboxes: ReturnType<typeof listAgentStates>;
@@ -4373,7 +4373,7 @@ async function agentSnapshotView(
   scope: ControllerScope | undefined,
   signal?: AbortSignal,
   proveLead = false,
-  allowTranscriptDefinitionFallback = true,
+  allowTranscriptDefinitionFallback = false,
 ): Promise<ManagedAgentSnapshotView> {
   const snapshot = await managedAgentSnapshots(
     pi,
@@ -5414,7 +5414,7 @@ function agentDefinitionForRuntime(
   agent: any,
   state: ManagedAgentState,
   cached?: Runtime,
-  allowTranscriptFallback = true,
+  allowTranscriptFallback = false,
 ): string {
   if (state.agentDefinition !== undefined) return stateAgentDefinition(state);
   // `unknown` is a tick's negative, evidence only that the transcript was not
@@ -5639,7 +5639,7 @@ function runtimeForListedAgent(
   agent: any,
   state: ManagedAgentState,
   cached?: Runtime,
-  allowTranscriptFallback = true,
+  allowTranscriptFallback = false,
 ): Runtime {
   const useCached =
     cached !== undefined && runtimeIdentityMatches(cached, state, agent);
@@ -11752,7 +11752,7 @@ export default function (pi: ExtensionAPI): void {
     const loadStatusSnapshot = async (
       ctx: ExtensionContext,
       signal?: AbortSignal,
-      allowTranscriptDefinitionFallback = true,
+      allowTranscriptDefinitionFallback = false,
     ): Promise<import("./presentation.ts").StatusSnapshot> => {
       const view = await agentSnapshotView(
         pi,

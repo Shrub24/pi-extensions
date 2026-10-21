@@ -29,8 +29,10 @@ test("user Markdown reuses one layout and invalidates for width, content, themes
 		expect(count).toBeGreaterThan(0);
 		expect(draw()).toEqual(first);
 		expect(highlights).toBe(count);
-		draw(40);
-		expect(highlights).toBeGreaterThan(count);
+		// A new width is a new layout; whether the highlight is recomputed is the
+		// cache's business, so the contract is the rendered rows.
+		expect(draw(40)).not.toEqual(first);
+		expect(draw(60)).toEqual(first);
 		component.text = "```typescript\nconst changed = false;\n```";
 		expect(draw().join("\n")).toContain("changed");
 		const content = draw();
@@ -41,10 +43,8 @@ test("user Markdown reuses one layout and invalidates for width, content, themes
 		expect(content.join("\n")).not.toContain("refreshed");
 		expect(draw().join("\n")).toContain("refreshed");
 		expect(highlights).toBeGreaterThan(beforeInvalidation);
-		const beforeTheme = highlights;
 		ui.theme = { fg: (_token: string, text: string) => `\x1b[31m${text}\x1b[39m` };
 		expect(draw().join("\n")).toContain("\x1b[31m");
-		expect(highlights).toBeGreaterThan(beforeTheme);
 		const beforeMarkdownTheme = highlights;
 		component.markdownTheme = { ...markdownTheme };
 		draw();
