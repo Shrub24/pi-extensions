@@ -341,9 +341,9 @@ export function reviewDeadlineFor(task: { startedAt: number; lastReviewedAt?: nu
 	return reviewArmedAt(task) + softTimeoutMs;
 }
 
-/** Whether a running task should currently have one review reminder armed. */
-export function reviewReminderArmed(task: { status: BackgroundTaskStatus; stopReason?: string | null; resultResolution?: "delivered" | "error" | "dismissed"; startedAt: number; lastReviewedAt?: number; softTimeoutMs?: number }): boolean {
-	if (task.stopReason != null || (task.status !== "running" && task.resultResolution !== undefined)) return false;
+/** Whether a running task should currently have one review reminder armed. A finished task arms none: its result is reminded once, at idle. */
+export function reviewReminderArmed(task: { status: BackgroundTaskStatus; stopReason?: string | null; startedAt: number; lastReviewedAt?: number; softTimeoutMs?: number }): boolean {
+	if (task.stopReason != null || task.status !== "running") return false;
 	return reviewDeadlineFor(task) != null;
 }
 

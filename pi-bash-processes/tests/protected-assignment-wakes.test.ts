@@ -31,8 +31,8 @@ async function until(predicate: () => boolean, budgetMs = 15_000): Promise<void>
 
 const exitMessagesFor = (id: string) =>
 	host.messages.filter(([message]) => {
-		const details = (message as { details?: { eventType?: string; grouped?: boolean } }).details;
-		return details?.eventType === "exit" && JSON.stringify(message).includes(id);
+		const details = (message as { details?: { eventType?: string; task?: { id?: string } } }).details;
+		return details?.eventType === "exit" && details.task?.id === id;
 	});
 const settle = async () => {
 	await host.dispatch("agent_end");
@@ -69,7 +69,7 @@ test("without protection a notifyOnExit:false task stays silent", async () => {
 	await bgTask().execute("protected-silent-get", { action: "get", id });
 });
 
-test("mid-turn protected exits coalesce into one grouped wake at the run boundary", async () => {
+test("mid-run protected exits are delivered at once, not held to the run boundary", async () => {
 	await host.dispatch("before_agent_start");
 	expect(bindBackgroundWorkAssignment(host.events, scope("req-c"))).toStrictEqual({ state: "bound" });
 	expect(protectBackgroundWorkAssignment(host.events, scope("req-c"), true)).toStrictEqual({ state: "bound" });
@@ -80,37 +80,13 @@ test("mid-turn protected exits coalesce into one grouped wake at the run boundar
 	const idB = (second.details.task as { id: string }).id;
 	await host.settledTask(idA);
 	await host.settledTask(idB);
-	expect(exitMessagesFor(idA), "mid-turn exits are held, not delivered").toHaveLength(0);
-	expect(exitMessagesFor(idB), "mid-turn exits are held, not delivered").toHaveLength(0);
-
-	await settle();
-	const grouped = host.messages.filter(([message]) => {
-		const content = (message as { content?: string }).content ?? "";
-		return content.includes(idA) && content.includes(idB);
-	});
-	expect(grouped, "both protected completions arrive as one grouped wake").toHaveLength(1);
+	await until(() => exitMessagesFor(idA).length > 0 && exitMessagesFor(idB).length > 0);
+	expect(exitMessagesFor(idA), "forced by protection, delivered mid-run").toHaveLength(1);
+	expect(exitMessagesFor(idB), "forced by protection, delivered mid-run").toHaveLength(1);
 	expect((await listed(idA))?.exitNotified).toBe(true);
 	expect((await listed(idB))?.exitNotified).toBe(true);
 	await bgTask().execute("protected-group-get", { action: "get", id: idA });
 	await bgTask().execute("protected-group-get", { action: "get", id: idB });
-});
-
-test("a retrieval after a held protected wake cancels it instead of double-delivering", async () => {
-	await host.dispatch("before_agent_start");
-	expect(bindBackgroundWorkAssignment(host.events, scope("req-d"))).toStrictEqual({ state: "bound" });
-	expect(protectBackgroundWorkAssignment(host.events, scope("req-d"), true)).toStrictEqual({ state: "bound" });
-
-	const spawned = await bgTask().execute("protected-cancel", { action: "spawn", command: "printf 'cancel-me\\n'", notifyOnExit: false });
-	const id = (spawned.details.task as { id: string }).id;
-	await host.settledTask(id);
-	// The exit is held (mid-turn); the retrieval is the observation that makes
-	// the held wake redundant.
-	const got = await bgTask().execute("protected-cancel-get", { action: "get", id });
-	expect(got.content[0]?.text ?? "").toContain(id);
-
-	await settle();
-	expect(exitMessagesFor(id), "the consumed held wake is never delivered").toHaveLength(0);
-	expect((await listed(id))?.exitNotified, "the obligation is still recorded").toBe(true);
 });
 
 test("a confirmed stop after a protected exit resolves and cancels its held wake", async () => {
@@ -209,24 +185,4 @@ test("protect does not duplicate a wake that was already delivered before it", a
 	expect(carried.snapshot.outstanding.map((entry) => entry.taskId), "the unretrieved result is still outstanding for the new request").toStrictEqual([id]);
 
 	await bgTask().execute("protect-prior-get", { action: "get", id });
-});
-
-test("protect over a held mid-turn wake queues nothing extra and forces one delivery at the boundary", async () => {
-	await host.dispatch("before_agent_start");
-	expect(bindBackgroundWorkAssignment(host.events, scope("req-h"))).toStrictEqual({ state: "bound" });
-	const spawned = await bgTask().execute("protect-held", { action: "spawn", command: "printf 'held-protect\\n'", notifyOnExit: false });
-	const id = (spawned.details.task as { id: string }).id;
-	await host.settledTask(id);
-	// The mid-turn exit is held (its obligation acked at hold), so protection
-	// must not queue a second entry for it.
-	expect((await listed(id))?.exitNotified, "the held wake already acked its obligation").toBe(true);
-	expect(protectBackgroundWorkAssignment(host.events, scope("req-h"), true)).toStrictEqual({ state: "bound" });
-	await Bun.sleep(150);
-	expect(exitMessagesFor(id), "nothing is delivered mid-turn").toHaveLength(0);
-
-	await settle();
-	await until(() => exitMessagesFor(id).length > 0);
-	await Bun.sleep(150);
-	expect(exitMessagesFor(id), "the held wake is delivered exactly once, forced by protection").toHaveLength(1);
-	await bgTask().execute("protect-held-get", { action: "get", id });
 });

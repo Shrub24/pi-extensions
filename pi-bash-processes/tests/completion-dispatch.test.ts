@@ -27,14 +27,15 @@ const settle = async () => {
 	await host.dispatch("agent_settled");
 };
 
-test("a stop revalidates a held completion and fulfils the same obligation once", async () => {
+test("a stop after the completion wake reports the real outcome and adds no second wake", async () => {
 	await host.dispatch("before_agent_start");
 	const spawned = await execute({ action: "spawn", command: "printf 'stopped-run\\n'" });
 	const id = (spawned.details.task as { id: string }).id;
 	await host.settledTask(id);
 
-	// The exit is held because a run is in flight.
-	expect(events("exit"), "a mid-run completion is held, not delivered").toHaveLength(0);
+	// The completion is the delivery and is not held for the end of the run.
+	await until(() => events("exit").length > 0);
+	expect(events("exit"), "a mid-run completion is delivered, not held").toHaveLength(1);
 
 	// The stop is the observation: it reports the task's real outcome under the
 	// same id and takes over the completion obligation.
@@ -42,7 +43,6 @@ test("a stop revalidates a held completion and fulfils the same obligation once"
 	const stopText = stopped.content[0]?.text ?? "";
 	expect(stopText, "a stop of an already-finished task reports its real terminal outcome").toContain("completed (exit 0)");
 	expect(stopText, "and never claims it stopped the process").not.toContain("Stopped bg-1");
-	expect(stopText, "the stop's own delivery is what settled the obligation").toContain("acknowledged: completion settled");
 	const afterStop = await taskById(id);
 	expect(
 		{ status: afterStop?.status, exitCode: afterStop?.exitCode, notified: afterStop?.exitNotified },
@@ -50,11 +50,11 @@ test("a stop revalidates a held completion and fulfils the same obligation once"
 	).toStrictEqual({ status: "completed", exitCode: 0, notified: true });
 
 	await settle();
-	expect(events("exit"), "the run boundary must not send a second, redundant wake").toHaveLength(0);
+	expect(events("exit"), "the run boundary must not send a second, redundant wake").toHaveLength(1);
 	expect((await taskById(id))?.exitNotified, "and the obligation stays fulfilled").toBe(true);
 });
 
-test("completion switches an unread result to result-review reminders", async () => {
+test("completion ends the progress reminders and leaves one idle advisory for the unread result", async () => {
 	await host.dispatch("before_agent_start");
 	const spawned = await execute({
 		action: "spawn",
@@ -67,28 +67,19 @@ test("completion switches an unread result to result-review reminders", async ()
 	await host.settledTask(id);
 	await settle();
 
-	// One reminder per elapsed interval, re-armed from its own delivery: a task
-	// that outlives several intervals is reviewed several times, and never holds
-	// more than the one pending reminder for the interval it is in.
-	const soft = events("soft-timeout");
-	expect(soft.length, "each elapsed interval produced its own review").toBeGreaterThanOrEqual(1);
-	const delivered = soft.length;
-	const deadlineAtTerminal = (await taskById(id))?.softExpiresAt ?? null;
-	// The terminal result remains owed, but it is no longer a progress review.
-	// Completion starts its own review interval after the previous progress wake.
+	const delivered = events("soft-timeout").length;
+	expect(delivered, "the running task was reviewed on its interval").toBeGreaterThanOrEqual(1);
+	expect((await taskById(id))?.softExpiresAt ?? null, "a finished task carries no review deadline").toBeNull();
 	await Bun.sleep(400);
 	expect(events("soft-timeout").length, "a finished task receives no further progress reminder").toBe(delivered);
-	expect(events("result-review").length, "the unread terminal result receives its own reminder").toBeGreaterThan(0);
-	expect((await taskById(id))?.softExpiresAt ?? 0, "result review re-arms from delivery").toBeGreaterThan(deadlineAtTerminal);
-	const exit = events("exit");
+	expect(events("result-review"), "the unread result is reminded once, at idle").toHaveLength(1);
+	const exit = events("exit").filter(([message]) => (message as { details?: { task?: { id?: string } } }).details?.task?.id === id);
 	expect(exit, "the completion is delivered separately, exactly once").toHaveLength(1);
-	expect(JSON.stringify(exit[0]), "the completion names its own task").toContain(id);
 	const final = await taskById(id);
 	expect(
 		{ status: final?.status, notified: final?.exitNotified },
 		"the reminder never became the completion's acknowledgment",
 	).toStrictEqual({ status: "completed", notified: true });
-expect(events("soft-timeout").length).toBe(delivered);
 });
 
 test("completions in an idle session are batched into one wake, each acknowledged once", async () => {

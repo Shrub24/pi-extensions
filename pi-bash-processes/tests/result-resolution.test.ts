@@ -159,15 +159,12 @@ test("a delivered host wake never resolves the result; the retrieval does", asyn
 	const id = (spawned.details.task as { id: string }).id;
 	await host.settledTask(id);
 
-	// The turn is in flight, so the completion is held, not delivered.
-	const heldExit = host.messages.filter(([message]) => (message as { details?: { eventType?: string } }).details?.eventType === "exit");
-	expect(heldExit, "the mid-turn completion is held").toHaveLength(0);
-
-	await host.dispatch("agent_end");
-	await host.dispatch("agent_settled");
-	const exits = host.messages.filter(([message]) => (message as { details?: { eventType?: string } }).details?.eventType === "exit");
-	expect(exits.length, "the settled turn delivers the completion wake exactly once").toBe(1);
-	expect(JSON.stringify(exits[0]), "the wake names its task").toContain(id);
+	// The turn is in flight, and the completion is delivered anyway: it is the
+	// result delivery, not something held for the run boundary.
+	const exits = () => host.messages.filter(([message]) => (message as { details?: { eventType?: string } }).details?.eventType === "exit");
+	for (let waited = 0; waited < 5_000 && exits().length === 0; waited += 10) await Bun.sleep(10);
+	expect(exits().length, "the mid-run completion is delivered exactly once").toBe(1);
+	expect(JSON.stringify(exits()[0]), "the wake names its task").toContain(id);
 	expect((await listed(id))?.exitNotified, "the wake is acknowledged as delivered").toBe(true);
 	expect((await listed(id))?.resultResolution, "a host wake is notification, not settlement").toBeUndefined();
 	expect(outstandingOf("req-n"), "the notified terminal result is still outstanding").toStrictEqual([

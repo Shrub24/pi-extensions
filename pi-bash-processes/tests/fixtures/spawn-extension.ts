@@ -169,23 +169,6 @@ try {
 		const afterTurnEnd = messages.slice(afterExit.length + afterLog.length);
 		deferred = { afterLog, afterTurnEnd, afterExit };
 	}
-	let deferredGroup: { count: number; grouped: boolean } | undefined;
-	if (input.mode === "deferred-group") {
-		await dispatch("before_agent_start");
-		// children[0] is the fixture's own pre-spawn; the two grouped tasks are
-		// children[1] and children[2].
-		await execute({ action: "spawn", command: "echo one", notifyOnExit: true });
-		await execute({ action: "spawn", command: "echo two", notifyOnExit: true });
-		native.children[1]?.emit("close", 0);
-		native.children[2]?.emit("close", 0);
-		await Promise.resolve();
-		await Promise.resolve();
-		const during = messages.length;
-		await dispatch("agent_end");
-		await dispatch("agent_settled");
-		const wakes = messages.slice(during).filter(([m]: any[]) => m?.customType === "kendex-background-tasks:event" && (m?.details?.grouped === true || m?.details?.eventType === "exit"));
-		deferredGroup = { count: wakes.length, grouped: wakes.some(([m]: any[]) => String(m?.content ?? "").includes("background tasks finished")) };
-	}
 	// Regression for the three-wake report: three tasks finishing at different
 	// points inside ONE run must produce a single grouped wake at the run
 	// boundary.
@@ -204,10 +187,9 @@ try {
 		native.children[3]?.emit("close", 0);
 		await Promise.resolve();
 		await Promise.resolve();
-		const during = messages.length;
 		await dispatch("agent_end");
 		await dispatch("agent_settled");
-		const wakes = messages.slice(during).filter(([m]: any[]) => m?.customType === "kendex-background-tasks:event" && (m?.details?.grouped === true || m?.details?.eventType === "exit"));
+		const wakes = messages.filter(([m]: any[]) => m?.customType === "kendex-background-tasks:event" && (m?.details?.grouped === true || m?.details?.eventType === "exit") && m?.details?.eventType !== "result-review");
 		const wakeTexts = wakes.map(([m]: any[]) => String(m?.content ?? "").slice(0, 1_200));
 		const listed = await execute({ action: "list" });
 		staggered = {
@@ -305,11 +287,8 @@ try {
 		await dispatch("agent_end");
 		await dispatch("agent_settled");
 		const exitWakes = exitWakeCount();
-		// The exit wake notifies; it does not read the result. The interval the
-		// running task would have used now belongs to the result it left behind, so
-		// firing it produces the reminder that says what is still owed.
-		native.fireTimeout(softMs);
-		await Promise.resolve();
+		// The exit wake delivered; the unretrieved result is reminded once, at the
+		// idle boundary just passed. No interval is armed for it.
 		const reviewWakes = messages
 			.map((args) => args[0] as { content?: unknown; details?: { eventType?: string } })
 			.filter((message) => message?.details?.eventType === "result-review")
@@ -486,7 +465,7 @@ try {
 	if (!shutDown) { await dispatch("session_shutdown"); shutDown = true; }
 	process.stdout.write(JSON.stringify({
 		spawn: { file: spawn.file, args: spawn.args, detached: spawn.options.detached, stdio: spawn.options.stdio, cwdIsPrivate: spawn.options.cwd === process.cwd(), piRootIsPrivate: (spawn.options.env as NodeJS.ProcessEnv).PI_CODING_AGENT_DIR === process.env.PI_CODING_AGENT_DIR, resultAction: spawned.details.action, resultId: spawned.details.task!.id, resultPid: spawned.details.task!.pid },
-		duplicate, waitAny, supersede, operatorStop, rerun, deferred, deferredGroup, staggered, soft, spawnSoftState,
+		duplicate, waitAny, supersede, operatorStop, rerun, deferred, staggered, soft, spawnSoftState,
 		before, outcome, stopResult, after, escalated, final, log, stoppedTimers, stopCalls, signals, childSignals,
 		timerEvents: native.timerEvents, remainingTimers: native.activeTimers(), unexpected: native.unexpected, notifications, messages,
 		fixtureNow, fixturePid,

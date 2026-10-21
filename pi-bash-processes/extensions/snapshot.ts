@@ -41,6 +41,7 @@ export function taskSnapshot(task: ManagedTask): BackgroundTaskSnapshot {
 		// observed handoff, they must survive the restart they are recorded for.
 		assignmentRequestId: task.assignmentRequestId,
 		resultResolution: task.resultResolution,
+		resultReminded: task.resultReminded === true ? true : undefined,
 		// Only a terminal task has an established capture record; a running task
 		// writes none, so restore reads "not recorded" and reconciles.
 		outputComplete: task.status === "running" ? undefined : task.outputComplete === true,
@@ -400,6 +401,7 @@ export async function restoredTaskFromSnapshot(snapshot: BackgroundTaskSnapshot,
 		// parent's branch). This session can never retrieve its result, so nothing
 		// here waits on it: a terminal one is closed as `delivered` instead of
 		// being advertised as awaiting review for the life of the fork.
+		resultReminded: snapshot.resultReminded === true ? true : undefined,
 		resultResolution: snapshot.resultResolution === "delivered" || snapshot.resultResolution === "error" || snapshot.resultResolution === "dismissed"
 			? snapshot.resultResolution
 			: foreignSession ? "delivered" : undefined,

@@ -43,7 +43,8 @@ test("an identical respawn supersedes the older task and drops its wake", () => 
 		command2: "sleep 5 && echo one",
 		wakeDelayMs: 1200,
 	}) as { supersede: { wakes: unknown[]; listText: string } };
-	expect(result.supersede.wakes.length, "only the newer task wakes").toBe(1);
+	const completions = result.supersede.wakes.filter((call) => JSON.stringify(call).includes('"eventType":"exit"'));
+	expect(completions.length, "only the newer task wakes").toBe(1);
 	expect(result.supersede.listText).toContain("superseded by bg-2");
 }, SPAWN_FIXTURE_TIMEOUT_MS);
 

@@ -180,6 +180,7 @@ import {
 	recordScheduledOutputDrop,
 	scheduleTaskWake,
 	sendOutputWakeBudgetExhaustedNotice,
+	sendResultReviewAdvisory,
 	sendTaskWake,
 	shouldEmitOutputWake,
 	truncateForTranscript,
@@ -239,8 +240,6 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 	// produced a visible "Background task finished" line for work that was
 	// already reported. Deferred wakes flush at turn end unless something
 	// observes the task first (see consumeObservedExitWake).
-	let turnActive = false;
-	const deferredExitWakes = new Map<string, { eventAt?: number; matchedPattern?: string; newOutputTail?: string; sequence?: number }>();
 	let requestWidgetRender: (() => void) | null = null;
 	let forceNextBashBackgroundAt: number | null = null;
 	const backgroundBashShortcut = settingString("backgroundBashShortcut", DEFAULT_BACKGROUND_BASH_SHORTCUT);
@@ -333,7 +332,6 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		if (task.status === "running") return false;
 		if (task.resultResolution !== undefined) return false;
 		task.resultResolution = kind;
-		remindedResultReviews.delete(task.id);
 		rememberSnapshot(task);
 		persistSnapshots();
 		bumpSettlementRevision();
@@ -575,9 +573,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 
 	/** Drops any completion wake this process still holds for a task. */
 	const cancelHeldCompletionWake = (taskId: string): boolean => {
-		const deferred = deferredExitWakes.delete(taskId);
-		const idle = idleExitBatch.delete(taskId);
-		return deferred || idle;
+		return exitWakeBatch.delete(taskId);
 	};
 
 	/**
@@ -588,7 +584,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 	 */
 	const ackCompletion = (
 		task: ManagedTask,
-		reason: "foreground-delivery" | "wait-delivery" | "retrieval" | "stop" | "host-notification" | "held-wake",
+		reason: "foreground-delivery" | "wait-delivery" | "retrieval" | "stop" | "host-notification",
 		options: { cancelHeld?: boolean } = {},
 	): boolean => {
 		const result = acknowledgeCompletion(
@@ -1722,27 +1718,18 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 				return true;
 			}
 		}
-		// Mid-turn exits are held until the turn ends: the agent can still read
-		// the result in this same turn, in which case the wake is dropped.
-		if (eventType === "exit" && turnActive && !shuttingDown) {
-			// Held, not delivered: record the obligation, but do not cancel the
-			// wake this branch is placing.
-			ackCompletion(task, "held-wake", { cancelHeld: false });
-			deferredExitWakes.set(task.id, options);
-			publishBackgroundTaskActivity(eventType, task, { ...options, sequence: options.sequence ?? task.wakeSequence ?? 0 });
-			return true;
-		}
-		// Idle-time exits: hold briefly so siblings finishing in the same window
-		// arrive as one grouped wake (subagents-style completion batching).
+		// Every other exit is the task's primary result delivery. It waits only the
+		// short batch window, so siblings finishing together share one message,
+		// and is never held for the end of a run: during a run Pi queues it as
+		// steer. Queued, not delivered: return false so callers do not mark the
+		// exit notified. The flush claims delivery once the send actually
+		// succeeds, which also keeps a crash inside the window replay-eligible.
 		if (eventType === "exit" && !shuttingDown) {
-			// Queued, not delivered: return false so callers do not mark the exit
-			// notified. The flush claims delivery once the send actually succeeds,
-			// which also keeps a crash inside the debounce window replay-eligible.
-			idleExitBatch.set(task.id, options);
+			exitWakeBatch.set(task.id, options);
 			publishBackgroundTaskActivity(eventType, task, { ...options, sequence: options.sequence ?? task.wakeSequence ?? 0 });
 			rememberSnapshot(task);
 			persistSnapshots();
-			scheduleIdleExitFlush();
+			scheduleExitFlush();
 			return false;
 		}
 		const sent = sendTaskWake({
@@ -1763,30 +1750,24 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		return sent;
 	};
 
-	const IDLE_EXIT_DEBOUNCE_MS = settingNumber("exitWakeBatchMs", 250, activeCtx?.cwd);
-	const idleExitBatch = new Map<string, { eventAt?: number; matchedPattern?: string; newOutputTail?: string; sequence?: number }>();
-	let idleExitTimer: ReturnType<typeof setTimeout> | null = null;
+	const EXIT_BATCH_MS = settingNumber("exitWakeBatchMs", 250, activeCtx?.cwd);
+	const exitWakeBatch = new Map<string, { eventAt?: number; matchedPattern?: string; newOutputTail?: string; sequence?: number }>();
+	let exitBatchTimer: ReturnType<typeof setTimeout> | null = null;
 
-	// Merge-into-undelivered is Pi's job now: settings.followUpMode = "all"
-	// drains queued follow-ups as one prompt, so every wake can go out as soon
-	// as it is ready and Pi coalesces whatever is still queued.
-	const scheduleIdleExitFlush = (): void => {
-		if (IDLE_EXIT_DEBOUNCE_MS <= 0) {
-			flushIdleExitBatch();
+	// Merge-into-undelivered is Pi's job: settings.followUpMode = "all" drains
+	// queued messages as one prompt, so every wake can go out as soon as it is
+	// ready and Pi coalesces whatever is still queued.
+	const scheduleExitFlush = (): void => {
+		if (EXIT_BATCH_MS <= 0) {
+			flushExitBatch();
 			return;
 		}
-		if (idleExitTimer) return;
-		idleExitTimer = setTimeout(() => {
-			idleExitTimer = null;
-			flushIdleExitBatch();
-		}, IDLE_EXIT_DEBOUNCE_MS);
-		idleExitTimer.unref?.();
-	};
-	const flushIdleExitBatch = (): void => {
-		if (idleExitBatch.size === 0) return;
-		for (const [id, options] of idleExitBatch) deferredExitWakes.set(id, options);
-		idleExitBatch.clear();
-		flushDeferredExitWakes();
+		if (exitBatchTimer) return;
+		exitBatchTimer = setTimeout(() => {
+			exitBatchTimer = null;
+			flushExitBatch();
+		}, EXIT_BATCH_MS);
+		exitBatchTimer.unref?.();
 	};
 
 	const scheduleOutputReaction = (task: ManagedTask) => {
@@ -1835,6 +1816,9 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			// full length on every chunk and could only re-report an older match.
 			const patternMatched = task.matcher ? task.matcher(patternMatchWindow(output, task.lastAnnouncedLength)) : true;
 			if (!patternMatched) {
+				// Examined and rejected: the cursor moves past it, or the next scan
+				// would read it again and the window would grow with every chunk.
+				task.lastAnnouncedLength = output.length;
 				persistScheduledOutputDrop(task, pending, "notify-pattern-no-match", { matchedPattern: task.notifyPattern });
 				return;
 			}
@@ -1887,7 +1871,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 	const scheduleSoftTimeout = (task: ManagedTask): void => {
 		if (task.softTimeoutTimer) clearTimeout(task.softTimeoutTimer);
 		task.softTimeoutTimer = null;
-		const deadline = reviewDeadlineFor(task);
+		const deadline = task.status === "running" ? reviewDeadlineFor(task) : null;
 		if (deadline == null) {
 			task.softExpiresAt = null;
 			return;
@@ -1901,9 +1885,8 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			// makes the scheduled reminder stale.
 			if ((task.reviewRevision ?? 0) !== revision) return;
 			if (task.stopReason != null) return;
-			const eventType = task.status === "running" ? "soft-timeout" : task.resultResolution === undefined ? "result-review" : null;
-			if (eventType == null) return;
-			deliverReviewReminder(task, deadline, revision, eventType);
+			if (task.status !== "running") return;
+			deliverReviewReminder(task, deadline, revision);
 		}, Math.max(1, deadline - Date.now()));
 		task.softTimeoutTimer.unref?.();
 	};
@@ -1914,17 +1897,15 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 	 * measured from delivery. A wake the host would not take (shutdown) is left
 	 * re-armable.
 	 */
-	const deliverReviewReminder = (task: ManagedTask, deadline: number, revision: number, eventType: "soft-timeout" | "result-review"): void => {
+	const deliverReviewReminder = (task: ManagedTask, deadline: number, revision: number): void => {
 		task.softTimeoutNotified = true;
 		const deliveredAt = Date.now();
-		const sent = sendTaskEvent(eventType, task, {
+		const sent = sendTaskEvent("soft-timeout", task, {
 			eventAt: deadline,
-			...(eventType === "soft-timeout" ? {
-				softTimeout: {
-					elapsedMs: Math.max(0, deliveredAt - task.startedAt),
-					softTimeoutMs: task.softTimeoutMs ?? 0,
-				},
-			} : {}),
+			softTimeout: {
+				elapsedMs: Math.max(0, deliveredAt - task.startedAt),
+				softTimeoutMs: task.softTimeoutMs ?? 0,
+			},
 		});
 		if (!sent) {
 			task.softTimeoutNotified = false;
@@ -2572,14 +2553,14 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 
 	/**
 	 * Sends every pending exit wake as one message. Deliverability is Pi's
-	 * concern now: with followUpMode "all" Pi drains queued follow-ups as a
-	 * single prompt, so a wake sent while another is queued still reaches the
+	 * concern: a wake sent during a run is queued as steer, one sent while idle
+	 * starts a turn, and a wake sent while another is queued still reaches the
 	 * agent merged, not stacked.
 	 */
-	const flushDeferredExitWakes = (): void => {
-		if (deferredExitWakes.size === 0) return;
-		const pending = [...deferredExitWakes.entries()];
-		deferredExitWakes.clear();
+	const flushExitBatch = (): void => {
+		if (exitWakeBatch.size === 0) return;
+		const pending = [...exitWakeBatch.entries()];
+		exitWakeBatch.clear();
 		const finished = pending
 			.map(([id]) => tasks.get(id))
 			.filter((task): task is ManagedTask => Boolean(task && task.status !== "running"));
@@ -2624,7 +2605,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		deliverWakeMessage(
 			wakeSend,
 			{ customType: BG_MESSAGE_TYPE, content, display: true, details: { grouped: true, tasks: finished.map((t) => compactBackgroundTaskSnapshot(t)) } },
-			{ deliverAs: "followUp", triggerTurn: true },
+			{ deliverAs: "steer", triggerTurn: true },
 		);
 		// One message named every task in the batch, so every obligation it
 		// fulfilled is recorded. An idle-batched completion never carried this
@@ -3070,42 +3051,33 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 
 	installSettingsCacheRefresh(pi);
 
-	// A wake is a follow-up message: it cannot steer the run that is already in
-	// flight, so holding it until the agent truly stops costs nothing and is the
-	// only way several completions can arrive as ONE grouped wake.
-	//
-	// The flush boundary is agent_settled, NOT agent_end: agent_end closes one
-	// low-level run, but retries, overflow recovery, compaction retry and
-	// follow-up work continue after it (docs/json.md: "agent_settled means Pi
-	// has no remaining automatic work"). A mid-run agent_end that folds
-	// turnActive=false would push every later exit down the idle path, where the
-	// wake is sent (after the 250ms debounce) before any later read can consume
-	// it — the "wake arrived already consumed" failure.
-	const remindedResultReviews = new Set<string>();
+	// agent_settled is the idle boundary: Pi has no remaining automatic work
+	// (docs/json.md), unlike agent_end, which closes only one low-level run.
+	// Completion wakes do not wait for it; they are sent within the batch window
+	// and queued as steer during a run. What waits for it is the advisory about
+	// results the agent still has not retrieved, sent once per result.
 	pi.on("agent_settled", () => {
-		turnActive = false;
-		// Only results notified before this boundary qualify: don't duplicate
-		// the exit wake we are about to deliver for the first time.
-		const unread = protectedAssignment === null ? [] : [...tasks.values()].filter((task) =>
-			task.assignmentRequestId === protectedAssignment && task.exitNotified &&
-			!deferredExitWakes.has(task.id) && !idleExitBatch.has(task.id) &&
-			!resultIsResolved(task) && taskReadiness(task) !== "running" &&
-			taskReadiness(task) !== "finalizing" && !remindedResultReviews.has(task.id));
-		flushDeferredExitWakes();
+		flushExitBatch();
 		announceRunningTasks();
-		if (unread.length) {
-			pi.sendUserMessage(
-				`Assignment completion is held on unread background results: ${unread.map((task) => task.id).join(", ")}. ` +
-				"These processes have exited; do not rerun or poll them. Retrieve each finished handle through bg_task get (output: full) " +
-				"to certify and acknowledge its result, then submit a fresh final response. Reading log files does not settle a handle.",
-				{ deliverAs: "followUp", triggerTurn: true },
-			);
-			for (const task of unread) remindedResultReviews.add(task.id);
+		const unread = [...tasks.values()].filter((task) =>
+			task.exitNotified && task.resultReminded !== true && task.supersededBy === undefined && !exitWakeBatch.has(task.id) &&
+			!resultIsResolved(task) && taskReadiness(task) !== "running" && taskReadiness(task) !== "finalizing");
+		if (unread.length === 0) return;
+		const sent = sendResultReviewAdvisory({
+			...wakeSend,
+			isShuttingDown: () => shuttingDown,
+			messageType: BG_MESSAGE_TYPE,
+			surface: () => taskToolSurface,
+		}, unread);
+		if (!sent) return;
+		for (const task of unread) {
+			task.resultReminded = true;
+			rememberSnapshot(task);
 		}
+		persistSnapshots();
 	});
 	pi.on("session_start", async (_event, ctx) => {
 		shuttingDown = false;
-		remindedResultReviews.clear();
 		recordProjectTrust(ctx);
 		activeCtx = ctx;
 		// The settlement provider is session-scoped: reset its restore state and
@@ -3169,15 +3141,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		syncWidget(ctx);
 		publishPaneFacts();
 	});
-	// A run Pi starts without `before_agent_start` (a queued follow-up, a peer
-	// extension's trigger-turn wake: earendil-works/pi#5581) is still a run in
-	// flight. If only `before_agent_start` marked it, an exit during that run
-	// took the idle path and was sent as a follow-up the agent had already
-	// consumed through get/stop.
-	pi.on("agent_start", () => { turnActive = true; });
-	pi.on("turn_start", () => { turnActive = true; });
 	pi.on("before_agent_start", (_event, ctx) => {
-		turnActive = true;
 		recordProjectTrust(ctx);
 		activeCtx = ctx;
 		syncWidget(ctx);
@@ -3200,10 +3164,8 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		sessionOutstandingOff = undefined;
 		// A script cannot outlive its session, so neither can its provenance.
 		codemodeCallIds.clear();
-		deferredExitWakes.clear();
-		idleExitBatch.clear();
+		exitWakeBatch.clear();
 		delete interop[MANAGED_BASH_SYMBOL];
-		flushIdleExitBatch();
 		shuttingDown = true;
 		// The endpoint answers from the live task map, so it closes before the map
 		// is emptied; a client that arrives during shutdown gets an unavailable

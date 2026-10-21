@@ -1,42 +1,51 @@
-// The review reminder outlives the process (openspec `background-unread-results`
-// task 1.3). A terminal result nobody retrieved is still owed after a restart, so
-// the interval the live task was carrying is re-armed for the result it left
-// behind, and the reminder names both ways out.
+// A finished result the agent has not retrieved is reminded once, when the agent
+// goes idle: a single concise message that starts no turn, never repeated and
+// never re-armed by a restart.
 
 import { afterAll, expect, test } from "bun:test";
 
 import { startExtensionHost, type ExtensionHost, type HostTool } from "./fixtures/extension-host.js";
 
-const host: ExtensionHost = await startExtensionHost({ settings: { exitWakeDebounceMs: 0, exitWakeBatchMs: 0 } });
+const host: ExtensionHost = await startExtensionHost({ settings: { exitWakeDebounceMs: 0, exitWakeBatchMs: 0, defaultSoftTimeoutMs: 0 } });
 afterAll(() => host.dispose());
 
 const bgTask = (): HostTool => host.tools.get("bg_task")!;
-const reviewWakes = (): string[] =>
-	host.messages
-		.map((call) => call[0] as { content?: unknown; details?: { eventType?: string } })
-		.filter((message) => message?.details?.eventType === "result-review")
-		.map((message) => String(message.content ?? ""));
+const reviews = () =>
+	host.messages.filter(([message]) => (message as { details?: { eventType?: string } })?.details?.eventType === "result-review");
 
-async function until(predicate: () => boolean, budgetMs = 5_000): Promise<void> {
-	const deadline = Date.now() + budgetMs;
-	while (!predicate() && Date.now() < deadline) await Bun.sleep(10);
-}
-
-test("a restored terminal result re-arms the reminder for the output it owes", async () => {
-	await host.dispatch("before_agent_start");
-	// A short interval, so the restored deadline is already behind the restart.
-	const spawned = await bgTask().execute("restore-review", { action: "spawn", command: "printf 'restored\\n'", softTimeoutMs: 300 });
+async function finished(command: string): Promise<string> {
+	const spawned = await bgTask().execute("review", { action: "spawn", command, softTimeoutMs: 300 });
 	const id = (spawned.details.task as { id: string }).id;
 	await host.settledTask(id);
-	expect(reviewWakes(), "an unretrieved result is not reminded before its interval elapses").toStrictEqual([]);
+	return id;
+}
 
-	// A restart replays the branch: the finished task comes back with its
-	// interval, and its result is still unread.
+test("an unretrieved result is reminded once at idle, as a message that starts no turn", async () => {
+	await host.dispatch("before_agent_start");
+	const id = await finished("printf 'unread\\n'");
+	await Bun.sleep(500);
+	expect(reviews(), "no interval fires for a finished task, and nothing is sent mid-run").toHaveLength(0);
+
+	await host.settle();
+	expect(reviews(), "idle sends the one advisory").toHaveLength(1);
+	const [message, options] = reviews()[0]!;
+	expect(JSON.stringify(message)).toContain(`${id} · exit 0 · result unretrieved`);
+	expect(options, "it costs no model turn of its own").toMatchObject({ triggerTurn: false });
+
+	await host.settle();
+	await Bun.sleep(400);
+	expect(reviews(), "never repeated, by idle or by interval").toHaveLength(1);
+
 	await host.dispatch("session_start");
-	await until(() => reviewWakes().length > 0);
-	const reminder = reviewWakes()[0] ?? "";
-	expect(reminder, "the restored result is reminded").toContain(`${id} finished, and its result is still unretrieved`);
-	expect(reminder, "and the reminder says what it owes").toContain(`bg_task action:"get" id: ${id}`);
-	expect(reminder, "including the way to settle it without reading it").toContain(`bg_task action:"clear" ids:["${id}"]`);
-	expect((await host.listTasks()).find((task) => task.id === id)?.resultResolution, "the reminder is not a resolution").toBeUndefined();
+	await host.settle();
+	expect(reviews(), "a restart does not re-arm it").toHaveLength(1);
+	expect((await host.listTasks()).find((task) => task.id === id)?.resultResolution, "a reminder resolves nothing").toBeUndefined();
+});
+
+test("a result retrieved before idle is not reminded", async () => {
+	const before = reviews().length;
+	const id = await finished("printf 'read\\n'");
+	await bgTask().execute("review-get", { action: "get", id });
+	await host.settle();
+	expect(reviews().length).toBe(before);
 });

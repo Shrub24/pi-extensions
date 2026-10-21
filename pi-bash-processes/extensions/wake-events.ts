@@ -575,31 +575,6 @@ export function sendTaskWake(
 		}, { deliverAs: "steer", triggerTurn: true }));
 		return true;
 	}
-	if (eventType === "result-review") {
-		// An unretrieved result stays owed until it is delivered or dismissed.
-		if (deps.isShuttingDown() || task.status === "running" || task.resultResolution !== undefined) return false;
-		const deliveredAt = now();
-		const compactTask = compactBackgroundTaskSnapshot(deps.rememberSnapshot(task));
-		const details: BackgroundTaskEventDetails = {
-			deliveredAt,
-			eventAt: options.eventAt ?? task.updatedAt ?? deliveredAt,
-			eventType,
-			sequence: task.wakeSequence ?? 0,
-			task: compactTask,
-			taskStatusAtEmit: task.status,
-		};
-		deliverWakeMessage(deps, {
-			content: [
-				`Background task ${task.id} finished, and its result is still unretrieved.`,
-				`Command: ${truncateField(task.command, WAKE_CONTENT_COMMAND_MAX_CHARS) ?? ""}`,
-				wakeTaskLine(task, guidance),
-			].join("\n"),
-			customType: deps.messageType,
-			details,
-			display: true,
-		}, { deliverAs: "steer", triggerTurn: true });
-		return true;
-	}
 	const pending: WakePendingRecord = {
 		eventAt: options.eventAt ?? (eventType === "output" ? (task.lastOutputAt ?? now()) : (task.updatedAt ?? now())),
 
@@ -682,7 +657,7 @@ export function sendTaskWake(
 			details,
 			display: true,
 		},
-		eventType === "exit" ? { deliverAs: "followUp", triggerTurn: true } : { deliverAs: "steer", triggerTurn: true },
+		{ deliverAs: "steer", triggerTurn: true },
 	);
 	return true;
 }
@@ -753,5 +728,28 @@ export function sendOutputWakeBudgetExhaustedNotice(
 		taskStatus: task.status,
 		timestamp,
 	});
+	return true;
+}
+
+/**
+ * The single advisory for finished results the agent has not retrieved. It is
+ * sent once per result, only when the agent has gone idle, as one concise
+ * message that does not start a turn: the completion wake was the delivery, and
+ * this is a reminder that costs no model call of its own. It asks for nothing
+ * mandatory and re-arms nothing.
+ */
+export function sendResultReviewAdvisory(
+	deps: Pick<SendTaskWakeDeps, "messageType" | "sendMessage" | "surface" | "isShuttingDown">,
+	tasks: ManagedTask[],
+): boolean {
+	if (deps.isShuttingDown() || tasks.length === 0) return false;
+	const guidance = taskSurfaceGuidance(deps.surface?.() ?? "compat");
+	const lines = tasks.map((task) => wakeTaskLine(task, guidance));
+	deliverWakeMessage(deps as WakeSend, {
+		content: [`${tasks.length === 1 ? "A finished background result is" : `${tasks.length} finished background results are`} still unretrieved:`, ...lines.map((line) => `• ${line}`)].join("\n"),
+		customType: deps.messageType,
+		details: { eventType: "result-review", grouped: true, tasks: tasks.map((task) => compactBackgroundTaskSnapshot(task as BackgroundTaskSnapshot)) },
+		display: true,
+	}, { triggerTurn: false });
 	return true;
 }

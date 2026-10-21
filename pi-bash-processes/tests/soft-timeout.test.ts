@@ -108,11 +108,11 @@ test("extend with softTimeoutMs 0 disables further reminders", () => {
 }, SPAWN_FIXTURE_TIMEOUT_MS * 2);
 
 /**
- * A task that exits before its soft deadline never gets a progress reminder — the
- * promise that reminder made transfers to the result it left behind: the finished,
- * unretrieved capture now owns the interval, and its reminder says what is owed.
+ * A task that exits before its soft deadline never gets a progress reminder, and
+ * arms no interval for its result either: the unretrieved capture is reminded
+ * once, at the idle boundary.
  */
-test("a terminal task emits no soft wake and reminds for the unretrieved result instead", () => {
+test("a terminal task emits no soft wake and is reminded once, at idle", () => {
 	const result = runSpawnFixture("spawn-extension.ts", { mode: "soft-terminal", softTimeoutMs: 60_000 }) as SoftFixtureResult;
 	const scenario = soft(result) as {
 		softWakes: number;
@@ -122,15 +122,10 @@ test("a terminal task emits no soft wake and reminds for the unretrieved result 
 	};
 	expect(scenario.softWakes, "no progress reminder for a finished task").toBe(0);
 	expect(scenario.exitWakes, "the exit still woke normally").toBe(1);
-	// One wake, naming the task and both ways out; a reminder that only nagged
-	// would leave the reader with no sanctioned way to settle it.
 	expect(scenario.reviewWakes).toHaveLength(1);
-	expect(scenario.reviewWakes[0]).toContain("bg-1 finished, and its result is still unretrieved");
-	expect(scenario.reviewWakes[0]).toContain('bg_task action:"get" id: bg-1');
-	expect(scenario.reviewWakes[0]).toContain('bg_task action:"clear" ids:["bg-1"]');
-	expect(scenario.timers, "the orphan watcher and the re-armed next interval").toEqual([
+	expect(scenario.reviewWakes[0]).toContain("bg-1 · exit 0 · result unretrieved");
+	expect(scenario.timers, "only the orphan watcher remains; no interval is armed for the result").toEqual([
 		{ kind: "interval", ms: 30_000 },
-		{ kind: "timeout", ms: 60_000 },
 	]);
 }, SPAWN_FIXTURE_TIMEOUT_MS);
 

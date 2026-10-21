@@ -233,6 +233,12 @@ export interface BackgroundTaskSnapshot {
 	 * stands; dismissal never claims output was delivered.
 	 */
 	resultResolution?: "delivered" | "error" | "dismissed";
+	/**
+	 * The one advisory about this terminal result has been sent. Persisted so a
+	 * restart cannot repeat it: a result-review is a single idle-time nudge, not
+	 * an interval.
+	 */
+	resultReminded?: boolean;
 	/** Set when a newer identical task superseded this one; suppresses its exit wake. */
 	supersededBy?: string;
 	// True after sendTaskEvent('exit') has fired for this task. Persisted so

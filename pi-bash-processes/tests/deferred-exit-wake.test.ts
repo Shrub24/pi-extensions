@@ -6,68 +6,52 @@ import { declaredCliEnv } from "../extensions/settings.js";
 import { runSpawnFixture, SPAWN_FIXTURE_TIMEOUT_MS } from "./fixtures/spawn-child-runner.js";
 
 /**
- * A task that exits while a turn is in flight must not emit a visible wake: the
- * agent is still working and can read the result itself. Reading it via
- * bg_task log drops the wake; otherwise it flushes when the turn ends.
+ * A completion wake is the result delivery: a task that exits while a run is in
+ * flight is sent at once (queued as steer by Pi), not held for the end of the
+ * run. Retrieval after that is a separate step and resolves the result.
  */
-test("mid-turn exit defers the wake, and reading the log drops it", () => {
+test("a mid-run exit is delivered at once; reading the live log does not resolve it", () => {
 	const result = runSpawnFixture("spawn-extension.ts", {
 		mode: "deferred",
 		command: "sleep 30 && echo done",
 	}) as { deferred: { afterExit: unknown[]; afterLog: unknown[]; afterTurnEnd: unknown[] } };
-	expect(result.deferred.afterExit).toHaveLength(0);
+	expect(result.deferred.afterExit, "the wake does not wait for the run boundary").toHaveLength(1);
+	expect(JSON.stringify(result.deferred.afterExit[0])).toContain('"deliverAs":"steer"');
 	expect(result.deferred.afterLog).toHaveLength(0);
-	expect(result.deferred.afterTurnEnd).toHaveLength(0);
+	expect(result.deferred.afterTurnEnd, "a log read is not a retrieval, so idle sends the one advisory").toHaveLength(1);
+	expect(JSON.stringify(result.deferred.afterTurnEnd[0])).toContain('"eventType":"result-review"');
 }, SPAWN_FIXTURE_TIMEOUT_MS);
 
 /**
- * Regression: agent_end closes one low-level run — retries, overflow recovery,
- * compaction retry and follow-up work all continue after it. Releasing the hold
- * on agent_end let a wake slip out before a later read could consume it, which
- * is how "the wake arrives already consumed" happens. The wake must stay held
- * across agent_end and flush only at agent_settled.
+ * agent_end closes one low-level run and changes nothing. Idle (agent_settled)
+ * sends the single advisory for a result still unretrieved, and only that.
  */
-test("a mid-run exit stays held across agent_end and flushes only at agent_settled", () => {
+test("an unretrieved result is reminded once at agent_settled, never at agent_end", () => {
 	const result = runSpawnFixture("spawn-extension.ts", { mode: "deferred-settle-hold", command: "sleep 5 && echo held" }) as {
 		deferred: { afterExit: unknown[]; afterLog: unknown[]; afterTurnEnd: unknown[] };
 	};
-	expect(result.deferred.afterExit, "nothing is sent while the run is live").toHaveLength(0);
-	expect(result.deferred.afterLog, "agent_end alone releases nothing").toHaveLength(0);
-	expect(result.deferred.afterTurnEnd, "agent_settled releases the held wake").toHaveLength(1);
-}, SPAWN_FIXTURE_TIMEOUT_MS);
-
-test("an unobserved mid-turn exit flushes at run end", () => {
-	const result = runSpawnFixture("spawn-extension.ts", {
-		mode: "deferred-unobserved",
-		command: "sleep 30 && echo done",
-	}) as { deferred: { afterExit: unknown[]; afterTurnEnd: unknown[] } };
-	expect(result.deferred.afterExit).toHaveLength(0);
-	expect(result.deferred.afterTurnEnd.length).toBeGreaterThan(0);
+	expect(result.deferred.afterExit, "delivered while the run is live").toHaveLength(1);
+	expect(result.deferred.afterLog, "agent_end alone sends nothing").toHaveLength(0);
+	expect(result.deferred.afterTurnEnd, "agent_settled sends the advisory").toHaveLength(1);
+	expect(JSON.stringify(result.deferred.afterTurnEnd[0])).toContain('"eventType":"result-review"');
+	expect(JSON.stringify(result.deferred.afterTurnEnd[0]), "and it starts no turn").toContain('"triggerTurn":false');
 }, SPAWN_FIXTURE_TIMEOUT_MS);
 
 /**
- * Regression (2026-09-21 three-wake report): Pi emits turn_end after every
- * assistant turn, so an exit wake flushed there fires mid-run and each one
- * becomes its own follow-up turn. Three tasks finishing at different points in
- * ONE run must arrive as a single grouped wake at the run boundary, naming all
- * three completions.
+ * Pi emits turn_end after every assistant turn, so tying delivery to it would
+ * give each completion its own wake. Three tasks finishing at different points
+ * of one run are three deliveries, each sent when it finished.
  */
-test("three staggered mid-run exits produce one grouped wake", () => {
+test("three staggered mid-run exits are each delivered as they finish", () => {
 	const result = runSpawnFixture("spawn-extension.ts", {
 		mode: "staggered-exits",
 	}) as { staggered: { listAfterRun: string; wakeTexts: string[]; wakes: number; grouped: boolean } };
-	expect(result.staggered.wakes, "one wake per run, not one per task").toBe(1);
-	expect(result.staggered.grouped, "the wake names the completions").toBe(true);
+	expect(result.staggered.wakes, "one wake per completion, none held to the run boundary").toBe(3);
 	const text = result.staggered.wakeTexts.join("\n");
 	for (const id of ["bg-2", "bg-3", "bg-4"]) {
-		// Each task keeps its own line: a batch may not be reduced to a count or a
-		// single summary line, so every one of them names its outcome and the result
-		// it still owes the reader.
-		expect(text, `${id} is reported by the single wake`).toContain(`${id} · exit 0 · result unretrieved`);
+		expect(text, `${id} names its outcome and the result it still owes`).toContain(`${id} · exit 0 · result unretrieved`);
 	}
-	// The sibling still running is reported with its own state rather than being
-	// silently absent from the batch.
-	expect(text, "the running sibling is named as still running").toContain("Tasks still running: bg-1");
+	expect(text, "the sibling still running is named").toContain("Tasks still running: bg-1");
 }, SPAWN_FIXTURE_TIMEOUT_MS);
 
 /**
@@ -98,16 +82,16 @@ test("no inferred-read consume log exists to race over any more", () => {
 });
 
 /**
- * Regression (bg-424): the exit is already deferred when a bounded wait attaches
- * and returns the terminal result. That tool result IS the delivery, so the turn
- * end must not flush a second, visible wake for work the agent just received.
+ * Regression (bg-424): the exit has already been delivered when a bounded wait
+ * attaches and returns the terminal result. That result is the retrieval, so
+ * idle has no advisory to send for it.
  */
-test("a wait on an already-terminal task consumes the deferred wake", () => {
+test("a wait on an already-delivered terminal task leaves nothing to remind", () => {
 	const result = runSpawnFixture("spawn-extension.ts", {
 		mode: "deferred-wait",
 		command: "sleep 30 && echo done",
 	}) as { deferred: { afterExit: unknown[]; afterLog: unknown[]; afterTurnEnd: unknown[] } };
-	expect(result.deferred.afterExit).toHaveLength(0);
+	expect(result.deferred.afterExit).toHaveLength(1);
 	expect(result.deferred.afterLog).toHaveLength(0);
-	expect(result.deferred.afterTurnEnd, "the wait result already delivered this exit").toHaveLength(0);
+	expect(result.deferred.afterTurnEnd, "the wait result was the retrieval").toHaveLength(0);
 }, SPAWN_FIXTURE_TIMEOUT_MS);
