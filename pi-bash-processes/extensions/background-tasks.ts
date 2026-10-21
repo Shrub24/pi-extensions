@@ -3312,16 +3312,15 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		return { result: { output, exitCode: 0, cancelled: false, truncated: false } };
 	});
 
-	// `bash` is declared in every mode, so it is re-declared with the mode's own
-	// guidance: its "what to do with a Running result" bullet is where a TUI could
-	// otherwise be told about the compatibility wait it does not have.
+	// `bash` is declared in every mode. Cross-tool background-task rules are
+	// contributed once by bg_task; this tool keeps only its shell-specific guidance.
 	const registerBashTool = (surface: TaskToolSurface): void => pi.registerTool({
 		name: "bash",
 		label: "bash",
 		renderShell: "self",
 		description: "Run builds, tests, programs, diagnostics, and system commands. Do not use shell grep/find/cat/ls as substitutes for dedicated retrieval or code-intelligence tools. Commands run under the background-task manager: a command that finishes within the foreground wait returns its stdout/stderr and exit status directly, while a command still running after that returns a Running result with a task id, keeps running under the manager, and wakes the agent automatically on completion. Optionally provide a timeout in seconds as a hard runtime limit.",
 		promptSnippet: "Run builds, tests, programs, diagnostics, and system commands. Do not use shell grep/find/cat/ls as substitutes for dedicated retrieval or code-intelligence tools.",
-		promptGuidelines: bashPromptGuidelines(surface),
+		promptGuidelines: bashPromptGuidelines(),
 		parameters: intentParameters("bash", Type.Object({
 			command: Type.String({ description: "Shell command to execute" }),
 			timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (optional, no default timeout); enforced as hard process runtime" })),

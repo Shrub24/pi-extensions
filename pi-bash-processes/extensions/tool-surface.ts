@@ -24,6 +24,13 @@
 
 export type TaskToolSurface = "tui" | "compat";
 
+/** Shared contract for the coupled managed-bash and bg_task tools. */
+export const BASH_TASK_GUIDELINES = [
+	"Do not trim managed bash output with `| tail`, `| head` or `2>/dev/null`: it hides failures and forces re-runs. Managed shells use pipefail.",
+	"A `Running` result is not complete output. Do not poll or repeatedly inspect a running task; use its soft reminders and completion wake to decide what to do next.",
+	"Read a finished background task's result with `bg_task action:\"get\" output:\"full\"`; do not read its log file directly. For a confirmed stop, `output:\"full\"` returns the final result in the same call.",
+] as const;
+
 /** The complete `bg_task` action surface of each mode. */
 export const TUI_BG_TASK_ACTIONS = ["spawn", "get", "stop", "list", "extend"] as const;
 export const COMPAT_BG_TASK_ACTIONS = ["spawn", "list", "log", "get", "stop", "clear", "wait", "extend"] as const;

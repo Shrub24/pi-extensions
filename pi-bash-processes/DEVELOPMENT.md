@@ -1,6 +1,6 @@
 # pi-background-tasks development
 
-For maintainers. What it does for a consumer is [README.md](README.md); the agent-facing contract (`bg_task` parameters, notify modes, durability promises) is `instructions.md`, and the mechanics live as comments on the modules named below. This file holds the invariants that span them.
+For maintainers. What it does for a consumer is [README.md](README.md); the agent-facing contract is declared with the `bash` and `bg_task` tools, and the mechanics live as comments on the modules named below. This file holds the invariants that span them.
 
 ## Invariants
 

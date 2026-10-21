@@ -23,7 +23,14 @@ export {
 	taskToolSurfaceFor,
 	type TaskToolSurface,
 } from "./tool-surface.js";
-import { COMPAT_BG_TASK_ACTIONS, TUI_BG_TASK_ACTIONS, taskSurfaceActions, taskToolSurfaceFor, type TaskToolSurface } from "./tool-surface.js";
+import {
+	BASH_TASK_GUIDELINES,
+	COMPAT_BG_TASK_ACTIONS,
+	TUI_BG_TASK_ACTIONS,
+	taskSurfaceActions,
+	taskToolSurfaceFor,
+	type TaskToolSurface,
+} from "./tool-surface.js";
 import { openDashboard, type DashboardDeps } from "./dashboard.js";
 import { formatRelativeTime, formatTaskLog, formatTaskResultText, summarizeTaskStatus, taskLogTruncation } from "./format.js";
 import { makeToolResult, renderBgToolResult, renderEmpty } from "./render.js";
@@ -87,25 +94,21 @@ function bgTaskActions(surface: TaskToolSurface): readonly string[] {
  * advice and a noninteractive child never receives push-only end-response advice.
  */
 function bgTaskGuidelines(surface: TaskToolSurface): string[] {
-	const shared = [
-		"Use bg_task instead of bash backgrounding/nohup when the user wants a long-running command to continue while the conversation remains usable.",
-		"Use bg_task action:\"get\" output:\"full\" to hand over a finished task's complete output; pass output:\"full\" with action:\"stop\" to stop and read the final result in one call.",
-	];
 	if (surface === "tui") {
 		return [
-			shared[0]!,
+			...BASH_TASK_GUIDELINES,
 			"Use bg_task list/get/stop/extend to inspect, re-arm, or terminate tasks started by bg_task or /bg. get is the task's result, including its readiness and outcome; there is no separate status tool in this mode.",
 			"A soft reminder is a check-in, not a result: completion always wakes you, so softTimeoutMs only sets how often you are reminded. For a build, test run, or watcher, set softTimeoutMs at spawn to about its expected duration (or 0 to disable reminders); re-arm later with bg_task action:\"extend\" id:... softTimeoutMs:....",
-			"Running is not success. Do not poll: no sleep/tail loops and no repeated list/get calls. Do independent work; if nothing independent remains, finish the turn with a brief waiting status and go idle, and the task's completion wakes the agent in a new turn.",
+			"After a task starts, continue independent work; when there is nothing left to do, end the turn and let its wake arrive. A soft reminder is the decision point if it takes longer than expected.",
 			"Use bg_task for pi-bridge, session, tmux, agent/delegate, or log monitoring instead of raw foreground bash polling loops.",
 			"If a bash monitor is auto-backgrounded, continue the turn and inspect it later with bg_task get/list/stop rather than waiting on foreground bash.",
 		];
 	}
 	return [
-		shared[0]!,
+		...BASH_TASK_GUIDELINES,
 		"Use bg_task list/log/get/stop to inspect or terminate tasks started by bg_task or /bg. log is the raw captured tail; get is the task's result, including its readiness and outcome.",
 		"Use bg_task clear ids:[...] to explicitly dismiss named finished results. Dismissal does not hand over output; a bulk clear keeps an assignment-owned result nobody received and never touches running tasks.",
-		"Running is not success. In an interactive session, do independent work and end the turn to await the completion wake instead of polling. A noninteractive or child caller that must have a shell result before its session closes can call bg_task action:\"wait\" once with a bounded waitSeconds: that yields only its own turn, never stops the task, and is the retained compatibility wait. Do not repeatedly call list/log/get/wait in a polling loop.",
+		"After a task starts, continue independent work; in an interactive session, end the turn when there is nothing left to do and let its wake arrive. A noninteractive or child caller that must have a shell result before its session closes can call bg_task action:\"wait\" once with a bounded waitSeconds: that yields only its own turn, never stops the task.",
 		"Use bg_task for pi-bridge, session, tmux, agent/delegate, or log monitoring instead of raw foreground bash polling loops.",
 		"If a bash monitor is auto-backgrounded, continue the turn and inspect it later with bg_task log/list/stop rather than waiting on foreground bash.",
 	];
@@ -115,9 +118,9 @@ function bgTaskDescription(surface: TaskToolSurface): string {
 	const behaviours =
 		"Tasks write persistent logs, do not time out by default, stop as a process group on Unix, and can wake the agent on exit or matching output.";
 	if (surface === "tui") {
-		return `Spawn, inspect, and stop explicit background shell tasks. ${behaviours} Never poll a running task with sleep/tail loops or repeated list/get calls: the exit wake arrives as a new turn. The background-tasks extension also auto-diverts recognized bash monitoring loops before they block.`;
+		return `Spawn, inspect, and stop explicit background shell tasks. ${behaviours} The background-tasks extension also auto-diverts recognized bash monitoring loops before they block.`;
 	}
-	return `Spawn, inspect, wait for, and stop explicit background shell tasks. \`wait\` blocks the turn for a bounded window and returns the terminal result or a truthful Running status; it never stops the task. ${behaviours} Never poll a running task with sleep/tail loops or repeated list/log calls: the exit wake arrives as a new turn. The background-tasks extension also auto-diverts recognized bash monitoring loops before they block.`;
+	return `Spawn, inspect, wait for, and stop explicit background shell tasks. \`wait\` blocks the turn for a bounded window and returns the terminal result or a truthful Running status; it never stops the task. ${behaviours} The background-tasks extension also auto-diverts recognized bash monitoring loops before they block.`;
 }
 
 function bgTaskPromptSnippet(surface: TaskToolSurface): string {
@@ -132,20 +135,9 @@ function bgTaskActionDescription(surface: TaskToolSurface): string {
 		: "spawn=start a task, list=show tasks, log=raw tail of the captured log, get=the task's result (state, outcome, output preview or full immutable output), stop=terminate and return the result, clear=remove finished tasks, wait=block up to waitSeconds for a task to finish, extend=reset the soft reminder, optionally at a new interval";
 }
 
-/**
- * `bash`'s guidelines about what to do with a Running result. `bash` is active
- * in every mode, so its guidance is the other place the TUI could be told about
- * an action it does not have: the bounded compatibility wait is only recommended
- * where it exists, and the TUI is pointed at ending the turn instead.
- */
-export function bashPromptGuidelines(surface: TaskToolSurface): string[] {
-	return [
-		"You can inspect PI_* environment variables for current model and session details.",
-		"Do not trim output with `| tail`/`| head` or discard it with `2>/dev/null`: oversized results are bounded and saved in full to a file the result names, and a trim hides failures and forces re-runs. To see the end of a large result, read that file at an offset. Shells run with pipefail, so a failing pipeline stage fails the command.",
-		surface === "tui"
-			? 'If a bash result says Running, it is not success: do not use its output or artifacts yet. Do independent work; if nothing independent remains, finish the turn with a brief waiting status and go idle, and completion will wake the agent in a new turn. There is no bounded wait in this mode, and repeatedly calling list/get is not a substitute for it.'
-			: 'If a bash result says Running, it is not success: do not use its output or artifacts yet. If the result is a dependency barrier, call bg_task action:"wait" once with a bounded waitSeconds; otherwise continue only independent work. If nothing independent remains, finish the turn with a brief waiting status and go idle; completion will wake the agent in a new turn. Do not repeatedly call list/log/wait in a polling loop.',
-	];
+/** Bash-specific prompt guidance; the shared task contract is contributed by `bg_task`. */
+export function bashPromptGuidelines(): string[] {
+	return ["You can inspect PI_* environment variables for current model and session details."];
 }
 
 /**

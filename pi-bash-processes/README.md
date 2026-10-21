@@ -265,8 +265,9 @@ equivalent — each is fork-only source plus its tests):
   mode from `session_start` decides the tools and the guidance. The TUI declares
   `bg_task` with exactly `spawn/get/stop/list/extend` and no `bg_status`; every other
   mode keeps the compatibility surface. Wake, acknowledgement and wake-budget text
-  is generated per mode so it never names an operation the model cannot call, and
-  the installed append-system block stays mode-neutral.
+  is generated per mode so it never names an operation the model cannot call. The
+  coupled bash/background-task operating rules come from one shared code-defined
+  rule set contributed by the active `bg_task` tool.
 - **Soft timeouts** — an advisory per-task reminder that surfaces a decision
   (re-arm its interval, stop, let it run) before the hard kill; the "Soft timeouts" section
   above documents the behaviour.

@@ -14,13 +14,10 @@
     "extensions": [
       "./extensions/background-tasks.ts"
     ],
-    "image": "https://raw.githubusercontent.com/vanillagreencom/kendex/main/pi-extensions/pi-background-tasks/assets/spawn-tasks.png",
-    "appendSystem": "./instructions.md"
+    "image": "https://raw.githubusercontent.com/vanillagreencom/kendex/main/pi-extensions/pi-background-tasks/assets/spawn-tasks.png"
   },
   "scripts": {
-    "test": "bun test --parallel=4 ./tests ./extensions/__tests__",
-    "postinstall": "node scripts/append-system.mjs install",
-    "preuninstall": "node scripts/append-system.mjs remove"
+    "test": "bun test --parallel=4 ./tests ./extensions/__tests__"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
@@ -32,7 +29,6 @@
     "extensions/",
     "assets/",
     "scripts/",
-    "instructions.md",
     "README.md",
     "THIRD_PARTY_NOTICES.md",
     "package.json"

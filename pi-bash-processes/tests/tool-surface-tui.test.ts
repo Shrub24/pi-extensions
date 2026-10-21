@@ -39,7 +39,7 @@ test("the assembled TUI prompt recommends ending the turn and names neither bg_s
 	expect(text, "the guidance the model actually receives is non-empty").not.toBe("");
 	expect(text).not.toContain("bg_status");
 	expect(text).not.toContain('action:"wait"');
-	expect(text, "the TUI guidance recommends the end-of-turn wake").toContain("finish the turn");
+	expect(text, "the TUI guidance recommends the end-of-turn wake").toContain("end the turn");
 });
 
 test("a plain read of a live capture changes no notification state", async () => {

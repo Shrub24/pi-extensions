@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 
 import { applyTaskToolSurface, bashPromptGuidelines, registerAll, type RegistrationDeps } from "../extensions/registrations.js";
-import { taskSurfaceGuidance, wakeTaskLine } from "../extensions/tool-surface.js";
+import { BASH_TASK_GUIDELINES, taskSurfaceGuidance, wakeTaskLine } from "../extensions/tool-surface.js";
 import { createToolRegistry, declaredActionEnum, declaredSchemaText } from "./fixtures/tool-surface-harness.js";
 
 // Task 4.1: the declared surface for each session mode.
@@ -146,7 +146,7 @@ test("the TUI prompt never recommends bg_status or the bounded wait, and no mode
 			expect(text, "TUI guidance must not recommend the absent bounded wait").not.toContain('action:"wait"');
 			expect(text, "TUI guidance must not name the absent status tool").not.toContain("bg_status");
 			expect(text, "TUI guidance must not offer compatibility-wait advice").not.toContain("noninteractive or child caller");
-			expect(text, "TUI guidance recommends ending the turn for the wake").toContain("finish the turn");
+			expect(text, "TUI guidance recommends ending the turn for the wake").toContain("end the turn");
 		} else {
 			expect(text, "compatibility guidance names the retained bounded wait").toContain('action:"wait"');
 			expect(text, "compatibility guidance names what the wait is for").toContain("noninteractive or child caller");
@@ -154,13 +154,18 @@ test("the TUI prompt never recommends bg_status or the bounded wait, and no mode
 	}
 });
 
-test("bash guidance tells every surface not to trim output and that shells run pipefail", () => {
-	for (const surface of ["tui", "compat"] as const) {
-		const text = bashPromptGuidelines(surface).join("\n");
-		expect(text, `${surface}: names the trim anti-pattern`).toContain("Do not trim output with");
-		expect(text, `${surface}: says oversized output is saved in full`).toContain("saved in full");
-		expect(text, `${surface}: says pipefail applies`).toContain("pipefail");
+test("the coupled bash/bg_task contract is contributed once from one shared rule set", () => {
+	for (const mode of ["tui", "print"] as const) {
+		const { registry } = surfaceFor(mode);
+		const prompt = registry.systemPromptSurface();
+		const text = [...prompt.availableTools, ...prompt.guidelines].join("\n");
+		for (const rule of BASH_TASK_GUIDELINES) {
+			expect(text, `${mode}: shared rule is present`).toContain(rule);
+			expect(text.split(rule).length - 1, `${mode}: shared rule appears once`).toBe(1);
+		}
 	}
+	// The bash tool itself carries no competing copy of the shared feature rules.
+	for (const rule of BASH_TASK_GUIDELINES) expect(bashPromptGuidelines().join("\n")).not.toContain(rule);
 });
 
 test("the declared parameter schema never names an action the same schema does not declare", () => {
@@ -221,29 +226,7 @@ test("the TUI soft reminder offers the extend lever its surface declares", () =>
 	expect(choices, "the reminder states that continuing repeats the same interval").toContain("same interval");
 });
 
-/**
- * Task 4.5: the installed append-system block is shared by every mode, so it may
- * not name a tool or action some mode lacks, may not present push-only
- * end-response waiting as the only way to await a result, and may not advertise
- * a mutable live log as the way to read one.
- */
-test("the installed append-system block is mode-neutral", () => {
-	const instructions = readFileSync(new URL("../instructions.md", import.meta.url), "utf8");
-	// Absent in TUI, so the shared block may not name them at all.
-	expect(instructions).not.toContain("bg_status");
-	expect(instructions).not.toContain('action:"wait"');
-	expect(instructions).not.toContain("pi-bg path");
-	expect(instructions).not.toContain("pi-bg peek");
-	expect(instructions).not.toContain("pi-bg read");
-	// Push-only waiting is qualified for a caller that cannot end its response.
-	expect(instructions).toContain("A caller that cannot end its response before it has the result");
-	// The retired inferred read is not advertised as an acknowledgment.
-	expect(instructions).toContain("never by reading a log file");
-	// The declared operations it does name are common to every mode.
-	for (const named of ["`pi-bg get <task-id> [--output]`", "`pi-bg list`", "`pi-bg stop <task-id>`"]) {
-		expect(instructions).toContain(named);
-	}
-});
+
 
 /**
  * Task 4.2: an exact-literal audit over every model-facing and transcript-facing
