@@ -8,6 +8,15 @@ Local `main` no longer tracks `upstream/main`. The forks report through
 eleven commits it calls untaken (KEN-2187, KEN-2242, part of KEN-2161) are
 already in this tree by content.
 
+## Follow-up briefs (2026-10-22)
+
+- [Background-task persistence rollout](pi-bash-processes/docs/persistence-rollout-brief.md): scope, owner-store authority, legacy restore, retention and acceptance evidence.
+- [Validation and compatibility audit](pi-bash-processes/docs/validation-and-compatibility-audit.md): notification-pattern cursor defect, exact schema mismatch, reproduced highlight-cache defect, unresolved test failures and runtime/storage name migration.
+
+These findings supersede earlier claims that matching was bounded per chunk or
+that the renderer/completion failures were proven load flakes. No runtime fix
+was made in this audit.
+
 ## Settings: file-managed, no editor
 
 Decided 2026-10-21: there is no in-session settings editor and nothing writes a
@@ -24,18 +33,18 @@ lifecycle is what applies an edit, so `installLiveSettingsRefresh` in
 `pi-tool-renderer` now clears its cache and its tracked components at session
 start and shutdown instead of refreshing on the event.
 
-Done for `pi-bash-processes`: renamed to `pi-bash-processes`, config key
-`pi-bash-processes`, `intent.ts` inlined (the renderer is an optional peer used
-only for the presentation row), the `kendex` settings schema, foreign metadata
-and kendex asset links removed, README rewritten. `pi-tool-renderer`'s manifest
-name is `pi-tool-renderer` so the optional import resolves without the scope;
-its own config key is still `@vanillagreen/pi-tool-renderer` until its pass.
+Done, all six packages (2026-10-21, `e5b1486c` on main): every package is named
+after its directory, reads its own top-level settings key, and carries no
+`@vanillagreen` scope, kendex settings schema, foreign author/repository
+metadata or kendex asset links. `pi-bash-processes` inlines `intent.ts` and
+treats the renderer as an optional peer for the presentation row only. The three
+packages with their own readers (`pi-jev`, `pi-cbmem`, `pi-native-router`) read
+`settings[<name>]` directly instead of walking the manager namespace.
 
-Remaining for the other packages, in order: `pi-tool-renderer`,
-`pi-output-policy`, `pi-jev`, `pi-native-router`, `pi-cbmem` — rename, move the
-config key, drop the manager-shaped reader where one is local (`pi-jev`,
-`pi-cbmem`, `pi-native-router` carry their own), and rewrite their README
-settings sections.
+The deployed dotfiles pin is bumped to that revision, with the four settings
+blocks moved to top-level keys and the `extension-manager` extension row
+dropped, so nothing in a deployed configuration reads or writes the manager
+namespace any more.
 
 Deliberately not renamed yet, because each needs one coordinated step rather
 than a silent change:
@@ -238,14 +247,19 @@ Radar owning pane detection and restart is the same split from the other side.
 
 ## Hygiene
 
-- One package test is red for reasons unrelated to this queue: `pi-bash-processes`
-  `tests/bash-structured-output.test.ts` "bash declares Pi's built-in bash
-  outputSchema" (Pi 1.2.0 schema drift). It fails with the 2026-10-21 changes
-  stashed, so it predates them; the package is 402/403.
-- `pi-tool-renderer` `extensions/__tests__/diff-border.test.ts` "split diff uses
-  one sampled border style" is timing-flaky: it fails on some runs and passes on
-  others with no code change. It is not a gate signal until it is made
-  deterministic.
+- Bash schema equality fails on description strings only; field types and
+  required fields match. Actual structured-result tests pass. Fix the assertion
+  boundary and review our descriptions, rather than changing compatible fields.
+- Renderer layout fails in the full suite and passes alone. A separate direct
+  probe proves the highlight cache reuses the first theme's output under a
+  second theme. Width assertions also depend on highlighter call counts rather
+  than layout. Do not dismiss this as a load flake.
+- Completion-dispatch passes alone; its earlier timeout remains unexplained.
+  The idle-batch test disables batching and waits for any exit before checking
+  every task. Its helper budget exceeds the default per-test timeout.
+- The earlier diff-border failure was not reproduced in this audit. Control
+  global COLUMNS and settings inputs before assigning a cause. Full evidence and
+  next slices are in the validation audit linked above.
 
 - In a shared working copy a bare `jj commit` / `jj new` finalizes whichever
   commit is checked out and sweeps in every other session's uncommitted files.
