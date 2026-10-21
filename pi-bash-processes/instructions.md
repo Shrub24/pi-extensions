@@ -1,6 +1,6 @@
 ## pi-background-tasks — `bg_task`
 
-Bash commands that exceed the foreground wait (20 seconds by default) return a `Running` task ID and keep executing. Completion wakes you in a new turn with the output tail. A caller that cannot end its response before it has the result (a child or headless session, for example) should use the bounded wait this mode's guidance describes, when it offers one.
+Bash commands that exceed the foreground wait (20 seconds by default) return a `Running` task ID and keep executing. Running is not a result: end your response and completion wakes you in a new turn with the output tail. Do not sleep, loop, or re-read a running task to wait for it. A caller that cannot end its response before it has the result (a child or headless session, for example) uses the bounded wait its mode's guidance names, and only that.
 
 Operations are declared by this mode's own tool schema. Do not assume an action exists because another mode has it.
 
@@ -14,6 +14,6 @@ Wakes: exits notify by default (`notifyOnExit`). `notifyOnOutput` with `notifyPa
 
 CLI: `pi-bg get <task-id> [--output]` writes the result, or the complete snapshot, to stdout with metadata on stderr. `pi-bg list` lists tasks. `pi-bg stop <task-id>` stops one and reports the confirmed result. A handle belongs to the session that created it. An expired handle reports an explicit error, not an empty result.
 
-Output: do not trim a command's output (`| tail`, `| head`, `2>/dev/null`) when you need its result. Oversized output is saved in full to the file the result names. Managed shells run with `pipefail`.
+Output: do not trim a command's output (`| tail`, `| head`, `2>/dev/null`) when you need its result. Trimming hides the failing stage and forces a re-run. Oversized output is saved in full to the file the result names; to see its end, read that file at an offset. Managed shells run with `pipefail`.
 
 Resource controls (opt-in, off by default): heavy tasks can run through a `systemd-run` transient service or a `nice`/`ionice` fallback, keeping log capture, wakeups, timeouts, and `/bg:stop`.

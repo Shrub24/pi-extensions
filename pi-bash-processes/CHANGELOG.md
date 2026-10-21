@@ -4,6 +4,7 @@
 
 ### Unreleased
 
+- The interactive TUI no longer names `bg_task clear`, which its schema does not declare: the unretrieved-result wake line and the TUI guidance now point only at `get`. Soft reminders and running-task advice no longer invite a `get` on a task that is still running; they say to end the turn and let the completion wake arrive. The shared `instructions.md` block says a running task is not a result and that a trimmed build should be read from its saved file at an offset instead.
 - Idle background-task wakes now use Pi's native `triggerTurn` path. Pi 1.2.0 runs these through `before_agent_start`, so the extra user-prompt wake workaround is no longer needed.
 - The managed-bash `outputSchema` metadata now matches Pi 1.2.0's built-in bash definition exactly; the structured result shape is unchanged.
 - An exit during a run that Pi started without `before_agent_start` (a queued follow-up, or another extension's trigger-turn wake) is now held until the run settles, and reading or stopping the task consumes it. Previously such an exit was sent immediately as a follow-up the agent had already acted on, which surfaced as a stale "Background task finished" turn after a `get` or `stop`. A `stop` of a task that had already ended renders as "already <outcome>" instead of reading like a failed stop, and exit wakes no longer tell the agent to `bg_task stop` a task that has finished.

@@ -563,7 +563,7 @@ export function sendTaskWake(
 			`Command: ${commandPreview}`,
 			wakeTaskLine(task, guidance),
 			`Output so far:\n${tail || "(no output yet)"}`,
-			`Inspect it with ${guidance.inspect} id: ${task.id} — Running is not success, so do not read a partial result as one.`,
+			"Running is not success, so do not read the output tail above as a result.",
 			...(hardRemaining != null ? [`Hard timeout backstop: about ${formatElapsed(hardRemaining)} remaining; it will kill the task if you let it lapse.`] : []),
 			guidance.softReminderChoices,
 		].join("\n");

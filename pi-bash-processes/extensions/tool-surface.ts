@@ -66,8 +66,11 @@ export interface TaskSurfaceGuidance {
 	recentRerun: (id: string) => string;
 	/** What a soft reminder offers: continue (optionally re-arming the interval), inspect, or stop. */
 	softReminderChoices: string;
-	/** How an unretrieved result is explicitly dismissed when it is no longer wanted. */
-	dismiss: (id: string) => string;
+	/**
+	 * How an unretrieved result is explicitly dismissed. Omitted where the surface
+	 * declares no dismissing action, so no prompt can name one it does not have.
+	 */
+	dismiss?: (id: string) => string;
 }
 
 const TUI_GUIDANCE: TaskSurfaceGuidance = {
@@ -77,12 +80,11 @@ const TUI_GUIDANCE: TaskSurfaceGuidance = {
 	fullResult: 'bg_task action:"get" output:"full"',
 	reviewFailures: "review with bg_task action:\"get\"",
 	pollingReason: "polling loop (agent waiting on something? prefer ending the turn and letting the exit wake arrive)",
-	duplicateRunning: "Prefer bg_task action:\"get\" on the existing task, or stop it first.",
-	similarRunning: "If this was meant to poll or retry it, bg_task action:\"get\" on the existing task is cheaper.",
+	duplicateRunning: "Wait for its completion wake rather than starting it again, or stop it first.",
+	similarRunning: "If this was meant to poll or retry it, end the turn and let the existing task's completion wake arrive.",
 	recentRerun: (id) => `Rerun only what changed (bg_task action:"get" id: "${id}" shows the captured result) unless the code changed since.`,
 	softReminderChoices:
-		'Choose one: let it continue (it will ask again in the same interval, or re-arm it now with bg_task action:"extend" id:... softTimeoutMs:...), inspect it with bg_task action:"get", or stop the task with bg_task action:"stop". Nothing was stopped; the exit wake is still armed.',
-	dismiss: (id) => `bg_task action:"clear" ids:["${id}"]`,
+		'Choose one: end your turn and let it ask again in the same interval (or re-arm it now with bg_task action:"extend" id:... softTimeoutMs:...), or stop the task with bg_task action:"stop". Nothing was stopped; the exit wake is still armed.',
 };
 
 const COMPAT_GUIDANCE: TaskSurfaceGuidance = {
@@ -123,7 +125,7 @@ export function wakeTaskLine(task: WakeTaskState, guidance: TaskSurfaceGuidance)
 	// `unretrieved` is the only state that still owes the reader something; a
 	// resolution — delivery, capture error, or an explicit dismissal — does not.
 	const owed = task.resultResolution === undefined
-		? `result unretrieved — ${guidance.inspect} id: ${task.id}, or dismiss it with ${guidance.dismiss(task.id)}`
+		? `result unretrieved — ${guidance.inspect} id: ${task.id}${guidance.dismiss ? `, or dismiss it with ${guidance.dismiss(task.id)}` : ""}`
 		: "result already resolved";
 	return `${task.id} · ${outcome} · ${owed}`;
 }

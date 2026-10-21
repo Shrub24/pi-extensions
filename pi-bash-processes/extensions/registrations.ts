@@ -95,8 +95,7 @@ function bgTaskGuidelines(surface: TaskToolSurface): string[] {
 		return [
 			shared[0]!,
 			"Use bg_task list/get/stop/extend to inspect, re-arm, or terminate tasks started by bg_task or /bg. get is the task's result, including its readiness and outcome; there is no separate status tool in this mode.",
-			"For a long-running watcher or monitor, set softTimeoutMs generously at spawn (or 0 to disable it); the periodic soft reminder can be re-armed later with bg_task action:\"extend\" id:... softTimeoutMs:....",
-			"Use bg_task clear ids:[...] to explicitly dismiss named finished results. Dismissal does not hand over output; a bulk clear keeps an assignment-owned result nobody received and never touches running tasks.",
+			"A soft reminder is a check-in, not a result: completion always wakes you, so softTimeoutMs only sets how often you are reminded. For a build, test run, or watcher, set softTimeoutMs at spawn to about its expected duration (or 0 to disable reminders); re-arm later with bg_task action:\"extend\" id:... softTimeoutMs:....",
 			"Running is not success. Do not poll: no sleep/tail loops and no repeated list/get calls. Do independent work; if nothing independent remains, finish the turn with a brief waiting status and go idle, and the task's completion wakes the agent in a new turn.",
 			"Use bg_task for pi-bridge, session, tmux, agent/delegate, or log monitoring instead of raw foreground bash polling loops.",
 			"If a bash monitor is auto-backgrounded, continue the turn and inspect it later with bg_task get/list/stop rather than waiting on foreground bash.",
@@ -142,7 +141,7 @@ function bgTaskActionDescription(surface: TaskToolSurface): string {
 export function bashPromptGuidelines(surface: TaskToolSurface): string[] {
 	return [
 		"You can inspect PI_* environment variables for current model and session details.",
-		"Do not trim output with `| tail`/`| head` or discard it with `2>/dev/null`: oversized results are bounded and saved in full to a file the result names, and a trim hides failures and forces re-runs. Shells run with pipefail, so a failing pipeline stage fails the command.",
+		"Do not trim output with `| tail`/`| head` or discard it with `2>/dev/null`: oversized results are bounded and saved in full to a file the result names, and a trim hides failures and forces re-runs. To see the end of a large result, read that file at an offset. Shells run with pipefail, so a failing pipeline stage fails the command.",
 		surface === "tui"
 			? 'If a bash result says Running, it is not success: do not use its output or artifacts yet. Do independent work; if nothing independent remains, finish the turn with a brief waiting status and go idle, and completion will wake the agent in a new turn. There is no bounded wait in this mode, and repeatedly calling list/get is not a substitute for it.'
 			: 'If a bash result says Running, it is not success: do not use its output or artifacts yet. If the result is a dependency barrier, call bg_task action:"wait" once with a bounded waitSeconds; otherwise continue only independent work. If nothing independent remains, finish the turn with a brief waiting status and go idle; completion will wake the agent in a new turn. Do not repeatedly call list/log/wait in a polling loop.',

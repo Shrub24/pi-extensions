@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 
 import { applyTaskToolSurface, bashPromptGuidelines, registerAll, type RegistrationDeps } from "../extensions/registrations.js";
-import { taskSurfaceGuidance } from "../extensions/tool-surface.js";
+import { taskSurfaceGuidance, wakeTaskLine } from "../extensions/tool-surface.js";
 import { createToolRegistry, declaredActionEnum, declaredSchemaText } from "./fixtures/tool-surface-harness.js";
 
 // Task 4.1: the declared surface for each session mode.
@@ -331,4 +331,53 @@ test("the shipped documents describe the mode surface and the retired mechanisms
 	expect(unreleased, "the surface switch is recorded").toContain("session mode");
 	expect(unreleased, "the acknowledgment change is recorded").toContain("no longer acknowledges its completion");
 	expect(unreleased, "and the migration is named").toContain("pi-bg get <task-id> [--output]");
+});
+
+/**
+ * The TUI declares no `clear`, so no TUI prompt or wake may name it. Repeated
+ * `clear` calls were the largest source of rejected `bg_task` calls, because
+ * the wake text told the agent to dismiss a finished task with an action its
+ * schema does not have.
+ */
+test("the TUI never names clear, in its wake line or its prompt", () => {
+	const tui = taskSurfaceGuidance("tui");
+	const line = wakeTaskLine({ id: "bg-7", status: "finished", exitCode: 0 }, tui);
+	expect(line).toContain('bg_task action:"get" id: bg-7');
+	expect(line).not.toContain("clear");
+	expect(line).not.toContain("dismiss");
+	const prompt = promptText("tui");
+	expect(prompt).not.toContain("clear");
+	expect(JSON.stringify(tui)).not.toContain("clear");
+});
+
+/**
+ * A running task is not read to wait for it: the TUI's reminder and running
+ * advice point at ending the turn, not at a `get` that hands over a partial
+ * result. Compatibility surfaces keep their own wording.
+ */
+test("the TUI reminder and duplicate advice do not invite get on a running task", () => {
+	const tui = taskSurfaceGuidance("tui");
+	expect(tui.softReminderChoices).not.toContain('action:"get"');
+	expect(tui.duplicateRunning).not.toContain('action:"get"');
+	expect(tui.similarRunning).not.toContain('action:"get"');
+	expect(tui.softReminderChoices).toContain("end your turn");
+	expect(taskSurfaceGuidance("compat").softReminderChoices).toContain('action:"get"');
+});
+
+/** The text a mode's model is given: the available-tool lines and every guideline. */
+function promptText(mode: string): string {
+	const { registry } = surfaceFor(mode);
+	const prompt = registry.systemPromptSurface();
+	return [...prompt.availableTools, ...prompt.guidelines].join("\n");
+}
+
+/**
+ * The soft reminder explains what softTimeoutMs controls, so agents set it to a
+ * build's expected length without treating it as the completion signal.
+ */
+test("the TUI guidance says softTimeoutMs only paces reminders, and names the build case", () => {
+	const guidelines = promptText("tui");
+	expect(guidelines).toContain("completion always wakes you");
+	expect(guidelines).toContain("about its expected duration");
+	expect(guidelines).not.toContain("bg_task clear");
 });
