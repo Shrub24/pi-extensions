@@ -30,6 +30,9 @@ test("an exit during a run is sent as steer without waiting for the run to end",
 
 	const [message, options] = exitCalls()[before]!;
 	expect(JSON.stringify(message), "the wake names its task").toContain(id);
+	// A lone completion delivers its result here, without a get.
+	expect(JSON.stringify(message)).toContain("Output:");
+	expect(JSON.stringify(message)).toContain("in-run");
 	expect(options, "a run in flight queues it as steer").toMatchObject({ deliverAs: "steer", triggerTurn: true });
 	await bgTask().execute("c", { action: "get", id });
 });
