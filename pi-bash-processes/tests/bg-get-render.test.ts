@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-import { applyTaskToolSurface, type RegistrationDeps } from "../extensions/registrations.js";
+import { registerBgTaskTool, type RegistrationDeps } from "../extensions/registrations.js";
 import { settingNumber } from "../extensions/settings.js";
 import { taskSnapshot } from "../extensions/snapshot.js";
 import { buildTaskResultObservation } from "../extensions/task-result.js";
@@ -74,13 +74,11 @@ function registeredBgTask(options: { artifact?: boolean; captureError?: string; 
 		backgroundBashShortcut: "none",
 		widgetToggleShortcut: "none",
 		armForcedBackground: unused,
-		clearFinishedTasks: unused,
 		consumeObservedExitWake: () => true,
 		extendSoftTimeout: unused,
 		formatTaskListText: unused,
 		getActiveCtx: () => null,
 		getTaskOutput: () => output,
-		oldestRunningTask: () => null,
 		readTaskResult: () => Promise.resolve({
 			ack: { acknowledged: true, committed: "terminal", reviewed: false },
 			handoff: {
@@ -98,11 +96,10 @@ function registeredBgTask(options: { artifact?: boolean; captureError?: string; 
 		spawnTask: unused,
 		stopTaskConfirmed: unused,
 		toggleWidget: unused,
-		waitForTask: unused,
 	};
-	applyTaskToolSurface(pi, deps, "tui");
+	registerBgTaskTool(pi, deps);
 	const tool = tools.get("bg_task");
-	if (!tool) throw new Error("bg_task was not registered for the tui surface");
+	if (!tool) throw new Error("bg_task was not registered");
 	return tool;
 }
 
