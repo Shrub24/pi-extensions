@@ -79,6 +79,14 @@ export class Health {
     const kind: ErrorCauseKind = failure.kind;
     this.attempt(() => this.store?.mark(key, kind, until, kind));
   }
+  /** Clears process-local causes for these scopes after a request on them proved it serves. */
+  recovered(keys: readonly string[]) {
+    for (const key of keys) this.local.delete(key);
+  }
+  /** Drops process-local causes whose scope key matches, after an operator reset. */
+  forget(match: (key: string) => boolean) {
+    for (const key of [...this.local.keys()]) if (match(key)) this.local.delete(key);
+  }
   eligible(model: { provider: string; id: string }, account?: string) {
     const keys = admissionKeys(model, account);
     for (const key of keys) {
@@ -141,9 +149,13 @@ export interface Resolved { candidate: Candidate; model: Model<Api> }
 export function requiredContext(route: RouteConfig, model: { maxTokens: number }, tokens: number): number {
   return Math.max(route.contextWindow, tokens + route.outputReserve);
 }
+/** Whether a candidate's window and output budget can serve this request, ignoring health. */
+export function fitsRequest(route: RouteConfig, { model }: Resolved, tokens: number): boolean {
+  return model.contextWindow >= requiredContext(route, model, tokens) && model.maxTokens >= route.outputReserve;
+}
 /** Candidates that are healthy and fit this request, in route order. */
 export function eligibleCandidates(route: RouteConfig, available: Resolved[], health: Health, tokens: number): Resolved[] {
-  return available.filter(({ model, candidate }) => health.eligible(model, candidate.account) && model.contextWindow >= requiredContext(route, model, tokens) && model.maxTokens >= route.outputReserve);
+  return available.filter(value => health.eligible(value.model, value.candidate.account) && fitsRequest(route, value, tokens));
 }
 export function choose(route: RouteConfig, available: Resolved[], health: Health, tokens: number, preferred?: string, exclude?: string | ReadonlySet<string>): Resolved | undefined {
   const excluded = (id: string) => typeof exclude === "string" ? exclude === id : exclude?.has(id) ?? false;

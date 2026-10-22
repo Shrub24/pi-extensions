@@ -102,12 +102,24 @@ export class HealthStore {
    * or none. Returns undefined when any scope is still blocked or leased elsewhere.
    */
   admitProbe(keys: readonly string[], holder: string): ProbeLease[] | undefined {
+    return this.admit(keys, holder, false);
+  }
+
+  /**
+   * Admits an explicit user pin on a target whose causes may still be live. Another holder's live lease still
+   * excludes it, so two processes never try the same target at once.
+   */
+  admitOverride(keys: readonly string[], holder: string): ProbeLease[] | undefined {
+    return this.admit(keys, holder, true);
+  }
+
+  private admit(keys: readonly string[], holder: string, override: boolean): ProbeLease[] | undefined {
     return this.tx(() => {
       const at = this.now();
       const leases: ProbeLease[] = [];
       for (const key of keys) {
         const causes = this.db.prepare("SELECT until, revision FROM causes WHERE key = ?").all(key) as Array<{ until: number; revision: number }>;
-        if (causes.some(cause => cause.until > at)) return undefined;
+        if (!override && causes.some(cause => cause.until > at)) return undefined;
         const lease = this.db.prepare("SELECT holder, expires FROM leases WHERE key = ?").get(key) as { holder: string; expires: number } | undefined;
         if (lease && lease.expires > at && lease.holder !== holder) return undefined;
         if (causes.length > 0) leases.push({ key, revision: Math.max(...causes.map(cause => cause.revision)) });
@@ -135,11 +147,29 @@ export class HealthStore {
     });
   }
 
-  /** Clears expired causes proven by a successful request admitted at `admittedRevision`. */
+  /**
+   * Clears the causes of every scope a request admitted at `admittedRevision` proved serves. A cause written
+   * after admission has a newer revision and survives. Tracker quota is cleared too; the next authoritative
+   * reading re-establishes it if the meter is still exhausted.
+   */
   recordSuccess(keys: readonly string[], admittedRevision: number): void {
     this.tx(() => {
-      const at = this.now();
-      for (const key of keys) this.db.prepare("DELETE FROM causes WHERE key = ? AND revision <= ? AND until <= ?").run(key, admittedRevision, at);
+      for (const key of keys) this.db.prepare("DELETE FROM causes WHERE key = ? AND revision <= ?").run(key, admittedRevision);
+    });
+  }
+
+  /**
+   * Operator reset of one provider: clears every cause and lease under it, including model-scoped causes of a
+   * single-key provider and account-scoped causes of a multi-account one.
+   */
+  resetProvider(provider: string): number {
+    return this.tx(() => {
+      const esc = provider.replace(/[%_\\]/g, "\\$&");
+      const scoped = [provider, `${esc}/%`, `${esc}#%`];
+      const causes = this.db.prepare("DELETE FROM causes WHERE key = ? OR key LIKE ? ESCAPE '\\' OR key LIKE ? ESCAPE '\\'").run(...scoped);
+      this.db.prepare("DELETE FROM leases WHERE key = ? OR key LIKE ? ESCAPE '\\' OR key LIKE ? ESCAPE '\\'").run(...scoped);
+      this.nextRevision();
+      return Number(causes.changes);
     });
   }
 
@@ -189,6 +219,14 @@ export class HealthStore {
    * cause; `undefined` clears one written before `startedRevision`. It never touches error-derived causes
    * (auth, rate, quota, transient) on the same scope, so recovered quota cannot clear them.
    */
+  /** Operator refresh: drops the scope's tracker-quota block so the next reading alone decides it. */
+  clearTrackerQuota(key: string): void {
+    this.tx(() => {
+      this.db.prepare("DELETE FROM causes WHERE key = ? AND kind = 'tracker-quota'").run(key);
+      this.nextRevision();
+    });
+  }
+
   reconcileTrackerQuota(key: string, exhaustedUntil: number | undefined, startedRevision: number, reason: string): void {
     if (exhaustedUntil !== undefined) {
       this.writeCause(key, "tracker-quota", exhaustedUntil, reason);

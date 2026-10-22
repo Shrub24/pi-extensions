@@ -19,7 +19,7 @@ import { codexbarConfigPath, generateCodexbarConfig, readCodexbarConfig, writeCo
 import { defaultPricingPath, loadSnapshot, refreshSnapshot, saveSnapshot } from "./pricing/cache";
 import { lookup } from "./pricing/catalog";
 import { applyPeak, backfillCost, isPeakPriced, isPeakRecorded, labelRecordedPeak, type CostUsage } from "./pricing/reconcile";
-import { accountOf, admissionKeys, cacheExpiry, choose, cycleTarget, classify, clampLevel, eligibleCandidates, Health, identity, observe, partialOutput, physicalOf, requiredContext, restore, THINKING_ORDER, type Resolved, type State } from "./policy";
+import { accountOf, admissionKeys, cacheExpiry, choose, cycleTarget, classify, clampLevel, eligibleCandidates, fitsRequest, Health, identity, observe, partialOutput, physicalOf, requiredContext, restore, THINKING_ORDER, type Resolved, type State } from "./policy";
 import { beforeTransition, flushBridge, type FlushHook, type TransitionHook } from "./transition";
 import { evaluateStrategy, loadStrategy, type LoadedStrategy, type RoutingContext, type StrategyTarget } from "./strategy";
 import { projectQuotaObservation, projectStrategyPrice } from "./strategy-projection";
@@ -142,7 +142,10 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     admissions.delete(activityKey);
     try {
       store.settleProbe(pending.holder, outcome.recovered);
-      if (outcome.recovered) store.recordSuccess(pending.keys, pending.revision);
+      if (outcome.recovered) {
+        store.recordSuccess(pending.keys, pending.revision);
+        health.recovered(pending.keys);
+      }
     } catch (error) { degrade(error); }
   };
   const hook = options.transition ?? flushBridge(pi, config.flushTimeoutMs);
@@ -231,7 +234,12 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     exclude: string | ReadonlySet<string> | undefined, ctx: ExtensionContext, input: Parameters<typeof strategyContext>[5]): Promise<{ selected?: Resolved; strategyId: string; reason: string; fallback?: string; quotaObservedAt?: number; pricingObservedAt?: number }> => {
     const selectable = route.strategy ? candidates.filter(value => input.state === undefined || !input.current || identity(value.model, value.candidate.account) === input.current || input.state.transitions < route.maxTransitions) : candidates;
     const isExcluded = (target: string) => typeof exclude === "string" ? exclude === target : exclude?.has(target) === true;
+    // A forced pin is the user's explicit try: health is checked later by its override admission, so only fit applies here.
     const eligible = eligibleCandidates(route, selectable, health, estimate).filter(value => !isExcluded(identity(value.model, value.candidate.account)));
+    if (input.forcePin && typeof input.priorityTarget === "string") {
+      const pinned = selectable.find(value => identity(value.model, value.candidate.account) === input.priorityTarget && fitsRequest(route, value, estimate) && !isExcluded(input.priorityTarget!));
+      if (pinned) return { selected: pinned, strategyId: "pin", reason: "explicit pin override" };
+    }
     const currentEligible = input.current !== undefined && eligible.some(value => identity(value.model, value.candidate.account) === input.current);
     // A newly set pin overrides incumbent stickiness once; afterward the selected physical target stays sticky.
     const preferredTarget = input.priority === "pin" && currentEligible && !input.forcePin ? undefined : input.priorityTarget;
@@ -353,10 +361,13 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
         if (!store) break;
         const holder = randomUUID();
         const keys = admissionKeys(selected.model, selected.candidate.account);
+        // An explicit pin is the user's intent to try this target, so it is admitted even while blocked; a live
+        // lease held elsewhere still excludes it. Success clears the blocks it proved; failure falls back as usual.
+        const override = forcePin && target === pin;
         let granted: boolean;
         try {
           const revision = store.revision();
-          granted = store.admitProbe(keys, holder) !== undefined;
+          granted = (override ? store.admitOverride(keys, holder) : store.admitProbe(keys, holder)) !== undefined;
           if (granted) admissions.set(activityKey, { holder, keys, revision, physical: target });
         } catch (error) { degrade(error); break; }
         if (granted) break;
@@ -477,7 +488,10 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     const lines: string[] = [];
     const now = options.now ?? Date.now;
     for (const { label, scope, quota } of quotaScopes) {
-      const outcome = await refreshQuota(store, scope, quota, codexbarRunner, now, quotaHolder, { force });
+      // An operator refresh asks for a fresh decision: a stale tracker block is dropped before the fetch, so the new
+    // reading (or its absence) alone governs this scope. Error-derived causes are left untouched.
+    if (force) store.clearTrackerQuota(quotaScopeKey(scope.provider, scope.account));
+    const outcome = await refreshQuota(store, scope, quota, codexbarRunner, now, quotaHolder, { force });
       lines.push(outcome.status === "unavailable" ? `  ${label}: unknown (${outcome.reason})`
         : outcome.status === "leased" ? `  ${label}: refresh already in progress elsewhere`
         : outcome.status === "cached" ? `  ${label}: reused a fetch ${Math.round((now() - outcome.observedAt) / 1000)}s old`
@@ -748,11 +762,11 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
   });
   pi.registerCommand("native-router-health", {
     getArgumentCompletions: prefix => completeArguments(prefix, slots["native-router-health"]),
-    description: "Inspect native-router health, or reset one account: /native-router-health [reset <account>]",
+    description: "Inspect native-router health, or reset one account or provider: /native-router-health [reset <account|provider>]",
     handler: async (args, ctx) => {
       const mode: HealthMode = store ? "shared" : config.sharedHealth ? "degraded-local" : "local-only";
       const reset = args.trim().match(/^reset\s+([a-z][a-z0-9_-]{0,31})$/);
-      if (args.trim() && !reset) { ctx.ui.notify("usage: /native-router-health [reset <account>]", "error"); return; }
+      if (args.trim() && !reset) { ctx.ui.notify("usage: /native-router-health [reset <account|provider>]", "error"); return; }
       if (!store) {
         const message = mode === "local-only"
           ? "native-router: sharedHealth is disabled; only process-local health applies, nothing is shared"
@@ -762,8 +776,14 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       }
       try {
         if (reset) {
-          const changed = store.resetAccount(reset[1]);
-          ctx.ui.notify(`native-router: reset account ${reset[1]} (${changed} cause record${changed === 1 ? "" : "s"} cleared; other accounts and provider outages unchanged; in-flight probes fenced)`, "info");
+          // A name is an account when some provider declares it, else a provider (the single-key case).
+          const name = reset[1];
+          const isAccount = Object.values(config.providers).some(p => name in p.accounts);
+          const isProvider = name in config.providers;
+          if (!isAccount && !isProvider) { ctx.ui.notify(`native-router: ${name} is neither a configured account nor a provider`, "error"); return; }
+          const changed = isAccount ? store.resetAccount(name) : store.resetProvider(name);
+          health.forget(key => isAccount ? key.endsWith(`#${name}`) : key === name || key.startsWith(`${name}/`) || key.startsWith(`${name}#`));
+          ctx.ui.notify(`native-router: reset ${isAccount ? "account" : "provider"} ${name} (${changed} cause record${changed === 1 ? "" : "s"} cleared; ${isAccount ? "other accounts and provider outages unchanged" : "other providers unchanged"}; in-flight probes fenced)`, "info");
           return;
         }
         ctx.ui.notify(healthReport(store.inspect(), options.now?.() ?? Date.now(), mode).join("\n"), "info");

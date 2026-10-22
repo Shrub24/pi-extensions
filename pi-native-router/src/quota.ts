@@ -142,11 +142,9 @@ export async function refreshQuota(
     store.putSnapshot(key, now(), snapshot, null);
     if (!isFresh(snapshot, now())) return { status: "refreshed", snapshot };
     const until = exhaustedUntil(snapshot, now());
-    // Only an enforced, authoritative exhaustion may block; a healthy reading clears tracker quota alone.
+    // Only an enforced, authoritative exhaustion may block; any other fresh reading clears tracker quota.
     const blockingUntil = source.enforce && snapshot.authoritative ? until : undefined;
-    if (blockingUntil !== undefined || until === undefined) {
-      store.reconcileTrackerQuota(key, blockingUntil, started, `tracker reports exhausted quota for ${source.provider}`);
-    }
+    store.reconcileTrackerQuota(key, blockingUntil, started, `tracker reports exhausted quota for ${source.provider}`);
     return { status: "refreshed", snapshot };
   } finally {
     store.releaseLease(leaseKey, holder);

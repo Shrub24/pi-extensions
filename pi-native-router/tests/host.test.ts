@@ -665,11 +665,10 @@ test("a new pin or cycle overrides incumbent stickiness once, then the selected 
   } finally { h.close(); }
 });
 
-test("a pin cannot pull the route back to a recovered failed candidate while the fallback stays healthy", async () => {
-  const h = await host(["ok", 429, "ok", "ok", "ok", "quota", "ok"]);
-  const notices: string[] = [];
+test("a pin on a blocked target is tried once; a failed attempt falls back and the pin stays stored", async () => {
+  const h = await host(["ok", 429, "ok", "quota", "ok"]);
   const statuses = new Map<string, string | undefined>();
-  const ui = { select: async () => undefined, notify: (message: string) => notices.push(message), setStatus: (key: string, value: string | undefined) => statuses.set(key, value) };
+  const ui = { select: async () => undefined, notify: () => {}, setStatus: (key: string, value: string | undefined) => statuses.set(key, value) };
   const ctx = { hasUI: true, model: h.runtime.getModel("route", "worker"), modelRegistry: {
     find: (provider: string, id: string) => h.runtime.getModel(provider, id), hasConfiguredAuth: () => true, runtime: h.runtime,
   }, sessionManager: h.manager, getContextUsage: () => ({ tokens: 0 }), thinkingLevel: "off", ui } as never;
@@ -679,20 +678,43 @@ test("a pin cannot pull the route back to a recovered failed candidate while the
     await h.session.prompt("pinned target succeeds");
     await h.session.prompt("pinned target rate-limited; fallback selected");
     expect(h.dispatches.map(d => d.physical)).toEqual(["fake-b", "fake-b", "fake-a"]);
+
+    // Re-pinning the blocked target: the footer previews the target the next request will try.
     await pin.handler("fake-b/model", ctx);
-    expect(statuses.get(FOOTER_KEYS.model)).not.toContain(PIN_GLYPH);
-    expect(statuses.get(FOOTER_KEYS.model)).toContain(PIN_FALLBACK_GLYPH);
-    await h.session.prompt("ineligible pin falls back and consumes its one-shot override");
+    expect(statuses.get(FOOTER_KEYS.model)).toContain(PIN_GLYPH);
+    expect(statuses.get(FOOTER_KEYS.model)).not.toContain(PIN_FALLBACK_GLYPH);
 
-    h.clock.value += 61_000;
-    await h.session.prompt("rate cooldown expired, but healthy fallback remains sticky");
-    expect(h.dispatches.at(-1)?.physical).toBe("fake-a");
-
-    await h.session.prompt("fallback fails, so eligible pin returns to preference");
-    expect(h.dispatches.slice(-2).map(d => d.physical)).toEqual(["fake-a", "fake-b"]);
+    await h.session.prompt("explicit try of the blocked pin fails; fallback serves");
+    expect(h.dispatches.map(d => d.physical)).toEqual(["fake-b", "fake-b", "fake-a", "fake-b", "fake-a"]);
     expect(h.manager.getBranch().some(entry => entry.type === "custom" && entry.customType === "@vanillagreen/pi-native-router/physical-pin" &&
       (entry.data as { identity?: string | null }).identity === "fake-b/model")).toBe(true);
   } finally { h.close(); }
+});
+
+test("a successful explicit try of a blocked pin clears the block in the shared store", async () => {
+  const shared = mkdtempSync(join(tmpdir(), "native-router-pin-clear-"));
+  const healthPath = join(shared, "health.sqlite");
+  const clock = { value: 1000 };
+  const h = await host(["ok", 429, "ok", "ok"], { healthPath, clock });
+  const ctx = { hasUI: true, model: h.runtime.getModel("route", "worker"), modelRegistry: {
+    find: (provider: string, id: string) => h.runtime.getModel(provider, id), hasConfiguredAuth: () => true, runtime: h.runtime,
+  }, sessionManager: h.manager, getContextUsage: () => ({ tokens: 0 }), thinkingLevel: "off", ui: { select: async () => undefined, notify: () => {}, setStatus: () => {} } } as never;
+  try {
+    const pin = h.commands.get("route-pin") as { handler: (args: string, context: never) => Promise<void> };
+    await pin.handler("fake-b/model", ctx);
+    await h.session.prompt("pinned target succeeds");
+    await h.session.prompt("pinned target rate-limited; fallback selected");
+    const before = new HealthStore(healthPath, () => clock.value);
+    expect(before.blocked(["fake-b/model"])).toBeDefined();
+    before.close();
+
+    await pin.handler("fake-b/model", ctx);
+    await h.session.prompt("explicit try of the blocked pin succeeds");
+    expect(h.dispatches.at(-1)?.physical).toBe("fake-b");
+    const after = new HealthStore(healthPath, () => clock.value);
+    expect(after.blocked(["fake-b/model"])).toBeUndefined();
+    after.close();
+  } finally { h.close(); rmSync(shared, { recursive: true, force: true }); }
 });
 
 test("route-pin preview normalizes a redundant strategy choice to auto and cycling follows configured order", async () => {

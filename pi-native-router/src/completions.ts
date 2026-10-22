@@ -27,6 +27,8 @@ export function completeArguments(prefix: string, slots: ArgumentSlots): Argumen
 export function commandSlots(config: Config): Record<"pricing" | "quotas" | "quotas-config" | "native-router-health" | "route-thinking" | "route-pin", ArgumentSlots> {
   // Price targets are the physical models the routes can select, so the list stays short and needs no catalog load.
   const accounts = Object.values(config.providers).flatMap(provider => Object.keys(provider.accounts));
+  // A single-key provider has no account id; it is reset by its provider id, which completions also offer.
+  const resetNames = [...new Set([...accounts, ...Object.keys(config.providers)])];
   const targets = [...new Set(Object.values(config.routes).flatMap(route => route.candidates.map(c => `${c.provider}/${c.id}`)))];
   // The current route is not known while completing, so pin labels cover every route; the command validates against its own route.
   const pinLabels = [...new Set(Object.values(config.routes).flatMap(route => route.candidates.map(c => `${c.provider}/${c.id}${c.account ? `#${c.account}` : ""}`)))];
@@ -41,7 +43,7 @@ export function commandSlots(config: Config): Record<"pricing" | "quotas" | "quo
       : [],
     "route-thinking": done => done.length === 0 ? [{ value: "default", description: "use candidate thinking defaults again" }] : [],
     "native-router-health": done => done.length === 0
-      ? [{ value: "reset", description: "clear one account's health causes" }]
-      : done[0] === "reset" && done.length === 1 ? accounts.map(value => ({ value, description: "router account" })) : [],
+      ? [{ value: "reset", description: "clear one account's or provider's health causes" }]
+      : done[0] === "reset" && done.length === 1 ? resetNames.map(value => ({ value, description: accounts.includes(value) ? "router account" : "router provider" })) : [],
   };
 }

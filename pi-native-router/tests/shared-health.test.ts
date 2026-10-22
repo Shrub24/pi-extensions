@@ -51,6 +51,35 @@ test("an operator reset of one account leaves other accounts and provider outage
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("an operator reset of a single-key provider clears its provider and model causes, and leaves other providers", () => {
+  const root = dir();
+  try {
+    let now = 1000;
+    const store = new HealthStore(join(root, "health.sqlite"), () => now);
+    store.mark("commandcode", "auth", now + 60_000, "auth");
+    store.mark("commandcode/deepseek", "rate", now + 60_000, "rate");
+    store.mark("opencode-go#go-a", "quota", now + 60_000, "quota");
+    expect(store.resetProvider("commandcode")).toBe(2);
+    expect(store.blocked(["commandcode"])).toBeUndefined();
+    expect(store.blocked(["commandcode/deepseek"])).toBeUndefined();
+    expect(store.blocked(["opencode-go#go-a"])?.key).toBe("opencode-go#go-a");
+    store.close();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("clearing tracker quota drops only the tracker block, not error-derived causes on the same scope", () => {
+  const root = dir();
+  try {
+    let now = 1000;
+    const store = new HealthStore(join(root, "health.sqlite"), () => now);
+    store.reconcileTrackerQuota("opencode-go#go-a", now + 60_000, store.revision(), "tracker");
+    store.mark("opencode-go#go-a", "auth", now + 60_000, "auth");
+    store.clearTrackerQuota("opencode-go#go-a");
+    expect(store.blocked(["opencode-go#go-a"])?.kind).toBe("auth");
+    store.close();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("a successful request admitted before a newer block cannot clear it", () => {
   const root = dir();
   try {
