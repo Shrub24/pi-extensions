@@ -179,6 +179,8 @@ The model part of `provider/model` is Pi's own model name, so model labels come 
 - A pin that cannot serve (cooldown, exhausted quota, or too small for the request) is dormant: that request uses the route's automatic selection, and the pin becomes a preference again once the incumbent is unavailable.
 - `auto` clears the pin. So does picking the candidate that automatic selection would already pick now; without a custom strategy this is the last served candidate, else the first in route order.
 - A pin is an explicit try: it is attempted even when its target is blocked (cooldown, quota, or auth), and a failed attempt falls back as normal while the pin stays stored. A successful attempt clears the blocks it proved in both the shared store and this process. Automatic routing still skips blocked targets.
+- The footer's model entry follows the model that actually serves: dispatch and each finished assistant message publish it.
+  A stored pin never pulls it back to the pinned model once another model has served; only a fresh pin change previews the pin.
 - The pin glyph shows only when the displayed model is the pinned one. When a pinned candidate cannot serve (cooling down, exhausted or unfit), the fallback glyph replaces it in the same entry. Picker entries for cooling candidates carry a red `⚠` mark. Each manual change is logged with reason `manual`.
 - A pin change reports that an eligible new choice will apply on the next request and then stay sticky; an actual physical switch uses the normal cache-rebuild notice.
 

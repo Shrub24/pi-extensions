@@ -467,6 +467,12 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       const activity = { logical: `route/${role}`, physical: state.physical, at: options.now?.() ?? Date.now() };
       activities.set(`${ctx.sessionManager.getSessionId()}:${role}`, activity);
       pi.appendEntry(CACHE_ACTIVITY_ENTRY, activity);
+      // The finished message names the model that actually served, so the footer follows it even when dispatch had no
+      // UI context to publish from. This is the authoritative correction after a failover.
+      const answered = event.message as { provider: string; model: string };
+      const served = ctx.modelRegistry.find(answered.provider, answered.model);
+      const candidate = config.routes[role].candidates.find(c => c.provider === answered.provider && c.id === answered.model);
+      if (served && candidate) publishRoute(ctx, role, served, accountOf(state.physical), routeLevel(served, candidate.thinkingLevel, userThinking(ctx, role)), userThinking(ctx, role));
     });
     pi.registerVirtualModel<State>({
       provider: "route", id: role, name: role, contextWindow: route.contextWindow, maxTokens: route.outputReserve,
@@ -527,6 +533,13 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     const route = config.routes[role];
     const state = branchState(ctx, role);
     const pin = pinOf(ctx, role);
+    const candidates = available(route, ctx, config);
+    // The footer follows what actually serves: the last dispatched target, unless the user has just chosen a new one
+    // (a fresh pin is pending). A stored pin does not pull the display away from a healthy fallback.
+    if (!(typeof pin === "string" && pinOverrideOf(ctx, role)) && state?.physical) {
+      const served = candidates.find(value => identity(value.model, value.candidate.account) === state.physical);
+      if (served) return served;
+    }
     const preferred = typeof pin === "string" ? pin : state?.physical;
     const selection = await chooseWithStrategy(role, route, available(route, ctx, config), health, ctx.getContextUsage()?.tokens ?? 0, preferred, undefined, ctx,
       { mode: "preview", reason: state?.physical ? "continuation" : "initial", state, current: state?.physical || undefined,
@@ -569,7 +582,9 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
   };
   // The physical model, peak and effective thinking level of a request this route has just resolved.
   const publishRoute = (ctx: ExtensionContext, role: string, model: Model<Api>, account: string | undefined, effective: string, requested: string | undefined) => {
-    if (!ctx.hasUI || ctx.model?.provider !== "route" || ctx.model.id !== role) return;
+    // Dispatch publishes the model that actually serves. The dispatch context may carry no selected model, or the
+    // physical model while Pi runs the routed request, so it is not used to decide which model the footer is showing.
+    if (!ctx.hasUI) return;
     nextDisplayGeneration(ctx);
     setPhysical(ctx, role, model, account);
     ctx.ui.setStatus(FOOTER_KEYS.thinking, model.reasoning ? thinkingText(effective, requested) : undefined);

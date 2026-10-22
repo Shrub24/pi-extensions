@@ -35,6 +35,8 @@ async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateT
   let api: ExtensionAPI;
   const commands = new Map<string, unknown>();
   const shortcuts = new Map<string, unknown>();
+  // Event handlers, so a test can drive Pi events (model_select, message_end) with a UI context.
+  const handlers = new Map<string, Array<(event: never, ctx: never) => unknown>>();
   const usage = { input: 10, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 11, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
   // `fake-d/wide` is registered but belongs to no route: it stands in for a model from another route.
   const providers = [["fake-a", opts.contextWindow ?? 300_000], ["fake-b", opts.smaller ?? 300_000], ["fake-c", 300_000], ...(opts.wide ? [["fake-d", 1_000_000] as const] : [])] as const;
@@ -98,6 +100,10 @@ async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateT
           commands.set(name, command);
           return (Reflect.get(target, property, target) as (...args: unknown[]) => unknown).call(target, name, command);
         };
+        if (property === "on") return (event: string, handler: (event: never, ctx: never) => unknown) => {
+          handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+          return (Reflect.get(target, property, target) as (...args: unknown[]) => unknown).call(target, event, handler);
+        };
         if (property === "registerShortcut") return (key: string, shortcut: unknown) => {
           shortcuts.set(key, shortcut);
           return (Reflect.get(target, property, target) as (...args: unknown[]) => unknown).call(target, key, shortcut);
@@ -135,7 +141,7 @@ async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateT
   }
   const manager = opts.manager ?? SessionManager.inMemory(dir);
   const { session } = await createAgentSession({ cwd: dir, agentDir: dir, modelRuntime: runtime, model: runtime.getModel("route", "worker")!, thinkingLevel: "off", settingsManager: settings, resourceLoader: loader, sessionManager: manager, tools: ["owned_tool"], customTools: [{ name: "owned_tool", label: "Owned", description: "Count owned executions", parameters: { type: "object", properties: {} } as never, execute: async () => { toolRuns++; return { content: [{ type: "text", text: "tool finished" }], details: {} }; } }] });
-  return { session, runtime, manager, dispatches, order, api: api!, commands, shortcuts, clock, decisionLogPath, get toolRuns() { return toolRuns; }, close() { session.dispose(); rmSync(dir, { recursive: true, force: true }); } };
+  return { session, runtime, manager, dispatches, order, api: api!, commands, shortcuts, handlers, clock, decisionLogPath, get toolRuns() { return toolRuns; }, close() { session.dispose(); rmSync(dir, { recursive: true, force: true }); } };
 }
 
 test("initial selection skips an unconfigured native provider without flushing", async () => {
@@ -691,6 +697,22 @@ test("a pin on a blocked target is tried once; a failed attempt falls back and t
   } finally { h.close(); }
 });
 
+test("the /route-pin picker marks a candidate that is cooling down", async () => {
+  const h = await host(["ok", 429, "ok"]);
+  const options: string[][] = [];
+  const ui = { select: async (_title: string, opts: string[]) => { options.push(opts); return undefined; }, notify: () => {}, setStatus: () => {} };
+  const ctx = { hasUI: true, model: h.runtime.getModel("route", "worker"), modelRegistry: {
+    find: (provider: string, id: string) => h.runtime.getModel(provider, id), hasConfiguredAuth: () => true, runtime: h.runtime,
+  }, sessionManager: h.manager, getContextUsage: () => ({ tokens: 0 }), thinkingLevel: "off", ui } as never;
+  try {
+    await h.session.prompt("first request");
+    await h.session.prompt("429 on the first candidate; fallback serves");
+    const pin = h.commands.get("route-pin") as { handler: (args: string, context: never) => Promise<void> };
+    await pin.handler("", ctx);
+    expect(options.at(-1)?.some(option => option.includes("\u26a0"))).toBe(true);
+  } finally { h.close(); }
+});
+
 test("a successful explicit try of a blocked pin clears the block in the shared store", async () => {
   const shared = mkdtempSync(join(tmpdir(), "native-router-pin-clear-"));
   const healthPath = join(shared, "health.sqlite");
@@ -715,6 +737,27 @@ test("a successful explicit try of a blocked pin clears the block in the shared 
     expect(after.blocked(["fake-b/model"])).toBeUndefined();
     after.close();
   } finally { h.close(); rmSync(shared, { recursive: true, force: true }); }
+});
+
+test("a stored pin does not pull the footer back to the pinned model once a fallback has served", async () => {
+  const h = await host(["ok", 429, "ok"]);
+  const statuses = new Map<string, string | undefined>();
+  const ui = { select: async () => undefined, notify: () => {}, setStatus: (key: string, value: string | undefined) => statuses.set(key, value) };
+  const ctx = { hasUI: true, model: h.runtime.getModel("route", "worker"), modelRegistry: {
+    find: (provider: string, id: string) => h.runtime.getModel(provider, id), hasConfiguredAuth: () => true, runtime: h.runtime,
+  }, sessionManager: h.manager, getContextUsage: () => ({ tokens: 0 }), thinkingLevel: "off", ui } as never;
+  try {
+    const pin = h.commands.get("route-pin") as { handler: (args: string, context: never) => Promise<void> };
+    await pin.handler("fake-b/model", ctx);
+    await h.session.prompt("pinned target succeeds");
+    await h.session.prompt("pinned target rate-limited; fallback serves");
+    expect(h.dispatches.at(-1)?.physical).toBe("fake-a");
+    // Any later preview (model_select, pin change) must keep the serving fallback on screen, not the stored pin.
+    for (const handler of h.handlers.get("model_select") ?? []) await handler({ model: (ctx as unknown as { model: unknown }).model } as never, ctx);
+    expect(statuses.get(FOOTER_KEYS.model)).toContain("fake-a");
+    expect(statuses.get(FOOTER_KEYS.model)).toContain(PIN_FALLBACK_GLYPH);
+    expect(statuses.get(FOOTER_KEYS.model)).not.toContain(PIN_GLYPH);
+  } finally { h.close(); }
 });
 
 test("route-pin preview normalizes a redundant strategy choice to auto and cycling follows configured order", async () => {
