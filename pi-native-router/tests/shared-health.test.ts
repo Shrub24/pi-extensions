@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { blockedResetName } from "../src/completions";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -207,4 +208,14 @@ test("a healthy tracker reading does not clear a tracker block written after it 
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("reset completion offers only names with a live block, from accounts and single-key providers alike", () => {
+  const config = { providers: { commandcode: { key: "COMMANDCODE_API_KEY", accounts: {} }, "opencode-go": { accounts: { "go-a": {}, "go-b": {} } } }, routes: {}, shortcuts: {}, display: { providers: {} } } as never;
+  expect(blockedResetName("commandcode/deepseek", config)).toBe("commandcode");
+  expect(blockedResetName("commandcode", config)).toBe("commandcode");
+  expect(blockedResetName("opencode-go#go-a", config)).toBe("go-a");
+  expect(blockedResetName("opencode-go/m#go-b", config)).toBe("go-b");
+  expect(blockedResetName("unknown#zz", config)).toBeUndefined();
+  expect(blockedResetName("unknown/model", config)).toBeUndefined();
 });

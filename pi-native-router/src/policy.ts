@@ -79,6 +79,10 @@ export class Health {
     const kind: ErrorCauseKind = failure.kind;
     this.attempt(() => this.store?.mark(key, kind, until, kind));
   }
+  /** Scope keys with a process-local cause still in force. */
+  liveKeys(at: number): string[] {
+    return [...this.local].filter(([, entry]) => entry.until > at).map(([key]) => key);
+  }
   /** Clears process-local causes for these scopes after a request on them proved it serves. */
   recovered(keys: readonly string[]) {
     for (const key of keys) this.local.delete(key);

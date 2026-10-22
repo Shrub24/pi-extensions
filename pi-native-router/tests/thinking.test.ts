@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { clampLevel, supportedLevels } from "../src/policy";
+import { routeLevel } from "../src/index";
 
 test("a non-reasoning physical model supports only off", () => {
   expect(supportedLevels({ reasoning: false })).toEqual(["off"]);
@@ -18,4 +19,13 @@ test("a requested level clamps upward first, then downward, as pi-ai does", () =
   const topOnly = { reasoning: true, thinkingLevelMap: { high: null, medium: null, low: null, minimal: null, xhigh: null, max: null } };
   expect(clampLevel(topOnly, "max")).toBe("off");
   expect(supportedLevels(topOnly)).toEqual(["off", "max"].filter(level => level === "off"));
+});
+
+test("a candidate default is clamped to the physical model like a user choice", () => {
+  // OpenCode Go's DeepSeek: low, high and max are accepted; medium maps to high.
+  const deepseek = { reasoning: true, thinkingLevelMap: { minimal: null, low: "low", medium: null, high: "high", max: "max" } };
+  expect(routeLevel(deepseek, "medium", undefined)).toBe("high");
+  expect(routeLevel(deepseek, "low", undefined)).toBe("low");
+  expect(routeLevel(deepseek, "medium", "medium")).toBe("high");
+  expect(routeLevel(deepseek, "medium", "max")).toBe("max");
 });

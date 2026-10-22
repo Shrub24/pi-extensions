@@ -121,7 +121,7 @@ Account and provider causes are shared across Pi processes of the same user on o
 - **Recovery** after a deadline admits exactly one probe per scope through an atomic lease (60 s, expiring if its holder crashes). Success clears only the causes the probe proved recovered; a newer failure, an operator reset or a late result cannot be erased by an older one.
 - **Partial output** from a quota or auth failure still records health, but the request is never replayed.
 - **Degradation:** if the store cannot be opened or accessed, routing keeps the process-local mirror and emits one `native-router:health-degraded` event per distinct error. Dispatch is not stalled by coordination.
-- **Inspect and reset:** `/native-router-health` lists causes with their reason and expiry, and probe leases. The header states the coordination mode: `shared`, `DEGRADED` (the store failed, so only process-local health applies), or `local-only` (`sharedHealth` is off). `/native-router-health reset <account|provider>` clears that account's causes, or a single-key provider's causes (its provider-wide and model-scoped causes), leaves other accounts and providers in place, and fences its in-flight probes. Completions offer both accounts and providers.
+- **Inspect and reset:** `/native-router-health` lists causes with their reason and expiry, and probe leases. The header states the coordination mode: `shared`, `DEGRADED` (the store failed, so only process-local health applies), or `local-only` (`sharedHealth` is off). `/native-router-health reset <account|provider>` clears that account's causes, or a single-key provider's causes (its provider-wide and model-scoped causes), leaves other accounts and providers in place, and fences its in-flight probes. Completions offer only names that currently have a live block, so there is nothing stale to pick.
 - **Rollback:** set `"sharedHealth": false` at the top level of the router configuration to return to process-local health. Parent and worker processes need the same setting to share state.
 
 ## Account quotas (CodexBar)
@@ -154,7 +154,7 @@ A provider or account may map to a CodexBar provider so `/quotas` can show its w
 
 ## Thinking level
 
-A route advertises every thinking level, so Shift+Tab and `/thinking` work on `route/<role>`. Your explicit choice is stored on the session branch, per role, and applies to every later request on that route until you change it. Each physical candidate clamps the choice to the levels it supports, using pi-ai's rule (upward first, then downward). Without an explicit choice, each candidate's configured `thinkingLevel` applies.
+A route advertises every thinking level, so Shift+Tab and `/thinking` work on `route/<role>`. Your explicit choice is stored on the session branch, per role, and applies to every later request on that route until you change it. Each physical candidate clamps the choice to the levels it supports, using pi-ai's rule (upward first, then downward). Without an explicit choice, each candidate's configured `thinkingLevel` applies, clamped the same way: a default the physical model does not accept runs as the level it maps to (for example `medium` on OpenCode Go's DeepSeek runs as `high`), and the footer shows that clamped level.
 
 Switching model does not count as a choice: a physical model's own thinking level never becomes a route choice.
 

@@ -74,8 +74,9 @@ const CACHE_ACTIVITY_ENTRY = "@vanillagreen/pi-native-router/cache-activity";
 const THINKING_CHOICE_ENTRY = "@vanillagreen/pi-native-router/thinking-choice";
 
 /** The level a route request runs at: the user's route choice clamped to the physical model, else the candidate default. */
-function routeLevel(model: Parameters<typeof clampLevel>[0], candidateLevel: string, explicit: string | undefined): string {
-  return explicit === undefined ? candidateLevel : clampLevel(model, explicit);
+/** The level a request runs at: the user's choice or the candidate default, both clamped to what the physical model accepts. */
+export function routeLevel(model: Parameters<typeof clampLevel>[0], candidateLevel: string, explicit: string | undefined): string {
+  return clampLevel(model, explicit ?? candidateLevel);
 }
 const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 /** The user's physical pin per route, persisted on the branch: a candidate identity, or null for auto. Last entry wins. */
@@ -606,7 +607,13 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     if (quotaTimer) clearInterval(quotaTimer);
     quotaTimer = undefined;
   });
-  const slots = commandSlots(config);
+  // Live blocks, read at completion time: the store's causes plus this process's local causes that have not expired.
+  const liveBlockKeys = (): string[] => {
+    const keys = health.liveKeys(options.now?.() ?? Date.now());
+    if (store) try { keys.push(...store.inspect().causes.filter(c => c.until > (options.now?.() ?? Date.now())).map(c => c.key)); } catch (error) { degrade(error); }
+    return [...new Set(keys)];
+  };
+  const slots = commandSlots(config, liveBlockKeys);
   pi.registerCommand("pricing", {
     getArgumentCompletions: prefix => completeArguments(prefix, slots.pricing),
     description: "Refresh catalog prices or show one physical model: /pricing refresh | /pricing show <provider>/<model>",
