@@ -679,7 +679,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     return selection.selected && identity(selection.selected.model, selection.selected.candidate.account);
   };
   // Picker and cycle mark a candidate that is cooling down; it stays selectable, unlike automatic routing.
-  const COOLING_MARK = " ⚠ cooling down";
+  const COOLING_MARK = " \x1b[31m⚠\x1b[39m";
   const blockedTarget = (ctx: ExtensionContext, candidate: { provider: string; id: string; account?: string }) => {
     const model = ctx.modelRegistry.find(candidate.provider, candidate.id);
     return model && model.api !== "pi-virtual" ? health.blockedReason(model, candidate.account) : undefined;
