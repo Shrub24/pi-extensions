@@ -1750,7 +1750,13 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		return sent;
 	};
 
-	const EXIT_BATCH_MS = settingNumber("exitWakeBatchMs", 250, activeCtx?.cwd);
+	// Batching only matters while a sibling can still finish. An idle wake starts a
+	// model turn, so it waits longer to share one; a wake during a run is queued as
+	// steer at no extra turn cost, so it waits only briefly. Run state picks the
+	// window and never holds a wake.
+	const IDLE_BATCH_MS = settingNumber("exitWakeBatchMs", 3_000, activeCtx?.cwd);
+	const RUN_BATCH_MS = settingNumber("exitWakeRunBatchMs", 250, activeCtx?.cwd);
+	let runInFlight = false;
 	const exitWakeBatch = new Map<string, { eventAt?: number; matchedPattern?: string; newOutputTail?: string; sequence?: number }>();
 	let exitBatchTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -1758,7 +1764,13 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 	// queued messages as one prompt, so every wake can go out as soon as it is
 	// ready and Pi coalesces whatever is still queued.
 	const scheduleExitFlush = (): void => {
-		if (EXIT_BATCH_MS <= 0) {
+		const windowMs = runInFlight ? RUN_BATCH_MS : IDLE_BATCH_MS;
+		// Nothing left running means nothing left to batch with: the last exit of a
+		// group, or a lone task, is delivered now with whatever already waited.
+		const siblingRunning = [...tasks.values()].some((task) => task.status === "running");
+		if (windowMs <= 0 || !siblingRunning) {
+			if (exitBatchTimer) clearTimeout(exitBatchTimer);
+			exitBatchTimer = null;
 			flushExitBatch();
 			return;
 		}
@@ -1766,7 +1778,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		exitBatchTimer = setTimeout(() => {
 			exitBatchTimer = null;
 			flushExitBatch();
-		}, EXIT_BATCH_MS);
+		}, windowMs);
 		exitBatchTimer.unref?.();
 	};
 
@@ -3057,6 +3069,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 	// and queued as steer during a run. What waits for it is the advisory about
 	// results the agent still has not retrieved, sent once per result.
 	pi.on("agent_settled", () => {
+		runInFlight = false;
 		flushExitBatch();
 		announceRunningTasks();
 		const unread = [...tasks.values()].filter((task) =>
@@ -3141,7 +3154,12 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		syncWidget(ctx);
 		publishPaneFacts();
 	});
+	// Run state only chooses the batch window. A run Pi starts without
+	// `before_agent_start` (a queued follow-up, a trigger-turn wake) is still a run.
+	pi.on("agent_start", () => { runInFlight = true; });
+	pi.on("turn_start", () => { runInFlight = true; });
 	pi.on("before_agent_start", (_event, ctx) => {
+		runInFlight = true;
 		recordProjectTrust(ctx);
 		activeCtx = ctx;
 		syncWidget(ctx);

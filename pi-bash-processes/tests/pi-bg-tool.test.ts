@@ -90,6 +90,9 @@ test("get on a finished task acknowledges the completion after a successful hand
 });
 
 test("list has no lifecycle side effects", async () => {
+	// A running sibling keeps the exit inside the batch window, so the completion
+	// is genuinely still owed while the listings run.
+	const sibling = await spawn("sleep 30", "get-list-sibling");
 	const id = await spawn("printf 'unobserved\\n'", "get-list");
 	await host.settledTask(id);
 	const owed = async () => ((await host.listTasks()).find((task) => task.id === id) ?? {}).exitNotified === false;
@@ -108,6 +111,7 @@ test("list has no lifecycle side effects", async () => {
 	expect(after.details.ack.committed).toBe("terminal");
 	expect(after.details.observation.completionOwed, "the settled handoff says so").toBe(false);
 	expect(await owed()).toBe(false);
+	await bgTask().execute("get-list-stop", { action: "stop", id: sibling });
 });
 
 // The boundary every terminal read in this file depends on. `status` leaves

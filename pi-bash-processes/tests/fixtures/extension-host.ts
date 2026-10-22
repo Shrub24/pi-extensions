@@ -143,7 +143,7 @@ export async function startExtensionHost(options: ExtensionHostOptions = {}): Pr
 	// Only settings this contract needs: finished-task retention and the wake
 	// debounce stay out of the way, and the foreground window is short enough
 	// that a command meant to outlive it does.
-	writeFileSync(join(root, "agent", "settings.json"), JSON.stringify({ [PACKAGE_ID]: { showWidget: false, exitWakeBatchMs: 0, foregroundYieldMs: 20_000, ...options.settings },
+	writeFileSync(join(root, "agent", "settings.json"), JSON.stringify({ [PACKAGE_ID]: { showWidget: false, exitWakeBatchMs: 0, exitWakeRunBatchMs: 0, foregroundYieldMs: 20_000, ...options.settings },
 		...options.packageConfig,
 	}));
 

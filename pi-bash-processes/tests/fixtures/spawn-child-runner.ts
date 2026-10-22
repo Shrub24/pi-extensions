@@ -13,7 +13,7 @@ export function runSpawnFixture(fixture: string, input: Record<string, unknown>)
 	const root = realpathSync(mkdtempSync(join(scratch, "spawn-hardening-")));
 	try { for (const name of [".pi", "home", "agent", "logs"]) mkdirSync(join(root, name));
 		writeFileSync(join(root, "agent", "settings.json"), JSON.stringify({ "pi-bash-processes": { showWidget: input.showWidget === true, resourceControlEnabled: input.resource === true, resourceControlMode: "systemd-run", forceKillGraceMs: 5000,
-			exitWakeBatchMs: 0,
+			exitWakeBatchMs: 0, exitWakeRunBatchMs: 0,
 			...(typeof input.defaultSoftTimeoutMs === "number" ? { defaultSoftTimeoutMs: input.defaultSoftTimeoutMs } : {}),
 			...(typeof input.taskWaitDefaultSeconds === "number" ? { taskWaitDefaultSeconds: input.taskWaitDefaultSeconds } : {}),
 			...(typeof input.taskWaitMaxSeconds === "number" ? { taskWaitMaxSeconds: input.taskWaitMaxSeconds } : {}), } }));
