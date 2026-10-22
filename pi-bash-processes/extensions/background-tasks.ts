@@ -188,7 +188,7 @@ import {
 	WAKE_MANIFEST_FIELD_MAX_CHARS,
 	type OutputWakeBudgetLimits,
 } from "./wake-events.js";
-import { taskSurfaceGuidance, wakeTaskLine, type TaskToolSurface } from "./tool-surface.js";
+import { batchRetrievalHint, taskSurfaceGuidance, wakeTaskLine, type TaskToolSurface } from "./tool-surface.js";
 
 /**
  * The surface the current session declared, resolved once at `session_start`.
@@ -2606,11 +2606,12 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		}
 		// Grouped wake: several mid-turn completions become one message.
 		const guidance = taskSurfaceGuidance(taskToolSurface);
-		const summaries = finished.map((task) => `${wakeTaskLine(task, guidance)} · ${compactText(task.command, 60)}`);
+		const summaries = finished.map((task) => `${wakeTaskLine(task, guidance, { hint: false })} · ${compactText(task.command, 60)}`);
 		const failures = finished.filter((task) => (task.exitCode ?? 0) !== 0);
 		const content = [
 			`${finished.length} background tasks finished.`,
 			...summaries.map((line) => `• ${line}`),
+			batchRetrievalHint(guidance),
 			...(failures.length > 0 ? [`${failures.length} failed: ${guidance.reviewFailures}.`] : []),
 			runningInventory(),
 		].join("\n");
@@ -3068,13 +3069,19 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 	// Completion wakes do not wait for it; they are sent within the batch window
 	// and queued as steer during a run. What waits for it is the advisory about
 	// results the agent still has not retrieved, sent once per result.
+	// The first idle after a completion wake is the run that wake started, and the
+	// model has just read it: a reminder there repeats what it chose not to act on.
+	// Only a result still unretrieved after the agent has moved on, at a later idle,
+	// is worth the one advisory.
+	const idleSeenWithResult = new Set<string>();
 	pi.on("agent_settled", () => {
 		runInFlight = false;
 		flushExitBatch();
 		announceRunningTasks();
 		const unread = [...tasks.values()].filter((task) =>
 			task.exitNotified && task.resultReminded !== true && task.supersededBy === undefined && !exitWakeBatch.has(task.id) &&
-			!resultIsResolved(task) && taskReadiness(task) !== "running" && taskReadiness(task) !== "finalizing");
+			!resultIsResolved(task) && taskReadiness(task) !== "running" && taskReadiness(task) !== "finalizing" &&
+			(idleSeenWithResult.has(task.id) || !idleSeenWithResult.add(task.id)));
 		if (unread.length === 0) return;
 		const sent = sendResultReviewAdvisory({
 			...wakeSend,
@@ -3091,6 +3098,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 	});
 	pi.on("session_start", async (_event, ctx) => {
 		shuttingDown = false;
+		idleSeenWithResult.clear();
 		recordProjectTrust(ctx);
 		activeCtx = ctx;
 		// The settlement provider is session-scoped: reset its restore state and

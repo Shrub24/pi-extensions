@@ -26,13 +26,13 @@ test("a mid-run exit is delivered at once; reading the live log does not resolve
  * agent_end closes one low-level run and changes nothing. Idle (agent_settled)
  * sends the single advisory for a result still unretrieved, and only that.
  */
-test("an unretrieved result is reminded once at agent_settled, never at agent_end", () => {
+test("an unretrieved result is reminded once, at a later idle than the one its wake started, never at agent_end", () => {
 	const result = runSpawnFixture("spawn-extension.ts", { mode: "deferred-settle-hold", command: "sleep 5 && echo held" }) as {
 		deferred: { afterExit: unknown[]; afterLog: unknown[]; afterTurnEnd: unknown[] };
 	};
 	expect(result.deferred.afterExit, "delivered while the run is live").toHaveLength(1);
 	expect(result.deferred.afterLog, "agent_end alone sends nothing").toHaveLength(0);
-	expect(result.deferred.afterTurnEnd, "agent_settled sends the advisory").toHaveLength(1);
+	expect(result.deferred.afterTurnEnd, "the second idle sends the advisory, the first sent nothing").toHaveLength(1);
 	expect(JSON.stringify(result.deferred.afterTurnEnd[0])).toContain('"eventType":"result-review"');
 	expect(JSON.stringify(result.deferred.afterTurnEnd[0]), "and it starts no turn").toContain('"triggerTurn":false');
 }, SPAWN_FIXTURE_TIMEOUT_MS);

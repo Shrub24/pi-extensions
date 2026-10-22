@@ -14,7 +14,7 @@ import type {
 	WakeEventRecord,
 	WakePendingRecord,
 } from "./types.js";
-import { taskSurfaceGuidance, wakeTaskLine, type TaskToolSurface } from "./tool-surface.js";
+import { batchRetrievalHint, taskSurfaceGuidance, wakeTaskLine, type TaskToolSurface } from "./tool-surface.js";
 
 export const NOTIFY_MODES = ["always", "transition", "first-match-only"] as const;
 const MAX_WAKE_EVENTS = 50;
@@ -744,9 +744,9 @@ export function sendResultReviewAdvisory(
 ): boolean {
 	if (deps.isShuttingDown() || tasks.length === 0) return false;
 	const guidance = taskSurfaceGuidance(deps.surface?.() ?? "compat");
-	const lines = tasks.map((task) => wakeTaskLine(task, guidance));
+	const lines = tasks.map((task) => wakeTaskLine(task, guidance, { hint: false }));
 	deliverWakeMessage(deps as WakeSend, {
-		content: [`${tasks.length === 1 ? "A finished background result is" : `${tasks.length} finished background results are`} still unretrieved:`, ...lines.map((line) => `• ${line}`)].join("\n"),
+		content: [`${tasks.length === 1 ? "A finished background result is" : `${tasks.length} finished background results are`} still unretrieved:`, ...lines.map((line) => `• ${line}`), batchRetrievalHint(guidance)].join("\n"),
 		customType: deps.messageType,
 		details: { eventType: "result-review", grouped: true, tasks: tasks.map((task) => compactBackgroundTaskSnapshot(task as BackgroundTaskSnapshot)) },
 		display: true,

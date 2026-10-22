@@ -166,7 +166,15 @@ try {
 		}
 		await dispatch("agent_end");
 		await dispatch("agent_settled");
+		// The first idle follows the run the completion wake belonged to. The advisory
+		// is for a result still unretrieved after the agent has moved on, so a second
+		// run and idle are what is measured.
+		const afterFirstIdle = messages.slice(afterExit.length + afterLog.length);
+		await dispatch("before_agent_start");
+		await dispatch("agent_end");
+		await dispatch("agent_settled");
 		const afterTurnEnd = messages.slice(afterExit.length + afterLog.length);
+		void afterFirstIdle;
 		deferred = { afterLog, afterTurnEnd, afterExit };
 	}
 	// Regression for the three-wake report: three tasks finishing at different
@@ -287,6 +295,9 @@ try {
 		await dispatch("agent_end");
 		await dispatch("agent_settled");
 		const exitWakes = exitWakeCount();
+		await dispatch("before_agent_start");
+		await dispatch("agent_end");
+		await dispatch("agent_settled");
 		// The exit wake delivered; the unretrieved result is reminded once, at the
 		// idle boundary just passed. No interval is armed for it.
 		const reviewWakes = messages

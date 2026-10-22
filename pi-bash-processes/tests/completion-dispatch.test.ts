@@ -66,13 +66,15 @@ test("completion ends the progress reminders and leaves one idle advisory for th
 	await until(() => events("soft-timeout").length > 0, 10_000);
 	await host.settledTask(id);
 	await settle();
+	await host.dispatch("before_agent_start");
+	await settle();
 
 	const delivered = events("soft-timeout").length;
 	expect(delivered, "the running task was reviewed on its interval").toBeGreaterThanOrEqual(1);
 	expect((await taskById(id))?.softExpiresAt ?? null, "a finished task carries no review deadline").toBeNull();
 	await Bun.sleep(400);
 	expect(events("soft-timeout").length, "a finished task receives no further progress reminder").toBe(delivered);
-	expect(events("result-review"), "the unread result is reminded once, at idle").toHaveLength(1);
+	expect(events("result-review"), "the unread result is reminded once, at a later idle").toHaveLength(1);
 	const exit = events("exit").filter(([message]) => (message as { details?: { task?: { id?: string } } }).details?.task?.id === id);
 	expect(exit, "the completion is delivered separately, exactly once").toHaveLength(1);
 	const final = await taskById(id);

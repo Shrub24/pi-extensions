@@ -126,13 +126,20 @@ export interface WakeTaskState {
  * be read as work that is done with, and a finished task is never confused with
  * one whose result has been handed over.
  */
-export function wakeTaskLine(task: WakeTaskState, guidance: TaskSurfaceGuidance): string {
+export function wakeTaskLine(task: WakeTaskState, guidance: TaskSurfaceGuidance, options: { hint?: boolean } = {}): string {
 	if (task.status === "running") return `${task.id} · still running · result pending`;
 	const outcome = task.exitCode == null ? "ended without an exit code" : `exit ${task.exitCode}`;
 	// `unretrieved` is the only state that still owes the reader something; a
 	// resolution — delivery, capture error, or an explicit dismissal — does not.
 	const owed = task.resultResolution === undefined
-		? `result unretrieved — ${guidance.inspect} id: ${task.id}${guidance.dismiss ? `, or dismiss it with ${guidance.dismiss(task.id)}` : ""}`
+		? options.hint === false
+			? "result unretrieved"
+			: `result unretrieved — ${guidance.inspect} id: ${task.id}${guidance.dismiss ? `, or dismiss it with ${guidance.dismiss(task.id)}` : ""}`
 		: "result already resolved";
 	return `${task.id} · ${outcome} · ${owed}`;
+}
+
+/** The retrieval instruction a message covering several tasks states once, instead of per task line. */
+export function batchRetrievalHint(guidance: TaskSurfaceGuidance): string {
+	return `Retrieve a result with ${guidance.inspect} id: <id>${guidance.dismiss ? `, or dismiss it with ${guidance.dismiss("<id>")}` : ""}.`;
 }

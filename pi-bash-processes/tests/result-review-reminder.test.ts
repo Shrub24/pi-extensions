@@ -27,9 +27,13 @@ test("an unretrieved result is reminded once at idle, as a message that starts n
 	expect(reviews(), "no interval fires for a finished task, and nothing is sent mid-run").toHaveLength(0);
 
 	await host.settle();
-	expect(reviews(), "idle sends the one advisory").toHaveLength(1);
+	expect(reviews(), "the first idle follows the run its completion wake started: nothing to add").toHaveLength(0);
+	await host.dispatch("before_agent_start");
+	await host.settle();
+	expect(reviews(), "a later idle with the result still unread sends the one advisory").toHaveLength(1);
 	const [message, options] = reviews()[0]!;
 	expect(JSON.stringify(message)).toContain(`${id} · exit 0 · result unretrieved`);
+	expect(JSON.stringify(message), "the retrieval instruction is stated once, not per task").toContain('Retrieve a result with bg_task action:\\"get\\" id: <id>');
 	expect(options, "it costs no model turn of its own").toMatchObject({ triggerTurn: false });
 
 	await host.settle();
@@ -46,6 +50,8 @@ test("a result retrieved before idle is not reminded", async () => {
 	const before = reviews().length;
 	const id = await finished("printf 'read\\n'");
 	await bgTask().execute("review-get", { action: "get", id });
+	await host.settle();
+	await host.dispatch("before_agent_start");
 	await host.settle();
 	expect(reviews().length).toBe(before);
 });

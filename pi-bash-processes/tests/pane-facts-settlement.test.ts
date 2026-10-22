@@ -34,9 +34,12 @@ test("an unread completed result stays an advertised dependency and is reminded 
   expect(latest()).toContain(`pi_bg_tasks=${id}:review`);
   expect(latest()).toContain("pi_bg_running=0");
   expect(host.userMessages, "no user turn is forced to retrieve it").toHaveLength(0);
-  expect(advisories(), "the advisory is sent once, at idle").toHaveLength(1);
-  expect(JSON.stringify(advisories()[0])).toContain(id);
+  expect(advisories(), "the first idle sends nothing: it follows the run the completion started").toHaveLength(0);
 
+  await host.dispatch("before_agent_start");
+  await host.dispatch("agent_settled");
+  expect(advisories(), "a later idle with the result unread sends the advisory").toHaveLength(1);
+  expect(JSON.stringify(advisories()[0])).toContain(id);
   await host.dispatch("before_agent_start");
   await host.dispatch("agent_settled");
   expect(advisories(), "no automatic reminder loop").toHaveLength(1);
