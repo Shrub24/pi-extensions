@@ -16,7 +16,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { spawn } from "node:child_process";
 import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { Type } from "typebox";
 import { openLaneDir, pruneLanes } from "../scripts/lane-retention.js";
@@ -36,6 +36,7 @@ import {
 	BG_INSTALL_SYMBOL,
 	BG_MESSAGE_TYPE,
 	BG_STATE_TYPE,
+	BG_TRANSITION_TYPE,
 	BG_WIDGET_KEY,
 	DEFAULT_BACKGROUND_BASH_SHORTCUT,
 	DEFAULT_BG_SHORTCUT,
@@ -117,7 +118,7 @@ void loadManagedBashPresentation();
 import { createOrphanWatcher, type OrphanWatcher } from "./orphan-watcher.js";
 import { blockingTaskCount, createPaneFactsPublisher, paneFacts } from "./pane-facts.js";
 import { busTasks, createRadarBusPublisher } from "./radar-bus.js";
-import { applyCustomEntryWithBarrier, createPersistence, sessionIdForContext, sidecarStatePath } from "./persistence.js";
+import { applyLegacySnapshotEntry, createPersistence, sessionIdForContext, sidecarStatePath } from "./persistence.js";
 import { mapWithConcurrency, PROBE_CONCURRENCY } from "./probes.js";
 import { defaultSystemdUnitActive, planResourceControlledSpawn, stopResourceControlledTask } from "./resource-control.js";
 import { installSettingsCacheRefresh, recordProjectTrust } from "./package-config.js";
@@ -140,7 +141,7 @@ import {
 	type TaskResultHandoff,
 	type TaskResultObservation,
 } from "./task-result.js";
-import { applyBgToolResultTasksWithBarrier } from "./tool-result-details.js";
+import { applyBgToolResultTasks } from "./tool-result-details.js";
 import {
 	defaultReadProcessIdentity,
 	forgetSnapshot,
@@ -522,7 +523,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 
 	const persistenceLayer = createPersistence({
 		pi,
-		customType: BG_STATE_TYPE,
+		transitionType: BG_TRANSITION_TYPE,
 		getActiveCtx: () => activeCtx,
 		listSnapshots: () => sortedTasks().map((task) => rememberSnapshot(task)),
 		notify: (where) => activeCtx?.ui.notify?.(
@@ -533,7 +534,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 
 	// Deferred persistence for per-chunk state; any immediate persist covers it.
 	const persistSoon = createCoalescedCall(() => persistenceLayer.persistSnapshots(), OUTPUT_PERSIST_MS);
-	const persistSnapshots = (): { appendEntry: boolean; sidecar: boolean } => {
+	const persistSnapshots = (): { transitions: number; sidecar: boolean } => {
 		persistSoon.cancel();
 		return persistenceLayer.persistSnapshots();
 	};
@@ -1242,43 +1243,40 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			replayed.set(snapshot.id, snapshot);
 		};
 		const clearRestoredTasks = () => { replayed.clear(); };
+		// The sidecar is the authority. When it loads, nothing in the branch is read:
+		// not the old snapshot entries and not the task lists inside tool results, so
+		// nothing older can clear or resurrect what the sidecar says. A session with
+		// no sidecar yet is a legacy one and replays the branch once; the persist at
+		// the end of restore writes the sidecar, which ends that migration.
 		let sidecarLoaded = false;
-		let sidecarTasks: BackgroundTaskSnapshot[] | undefined;
-		try {
-			const file = sidecarStatePath(ctx);
-			if (existsSync(file)) {
+		const file = sidecarStatePath(ctx);
+		if (existsSync(file)) {
+			try {
 				const data = JSON.parse(readFileSync(file, "utf8")) as { tasks?: unknown };
-				if (Array.isArray(data?.tasks)) {
-					sidecarTasks = data.tasks as BackgroundTaskSnapshot[];
-					for (const snapshot of sidecarTasks) rememberRestoredSnapshot(snapshot);
-					sidecarLoaded = true;
-				}
+				if (!Array.isArray(data?.tasks)) throw new Error("state file has no task list");
+				for (const snapshot of data.tasks as BackgroundTaskSnapshot[]) rememberRestoredSnapshot(snapshot);
+				sidecarLoaded = true;
+			} catch (error) {
+				// Corrupt is not empty. Keep the unreadable file where it can be recovered
+				// from, say so, and rebuild from the legacy branch so no obligation is lost.
+				const msg = error instanceof Error ? error.message : String(error);
+				const kept = `${file}.corrupt-${Date.now()}`;
+				try { renameSync(file, kept); } catch { /* the next write replaces it; the diagnostic below still names it */ }
+				logBackgroundDiagnostic("persistence failed (sidecar-read)", { error: msg, kept });
+				ctx.ui.notify?.(`Background task state could not be read (${msg}); the unreadable file was kept at ${kept}. Tasks are rebuilt from the session where it recorded them.`, "warning");
+				replayed.clear();
 			}
-		} catch (error) {
-			const msg = error instanceof Error ? error.message : String(error);
-			logBackgroundDiagnostic("persistence failed (sidecar-read)", { error: msg });
-			// Fall back to session entries below.
 		}
-		for (const entry of ctx.sessionManager.getBranch()) {
-			if (entry.type === "custom" && entry.customType === BG_STATE_TYPE) {
-				applyCustomEntryWithBarrier({
-					data: entry.data,
-					sidecarLoaded,
-					sidecarTasks,
-					clear: clearRestoredTasks,
-					apply: (snapshot) => rememberRestoredSnapshot(snapshot),
-				});
-			}
-			if (entry.type === "message" && entry.message.role === "toolResult" && (entry.message.toolName === "bg_task" || entry.message.toolName === "bg_status" || entry.message.toolName === "bash")) {
-				const details = entry.message.details as { task?: unknown; tasks?: unknown } | undefined;
-				if (details?.task) rememberRestoredSnapshot(details.task as BackgroundTaskSnapshot);
-				applyBgToolResultTasksWithBarrier({
-					apply: (snapshot) => rememberRestoredSnapshot(snapshot as BackgroundTaskSnapshot),
-					clear: clearRestoredTasks,
-					detailsTasks: details?.tasks,
-					sidecarLoaded,
-					sidecarTasks,
-				});
+		if (!sidecarLoaded) {
+			for (const entry of ctx.sessionManager.getBranch()) {
+				if (entry.type === "custom" && entry.customType === BG_STATE_TYPE) {
+					applyLegacySnapshotEntry({ data: entry.data, clear: clearRestoredTasks, apply: rememberRestoredSnapshot });
+				}
+				if (entry.type === "message" && entry.message.role === "toolResult" && (entry.message.toolName === "bg_task" || entry.message.toolName === "bash")) {
+					const details = entry.message.details as { task?: unknown; tasks?: unknown } | undefined;
+					if (details?.task) rememberRestoredSnapshot(details.task as BackgroundTaskSnapshot);
+					applyBgToolResultTasks({ apply: (snapshot) => rememberRestoredSnapshot(snapshot as BackgroundTaskSnapshot), detailsTasks: details?.tasks });
+				}
 			}
 		}
 		const sessionId = activeSessionId ?? undefined;
@@ -1298,6 +1296,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			// The same persisted deadline is re-armed once for either state.
 			scheduleSoftTimeout(task);
 		}
+		persistenceLayer.seed(sortedTasks().map((task) => rememberSnapshot(task)));
 		if (tasks.size > 0) persistSnapshots();
 	};
 

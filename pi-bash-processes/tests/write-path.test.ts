@@ -29,7 +29,7 @@ test("streamed output chunks defer log, widget and state writes to their windows
 		const persistWindows = 1;
 		expect(result, row.name).toStrictEqual({
 			duringChunks: {
-				entries: 0, logBytes: 0,
+				stateWrites: 0, logBytes: 0,
 				timerSets: {
 					"interval:30000": 1, [`timeout:${OUTPUT_SETTLE_MS}`]: row.chunks, [`timeout:${LOG_FLUSH_MS}`]: 1,
 					[`timeout:${UI_REFRESH_MS}`]: 1, [`timeout:${PERSIST_MS}`]: persistWindows,

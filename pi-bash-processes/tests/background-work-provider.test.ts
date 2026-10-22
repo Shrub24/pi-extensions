@@ -12,6 +12,8 @@
 // pinned.
 
 import { afterAll, expect, test } from "bun:test";
+import { rmSync } from "node:fs";
+import { sidecarStatePath } from "../extensions/persistence.js";
 
 import { startExtensionHost, type ExtensionHost } from "./fixtures/extension-host.js";
 import {
@@ -229,6 +231,8 @@ test("a fresh session_start re-registers the provider after disposal", async () 
 test("a failing restore reports an actionable provider error, never an empty successful snapshot", async () => {
 	const branch = host.ctx.sessionManager;
 	const originalGetBranch = branch.getBranch;
+	// A session whose sidecar loads never reads the branch; the legacy path does.
+	rmSync(sidecarStatePath(host.ctx), { force: true });
 	branch.getBranch = () => {
 		throw new Error("injected branch read failure");
 	};

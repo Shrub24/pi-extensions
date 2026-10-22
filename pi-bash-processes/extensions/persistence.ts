@@ -1,16 +1,16 @@
-// Snapshot persistence helpers for pi-background-tasks.
+// Task-state persistence for pi-bash-processes.
 //
-// Responsibilities:
-//   - Resolve the per-session sidecar state path.
-//   - Atomic temp+rename writes so a crash mid-write can't shred the
-//     replay record.
-//   - Surface failures on both channels (Pi appendEntry + sidecar)
-//     instead of silently swallowing them.
+// One authority: the per-session sidecar `state.json` holds the recoverable task
+// records and is written atomically (temp file + rename) on each persist. The
+// Pi session carries only small lifecycle transition entries — identity, the
+// handful of fields that mark a transition, the writing session and a
+// timestamp — never a roster, a full command history or output. Sessions are
+// append-only, so anything written there is permanent; keeping the transcript to
+// transitions is what stops it growing with task count times output activity.
 //
-// The factory function returns a closure-friendly { persistSnapshots,
-// sidecarStatePath, sessionIdForContext } trio so background-tasks.ts
-// can pass it the current view of the task map without re-importing
-// everything per call.
+// Restore reads the sidecar first (see `background-tasks.ts`). Session entries of
+// the old `kendex-background-tasks:state` snapshot type are read only for a
+// session that has no sidecar yet, and are never written again.
 
 import { createHash } from "node:crypto";
 import {
@@ -27,57 +27,45 @@ import { logBackgroundDiagnostic } from "./diagnostics.js";
 import { piUserDir } from "./package-config.js";
 import type { BackgroundTaskSnapshot } from "./types.js";
 
-// Hard cap on the JSON byte size of a `kendex-background-tasks:state` custom
-// entry appended to a Pi session JSONL file. Sessions are append-only, so
-// repeatedly writing full task lists with multi-KB heredoc commands
-// can make session history too large for `/resume`. Sidecar state remains
-// canonical at this size and is read
-// first on restore; oversized session payloads degrade to a tiny manifest.
-export const BG_TASKS_SNAPSHOT_MAX_BYTES = 64 * 1024;
+/** Sidecar format version. Version 1 files (full payload, no session id) still load. */
+export const BG_TASK_STORE_VERSION = 2;
 
-export interface BgTasksBoundedManifest {
-	version: 2;
-	fullSnapshot: false;
-	reason: "payload-too-large";
-	byteSize: number;
-	fingerprint: string;
-	counts: { tasks: number };
-	updatedAt: number;
+/** Longest command prefix a transition entry carries, on a task's first appearance only. */
+const TRANSITION_COMMAND_MAX_CHARS = 80;
+
+/**
+ * One lifecycle transition as it lands in the session. Only the fields that mark
+ * a transition are present; `command` appears on `created` alone.
+ */
+export interface TaskTransitionEntry {
+	v: 1;
+	session: string;
+	at: number;
+	id: string;
+	transition: "created" | "changed" | "removed";
+	command?: string;
+	status?: BackgroundTaskSnapshot["status"];
+	exitCode?: number | null;
+	exitNotified?: boolean;
+	resultReady?: boolean;
+	resultResolution?: BackgroundTaskSnapshot["resultResolution"];
+	resultReminded?: boolean;
 }
 
-export function isBgTasksBoundedManifest(value: unknown): value is BgTasksBoundedManifest {
-	if (!value || typeof value !== "object") return false;
-	const candidate = value as Partial<BgTasksBoundedManifest>;
-	return candidate.version === 2 && candidate.fullSnapshot === false;
-}
-
-// This leaf module exposes the barrier semantics without loading the full
-// @earendil-works/pi-coding-agent dependency chain. It handles a single session-branch
-// custom entry of type BG_STATE_TYPE.
-//
-// When the entry is a bounded manifest (`fullSnapshot: false`, any
-// version), and a sidecar restore has already loaded the canonical
-// task set, re-apply the sidecar tasks. The manifest signals "sidecar
-// is authoritative as of this point"; without this, an older full
-// snapshot earlier in the branch can replace the sidecar-restored
-// state before the manifest is reached and regress canonical state.
-export interface ApplyCustomEntryArgs<T> {
+/**
+ * Applies one legacy `kendex-background-tasks:state` entry to a restore in
+ * progress. A full snapshot replaces what came before it; a bounded manifest
+ * carried no tasks and changes nothing. Used only for a session with no sidecar.
+ */
+export interface ApplyLegacyEntryArgs<T> {
 	data: unknown;
-	sidecarLoaded: boolean;
-	sidecarTasks: T[] | undefined;
 	clear: () => void;
 	apply: (snapshot: T) => void;
 }
 
-export function applyCustomEntryWithBarrier<T>(args: ApplyCustomEntryArgs<T>): void {
+export function applyLegacySnapshotEntry<T>(args: ApplyLegacyEntryArgs<T>): void {
 	const data = args.data as { tasks?: unknown; fullSnapshot?: unknown } | undefined;
-	if (data?.fullSnapshot === false) {
-		if (args.sidecarLoaded && args.sidecarTasks) {
-			args.clear();
-			for (const snapshot of args.sidecarTasks) args.apply(snapshot);
-		}
-		return;
-	}
+	if (data?.fullSnapshot === false) return;
 	args.clear();
 	if (Array.isArray(data?.tasks)) for (const snapshot of data.tasks) args.apply(snapshot as T);
 }
@@ -99,26 +87,26 @@ export function stableSnapshotFingerprint(value: unknown): string {
 }
 
 export interface PersistResult {
-	appendEntry: boolean;
+	/** Transition entries appended to the session by this persist. */
+	transitions: number;
+	/** Whether the sidecar now holds the current state. */
 	sidecar: boolean;
-	/** Why the session-entry write resolved the way it did. */
-	appendReason?: "appended" | "unchanged" | "manifest" | "manifest-oversize-skipped" | "no-active-context" | "error";
 }
 
 export interface PersistencePayload {
 	version: number;
+	sessionId?: string;
 	tasks: BackgroundTaskSnapshot[];
 	updatedAt: number;
 }
 
 export interface PersistenceDeps {
 	pi: ExtensionAPI;
-	customType: string;
+	/** Session entry type the transition entries are appended under. */
+	transitionType: string;
 	getActiveCtx: () => ExtensionContext | null;
 	listSnapshots: () => BackgroundTaskSnapshot[];
 	notify?: (where: string, message: string) => void;
-	/** Override the per-entry byte cap (testing). Defaults to BG_TASKS_SNAPSHOT_MAX_BYTES. */
-	maxEntryBytes?: number;
 }
 
 export function safeFileName(value: string): string {
@@ -170,106 +158,99 @@ export function reportPersistFailure(
 	notify?.(where, msg);
 }
 
-// Persist the latest snapshot set on both channels independently:
-//   1. pi.appendEntry — the in-session JSONL custom entry the agent
-//      will see on next restore via getBranch().
-//   2. Sidecar — out-of-session state.json the extension reads first
-//      on session_start so the agent doesn't have to walk the entire
-//      session log.
-//
-// Each channel's success is reported independently; one failure does
-// not suppress the other. A partial write still leaves at least one
-// durable copy of the latest state.
+const transitionKey = (task: BackgroundTaskSnapshot): string =>
+	JSON.stringify([task.status, task.exitCode ?? null, task.exitNotified === true, task.resultReady === true, task.resultResolution ?? null, task.resultReminded === true]);
+
+function transitionFacts(task: BackgroundTaskSnapshot): Omit<TaskTransitionEntry, "v" | "session" | "at" | "id" | "transition" | "command"> {
+	return {
+		status: task.status,
+		exitCode: task.exitCode ?? null,
+		exitNotified: task.exitNotified === true,
+		resultReady: task.resultReady === true,
+		...(task.resultResolution !== undefined ? { resultResolution: task.resultResolution } : {}),
+		resultReminded: task.resultReminded === true,
+	};
+}
+
+// Persist the current task set.
+//   1. The sidecar is written in full, atomically. It is the only recoverable
+//      copy; a failure is reported and leaves the previous file intact.
+//   2. The session gets one small entry per task whose lifecycle changed since
+//      the last persist, and one per task that disappeared. Output growth changes
+//      neither, so a chatty task adds nothing to the session.
+// The two are independent: a failed sidecar write does not suppress the entries,
+// which describe what happened rather than what can be recovered.
 export function createPersistence(deps: PersistenceDeps): {
 	persistSnapshots: () => PersistResult;
-	payloadFor: (tasks: BackgroundTaskSnapshot[]) => PersistencePayload;
+	/** Records the restored tasks as already seen, so a resume appends no transitions for them. */
+	seed: (tasks: BackgroundTaskSnapshot[]) => void;
+	payloadFor: (tasks: BackgroundTaskSnapshot[], sessionId?: string) => PersistencePayload;
 } {
 	const notify = deps.notify;
-	const maxBytes = deps.maxEntryBytes ?? BG_TASKS_SNAPSHOT_MAX_BYTES;
-	// Last fingerprint observed per Pi session id. Identical successive task
-	// lists do not re-append to JSONL; a session that mostly stays steady
-	// emits one entry per change instead of one per lifecycle event.
-	const lastFingerprintBySession = new Map<string, string>();
+	// Last lifecycle tuple appended per task id; absence means the session has not seen the task.
+	const lastSeen = new Map<string, string>();
 
-	function payloadFor(tasks: BackgroundTaskSnapshot[]): PersistencePayload {
-		return { version: 1, tasks, updatedAt: Date.now() };
+	function payloadFor(tasks: BackgroundTaskSnapshot[], sessionId?: string): PersistencePayload {
+		return { version: BG_TASK_STORE_VERSION, ...(sessionId !== undefined ? { sessionId } : {}), tasks, updatedAt: Date.now() };
+	}
+
+	function seed(tasks: BackgroundTaskSnapshot[]): void {
+		lastSeen.clear();
+		for (const task of tasks) lastSeen.set(task.id, transitionKey(task));
 	}
 
 	function persistSnapshots(): PersistResult {
-		const payload = payloadFor(deps.listSnapshots());
-		// Serialized once, compact: it sizes the session entry and is the sidecar body.
-		const serialized = JSON.stringify(payload);
 		const ctx = deps.getActiveCtx();
-		let appendEntryOk = false;
-		let appendReason: PersistResult["appendReason"] = ctx ? undefined : "no-active-context";
-		let sidecarOk = ctx == null;
+		if (!ctx) return { transitions: 0, sidecar: false };
+		const tasks = deps.listSnapshots();
+		const session = sessionIdForContext(ctx);
+		let sidecarOk = false;
+		try {
+			writeSidecarAtomic(sidecarStatePath(ctx), `${JSON.stringify(payloadFor(tasks, session))}\n`);
+			sidecarOk = true;
+		} catch (error) {
+			reportPersistFailure("sidecar", error, notify);
+		}
 
-		if (ctx) {
-			const sessionKey = sessionIdForContext(ctx);
-			// Fingerprint excludes updatedAt because only structural changes warrant another session entry.
-			const fingerprint = stableSnapshotFingerprint({ tasks: payload.tasks });
-			if (lastFingerprintBySession.get(sessionKey) === fingerprint) {
-				appendEntryOk = true;
-				appendReason = "unchanged";
-			} else {
-				const byteSize = Buffer.byteLength(serialized, "utf8");
-				try {
-					if (byteSize <= maxBytes) {
-						deps.pi.appendEntry(deps.customType, payload);
-						appendReason = "appended";
-						lastFingerprintBySession.set(sessionKey, fingerprint);
-						appendEntryOk = true;
-					} else {
-						const manifest: BgTasksBoundedManifest = {
-							version: 2,
-							fullSnapshot: false,
-							reason: "payload-too-large",
-							byteSize,
-							fingerprint,
-							counts: { tasks: payload.tasks.length },
-							updatedAt: payload.updatedAt,
-						};
-						// The manifest must stay under the cap.
-						const manifestBytes = Buffer.byteLength(JSON.stringify(manifest), "utf8");
-						if (manifestBytes > maxBytes) {
-							appendReason = "manifest-oversize-skipped";
-							reportPersistFailure("appendEntry", new Error(`bounded manifest ${manifestBytes}B exceeds cap ${maxBytes}B; sidecar remains canonical`), notify);
-						} else {
-							deps.pi.appendEntry(deps.customType, manifest);
-							appendReason = "manifest";
-							lastFingerprintBySession.set(sessionKey, fingerprint);
-							appendEntryOk = true;
-						}
-					}
-				} catch (error) {
-					appendReason = "error";
-					reportPersistFailure("appendEntry", error, notify);
-				}
-			}
-		} else {
-			// No active context — fall back to the unconditional append so a one-shot/
-			// no-context call still records something. Bounded restore is irrelevant
-			// without a session.
+		const at = Date.now();
+		const entries: { id: string; key: string | null; entry: TaskTransitionEntry }[] = [];
+		const present = new Set<string>();
+		for (const task of tasks) {
+			present.add(task.id);
+			const key = transitionKey(task);
+			const before = lastSeen.get(task.id);
+			if (before === key) continue;
+			entries.push({
+				id: task.id,
+				key,
+				entry: {
+					v: 1,
+					session,
+					at,
+					id: task.id,
+					transition: before === undefined ? "created" : "changed",
+					...(before === undefined ? { command: task.command.slice(0, TRANSITION_COMMAND_MAX_CHARS) } : {}),
+					...transitionFacts(task),
+				},
+			});
+		}
+		for (const id of lastSeen.keys()) {
+			if (!present.has(id)) entries.push({ id, key: null, entry: { v: 1, session, at, id, transition: "removed" } });
+		}
+		let appended = 0;
+		for (const { id, key, entry } of entries) {
 			try {
-				deps.pi.appendEntry(deps.customType, payload);
-				appendEntryOk = true;
+				deps.pi.appendEntry(deps.transitionType, entry);
+				if (key === null) lastSeen.delete(id);
+				else lastSeen.set(id, key);
+				appended += 1;
 			} catch (error) {
-				appendReason = "error";
 				reportPersistFailure("appendEntry", error, notify);
+				break;
 			}
 		}
-
-		if (ctx) {
-			try {
-				writeSidecarAtomic(sidecarStatePath(ctx), `${serialized}\n`);
-				sidecarOk = true;
-			} catch (error) {
-				reportPersistFailure("sidecar", error, notify);
-			}
-		}
-
-		return { appendEntry: appendEntryOk, sidecar: sidecarOk, appendReason };
+		return { transitions: appended, sidecar: sidecarOk };
 	}
 
-	return { persistSnapshots, payloadFor };
+	return { persistSnapshots, seed, payloadFor };
 }

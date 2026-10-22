@@ -1,7 +1,8 @@
 import { mock } from "bun:test";
 import { createEventBus, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { sidecarStatePath } from "../../extensions/persistence.js";
 import { DEFAULT_SOFT_TIMEOUT_MS } from "../../extensions/constants.js";
 import { interceptNativeEffects, fixtureNow, fixturePid } from "./spawn-native.js";
 
@@ -59,11 +60,13 @@ async function execute(params: Record<string, unknown>) {
 // the snapshot it persisted for the next session to restore. `appendEntry`
 // records { type, customType, data }, and the snapshot set is `data.tasks`.
 function persistedTask(): Record<string, unknown> | undefined {
-	for (const entry of [...entries].reverse() as Array<{ data?: { tasks?: Record<string, unknown>[] } }>) {
-		const task = entry?.data?.tasks?.find((candidate) => candidate.id === "bg-1");
-		if (task) return task;
-	}
-	return undefined;
+	// The sidecar is the record of a task; the session carries only transitions.
+	try {
+		const file = sidecarStatePath(ctx);
+		if (!existsSync(file)) return undefined;
+		const data = JSON.parse(readFileSync(file, "utf8")) as { tasks?: Record<string, unknown>[] };
+		return data.tasks?.find((candidate) => candidate.id === "bg-1");
+	} catch { return undefined; }
 }
 async function peek(id: string) {
 	const tasks = (await execute({ action: "list" })).details.tasks;

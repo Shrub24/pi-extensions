@@ -279,7 +279,7 @@ function ackReplayHooks() {
 		clearTaskTimers: () => {},
 		persistSnapshots: () => {
 			persistCalls.push("batch");
-			return { appendEntry: true, sidecar: true };
+			return { transitions: 0, sidecar: true };
 		},
 		refreshUi: () => {},
 		rememberSnapshot: (task) => {

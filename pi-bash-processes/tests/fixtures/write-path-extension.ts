@@ -1,7 +1,8 @@
 import { mock } from "bun:test";
 import { createEventBus, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { sidecarStatePath } from "../../extensions/persistence.js";
 import { fixturePid, interceptNativeEffects } from "./spawn-native.js";
 
 // Drives the registered extension through its write-heavy and probe paths:
@@ -104,8 +105,14 @@ const timerSets = () => { const counts: Record<string, number> = {};
 	return counts;
 };
 const logBytes = (file: string) => existsSync(file) ? readFileSync(file, "utf8").length : 0;
-const persistedTask = (id: string) => { const payload = (entries.at(-1) as [string, { tasks: Record<string, unknown>[] }] | undefined)?.[1];
-	return payload?.tasks.find((task) => task.id === id) ?? null;
+// Each sidecar write is a rename onto a fresh inode, so a changed inode is a write.
+const sidecarInode = () => { try { return statSync(sidecarStatePath(ctx)).ino; } catch { return null; } };
+const persistedTask = (id: string) => { try {
+	const file = sidecarStatePath(ctx);
+	if (!existsSync(file)) return null;
+	const payload = JSON.parse(readFileSync(file, "utf8")) as { tasks: Record<string, unknown>[] };
+	return payload.tasks.find((task) => task.id === id) ?? null;
+} catch { return null; }
 };
 const persistedProcIdent = (id: string) => persistedTask(id)?.procIdent ?? null;
 const persistedOutcome = (id: string) => { const task = persistedTask(id);
@@ -120,14 +127,14 @@ try { const { default: backgroundTasks } = await import("../../extensions/backgr
 		const logFile = spawned.details.task!.logFile as string;
 		await settle();
 		const child = native.children[0]!;
-		const entriesBefore = entries.length;
+		const inodeBefore = sidecarInode();
 		const chunk = "fixture output line\n";
 		for (let index = 0; index < (input.chunks ?? 0); index++) { child.stdout.write(chunk);
 			await settle(); }
-		const duringChunks = { entries: entries.length - entriesBefore, logBytes: logBytes(logFile), timerSets: timerSets() };
+		const duringChunks = { stateWrites: sidecarInode() === inodeBefore ? 0 : 1, logBytes: logBytes(logFile), timerSets: timerSets() };
 		const fireIfArmed = (ms: number) => { if (native.activeTimers().some((timer) => timer.kind === "timeout" && timer.ms === ms)) native.fireTimeout(ms); };
 		fireIfArmed(1_000);
-		const afterPersistWindow = entries.length - entriesBefore;
+		const afterPersistWindow = sidecarInode() === inodeBefore ? 0 : 1;
 		fireIfArmed(250);
 		await taskLogs.drain();
 		result = { duringChunks, afterPersistWindow, procIdent: persistedProcIdent("bg-1"), logBytesAfterFlush: logBytes(logFile), chunkBytes: chunk.length };

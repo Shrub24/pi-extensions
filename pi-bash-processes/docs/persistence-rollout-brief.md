@@ -9,7 +9,7 @@ an alternative database.
 
 Scope: pi-bash-processes, with coordinated path readers in pi-output-policy if
 storage naming changes. Herdsman/Radar ownership and timer changes are separate.
-This is an implementation brief, not a claim that the rollout has landed.
+**Status (2026-10-22): the minimal slice below has landed** (writer, sidecar-first restore, corrupt-file handling, tests). The owner-path rename, sidecar write volume and `kendex` entry names remain deferred.
 
 ## Existing behaviour and starting seam
 
@@ -218,3 +218,10 @@ Estimated effect (reasoning, not a measurement): the session cost of a task fall
 from one roster-sized snapshot per structural change to a few entries of roughly
 a hundred bytes per lifecycle transition. Measure with the fixed chatty-task
 fixture before claiming a figure.
+
+## As landed
+
+- Writer (`persistence.ts`): the sidecar is written atomically with `version: 2` and the owning `sessionId`; the session receives one `pi-bash-processes:task-transition` entry per task whose `(status, exitCode, exitNotified, resultReady, resultResolution, resultReminded)` changed, plus `removed` entries. `command` (80 chars) rides on `created` only. Output counters, timestamps and wake history are not in session entries. A resume `seed`s the restored tasks so it appends nothing for them.
+- Restore: a loadable sidecar is the only input; the branch (old snapshot entries and `bg_task`/`bash` tool-result rosters) is not read. No sidecar means a legacy session: replay the branch once, then the end-of-restore persist writes the sidecar. An unreadable sidecar is renamed to `state.json.corrupt-<ms>`, reported through `ui.notify`, and rebuilt from the legacy branch, never treated as empty.
+- Removed: the full-snapshot and overflow-manifest writers, the fingerprint dedupe, the barrier helpers, and `bgToolResultTasks`' restore barrier. `BG_STATE_TYPE` stays as a legacy read name.
+- Not changed: the sidecar is still rewritten on output-driven persists (coalesced), still at `kendex/sessions/<id>/pi-background-tasks/state.json`. Existing session files keep their old snapshots.

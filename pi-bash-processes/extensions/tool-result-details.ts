@@ -55,19 +55,15 @@ export function bgToolResultTasks(
 
 export interface ApplyBgToolResultTasksArgs<T> {
 	apply: (snapshot: T) => void;
-	clear: () => void;
 	detailsTasks: unknown;
-	sidecarLoaded: boolean;
-	sidecarTasks: T[] | undefined;
 }
 
-export function applyBgToolResultTasksWithBarrier<T>(args: ApplyBgToolResultTasksArgs<T>): void {
-	if (isBgToolResultBoundedTasks(args.detailsTasks)) {
-		if (args.sidecarLoaded && args.sidecarTasks) {
-			args.clear();
-			for (const snapshot of args.sidecarTasks) args.apply(snapshot);
-		}
-		return;
-	}
+/**
+ * Applies the task list a `bg_task list` result carried, for a session with no
+ * sidecar. A bounded manifest names ids only and holds no snapshots, so it
+ * changes nothing.
+ */
+export function applyBgToolResultTasks<T>(args: ApplyBgToolResultTasksArgs<T>): void {
+	if (isBgToolResultBoundedTasks(args.detailsTasks)) return;
 	if (Array.isArray(args.detailsTasks)) for (const snapshot of args.detailsTasks) args.apply(snapshot as T);
 }

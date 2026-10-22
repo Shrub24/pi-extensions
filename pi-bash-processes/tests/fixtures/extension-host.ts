@@ -70,6 +70,10 @@ export interface ExtensionHost { /** Temp root holding the agent dir, home, task
 	userMessages: unknown[][];
 	/** Every `pi.appendEntry` call: the extension's persisted state. */
 	entries: unknown[];
+	/** The session branch `restore` reads; tests seed legacy entries here. Appended entries land in it too. */
+	branch: unknown[];
+	/** Every `ctx.ui.notify` call. */
+	notifications: unknown[][];
 	/** The shared `pi.events` bus the extension registers its settlement provider on. */
 	events: EventBus;
 	/** Every `pi.exec` call the extension made — the Herdr pane writes, for tests. */
@@ -266,6 +270,8 @@ export async function startExtensionHost(options: ExtensionHostOptions = {}): Pr
 		messages,
 		userMessages,
 		entries,
+		branch: entriesForBranch,
+		notifications,
 		events,
 		execCalls,
 		settle: () => dispatch("agent_settled"),
