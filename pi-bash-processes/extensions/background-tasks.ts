@@ -2495,8 +2495,18 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			}
 			return;
 		}
-		// Grouped wake: several mid-turn completions become one message.
-		const summaries = finished.map((task) => `${wakeTaskLine(task)} · ${compactText(task.command, 60)}`);
+		// Grouped wake: several mid-turn completions become one message. Each task
+		// carries its own bounded tail, because this message is the whole result
+		// delivery for a batched completion: a roster of ids and exit codes would
+		// leave the model with nothing to read.
+		const tailMax = settingNumber("outputAlertMaxChars", DEFAULT_OUTPUT_ALERT_MAX_CHARS, activeCtx?.cwd);
+		const summaries = finished.map((task) => {
+			const tail = tailText(getTaskOutput(task), tailMax).trimEnd();
+			const block = tail
+				? `\n  Output:\n${tail.split("\n").map((line) => `  ${line}`).join("\n")}`
+				: "";
+			return `${wakeTaskLine(task)} · ${compactText(task.command, 60)}${block}`;
+		});
 		const content = [
 			`${finished.length} background tasks finished.`,
 			...summaries.map((line) => `• ${line}`),

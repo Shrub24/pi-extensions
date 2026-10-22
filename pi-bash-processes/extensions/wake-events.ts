@@ -634,6 +634,12 @@ export function sendTaskWake(
 			? `Background task ${task.id} was cancelled by the user; no result is coming.`
 			: `Background task ${task.id} finished.`
 		: `Background task ${task.id} emitted new output.`;
+	// The completion wake is how a finished task's result reaches the model, so it
+	// carries the bounded tail itself. `get` reads more; it is not the only way to
+	// see anything. A cancelled task has no result to show.
+	const outputBlock = eventType === "exit" && !cancelled && tail.length > 0
+		? `\nOutput:\n${tail}`
+		: "";
 	const exitGuidance = eventType !== "exit"
 		? ""
 		: cancelled
@@ -645,7 +651,7 @@ export function sendTaskWake(
 	deliverWakeMessage(
 		deps,
 		{
-			content: `${headline}\nCommand: ${commandPreview}${exitGuidance}${inventory ? `\n${inventory}` : ""}`,
+			content: `${headline}\nCommand: ${commandPreview}${outputBlock}${exitGuidance}${inventory ? `\n${inventory}` : ""}`,
 			customType: deps.messageType,
 			details,
 			display: true,

@@ -75,7 +75,8 @@ wake history, counters or full output. Do not append a manifest on every output
 change as a substitute for removing snapshots.
 
 Explicit tool responses and completion wakes still deliver useful bounded
-results. Audit their task details so they do not recreate the snapshot stream.
+results: the single and the grouped exit wake both carry each finished task's
+bounded output tail (`2026-10-22`, both were id-only before). Audit their task details so they do not recreate the snapshot stream.
 New lifecycle entries and tool-result details are not alternate restore stores.
 
 ### 3. Restore and migration

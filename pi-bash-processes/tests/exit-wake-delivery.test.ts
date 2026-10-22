@@ -87,5 +87,12 @@ test("the idle window holds an exit only while a sibling is still running", asyn
 	const delivered = exitCalls().slice(before);
 	expect(delivered, "the last exit releases the group as one message").toHaveLength(1);
 	for (const id of [quick, slow]) expect(JSON.stringify(delivered[0])).toContain(id);
+	// A batched completion still carries each task's bounded tail: the message is
+	// the whole result delivery, so ids and exit codes alone would leave the model
+	// nothing to read.
+	const text = JSON.stringify(delivered[0]);
+	expect(text).toContain("Output:");
+	expect(text).toContain("quick");
+	expect(text).toContain("slow");
 	for (const id of [quick, slow]) await bgTask().execute("c", { action: "get", id });
 });
