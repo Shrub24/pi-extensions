@@ -15,7 +15,8 @@
 
 /** Shared contract for the coupled managed-bash and bg_task tools. */
 export const BASH_TASK_GUIDELINES = [
-	"Do not trim managed bash output with `| tail`, `| head` or `2>/dev/null`: it hides failures and forces re-runs. Managed shells use pipefail.",
+	"Do not trim managed bash output with `| tail`, `| head` or `2>/dev/null`: it hides failures and forces re-runs. Inside a background task the discarded lines never reach the captured result either, so `get output:\"full\"` cannot return them. Managed shells use pipefail.",
+	"Do not sleep to wait: `sleep N; check` and `while ...; do sleep N; done` are polling with extra steps, and a long sleep only builds a timer the task system already runs. End the turn and let the wake arrive, and set `softTimeoutMs` to how often a long task should check in.",
 	"A `Running` result is not complete output. Do not poll or repeatedly inspect a running task; use its soft reminders and completion wake to decide what to do next.",
 	"Read a finished background task's result with `bg_task action:\"get\" output:\"full\"`; do not read its log file directly. For a confirmed stop, `output:\"full\"` returns the final result in the same call.",
 ] as const;

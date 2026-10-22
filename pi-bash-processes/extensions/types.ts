@@ -143,6 +143,14 @@ export interface BackgroundTaskSnapshot {
 	notifyPattern?: string;
 	notifyMode?: NotifyMode;
 	dedupeKey?: string;
+	/**
+	 * Whether this task's result is meant to be consumed. Absent means yes: the
+	 * exit wake is that result's signal, and an unread one is reminded once at
+	 * idle. `false` marks informational work (a smoke test, a timing wait, a log
+	 * tail): its completion is still reported, but it starts no turn, asks for no
+	 * retrieval, and never holds an assignment open.
+	 */
+	needsResult?: boolean;
 	outputBytes: number;
 	wakeSequence?: number;
 	wakeEvents?: WakeEventRecord[];
@@ -358,6 +366,8 @@ export interface SpawnTaskOptions {
 	foregroundYieldMs?: number;
 	notifyOnExit?: boolean;
 	notifyOnOutput?: boolean;
+	/** Whether the result is meant to be consumed. Defaults to true; see BackgroundTaskSnapshot.needsResult. */
+	needsResult?: boolean;
 	notifyPattern?: string;
 	notifyMode?: NotifyMode;
 	dedupeKey?: string;

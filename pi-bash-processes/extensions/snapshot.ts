@@ -18,6 +18,7 @@ export function taskSnapshot(task: ManagedTask): BackgroundTaskSnapshot {
 		id: task.id,
 		lastOutputAt: task.lastOutputAt,
 		logFile: task.logFile,
+		needsResult: task.needsResult === false ? false : undefined,
 		notifyOnExit: task.notifyOnExit,
 		notifyOnOutput: task.notifyOnOutput,
 		notifyPattern: task.notifyPattern,
@@ -401,6 +402,7 @@ export async function restoredTaskFromSnapshot(snapshot: BackgroundTaskSnapshot,
 		// parent's branch). This session can never retrieve its result, so nothing
 		// here waits on it: a terminal one is closed as `delivered` instead of
 		// being advertised as awaiting review for the life of the fork.
+		needsResult: snapshot.needsResult === false ? false : undefined,
 		resultReminded: snapshot.resultReminded === true ? true : undefined,
 		resultResolution: snapshot.resultResolution === "delivered" || snapshot.resultResolution === "error" || snapshot.resultResolution === "dismissed"
 			? snapshot.resultResolution

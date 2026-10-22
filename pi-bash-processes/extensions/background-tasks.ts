@@ -348,6 +348,10 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		const classification: SettlementClassification = { outstanding: [], unassociated: [], unattributable: [] };
 		for (const task of tasks.values()) {
 			if (resultIsResolved(task)) continue;
+			// An informational task owes its result to nobody: a terminal one is not
+			// outstanding work and never holds an assignment open. A running one is
+			// still in flight, and is classified below.
+			if (task.needsResult === false && task.status !== "running") continue;
 			if (task.assignmentRequestId === undefined) {
 				classification.unassociated.push(task.id);
 				continue;
@@ -2510,12 +2514,14 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			return;
 		}
 		// Grouped wake: several mid-turn completions become one message. Each task
-		// carries its own bounded tail, because this message is the whole result
-		// delivery for a batched completion: a roster of ids and exit codes would
-		// leave the model with nothing to read.
+		// that owes a result carries its own bounded tail, because this message is
+		// the whole result delivery for a batched completion: a roster of ids and
+		// exit codes would leave the model with nothing to read. A task spawned with
+		// needsResult:false owes nothing, so it stays a single line.
+		const resultOwed = finished.some((task) => task.needsResult !== false);
 		const tailMax = settingNumber("outputAlertMaxChars", DEFAULT_OUTPUT_ALERT_MAX_CHARS, activeCtx?.cwd);
 		const summaries = finished.map((task) => {
-			const tail = tailText(getTaskOutput(task), tailMax).trimEnd();
+			const tail = task.needsResult === false ? "" : tailText(getTaskOutput(task), tailMax).trimEnd();
 			const block = tail
 				? `\n  Output:\n${tail.split("\n").map((line) => `  ${line}`).join("\n")}`
 				: "";
@@ -2524,13 +2530,13 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		const content = [
 			`${finished.length} background tasks finished.`,
 			...summaries.map((line) => `• ${line}`),
-			retrievalHint(),
+			...(resultOwed ? [retrievalHint()] : []),
 			runningInventory(),
 		].join("\n");
 		deliverWakeMessage(
 			wakeSend,
 			{ customType: BG_MESSAGE_TYPE, content, display: true, details: { grouped: true, tasks: finished.map((t) => compactBackgroundTaskSnapshot(t)) } },
-			{ deliverAs: "steer", triggerTurn: true },
+			{ deliverAs: "steer", triggerTurn: resultOwed },
 		);
 		// One message named every task in the batch, so every obligation it
 		// fulfilled is recorded. An idle-batched completion never carried this
@@ -2704,6 +2710,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			logFile,
 			matcher: parseOutputMatcher(options.notifyPattern),
 			notifyOnExit: options.notifyOnExit ?? true,
+			needsResult: options.needsResult === false ? false : undefined,
 			notifyOnOutput: options.notifyOnOutput ?? false,
 			notifyPattern: options.notifyPattern?.trim() || undefined,
 			notifyMode: resolveNotifyMode(options.notifyMode, options.notifyPattern),
@@ -2973,6 +2980,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		flushExitBatch();
 		announceRunningTasks();
 		const unread = [...tasks.values()].filter((task) =>
+			task.needsResult !== false &&
 			task.exitNotified && task.resultReminded !== true && task.supersededBy === undefined && !exitWakeBatch.has(task.id) &&
 			!resultIsResolved(task) && taskReadiness(task) !== "running" && taskReadiness(task) !== "finalizing" &&
 			(idleSeenWithResult.has(task.id) || !idleSeenWithResult.add(task.id)));

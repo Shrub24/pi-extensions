@@ -66,7 +66,8 @@ function bgTaskGuidelines(): string[] {
 	return [
 		...BASH_TASK_GUIDELINES,
 		"Use bg_task list/get/stop/extend to inspect, re-arm, or terminate tasks started by bg_task or /bg. get is the task's result, including its readiness and outcome.",
-		"A soft reminder is a check-in, not a result: completion always wakes you, so softTimeoutMs only sets how often you are reminded. For a build, test run, or watcher, set softTimeoutMs at spawn to about its expected duration (or 0 to disable reminders); re-arm later with bg_task action:\"extend\" id:... softTimeoutMs:....",
+	"A soft reminder is a check-in, not a result: completion always wakes you, so softTimeoutMs only sets how often you are reminded. For a build, test run, or watcher, set softTimeoutMs at spawn to about its expected duration (or 0 to disable reminders); re-arm later with bg_task action:\"extend\" id:... softTimeoutMs:....",
+	"Set needsResult:false at spawn for work whose result you will not read (a smoke test, a timing wait, a log tail): its completion is still reported, but it starts no turn, asks for no retrieval, and never holds an assignment open.",
 		"After a task starts, continue independent work; when there is nothing left to do, end the turn and let its wake arrive. A soft reminder is the decision point if it takes longer than expected.",
 		"Use bg_task for pi-bridge, session, tmux, agent/delegate, or log monitoring instead of raw foreground bash polling loops.",
 		"If a bash monitor is auto-backgrounded, continue the turn and inspect it later with bg_task get/list/stop rather than waiting on foreground bash.",
@@ -87,6 +88,9 @@ const bgTaskSchema = () => Type.Object({
 	cwd: Type.Optional(Type.String({ description: "Working directory for action=spawn" })),
 	id: Type.Optional(Type.String({ description: "Task id for action=get, action=stop, or action=extend." })),
 	notifyOnExit: Type.Optional(Type.Boolean({ description: "Wake the agent when the task exits. Defaults to true." })),
+	needsResult: Type.Optional(Type.Boolean({
+		description: "Whether the task's result is meant to be consumed. Defaults to true. Set false for informational work (a smoke test, a timing wait, a log tail): completion is still reported, but the wake starts no turn, asks for no retrieval, and the task never holds an assignment open.",
+	})),
 	notifyOnOutput: Type.Optional(Type.Boolean({ description: "Wake the agent when new output arrives. Defaults to false." })),
 	notifyPattern: Type.Optional(Type.String({ description: "Substring or /regex/flags gate for output wakeups." })),
 	notifyMode: Type.Optional(StringEnum(NOTIFY_MODES, {
@@ -136,6 +140,7 @@ export function registerBgTaskTool(pi: ExtensionAPI, deps: RegistrationDeps): vo
 					command: params.command ?? "",
 					cwd: params.cwd,
 					notifyOnExit: params.notifyOnExit,
+					needsResult: params.needsResult,
 					notifyOnOutput: params.notifyOnOutput,
 					notifyPattern: params.notifyPattern,
 					notifyMode: params.notifyMode,

@@ -498,6 +498,7 @@ export function compactBackgroundTaskSnapshot(snapshot: BackgroundTaskSnapshot):
 		id: snapshot.id,
 		lastOutputAt: snapshot.lastOutputAt,
 		logFile: truncateField(snapshot.logFile, WAKE_MANIFEST_FIELD_MAX_CHARS) ?? "",
+		needsResult: snapshot.needsResult === false ? false : undefined,
 		notifyMode: snapshot.notifyMode,
 		notifyOnExit: snapshot.notifyOnExit,
 		notifyOnOutput: snapshot.notifyOnOutput,
@@ -629,6 +630,9 @@ export function sendTaskWake(
 		taskStatusAtEmit: task.status,
 	};
 	const cancelled = eventType === "exit" && task.terminationReason === "cancelled-by-user";
+	// Informational work owes no result: its completion is still reported, but
+	// the wake neither asks for retrieval nor starts a turn.
+	const resultOwed = task.needsResult !== false;
 	const headline = eventType === "exit"
 		? cancelled
 			? `Background task ${task.id} was cancelled by the user; no result is coming.`
@@ -636,15 +640,16 @@ export function sendTaskWake(
 		: `Background task ${task.id} emitted new output.`;
 	// The completion wake is how a finished task's result reaches the model, so it
 	// carries the bounded tail itself. `get` reads more; it is not the only way to
-	// see anything. A cancelled task has no result to show.
-	const outputBlock = eventType === "exit" && !cancelled && tail.length > 0
+	// see anything. A cancelled task has no result to show, and an informational
+	// task's tail is not owed to anyone.
+	const outputBlock = eventType === "exit" && !cancelled && resultOwed && tail.length > 0
 		? `\nOutput:\n${tail}`
 		: "";
 	const exitGuidance = eventType !== "exit"
 		? ""
 		: cancelled
 			? "\nNo result will arrive; rerun the work if it is still needed."
-			: `\n${wakeTaskLine(task)}${task.resultResolution === undefined ? `\n${retrievalHint(task.id)}` : ""}`;
+			: `\n${wakeTaskLine(task)}${resultOwed && task.resultResolution === undefined ? `\n${retrievalHint(task.id)}` : ""}`;
 	const inventory = deps.runningInventory?.();
 	const commandPreview = truncateField(task.command, WAKE_CONTENT_COMMAND_MAX_CHARS) ?? "";
 
@@ -656,7 +661,7 @@ export function sendTaskWake(
 			details,
 			display: true,
 		},
-		{ deliverAs: "steer", triggerTurn: true },
+		{ deliverAs: "steer", triggerTurn: eventType === "exit" ? resultOwed : true },
 	);
 	return true;
 }
