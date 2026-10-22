@@ -30,7 +30,7 @@ A Pi extension for shell commands that run while the conversation continues. It 
 
 - In this repo: a Bun workspace package, installed by name (`pi-bash-processes`). The Nix plugins build is what deployed configurations use.
 
-Restart Pi after installation. Use `kendex update-pi --check` to preview the installation.
+Restart Pi after installation.
 
 ## Features
 

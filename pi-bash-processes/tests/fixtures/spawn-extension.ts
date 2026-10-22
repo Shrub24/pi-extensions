@@ -205,7 +205,7 @@ try {
 		await Promise.resolve();
 		await dispatch("agent_end");
 		await dispatch("agent_settled");
-		const wakes = messages.filter(([m]: any[]) => m?.customType === "kendex-background-tasks:event" && (m?.details?.grouped === true || m?.details?.eventType === "exit") && m?.details?.eventType !== "result-review");
+		const wakes = messages.filter(([m]: any[]) => m?.customType === "pi-bash-processes:event" && (m?.details?.grouped === true || m?.details?.eventType === "exit") && m?.details?.eventType !== "result-review");
 		const wakeTexts = wakes.map(([m]: any[]) => String(m?.content ?? "").slice(0, 1_200));
 		const listed = await execute({ action: "list" });
 		staggered = {

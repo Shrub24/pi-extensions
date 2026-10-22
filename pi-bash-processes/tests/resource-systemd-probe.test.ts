@@ -41,18 +41,18 @@ test.skipIf(process.platform !== "linux")("default systemd availability probe ex
 			if (row.probeRuns) expectedCalls.push({
 				command: "systemd-run",
 				args: [
-					"--user", "--wait", "--pipe", "--quiet", "--collect", `--unit=kendex-pi-bg-probe-${result.pid}-123456.service`,
+					"--user", "--wait", "--pipe", "--quiet", "--collect", `--unit=pi-bg-probe-${result.pid}-123456.service`,
 					`--working-directory=${root}`, "--property=CPUWeight=25", "--property=IOWeight=50", "--property=Nice=12",
 					"--property=IOSchedulingClass=best-effort", "--property=IOSchedulingPriority=6", "--", "/usr/bin/true",
 				],
 			});
 			// A reachable manager is not asked again; the unit query follows planning.
-			if (row.systemctlStatus === 0) expectedCalls.push({ command: "systemctl", args: ["--user", "is-active", "--quiet", "kendex-pi-bg-bg-7-123456.service"] });
+			if (row.systemctlStatus === 0) expectedCalls.push({ command: "systemctl", args: ["--user", "is-active", "--quiet", "pi-bg-bg-7-123456.service"] });
 			const expectedPlan = row.available ? {
 				file: "systemd-run", warnings: [],
-				metadata: { mode: "systemd-run", requestedMode: "systemd-run", unitName: "kendex-pi-bg-bg-7-123456.service" },
+				metadata: { mode: "systemd-run", requestedMode: "systemd-run", unitName: "pi-bg-bg-7-123456.service" },
 				args: [
-					"--user", "--quiet", "--wait", "--pipe", "--collect", "--unit=kendex-pi-bg-bg-7-123456.service",
+					"--user", "--quiet", "--wait", "--pipe", "--collect", "--unit=pi-bg-bg-7-123456.service",
 					"--working-directory=/tmp/work tree", "--property=CPUWeight=25", "--property=IOWeight=50", "--property=Nice=12",
 					"--property=IOSchedulingClass=best-effort", "--property=IOSchedulingPriority=6", "--", "/bin/bash", "-lc", command,
 				],

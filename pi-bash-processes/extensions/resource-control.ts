@@ -194,7 +194,7 @@ function userSystemdAvailable(commandProbe: (command: string) => boolean, platfo
 		// plans accepted availability checks but failed at spawn time on hosts
 		// where `--scope --wait` or scope-level Nice/IOScheduling properties are
 		// rejected by systemd-run.
-		const unitName = `kendex-pi-bg-probe-${process.pid}-${Date.now()}.service`;
+		const unitName = `pi-bg-probe-${process.pid}-${Date.now()}.service`;
 		const probe = spawnSync("systemd-run", [
 			"--user",
 			"--wait",
@@ -246,7 +246,7 @@ function ioniceClassNumber(value: ResourceControlIoniceClass): string {
 
 function makeSystemdUnitName(taskId: string, now: number): string {
 	const safe = `${taskId}-${now}`.replaceAll(/[^A-Za-z0-9_.:-]/g, "-").slice(0, 96) || "task";
-	return `kendex-pi-bg-${safe}.service`;
+	return `pi-bg-${safe}.service`;
 }
 
 function basePlan(input: ResourceControlSpawnInput): ResourceControlSpawnPlan {

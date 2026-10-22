@@ -53,7 +53,7 @@ const widgets = new Map<string, MiniDashboardComponent>();
 const removals: string[] = [];
 const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as unknown as Theme;
 const tui = { terminal: { rows: 40 }, requestRender() {} } as unknown as TUI;
-const stackKey = `kendex-mini-dashboard-stack-${placement === "aboveEditor" ? "above" : "below"}`;
+const stackKey = `pi-bash-processes-dashboard-${placement === "aboveEditor" ? "above" : "below"}`;
 const registry = () => (globalThis as unknown as Record<symbol, { entries: Map<string, unknown> }>)[Symbol.for("kendex.pi.mini-dashboard-stack")];
 let session = 0;
 function createSession(completed: boolean) { const id = `widget-${++session}`;

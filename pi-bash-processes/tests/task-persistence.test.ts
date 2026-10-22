@@ -29,7 +29,7 @@ function withPersistenceContext(run: (ctx: NonNullable<ReturnType<PersistenceDep
 				getSessionFile: () => join(root, "session.jsonl"),
 			},
 		} as NonNullable<ReturnType<PersistenceDeps["getActiveCtx"]>>;
-		run(ctx, join(piDir, "kendex", "sessions", "session", "pi-background-tasks", "state.json"));
+		run(ctx, join(piDir, "pi-bash-processes", "sessions", "session", "state.json"));
 	} finally {
 		if (previousPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = previousPiDir;

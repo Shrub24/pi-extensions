@@ -30,7 +30,7 @@ import type {
 	BackgroundTaskEventDetails,
 	BackgroundTaskSnapshot,
 	BackgroundTaskStatus,
-	kendexModalLock,
+	ModalLock,
 } from "./types.js";
 
 type TreeBranch = "├" | "└" | "│";
@@ -49,9 +49,9 @@ export function splitOutputLines(output: string): string[] {
 	return [`${glyphs().ellipsis} ${lines.length - maxLines} older line(s) omitted from dashboard; use bg_task get output:"full" for the complete capture`, ...lines.slice(-maxLines)];
 }
 
-export function acquirekendexModalLock(): () => void {
+export function acquireModalLock(): () => void {
 	const host = globalThis as unknown as Record<PropertyKey, unknown>;
-	const existing = host[KENDEX_MODAL_LOCK_SYMBOL] as kendexModalLock | undefined;
+	const existing = host[KENDEX_MODAL_LOCK_SYMBOL] as ModalLock | undefined;
 	const lock = existing && typeof existing.depth === "number" ? existing : { depth: 0 };
 	host[KENDEX_MODAL_LOCK_SYMBOL] = lock;
 	lock.depth += 1;

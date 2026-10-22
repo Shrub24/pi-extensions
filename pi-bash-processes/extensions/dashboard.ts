@@ -24,7 +24,7 @@ import {
 	taskElapsedMs,
 } from "./format.js";
 import {
-	acquirekendexModalLock,
+	acquireModalLock,
 	activePill,
 	bgStatusIcon,
 	bgStatusText,
@@ -65,7 +65,7 @@ export async function openDashboard(
 		...all.filter((task) => task.status === "running"),
 		...all.filter((task) => task.status !== "running"),
 	];
-	const releaseModalLock = acquirekendexModalLock();
+	const releaseModalLock = acquireModalLock();
 	try {
 		await ctx.ui.custom(
 			(tui, theme, _keybindings, done) => {

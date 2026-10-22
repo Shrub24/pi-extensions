@@ -46,7 +46,7 @@ describe("background-task sidecar root", () => {
 			expect.assertions(rows.length + 1);
 			expect(rows.length, "sidecar root table must contain cases").toBeGreaterThan(0);
 			for (const { name, override, expected } of rows) {
-				expect(sidecarPath(home, override), name).toBe(join(expected, "kendex", "sessions", SESSION_ID, "pi-background-tasks", "state.json"));
+				expect(sidecarPath(home, override), name).toBe(join(expected, "pi-bash-processes", "sessions", SESSION_ID, "state.json"));
 			}
 		} finally {
 			for (const dir of [home, absolute]) rmSync(dir, { recursive: true, force: true });

@@ -2,8 +2,8 @@ import { afterAll, beforeEach, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
-import { BG_STATE_TYPE } from "../extensions/constants.js";
-import { sidecarStatePath } from "../extensions/persistence.js";
+import { LEGACY_BG_STATE_TYPE } from "../extensions/constants.js";
+import { legacySidecarStatePath, sidecarStatePath } from "../extensions/persistence.js";
 import { startExtensionHost } from "./fixtures/extension-host.js";
 import { fakeSnapshot } from "./fixtures/lifecycle.js";
 
@@ -14,7 +14,7 @@ const legacyTask = (id: string) => fakeSnapshot({
 	id, status: "completed", exitCode: 0, exitNotified: true, resultReady: true,
 	sessionId: host.ctx.sessionManager.getSessionId(), pid: undefined as never, logFile: `${host.root}/${id}.log`,
 });
-const legacyEntry = (...ids: string[]) => ({ type: "custom", customType: BG_STATE_TYPE, data: { version: 1, tasks: ids.map(legacyTask), updatedAt: 1 } });
+const legacyEntry = (...ids: string[]) => ({ type: "custom", customType: LEGACY_BG_STATE_TYPE, data: { version: 1, tasks: ids.map(legacyTask), updatedAt: 1 } });
 const sidecarFile = () => sidecarStatePath(host.ctx);
 const ids = async () => (await host.listTasks()).map((task) => task.id).sort();
 const restart = async () => { await host.dispatch("session_shutdown"); await host.dispatch("session_start"); };
@@ -87,4 +87,24 @@ test("a stale byte count in the store is re-derived from the log on restore", as
 	await host.dispatch("session_start");
 	const restored = (await host.listTasks()).find((candidate) => candidate.id === "bg-11");
 	expect(restored?.outputBytes, "the log, not the stale counter, says what the task produced").toBe(written.length);
+});
+
+test("a store at the old path migrates once, then the old file is retired", async () => {
+	await host.dispatch("session_shutdown");
+	rmSync(dirname(sidecarStatePath(host.ctx)), { recursive: true, force: true });
+	const legacyFile = legacySidecarStatePath(host.ctx);
+	mkdirSync(dirname(legacyFile), { recursive: true });
+	const task = legacyTask("bg-21");
+	writeFileSync(legacyFile, `${JSON.stringify({ version: 1, updatedAt: 1, tasks: [{ ...task, outputBytes: 0 }] })}\n`);
+
+	await host.dispatch("session_start");
+	expect(await ids(), "the old store is read as migration input").toEqual(["bg-21"]);
+	const migrated = JSON.parse(readFileSync(sidecarStatePath(host.ctx), "utf8")) as { version: number; tasks: { id: string }[] };
+	expect({ version: migrated.version, ids: migrated.tasks.map((entry) => entry.id) }).toEqual({ version: 2, ids: ["bg-21"] });
+	expect(existsSync(legacyFile), "the retired file cannot resurrect tasks later").toBe(false);
+
+	// A later restart reads only the new store.
+	await host.dispatch("session_shutdown");
+	await host.dispatch("session_start");
+	expect(await ids()).toEqual(["bg-21"]);
 });

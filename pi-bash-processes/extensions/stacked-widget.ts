@@ -35,8 +35,8 @@ interface MiniDashboardRegistry {
 
 const REGISTRY_SYMBOL = Symbol.for("kendex.pi.mini-dashboard-stack");
 const STACK_WIDGET_KEY: Record<MiniDashboardPlacement, string> = {
-	aboveEditor: "kendex-mini-dashboard-stack-above",
-	belowEditor: "kendex-mini-dashboard-stack-below",
+	aboveEditor: "pi-bash-processes-dashboard-above",
+	belowEditor: "pi-bash-processes-dashboard-below",
 };
 
 function registry(): MiniDashboardRegistry {

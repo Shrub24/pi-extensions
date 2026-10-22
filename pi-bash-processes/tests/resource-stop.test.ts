@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { stopResourceControlledTask, type ResourceControlMetadata, type ResourceControlStopResult } from "../extensions/resource-control.js";
 
 test("resource stop selects the unit command and returns its result", () => {
-	const unit = "kendex-pi-bg-bg-7.service";
+	const unit = "pi-bg-bg-7.service";
 	const systemd: ResourceControlMetadata = { mode: "systemd-run", requestedMode: "auto", unitName: unit };
 	const rows: {
 		name: string; metadata: ResourceControlMetadata; signal: NodeJS.Signals;

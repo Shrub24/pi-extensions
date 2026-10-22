@@ -8,5 +8,5 @@ const plan = planResourceControlledSpawn(spawnInput({
 	probes: { platform: "linux", commandExists: (command) => command === "systemctl" || command === "systemd-run" },
 }));
 // The unit probe reads the user manager answer spawn planning settled.
-const unitActive = await defaultSystemdUnitActive("kendex-pi-bg-bg-7-123456.service");
+const unitActive = await defaultSystemdUnitActive("pi-bg-bg-7-123456.service");
 process.stdout.write(JSON.stringify({ pid: process.pid, plan, unitActive }));

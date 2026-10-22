@@ -1,5 +1,5 @@
 /*
- * kendex Pi background tasks.
+ * pi-bash-processes: managed bash output and `bg_task` background tasks.
  *
  * Locally owned package based on ideas and portions of the MIT-licensed
  * @ifi/pi-background-tasks package. See ../THIRD_PARTY_NOTICES.md.
@@ -35,7 +35,7 @@ import {
 	BG_COMMAND,
 	BG_INSTALL_SYMBOL,
 	BG_MESSAGE_TYPE,
-	BG_STATE_TYPE,
+	LEGACY_BG_STATE_TYPE,
 	BG_TRANSITION_TYPE,
 	BG_WIDGET_KEY,
 	DEFAULT_BACKGROUND_BASH_SHORTCUT,
@@ -118,7 +118,7 @@ void loadManagedBashPresentation();
 import { createOrphanWatcher, type OrphanWatcher } from "./orphan-watcher.js";
 import { blockingTaskCount, createPaneFactsPublisher, paneFacts } from "./pane-facts.js";
 import { busTasks, createRadarBusPublisher } from "./radar-bus.js";
-import { applyLegacySnapshotEntry, createPersistence, sessionIdForContext, sidecarStatePath } from "./persistence.js";
+import { applyLegacySnapshotEntry, createPersistence, legacySidecarStatePath, sessionIdForContext, sidecarStatePath } from "./persistence.js";
 import { mapWithConcurrency, PROBE_CONCURRENCY } from "./probes.js";
 import { defaultSystemdUnitActive, planResourceControlledSpawn, stopResourceControlledTask } from "./resource-control.js";
 import { installSettingsCacheRefresh, recordProjectTrust } from "./package-config.js";
@@ -1249,7 +1249,13 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		// no sidecar yet is a legacy one and replays the branch once; the persist at
 		// the end of restore writes the sidecar, which ends that migration.
 		let sidecarLoaded = false;
-		const file = sidecarStatePath(ctx);
+		// A store from an earlier version is migration input: it is read once,
+		// written forward to the owner path below, and then retired so it cannot
+		// come back to life if the new file is ever lost.
+		const legacyFile = legacySidecarStatePath(ctx);
+		const migratedFrom = !existsSync(sidecarStatePath(ctx)) && existsSync(legacyFile) ? legacyFile : undefined;
+		if (migratedFrom) logBackgroundDiagnostic("persistence migrating legacy store", { from: migratedFrom });
+		const file = migratedFrom ?? sidecarStatePath(ctx);
 		if (existsSync(file)) {
 			try {
 				const data = JSON.parse(readFileSync(file, "utf8")) as { tasks?: unknown };
@@ -1269,7 +1275,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		}
 		if (!sidecarLoaded) {
 			for (const entry of ctx.sessionManager.getBranch()) {
-				if (entry.type === "custom" && entry.customType === BG_STATE_TYPE) {
+				if (entry.type === "custom" && entry.customType === LEGACY_BG_STATE_TYPE) {
 					applyLegacySnapshotEntry({ data: entry.data, clear: clearRestoredTasks, apply: rememberRestoredSnapshot });
 				}
 				if (entry.type === "message" && entry.message.role === "toolResult" && (entry.message.toolName === "bg_task" || entry.message.toolName === "bash")) {
@@ -1306,7 +1312,15 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			scheduleSoftTimeout(task);
 		}
 		persistenceLayer.seed(sortedTasks().map((task) => rememberSnapshot(task)));
-		if (tasks.size > 0) persistSnapshots();
+		if (tasks.size > 0) {
+			const { sidecar } = persistSnapshots();
+			// Retire the old file only once the store it was imported into exists.
+			if (migratedFrom && sidecar === "written") {
+				try { renameSync(migratedFrom, `${migratedFrom}.migrated`); } catch (error) {
+					logBackgroundDiagnostic("persistence failed (legacy-store retire)", { file: migratedFrom, error: error instanceof Error ? error.message : String(error) });
+				}
+			}
+		}
 	};
 
 	const sortedTasks = (): ManagedTask[] => [...tasks.values()].sort((a, b) => b.startedAt - a.startedAt);
@@ -2634,7 +2648,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			origin: options.origin ?? "bg_task",
 		});
 		for (const warning of spawnPlan.warnings) warnResourceControlFallback(warning, cwd);
-		// kendex#97 hardening: spawn the child in its own session / process
+		// Process-group hardening: spawn the child in its own session / process
 		// group via `detached: true` (Node calls setsid() on POSIX before
 		// exec). This protects against two signal paths:
 		//

@@ -258,7 +258,7 @@ const bashBin = (() => {
  */
 const basePath = (process.env.PATH ?? "")
 	.split(":")
-	.filter((entry) => entry && !entry.includes("kendex-pi-bg"))
+	.filter((entry) => entry && !entry.includes("pi-bash-processes"))
 	.join(":");
 const managedPath = [binDir, basePath].filter(Boolean).join(":");
 
@@ -315,12 +315,12 @@ test("pi-bg list, get and stop are answered by the session endpoint", async () =
 			stdout: "bg-7\trunning\trunning\tcomplete\tsleep 30\n",
 		});
 		// Retrieval metadata goes to stderr, so stdout stays a clean pipeline.
-		expect(list.stderr).toContain("kendex: result=ok");
+		expect(list.stderr).toContain("pi-bash-processes: result=ok");
 
 		const get = await runCli(["get", "bg-7"], env);
 		expect({ status: get.status, stdout: get.stdout }).toEqual({ status: 0, stdout: "still going\n" });
-		expect(get.stderr).toContain("kendex: task=bg-7");
-		expect(get.stderr).toContain("kendex: readiness=running");
+		expect(get.stderr).toContain("pi-bash-processes: task=bg-7");
+		expect(get.stderr).toContain("pi-bash-processes: readiness=running");
 		// The CLI is told what it may hand off, never where the mutable log lives.
 		expect(get.stderr).not.toContain(".log");
 
@@ -413,7 +413,7 @@ test("assembling the managed-shell environment signals nothing", () => {
 	const isolation = mkdtempSync(join(tmpdir(), "managed-env-"));
 	// A stale endpoint file whose owning pid is certainly gone: this is exactly
 	// what a liveness probe would have been tempted to signal.
-	const runtimeDir = join(process.env.XDG_RUNTIME_DIR?.startsWith("/") ? process.env.XDG_RUNTIME_DIR : tmpdir(), "kendex-pi-bg-ipc");
+	const runtimeDir = join(process.env.XDG_RUNTIME_DIR?.startsWith("/") ? process.env.XDG_RUNTIME_DIR : tmpdir(), "pi-bash-processes-ipc");
 	mkdirSync(runtimeDir, { recursive: true });
 	const staleSocket = join(runtimeDir, `signals-guard-999999.sock`);
 	writeFileSync(staleSocket, "");
@@ -457,7 +457,7 @@ test("the retired live-path CLI helpers refuse with a migration, not a bypass", 
 		expect(run.stderr, "the refusal says why it is gone").toContain("bypassed completion acknowledgment");
 		// No contact with any endpoint: the refusal happens before the CLI is even
 		// consulted, so no receipt can be produced for it.
-		expect(run.stderr).not.toContain("kendex: result=ok");
+		expect(run.stderr).not.toContain("pi-bash-processes: result=ok");
 	}
 });
 

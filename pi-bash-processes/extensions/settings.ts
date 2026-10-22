@@ -46,7 +46,7 @@ export function settingEnum<T extends string>(key: string, allowed: readonly T[]
 
 export function taskDir(): string {
 	const configured = settingString("taskDir", "");
-	return process.env.PI_BG_TASK_DIR?.trim() || (configured ? resolve(expandHome(configured)) : join(tmpdir(), "kendex-pi-bg"));
+	return process.env.PI_BG_TASK_DIR?.trim() || (configured ? resolve(expandHome(configured)) : join(tmpdir(), "pi-bash-processes"));
 }
 
 function safeLabel(input: string): string {
@@ -90,7 +90,7 @@ export function bridgeSocketPath(sessionId: string): string {
 
 function bridgeRuntimeDir(): string {
 	const base = process.env.XDG_RUNTIME_DIR?.trim();
-	return join(base && base.startsWith("/") ? base : tmpdir(), "kendex-pi-bg-ipc");
+	return join(base && base.startsWith("/") ? base : tmpdir(), "pi-bash-processes-ipc");
 }
 
 function safeSessionName(sessionId: string): string {

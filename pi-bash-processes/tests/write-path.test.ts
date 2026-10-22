@@ -54,7 +54,7 @@ describe.skipIf(process.platform !== "linux")("restore probes", () => {
 		];
 		expect.assertions(rows.length + 1);
 		expect(rows.length, "restore probe table must contain cases").toBeGreaterThan(0);
-		const unit = "kendex-pi-bg-bg-2-1700000000000.service";
+		const unit = "pi-bg-bg-2-1700000000000.service";
 		for (const row of rows) {
 			const result = runSpawnFixture("write-path-extension.ts", { mode: "restore", entries: row.entries });
 			// Restore probes the final task set; the orphan watcher's first pass waits one poll interval.

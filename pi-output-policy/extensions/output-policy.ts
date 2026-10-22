@@ -382,7 +382,7 @@ function isWithin(dir: string, path: string): boolean {
 // Mirrors pi-bash-processes' taskDir() resolution so its lanes can be recognised.
 function backgroundTaskLanesRoot(cwd: string): string {
 	const configured = configString(readPackageConfig(BACKGROUND_TASKS_CONFIG_ID, cwd) as kendexConfig, "taskDir", "");
-	const taskDir = process.env.PI_BG_TASK_DIR?.trim() || (configured ? resolve(expandHome(configured)) : join(tmpdir(), "kendex-pi-bg"));
+	const taskDir = process.env.PI_BG_TASK_DIR?.trim() || (configured ? resolve(expandHome(configured)) : join(tmpdir(), "pi-bash-processes"));
 	return join(taskDir, "lanes");
 }
 

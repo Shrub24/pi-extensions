@@ -55,11 +55,11 @@ test("a managed command can ask the session about its own task", async () => {
 	expect({ exitCode: stdoutOnly.exitCode, output: stdoutOnly.output }).toEqual({ exitCode: 0, output: "alpha\nbeta\n" });
 	const stderrOnly = await bashRun(`pi-bg get ${done.id} 1>/dev/null`);
 	expect(stderrOnly.exitCode).toBe(0);
-	expect(stderrOnly.output).toContain(`kendex: task=${done.id}`);
-	expect(stderrOnly.output).toContain("kendex: readiness=terminal");
+	expect(stderrOnly.output).toContain(`pi-bash-processes: task=${done.id}`);
+	expect(stderrOnly.output).toContain("pi-bash-processes: readiness=terminal");
 	// Metadata is a one-line-per-field protocol: the command is echoed escaped,
 	// so no field can inject a line into the caller's stderr stream.
-	expect(stderrOnly.output).toContain("kendex: command=printf 'alpha\\nbeta\\n'");
+	expect(stderrOnly.output).toContain("pi-bash-processes: command=printf 'alpha\\nbeta\\n'");
 	expect(stderrOnly.output, "no task output leaks into the metadata stream").not.toContain("alpha\nbeta\n");
 
 	// An unknown id is an outcome, not an empty success.
@@ -90,6 +90,6 @@ test("a managed task can query the endpoint while it runs, and still complete", 
 	const result = await bgTask().execute("managed-get", { action: "get", id: query.id, output: "full" });
 	const logText = result.content[0]?.text ?? "";
 	expect(logText).toContain("gamma\n");
-	expect(logText).toContain(`kendex: task=${target.id}`);
+	expect(logText).toContain(`pi-bash-processes: task=${target.id}`);
 	expect(logText).toContain(query.id);
 });

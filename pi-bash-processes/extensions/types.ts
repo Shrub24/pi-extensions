@@ -119,7 +119,7 @@ export interface ProcessIdentity {
 	comm: string;
 }
 
-export interface kendexModalLock {
+export interface ModalLock {
 	depth: number;
 }
 

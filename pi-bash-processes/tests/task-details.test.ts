@@ -18,7 +18,7 @@ function snapshot(overrides: Record<string, unknown> = {}) {
 		expiresAt: null,
 		id: "bg-details-fixture",
 		lastOutputAt: null,
-		logFile: "/tmp/kendex-pi-bg/bg-details-fixture.log",
+		logFile: "/tmp/pi-bash-processes/bg-details-fixture.log",
 		notifyOnExit: true,
 		notifyOnOutput: false,
 		outputBytes: 0,

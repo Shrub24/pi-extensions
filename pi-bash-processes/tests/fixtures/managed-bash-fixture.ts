@@ -34,7 +34,7 @@ const widgets = new Map<string, unknown>();
 const widgetTheme = { fg: (_token: string, text: string) => text, bold: (text: string) => text };
 const widgetTui = { terminal: { rows: 40 }, requestRender() {} };
 const widgetLines = (): string => {
-	const factory = widgets.get("kendex-mini-dashboard-stack-above");
+	const factory = widgets.get("pi-bash-processes-dashboard-above");
 	if (typeof factory !== "function") return "";
 	try {
 		const component = (factory as (tui: unknown, theme: unknown) => { render(width: number): string[] })(widgetTui, widgetTheme);

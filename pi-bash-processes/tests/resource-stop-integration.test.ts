@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { LOG_FLUSH_DELAY_MS, LOG_WRITE_STALL_MS } from "../extensions/log-writer.js";
 import { runSpawnFixture, SPAWN_FIXTURE_TIMEOUT_MS } from "./fixtures/spawn-child-runner.js";
 
-const unit = "kendex-pi-bg-bg-1-1700000000000.service";
+const unit = "pi-bg-bg-1-1700000000000.service";
 const term = { file: "systemctl", args: ["--user", "stop", "--no-block", unit] };
 const kill = { file: "systemctl", args: ["--user", "kill", "--signal=SIGKILL", unit] };
 const signalPid = process.platform === "win32" ? 4242 : -4242;

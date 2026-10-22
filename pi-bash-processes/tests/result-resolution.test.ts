@@ -236,7 +236,7 @@ test("a failed CLI handoff stays unresolved; a completed read resolves", async (
 		unsubscribe();
 	}
 	expect(complete.exitCode, complete.output).toBe(0);
-	expect(complete.output).toContain("kendex: ack=terminal");
+	expect(complete.output).toContain("pi-bash-processes: ack=terminal");
 	expect((await listed(id))?.resultResolution, "the completed CLI read resolves it").toBe("delivered");
 	const resolvedSnapshot = queryBackgroundWorkSnapshot(host.events, scope("req-n"));
 	if (resolvedSnapshot.state !== "ready") throw new Error(`expected a ready snapshot after retrieval, received ${JSON.stringify(resolvedSnapshot)}`);

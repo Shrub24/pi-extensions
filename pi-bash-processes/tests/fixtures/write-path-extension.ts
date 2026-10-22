@@ -45,7 +45,7 @@ const entries: unknown[] = [];
 let wakeLogFile: string | null = null;
 const logsAtWake: string[] = [];
 const sessionId = "write-path-private-session";
-const unit = "kendex-pi-bg-bg-2-1700000000000.service";
+const unit = "pi-bg-bg-2-1700000000000.service";
 const snapshot = (id: string, fields: Record<string, unknown>) => ({ command: `fixture ${id}`, cwd: process.cwd(), exitCode: null, exitNotified: true, expiresAt: null, id,
 	lastOutputAt: null, logFile: join(process.cwd(), `${id}.log`), notifyOnExit: false, notifyOnOutput: false,
 	outputBytes: 0, pid: 0, sessionId, startedAt: 1_700_000_000_000, status: "completed", title: id, updatedAt: 1_700_000_000_000, ...fields,

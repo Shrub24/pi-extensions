@@ -8,7 +8,7 @@ function envEnabled(value: string | undefined): boolean {
 
 function diagnosticPath(): string {
 	const configured = process.env.PI_BG_TASK_DIAGNOSTIC_LOG?.trim();
-	return configured ? resolve(configured) : join(tmpdir(), "kendex-pi-bg", "diagnostics.log");
+	return configured ? resolve(configured) : join(tmpdir(), "pi-bash-processes", "diagnostics.log");
 }
 
 export function backgroundDiagnosticsEnabled(): boolean {

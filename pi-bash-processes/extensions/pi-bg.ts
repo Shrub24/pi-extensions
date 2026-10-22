@@ -43,7 +43,7 @@ export const PI_BG_EXIT = {
 /** The shell wrapper installed as `pi-bg`. */
 export function piBgWrapperScript(): string {
 	return `#!/usr/bin/env bash
-# kendex declared background-task CLI.
+# pi-bg: the background-task CLI declared for managed shells.
 #
 #   pi-bg get <task-id>          task state, readiness, and an output preview
 #   pi-bg list                   running and finished tasks in this session
@@ -125,7 +125,7 @@ const usage = () => {
 const meta = (fields) => {
 	for (const [key, value] of Object.entries(fields)) {
 		if (value === undefined || value === null || value === "") continue;
-		process.stderr.write("kendex: " + key + "=" + value + "\\n");
+		process.stderr.write("pi-bash-processes: " + key + "=" + value + "\\n");
 	}
 };
 

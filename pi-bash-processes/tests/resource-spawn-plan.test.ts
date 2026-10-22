@@ -16,12 +16,12 @@ test("resource spawn plans retain complete argv, metadata and warnings", () => {
 			expected: {
 				file: "systemd-run",
 				args: [
-					"--user", "--quiet", "--wait", "--pipe", "--collect", "--unit=kendex-pi-bg-bg-7-123456.service",
+					"--user", "--quiet", "--wait", "--pipe", "--collect", "--unit=pi-bg-bg-7-123456.service",
 					"--working-directory=/tmp/work tree", "--property=CPUWeight=25", "--property=IOWeight=50",
 					"--property=Nice=12", "--property=IOSchedulingClass=best-effort", "--property=IOSchedulingPriority=6",
 					"--", "/bin/bash", "-lc", command,
 				],
-				metadata: { mode: "systemd-run", requestedMode: "auto", unitName: "kendex-pi-bg-bg-7-123456.service", warning: undefined },
+				metadata: { mode: "systemd-run", requestedMode: "auto", unitName: "pi-bg-bg-7-123456.service", warning: undefined },
 				warnings: [],
 			},
 		},

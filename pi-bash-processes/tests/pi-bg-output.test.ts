@@ -92,15 +92,15 @@ test("a full read redirects the capture byte-for-byte, with no retrieval metadat
 	expect(written).toContain("SUFFIX-MARKER");
 	expect(written).toContain("stderr-marker");
 	expect(written).not.toContain("kendex:");
-	expect(redirected.output).toContain(`kendex: task=${task.id}`);
-	expect(redirected.output).toContain("kendex: ack=terminal");
+	expect(redirected.output).toContain(`pi-bash-processes: task=${task.id}`);
+	expect(redirected.output).toContain("pi-bash-processes: ack=terminal");
 
 	// A pipe into a filter is the same declared operation, and the metadata still
 	// goes to stderr rather than into the pipe.
 	const filtered = await bashRun(`pi-bg get ${task.id} --output | grep -c MARKER`);
 	expect(filtered.exitCode).toBe(0);
 	expect(filtered.output).toContain("3");
-	expect(filtered.output).toContain("kendex: ack=");
+	expect(filtered.output).toContain("pi-bash-processes: ack=");
 });
 
 test("output larger than 1 MiB keeps its prefix, middle and suffix", async () => {
@@ -147,7 +147,7 @@ test("a running snapshot is immutable: output produced later cannot change it", 
 	expect(first.exitCode, first.output).toBe(0);
 	const snapshot = readFileSync(file, "utf8");
 	expect(snapshot).toBe("FIRST-HALF\n");
-	expect(first.output, "a running handoff is labelled partial").toContain("kendex: readiness=running");
+	expect(first.output, "a running handoff is labelled partial").toContain("pi-bash-processes: readiness=running");
 
 	await host.settledTask(task.id, 20_000);
 	// The task finished, but the artifact handed over earlier did not change.
@@ -158,7 +158,7 @@ test("a running snapshot is immutable: output produced later cannot change it", 
 	const second = await bashRun(`pi-bg get ${task.id} --output > ${secondFile}`);
 	expect(second.exitCode, second.output).toBe(0);
 	expect(readFileSync(secondFile, "utf8")).toBe("FIRST-HALF\nSECOND-HALF\n");
-	expect(second.output).toContain("kendex: readiness=terminal");
+	expect(second.output).toContain("pi-bash-processes: readiness=terminal");
 });
 
 test("a running full read resets the review clock and never acknowledges the completion", async () => {
@@ -174,7 +174,7 @@ test("a running full read resets the review clock and never acknowledges the com
 	const file = join(scratch, "review.txt");
 	const read = await bashRun(`pi-bg get ${task.id} --output > ${file}`);
 	expect(read.exitCode, read.output).toBe(0);
-	expect(read.output, "a running handoff is a review, not an acknowledgment").toContain("kendex: ack=review");
+	expect(read.output, "a running handoff is a review, not an acknowledgment").toContain("pi-bash-processes: ack=review");
 	const after = await listed(task.id);
 	expect(after!.lastReviewedAt).toBeGreaterThanOrEqual(before!.startedAt as number);
 	expect(after!.exitNotified, "the completion stays owed").toBeFalsy();
@@ -209,8 +209,8 @@ test("a closed pipe leaves the handoff uncommitted, and a completed read then co
 	const file = join(scratch, "epipe-recovered.txt");
 	const complete = await bashRun(`pi-bg get ${task.id} --output > ${file}`);
 	expect(complete.exitCode, complete.output).toBe(0);
-	expect(complete.output).toContain("kendex: ack=review");
-	const boundary = Number(/kendex: outputBytes=(\d+)/.exec(complete.output)?.[1] ?? -1);
+	expect(complete.output).toContain("pi-bash-processes: ack=review");
+	const boundary = Number(/pi-bash-processes: outputBytes=(\d+)/.exec(complete.output)?.[1] ?? -1);
 	expect(boundary).toBeGreaterThan(3_000_000);
 	const written = readFileSync(file, "utf8");
 	expect(written).toContain("TAIL-MARKER");
@@ -236,7 +236,7 @@ test("stop returns the result under the same id, and a full read of it still suc
 	const read = await bashRun(`pi-bg get ${task.id} --output > ${file}`);
 	expect(read.exitCode, read.output).toBe(0);
 	expect(readFileSync(file, "utf8")).toContain("before-stop");
-	expect(read.output).toContain(`kendex: task=${task.id}`);
+	expect(read.output).toContain(`pi-bash-processes: task=${task.id}`);
 });
 
 test("a naturally finished task reports its real exit code through the same stop/get surface", async () => {

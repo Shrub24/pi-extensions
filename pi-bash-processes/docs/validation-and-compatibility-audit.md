@@ -145,6 +145,10 @@ notices, copyright, import provenance and upstream issue references intact.
 
 ### Safe local cleanup
 
+Done: `kendexModalLock` and `acquirekendexModalLock` are `ModalLock` and
+`acquireModalLock` in this package (the pi-output-policy and pi-tool-renderer
+copies are separate slices).
+
 Rename local types/functions such as `kendexConfig`, `readkendexConfig`,
 `kendexModalLock` and `acquirekendexModalLock`, comments and UI keys with all their
 current callers. A TypeScript type name is NOT a cross-extension runtime
@@ -197,12 +201,14 @@ new persistence format.
 
 ### Filesystem paths and discovery boundaries
 
-- Background sidecar: `persistence.ts:136-145` (migration in the persistence
-  brief).
-- Default logs: `settings.ts:47-49`; diagnostics independently use the old
-  directory in `diagnostics.ts:11`. Output-policy knows the same default in
-  `output-policy.ts:384-385`. Change these as one slice and honour existing
-  absolute log paths.
+- Background sidecar: done — the store now lives at
+  `$PI_CODING_AGENT_DIR/pi-bash-processes/sessions/<id>/state.json`, with the old
+  `kendex/sessions/<id>/pi-background-tasks/state.json` read once as migration
+  input.
+- Default logs: done — `settings.ts`, `diagnostics.ts` and the mirrored default
+  in `pi-output-policy/extensions/output-policy.ts:385` all use the
+  `pi-bash-processes` task directory now. Existing absolute log paths in the
+  store are honoured, so abandoned `/tmp` lanes are never read again.
 - Output-policy artifacts: `output-policy.ts:170,1016` use
   `<agent>/kendex/sessions/...`; retain retrieval of old artifact paths and
   scoped old-root cleanup rather than orphaning files.

@@ -3,11 +3,13 @@ export const DEFAULT_BACKGROUND_BASH_SHORTCUT = "alt+.";
 export const DEFAULT_BG_SHORTCUT = "alt+shift+h";
 export const DEFAULT_WIDGET_TOGGLE_SHORTCUT = "alt+h";
 export const CONFIG_ID = "pi-bash-processes";
-export const BG_MESSAGE_TYPE = "kendex-background-tasks:event";
-export const BG_STATE_TYPE = "kendex-background-tasks:state";
+/** Custom message type for wake and advisory messages shown in the session. */
+export const BG_MESSAGE_TYPE = "pi-bash-processes:event";
+/** Legacy snapshot entry type. Read only for a session with no owner store, never written. */
+export const LEGACY_BG_STATE_TYPE = "kendex-background-tasks:state";
 /** Lifecycle transition entries appended to the session; the sidecar, not these, is what restore reads. */
 export const BG_TRANSITION_TYPE = "pi-bash-processes:task-transition";
-export const BG_WIDGET_KEY = "kendex-background-tasks";
+export const BG_WIDGET_KEY = "pi-bash-processes";
 export const BG_INSTALL_SYMBOL = Symbol.for("kendex.background-tasks.installed");
 export const MANAGED_BASH_SYMBOL = Symbol.for("kendex.background-tasks.managed-bash");
 export const KENDEX_MODAL_LOCK_SYMBOL = Symbol.for("kendex.pi.modal-lock");

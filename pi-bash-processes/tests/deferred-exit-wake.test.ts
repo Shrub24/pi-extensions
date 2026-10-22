@@ -77,7 +77,7 @@ test("no inferred-read consume log exists to race over any more", () => {
 	expect(cli, "the CLI no longer reports a read to a consume log").not.toMatch(/PI_BG_CONSUME_LOG|PI_BG_REAL_PATH/);
 	const exported = Object.keys(declaredCliEnv({ sessionId: "s", socketPath: "/tmp/s.sock" }));
 	expect(exported, "the managed-shell env names the endpoint and the PATH only").toStrictEqual(["PI_BG_SOCKET", "PI_BG_SESSION", "PATH"]);
-	expect(existsSync(join(tmpdir(), "kendex-pi-bg", "consumed.log")), "no legacy shared consume file is written").toBe(false);
+	expect(existsSync(join(tmpdir(), "pi-bash-processes", "consumed.log")), "no legacy shared consume file is written").toBe(false);
 });
 
 /**

@@ -143,15 +143,18 @@ export function sessionIdForContext(ctx: ExtensionContext): string {
 	return `ephemeral-${process.pid}`;
 }
 
+/**
+ * The owner store for a session: `$PI_CODING_AGENT_DIR/pi-bash-processes/sessions/<id>/state.json`.
+ * It is this package's own directory, so the format and the retention rule are
+ * ours to change without disturbing anything else under the agent directory.
+ */
 export function sidecarStatePath(ctx: ExtensionContext): string {
-	return join(
-		piUserDir(),
-		"kendex",
-		"sessions",
-		safeFileName(sessionIdForContext(ctx)),
-		"pi-background-tasks",
-		"state.json",
-	);
+	return join(piUserDir(), "pi-bash-processes", "sessions", safeFileName(sessionIdForContext(ctx)), "state.json");
+}
+
+/** Where earlier versions kept the store. Read as migration input only. */
+export function legacySidecarStatePath(ctx: ExtensionContext): string {
+	return join(piUserDir(), "kendex", "sessions", safeFileName(sessionIdForContext(ctx)), "pi-background-tasks", "state.json");
 }
 
 // Atomic write: temp file in the same directory + rename(2). Aborts on

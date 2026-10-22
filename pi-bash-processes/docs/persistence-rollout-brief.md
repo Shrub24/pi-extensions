@@ -9,15 +9,16 @@ an alternative database.
 
 Scope: pi-bash-processes, with coordinated path readers in pi-output-policy if
 storage naming changes. Herdsman/Radar ownership and timer changes are separate.
-**Status (2026-10-22): the minimal slice below has landed** (writer, sidecar-first restore, corrupt-file handling, tests). The owner-path rename, sidecar write volume and `kendex` entry names remain deferred.
+**Status (2026-10-22): landed.** Writer, sidecar-first restore, corrupt-file handling, transition-driven store writes, the owner-path rename and the package's own entry names are in `main`. The `Symbol.for("kendex.*")` interop registry is the one item left, and it needs a coordinated move with the renderer and the activity broker.
 
 ## Existing behaviour and starting seam
 
 References checked against the working tree based on `e5b1486c`:
 
-- `extensions/persistence.ts:136-163`: sidecar location and same-directory
-  temporary-file/rename writer. Current path is
-  `$PI_CODING_AGENT_DIR/kendex/sessions/<session-id>/pi-background-tasks/state.json`.
+- `extensions/persistence.ts`: the store path and the same-directory
+  temporary-file/rename writer. It was
+  `$PI_CODING_AGENT_DIR/kendex/sessions/<session-id>/pi-background-tasks/state.json`
+  and is now `$PI_CODING_AGENT_DIR/pi-bash-processes/sessions/<session-id>/state.json`.
   Reuse this writer; rename is atomic replacement, not proof of power-loss
   durability (no fsync is shown).
 - `extensions/persistence.ts:183-275`: `createPersistence` serialises all tasks,
@@ -211,9 +212,10 @@ from the wake change), so a restart cannot repeat an advisory. It is already a
 snapshot field, so the sidecar holds it; only the session transition tuple needs
 to include it.
 
-Deferred to a second slice: sidecar write volume (the file is still rewritten in
-full on output-driven persists), the owner-path rename, and the `kendex` entry
-names. They do not affect session growth.
+Landed since: sidecar write volume, the owner-path rename and the package's own
+entry names. Still deferred: the `Symbol.for("kendex.*")` interop registry, which
+is shared with the renderer and the activity broker and has to move in one step.
+
 
 Estimated effect (reasoning, not a measurement): the session cost of a task falls
 from one roster-sized snapshot per structural change to a few entries of roughly
@@ -226,7 +228,8 @@ fixture before claiming a figure.
 - Restore: a loadable sidecar is the only input; the branch (old snapshot entries and `bg_task`/`bash` tool-result rosters) is not read. No sidecar means a legacy session: replay the branch once, then the end-of-restore persist writes the sidecar. An unreadable sidecar is renamed to `state.json.corrupt-<ms>`, reported through `ui.notify`, and rebuilt from the legacy branch, never treated as empty.
 - Removed: the full-snapshot and overflow-manifest writers, the fingerprint dedupe, the barrier helpers, and `bgToolResultTasks`' restore barrier. `BG_STATE_TYPE` stays as a legacy read name.
 - Store writes are transition-driven: the sidecar is rewritten only when the durable projection changes, where "durable" excludes `outputBytes`, `lastOutputAt`, `updatedAt` and `wakeEvents`. A chatty task therefore costs no writes at all, and the dropped-wake diagnostic no longer forces a persist. Because the stored counters can lag, restore re-derives `outputBytes` and the output cursor from the log when the file is longer than the record.
-- Not changed: the sidecar path is still `kendex/sessions/<id>/pi-background-tasks/state.json`, and existing session files keep their old snapshots.
+- Store path: `$PI_CODING_AGENT_DIR/pi-bash-processes/sessions/<session-id>/state.json`. The old `kendex/sessions/<id>/pi-background-tasks/state.json` is read once as migration input, written forward, and then renamed `state.json.migrated` so it cannot resurrect tasks if the new store is lost. Existing session files keep their old snapshots.
+- Entry names are ours: `pi-bash-processes:event` for wakes and `pi-bash-processes:task-transition` for transitions. `kendex-background-tasks:state` survives only as the legacy snapshot read type.
 
 ## Measurement (2026-10-22)
 

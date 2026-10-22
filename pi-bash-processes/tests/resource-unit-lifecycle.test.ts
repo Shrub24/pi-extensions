@@ -5,7 +5,7 @@ import type { ManagedTask, ProcessIdentity } from "../extensions/types.js";
 import { fakeSnapshot, fakeTask, reading, recordingHooks } from "./fixtures/lifecycle.js";
 
 test("systemd unit state takes precedence over wrapper identity during restore and polling", async () => {
-	const unit = "kendex-pi-bg-bg-7.service";
+	const unit = "pi-bg-bg-7.service";
 	const identity = { comm: "systemd-run", pid: 4242, startToken: "start-4242" };
 	const rows: {
 		name: string; operation: "restore" | "watch"; active: boolean; identity: ProcessIdentity | null; expected: object;
