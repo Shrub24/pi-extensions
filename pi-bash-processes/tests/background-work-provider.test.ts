@@ -198,9 +198,8 @@ test("protect is refused until the request is the bound assignment, and dies wit
 	if (stale.state !== "refused") throw new Error(`protection must not follow a rebind: ${JSON.stringify(stale)}`);
 });
 
-test("clearing finished tasks through the public tool keeps the view ready", async () => {
-	const cleared = await bgTask().execute("provider-clear", { action: "clear" });
-	expect((cleared.content[0]?.text ?? "")).toContain("Removed");
+test("clearing finished tasks keeps the view ready", async () => {
+	await host.clearFinished();
 	const snapshot = readySnapshot("req-8");
 	expect(snapshot.outstanding).toStrictEqual([]);
 });

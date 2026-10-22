@@ -59,8 +59,8 @@ test("managed bash v1: slow command yields Running, same process wakes once on e
 	expect(result.spawns, "still exactly one spawn after yield").toBe(1);
 	expect(result.resultAction).toBe("bash");
 	expect(result.resultText).toContain("Running bg-1");
-	expect(result.resultText).toContain("Do not poll it (no sleep/tail loops, no repeated list/log calls)");
-	expect(result.resultText).toContain('bg_task action:"wait" blocks once, bounded');
+	expect(result.resultText).toContain("Do not poll it (no sleep/tail loops, no repeated get calls)");
+	expect(result.resultText).not.toContain('action:"wait"');
 	expect(result.resultText).toContain("the exit wake arrives with an output tail");
 	expect(result.resultText).not.toMatch(/success|completed/i);
 	expect(result.resultTask?.status).toBe("running");

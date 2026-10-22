@@ -11,7 +11,7 @@ test("spawning an identical command while one runs warns with the existing id", 
 	expect(result.duplicate.first, "first spawn has no warning").not.toContain("WARNING");
 	expect(result.duplicate.second).toContain("WARNING: identical command already running: bg-1");
 	expect(result.duplicate.second, "the new task itself is not listed as a duplicate").not.toContain("bg-2.");
-	expect(result.duplicate.second).toContain("bg_task wait");
+	expect(result.duplicate.second).toContain("Wait for its completion wake");
 }, SPAWN_FIXTURE_TIMEOUT_MS);
 
 test("spawning a similar command notes the overlap without the warning", () => {
@@ -22,13 +22,6 @@ test("spawning a similar command notes the overlap without the warning", () => {
 	}) as { duplicate: { first: string; second: string } };
 	expect(result.duplicate.first).not.toContain("already running");
 	expect(result.duplicate.second).toContain("Note: similar command already running: bg-1");
-}, SPAWN_FIXTURE_TIMEOUT_MS);
-
-test("id-less wait attaches to the oldest running task", () => {
-	const result = runSpawnFixture("spawn-extension.ts", { mode: "wait-any", command: "sleep 30" }) as {
-		waitAny: { details: { task?: { id?: string } } };
-	};
-	expect(result.waitAny.details.task?.id).toBe("bg-1");
 }, SPAWN_FIXTURE_TIMEOUT_MS);
 
 /**

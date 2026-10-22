@@ -28,14 +28,15 @@ interface BashTool {
 }
 
 const tools = new Map<string, unknown>();
+const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
 const pi = {
 	events: createEventBus(),
 	appendEntry() {}, registerCommand() {}, registerMessageRenderer() {}, registerShortcut() {},
 	registerTool(tool: unknown) { tools.set((tool as { name: string }).name, tool); },
-	on() {}, sendMessage() {},
+	on(event: string, handler: (event: unknown, ctx: unknown) => unknown) { handlers.set(event, handler); }, sendMessage() {},
 } as unknown as ExtensionAPI;
 const ctx = {
-	cwd: process.cwd(), hasUI: true, isProjectTrusted: () => true,
+	cwd: process.cwd(), hasUI: true, mode: "tui", isProjectTrusted: () => true,
 	sessionManager: { getBranch: () => [], getSessionFile: () => join(process.cwd(), "session.jsonl"), getSessionId: () => "bash-fallback-session" },
 	ui: { notify() {}, setWidget() {} },
 } as unknown as ExtensionContext;
@@ -52,6 +53,7 @@ try {
 
 const { default: backgroundTasks } = await import("../../extensions/background-tasks.js");
 backgroundTasks(pi);
+await handlers.get("session_start")!({}, ctx);
 const bash = tools.get("bash") as BashTool | undefined;
 if (!bash) throw new Error("bash_fallback_fixture.tool_missing=bash");
 

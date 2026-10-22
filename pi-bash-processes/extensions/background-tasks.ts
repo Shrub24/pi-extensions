@@ -96,7 +96,7 @@ import {
 } from "./background-work.js";
 // The surface type is the leaf module's; `registrations.ts` re-exports it for
 // its own deps, and importing it from both places is a duplicate binding.
-import { applyTaskToolSurface, bashPromptGuidelines, registerAll, type RegistrationDeps } from "./registrations.js";
+import { bashPromptGuidelines, registerAll, registerBgTaskTool, type RegistrationDeps } from "./registrations.js";
 import { closeTaskLifecycle, replayMissedExitsLifecycle, sendExitWakeLifecycle, type LifecycleHooks } from "./lifecycle.js";
 import { taskLogs } from "./log-writer.js";
 import { BASH_OUTPUT_SCHEMA, buildManagedBashEnv, createForegroundWaiter, formatManagedBashCompletionText, formatManagedBashRunningText, isCodemodeCall, normalizeManagedBashTimeoutSeconds, settleForegroundWaiter, STRUCTURED_OUTPUT_MAX_BYTES, structuredOutputFor, structuredOutputOmittedMarker } from "./managed-bash.js";
@@ -106,7 +106,9 @@ let managedBashPresentation: typeof ManagedBashPresentation | undefined;
 async function loadManagedBashPresentation(): Promise<void> {
 	if (managedBashPresentation) return;
 	try {
-		managedBashPresentation = await import("pi-tool-renderer/managed-bash");
+		const loaded = await import("pi-tool-renderer/managed-bash");
+		// A module that resolves without the presentation functions is as good as absent.
+		managedBashPresentation = typeof loaded.renderManagedBashCall === "function" && typeof loaded.renderManagedBashResult === "function" ? loaded : undefined;
 	} catch {
 		managedBashPresentation = undefined;
 	}
@@ -121,7 +123,6 @@ import { defaultSystemdUnitActive, planResourceControlledSpawn, stopResourceCont
 import { installSettingsCacheRefresh, recordProjectTrust } from "./package-config.js";
 import { bridgeSocketPath, logFilePath, pipefailShellArgs, settingBoolean, settingEnum, settingNumber, settingString, taskEnv, taskLaneDir, taskLanesRoot } from "./settings.js";
 import { prepareSnapshot } from "./snapshot-artifact.js";
-import { clampTaskWaitSeconds, createTaskWaitWaiter, DEFAULT_TASK_WAIT_SECONDS, formatTaskWaitRunningText, MAX_TASK_WAIT_SECONDS, settleTaskWaitWaiter, TASK_WAIT_PENDING_POLL_MS } from "./task-wait.js";
 import {
 	acknowledgeCompletion,
 	beginResultFinalization,
@@ -164,7 +165,6 @@ import type {
 	ManagedTask,
 	SpawnTaskOptions,
 	TaskEventType,
-	TaskWaitOutcome,
 	WakeDiagnostic,
 	WakeDropReason,
 	WakeEventType,
@@ -188,16 +188,7 @@ import {
 	WAKE_MANIFEST_FIELD_MAX_CHARS,
 	type OutputWakeBudgetLimits,
 } from "./wake-events.js";
-import { batchRetrievalHint, taskSurfaceGuidance, wakeTaskLine, type TaskToolSurface } from "./tool-surface.js";
-
-/**
- * The surface the current session declared, resolved once at `session_start`.
- * Wake and acknowledgement text is generated long after registration, so it
- * reads this rather than a captured mode: a wake may only name operations the
- * model can actually call. The load-time value is the conservative compatibility
- * surface, which is also what a session that never reports a mode keeps.
- */
-let taskToolSurface: TaskToolSurface = "compat";
+import { retrievalHint, wakeTaskLine } from "./tool-surface.js";
 
 /**
  * Clamp the rendered line count of an aboveEditor widget so it can never push
@@ -327,7 +318,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 	 * notification, not settlement. Never applies to a running task: running
 	 * work is inspected, not resolved.
 	 */
-	const recordResultResolution = (task: ManagedTask, kind: "delivered" | "error" | "dismissed" | null): boolean => {
+	const recordResultResolution = (task: ManagedTask, kind: "delivered" | "error" | null): boolean => {
 		if (kind === null) return false;
 		if (task.status === "running") return false;
 		if (task.resultResolution !== undefined) return false;
@@ -1678,7 +1669,6 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			...wakeSend,
 			logDiagnostic: logWakeDiagnostic,
 			messageType: BG_MESSAGE_TYPE,
-			surface: () => taskToolSurface,
 			rememberSnapshot,
 		}, task, limits);
 		if (announced) {
@@ -1702,8 +1692,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		// gate and must stay replay-eligible.
 		if (eventType === "exit" && !shuttingDown) {
 			const foregroundOwnsExit = Boolean(task.foregroundWaiter && !task.foregroundWaiter.settled);
-			const waitOwnsExit = task.taskWaiter?.attached === true && !task.taskWaiter.settled;
-			if (foregroundOwnsExit || waitOwnsExit) {
+			if (foregroundOwnsExit) {
 				// The foreground/wait tool result IS this exit's delivery channel:
 				// acknowledge through the shared entry point, which also drops any
 				// completion wake this process still holds for the task. The result
@@ -1737,7 +1726,6 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			isShuttingDown: () => shuttingDown,
 			logDiagnostic: logWakeDiagnostic,
 			messageType: BG_MESSAGE_TYPE,
-			surface: () => taskToolSurface,
 			outputTail: (target) => tailText(getTaskOutput(target), settingNumber("outputAlertMaxChars", DEFAULT_OUTPUT_ALERT_MAX_CHARS, activeCtx?.cwd)),
 			rememberSnapshot,
 			runningInventory,
@@ -2059,7 +2047,6 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			// Release the waiters after that decision, and even for a task a newer
 			// run replaced: an attached wait must always end.
 			settleForeground(task, { exitCode: task.exitCode, kind: "exited", status: task.status });
-			settleTaskWait(task, { kind: "settled" });
 		};
 		const written = taskLogs.flush(task.logFile);
 		if (written) void written.then(settle);
@@ -2093,7 +2080,6 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 				// bounded wait here; the exit-wake suppression itself already
 				// happened inside finalizeTaskLifecycle while the waiter was
 				// still attached.
-				settleTaskWait(task, { kind: "settled" });
 				logBackgroundDiagnostic("orphan task finalized", { id: task.id, pid: task.pid, reason, status: task.status });
 			},
 		});
@@ -2191,7 +2177,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		persistSnapshots();
 
 		// Bound the command preview embedded in the stop message so a 100KB
-		// heredoc command cannot leak into the bg_task/bg_status stop tool
+		// heredoc command cannot leak into the bg_task stop tool
 		// result content.
 		const safeCommand = truncateForTranscript(task.command, WAKE_MANIFEST_FIELD_MAX_CHARS) ?? "";
 
@@ -2253,11 +2239,6 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 	const settleForeground = (task: ManagedTask, outcome: ForegroundOutcome): boolean =>
 		settleForegroundWaiter(task.foregroundWaiter, outcome);
 
-	// Single-owner settle for a bounded bg_task wait. Unlike the managed-Bash
-	// foreground waiter, ending the wait never signals the task's process.
-	const settleTaskWait = (task: ManagedTask, outcome: TaskWaitOutcome): boolean =>
-		settleTaskWaitWaiter(task.taskWaiter, outcome);
-
 	// Bounded soft wait. Resolves "yielded" after yieldMs without signalling
 	// the child; a finalize before the timer wins resolves "exited". A task
 	// that finalized before the wait attached resolves immediately with its
@@ -2316,7 +2297,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			id: task.id,
 			outputTail: managedBashOutputTail(task, cwd),
 			pid: task.pid,
-		}, taskToolSurface);
+		});
 
 	/**
 	 * Pi's own bash tool definition, typed from the module's export without
@@ -2449,112 +2430,6 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		}
 	};
 
-	/**
-	 * Bounded `bg_task action:"wait"` attachment. A terminal task returns its
-	 * terminal status and bounded output immediately; a running task attaches
-	 * one waiter that resolves on task settlement, window expiry, a queued
-	 * user message, or tool abort. Only a settlement is consumed by the wait
-	 * (the async exit wake is suppressed to keep one owner); expiry, steer,
-	 * and abort return Running/abort and leave the completion wake armed. A
-	 * second concurrent wait for the same task is rejected. Nothing here
-	 * starts, stops, or re-waits for the task.
-	 */
-	/** Oldest running task, for id-less waits: `bg_task wait` with no target. */
-	const oldestRunningTask = (): ManagedTask | null => {
-		let oldest: ManagedTask | null = null;
-		for (const task of tasks.values()) {
-			if (task.status !== "running") continue;
-			if (!oldest || task.startedAt < oldest.startedAt) oldest = task;
-		}
-		return oldest;
-	};
-
-	const waitForTask = async (
-		task: ManagedTask,
-		waitSecondsInput: unknown,
-		signal: AbortSignal | undefined,
-		ctx: ExtensionContext,
-	): Promise<AgentToolResult<unknown>> => {		const waitSeconds = clampTaskWaitSeconds(
-			waitSecondsInput,
-			settingNumber("taskWaitDefaultSeconds", DEFAULT_TASK_WAIT_SECONDS, ctx.cwd),
-			settingNumber("taskWaitMaxSeconds", MAX_TASK_WAIT_SECONDS, ctx.cwd),
-		);
-		const details = () => ({ action: "wait", task: compactBackgroundTaskSnapshot(rememberSnapshot(task)) });
-		if (task.status !== "running") {
-			// The terminal result IS the delivery: drop any exit wake that was
-			// deferred while this turn was in flight, otherwise the agent gets
-			// pinged at turn end for a result this call already handed it. The
-			// preparation lease keeps retention from pruning the task mid-read.
-			consumeObservedExitWake(task.id);
-			// This wait's result is an actual handoff of the terminal result —
-			// eligibility decided by the centralized rule: certified delivers,
-			// unrecoverable delivers as `error`, a still-flushing capture
-			// records nothing (openspec tasks 2.2-2.3). A wait that returns a
-			// still-running task below resolves nothing either.
-			recordResultResolution(task, resultResolutionForDelivery(observeTaskResult(task)));
-			const text = withResultPreparationLease(task, () => formatManagedBashCompletion(task, Date.now() - task.startedAt, ctx.cwd));
-			return makeToolResult(text, details());
-		}
-		const active = task.taskWaiter;
-		if (active && active.attached && !active.settled) {
-			throw new Error(`A bounded wait is already active for ${task.id}; await its result or the automatic completion wake instead of starting another wait.`);
-		}
-		// A Running result reports how long this wait was attached, not how
-		// old the task is: waiting once on a long-running task must not
-		// present the task's whole lifetime as the wait duration.
-		const waitStartedAt = Date.now();
-		const waiter = createTaskWaitWaiter();
-		task.taskWaiter = waiter;
-		const waitPromise = new Promise<TaskWaitOutcome>((resolve) => {
-			waiter.resolve = resolve;
-			const expiryTimer = setTimeout(() => {
-				settleTaskWaitWaiter(waiter, { kind: "expired" });
-			}, Math.max(0, waitSeconds) * 1_000);
-			expiryTimer.unref?.();
-			waiter.expiryTimer = expiryTimer;
-			const pollTimer = setInterval(() => {
-				if (!waiter.attached) return;
-				let pending = false;
-				try {
-					pending = ctx.hasPendingMessages();
-				} catch {
-					pending = false;
-				}
-				if (pending) settleTaskWaitWaiter(waiter, { kind: "pending-message" });
-			}, TASK_WAIT_PENDING_POLL_MS);
-			pollTimer.unref?.();
-			waiter.pollTimer = pollTimer;
-		});
-		const onAbort = () => { settleTaskWaitWaiter(waiter, { kind: "aborted" }); };
-		if (signal?.aborted) onAbort();
-		else signal?.addEventListener("abort", onAbort, { once: true });
-		try {
-			const outcome = await waitPromise;
-			if (outcome.kind === "aborted") throw new Error("Operation aborted");
-			if (task.status !== "running") {
-				// Terminal delivery keeps total task age; only the Running
-				// text below is scoped to the wait attachment. Eligibility for
-				// the durable resolution follows the centralized rule (tasks
-				// 2.2-2.3): certified → delivered, unrecoverable → error,
-				// still-flushing → nothing recorded.
-				recordResultResolution(task, resultResolutionForDelivery(observeTaskResult(task)));
-				return makeToolResult(formatManagedBashCompletion(task, Date.now() - task.startedAt, ctx.cwd), details());
-			}
-			return makeToolResult(
-				formatTaskWaitRunningText({
-					elapsedText: formatDuration(Date.now() - waitStartedAt),
-					id: task.id,
-					outputTail: managedBashOutputTail(task, ctx.cwd),
-					pid: task.pid,
-					waitSeconds,
-				}),
-				details(),
-			);
-		} finally {
-			signal?.removeEventListener("abort", onAbort);
-		}
-	};
-
 	/** One-line inventory of other running tasks for wake payloads. */
 	const runningInventory = (): string => {
 		const running = [...tasks.values()].filter((t) => t.status === "running" && t.stopReason == null).map((t) => t.id);
@@ -2588,7 +2463,6 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 				isShuttingDown: () => shuttingDown,
 				logDiagnostic: logWakeDiagnostic,
 				messageType: BG_MESSAGE_TYPE,
-				surface: () => taskToolSurface,
 				outputTail: (target) => tailText(getTaskOutput(target), settingNumber("outputAlertMaxChars", DEFAULT_OUTPUT_ALERT_MAX_CHARS, activeCtx?.cwd)),
 				rememberSnapshot,
 				runningInventory,
@@ -2605,14 +2479,11 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			return;
 		}
 		// Grouped wake: several mid-turn completions become one message.
-		const guidance = taskSurfaceGuidance(taskToolSurface);
-		const summaries = finished.map((task) => `${wakeTaskLine(task, guidance, { hint: false })} · ${compactText(task.command, 60)}`);
-		const failures = finished.filter((task) => (task.exitCode ?? 0) !== 0);
+		const summaries = finished.map((task) => `${wakeTaskLine(task)} · ${compactText(task.command, 60)}`);
 		const content = [
 			`${finished.length} background tasks finished.`,
 			...summaries.map((line) => `• ${line}`),
-			batchRetrievalHint(guidance),
-			...(failures.length > 0 ? [`${failures.length} failed: ${guidance.reviewFailures}.`] : []),
+			retrievalHint(),
 			runningInventory(),
 		].join("\n");
 		deliverWakeMessage(
@@ -2786,7 +2657,6 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			resultReady: false,
 			forceKillTimer: null,
 			foregroundWaiter: options.foregroundYieldMs != null ? createForegroundWaiter() : null,
-			taskWaiter: null,
 			id,
 			lastAnnouncedLength: 0,
 			lastOutputAt: null,
@@ -2921,28 +2791,13 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		return task;
 	};
 
-	const clearFinishedTasks = (ids?: string[]): { removed: number; kept: number; dismissed: number } => {
+	/** Operator-only (`/bg clear`, dashboard): forgets finished tasks, keeping assignment-owned results nobody received. */
+	const clearFinishedTasks = (): { removed: number; kept: number } => {
 		let removed = 0;
 		let kept = 0;
-		let dismissed = 0;
-		const selected = ids === undefined ? [...tasks.values()] : [...new Set(ids)].map((id) => tasks.get(id));
-		for (const task of selected) {
-			if (!task) {
-				kept += 1;
-				continue;
-			}
-			if (task.status === "running") {
-				if (ids !== undefined) kept += 1;
-				continue;
-			}
-			if (ids !== undefined && !resultIsResolved(task)) {
-				if (recordResultResolution(task, "dismissed")) dismissed += 1;
-				else kept += 1;
-				continue;
-			}
-			// Bulk clear preserves assignment-owned results until an explicit
-			// handoff or targeted dismissal; targeted clear is the owner's decision.
-			if (ids === undefined && task.assignmentRequestId !== undefined && !resultIsResolved(task)) {
+		for (const task of [...tasks.values()]) {
+			if (task.status === "running") continue;
+			if (task.assignmentRequestId !== undefined && !resultIsResolved(task)) {
 				kept += 1;
 				continue;
 			}
@@ -2951,7 +2806,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		}
 		persistSnapshots();
 		refreshUi();
-		return { removed, kept, dismissed };
+		return { removed, kept };
 	};
 
 	const formatTaskListText = (): string => {
@@ -2990,7 +2845,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		if (!command.trim()) return null;
 		if (consumeForcedBackground(cwd)) return forcedBackgroundDecision(command, cwd);
 		if (!settingBoolean("autoBackgroundBash", true, cwd)) return null;
-		return autoBackgroundDecision(command, cwd, taskToolSurface);
+		return autoBackgroundDecision(command, cwd);
 	};
 
 	const dashboardDeps = {
@@ -3044,8 +2899,6 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		similarRunningTasks,
 		recentlyFinishedTasks,
 		spawnTask,
-		oldestRunningTask,
-		waitForTask,
 		consumeObservedExitWake,
 		clearFinishedTasks,
 		armForcedBackground,
@@ -3087,7 +2940,6 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			...wakeSend,
 			isShuttingDown: () => shuttingDown,
 			messageType: BG_MESSAGE_TYPE,
-			surface: () => taskToolSurface,
 		}, unread);
 		if (!sent) return;
 		for (const task of unread) {
@@ -3128,12 +2980,15 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			// keeps its normal lifecycle, and the failure stays on record.
 			logBackgroundDiagnostic("background settlement provider registration failed", { error: error instanceof Error ? error.message : String(error) });
 		}
-		// The session mode is known only here, and it decides the declared tool
-		// surface: the TUI gets `bg_task` with exactly spawn/get/stop/list and no
-		// `bg_status`, while print/json/rpc/unknown keep the compatibility surface
-		// with `bg_status` and the bounded wait. This runs before the first agent
-		// turn, so no request is ever assembled against the wrong declaration.
-		registerBashTool(taskToolSurface = applyTaskToolSurface(pi, registrationDeps, ctx.mode));
+		// Background tasks exist only in the interactive TUI. The session mode is
+		// known only here, so the tools are declared here and every other mode keeps
+		// Pi's own `bash` and has no `bg_task`. Registering at `session_start`, before
+		// the first turn, means no request is assembled against the wrong declaration.
+		if (ctx.mode === "tui") {
+			registerBashTool();
+			registerBgTaskTool(pi, registrationDeps);
+			interop[MANAGED_BASH_SYMBOL] = true;
+		}
 		const pruned = pruneLanes(taskLanesRoot());
 		for (const failure of pruned.failed) logBackgroundDiagnostic("task log prune failed", { path: failure.path, error: failure.error });
 		try {
@@ -3204,7 +3059,6 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		// detaches and rejects through its normal `Operation aborted`
 		// channel, and because the shutdown exit-wake gate owns delivery,
 		// exitNotified stays false so the exit remains replay-eligible.
-		for (const task of tasks.values()) settleTaskWait(task, { kind: "aborted" });
 		for (const task of tasks.values()) {
 			if (task.status === "running") {
 				task.stopReason = "shutdown";
@@ -3295,8 +3149,8 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		const identical = similar.identical.filter((t) => t.id !== task.id).map((t) => t.id);
 		const related = similar.similar.filter((t) => t.id !== task.id).map((t) => t.id);
 		const reran = recentlyFinishedTasks(command, task.cwd).filter((t) => t.id !== task.id);
-		const duplicateNote = duplicateTaskNote(identical, related, reran, taskToolSurface);
-		const output = bashBackgroundAckText(rememberSnapshot(task), decision, otherRunning, duplicateNote, taskToolSurface);
+		const duplicateNote = duplicateTaskNote(identical, related, reran);
+		const output = bashBackgroundAckText(rememberSnapshot(task), decision, otherRunning, duplicateNote);
 		if (ctx.hasUI) {
 			const label = decision.forced ? "Shortcut moved user bash to background" : "Auto-backgrounded user bash";
 			ctx.ui.notify(`${label}: ${task.id} (pid ${task.pid})`, "info");
@@ -3306,7 +3160,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 
 	// `bash` is declared in every mode. Cross-tool background-task rules are
 	// contributed once by bg_task; this tool keeps only its shell-specific guidance.
-	const registerBashTool = (surface: TaskToolSurface): void => pi.registerTool({
+	const registerBashTool = (): void => pi.registerTool({
 		name: "bash",
 		label: "bash",
 		renderShell: "self",
@@ -3354,11 +3208,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			return renderManagedBashFallbackResult(result, options, theme, context, activeCtx?.cwd ?? process.cwd());
 		},
 	});
-	interop[MANAGED_BASH_SYMBOL] = true;
-	// The load-time declaration is the conservative one; `session_start` replaces
-	// it with the mode's own surface through `applyTaskToolSurface`.
-	registerBashTool("compat");
-
+	// `bash` and `bg_task` are declared at `session_start`, once the mode is known.
 	registerAll(pi, registrationDeps);
 	// `bash` and `bg_task` carry the intent argument (the declaration above and
 	// `registerBgTaskTool`). A model-issued call that omits a required intent is

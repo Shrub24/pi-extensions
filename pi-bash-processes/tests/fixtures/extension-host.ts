@@ -81,6 +81,8 @@ export interface ExtensionHost { /** Temp root holding the agent dir, home, task
 	dispatch(event: string, payload?: unknown): Promise<unknown[]>;
 	/** `bg_task list` tasks, as the model would see them. */
 	listTasks(): Promise<Record<string, any>[]>;
+	/** The operator's `/bg clear`: forgets finished tasks, keeping assignment-owned results nobody received. */
+	clearFinished(): Promise<void>;
 	/** The names Pi declares to the model, in registration order. */
 	activeTools(): string[];
 	/** Every registered tool, whether active or not, as Pi reports it. */
@@ -104,15 +106,16 @@ export interface ExtensionHost { /** Temp root holding the agent dir, home, task
 	 * returning with the precondition unmet.
 	 */
 	settledTask(id: string, budgetMs?: number): Promise<Record<string, any>>;
+	/** Resolves once the task has left `running`, certified capture or not. */
+	closedTask(id: string, budgetMs?: number): Promise<Record<string, any>>;
 	dispose(): Promise<void>;
 }
 
 export interface ExtensionHostOptions { /** Package settings merged over the host defaults. */
 	settings?: Record<string, unknown>;
 	/**
-	 * The session mode Pi reports on `ctx.mode`. Defaults to `"print"`, the
-	 * conservative compatibility mode, so a test opts in to the TUI surface
-	 * explicitly instead of inheriting it.
+	 * The session mode Pi reports on `ctx.mode`. Defaults to `"tui"`, the only
+	 * mode that declares any tool; a test of another mode passes it explicitly.
 	 */
 	mode?: string;
 	/**
@@ -178,6 +181,7 @@ export async function startExtensionHost(options: ExtensionHostOptions = {}): Pr
 			else process.env[key] = value; } };
 
 	const handlers = new Map<string, ((event: unknown, ctx: ExtensionContext) => unknown)[]>();
+	const commandHandlers = new Map<string, (args: string, ctx: ExtensionContext) => unknown>();
 	const tools = new Map<string, HostTool>();
 	const messages: unknown[][] = [];
 	const userMessages: unknown[][] = [];
@@ -188,7 +192,7 @@ export async function startExtensionHost(options: ExtensionHostOptions = {}): Pr
 	const entriesForBranch: unknown[] = [];
 	const ctx = { cwd,
 		hasUI: false,
-		mode: options.mode ?? "print",
+		mode: options.mode ?? "tui",
 		isIdle: () => idleFn(),
 		isProjectTrusted: () => true,
 		hasPendingMessages: () => false,
@@ -213,7 +217,7 @@ export async function startExtensionHost(options: ExtensionHostOptions = {}): Pr
 				sourceInfo: { extensionPath: PACKAGE_ID, source: "extension" }, })),
 		setActiveTools: (names: string[]) => registry.setActiveTools(names),
 		refreshTools: () => registry.refresh(),
-		registerCommand() {},
+		registerCommand(name: string, command: { handler(args: string, ctx: ExtensionContext): unknown }) { commandHandlers.set(name, command.handler); },
 		registerShortcut() {},
 		registerMessageRenderer() {},
 		on(event: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) { const registered = handlers.get(event) ?? [];
@@ -268,6 +272,7 @@ export async function startExtensionHost(options: ExtensionHostOptions = {}): Pr
 		setIdle: (isIdle: () => boolean) => { idleFn = isIdle; },
 		dispatch,
 		listTasks: readTasks,
+		clearFinished: async () => { await commandHandlers.get("bg")?.("clear", ctx); },
 		activeTools: () => registry.getActiveTools(),
 		allTools: () =>
 			registry.getAllTools().map((tool) => ({ actionEnum: declaredActionEnum(tool),
@@ -280,6 +285,11 @@ export async function startExtensionHost(options: ExtensionHostOptions = {}): Pr
 			for (;;) { const task = (await readTasks()).find((candidate) => candidate.id === id);
 				if (task && task.status !== "running" && task.resultReady === true) return task;
 				if (Date.now() >= deadline) { throw new Error(`task ${id} did not reach a certified terminal record within ${budgetMs}ms: ${JSON.stringify(task ?? null)}`); }
+				await Bun.sleep(5); } },
+		async closedTask(id, budgetMs = 20_000) { const deadline = Date.now() + budgetMs;
+			for (;;) { const task = (await readTasks()).find((candidate) => candidate.id === id);
+				if (task && task.status !== "running") return task;
+				if (Date.now() >= deadline) { throw new Error(`task ${id} did not close within ${budgetMs}ms: ${JSON.stringify(task ?? null)}`); }
 				await Bun.sleep(5); } },
 		async dispose() { try { await dispatch("session_shutdown"); } finally { restoreEnv();
 				rmSync(root, { recursive: true, force: true }); } }, };

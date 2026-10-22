@@ -2,7 +2,7 @@ import { afterAll, expect, test } from "bun:test";
 import { readFileSync, rmSync } from "node:fs";
 
 import { startExtensionHost, type HostTool } from "./fixtures/extension-host.js";
-import { registerAll, type RegistrationDeps } from "../extensions/registrations.js";
+import { registerAll, registerBgTaskTool, type RegistrationDeps } from "../extensions/registrations.js";
 
 // The declared tool surface for `get` and `stop`: the same prepared result, the
 // same commit rule, and the same confirmed-termination procedure the `pi-bg` CLI
@@ -248,7 +248,6 @@ function toolWithStop(deps: Partial<RegistrationDeps>): HostTool {
 	} as never;
 	const base: RegistrationDeps = {
 		backgroundBashShortcut: "none",
-		clearFinishedTasks: () => 0,
 		consumeObservedExitWake: () => false,
 		dashboardDeps: {
 			getActiveTaskId: () => null,
@@ -261,7 +260,6 @@ function toolWithStop(deps: Partial<RegistrationDeps>): HostTool {
 		formatTaskListText: () => "",
 		getActiveCtx: () => null,
 		getTaskOutput: () => "",
-		oldestRunningTask: () => null,
 		readTaskResult: async () => {
 			throw new Error("an unconfirmed stop must not reach the result operation");
 		},
@@ -272,11 +270,11 @@ function toolWithStop(deps: Partial<RegistrationDeps>): HostTool {
 		similarRunningTasks: () => ({ identical: [], similar: [] }),
 		sortedTasks: () => [],
 		stopTaskConfirmed: async () => ({ confirmed: false, message: "bg-9 did not confirm termination within 5000ms" }),
-		waitForTask: async () => ({ content: [], details: {} }),
 		widgetToggleShortcut: "none",
 		...deps,
 	};
 	registerAll(stub, base);
+	registerBgTaskTool(stub, base);
 	return tools.get("bg_task")!;
 }
 

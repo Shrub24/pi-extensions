@@ -46,19 +46,16 @@ test("a finished command is retrievable, and its completion is acknowledged once
 	).toStrictEqual({ status: "completed", exitCode: 0, resultReady: true, exitNotified: true });
 
 	// Retrieval is repeatable and carries the final flushed bytes.
-	const first = await execute({ action: "log", id });
-	const second = await execute({ action: "log", id });
-	expect({ first: first.content[0]?.text, repeated: second.content[0]?.text === first.content[0]?.text }).toStrictEqual({
-		first: "alpha\nbeta\n",
-		repeated: true,
-	});
+	const first = await execute({ action: "get", id, output: "full" });
+	const second = await execute({ action: "get", id, output: "full" });
+	expect(first.content[0]?.text).toContain("\nalpha\nbeta\n");
+	expect(second.content[0]?.text).toContain("\nalpha\nbeta\n");
 	expect(exitWakes(), "a repeated retrieval never creates a second notification").toHaveLength(1);
 	expect((await listed(id))?.status, "and does not retire the handle").toBe("completed");
 
 	// A retained log that is gone is an explicit expiry error, not empty success.
 	rmSync(task!.logFile as string, { force: true });
-	const expired = await execute({ action: "log", id });
-	expect(expired.content[0]?.text).toContain("retained output is gone");
+	await expect(execute({ action: "get", id, output: "full" })).rejects.toThrow("retained output is gone");
 });
 
 test("a replacement run starts unacknowledged and unready, leaving the older snapshot intact", async () => {
@@ -92,17 +89,19 @@ test("a replacement run starts unacknowledged and unready, leaving the older sna
 		},
 		"every confirmed stop ends with a ready retained result",
 	).toStrictEqual({ first: { status: "stopped", ready: true }, second: { status: "stopped", ready: true } });
-	expect((await execute({ action: "log", id: second.id })).details.action, "and its output stays retrievable under the same id").toBe("log");
+	expect((await execute({ action: "get", id: second.id })).details.action, "and its output stays retrievable under the same id").toBe("get");
 });
 
 test("the hard process ceiling is immutable across retrieval, listing, and the legacy soft reset", async () => {
 	const bounded = spawned(await execute({ action: "spawn", command: "sleep 30", timeoutSeconds: 3_600 }));
-	await execute({ action: "log", id: bounded.id });
 	await execute({ action: "list" });
 	expect(
 		{ hard: (await listed(bounded.id))?.expiresAt, soft: (await listed(bounded.id))?.softExpiresAt },
-		"neither a retrieval nor a listing moves either deadline",
+		"a listing moves neither deadline",
 	).toStrictEqual({ hard: bounded.expiresAt, soft: bounded.softExpiresAt });
+	// A get is a review, so it restarts the soft interval; the hard ceiling is the spawn's.
+	await execute({ action: "get", id: bounded.id });
+	expect((await listed(bounded.id))?.expiresAt, "a retrieval never moves the hard ceiling").toBe(bounded.expiresAt);
 
 	const extended = await execute({ action: "extend", id: bounded.id, softTimeoutMs: 120_000 });
 	const afterExtend = await listed(bounded.id);
@@ -112,7 +111,7 @@ test("the hard process ceiling is immutable across retrieval, listing, and the l
 	expect(afterExtend?.softExpiresAt, "the new window is a fresh interval, not the old deadline").not.toBe(bounded.softExpiresAt);
 
 	const unbounded = spawned(await execute({ action: "spawn", command: "sleep 30", timeoutSeconds: 0 }));
-	await execute({ action: "log", id: unbounded.id });
+	await execute({ action: "get", id: unbounded.id });
 	await execute({ action: "list" });
 	expect((await listed(unbounded.id))?.expiresAt, "a task with no configured ceiling never acquires one").toBeNull();
 
@@ -174,7 +173,7 @@ test("repeated inspection never moves the absolute hard limit", async () => {
 
 	// A `get` storm across the deadline: the ceiling is the spawn's, not the
 	// inspection's.
-	await execute({ action: "log", id: task.id });
+	await execute({ action: "get", id: task.id });
 	await untilSettled([task.id]);
 	const final = await listed(task.id);
 	expect(

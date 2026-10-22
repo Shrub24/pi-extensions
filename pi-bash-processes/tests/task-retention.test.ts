@@ -21,7 +21,7 @@ test("task logs follow the lane retention rule, and finished tasks are bounded a
 		// clear must never do is drop an owned result nobody received — see
 		// `assignment-evidence-retention.test.ts`.
 		logsAfterClear: 0,
-		longLog: { tail: true, head: false },
+		longLog: { tail: true },
 		unloggedLog: "late-output",
 		// session_shutdown releases the task map.
 		listedAfterShutdown: "No background tasks.",

@@ -1,7 +1,7 @@
 import { stableSnapshotFingerprint } from "./persistence.js";
 import type { BackgroundTaskSnapshot } from "./types.js";
 
-// `bg_task list` / `bg_status list` tool-result details land in Pi's
+// `bg_task list` tool-result details land in Pi's
 // append-only session JSONL independently of custom persistence entries. Large
 // fleets must therefore use a tiny manifest while sidecar state remains
 // canonical for restore. Acceptance target for bounded details is <=4 KiB.

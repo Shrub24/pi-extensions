@@ -72,15 +72,16 @@ const theme = { fg: (_color: string, text: string) => text, bold: (text: string)
 const widgetCounts = () => { const counts = frame.join("\n").match(/(\d+) running · (\d+) finished/);
 	return counts ? { running: Number(counts[1]), finished: Number(counts[2]) } : null;
 };
-const ctx = { cwd: process.cwd(), hasUI, isProjectTrusted: () => true,
+const ctx = { cwd: process.cwd(), hasUI, mode: "tui", isProjectTrusted: () => true,
 	sessionManager: { getSessionId: () => sessionId, getSessionFile: () => join(process.cwd(), "session.jsonl"), getBranch: () => branch },
 	ui: { notify() {},
 		setWidget(_key: string, factory?: (tui: unknown, theme: unknown) => Drawn) { widget = factory ? factory(tui, theme) : null;
 			draw(); }, },
 } as unknown as ExtensionContext;
+const commandHandlers = new Map<string, (args: string, ctx: ExtensionContext) => unknown>();
 const pi = { events: createEventBus(),
 	registerTool(tool: Tool) { tools.set(tool.name, tool); },
-	registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {},
+	registerCommand(name: string, command: { handler(args: string, ctx: ExtensionContext): unknown }) { commandHandlers.set(name, command.handler); }, registerShortcut() {}, registerMessageRenderer() {},
 	on(event: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) { events.set(event, handler); },
 	appendEntry: (...args: unknown[]) => entries.push(args),
 	sendMessage() { if (wakeLogFile) logsAtWake.push(existsSync(wakeLogFile) ? readFileSync(wakeLogFile, "utf8") : ""); },
@@ -181,7 +182,7 @@ try { const { default: backgroundTasks } = await import("../../extensions/backgr
 			await settle();
 			signals = [...native.signals];
 			native.releaseAppends();
-			await shutdown; } else if (input.during === "clear") { await execute({ action: "clear" });
+			await shutdown; } else if (input.during === "clear") { await commandHandlers.get("bg")?.("clear", ctx);
 			signals = [...native.signals];
 			native.releaseAppends();
 			// clear deletes the task's log once the held write has landed.
@@ -253,7 +254,7 @@ try { const { default: backgroundTasks } = await import("../../extensions/backgr
 		await execute({ action: "spawn", command: "fixture quick", notifyOnExit: false });
 		await settle();
 		native.children[0]!.emit("close", 0);
-		await execute({ action: "clear" });
+		await commandHandlers.get("bg")?.("clear", ctx);
 		const heldReads = native.heldProcReads();
 		native.releaseProcReads();
 		await settle();
@@ -270,7 +271,7 @@ try { const { default: backgroundTasks } = await import("../../extensions/backgr
 		await start;
 		result = { maxInFlight, probes }; } else { await dispatch("session_start");
 		const states = [];
-		for (const id of ["bg-1", "bg-2", "bg-3"]) { const task = (await execute({ action: "log", id })).details.task!;
+		for (const id of ["bg-1", "bg-2", "bg-3"]) { const task = (await execute({ action: "list" })).details.tasks.find((candidate: { id: string }) => candidate.id === id)!;
 			states.push({ id: task.id, status: task.status }); }
 		// Concurrent probes finish in any order; the multiset is the contract.
 		result = { probes: native.probeCalls.map(({ file, args }) => [file, ...args].join(" ")).sort(), states }; }

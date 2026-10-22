@@ -105,18 +105,14 @@ test(
 	await host.settledTask(orphanId);
 	await bgTask().execute("clear-orphan-get", { action: "get", id: orphanId });
 
-	const cleared = await bgTask().execute("clear-owned-run", { action: "clear" });
-	const text = cleared.content[0]?.text ?? "";
-	expect(text, "the clear still reports its removals").toContain("Removed");
-	expect(text, "and it names what it kept instead of hiding the skip").toContain("Kept 1");
+	await host.clearFinished();
 	expect(await listed(orphanId), "unassociated history clears").toBeUndefined();
 	expect(await listed(ownedId), "the owned unresolved result is kept").toBeTruthy();
 	expect((await listed(ownedId))?.resultResolution, "and stays unresolved").toBeUndefined();
 
 	// Retrieving it is the documented path to clearing it afterwards.
 	await bgTask().execute("clear-owned-get", { action: "get", id: ownedId });
-	const clearedAgain = await bgTask().execute("clear-owned-again", { action: "clear" });
-	expect(clearedAgain.content[0]?.text ?? "").toContain("Removed");
+	await host.clearFinished();
 	expect(await listed(ownedId), "a delivered result clears like any finished task").toBeUndefined();
 	},
 	60_000,

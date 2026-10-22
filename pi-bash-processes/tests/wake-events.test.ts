@@ -67,11 +67,11 @@ test("a completion wake names the task's outcome and the result it still owes", 
 	expect(sendTaskWake(deps, "exit", task, {})).toBe(true);
 	const content = String(messages.at(-1)?.message.content ?? "");
 	// A count or a bare "finished" is not enough: the reader has to be able to tell
-	// what the task did and that its result is still unread, and how to settle it.
+	// what the task did, and how to retrieve its result.
 	expect(content).toContain("bg-9 finished");
-	expect(content).toContain("bg-9 · exit 0 · result unretrieved");
+	expect(content).toContain("bg-9 · exit 0");
 	expect(content).toContain('bg_task action:"get" id: bg-9');
-	expect(content).toContain('bg_task action:"clear" ids:["bg-9"]');
+	expect(content).not.toContain("clear");
 });
 
 test("wake payload retained content", () => {

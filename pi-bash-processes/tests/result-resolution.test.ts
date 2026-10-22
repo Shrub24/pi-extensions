@@ -125,7 +125,8 @@ test("an unrecoverable capture error delivered through the tool and the CLI reso
 
 	// Bounded-wait path: the centralized rule can only deliver an incomplete
 	// capture as an error, never as a successful terminal result.
-	const waited = await bgTask().execute("resolution-err-wait", { action: "wait", id: "bg-902", waitSeconds: 5 }, undefined, undefined, host.ctx);
+	await host.closedTask("bg-902");
+	const waited = await bgTask().execute("resolution-err-wait", { action: "get", id: "bg-902" });
 	expect(waited.content[0]?.text ?? "").toContain("bg-902");
 	expect((await listed("bg-902"))?.resultResolution, "the wait delivered an unrecoverable capture as an error").toBe("error");
 	expect((await listed("bg-902"))?.exitNotified, "the wait is a result handoff, not a host notification").toBe(false);
@@ -134,7 +135,8 @@ test("an unrecoverable capture error delivered through the tool and the CLI reso
 	// record says resultReady but outputComplete false): the wait's early
 	// branch still routes through the centralized rule and can only deliver
 	// it as an error — terminal by latch, uncertified by integrity.
-	const latched = await bgTask().execute("resolution-err-wait-latched", { action: "wait", id: "bg-903", waitSeconds: 5 }, undefined, undefined, host.ctx);
+	await host.closedTask("bg-903");
+	const latched = await bgTask().execute("resolution-err-wait-latched", { action: "get", id: "bg-903" });
 	expect(latched.content[0]?.text ?? "").toContain("bg-903");
 	expect((await listed("bg-903"))?.resultResolution, "an uncertified terminal capture is delivered as an error").toBe("error");
 	expect((await listed("bg-903"))?.exitNotified).toBe(false);
@@ -186,7 +188,8 @@ test("a running inspection resolves nothing; the bounded wait's terminal result 
 		{ taskId: id, state: "running", reason: expect.stringContaining("spawned under this assignment") },
 	]);
 
-	const waited = await bgTask().execute("resolution-wait-wait", { action: "wait", id, waitSeconds: 20 }, undefined, undefined, host.ctx);
+	await host.closedTask(id);
+	const waited = await bgTask().execute("resolution-wait-wait", { action: "get", id });
 	expect(waited.content[0]?.text ?? "").toContain(id);
 	expect((await listed(id))?.resultResolution, "the wait's terminal result was an actual delivery").toBe("delivered");
 	expect(outstandingOf("req-n")).toStrictEqual([]);
@@ -274,11 +277,12 @@ const blockNewLogs = (laneDir: string): (() => void) => {
 	};
 };
 
-test("a bounded wait delivers the terminal result only after the log's flush barrier settles", async () => {
+test("a get delivers the terminal result only after the log's flush barrier settles", async () => {
 	expect(bindBackgroundWorkAssignment(host.events, scope("req-flush"))).toStrictEqual({ state: "bound" });
 	const spawned = await bgTask().execute("resolution-flush", { action: "spawn", command: "printf 'flush-barrier\\n'" });
 	const id = (spawned.details.task as { id: string }).id;
-	const waited = await bgTask().execute("resolution-flush-wait", { action: "wait", id, waitSeconds: 20 }, undefined, undefined, host.ctx);
+	await host.closedTask(id);
+	const waited = await bgTask().execute("resolution-flush-wait", { action: "get", id });
 	expect(waited.content[0]?.text ?? "").toContain(id);
 	// The wait attaches while the process runs, so it owns this exit and is
 	// released only inside finalizeTask's settle() — after
@@ -291,7 +295,7 @@ test("a bounded wait delivers the terminal result only after the log's flush bar
 	expect(outstandingOf("req-flush"), "the delivery retires the assignment's waiting").toStrictEqual([]);
 });
 
-test("a bounded wait whose log can never settle delivers the capture as an error, never a result", async () => {
+test("a get whose log can never settle delivers the capture as an error, never a result", async () => {
 	expect(bindBackgroundWorkAssignment(host.events, scope("req-flushfail"))).toStrictEqual({ state: "bound" });
 	// spawnTask pre-creates the log file; making it read-only the moment it
 	// appears means every append the writer attempts fails, so the chain ends
@@ -300,7 +304,8 @@ test("a bounded wait whose log can never settle delivers the capture as an error
 	try {
 		const spawned = await bgTask().execute("resolution-flushfail", { action: "spawn", command: "sleep 0.15; printf 'one\\n'; sleep 0.15; printf 'tail\\n'" });
 		const id = (spawned.details.task as { id: string }).id;
-		const waited = await bgTask().execute("resolution-flushfail-wait", { action: "wait", id, waitSeconds: 20 }, undefined, undefined, host.ctx);
+		await host.closedTask(id);
+		const waited = await bgTask().execute("resolution-flushfail-wait", { action: "get", id });
 		expect(waited.content[0]?.text ?? "").toContain(id);
 		// The barrier settled the process's fate but not the capture's
 		// integrity: readiness is terminal, outputComplete false, so the

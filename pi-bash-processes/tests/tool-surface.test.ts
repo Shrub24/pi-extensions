@@ -1,17 +1,18 @@
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 
-import { applyTaskToolSurface, bashPromptGuidelines, registerAll, type RegistrationDeps } from "../extensions/registrations.js";
-import { BASH_TASK_GUIDELINES, taskSurfaceGuidance, wakeTaskLine } from "../extensions/tool-surface.js";
+import { bashPromptGuidelines, registerAll, registerBgTaskTool, type RegistrationDeps } from "../extensions/registrations.js";
+import { BASH_TASK_GUIDELINES, BG_TASK_ACTIONS, retrievalHint, TASK_GUIDANCE, wakeTaskLine } from "../extensions/tool-surface.js";
+import { startExtensionHost } from "./fixtures/extension-host.js";
 import { createToolRegistry, declaredActionEnum, declaredSchemaText } from "./fixtures/tool-surface-harness.js";
 
-// Task 4.1: the declared surface for each session mode.
+// The declared surface. Background tasks exist only in the interactive TUI, with
+// one `bg_task` whose action set is spawn/get/stop/list/extend. Every other mode
+// declares nothing and keeps Pi's own bash.
 //
 // The assertion target is the effective registry and prompt, not the TypeBox
 // literal a tool was handed: `createToolRegistry` is the model of Pi's real
-// activation and prompt-assembly rules (see the fixture for the host citations),
-// and every row below reads the answer back out of it. A real boot is verified
-// separately by the fresh-host check.
+// activation and prompt-assembly rules (see the fixture for the host citations).
 
 const unused = () => {
 	throw new Error("surface test reached an unrelated operation");
@@ -34,8 +35,6 @@ const deps = (): RegistrationDeps =>
 		spawnTask: unused,
 		similarRunningTasks: unused,
 		recentlyFinishedTasks: unused,
-		oldestRunningTask: unused,
-		waitForTask: unused,
 		consumeObservedExitWake: unused,
 		clearFinishedTasks: unused,
 		armForcedBackground: unused,
@@ -53,8 +52,8 @@ const deps = (): RegistrationDeps =>
 		widgetToggleShortcut: "none",
 	}) as unknown as RegistrationDeps;
 
-/** A host whose registry is the real activation model, driven like Pi drives it. */
-function surfaceFor(mode: string | undefined, options: { activeTools?: string[]; excludedTools?: string[] } = {}) {
+/** A registry driven like Pi drives it, with the tool declared as `session_start` declares it. */
+function surface(options: { activeTools?: string[]; excludedTools?: string[] } = {}) {
 	const registry = createToolRegistry(options);
 	const pi = {
 		registerTool(tool: { name: string }) {
@@ -64,176 +63,102 @@ function surfaceFor(mode: string | undefined, options: { activeTools?: string[];
 		registerShortcut() {},
 	} as never;
 	const registrationDeps = deps();
-	// What the extension does at load, before the mode is known.
 	registerAll(pi, registrationDeps);
-	const atLoad = { active: registry.getActiveTools(), names: registry.getAllTools().map((tool) => tool.name) };
-	// What it does again from `session_start`, when ctx.mode is known.
-	const surface = applyTaskToolSurface(pi, registrationDeps, mode);
-	return { registry, surface, atLoad };
+	const atLoad = { names: registry.getAllTools().map((tool) => tool.name) };
+	registerBgTaskTool(pi, registrationDeps);
+	return { registry, atLoad };
 }
 
-const toolNamed = (registry: ReturnType<typeof createToolRegistry>, name: string) =>
-	registry.getAllTools().find((tool) => tool.name === name);
+const bgTask = (registry: ReturnType<typeof createToolRegistry>) => registry.getAllTools().find((tool) => tool.name === "bg_task")!;
 
-test("only the interactive TUI is narrowed; every other mode keeps the compatibility surface", () => {
-	const rows = [
-		{ mode: "tui", expected: "tui" },
-		{ mode: "print", expected: "compat" },
-		{ mode: "json", expected: "compat" },
-		{ mode: "rpc", expected: "compat" },
-		// The installed mode union has no `"unknown"` member, so this is the
-		// runtime guard a mode this build does not know falls into.
-		{ mode: "future-mode", expected: "compat" },
-		{ mode: undefined, expected: "compat" },
-	];
-	for (const row of rows) {
-		expect(surfaceFor(row.mode).surface, `mode ${String(row.mode)}`).toBe(row.expected);
+/** The text the model is given: the available-tool lines and every guideline. */
+function promptText(): string {
+	const prompt = surface().registry.systemPromptSurface();
+	return [...prompt.availableTools, ...prompt.guidelines].join("\n");
+}
+
+test("loading the extension declares no tool; the mode decides at session_start", () => {
+	expect(surface().atLoad.names).toStrictEqual([]);
+});
+
+test("the TUI declares exactly one tool with exactly five actions", () => {
+	const { registry } = surface();
+	expect(registry.getAllTools().map((tool) => tool.name)).toStrictEqual(["bg_task"]);
+	expect(declaredActionEnum(bgTask(registry))).toStrictEqual([...BG_TASK_ACTIONS]);
+	expect([...BG_TASK_ACTIONS]).toStrictEqual(["spawn", "get", "stop", "list", "extend"]);
+});
+
+test("a session that is not the TUI declares no bash and no bg_task", async () => {
+	for (const mode of ["print", "json", "rpc", "future-mode"]) {
+		const host = await startExtensionHost({ mode });
+		try {
+			expect(host.allTools().map((tool) => tool.name), `${mode}: nothing is declared`).toStrictEqual([]);
+		} finally {
+			await host.dispose();
+		}
 	}
 });
 
-test("bg_status is never registered at load, and only the compatibility modes register it at all", () => {
-	// At load the mode is unknown, so the conservative surface is declared — and
-	// `bg_status` is deliberately absent, because a mode that must not expose it
-	// can then never have to remove a definition it already declared.
-	const tui = surfaceFor("tui");
-	expect(tui.atLoad.names, "load registers bg_task only").toStrictEqual(["bg_task"]);
-	expect(tui.registry.getAllTools().map((tool) => tool.name), "TUI never registers bg_status").toStrictEqual(["bg_task"]);
-
-	const compat = surfaceFor("print");
-	expect(compat.registry.getAllTools().map((tool) => tool.name).sort()).toStrictEqual(["bg_status", "bg_task"]);
-});
-
-test("the declared action enum is exactly the five TUI actions, and the full set everywhere else", () => {
-	const tui = surfaceFor("tui");
-	expect(declaredActionEnum(toolNamed(tui.registry, "bg_task")!)).toStrictEqual(["spawn", "get", "stop", "list", "extend"]);
-
-	const compat = surfaceFor("print");
-	expect(declaredActionEnum(toolNamed(compat.registry, "bg_task")!)).toStrictEqual([
-		"spawn",
-		"list",
-		"log",
-		"get",
-		"stop",
-		"clear",
-		"wait",
-		"extend",
-	]);
-});
-
-test("the TUI prompt never recommends bg_status or the bounded wait, and no mode's prompt names an absent tool", () => {
-	const cases = [
-		{ mode: "tui", forbiddenTools: ["bg_status"] },
-		{ mode: "print", forbiddenTools: [] as string[] },
-		{ mode: "json", forbiddenTools: [] as string[] },
-		{ mode: "rpc", forbiddenTools: [] as string[] },
-		{ mode: "future-mode", forbiddenTools: [] as string[] },
-	];
-	for (const testCase of cases) {
-		const { registry, surface } = surfaceFor(testCase.mode);
-		const prompt = registry.systemPromptSurface();
-		const text = [...prompt.availableTools, ...prompt.guidelines].join("\n");
-		const active = registry.getActiveTools();
-		// Every tool named by the prompt must actually be declared and active here;
-		// the reverse is what the per-mode rows below pin.
-		for (const name of ["bg_task", "bg_status"]) {
-			const named = text.includes(name);
-			expect(named, `${testCase.mode}: the prompt names ${name} only when it is active`).toBe(active.includes(name));
-		}
-		for (const forbidden of testCase.forbiddenTools) {
-			expect(text, `${testCase.mode}: the prompt must not name ${forbidden}`).not.toContain(forbidden);
-		}
-		if (surface === "tui") {
-			expect(text, "TUI guidance must not recommend the absent bounded wait").not.toContain('action:"wait"');
-			expect(text, "TUI guidance must not name the absent status tool").not.toContain("bg_status");
-			expect(text, "TUI guidance must not offer compatibility-wait advice").not.toContain("noninteractive or child caller");
-			expect(text, "TUI guidance recommends ending the turn for the wake").toContain("end the turn");
-		} else {
-			expect(text, "compatibility guidance names the retained bounded wait").toContain('action:"wait"');
-			expect(text, "compatibility guidance names what the wait is for").toContain("noninteractive or child caller");
-		}
+test("the prompt recommends ending the turn and names no operation the surface lacks", () => {
+	const text = promptText();
+	expect(text).toContain("end the turn");
+	expect(text).toContain("completion always wakes you");
+	expect(text).toContain("about its expected duration");
+	for (const absent of ["bg_status", 'action:"wait"', "bg_task clear", "bg_task log", "noninteractive or child caller"]) {
+		expect(text, `the prompt must not name ${absent}`).not.toContain(absent);
 	}
 });
 
 test("the coupled bash/bg_task contract is contributed once from one shared rule set", () => {
-	for (const mode of ["tui", "print"] as const) {
-		const { registry } = surfaceFor(mode);
-		const prompt = registry.systemPromptSurface();
-		const text = [...prompt.availableTools, ...prompt.guidelines].join("\n");
-		for (const rule of BASH_TASK_GUIDELINES) {
-			expect(text, `${mode}: shared rule is present`).toContain(rule);
-			expect(text.split(rule).length - 1, `${mode}: shared rule appears once`).toBe(1);
-		}
+	const text = promptText();
+	for (const rule of BASH_TASK_GUIDELINES) {
+		expect(text, "shared rule is present").toContain(rule);
+		expect(text.split(rule).length - 1, "shared rule appears once").toBe(1);
 	}
 	// The bash tool itself carries no competing copy of the shared feature rules.
 	for (const rule of BASH_TASK_GUIDELINES) expect(bashPromptGuidelines().join("\n")).not.toContain(rule);
 });
 
-test("the declared parameter schema never names an action the same schema does not declare", () => {
-	const tui = surfaceFor("tui");
-	const tuiSchema = declaredSchemaText(toolNamed(tui.registry, "bg_task")!);
-	for (const absent of ['action=log', 'action=wait', "action=\"log\"", 'waitSeconds', 'action="wait"']) {
-		expect(tuiSchema, `the TUI schema must not name ${absent}`).not.toContain(absent);
+test("the declared parameter schema names no action the surface does not declare", () => {
+	const schema = declaredSchemaText(bgTask(surface().registry));
+	for (const absent of ["action=log", "action=wait", "action=clear", "waitSeconds", "taskWaitDefaultSeconds", "ids"]) {
+		expect(schema, `the schema must not name ${absent}`).not.toContain(absent);
 	}
-	// `extend` is declared in the TUI now, so its action and its parameter are named.
-	expect(tuiSchema, "the TUI schema names the extend action it declares").toContain("action=extend");
-	// The properties that exist only for those actions are not declared either.
-	expect(tuiSchema, "the TUI schema declares no bounded wait window").not.toContain("taskWaitDefaultSeconds");
-	expect(tuiSchema, "the TUI schema names the actions it does declare").toContain("action=get");
+	for (const present of ["action=get", "action=extend", "action=stop"]) expect(schema, `the schema names ${present}`).toContain(present);
+});
 
-	// The compatibility schema keeps every field and description it had.
-	const compat = declaredSchemaText(toolNamed(surfaceFor("print").registry, "bg_task")!);
-	for (const present of ["action=log", "action=wait", "action=extend", "waitSeconds", "taskWaitDefaultSeconds"]) {
-		expect(compat, `the compatibility schema keeps ${present}`).toContain(present);
+test("an explicit tool selection is preserved", () => {
+	expect(surface().registry.getActiveTools()).toStrictEqual(["bg_task"]);
+	expect(surface({ excludedTools: ["bg_task"] }).registry.getAllTools().map((tool) => tool.name)).toStrictEqual([]);
+	const { registry } = surface();
+	// A user or another extension narrowed the set, exactly as `setActiveTools` allows.
+	registry.setActiveTools([]);
+	expect(registry.getActiveTools()).toStrictEqual([]);
+});
+
+test("the soft reminder offers the extend lever the surface declares, and no get on a running task", () => {
+	expect(TASK_GUIDANCE.softReminderChoices).toContain('bg_task action:"extend"');
+	expect(TASK_GUIDANCE.softReminderChoices, "continuing repeats the same interval").toContain("same interval");
+	expect(TASK_GUIDANCE.softReminderChoices).toContain("end your turn");
+	for (const advice of [TASK_GUIDANCE.softReminderChoices, TASK_GUIDANCE.duplicateRunning, TASK_GUIDANCE.similarRunning]) {
+		expect(advice).not.toContain('action:"get"');
 	}
 });
 
-test("an explicit tool selection is preserved, including one that excludes the late tool", () => {
-	// No selection: the late registration activates through the ordinary path.
-	const open = surfaceFor("print");
-	expect(open.registry.getActiveTools()).toContain("bg_status");
-
-	// A selection that NAMES the tool: it is registered late, after the allowlist
-	// was applied, and must still be honoured.
-	const named = surfaceFor("json", { activeTools: ["bg_task", "bg_status"] });
-	expect(named.registry.getActiveTools().sort()).toStrictEqual(["bg_status", "bg_task"]);
-
-	// A selection that OMITS it: late registration must not force it on.
-	const omitted = surfaceFor("json", { activeTools: ["bg_task"] });
-	expect(omitted.registry.getActiveTools()).toStrictEqual(["bg_task"]);
-
-	// An exclusion is honoured too: the tool is not even registered.
-	const excluded = surfaceFor("print", { excludedTools: ["bg_status"] });
-	expect(excluded.registry.getAllTools().map((tool) => tool.name)).toStrictEqual(["bg_task"]);
-});
-
-test("a pre-existing active selection survives the mode surface being applied", () => {
-	const { registry } = surfaceFor("print");
-	// A user or another extension narrowed the set before/after load, exactly as
-	// `setActiveTools` allows; applying the surface must not widen it back.
-	registry.setActiveTools(["bg_task"]);
-	expect(registry.getActiveTools()).toStrictEqual(["bg_task"]);
+test("a wake line states the task and its exit code, and the retrieval instruction is stated once", () => {
+	expect(wakeTaskLine({ id: "bg-7", status: "completed", exitCode: 0 })).toBe("bg-7 · exit 0");
+	expect(wakeTaskLine({ id: "bg-8", status: "running" })).toBe("bg-8 · still running");
+	expect(wakeTaskLine({ id: "bg-9", status: "completed", exitCode: null })).toBe("bg-9 · ended without an exit code");
+	expect(retrievalHint("bg-7")).toBe('Retrieve its result with bg_task action:"get" id: bg-7.');
+	expect(retrievalHint()).toBe('Retrieve a result with bg_task action:"get" id: <id>.');
+	for (const text of [promptText(), JSON.stringify(TASK_GUIDANCE), retrievalHint("bg-7")]) expect(text).not.toContain("clear");
 });
 
 /**
- * The soft reminder the TUI now receives names the `extend` lever the surface
- * declares, so the agent can re-arm the interval instead of only choosing it at
- * spawn. `wake-events.ts` renders this field, so the wake text and the schema
- * cannot disagree about the operation that exists.
- */
-test("the TUI soft reminder offers the extend lever its surface declares", () => {
-	const choices = taskSurfaceGuidance("tui").softReminderChoices;
-	expect(choices).toContain('bg_task action:"extend"');
-	expect(choices, "the reminder states that continuing repeats the same interval").toContain("same interval");
-});
-
-
-
-/**
- * Task 4.2: an exact-literal audit over every model-facing and transcript-facing
- * text surface, so a live log path cannot creep back in by prose. The structured
- * task snapshot keeps `logFile` as machine metadata (asserted in
- * `tests/log-tool-result-bounds.test.ts`); what this checks is that no *text*
- * invites a read of it.
+ * An exact-literal audit over every model-facing and transcript-facing text
+ * surface, so a live log path cannot creep back in by prose. The structured task
+ * snapshot keeps `logFile` as machine metadata; what this checks is that no
+ * *text* invites a read of it.
  */
 test("no model-facing text advertises the mutable live log path as the retrieval route", () => {
 	const advertising = [
@@ -252,115 +177,45 @@ test("no model-facing text advertises the mutable live log path as the retrieval
 		"../extensions/auto-background.ts",
 		"../extensions/wake-events.ts",
 		"../extensions/managed-bash.ts",
-		"../extensions/task-wait.ts",
 		"../extensions/format.ts",
 		"../extensions/render.ts",
 	];
-	for (const surface of surfaces) {
-		const source = readFileSync(new URL(surface, import.meta.url), "utf8");
+	for (const path of surfaces) {
+		const source = readFileSync(new URL(path, import.meta.url), "utf8");
 		for (const pattern of advertising) {
-			expect(source, `${surface} must not advertise a live log: ${pattern}`).not.toMatch(pattern);
+			expect(source, `${path} must not advertise a live log: ${pattern}`).not.toMatch(pattern);
 		}
 	}
 	// The only path a full read may advertise is the immutable artifact, which is
 	// a different field from the task snapshot's live `logFile`.
 	const registrations = readFileSync(new URL("../extensions/registrations.ts", import.meta.url), "utf8");
 	expect(registrations, "the full read names the artifact").toContain("fullOutputPath: truncateForTranscript(handoff.artifact.path");
-	expect(registrations, "the raw log action advertises no path at all").not.toContain("fullOutputPath: truncateForTranscript(task.logFile");
 
-	// An action the narrowed surface does not declare may not be recommended from
-	// text that a TUI session can receive. These producers all read the resolved
-	// surface; naming a fixed action is how this regressed.
-	const actionProducers = [
-		"../extensions/wake-events.ts",
-		"../extensions/auto-background.ts",
-		"../extensions/managed-bash.ts",
-	];
-	for (const producer of actionProducers) {
+	// Text producers name only declared operations; naming a fixed raw-log action is how this regressed.
+	for (const producer of ["../extensions/wake-events.ts", "../extensions/auto-background.ts", "../extensions/managed-bash.ts"]) {
 		const source = readFileSync(new URL(producer, import.meta.url), "utf8");
-		expect(source, `${producer} must resolve its surface`).toContain("tool-surface.js");
-		expect(source, `${producer} must not hard-code a narrowed-away raw log action`).not.toMatch(/bg_task log/);
+		expect(source, `${producer} must not hard-code a raw log action`).not.toMatch(/bg_task log/);
 	}
 });
 
-/**
- * Task 4.5 also covers the written surfaces: the fork delta may not advertise a
- * mechanism that no longer exists, the mode split has to be stated where a
- * maintainer and an operator will look, and the changelog has to record both the
- * surface switch and the retirement. These are the documents the repo ships.
- */
-test("the shipped documents describe the mode surface and the retired mechanisms", () => {
+test("the shipped documents describe the single TUI-only surface and the retired mechanisms", () => {
 	const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8");
 	const development = readFileSync(new URL("../DEVELOPMENT.md", import.meta.url), "utf8");
 	const changelog = readFileSync(new URL("../CHANGELOG.md", import.meta.url), "utf8");
 
-	// The mode split is stated in the consumer docs and the maintainer notes.
 	expect(readme, "the README states the TUI action set").toContain("`spawn/get/stop/list/extend`");
-	expect(readme, "the README states the compatibility surface").toContain("`bg_status`");
+	expect(readme, "the README states other modes are unsupported").toContain("declares no tools");
 	expect(development, "the maintainer notes name the single surface module").toContain("extensions/tool-surface.ts");
-	expect(development, "and say why it is declared at session_start").toContain("never at factory load");
+	expect(development, "and say the tools are declared at session_start").toContain("declared at\n  `session_start`");
 
-	// The retired mechanisms are described as retired, not as still present.
 	const forkDelta = readme.slice(readme.indexOf("## Fork delta"));
 	for (const retired of ["read shim (`read-shim.ts`)", "sleep-as-wait interception", "consume logs"]) {
 		expect(forkDelta, `the fork delta records ${retired} as retired`).toContain(retired);
 	}
-	expect(forkDelta, "and says so").toContain("retired");
 	expect(readme, "the CLI helpers are stated as removed").toContain("are **removed**");
-	expect(forkDelta, "the fork delta no longer claims the shim is present").not.toMatch(/a read shim \(`read-shim\.ts`\) so a log read/);
 
-	// The changelog records the consumer-visible contract changes.
 	const unreleased = changelog.slice(changelog.indexOf("### Unreleased"), changelog.indexOf("### 2.1.1"));
-	expect(unreleased, "the surface switch is recorded").toContain("session mode");
+	expect(unreleased, "the TUI-only change is recorded").toContain("TUI-only");
 	expect(unreleased, "the acknowledgment change is recorded").toContain("no longer acknowledges its completion");
 	expect(unreleased, "and the migration is named").toContain("pi-bg get <task-id> [--output]");
-});
-
-/**
- * The TUI declares no `clear`, so no TUI prompt or wake may name it. Repeated
- * `clear` calls were the largest source of rejected `bg_task` calls, because
- * the wake text told the agent to dismiss a finished task with an action its
- * schema does not have.
- */
-test("the TUI never names clear, in its wake line or its prompt", () => {
-	const tui = taskSurfaceGuidance("tui");
-	const line = wakeTaskLine({ id: "bg-7", status: "finished", exitCode: 0 }, tui);
-	expect(line).toContain('bg_task action:"get" id: bg-7');
-	expect(line).not.toContain("clear");
-	expect(line).not.toContain("dismiss");
-	const prompt = promptText("tui");
-	expect(prompt).not.toContain("clear");
-	expect(JSON.stringify(tui)).not.toContain("clear");
-});
-
-/**
- * A running task is not read to wait for it: the TUI's reminder and running
- * advice point at ending the turn, not at a `get` that hands over a partial
- * result. Compatibility surfaces keep their own wording.
- */
-test("the TUI reminder and duplicate advice do not invite get on a running task", () => {
-	const tui = taskSurfaceGuidance("tui");
-	expect(tui.softReminderChoices).not.toContain('action:"get"');
-	expect(tui.duplicateRunning).not.toContain('action:"get"');
-	expect(tui.similarRunning).not.toContain('action:"get"');
-	expect(tui.softReminderChoices).toContain("end your turn");
-	expect(taskSurfaceGuidance("compat").softReminderChoices).toContain('action:"get"');
-});
-
-/** The text a mode's model is given: the available-tool lines and every guideline. */
-function promptText(mode: string): string {
-	const { registry } = surfaceFor(mode);
-	const prompt = registry.systemPromptSurface();
-	return [...prompt.availableTools, ...prompt.guidelines].join("\n");
-}
-
-/**
- * The soft reminder explains what softTimeoutMs controls, so agents set it to a
- * build's expected length without treating it as the completion signal.
- */
-test("the TUI guidance says softTimeoutMs only paces reminders, and names the build case", () => {
-	const guidelines = promptText("tui");
-	expect(guidelines).toContain("completion always wakes you");
-	expect(guidelines).toContain("about its expected duration");
-	expect(guidelines).not.toContain("bg_task clear");
 });

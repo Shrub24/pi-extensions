@@ -28,9 +28,10 @@ persistence rollout, and the compatibility phase-out.
 - A finished task arms no review interval. A result still unretrieved at a later
   idle than the one its wake started gets one advisory, with no turn, persisted as
   `resultReminded`. Soft-timeout reminders are running-task only.
-- Next, as its own change: one TUI-only tool surface (spawn/get/stop/list/extend);
-  non-TUI modes register no managed bash, `bg_task` or `bg_status` and use Pi's
-  built-in bash. This removes `clear`, `wait`, `bg_status` and the wait machinery.
+- One TUI-only tool surface (spawn/get/stop/list/extend), landed with it: other
+  modes declare no managed bash or `bg_task` and use Pi's built-in bash. `clear`,
+  `wait`, `log`, `bg_status` and the wait machinery are removed; `/bg clear` stays
+  for the operator. Wake lines carry only id and exit code, with one retrieval line.
 
 ## Settings: file-managed, no editor
 

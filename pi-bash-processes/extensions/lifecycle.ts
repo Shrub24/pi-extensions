@@ -88,7 +88,7 @@ export function closeTaskLifecycle(
 
 // The exit wake, with two by-design suppressions:
 //   • Agent-authored stop: a user/agent-initiated stop whose finalize carries the
-//     extension-stop reason. The bg_task/bg_status stop tool result already
+//     extension-stop reason. The bg_task stop tool result already
 //     reported the stop, so waking the agent for its own action is pure noise.
 //     An override (orphan reuse, shutdown) means an external force performed the
 //     terminal transition, which the agent did not author and must hear about.

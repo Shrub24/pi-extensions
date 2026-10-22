@@ -40,10 +40,9 @@ test("a soft reminder is never described as a termination or a killed process", 
 			expect(text, `${source} must not equate a soft reminder with a termination: ${forbidden}`).not.toMatch(forbidden);
 		}
 	}
-	// The reminder's own text says what it does NOT do — in both surfaces, since
-	// the choices a reminder offers are per-mode.
+	// The reminder's own text says what it does NOT do — in the one place it is written.
 	const guidance = read("tool-surface.ts");
-	expect((guidance.match(/Nothing was stopped; the exit wake is still armed/g) ?? []).length, "both surfaces state nothing was stopped").toBe(2);
+	expect((guidance.match(/Nothing was stopped; the exit wake is still armed/g) ?? []).length, "the reminder states nothing was stopped").toBe(1);
 	// The schema copy says the same.
 	const schema = read("registrations.ts");
 	expect(schema, "the soft window is described as advisory").toContain("Soft expiry never stops the process");

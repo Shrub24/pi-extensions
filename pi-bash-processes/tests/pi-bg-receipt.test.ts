@@ -123,7 +123,7 @@ test("an accepted receipt outlives its task as a task expiry, never as a rolled-
 	// it. The commit still happened, so the retry must be told the *task* expired
 	// — an unaccepted-preparation error here would read as an undone
 	// acknowledgment.
-	await bgTask().execute("receipt-retention-clear", { action: "clear" });
+	await host.clearFinished();
 	expect(await listed(task.id), "the task is out of the retained map").toBeUndefined();
 	const afterPrune = await requestBridge({ session, socketPath }, { op: "receipt", token: prepared.receipt! });
 	expect(afterPrune.ok).toBe(false);
@@ -143,7 +143,7 @@ test("an accepted receipt outlives the abandoned-preparation window, and is neve
 	expect(accepted.ack).toMatchObject({ acknowledged: true, committed: "terminal" });
 
 	// The task leaves the retained map, the way the finished-task bound drops it.
-	await bgTask().execute("receipt-ttl-clear", { action: "clear" });
+	await host.clearFinished();
 	expect(await listed(task.id)).toBeUndefined();
 
 	// Advance a full hour past the window in which a preparation the session never
@@ -185,7 +185,7 @@ test("a filled receipt store retires the oldest accepted handoff without calling
 		asResult(await requestBridge({ session, socketPath }, { op: "receipt", token: prepared.receipt! }));
 		if (index === 0) oldest.token = prepared.receipt!;
 		oldest.id = task.id;
-		await bgTask().execute(`receipt-overflow-clear-${index}`, { action: "clear", id: task.id });
+		await host.clearFinished();
 	}
 	expect(await listed(oldest.id), "the first task left the retained map").toBeUndefined();
 

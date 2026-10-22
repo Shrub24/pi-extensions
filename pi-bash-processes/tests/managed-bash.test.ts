@@ -119,7 +119,7 @@ test("completion text is truthful, running text forbids polling", () => {
 		pid: 4242,
 	});
 	expect(running).toContain("Running bg-2");
-	expect(running).toContain('bg_task action:"wait"');
+	expect(running).not.toContain('action:"wait"');
 	expect(running).toContain("Do not poll it");
 	expect(running).toContain("end the turn");
 	expect(running).toContain("the exit wake arrives with an output tail");

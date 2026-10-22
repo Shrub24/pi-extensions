@@ -44,7 +44,7 @@ const widgetLines = (): string => {
 	}
 };
 const ctx = {
-	cwd: process.cwd(), hasUI: true, isProjectTrusted: () => true,
+	cwd: process.cwd(), hasUI: true, mode: "tui", isProjectTrusted: () => true,
 	sessionManager: { getSessionId: () => "managed-bash-session", getSessionFile: () => join(process.cwd(), "session.jsonl"), getBranch: () => [] },
 	ui: {
 		notify() {},
@@ -72,8 +72,8 @@ let shutDown = false;
 try {
 	const { default: backgroundTasks } = await import("../../extensions/background-tasks.js");
 	backgroundTasks(pi);
-	const managedBashPublished = Boolean((globalThis as unknown as Record<PropertyKey, unknown>)[Symbol.for("kendex.background-tasks.managed-bash")]);
 	await events.get("session_start")!( {}, ctx);
+	const managedBashPublished = Boolean((globalThis as unknown as Record<PropertyKey, unknown>)[Symbol.for("kendex.background-tasks.managed-bash")]);
 	started = true;
 	const bash = tools.get("bash");
 	if (!bash) throw new Error("managed_bash_fixture.tool_missing=bash");

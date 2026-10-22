@@ -79,15 +79,16 @@ test("a managed task can query the endpoint while it runs, and still complete", 
 	await host.settledTask(target.id);
 
 	const query = spawned(await bgTask().execute("managed-query", { action: "spawn", command: `pi-bg get ${target.id} && pi-bg list` }));
-	const waited = await bgTask().execute("managed-wait", { action: "wait", id: query.id, waitSeconds: 20 }, undefined, undefined, host.ctx);
+	await host.closedTask(query.id);
+	const waited = await bgTask().execute("managed-wait", { action: "get", id: query.id });
 	const text = waited.content[0]?.text ?? "";
 	expect(text, "the querying task finished instead of being cut off").toContain(query.id);
 	const record = (await host.listTasks()).find((candidate) => candidate.id === query.id);
 	expect({ status: record?.status, exitCode: record?.exitCode }).toEqual({ status: "completed", exitCode: 0 });
 
-	const log = await bgTask().execute("managed-log", { action: "log", id: query.id });
-	const logText = log.content[0]?.text ?? "";
 	// The task read the target's bytes through the CLI, and listed itself.
+	const result = await bgTask().execute("managed-get", { action: "get", id: query.id, output: "full" });
+	const logText = result.content[0]?.text ?? "";
 	expect(logText).toContain("gamma\n");
 	expect(logText).toContain(`kendex: task=${target.id}`);
 	expect(logText).toContain(query.id);

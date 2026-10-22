@@ -4,15 +4,13 @@ For maintainers. What it does for a consumer is [README.md](README.md); the agen
 
 ## Invariants
 
-- After registering its managed `bash`, the extension publishes `Symbol.for("kendex.background-tasks.managed-bash")` on `globalThis` until `session_shutdown`. Renderer packages defer their Bash decision until `session_start`, so either package order sees the marker; shutdown removes it before Pi loads a fresh extension runtime.
-- The declared tool surface is a function of the session mode, and it is declared at
-  `session_start`, never at factory load: the factory knows no mode, so it registers
-  `bg_task` alone and the mode branch adds `bg_status` only where it belongs. That is
-  why the TUI can satisfy "`bg_status` is absent" without an unregister API that does
-  not exist. `extensions/tool-surface.ts` is the single spelling of the surface, the
-  action enums and every mode-dependent phrase; `registrations.ts` declares from it,
-  and the wake, acknowledgement, managed-bash and schema-description text all read it,
-  so a mode is never handed prose for an operation it cannot call.
+- When `session_start` declares its managed `bash` (TUI only), the extension publishes `Symbol.for("kendex.background-tasks.managed-bash")` on `globalThis` until `session_shutdown`. Renderer packages defer their Bash decision until `session_start`, so either package order sees the marker; shutdown removes it before Pi loads a fresh extension runtime.
+- Background tasks exist only in the interactive TUI. `bash` and `bg_task` are declared at
+  `session_start`, once the mode is known, and only when it is `tui`; every other mode keeps
+  Pi's own `bash` and has no `bg_task`, no `bg_status` and no wake machinery to drive.
+  `bg_task` declares exactly `spawn/get/stop/list/extend`. `extensions/tool-surface.ts` is
+  the single spelling of the action enum and of every phrase that names an operation, so
+  no text can name one the model cannot call.
 - A wake never depends on `pi-output-policy`. Wakes go out through `pi.sendMessage`, which that policy does not see, so every byte a wake adds to the transcript is bounded here: one inline tail capped by `outputAlertMaxChars`, a task manifest whose long fields are cut at `WAKE_MANIFEST_FIELD_MAX_CHARS`, a headline command preview cut at `WAKE_CONTENT_COMMAND_MAX_CHARS`, and a per-task output-wake budget after which one exhaustion notice is sent and further output wakes are dropped. `extensions/wake-events.ts::compactBackgroundTaskSnapshot`, `shouldEmitOutputWake`, `sendOutputWakeBudgetExhaustedNotice`. The same compact manifest is what `bg_task` and `bg_status` return in `details`, so a log-polling loop cannot grow the transcript through tool results either.
 - Exit wakes are durable and fire exactly once. A task's snapshot carries `exitNotified`; a terminal task that never fired its exit wake is replayed on the next `session_start`. Exit wakes ignore the output-wake budget. `extensions/lifecycle.ts::closeTaskLifecycle` sets a task's terminal state and `sendExitWakeLifecycle` sends its exit wake; the record-and-persist tail of `sendExitWakeLifecycle` is the shared acknowledgment (`extensions/task-result.ts::acknowledgeCompletion`), so host submission, terminal retrieval, a confirmed stop, and a foreground delivery all settle the same obligation. `extensions/background-tasks.ts::finalizeTask` (exit, spawn error, timeout, stop) and `extensions/lifecycle.ts::finalizeTaskLifecycle` (orphan watcher) call both. Restore (`extensions/snapshot.ts::restoredTaskFromSnapshot`) and `session_shutdown` set status themselves, and `extensions/lifecycle.ts::replayMissedExitsLifecycle` sends the wakes restore finds missing. See "Completion lifecycle" below for how process exit, output readiness, acknowledgment, and retention differ.
 - The orphan watcher observes and never signals. A task whose child outlived Pi rehydrates as `running` and `extensions/orphan-watcher.ts` polls an asynchronous identity probe (pid plus process start time; the kernel comm name is recorded but is not part of identity, because `exec` rotates it) until the process is gone or the pid was reused, then finalizes through the lifecycle. Adding a `kill` there resurrects a failure where a snapshot flicker terminates a live workload.
@@ -36,8 +34,8 @@ the rules; `extensions/background-tasks.ts` supplies the host effects.
 
 - **Process exit.** `finalizeTask` closes the process first: status, exit code,
   termination reason and timers settle at once, and the exit-wake decision runs
-  while an attached foreground or bounded waiter is still unsettled (that is how
-the wait result becomes the delivery channel).
+  while an attached foreground waiter is still unsettled (that is how the
+  foreground result becomes the delivery channel).
 - **Output readiness.** The exit wake names the task's log as its full output, so
   it waits on `taskLogs.flush`. `resultReady` records that second half:
   `taskReadiness` answers `running` (process active), `finalizing` (process gone,

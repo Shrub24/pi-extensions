@@ -35,7 +35,7 @@ Restart Pi after installation. Use `kendex update-pi --check` to preview the ins
 ## Features
 
 - Start, inspect and stop background commands.
-- In the interactive TUI, exactly `bg_task spawn/get/stop/list/extend`: completion arrives as a pushed wake, so no bounded wait and no status tool are declared, and `extend` only re-arms a task's soft reminder. Noninteractive and child sessions keep the compatibility surface — the bounded `bg_task wait` (configurable 30s default, 120s maximum) and the `bg_status` status tool — without turning the turn into a polling loop.
+- In the interactive TUI, exactly `bg_task spawn/get/stop/list/extend`: completion arrives as a pushed wake, so there is no wait or status tool, and `extend` only re-arms a task's soft reminder. Other modes (`print`, `json`, `rpc`) are not supported: the extension declares no tools there and Pi's own `bash` runs unchanged.
 - Yield unexpectedly slow model-facing Bash commands into managed background tasks after a configurable foreground wait.
 - Notify the agent when a task exits or produces selected output.
 - Read full logs and task history in the dashboard.
@@ -231,9 +231,9 @@ Settings are files, not a menu. This package reads its own top-level key in Pi's
 Session-local choices, such as showing or hiding the widget for this run, stay in memory and are not written back.
 
 - `enabled`: package toggle; `glyphStyle` picks Unicode or ASCII symbols, and `pi-tool-renderer`'s global override wins when set.
-- Tool surface: the interactive TUI declares `bg_task` (`spawn`, `get`, `stop`, `list`, `extend`) and no `bg_status`; `print`, `json`, `rpc` and any unrecognized mode keep the compatibility surface (bounded `wait`, `bg_status`). There is nothing to configure — the mode Pi reports decides it.
+- Tool surface: the interactive TUI declares `bg_task` (`spawn`, `get`, `stop`, `list`, `extend`) and the managed `bash`; every other mode declares nothing. There is nothing to configure — the mode Pi reports decides it.
 - Auto-backgrounding for user `!` Bash: `autoBackgroundBash`, `autoBackgroundPatterns`, `forcedBackgroundWindowSeconds`, `forcedBackgroundNotifyOnOutput`.
-- Execution: `foregroundYieldMs` is the model-facing Bash soft wait; `taskWaitDefaultSeconds` and `taskWaitMaxSeconds` bound one compatibility `bg_task wait` (a TUI session declares no wait at all); `defaultSoftTimeoutMs` is the default soft reminder (10 minutes, 0 disables); `defaultTimeoutSeconds` (hard backstop, default disabled), `forceKillGraceMs`, and the `resourceControl*` group control explicit and auto-background task runtime and resources. Soft waits and soft reminders never kill a process, and resource controls do not wrap ordinary managed Bash commands.
+- Execution: `foregroundYieldMs` is the model-facing Bash soft wait; `exitWakeBatchMs` (3000) and `exitWakeRunBatchMs` (250) are how long a completion wake waits for a still-running sibling to finish with it, while idle and during a run; `defaultSoftTimeoutMs` is the default soft reminder (10 minutes, 0 disables); `defaultTimeoutSeconds` (hard backstop, default disabled), `forceKillGraceMs`, and the `resourceControl*` group control explicit and auto-background task runtime and resources. Soft waits and soft reminders never kill a process, and resource controls do not wrap ordinary managed Bash commands.
 - Wakes and output: `outputSettleMs`, `outputAlertMaxChars`, `outputWakeBudgetMaxWakes`, `outputWakeBudgetMaxBytes`, `outputBufferMaxChars`, `logTailMaxChars`.
 - UI: `showWidget`, `widgetPlacement`, `widgetDefaultMode`, `widgetFinishedRetentionSeconds`, `toolRenderMode`, `toolExpandedLogLines`, `dashboardOutputMaxLines`.
 - Shortcuts: `backgroundBashShortcut`, `widgetToggleShortcut`, `dashboardShortcut`; `none` disables one, and a change takes effect on restart.
@@ -250,18 +250,17 @@ current through upstream `#3289`. The fork's own features (upstream has no
 equivalent — each is fork-only source plus its tests):
 
 - **Managed bash** (`extensions/managed-bash.ts`) — the extension's own bash
-  tool wrapping pi-bash-processes semantics, with a bounded task wait
-  (`task-wait.ts`) and `pipefail` on bash and zsh shells (`managedShellPipefail:
+  tool wrapping pi-bash-processes semantics, with `pipefail` on bash and zsh shells (`managedShellPipefail:
   false` opts out). Commands run exactly as written: a trailing `| head`/`| tail`
   is no longer rewritten. Awaiting a result is
   a declared operation now: the read shim (`read-shim.ts`) that made a raw log
   read consume the exit wake, the sleep-as-wait interception
   (`sleep-intercept.ts`), and the per-process consume logs are all retired.
-- **Declared tool surface per session mode** (`extensions/tool-surface.ts`) — the
-  mode from `session_start` decides the tools and the guidance. The TUI declares
-  `bg_task` with exactly `spawn/get/stop/list/extend` and no `bg_status`; every other
-  mode keeps the compatibility surface. Wake, acknowledgement and wake-budget text
-  is generated per mode so it never names an operation the model cannot call. The
+- **TUI-only tool surface** (`extensions/tool-surface.ts`) — the mode from
+  `session_start` decides whether any tool is declared. The TUI declares `bg_task`
+  with exactly `spawn/get/stop/list/extend`; every other mode declares nothing and
+  uses Pi's own `bash`. Wake, acknowledgement and wake-budget text names only those
+  operations. The
   coupled bash/background-task operating rules come from one shared code-defined
   rule set contributed by the active `bg_task` tool.
 - **Soft timeouts** — an advisory per-task reminder that surfaces a decision

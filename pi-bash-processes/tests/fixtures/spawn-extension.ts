@@ -26,7 +26,7 @@ const entries: unknown[] = [];
 // Restore replays from the session branch; getBranch returns the entries this
 // process appended so a second session_start acts as a live restore.
 const ctx = {
-	cwd: process.cwd(), hasUI: false, isProjectTrusted: () => true,
+	cwd: process.cwd(), hasUI: false, mode: "tui", isProjectTrusted: () => true,
 	sessionManager: { getSessionId: () => "spawn-hardening-private-session", getSessionFile: () => join(process.cwd(), "session.jsonl"), getBranch: () => [...entries] },
 	ui: { notify: (...args: unknown[]) => notifications.push(args), setWidget() {} },
 } as unknown as ExtensionContext;
@@ -65,13 +65,19 @@ function persistedTask(): Record<string, unknown> | undefined {
 	}
 	return undefined;
 }
+async function peek(id: string) {
+	const tasks = (await execute({ action: "list" })).details.tasks;
+	// A bounded manifest names ids only; the task's own record then comes from get.
+	if (!Array.isArray(tasks)) return (await execute({ action: "get", id })).details.task as Record<string, any> | undefined;
+	return (tasks as Record<string, any>[]).find((task) => task.id === id);
+}
 async function state() {
 	// After `session_shutdown` the live map is empty (upstream's handler clears it,
 	// where HEAD's deliberately did not), and a finalized task may be pruned from
 	// it by the finished-task bound (#3224). The persisted snapshot is then the
 	// record — and reading it is what a later turn does too, so a pruned task and
 	// a retained one report the same state.
-	const task = (shutDown ? undefined : (await execute({ action: "log", id: "bg-1" })).details.task) ?? persistedTask();
+	const task = (shutDown ? undefined : await peek("bg-1")) ?? persistedTask();
 	if (!task) throw new Error("spawn_fixture.task_missing=bg-1");
 	return { id: task.id, pid: task.pid, status: task.status, reason: task.terminationReason ?? null, exitCode: task.exitCode, exitNotified: task.exitNotified };
 }
@@ -85,8 +91,7 @@ const exitWakeCount = () => messages
 	.filter((message) => message?.details?.eventType === "exit" && message?.details?.task?.id === "bg-1").length;
 const softTimers = (ms: number) => native.activeTimers().filter((timer) => timer.kind === "timeout" && timer.ms === ms);
 async function softState() {
-	const inspected = await execute({ action: "log", id: "bg-1" });
-	const task = inspected.details.task;
+	const task = await peek("bg-1");
 	if (!task) throw new Error("spawn_fixture.task_missing=bg-1");
 	return {
 		status: task.status,
@@ -147,13 +152,13 @@ try {
 		const afterExit = messages.slice();
 		let afterLog: unknown[] = [];
 		if (input.mode === "deferred") {
-			await execute({ action: "log", id: "bg-1" });
+			await execute({ action: "get", id: "bg-1" });
 			afterLog = messages.slice(afterExit.length);
 		}
 		if (input.mode === "deferred-wait") {
 			// The exit is already deferred; a bounded wait returns the terminal
 			// result immediately and must consume the pending wake.
-			await execute({ action: "wait", id: "bg-1", waitSeconds: 5 });
+			await execute({ action: "get", id: "bg-1" });
 			afterLog = messages.slice(afterExit.length);
 		}
 		if (input.mode === "deferred-settle-hold") {
@@ -387,16 +392,6 @@ try {
 			.map((m: any) => (typeof m === "string" ? m : JSON.stringify(m)))
 			.filter((text: string) => text.includes("bg-1"));
 		operatorStop = { messages: wakeText, activeStopKey: true };
-	} else if (input.mode === "wait-any") {
-		// No id: the wait should attach to the oldest running task. Native timers
-		// are intercepted, so fire the wait's expiry, then close the child. The
-		// window is 3s so it cannot be confused with the state writer's 1s
-		// persist window or the 2s log stall deadline; fireTimeout is exact.
-		const waitedPromise = execute({ action: "wait", waitSeconds: 3 });
-		native.fireTimeout(3_000);
-		const waited = await waitedPromise;
-		native.children[0]?.emit("close", 0);
-		waitAny = { first: spawned.content[0]?.text ?? "", waited: waited.content[0]?.text ?? "", details: waited.details as { task?: { id?: string } } };
 	}
 	if (input.mode === "spawn" || input.mode === "stop" || input.mode === "rerun") {
 		const expectedSpawns = input.mode === "rerun" ? 2 : 1;

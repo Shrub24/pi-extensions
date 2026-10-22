@@ -1,7 +1,6 @@
 import { Type } from "typebox";
 
 import { antiPollLine } from "./auto-background.js";
-import type { TaskToolSurface } from "./tool-surface.js";
 import type { ForegroundOutcome, ForegroundWaiter } from "./types.js";
 
 /**
@@ -237,10 +236,10 @@ export interface ManagedBashRunningText {
  * yet, polling is forbidden, only independent work may continue, and
  * completion arrives automatically as a wake message.
  */
-export function formatManagedBashRunningText(text: ManagedBashRunningText, surface: TaskToolSurface = "compat"): string {
+export function formatManagedBashRunningText(text: ManagedBashRunningText): string {
 	const lines = [
 		`Running ${text.id} (pid ${text.pid}) after ${text.elapsedText}. The command is still executing and has not finished yet.`,
-		antiPollLine(surface),
+		antiPollLine(),
 	];
 	if (text.outputTail) lines.splice(1, 0, `Output so far (bounded tail):\n${text.outputTail}`);
 	return lines.join("\n\n");

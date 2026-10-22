@@ -10,7 +10,7 @@ import { runSpawnFixture, SPAWN_FIXTURE_TIMEOUT_MS } from "./fixtures/spawn-chil
  * flight is sent at once (queued as steer by Pi), not held for the end of the
  * run. Retrieval after that is a separate step and resolves the result.
  */
-test("a mid-run exit is delivered at once; reading the live log does not resolve it", () => {
+test("a mid-run exit is delivered at once; retrieving the result then resolves it", () => {
 	const result = runSpawnFixture("spawn-extension.ts", {
 		mode: "deferred",
 		command: "sleep 30 && echo done",
@@ -18,8 +18,7 @@ test("a mid-run exit is delivered at once; reading the live log does not resolve
 	expect(result.deferred.afterExit, "the wake does not wait for the run boundary").toHaveLength(1);
 	expect(JSON.stringify(result.deferred.afterExit[0])).toContain('"deliverAs":"steer"');
 	expect(result.deferred.afterLog).toHaveLength(0);
-	expect(result.deferred.afterTurnEnd, "a log read is not a retrieval, so idle sends the one advisory").toHaveLength(1);
-	expect(JSON.stringify(result.deferred.afterTurnEnd[0])).toContain('"eventType":"result-review"');
+	expect(result.deferred.afterTurnEnd, "the result was retrieved, so idle sends no advisory").toHaveLength(0);
 }, SPAWN_FIXTURE_TIMEOUT_MS);
 
 /**
@@ -49,7 +48,7 @@ test("three staggered mid-run exits are each delivered as they finish", () => {
 	expect(result.staggered.wakes, "one wake per completion, none held to the run boundary").toBe(3);
 	const text = result.staggered.wakeTexts.join("\n");
 	for (const id of ["bg-2", "bg-3", "bg-4"]) {
-		expect(text, `${id} names its outcome and the result it still owes`).toContain(`${id} · exit 0 · result unretrieved`);
+		expect(text, `${id} names its outcome`).toContain(`${id} · exit 0`);
 	}
 	expect(text, "the sibling still running is named").toContain("Tasks still running: bg-1");
 }, SPAWN_FIXTURE_TIMEOUT_MS);

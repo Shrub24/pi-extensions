@@ -13,7 +13,7 @@ export interface ResourceControlMetadata {
 }
 
 /**
- * Why a tracked task left the running state. Surfaced on `bg_status list`,
+ * Why a tracked task left the running state. Surfaced on `bg_task list`,
  * the wake-event payload, and persisted snapshots so callers can distinguish
  * a clean self-exit from an external kill.
  *
@@ -21,7 +21,7 @@ export interface ResourceControlMetadata {
  *   `completed` (exitCode 0) and `failed` (non-zero exitCode). `external` is
  *   the same close path with `exitCode === null`, which means the child was
  *   killed by a signal we did not issue.
- * - `extension-stop`: this extension issued the kill via `bg_status stop`.
+ * - `extension-stop`: this extension issued the kill via `bg_task stop`.
  * - `session-shutdown`: this extension issued the kill on `session_shutdown`.
  * - `timeout`: the task's `timeoutSeconds` budget elapsed.
  * - `reconcile-on-restart`: a Pi restart probed the recorded pid and found
@@ -291,38 +291,9 @@ export interface ForegroundWaiter {
 	yieldTimer: ReturnType<typeof setTimeout> | null;
 }
 
-/**
- * Outcome of a bounded `bg_task action:"wait"` attachment. `settled` means
- * the task reached a terminal state while the wait owned the exit; the
- * other kinds detach the wait without touching the task.
- */
-export type TaskWaitOutcome =
-	| { kind: "aborted" }
-	| { kind: "expired" }
-	| { kind: "pending-message" }
-	| { kind: "settled" };
-
-/**
- * Non-persisted single-owner latch between a bounded `bg_task wait` and the
- * task's terminal finalize. `attached` is true only while the wait owns the
- * exit notification: while attached, finalize suppresses the async exit wake
- * and settles the waiter with `settled`; expiry, a queued message, or abort
- * detach the waiter and leave the normal completion wake enabled. Distinct
- * from ForegroundWaiter, whose abort stops the managed-Bash process.
- */
-export interface TaskWaitWaiter {
-	attached: boolean;
-	settled: boolean;
-	outcome: TaskWaitOutcome | null;
-	resolve: ((outcome: TaskWaitOutcome) => void) | null;
-	expiryTimer: ReturnType<typeof setTimeout> | null;
-	pollTimer: ReturnType<typeof setInterval> | null;
-}
-
 export type ManagedTask = BackgroundTaskSnapshot & {
 	child: ChildProcess | null;
 	foregroundWaiter?: ForegroundWaiter | null;
-	taskWaiter?: TaskWaitWaiter | null;
 	closed: boolean;
 	forceKillTimer: ReturnType<typeof setTimeout> | null;
 	lastAnnouncedLength: number;

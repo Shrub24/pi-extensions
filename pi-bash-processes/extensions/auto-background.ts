@@ -1,6 +1,6 @@
 import { compactText, formatRelativeTime, normalizedCommand, shellQuote } from "./format.js";
 import { settingBoolean, settingString } from "./settings.js";
-import { taskSurfaceGuidance, type TaskToolSurface } from "./tool-surface.js";
+import { TASK_GUIDANCE } from "./tool-surface.js";
 import type { BackgroundTaskSnapshot, BashBackgroundDecision } from "./types.js";
 import { WAKE_MANIFEST_FIELD_MAX_CHARS, truncateForTranscript } from "./wake-events.js";
 
@@ -52,7 +52,7 @@ function looksLikeSessionMonitor(command: string): boolean {
 	return /\b(?:pi-bridge|tmux|capture-pane|list-panes|has-session|delegate-state|subagent|session)\b/i.test(command);
 }
 
-export function autoBackgroundDecision(command: string, cwd?: string, surface: TaskToolSurface = "compat"): BashBackgroundDecision | null {
+export function autoBackgroundDecision(command: string, cwd?: string): BashBackgroundDecision | null {
 	const normalized = normalizedCommand(command);
 	if (!normalized) return null;
 	if (matchesAnyRegex(normalized, parsePatternList(settingString("autoBackgroundPatterns", "", cwd)))) {
@@ -113,7 +113,7 @@ export function autoBackgroundDecision(command: string, cwd?: string, surface: T
 				// only the waiting route this mode actually has.
 				reason: looksLikeMonitor
 					? "session/tmux monitoring loop"
-					: taskSurfaceGuidance(surface).pollingReason,
+					: TASK_GUIDANCE.pollingReason,
 				title: `monitor: ${compactText(normalized, 72)}`,
 			};
 		}
@@ -141,9 +141,8 @@ export function duplicateTaskNote(
 	identical: string[],
 	related: string[],
 	reran: { id: string; updatedAt: number }[],
-	surface: TaskToolSurface = "compat",
 ): string {
-	const guidance = taskSurfaceGuidance(surface);
+	const guidance = TASK_GUIDANCE;
 	if (identical.length > 0) {
 		return `WARNING: identical command already running: ${identical.join(", ")}. ${guidance.duplicateRunning}`;
 	}
@@ -158,17 +157,15 @@ export function duplicateTaskNote(
 
 /**
  * The one anti-poll line, shared by the auto-background ack and the
- * managed-bash yield text so both surfaces say exactly the same thing — and, per
- * mode, only about waiting routes the mode declares.
+ * managed-bash yield text so both say exactly the same thing.
  */
-export const antiPollLine = (surface: TaskToolSurface = "compat"): string => taskSurfaceGuidance(surface).runningAdvice;
+export const antiPollLine = (): string => TASK_GUIDANCE.runningAdvice;
 
 export function bashBackgroundAckText(
 	task: BackgroundTaskSnapshot,
 	decision: BashBackgroundDecision,
 	otherRunning?: string[],
 	duplicateNote?: string,
-	surface: TaskToolSurface = "compat",
 ): string {
 	const safeCommand = truncateForTranscript(task.command, WAKE_MANIFEST_FIELD_MAX_CHARS) ?? "";
 	const safeCwd = truncateForTranscript(task.cwd, WAKE_MANIFEST_FIELD_MAX_CHARS) ?? "";
@@ -180,7 +177,7 @@ export function bashBackgroundAckText(
 		`Command: ${safeCommand}`,
 		`Cwd: ${safeCwd}`,
 		`Wakeups: exit=${task.notifyOnExit ? "yes" : "no"}, output=${task.notifyOnOutput ? (safePattern ?? "yes") : "no"}, mode=${task.notifyMode ?? "always"}${safeDedupe ? `, dedupeKey=${safeDedupe}` : ""}`,
-		antiPollLine(surface),
+		antiPollLine(),
 		...(duplicateNote ? [duplicateNote] : []),
 		...(otherRunning && otherRunning.length > 0
 			? [`Tasks still running: ${otherRunning.join(", ")} (includes this one). You will be woken once each; no polling needed.`]
@@ -190,6 +187,6 @@ export function bashBackgroundAckText(
 	].join("\n");
 }
 
-export function bashBackgroundAck(task: BackgroundTaskSnapshot, decision: BashBackgroundDecision, surface: TaskToolSurface = "compat"): string {
-	return `printf '%s\\n' ${shellQuote(bashBackgroundAckText(task, decision, undefined, undefined, surface))}`;
+export function bashBackgroundAck(task: BackgroundTaskSnapshot, decision: BashBackgroundDecision): string {
+	return `printf '%s\\n' ${shellQuote(bashBackgroundAckText(task, decision))}`;
 }

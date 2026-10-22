@@ -14,7 +14,7 @@ import type {
 	WakeEventRecord,
 	WakePendingRecord,
 } from "./types.js";
-import { batchRetrievalHint, taskSurfaceGuidance, wakeTaskLine, type TaskToolSurface } from "./tool-surface.js";
+import { retrievalHint, TASK_GUIDANCE, wakeTaskLine } from "./tool-surface.js";
 
 export const NOTIFY_MODES = ["always", "transition", "first-match-only"] as const;
 const MAX_WAKE_EVENTS = 50;
@@ -345,12 +345,6 @@ export interface SendTaskWakeDeps {
 	isShuttingDown: () => boolean;
 	logDiagnostic: (diagnostic: WakeDiagnostic) => void;
 	messageType: string;
-	/**
-	 * The session's declared surface, so the wake names only callable
-	 * operations. Omitted means the conservative compatibility surface, which is
-	 * what a caller with no session mode has.
-	 */
-	surface?: () => TaskToolSurface;
 	now?: () => number;
 	/**
 	 * Bounded full-output tail used as the fallback `outputTail` payload.
@@ -531,7 +525,6 @@ export function sendTaskWake(
 ): boolean {
 	ensureWakeState(task);
 	const now = deps.now ?? Date.now;
-	const guidance = taskSurfaceGuidance(deps.surface?.() ?? "compat");
 	if (eventType === "soft-timeout") {
 		if (deps.isShuttingDown() || task.status !== "running" || task.stopReason != null) return false;
 		const deliveredAt = now();
@@ -561,11 +554,11 @@ export function sendTaskWake(
 		const content = [
 			`Background task ${task.id} is still running after ${formatElapsed(softTimeout.elapsedMs)} (soft reminder at ${formatElapsed(softTimeout.softTimeoutMs)}).`,
 			`Command: ${commandPreview}`,
-			wakeTaskLine(task, guidance),
+			wakeTaskLine(task),
 			`Output so far:\n${tail || "(no output yet)"}`,
 			"Running is not success, so do not read the output tail above as a result.",
 			...(hardRemaining != null ? [`Hard timeout backstop: about ${formatElapsed(hardRemaining)} remaining; it will kill the task if you let it lapse.`] : []),
-			guidance.softReminderChoices,
+			TASK_GUIDANCE.softReminderChoices,
 		].join("\n");
 		sendSoftAdvisory(deps, task, options.sequence ?? task.wakeSequence ?? 0, () => deliverWakeMessage(deps, {
 			content,
@@ -645,7 +638,7 @@ export function sendTaskWake(
 		? ""
 		: cancelled
 			? "\nNo result will arrive; rerun the work if it is still needed."
-			: `\n${wakeTaskLine(task, guidance)}${(task.exitCode ?? 0) === 0 ? "" : `\n${guidance.reviewFailures} (the failed task is ${task.id}).`}`;
+			: `\n${wakeTaskLine(task)}${task.resultResolution === undefined ? `\n${retrievalHint(task.id)}` : ""}`;
 	const inventory = deps.runningInventory?.();
 	const commandPreview = truncateField(task.command, WAKE_CONTENT_COMMAND_MAX_CHARS) ?? "";
 
@@ -674,12 +667,6 @@ export interface SendBudgetExhaustedNoticeDeps {
 	now?: () => number;
 	rememberSnapshot: (task: ManagedTask) => BackgroundTaskSnapshot;
 	sendMessage: (message: Record<string, unknown>, options: Record<string, unknown>) => void;
-	/**
-	 * The mode's declared surface, read lazily so the notice names the operation
-	 * the session actually has. Absent means the conservative compatibility
-	 * surface, which is what a caller that does not know its mode must get.
-	 */
-	surface?: () => TaskToolSurface;
 }
 
 export function sendOutputWakeBudgetExhaustedNotice(
@@ -695,7 +682,7 @@ export function sendOutputWakeBudgetExhaustedNotice(
 	budget.announcedAt = timestamp;
 	const content = [
 		`Background task ${task.id} output wake budget exhausted; further output wakes suppressed.`,
-		`Inspect it with ${taskSurfaceGuidance(deps.surface?.() ?? "compat").inspect} id: ${task.id} (or pid: ${task.pid}).`,
+		`Inspect it with ${TASK_GUIDANCE.inspect} id: ${task.id} (or pid: ${task.pid}).`,
 		`Budget caps: ${Math.max(0, Math.floor(limits.maxWakes))} wakes / ${Math.max(0, Math.floor(limits.maxBytes))} inline bytes.`,
 	].join("\n");
 	const compactTask = compactBackgroundTaskSnapshot(deps.rememberSnapshot(task));
@@ -739,14 +726,13 @@ export function sendOutputWakeBudgetExhaustedNotice(
  * mandatory and re-arms nothing.
  */
 export function sendResultReviewAdvisory(
-	deps: Pick<SendTaskWakeDeps, "messageType" | "sendMessage" | "surface" | "isShuttingDown">,
+	deps: Pick<SendTaskWakeDeps, "messageType" | "sendMessage" | "isShuttingDown">,
 	tasks: ManagedTask[],
 ): boolean {
 	if (deps.isShuttingDown() || tasks.length === 0) return false;
-	const guidance = taskSurfaceGuidance(deps.surface?.() ?? "compat");
-	const lines = tasks.map((task) => wakeTaskLine(task, guidance, { hint: false }));
+	const lines = tasks.map((task) => wakeTaskLine(task));
 	deliverWakeMessage(deps as WakeSend, {
-		content: [`${tasks.length === 1 ? "A finished background result is" : `${tasks.length} finished background results are`} still unretrieved:`, ...lines.map((line) => `• ${line}`), batchRetrievalHint(guidance)].join("\n"),
+		content: [`${tasks.length === 1 ? "A finished background result is" : `${tasks.length} finished background results are`} still unretrieved:`, ...lines.map((line) => `• ${line}`), retrievalHint()].join("\n"),
 		customType: deps.messageType,
 		details: { eventType: "result-review", grouped: true, tasks: tasks.map((task) => compactBackgroundTaskSnapshot(task as BackgroundTaskSnapshot)) },
 		display: true,

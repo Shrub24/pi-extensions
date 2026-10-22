@@ -32,7 +32,7 @@ test("an unretrieved result is reminded once at idle, as a message that starts n
 	await host.settle();
 	expect(reviews(), "a later idle with the result still unread sends the one advisory").toHaveLength(1);
 	const [message, options] = reviews()[0]!;
-	expect(JSON.stringify(message)).toContain(`${id} · exit 0 · result unretrieved`);
+	expect(JSON.stringify(message)).toContain(`${id} · exit 0`);
 	expect(JSON.stringify(message), "the retrieval instruction is stated once, not per task").toContain('Retrieve a result with bg_task action:\\"get\\" id: <id>');
 	expect(options, "it costs no model turn of its own").toMatchObject({ triggerTurn: false });
 

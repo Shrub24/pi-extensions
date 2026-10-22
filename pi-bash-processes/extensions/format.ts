@@ -167,7 +167,7 @@ export function summarizeTaskStatus(
 	const base = baseStatusLabel(status, exitCode);
 	if (!terminationReason || terminationReason === "self-exit") return base;
 	// surface the non-self-exit cause inline so operators reading
-	// `bg_status list` can tell extension-stop from session-shutdown from a
+	// `bg_task list` can tell extension-stop from session-shutdown from a
 	// reconcile-on-restart coercion. Self-exit termination matches the
 	// historical wording so unchanged completed/failed rows stay terse.
 	return `${base} (${terminationReason})`;

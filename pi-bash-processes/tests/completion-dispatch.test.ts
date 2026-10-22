@@ -111,11 +111,8 @@ test("completions in an idle session are batched into one wake, each acknowledge
 });
 
 test("no batch clears a Pi message queue the extension does not own", () => {
-	// The completion path only ever sends. The single queue-shaped call in the
-	// extension is a bounded wait *reading* whether Pi has messages pending, which
-	// is how it releases early without touching the queue's contents.
+	// The completion path only ever sends; nothing here reads or touches Pi's queue.
 	const source = readFileSync(new URL("../extensions/background-tasks.ts", import.meta.url), "utf8");
-	expect(source, "pending-message state is read, never drained").toContain("ctx.hasPendingMessages()");
 	for (const forbidden of ["clearMessages", "drainMessages", "pendingMessages.splice", "dequeueMessage"]) {
 		expect(source, `no private queue manipulation: ${forbidden}`).not.toContain(forbidden);
 	}

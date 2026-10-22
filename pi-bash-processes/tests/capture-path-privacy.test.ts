@@ -35,8 +35,6 @@ test("no model-facing task surface names a capture path", async () => {
 	const surfaces: Record<string, string> = {
 		spawn: textOf(spawned),
 		list: textOf(await bgTask().execute("privacy-list", { action: "list" }, undefined, undefined, host.ctx)),
-		// A running read, so the surface that carries a live capture is included.
-		log: textOf(await bgTask().execute("privacy-log", { action: "log", id: task.id }, undefined, undefined, host.ctx)),
 		get: textOf(await bgTask().execute("privacy-get", { action: "get", id: task.id }, undefined, undefined, host.ctx)),
 		stop: textOf(await bgTask().execute("privacy-stop", { action: "stop", id: task.id }, undefined, undefined, host.ctx)),
 		guidance: [bgTask().description, bgTask().promptSnippet, ...(bgTask().promptGuidelines ?? [])].join("\n"),

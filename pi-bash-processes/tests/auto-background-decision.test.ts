@@ -52,24 +52,13 @@ async function stopEveryTask(): Promise<void> {
  * has to stay the conservative compatibility surface — a caller that has not
  * been told its mode must not be handed a TUI-only claim.
  */
-test("an ordinary polling loop returns a decision in every surface, and never throws", () => {
+test("an ordinary polling loop returns a decision and never throws", () => {
 	for (const command of POLLING_COMMANDS) {
-		const defaulted = autoBackgroundDecision(command);
-		expect(defaulted, `default decision for ${command}`).not.toBeNull();
-		expect(defaulted!.title).toStartWith("monitor: ");
-
-		const compat = autoBackgroundDecision(command, undefined, "compat");
-		const tui = autoBackgroundDecision(command, undefined, "tui");
-		expect(compat, `compat decision for ${command}`).not.toBeNull();
-		expect(tui, `tui decision for ${command}`).not.toBeNull();
-
-		// The default is the conservative surface, not whichever the module last saw.
-		expect(defaulted!.reason, `default is compat for ${command}`).toBe(compat!.reason);
-		// Each surface names only the waiting route it declares.
-		expect(compat!.reason).toContain('bg_task wait');
-		expect(tui!.reason).not.toContain('bg_task wait');
-		expect(tui!.reason).toContain("ending the turn");
-		expect(tui!.reason).not.toBe(compat!.reason);
+		const decision = autoBackgroundDecision(command);
+		expect(decision, `decision for ${command}`).not.toBeNull();
+		expect(decision!.title).toStartWith("monitor: ");
+		expect(decision!.reason).toContain("ending the turn");
+		expect(decision!.reason).not.toContain("bg_task wait");
 	}
 });
 
@@ -90,7 +79,7 @@ test("an auto-backgrounded user bash command is handled, with the ack the mode d
 	const output = handled!.result!.output ?? "";
 	expect(output).toStartWith("Started bg-");
 	expect(output, "the ack carries the mode's polling reason").toContain("polling loop");
-	expect(output, "and the waiting route the compat surface declares").toContain('bg_task wait');
+	expect(output, "and no waiting route the surface lacks").not.toContain("bg_task wait");
 
 	const taskId = output.match(/^Started (bg-\d+)/)?.[1];
 	expect(taskId, "the ack names the started task").toBeString();
@@ -122,12 +111,12 @@ test("a duplicate auto-backgrounded command is reported instead of throwing", as
  * surface so the default stays compat, and the empty case returns "" rather than
  * a note-shaped string.
  */
-test("the duplicate note binds the surface, and is empty when nothing is flagged", () => {
+test("the duplicate note names only declared operations, and is empty when nothing is flagged", () => {
 	expect(duplicateTaskNote([], [], [])).toBe("");
-	expect(duplicateTaskNote(["bg-7"], [], [], "compat")).toContain('bg_task wait/log');
-	expect(duplicateTaskNote(["bg-7"], [], [], "tui")).not.toContain('bg_task wait/log');
-	expect(duplicateTaskNote([], ["bg-8"], [], "compat")).toContain("similar command already running: bg-8");
-	expect(duplicateTaskNote([], [], [{ id: "bg-9", updatedAt: Date.now() }], "compat")).toContain("finished recently");
+	expect(duplicateTaskNote(["bg-7"], [], [])).toContain("completion wake");
+	expect(duplicateTaskNote(["bg-7"], [], [])).not.toContain("bg_task wait");
+	expect(duplicateTaskNote([], ["bg-8"], [])).toContain("similar command already running: bg-8");
+	expect(duplicateTaskNote([], [], [{ id: "bg-9", updatedAt: Date.now() }])).toContain("finished recently");
 });
 
 afterAll(async () => {

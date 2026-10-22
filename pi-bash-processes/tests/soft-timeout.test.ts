@@ -49,9 +49,8 @@ test("soft expiry reviews once, never stops the process, and keeps the later exi
 	expect(afterWake.state.softExpiresAt, "the next interval is measured from the delivered review").toBe(1_700_000_060_000);
 	expect(afterWake.exitWakes, "a reminder is not an exit wake").toBe(0);
 	expect(afterWake.text).toContain("still running after");
-	// The progress wake carries the same per-task line the completion wakes do:
-	// what the task is doing, and that its result is not in hand yet.
-	expect(afterWake.text).toContain("bg-1 · still running · result pending");
+	// The progress wake carries the same per-task line the completion wakes do.
+	expect(afterWake.text).toContain("bg-1 · still running");
 	expect(afterWake.text).toContain('bg_task action:"extend"');
 	expect(afterWake.text).toContain('bg_task action:"stop"');
 	expect(afterExit.state.status, "the real exit still finalized the task").toBe("completed");
@@ -123,7 +122,7 @@ test("a terminal task emits no soft wake and is reminded once, at idle", () => {
 	expect(scenario.softWakes, "no progress reminder for a finished task").toBe(0);
 	expect(scenario.exitWakes, "the exit still woke normally").toBe(1);
 	expect(scenario.reviewWakes).toHaveLength(1);
-	expect(scenario.reviewWakes[0]).toContain("bg-1 · exit 0 · result unretrieved");
+	expect(scenario.reviewWakes[0]).toContain("bg-1 · exit 0");
 	expect(scenario.timers, "only the orphan watcher remains; no interval is armed for the result").toEqual([
 		{ kind: "interval", ms: 30_000 },
 	]);

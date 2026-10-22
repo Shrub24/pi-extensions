@@ -17,20 +17,7 @@ import { Type } from "typebox";
 import { BG_COMMAND } from "./constants.js";
 import { duplicateTaskNote } from "./auto-background.js";
 import { getIntent, intentHardRequired, intentModeFor, intentParameters, intentPrepare, intentSuffix, stripIntent, withIntentParameter } from "./intent.js";
-export {
-	COMPAT_BG_TASK_ACTIONS,
-	TUI_BG_TASK_ACTIONS,
-	taskToolSurfaceFor,
-	type TaskToolSurface,
-} from "./tool-surface.js";
-import {
-	BASH_TASK_GUIDELINES,
-	COMPAT_BG_TASK_ACTIONS,
-	TUI_BG_TASK_ACTIONS,
-	taskSurfaceActions,
-	taskToolSurfaceFor,
-	type TaskToolSurface,
-} from "./tool-surface.js";
+import { BASH_TASK_GUIDELINES, BG_TASK_ACTIONS } from "./tool-surface.js";
 import { openDashboard, type DashboardDeps } from "./dashboard.js";
 import { formatRelativeTime, formatTaskLog, formatTaskResultText, summarizeTaskStatus, taskLogTruncation } from "./format.js";
 import { makeToolResult, renderBgToolResult, renderEmpty } from "./render.js";
@@ -64,14 +51,6 @@ export interface RegistrationDeps {
 	extendSoftTimeout: (task: ManagedTask | null, seconds?: number) => { ok: boolean; message: string };
 	spawnTask: (options: SpawnTaskOptions) => ManagedTask;
 	similarRunningTasks: (command: string) => { identical: ManagedTask[]; similar: ManagedTask[] };
-	oldestRunningTask: () => ManagedTask | null;
-	waitForTask: (
-		task: ManagedTask,
-		waitSeconds: unknown,
-		signal: AbortSignal | undefined,
-		ctx: ExtensionContext,
-	) => Promise<AgentToolResult<unknown>>;
-	clearFinishedTasks: (ids?: string[]) => { removed: number; kept: number; dismissed: number };
 	/** True when a deferred exit wake for this task was dropped. */
 	consumeObservedExitWake: (taskId: string) => boolean;
 	armForcedBackground: (ctx: ExtensionContext, source: "shortcut" | "command") => void;
@@ -82,57 +61,16 @@ export interface RegistrationDeps {
 	widgetToggleShortcut: string;
 }
 
-/** Action enum named by the surface, so the declared schema is the narrow one in TUI. */
-function bgTaskActions(surface: TaskToolSurface): readonly string[] {
-	return taskSurfaceActions(surface);
-}
-
-/**
- * Per-surface `bg_task` guidance. This is the supported per-session prompt
- * contribution: Pi appends a tool's `promptGuidelines` to the system prompt only
- * while that tool is active, so the TUI never receives the compatibility wait
- * advice and a noninteractive child never receives push-only end-response advice.
- */
-function bgTaskGuidelines(surface: TaskToolSurface): string[] {
-	if (surface === "tui") {
-		return [
-			...BASH_TASK_GUIDELINES,
-			"Use bg_task list/get/stop/extend to inspect, re-arm, or terminate tasks started by bg_task or /bg. get is the task's result, including its readiness and outcome; there is no separate status tool in this mode.",
-			"A soft reminder is a check-in, not a result: completion always wakes you, so softTimeoutMs only sets how often you are reminded. For a build, test run, or watcher, set softTimeoutMs at spawn to about its expected duration (or 0 to disable reminders); re-arm later with bg_task action:\"extend\" id:... softTimeoutMs:....",
-			"After a task starts, continue independent work; when there is nothing left to do, end the turn and let its wake arrive. A soft reminder is the decision point if it takes longer than expected.",
-			"Use bg_task for pi-bridge, session, tmux, agent/delegate, or log monitoring instead of raw foreground bash polling loops.",
-			"If a bash monitor is auto-backgrounded, continue the turn and inspect it later with bg_task get/list/stop rather than waiting on foreground bash.",
-		];
-	}
+/** `bg_task` guidance, appended to the system prompt only while the tool is active. */
+function bgTaskGuidelines(): string[] {
 	return [
 		...BASH_TASK_GUIDELINES,
-		"Use bg_task list/log/get/stop to inspect or terminate tasks started by bg_task or /bg. log is the raw captured tail; get is the task's result, including its readiness and outcome.",
-		"Use bg_task clear ids:[...] to explicitly dismiss named finished results. Dismissal does not hand over output; a bulk clear keeps an assignment-owned result nobody received and never touches running tasks.",
-		"After a task starts, continue independent work; in an interactive session, end the turn when there is nothing left to do and let its wake arrive. A noninteractive or child caller that must have a shell result before its session closes can call bg_task action:\"wait\" once with a bounded waitSeconds: that yields only its own turn, never stops the task.",
+		"Use bg_task list/get/stop/extend to inspect, re-arm, or terminate tasks started by bg_task or /bg. get is the task's result, including its readiness and outcome.",
+		"A soft reminder is a check-in, not a result: completion always wakes you, so softTimeoutMs only sets how often you are reminded. For a build, test run, or watcher, set softTimeoutMs at spawn to about its expected duration (or 0 to disable reminders); re-arm later with bg_task action:\"extend\" id:... softTimeoutMs:....",
+		"After a task starts, continue independent work; when there is nothing left to do, end the turn and let its wake arrive. A soft reminder is the decision point if it takes longer than expected.",
 		"Use bg_task for pi-bridge, session, tmux, agent/delegate, or log monitoring instead of raw foreground bash polling loops.",
-		"If a bash monitor is auto-backgrounded, continue the turn and inspect it later with bg_task log/list/stop rather than waiting on foreground bash.",
+		"If a bash monitor is auto-backgrounded, continue the turn and inspect it later with bg_task get/list/stop rather than waiting on foreground bash.",
 	];
-}
-
-function bgTaskDescription(surface: TaskToolSurface): string {
-	const behaviours =
-		"Tasks write persistent logs, do not time out by default, stop as a process group on Unix, and can wake the agent on exit or matching output.";
-	if (surface === "tui") {
-		return `Spawn, inspect, and stop explicit background shell tasks. ${behaviours} The background-tasks extension also auto-diverts recognized bash monitoring loops before they block.`;
-	}
-	return `Spawn, inspect, wait for, and stop explicit background shell tasks. \`wait\` blocks the turn for a bounded window and returns the terminal result or a truthful Running status; it never stops the task. ${behaviours} The background-tasks extension also auto-diverts recognized bash monitoring loops before they block.`;
-}
-
-function bgTaskPromptSnippet(surface: TaskToolSurface): string {
-	return surface === "tui"
-		? "Spawn, inspect, and stop explicit non-blocking background shell tasks."
-		: "Spawn, inspect, wait for, and stop explicit non-blocking background shell tasks.";
-}
-
-function bgTaskActionDescription(surface: TaskToolSurface): string {
-	return surface === "tui"
-		? "spawn=start a task, get=the task's result (state, outcome, output preview or full immutable output), stop=terminate and return the result, list=show tasks, extend=reset the soft reminder, optionally at a new interval"
-		: "spawn=start a task, list=show tasks, log=raw tail of the captured log, get=the task's result (state, outcome, output preview or full immutable output), stop=terminate and return the result, clear=remove finished tasks, wait=block up to waitSeconds for a task to finish, extend=reset the soft reminder, optionally at a new interval";
 }
 
 /** Bash-specific prompt guidance; the shared task contract is contributed by `bg_task`. */
@@ -140,122 +78,51 @@ export function bashPromptGuidelines(): string[] {
 	return ["You can inspect PI_* environment variables for current model and session details."];
 }
 
-/**
- * The `bg_task` parameter schema for one surface. The declared properties narrow
- * with the action enum and so do their descriptions: a field that exists only to
- * serve an action this surface does not declare is not declared either, and no
- * description names an action the caller cannot use. A compatibility caller's
- * schema is therefore unchanged, and the TUI never reads prose about a bounded
- * wait or a raw log action.
- */
-function bgTaskSchema(surface: TaskToolSurface) {
-	const tui = surface === "tui";
-	return Type.Object({
-		action: StringEnum(bgTaskActions(surface), {
-			description: bgTaskActionDescription(surface),
-		}),
-		command: Type.Optional(Type.String({ description: "Shell command for action=spawn" })),
-		cwd: Type.Optional(Type.String({ description: "Working directory for action=spawn" })),
-		id: Type.Optional(Type.String({
-			description: tui
-				? "Task id for action=get, action=stop, or action=extend."
-				: "Task id for action=log, action=get, action=stop, action=wait, or action=extend. action=wait without an id waits on the oldest running task.",
-		})),
-		ids: Type.Optional(Type.Array(Type.String(), { description: "For action=clear: dismiss the named finished tasks (a result never retrieved is recorded as dismissed, an already-delivered one is removed). Without ids, finished tasks are removed but an assignment-owned result nobody received is kept. Running tasks are never cleared." })),
-		notifyOnExit: Type.Optional(Type.Boolean({ description: "Wake the agent when the task exits. Defaults to true." })),
-		notifyOnOutput: Type.Optional(Type.Boolean({ description: "Wake the agent when new output arrives. Defaults to false." })),
-		notifyPattern: Type.Optional(Type.String({ description: "Substring or /regex/flags gate for output wakeups." })),
-		notifyMode: Type.Optional(StringEnum(NOTIFY_MODES, {
-			description: "Output wake mode: always=every output update, transition=only changed output tail hash, first-match-only=one notifyPattern match then suppress output wakes. Default: first-match-only when notifyPattern is set, transition otherwise (set 'always' explicitly to opt into every-output wakes).",
-		})),
-		dedupeKey: Type.Optional(Type.String({ description: "Optional key used by notifyMode=transition to coalesce matching output wakes across tasks." })),
-		pid: Type.Optional(Type.Number({
-			description: tui ? "PID for action=get or action=stop" : "PID for action=log, action=get, or action=stop",
-		})),
-		output: Type.Optional(StringEnum(["preview", "full"] as const, {
-			description: "For action=get or action=stop: preview=an inline preview of captured output (default), full=flush the capture and hand over the complete immutable output for this task.",
-		})),
-		timeoutSeconds: Type.Optional(Type.Number({ description: "Hard timeout for spawned tasks. Defaults to 0 (disabled)." })),
-		softTimeoutMs: Type.Optional(Type.Number({
-			description: "Soft progress reminder in milliseconds for action=spawn, or for action=extend to re-arm it later. Set it generously for a long-running task such as a watcher or log monitor, or 0 to disable it. Defaults to 600000 (10 minutes). Soft expiry never stops the process: it asks the agent to continue, inspect, or stop.",
-		})),
-		...(tui
-			? {}
-			: {
-				waitSeconds: Type.Optional(Type.Number({ description: "Bounded wait window in seconds for action=wait. Omitted values use taskWaitDefaultSeconds and values are capped by taskWaitMaxSeconds. This is a wait budget, not a task timeout: it never stops the task." })),
-			}),
-		title: Type.Optional(Type.String({ description: "Optional display label for action=spawn" })),
-		watcherGuidance: Type.Optional(Type.String({
-			maxLength: 240,
-			description: "Optional instruction for the soft reminder's advisory offer: action=spawn sets it, action=extend replaces it, and an extend that omits it keeps the stored one. A wake consumer may read it when deciding whether the reminder is worth delivering now. It is data for that consumer, never a command the task runs, and it changes no reminder when no consumer is loaded.",
-		})),
-	});
-}
+/** The `bg_task` parameter schema. */
+const bgTaskSchema = () => Type.Object({
+	action: StringEnum(BG_TASK_ACTIONS, {
+		description: "spawn=start a task, get=the task's result (state, outcome, output preview or full immutable output), stop=terminate and return the result, list=show tasks, extend=reset the soft reminder, optionally at a new interval",
+	}),
+	command: Type.Optional(Type.String({ description: "Shell command for action=spawn" })),
+	cwd: Type.Optional(Type.String({ description: "Working directory for action=spawn" })),
+	id: Type.Optional(Type.String({ description: "Task id for action=get, action=stop, or action=extend." })),
+	notifyOnExit: Type.Optional(Type.Boolean({ description: "Wake the agent when the task exits. Defaults to true." })),
+	notifyOnOutput: Type.Optional(Type.Boolean({ description: "Wake the agent when new output arrives. Defaults to false." })),
+	notifyPattern: Type.Optional(Type.String({ description: "Substring or /regex/flags gate for output wakeups." })),
+	notifyMode: Type.Optional(StringEnum(NOTIFY_MODES, {
+		description: "Output wake mode: always=every output update, transition=only changed output tail hash, first-match-only=one notifyPattern match then suppress output wakes. Default: first-match-only when notifyPattern is set, transition otherwise (set 'always' explicitly to opt into every-output wakes).",
+	})),
+	dedupeKey: Type.Optional(Type.String({ description: "Optional key used by notifyMode=transition to coalesce matching output wakes across tasks." })),
+	pid: Type.Optional(Type.Number({ description: "PID for action=get or action=stop" })),
+	output: Type.Optional(StringEnum(["preview", "full"] as const, {
+		description: "For action=get or action=stop: preview=an inline preview of captured output (default), full=flush the capture and hand over the complete immutable output for this task.",
+	})),
+	timeoutSeconds: Type.Optional(Type.Number({ description: "Hard timeout for spawned tasks. Defaults to 0 (disabled)." })),
+	softTimeoutMs: Type.Optional(Type.Number({
+		description: "Soft progress reminder in milliseconds for action=spawn, or for action=extend to re-arm it later. Set it generously for a long-running task such as a watcher or log monitor, or 0 to disable it. Defaults to 600000 (10 minutes). Soft expiry never stops the process: it asks the agent to continue or stop.",
+	})),
+	title: Type.Optional(Type.String({ description: "Optional display label for action=spawn" })),
+	watcherGuidance: Type.Optional(Type.String({
+		maxLength: 240,
+		description: "Optional instruction for the soft reminder's advisory offer: action=spawn sets it, action=extend replaces it, and an extend that omits it keeps the stored one. A wake consumer may read it when deciding whether the reminder is worth delivering now. It is data for that consumer, never a command the task runs, and it changes no reminder when no consumer is loaded.",
+	})),
+});
 
 /**
- * The compatibility-only status tool. It is registered late, in non-TUI modes
- * only, and routes `list`/`stop`/`log` through the same shared operations
- * `bg_task` uses, so a result read here is acknowledged exactly once by the same
- * path rather than by a second acknowledgment channel.
- */
-function registerBgStatusTool(pi: ExtensionAPI, deps: RegistrationDeps): void {
-	pi.registerTool({
-		renderShell: "self",
-		name: "bg_status",
-		label: "Background Process Status",
-		description: "List, view the result of, or stop background tasks spawned by bg_task or /bg. Use pid for log/stop.",
-		promptGuidelines: [
-			"bg_status is the compatibility status surface for noninteractive and child sessions: list shows tracked tasks, log hands over a task's result through the same shared get operation as bg_task, and stop ends the task through the same shared confirmed stop. A result read here acknowledges completion on the same single path.",
-		],
-		parameters: Type.Object({
-			action: StringEnum(["list", "log", "stop"] as const, {
-				description: "list=show tracked tasks, log=hand over the task's result by pid, stop=terminate by pid",
-			}),
-			pid: Type.Optional(Type.Number({ description: "Task pid for action=log or action=stop" })),
-		}),
-		async execute(_toolCallId, params): Promise<AgentToolResult<unknown>> {
-			if (params.action === "list") {
-				const tasks = deps.sortedTasks().map(deps.rememberSnapshot);
-				return makeToolResult(deps.formatTaskListText(), { action: "list", tasks: bgToolResultTasks(tasks) });
-			}
-			const task = deps.resolveTask(undefined, params.pid);
-			if (!task) throw new Error("No background task matched that pid.");
-			if (params.action === "log") {
-				// The compatibility read is the shared get operation, not a raw live-log
-				// tail: it hands over the same prepared snapshot and commits the same
-				// single acknowledgment, so there is no second channel to reconcile.
-				return makeToolResult(...(await getResultResult(deps, task, "preview", "log")));
-			}
-			// A stop that cannot confirm termination is reported as unconfirmed, never
-			// as a stopped task.
-			const stopped = await deps.stopTaskConfirmed(task);
-			if (!stopped.confirmed) throw new Error(stopped.message);
-			return makeToolResult(stopped.message, { action: "stop", task: compactBackgroundTaskSnapshot(deps.rememberSnapshot(task)) });
-		},
-		renderCall() { return renderEmpty(); },
-		renderResult(result: any, options: any, theme: Theme, context: any) {
-			return renderBgToolResult(result, options, theme, context);
-		},
-	});
-}
-
-/**
- * Registers `bg_task` for one surface. Re-registering the same name replaces the
- * declaration, which is how the TUI gets its four-action schema instead of the
- * compatibility one; Pi activates the replacement through the ordinary
+ * Registers `bg_task`. Pi activates a newly registered tool through its ordinary
  * registration path, so a user or child selection that already excluded the name
  * is never overridden.
  */
-function registerBgTaskTool(pi: ExtensionAPI, deps: RegistrationDeps, surface: TaskToolSurface): void {
+export function registerBgTaskTool(pi: ExtensionAPI, deps: RegistrationDeps): void {
 	pi.registerTool({
 		renderShell: "self",
 		name: "bg_task",
-		intent: "start, inspect, wait for, or stop a managed background process",
+		intent: "start, inspect, or stop a managed background process",
 		label: "Background Task",
-		description: bgTaskDescription(surface),
-		promptSnippet: bgTaskPromptSnippet(surface),
-		promptGuidelines: bgTaskGuidelines(surface),
-		parameters: intentParameters("bg_task", bgTaskSchema(surface)), async execute(_toolCallId, params, signal, _onUpdate, ctx): Promise<AgentToolResult<unknown>> {
+		description: "Spawn, inspect, and stop explicit background shell tasks. Tasks write persistent logs, do not time out by default, stop as a process group on Unix, and can wake the agent on exit or matching output. The background-tasks extension also auto-diverts recognized bash monitoring loops before they block.",
+		promptSnippet: "Spawn, inspect, and stop explicit non-blocking background shell tasks.",
+		promptGuidelines: bgTaskGuidelines(),
+		parameters: intentParameters("bg_task", bgTaskSchema()), async execute(_toolCallId, params): Promise<AgentToolResult<unknown>> {
 			const intent = getIntent(params);
 			if (params.action === "spawn" && intent) {
 				params.title = typeof params.title === "string" && params.title.trim() ? params.title : intent;
@@ -263,24 +130,6 @@ function registerBgTaskTool(pi: ExtensionAPI, deps: RegistrationDeps, surface: T
 			if (params.action === "list") {
 				const tasks = deps.sortedTasks().map(deps.rememberSnapshot);
 				return makeToolResult(deps.formatTaskListText(), { action: "list", tasks: bgToolResultTasks(tasks) });
-			}
-			if (params.action === "clear") {
-				if (params.ids !== undefined && (!Array.isArray(params.ids) || params.ids.some((id) => typeof id !== "string"))) {
-					throw new TypeError("bg_task clear ids must be an array of task ids");
-				}
-				const { removed, kept, dismissed } = deps.clearFinishedTasks(params.ids as string[] | undefined);
-				const running = deps.sortedTasks().filter((candidate) => candidate.status === "running" && candidate.stopReason == null);
-				const stillRunning = running.length > 0
-					? `\nStill running: ${running.map((candidate) => candidate.id).join(", ")} — clear does not touch running tasks. Use bg_task stop to end them.`
-					: "";
-				// A bulk clear keeps what is still owed; a targeted one keeps only what
-				// it could not act on. Either way the caller is told, never left to read
-				// a smaller removal count as a full success.
-				const keptNote = params.ids !== undefined
-					? kept > 0 ? `\nKept ${kept} selected task(s): running or unknown. Nothing was dismissed for them.` : ""
-					: kept > 0 ? `\nKept ${kept} unretrieved terminal task(s); retrieve one with get, or dismiss a named finished result with clear ids:[...].` : "";
-				const dismissedNote = dismissed > 0 ? ` Dismissed ${dismissed} selected result(s); dismissal is not an output handoff.` : "";
-				return makeToolResult(`Removed ${removed} eligible finished background task(s).${dismissedNote}${keptNote}${stillRunning}`, { action: "clear", removed, dismissed, ...(kept > 0 ? { kept } : {}) });
 			}
 			if (params.action === "spawn") {
 				const task = deps.spawnTask({
@@ -310,7 +159,6 @@ function registerBgTaskTool(pi: ExtensionAPI, deps: RegistrationDeps, surface: T
 					identical.map((t) => t.id),
 					related.map((t) => t.id),
 					reran,
-					surface,
 				);
 				const resourceControl = task.resourceControl
 					? `\nResource controls: ${task.resourceControl.mode}${task.resourceControl.unitName ? ` (${task.resourceControl.unitName})` : ""}`
@@ -336,35 +184,12 @@ function registerBgTaskTool(pi: ExtensionAPI, deps: RegistrationDeps, surface: T
 					tasks: results.map(({ candidate }) => compactBackgroundTaskSnapshot(deps.rememberSnapshot(candidate))),
 				});
 			}
-			const task = deps.resolveTask(params.id, params.pid)
-				?? (params.action === "wait" && params.id === undefined && params.pid === undefined ? deps.oldestRunningTask() : null);
-			if (!task) {
-				throw new Error(
-					params.action === "wait"
-						? 'No background task matched that id or pid, and no task is running. Start one with action:"spawn" or list tasks with action:"list".'
-						: "No background task matched that id or pid.",
-				);
-			}
-			
-			if (params.action === "wait") return deps.waitForTask(task, params.waitSeconds, signal, ctx);
+			const task = deps.resolveTask(params.id, params.pid);
+			if (!task) throw new Error("No background task matched that id or pid.");
 			if (params.action === "extend") {
 				const extended = deps.extendSoftTimeout(task, params.softTimeoutMs, params.watcherGuidance);
 				if (!extended.ok) throw new Error(extended.message);
 				return makeToolResult(extended.message, { action: "extend", task: compactBackgroundTaskSnapshot(deps.rememberSnapshot(task)) });
-			}
-			if (params.action === "log") {
-				// Reading a finished task's log in the same turn the exit wake was
-				// deferred means the agent already has the result: drop the wake
-				// instead of announcing work that has been reported.
-				if (task.status !== "running") deps.consumeObservedExitWake(task.id);
-				const output = deps.getTaskOutput(task);
-				const cwd = deps.getActiveCtx()?.cwd;
-				const truncation = taskLogTruncation(output, task.logFile, cwd);
-				return makeToolResult(formatTaskLog(output, task.logFile, cwd), {
-					action: "log",
-					task: compactBackgroundTaskSnapshot(deps.rememberSnapshot(task)),
-					...(truncation ? { truncation } : {}),
-				});
 			}
 			if (params.action === "get") {
 				return makeToolResult(...(await getResultResult(deps, task, params.output, "get")));
@@ -393,15 +218,13 @@ function registerBgTaskTool(pi: ExtensionAPI, deps: RegistrationDeps, surface: T
  * The `bg_task` transport for the shared get operation. The tool delivers its
  * output synchronously in the result, so a handoff it produced successfully is
  * committed by the operation itself; an uncertified capture comes back with its
- * loss metadata and no acknowledgment, and is described as such. The
- * compatibility `bg_status log` action uses the same transport, so its read is
- * acknowledged by the same path rather than by a second channel.
+ * loss metadata and no acknowledgment, and is described as such.
  */
 async function getResultResult(
 	deps: RegistrationDeps,
 	task: ManagedTask,
 	output: "preview" | "full" | undefined,
-	action: "get" | "stop" | "log",
+	action: "get" | "stop",
 ): Promise<[string, Record<string, unknown>]> {
 	const { ack, handoff } = await deps.readTaskResult(task, output ?? "preview");
 	if (handoff.failure) throw new Error(handoff.failure.message);
@@ -592,33 +415,6 @@ function registerShortcuts(pi: ExtensionAPI, deps: RegistrationDeps): void {
 }
 
 export function registerAll(pi: ExtensionAPI, deps: RegistrationDeps): void {
-	// Initial registration happens before the session mode is known, so it is the
-	// conservative compatibility surface with `bg_task` only. `bg_status` is
-	// deliberately NOT registered here: a mode that must not expose it can never
-	// have to remove a definition it already declared.
-	registerBgTaskTool(pi, deps, "compat");
 	registerCommands(pi, deps);
 	registerShortcuts(pi, deps);
-}
-
-/**
- * Declares the tool surface for the mode the session actually started in. Called
- * from `session_start`, which is when Pi first tells the extension its mode.
- *
- * - `tui`: `bg_task` is re-registered with exactly spawn/get/stop/list and
- *   `bg_status` is not registered at all.
- * - `print`/`json`/`rpc`/anything unknown: `bg_status` is registered with its
- *   compatibility actions and `bg_task` keeps the full action set, including the
- *   bounded `wait` a child or headless caller may need before it returns.
- *
- * Nothing is ever removed and no active-tool list is rewritten: Pi activates a
- * newly registered tool through its ordinary registration path and honours an
- * existing allow/exclude selection, so a user, child or other extension's choice
- * is preserved by construction rather than repaired afterwards.
- */
-export function applyTaskToolSurface(pi: ExtensionAPI, deps: RegistrationDeps, mode: string | undefined): TaskToolSurface {
-	const surface = taskToolSurfaceFor(mode);
-	registerBgTaskTool(pi, deps, surface);
-	if (surface === "compat") registerBgStatusTool(pi, deps);
-	return surface;
 }

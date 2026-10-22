@@ -64,7 +64,7 @@ function createSession(completed: boolean) { const id = `widget-${++session}`;
 		registerShortcut: (key: string, definition: { handler: (ctx: ExtensionContext) => unknown }) => shortcuts.set(key, definition),
 		registerTool() {}, registerCommand() {}, registerMessageRenderer() {}, appendEntry() {},
 		sendMessage() { throw new Error("unexpected wake"); }, } as unknown as ExtensionAPI;
-	const ctx = { cwd: process.cwd(), hasUI: true, isIdle: () => true, isProjectTrusted: () => false,
+	const ctx = { cwd: process.cwd(), hasUI: true, mode: "tui", isIdle: () => true, isProjectTrusted: () => false,
 		sessionManager: { getSessionId: () => id,
 			getSessionFile: () => join(process.cwd(), `${id}.jsonl`),
 			getBranch: () => completed ? [{ type: "message", message: { role: "toolResult", toolName: "bg_task", details: { tasks: [{ id: "bg-1", title: "true", command: "true", cwd: process.cwd(), pid: 0, status: "completed", exitCode: 0,

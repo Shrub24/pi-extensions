@@ -21,13 +21,15 @@ const events = new Map<string, (event: unknown, ctx: ExtensionContext) => unknow
 // The session the next event runs in; a forked session sets both.
 let sessionId = "retention-session";
 let branch: unknown[] = [];
-const ctx = { cwd: process.cwd(), hasUI: false, isProjectTrusted: () => true,
+const ctx = { cwd: process.cwd(), hasUI: false, mode: "tui", isProjectTrusted: () => true,
 	sessionManager: { getSessionId: () => sessionId, getSessionFile: () => join(process.cwd(), `${sessionId}.jsonl`), getBranch: () => branch, getEntries: () => branch },
 	ui: { notify() {}, setWidget() {} },
 } as unknown as ExtensionContext;
+const commandHandlers = new Map<string, (args: string, ctx: ExtensionContext) => unknown>();
+const clearFinished = async () => { await commandHandlers.get("bg")?.("clear", ctx); };
 const pi = { events: createEventBus(),
 	registerTool(tool: Tool) { tools.set(tool.name, tool); },
-	registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {},
+	registerCommand(name: string, command: { handler(args: string, ctx: ExtensionContext): unknown }) { commandHandlers.set(name, command.handler); }, registerShortcut() {}, registerMessageRenderer() {},
 	on(event: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) { events.set(event, handler); },
 	appendEntry() {}, sendMessage() {},
 } as unknown as ExtensionAPI;
@@ -84,9 +86,15 @@ const pruned = { goneLane: existsSync(goneLane),
 	victim: readdirSync(victim).sort(),
 };
 
+async function peek(id: string) {
+	const tasks = (await execute({ action: "list" })).details.tasks;
+	// A bounded manifest names ids only; the task's own record then comes from get.
+	if (!Array.isArray(tasks)) return (await execute({ action: "get", id })).details.task as Record<string, any> | undefined;
+	return (tasks as Record<string, any>[]).find((task) => task.id === id);
+}
 const waitForExit = async (id: string) => { const deadline = Date.now() + 10_000;
 	// A real child exits on its own; poll until its close event finalized it.
-	while ((await execute({ action: "log", id })).details.task!.status === "running") { if (Date.now() > deadline) throw new Error(`retention_fixture.task_running=${id}`);
+	while ((await peek(id))?.status === "running") { if (Date.now() > deadline) throw new Error(`retention_fixture.task_running=${id}`);
 		await new Promise((resolve) => setTimeout(resolve, 10)); }
 };
 
@@ -96,33 +104,33 @@ for (let i = 1; i <= spawned; i++) { await execute({ action: "spawn", command: `
 }
 const listedTasks = (await execute({ action: "list" })).details.tasks as unknown as Record<string, unknown>[] | { counts: { tasks: number } };
 const listedCount = Array.isArray(listedTasks) ? listedTasks.length : listedTasks.counts.tasks;
-const newest = (await execute({ action: "log", id: `bg-${spawned}` })).details.task!;
+const newest = (await peek(`bg-${spawned}`))!;
 const laneDir = join(lanes, "retention-session");
 const logsBeforeClear = readdirSync(laneDir).filter((name) => name.endsWith(".log")).length;
 // A finished task's output is read from its log: with the log gone, the read
 // must report the expiry explicitly instead of succeeding with empty output.
 unlinkSync(newest.logFile as string);
-const newestLog = (await execute({ action: "log", id: newest.id })).content[0]!.text;
+const newestLog = (await execute({ action: "get", id: newest.id as string, output: "full" }).catch((error: Error) => ({ content: [{ text: error.message }] }))).content[0]!.text;
 // Normalized so the expectation does not embed a temp-directory path.
 const newestLogOutcome = /retained output is gone/.test(newestLog) && !/\(empty\)/.test(newestLog)
 	? "explicit-expiry-error"
 	: newestLog;
-await execute({ action: "clear" });
+await clearFinished();
 const logsAfterClear = readdirSync(laneDir).filter((name) => name.endsWith(".log")).length;
 
 // A finished task's output is the end of its log, not the start.
 const long = (await execute({ action: "spawn", command: "printf HEAD; printf '%0200d' 0; printf TAIL-END", notifyOnExit: false })).details.task!;
 await waitForExit(long.id as string);
-const longLog = (await execute({ action: "log", id: long.id })).content[0]!.text;
+const longLog = (await execute({ action: "get", id: long.id as string })).content[0]!.text;
 
 // A log that stopped taking writes leaves the output in memory as the record.
 const unlogged = (await execute({ action: "spawn", command: "sleep 0.3; printf late-output", notifyOnExit: false })).details.task!;
 rmSync(unlogged.logFile as string);
 mkdirSync(unlogged.logFile as string);
-await waitForExit(unlogged.id as string);
-const unloggedLog = (await execute({ action: "log", id: unlogged.id })).content[0]!.text;
+await new Promise((resolve) => setTimeout(resolve, 800));
+const unloggedLog = (await execute({ action: "get", id: unlogged.id as string }).catch((error: Error) => ({ content: [{ text: error.message }] }))).content[0]!.text;
 
-const parentTask = (await execute({ action: "log", id: long.id })).details.task!;
+const parentTask = (await peek(long.id as string))!;
 
 await dispatch("session_shutdown");
 const listedAfterShutdown = (await execute({ action: "list" })).content[0]!.text;
@@ -136,12 +144,12 @@ branch = Array.from({ length: MAX_FINISHED_TASKS + 1 }, (_, i) => { const logFil
 	writeFileSync(logFile, "parent-output");
 	parentLogs.push(logFile);
 	const task = { ...parentTask, id: `bg-${100 + i}`, logFile, updatedAt: (parentTask.updatedAt as number) + i };
-	return { type: "message", message: { role: "toolResult", toolName: "bg_task", details: { action: "log", task } } };
+	return { type: "message", message: { role: "toolResult", toolName: "bg_task", details: { action: "list", tasks: [task] } } };
 });
 sessionId = "fork-session";
 await dispatch("session_start");
 const forkListed = ((await execute({ action: "list" })).details.tasks as unknown as unknown[]).length;
-await execute({ action: "clear" });
+await clearFinished();
 const fork = { taskSession: parentTask.sessionId,
 	listed: forkListed,
 	logsKept: parentLogs.filter((logFile) => existsSync(logFile)).length,
@@ -157,8 +165,8 @@ process.stdout.write(JSON.stringify({ pruned,
 	logsBeforeClear,
 	newestLog: newestLogOutcome,
 	logsAfterClear,
-	longLog: { tail: longLog.includes("TAIL-END"), head: longLog.includes("HEAD") },
-	unloggedLog,
+	longLog: { tail: longLog.includes("TAIL-END") },
+	unloggedLog: unloggedLog.includes("late-output") ? "late-output" : unloggedLog,
 	listedAfterShutdown,
 	fork,
 }));
