@@ -151,17 +151,13 @@ export function choose(route: RouteConfig, available: Resolved[], health: Health
   return usable.find(c => identity(c.model, c.candidate.account) === preferred) ?? usable[0];
 }
 /**
- * The next eligible candidate after `current` in route order, wrapping once; `current` itself is tried last. With no
- * current candidate in the list, the search starts at the first one.
+ * The next configured candidate after `current` in route order, wrapping at the end. Cooling
+ * or disabled candidates stay in the cycle: a manual pin may name them, and the router falls back when they cannot serve.
+ * With no current candidate in the list, the search starts at the first one.
  */
-export function cycleTarget(route: RouteConfig, available: Resolved[], health: Health, tokens: number, current: string | undefined): Resolved | undefined {
-  const eligible = new Set(eligibleCandidates(route, available, health, tokens).map(c => identity(c.model, c.candidate.account)));
+export function cycleTarget(available: Resolved[], current: string | undefined): Resolved | undefined {
   const start = available.findIndex(c => identity(c.model, c.candidate.account) === current);
-  for (let step = 1; step <= available.length; step++) {
-    const next = available[(start + step + available.length) % available.length];
-    if (eligible.has(identity(next.model, next.candidate.account))) return next;
-  }
-  return undefined;
+  return available.length === 0 ? undefined : available[(start + 1 + available.length) % available.length];
 }
 
 // Pi's thinking levels in increasing order, and the clamp Pi applies to a model's supported set (pi-ai).

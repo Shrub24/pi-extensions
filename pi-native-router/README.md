@@ -165,8 +165,7 @@ Switching model does not count as a choice: a physical model's own thinking leve
 The router publishes four status items for powerline's `customItems` (`native-router-provider`, `native-router-model`, `native-router-peak`, `native-router-thinking`):
 
 - **Provider:** the provider serving the current request, with its account after `·` (e.g. `OpenCode Go · go-a`). Before the first request on a route, it shows the candidate the next request will try.
-- **Model:** Pi's model name for that candidate, with `⚑` while a route pin is set.
-- **Peak:** a `▲` while the physical model is in a peak window.
+- **Model:** one entry, in this order: the pin glyph (U+F0931) while the route is pinned to the model shown, or a warning-coloured fallback glyph (U+F0930) while a pin is set but another model serves; then Pi's model name for that candidate with the provider name removed when it leads (`Claude Haiku 5.5` under `Claude` reads `Haiku 5.5`); then the peak glyph (U+F0535), warning-coloured, while the physical model is in a peak window. The entry uses inline colour, so its Powerline item must set `selfColorize = true`; the glyph colours use standard ANSI yellow because the status channel carries no theme.
 - **Thinking:** the one thinking state shown, for direct and route models alike: the level name that will run (e.g. `high`). A Nerd Font pencil (`\uF040`, `nf-fa-pencil`) follows, after a space, when you chose the level on the route. Keep Pi's built-in thinking segment out of the powerline layout so the level is shown once.
 
 The model part of `provider/model` is Pi's own model name, so model labels come from Pi's catalog and need no config. A provider's `name` replaces its id in the footer. Labels change only what the footer shows, never routing, keys or telemetry.
@@ -179,10 +178,10 @@ The model part of `provider/model` is Pi's own model name, so model labels come 
 - A newly changed eligible pin overrides the incumbent once. On later requests, an eligible current model stays sticky even if a different pin remains stored; when there is no eligible incumbent, the pin is preferred over route order. A fresh manual choice also overrides pending recovery preference, but never health, fit, transition, activation or flush safeguards.
 - A pin that cannot serve (cooldown, exhausted quota, or too small for the request) is dormant: that request uses the route's automatic selection, and the pin becomes a preference again once the incumbent is unavailable.
 - `auto` clears the pin. So does picking the candidate that automatic selection would already pick now; without a custom strategy this is the last served candidate, else the first in route order.
-- The physical footer item shows `⚑` only when its displayed physical target matches the pin. A separate single warning glyph marks a pinned target that is cooling down, without marking the healthy fallback. Each manual change is logged with reason `manual`.
+- The pin glyph shows only when the displayed model is the pinned one. When a pinned candidate cannot serve (cooling down, exhausted or unfit), the fallback glyph replaces it in the same entry. Picker entries for cooling candidates carry a `⚠ cooling down` mark. Each manual change is logged with reason `manual`.
 - A pin change reports that an eligible new choice will apply on the next request and then stay sticky; an actual physical switch uses the normal cache-rebuild notice.
 
-Selecting a route shows its next candidate (pending explicit pin, then healthy current model, then eligible stored pin, then configured automatic selection), so cycling starts from what the route will do. Failures surface as notices: a candidate that fails with a quota, auth, or rate error warns with its cooldown deadline, and a failover warns with the old and new candidates. Transient errors retried on the same candidate are shown as info.
+Selecting a route shows its next candidate (pending explicit pin, then healthy current model, then eligible stored pin, then configured automatic selection), so cycling starts from what the route will do. Cycling walks every configured candidate in route order, including cooling ones: automatic routing skips them, while a manual pin may still name them and falls back until they recover. Failures surface as notices: a candidate that fails with a quota, auth, or rate error warns with its cooldown deadline, and a failover warns with the old and new candidates. Transient errors retried on the same candidate are shown as info.
 
 ## Decision log
 

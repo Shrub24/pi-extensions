@@ -11,7 +11,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream, type AssistantMessage } from "@earendil-works/pi-ai";
 import { installRouter } from "../src/index";
-import { FOOTER_KEYS } from "../src/footer";
+import { FOOTER_KEYS, PIN_FALLBACK_GLYPH, PIN_GLYPH } from "../src/footer";
 import { parseConfig } from "../src/config";
 import { nativeHttpError } from "./native-error";
 
@@ -653,7 +653,7 @@ test("a new pin or cycle overrides incumbent stickiness once, then the selected 
     const pin = h.commands.get("route-pin") as { handler: (args: string, context: never) => Promise<void> };
     await pin.handler("fake-b/model", ctx);
     expect(statuses.get(FOOTER_KEYS.model)).toContain("fake-b");
-    expect(statuses.get(FOOTER_KEYS.model)).toContain("⚑");
+    expect(statuses.get(FOOTER_KEYS.model)).toContain(PIN_GLYPH);
     await h.session.prompt("explicit pin should switch away from the healthy incumbent");
     await h.session.prompt("the selected target should now stay sticky");
     expect(h.dispatches.map(d => d.physical)).toEqual(["fake-a", "fake-b", "fake-b"]);
@@ -680,8 +680,8 @@ test("a pin cannot pull the route back to a recovered failed candidate while the
     await h.session.prompt("pinned target rate-limited; fallback selected");
     expect(h.dispatches.map(d => d.physical)).toEqual(["fake-b", "fake-b", "fake-a"]);
     await pin.handler("fake-b/model", ctx);
-    expect(statuses.get(FOOTER_KEYS.model)).not.toContain("⚑");
-    expect(statuses.get(FOOTER_KEYS.pinHealth)).toBe("⚠");
+    expect(statuses.get(FOOTER_KEYS.model)).not.toContain(PIN_GLYPH);
+    expect(statuses.get(FOOTER_KEYS.model)).toContain(PIN_FALLBACK_GLYPH);
     await h.session.prompt("ineligible pin falls back and consumes its one-shot override");
 
     h.clock.value += 61_000;

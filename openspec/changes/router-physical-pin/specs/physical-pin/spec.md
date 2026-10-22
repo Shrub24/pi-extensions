@@ -69,7 +69,7 @@ When the pinned candidate cannot serve a request, the router SHALL use the confi
 
 ### Requirement: Cycle hotkey
 
-A configurable hotkey SHALL move the pin to the next eligible candidate in configured route order after the one currently serving, wrapping once; cycling order is independent of custom automatic selection. When no candidate is eligible, it SHALL notify and leave the pin unchanged.
+A configurable hotkey SHALL move the pin to the next configured candidate in route order after the one currently serving, wrapping at the end; cycling order is independent of custom automatic selection. Cooling or disabled candidates remain in the cycle and the picker, marked as cooling down; a pin on one falls back until it recovers, and automatic routing still skips it.
 
 #### Scenario: Cycle wraps
 - **WHEN** the user presses the hotkey on the last candidate

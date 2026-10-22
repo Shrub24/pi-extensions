@@ -10,7 +10,7 @@ import { readConfig, type Candidate, type Config, type KeySource, type RouteConf
 import { commandSlots, completeArguments } from "./completions";
 import { keyActive, readKey, runtimeKeysAvailable, useKey } from "./accounts";
 import { HealthStore } from "./health-store";
-import { FOOTER_KEYS, modelText, peakText, providerText, thinkingText } from "./footer";
+import { FOOTER_KEYS, isPeakNow, modelEntryText, providerText, thinkingText } from "./footer";
 import { DEFAULT_CYCLE_PIN } from "./config";
 import { healthReport, type HealthMode } from "./health-report";
 import { defaultDecisionLogPath, recordDecision, type DecisionReason } from "./decision-log";
@@ -93,9 +93,6 @@ function pinOf(ctx: ExtensionContext, role: string): string | null | undefined {
 function pinOverrideOf(ctx: ExtensionContext, role: string): boolean {
   const entry = pinEntry(ctx, role);
   return entry?.type === "custom" && (entry.data as { override?: unknown }).override === true;
-}
-function isPinned(ctx: ExtensionContext, role: string, physical: string): boolean {
-  return pinOf(ctx, role) === physical;
 }
 
 /** The latest explicit route thinking choice on this branch, if the user made one. */
@@ -294,7 +291,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
         const selected = selection.selected;
         reportStrategyFallback(role, ctx, { ...selection, selected });
         if (!selected) throw exhausted(role, route, ctx, config);
-        publishRoute(ctx, role, selected.model, selected.candidate.account, selected.candidate.thinkingLevel, undefined, false);
+        publishRoute(ctx, role, selected.model, selected.candidate.account, selected.candidate.thinkingLevel, undefined);
         return { model: selected.model, thinkingLevel: selected.candidate.thinkingLevel };
       }
       const old = restore(request.state);
@@ -442,7 +439,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       // An explicit user choice on this route overrides the candidate default; reasoning-less models keep theirs.
       const explicit = userThinking(ctx, role);
       const thinkingLevel = routeLevel(selected.model, selected.candidate.thinkingLevel, explicit) as ModelThinkingLevel;
-      publishRoute(ctx, role, selected.model, selected.candidate.account, thinkingLevel, explicit, isPinned(ctx, role, physical));
+      publishRoute(ctx, role, selected.model, selected.candidate.account, thinkingLevel, explicit);
       return { model: selected.model, thinkingLevel, state: unchanged ? request.state : state };
     };
     pi.on("message_end", (event, ctx) => {
@@ -522,22 +519,17 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     reportStrategyFallback(role, ctx, { ...selection, selected: selection.selected }, false);
     return selection.selected;
   };
-  const pinHealthText = (ctx: ExtensionContext, role: string): string | undefined => {
-    const pin = pinOf(ctx, role);
-    if (typeof pin !== "string") return undefined;
-    const candidate = config.routes[role].candidates.find(value => identity(value, value.account) === pin);
-    if (!candidate) return undefined;
-    const model = ctx.modelRegistry.find(candidate.provider, candidate.id);
-    return model && health.blockedReason(model, candidate.account) ? "⚠" : undefined;
-  };
-  const setPhysical = (ctx: ExtensionContext, model: Model<Api> | undefined, account: string | undefined, pinned: boolean) => {
+  // The route's model entry: pin glyph (fallback-coloured while another model serves), model name, peak glyph.
+  const setPhysical = (ctx: ExtensionContext, role: string | undefined, model: Model<Api> | undefined, account: string | undefined) => {
     ctx.ui.setStatus(FOOTER_KEYS.provider, model === undefined ? undefined : providerText(model.provider, account, config.display));
-    ctx.ui.setStatus(FOOTER_KEYS.model, model === undefined ? undefined : modelText(model.name, pinned));
+    if (model === undefined || role === undefined) { ctx.ui.setStatus(FOOTER_KEYS.model, undefined); return; }
+    const pin = pinOf(ctx, role);
+    const pinState = typeof pin !== "string" ? undefined : pin === identity(model, account) ? "pinned" as const : "fallback" as const;
+    ctx.ui.setStatus(FOOTER_KEYS.model, modelEntryText({ name: model.name, provider: model.provider, providerLabel: config.display.providers[model.provider] ?? model.provider,
+      pin: pinState, peak: isPeakNow(model.provider, model.id, options.now?.() ?? Date.now()) }));
   };
   const clearRoute = (ctx: ExtensionContext) => {
-    setPhysical(ctx, undefined, undefined, false);
-    ctx.ui.setStatus(FOOTER_KEYS.pinHealth, undefined);
-    ctx.ui.setStatus(FOOTER_KEYS.peak, undefined);
+    setPhysical(ctx, undefined, undefined, undefined);
     ctx.ui.setStatus(FOOTER_KEYS.thinking, undefined);
   };
   // `choice` is the route's thinking choice: undefined reads it from the branch, null means no choice.
@@ -548,9 +540,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     if (displayGeneration.get(sessionId) !== generation || ctx.model?.provider !== "route" || ctx.model.id !== role) return;
     if (!shown) { clearRoute(ctx); return; }
     const { model, candidate } = shown;
-    setPhysical(ctx, model, candidate.account, isPinned(ctx, role, identity(model, candidate.account)));
-    ctx.ui.setStatus(FOOTER_KEYS.pinHealth, pinHealthText(ctx, role));
-    ctx.ui.setStatus(FOOTER_KEYS.peak, peakText(model.provider, model.id, options.now?.() ?? Date.now()));
+    setPhysical(ctx, role, model, candidate.account);
     const explicit = choice ?? undefined;
     const level = routeLevel(model, candidate.thinkingLevel, explicit);
     ctx.ui.setStatus(FOOTER_KEYS.thinking, model.reasoning ? thinkingText(level, explicit) : undefined);
@@ -559,18 +549,14 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     if (!ctx.hasUI) return;
     nextDisplayGeneration(ctx);
     if (model?.provider === "route" && config.routes[model.id]) { await previewRoute(ctx, model.id); return; }
-    setPhysical(ctx, undefined, undefined, false);
-    ctx.ui.setStatus(FOOTER_KEYS.pinHealth, undefined);
-    ctx.ui.setStatus(FOOTER_KEYS.peak, undefined);
+    setPhysical(ctx, undefined, undefined, undefined);
     ctx.ui.setStatus(FOOTER_KEYS.thinking, model?.reasoning && ctx.thinkingLevel ? thinkingText(ctx.thinkingLevel, undefined) : undefined);
   };
   // The physical model, peak and effective thinking level of a request this route has just resolved.
-  const publishRoute = (ctx: ExtensionContext, role: string, model: Model<Api>, account: string | undefined, effective: string, requested: string | undefined, pinned: boolean) => {
+  const publishRoute = (ctx: ExtensionContext, role: string, model: Model<Api>, account: string | undefined, effective: string, requested: string | undefined) => {
     if (!ctx.hasUI || ctx.model?.provider !== "route" || ctx.model.id !== role) return;
     nextDisplayGeneration(ctx);
-    setPhysical(ctx, model, account, pinned);
-    ctx.ui.setStatus(FOOTER_KEYS.pinHealth, pinHealthText(ctx, role));
-    ctx.ui.setStatus(FOOTER_KEYS.peak, peakText(model.provider, model.id, options.now?.() ?? Date.now()));
+    setPhysical(ctx, role, model, account);
     ctx.ui.setStatus(FOOTER_KEYS.thinking, model.reasoning ? thinkingText(effective, requested) : undefined);
   };
   pi.on("model_select", async (event, ctx) => {
@@ -692,6 +678,12 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
         ...(state?.next ? { recovery: state.next, priorityTarget: state.next, priority: "recovery" as const } : {}) });
     return selection.selected && identity(selection.selected.model, selection.selected.candidate.account);
   };
+  // Picker and cycle mark a candidate that is cooling down; it stays selectable, unlike automatic routing.
+  const COOLING_MARK = " ⚠ cooling down";
+  const blockedTarget = (ctx: ExtensionContext, candidate: { provider: string; id: string; account?: string }) => {
+    const model = ctx.modelRegistry.find(candidate.provider, candidate.id);
+    return model && model.api !== "pi-virtual" ? health.blockedReason(model, candidate.account) : undefined;
+  };
   const pinRoute = async (ctx: ExtensionContext, role: string, requested: string | null) => {
     // A pin on the candidate auto already picks changes nothing, so it is stored as auto instead.
     const matchesAuto = requested !== null && requested === await autoChoice(ctx, role);
@@ -701,6 +693,9 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     await previewRoute(ctx, role);
     if (matchesAuto) { ctx.ui.notify(`native-router: ${role} already follows auto on ${requested}; pin cleared`, "info"); return; }
     const note = choice === null ? `native-router: ${role} follows automatic selection` : `native-router: ${role} prefers ${choice}`;
+    const chosen = choice === null ? undefined : config.routes[role].candidates.find(c => identity(c, c.account) === choice);
+    const cooling = chosen ? blockedTarget(ctx, chosen) : undefined;
+    if (cooling) { ctx.ui.notify(`${note}; ${choice} is cooling down until ${new Date(cooling.until).toISOString()}, so the fallback serves until it recovers`, "warning"); return; }
     ctx.ui.notify(`${note}; an eligible new pin applies on the next request, then the selected model stays sticky`, "info");
   };
   const cyclePin = async (ctx: ExtensionContext) => {
@@ -708,8 +703,8 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     if (!model || model.provider !== "route" || !config.routes[model.id]) { ctx.ui.notify("native-router: select a route first", "warning"); return; }
     const role = model.id;
     const shown = await displayed(ctx, role);
-    const target = cycleTarget(config.routes[role], available(config.routes[role], ctx, config), health, ctx.getContextUsage()?.tokens ?? 0, shown && identity(shown.model, shown.candidate.account));
-    if (!target) { ctx.ui.notify(`native-router: no eligible candidate for ${role}; pin unchanged`, "warning"); return; }
+    const target = cycleTarget(available(config.routes[role], ctx, config), shown && identity(shown.model, shown.candidate.account));
+    if (!target) { ctx.ui.notify(`native-router: no candidate for ${role}; pin unchanged`, "warning"); return; }
     await pinRoute(ctx, role, identity(target.model, target.candidate.account));
   };
   pi.registerCommand("route-pin", {
@@ -724,9 +719,11 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       let choice: string | null;
       if (requested === "") {
         if (!ctx.hasUI) { ctx.ui.notify(`native-router: ${role} candidates: ${labels.join(", ")}`, "info"); return; }
-        const picked = await ctx.ui.select(`Pin ${role} to`, ["auto", ...labels]);
+        // Cooling candidates stay selectable; the label says so, and a pin on one falls back until it recovers.
+        const choices = config.routes[role].candidates.map((c, index) => blockedTarget(ctx, c) ? `${labels[index]}${COOLING_MARK}` : labels[index]);
+        const picked = await ctx.ui.select(`Pin ${role} to`, ["auto", ...choices]);
         if (picked === undefined) return;
-        choice = picked === "auto" ? null : picked;
+        choice = picked === "auto" ? null : picked.endsWith(COOLING_MARK) ? picked.slice(0, -COOLING_MARK.length) : picked;
       } else if (requested === "auto") choice = null;
       else if (labels.includes(requested)) choice = requested;
       else { ctx.ui.notify(`native-router: ${requested} is not a candidate of ${role}; use auto or one of: ${labels.join(", ")}`, "error"); return; }

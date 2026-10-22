@@ -10,7 +10,7 @@ A pin is a custom branch entry, `native-router:physical-pin`, with data `{ role,
 
 ## Cycling
 
-The cycle target is computed from the candidate list in route order. Starting after the currently serving candidate (or the pin, when set), it selects the first candidate that is eligible and fits the current context estimate, wrapping once. The cycle writes the same pin entry as the picker. If no candidate is eligible, it notifies and changes nothing.
+The cycle target is computed from the candidate list in route order. Starting after the currently serving candidate (or the pin, when set), it selects the next configured candidate in route order, wrapping at the end. Cooling or disabled candidates stay in the cycle and are marked in the picker; a pin on one falls back until it recovers, while automatic selection still skips them. The cycle writes the same pin entry as the picker.
 
 ## Command and hotkey
 
