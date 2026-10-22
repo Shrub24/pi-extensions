@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, expect, test } from "bun:test";
-import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
 import { BG_STATE_TYPE } from "../extensions/constants.js";
@@ -61,6 +61,7 @@ test("an empty sidecar is authoritative: removed tasks do not come back from the
 
 test("an unreadable sidecar is kept aside and reported, and the legacy branch rebuilds the roster", async () => {
 	await host.dispatch("session_shutdown");
+	mkdirSync(dirname(sidecarFile()), { recursive: true });
 	writeFileSync(sidecarFile(), "{ not json");
 	host.branch.push(legacyEntry("bg-9"));
 	const before = host.notifications.length;
@@ -71,4 +72,19 @@ test("an unreadable sidecar is kept aside and reported, and the legacy branch re
 	expect(readFileSync(`${dirname(sidecarFile())}/${kept[0]}`, "utf8")).toBe("{ not json");
 	expect(String(host.notifications.slice(before).flat().join(" "))).toContain("could not be read");
 	expect(existsSync(sidecarFile()), "a fresh sidecar replaces it").toBe(true);
+});
+
+test("a stale byte count in the store is re-derived from the log on restore", async () => {
+	await host.dispatch("session_shutdown");
+	rmSync(dirname(sidecarFile()), { recursive: true, force: true });
+	mkdirSync(dirname(sidecarFile()), { recursive: true });
+	const logFile = `${host.root}/bg-11.log`;
+	const written = "x".repeat(4_096);
+	writeFileSync(logFile, written);
+	const task = legacyTask("bg-11");
+	// The store records the count as of the last lifecycle transition, before the task kept writing.
+	writeFileSync(sidecarFile(), `${JSON.stringify({ version: 2, sessionId: host.ctx.sessionManager.getSessionId(), updatedAt: 1, tasks: [{ ...task, outputBytes: 10, lastOutputAt: 1 }] })}\n`);
+	await host.dispatch("session_start");
+	const restored = (await host.listTasks()).find((candidate) => candidate.id === "bg-11");
+	expect(restored?.outputBytes, "the log, not the stale counter, says what the task produced").toBe(written.length);
 });

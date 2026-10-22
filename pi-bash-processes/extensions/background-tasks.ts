@@ -16,7 +16,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { spawn } from "node:child_process";
 import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { Type } from "typebox";
 import { openLaneDir, pruneLanes } from "../scripts/lane-retention.js";
@@ -534,7 +534,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 
 	// Deferred persistence for per-chunk state; any immediate persist covers it.
 	const persistSoon = createCoalescedCall(() => persistenceLayer.persistSnapshots(), OUTPUT_PERSIST_MS);
-	const persistSnapshots = (): { transitions: number; sidecar: boolean } => {
+	const persistSnapshots = (): { transitions: number; sidecar: "written" | "unchanged" | "failed" } => {
 		persistSoon.cancel();
 		return persistenceLayer.persistSnapshots();
 	};
@@ -1283,6 +1283,15 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		const restored = await mapWithConcurrency([...replayed.values()], PROBE_CONCURRENCY, (snapshot) =>
 			restoredTaskFromSnapshot(snapshot, { sessionId, unitActiveProbe: defaultSystemdUnitActive }));
 		for (const task of restored) {
+			// The stored byte count dates from the last lifecycle transition, so a task
+			// that kept writing afterwards carries a stale one. The log is the record of
+			// what it produced: take the larger of the two, which also keeps a restart
+			// from re-announcing output that was already seen.
+			const onDisk = logSize(task.logFile);
+			if (onDisk !== null && onDisk > task.outputBytes) {
+				task.outputBytes = onDisk;
+				task.lastAnnouncedLength = onDisk;
+			}
 			tasks.set(task.id, task);
 			taskCounter = Math.max(taskCounter, numericTaskId(task.id));
 			rememberSnapshot(task);
@@ -1306,6 +1315,15 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 	// end as the in-memory buffer would have held. The dashboard asks on every
 	// redraw, so the last tail read is reused while its log is unchanged.
 	let lastLogTail: { logFile: string; size: number; mtimeMs: number; text: string } | undefined;
+	const logSize = (logFile: string): number | null => {
+		try {
+			const stats = statSync(logFile);
+			return stats.isFile() ? stats.size : null;
+		} catch {
+			return null;
+		}
+	};
+
 	const readLogTail = (logFile: string): string => {
 		const maxChars = settingNumber("outputBufferMaxChars", DEFAULT_OUTPUT_BUFFER_MAX_CHARS);
 		let fd: number | undefined;
@@ -1644,9 +1662,9 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			reason,
 			task,
 		});
-		// A dropped output wake is a diagnostic record, and a chatty task drops
-		// one per chunk; it rides the next persist instead of forcing one.
-		persistSoon.request();
+		// A dropped output wake is a diagnostic record and no longer forces a write:
+		// it rides the next lifecycle transition, and task state is not written for
+		// output growth.
 	};
 
 	const wakeBudgetLimits = (cwd?: string): OutputWakeBudgetLimits => ({

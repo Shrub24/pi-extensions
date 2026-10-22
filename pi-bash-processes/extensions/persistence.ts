@@ -89,8 +89,30 @@ export function stableSnapshotFingerprint(value: unknown): string {
 export interface PersistResult {
 	/** Transition entries appended to the session by this persist. */
 	transitions: number;
-	/** Whether the sidecar now holds the current state. */
-	sidecar: boolean;
+	/** What the owner store did: rewritten, already current, or failed. */
+	sidecar: "written" | "unchanged" | "failed";
+}
+
+/**
+ * Snapshot fields that move with output rather than with task lifecycle. They
+ * stay in the stored record but are not what decides whether the record is worth
+ * rewriting: a chatty task would otherwise rewrite the file on every chunk. A
+ * counter that is therefore stale on disk is re-derived from the log on restore.
+ */
+const VOLATILE_SNAPSHOT_FIELDS = new Set(["outputBytes", "lastOutputAt", "updatedAt", "wakeEvents"]);
+
+function durableKey(tasks: BackgroundTaskSnapshot[]): string {
+	const rows = tasks.map((task) => {
+		const record = task as unknown as Record<string, unknown>;
+		const row: Record<string, unknown> = {};
+		for (const key of Object.keys(record).sort()) {
+			if (VOLATILE_SNAPSHOT_FIELDS.has(key) || record[key] === undefined) continue;
+			row[key] = record[key];
+		}
+		return row;
+	});
+	rows.sort((left, right) => String(left.id).localeCompare(String(right.id)));
+	return createHash("sha256").update(JSON.stringify(rows)).digest("hex");
 }
 
 export interface PersistencePayload {
@@ -173,8 +195,10 @@ function transitionFacts(task: BackgroundTaskSnapshot): Omit<TaskTransitionEntry
 }
 
 // Persist the current task set.
-//   1. The sidecar is written in full, atomically. It is the only recoverable
-//      copy; a failure is reported and leaves the previous file intact.
+//   1. The sidecar is written in full, atomically, whenever the durable
+//      projection changed. It is the only recoverable copy; a failure is
+//      reported and leaves the previous file intact. Output-only movement is not
+//      a change, so a chatty task costs no writes.
 //   2. The session gets one small entry per task whose lifecycle changed since
 //      the last persist, and one per task that disappeared. Output growth changes
 //      neither, so a chatty task adds nothing to the session.
@@ -189,6 +213,8 @@ export function createPersistence(deps: PersistenceDeps): {
 	const notify = deps.notify;
 	// Last lifecycle tuple appended per task id; absence means the session has not seen the task.
 	const lastSeen = new Map<string, string>();
+	// Durable projection last written, so an output-driven persist writes nothing.
+	let lastDurable: string | undefined;
 
 	function payloadFor(tasks: BackgroundTaskSnapshot[], sessionId?: string): PersistencePayload {
 		return { version: BG_TASK_STORE_VERSION, ...(sessionId !== undefined ? { sessionId } : {}), tasks, updatedAt: Date.now() };
@@ -201,15 +227,20 @@ export function createPersistence(deps: PersistenceDeps): {
 
 	function persistSnapshots(): PersistResult {
 		const ctx = deps.getActiveCtx();
-		if (!ctx) return { transitions: 0, sidecar: false };
+		if (!ctx) return { transitions: 0, sidecar: "unchanged" };
 		const tasks = deps.listSnapshots();
 		const session = sessionIdForContext(ctx);
-		let sidecarOk = false;
-		try {
-			writeSidecarAtomic(sidecarStatePath(ctx), `${JSON.stringify(payloadFor(tasks, session))}\n`);
-			sidecarOk = true;
-		} catch (error) {
-			reportPersistFailure("sidecar", error, notify);
+		const durable = durableKey(tasks);
+		let sidecar: PersistResult["sidecar"] = "unchanged";
+		if (durable !== lastDurable) {
+			try {
+				writeSidecarAtomic(sidecarStatePath(ctx), `${JSON.stringify(payloadFor(tasks, session))}\n`);
+				lastDurable = durable;
+				sidecar = "written";
+			} catch (error) {
+				sidecar = "failed";
+				reportPersistFailure("sidecar", error, notify);
+			}
 		}
 
 		const at = Date.now();
@@ -249,7 +280,7 @@ export function createPersistence(deps: PersistenceDeps): {
 				break;
 			}
 		}
-		return { transitions: appended, sidecar: sidecarOk };
+		return { transitions: appended, sidecar };
 	}
 
 	return { persistSnapshots, seed, payloadFor };

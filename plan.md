@@ -106,12 +106,16 @@ of which repeated JSON keys were about 46%, `command` 20% and `title` 19%.
    possible second call through `gonePastUnproved`. At 1-3 live children the
    cost follows the session's launch history instead, so it grows over a long
    lead session.
-4. **Persistence rollout.** `pi-bash-processes` still writes a full task
-   snapshot per structural change (bounded at 64 KB and deduped by a
-   fingerprint that includes volatile output fields), and Herdsman still
-   rewrites `pi-herdsman-lead-state` and `pi-herdsman-agent-definitions`. Both
-   are small in bytes today (Herdsman totals about 1.1 MB) but are the pattern
-   the rules replace.
+4. **Persistence rollout.** Landed for `pi-bash-processes` (`1ea99552`): the
+   sidecar is the only task-state authority, the session gets one bounded
+   transition entry per lifecycle change instead of full snapshots, and the
+   store is rewritten only when the durable projection changes — a 20-task,
+   50-chunk fixture went from 490 KB and 53 store writes per lifecycle to 9.9 KB
+   and 3. Restore re-derives output counters from the log. Herdsman still
+   rewrites `pi-herdsman-lead-state` and `pi-herdsman-agent-definitions`; both
+   are small in bytes today (about 1.1 MB) but are the pattern the rules
+   replace. Remaining for this package: the owner path rename and the `kendex`
+   entry names.
 
 ### Takes from upstream
 

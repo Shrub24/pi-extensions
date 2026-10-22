@@ -224,4 +224,21 @@ fixture before claiming a figure.
 - Writer (`persistence.ts`): the sidecar is written atomically with `version: 2` and the owning `sessionId`; the session receives one `pi-bash-processes:task-transition` entry per task whose `(status, exitCode, exitNotified, resultReady, resultResolution, resultReminded)` changed, plus `removed` entries. `command` (80 chars) rides on `created` only. Output counters, timestamps and wake history are not in session entries. A resume `seed`s the restored tasks so it appends nothing for them.
 - Restore: a loadable sidecar is the only input; the branch (old snapshot entries and `bg_task`/`bash` tool-result rosters) is not read. No sidecar means a legacy session: replay the branch once, then the end-of-restore persist writes the sidecar. An unreadable sidecar is renamed to `state.json.corrupt-<ms>`, reported through `ui.notify`, and rebuilt from the legacy branch, never treated as empty.
 - Removed: the full-snapshot and overflow-manifest writers, the fingerprint dedupe, the barrier helpers, and `bgToolResultTasks`' restore barrier. `BG_STATE_TYPE` stays as a legacy read name.
-- Not changed: the sidecar is still rewritten on output-driven persists (coalesced), still at `kendex/sessions/<id>/pi-background-tasks/state.json`. Existing session files keep their old snapshots.
+- Store writes are transition-driven: the sidecar is rewritten only when the durable projection changes, where "durable" excludes `outputBytes`, `lastOutputAt`, `updatedAt` and `wakeEvents`. A chatty task therefore costs no writes at all, and the dropped-wake diagnostic no longer forces a persist. Because the stored counters can lag, restore re-derives `outputBytes` and the output cursor from the log when the file is longer than the record.
+- Not changed: the sidecar path is still `kendex/sessions/<id>/pi-background-tasks/state.json`, and existing session files keep their old snapshots.
+
+## Measurement (2026-10-22)
+
+Fixed fixture: 20 tasks, each written at creation, then 50 output chunks, then
+finished, then removed; one persist call per step, 53 in total.
+
+| | session entries | session bytes | store writes |
+| --- | --- | --- | --- |
+| before (`wlytlvuv`, full snapshots) | 53 | 490,098 | 53 |
+| after (transition entries) | 60 | 9,890 | 3 |
+
+Reproduce with a throwaway script in `pi-bash-processes/tests/`: import the
+current `createPersistence` and one recovered with
+`jj file show -r wlytlvuv pi-bash-processes/extensions/persistence.ts`, drive
+both with the same snapshot list, and count appended payload bytes and sidecar
+inode changes.

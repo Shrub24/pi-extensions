@@ -39,7 +39,7 @@ export function recordingHooks(sendReturns = true) {
 	let timerClears = 0;
 	const hooks: LifecycleHooks = {
 		rememberSnapshot(task) { remembers++; return { ...task }; },
-		persistSnapshots() { persists++; return { transitions: 0, sidecar: true }; },
+		persistSnapshots() { persists++; return { transitions: 0, sidecar: "written" }; },
 		sendTaskEvent(type, task) {
 			events.push({ type, task, id: task.id, reason: task.terminationReason });
 			return sendReturns;

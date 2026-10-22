@@ -58,20 +58,21 @@ test("the session gets an entry per lifecycle transition and none for output gro
 	withPersistenceContext((ctx, sidecarFile) => {
 		const { appended, persistence, set } = harness(ctx);
 		set([boundedSnapshot({ status: "running", exitCode: null })]);
-		expect(persistence.persistSnapshots()).toEqual({ transitions: 1, sidecar: true });
+		expect(persistence.persistSnapshots()).toEqual({ transitions: 1, sidecar: "written" });
 		expect(appended[0]!.entry).toMatchObject({ transition: "created", id: "bg-1", session: "session", status: "running", command: "printf ready" });
 
 		// A chatty task: output counters and timestamps move on every chunk.
 		for (let chunk = 1; chunk <= 200; chunk++) {
 			set([boundedSnapshot({ status: "running", exitCode: null, outputBytes: chunk * 4096, lastOutputAt: chunk, updatedAt: chunk })]);
-			expect(persistence.persistSnapshots().transitions).toBe(0);
+			expect(persistence.persistSnapshots(), `chunk ${chunk}`).toEqual({ transitions: 0, sidecar: "unchanged" });
 		}
 		expect(appended, "output alone appends nothing").toHaveLength(1);
+		// The counters on disk are therefore stale by design; restore re-derives them from the log.
 		const sidecar = JSON.parse(readFileSync(sidecarFile, "utf8")) as PersistencePayload;
-		expect(sidecar.tasks[0]!.outputBytes, "the sidecar still follows the task").toBe(200 * 4096);
+		expect(sidecar.tasks[0]!.outputBytes).toBe(0);
 
 		set([boundedSnapshot({ status: "completed", exitCode: 0, resultReady: true })]);
-		expect(persistence.persistSnapshots().transitions).toBe(1);
+		expect(persistence.persistSnapshots()).toEqual({ transitions: 1, sidecar: "written" });
 		expect(appended[1]!.entry).toMatchObject({ transition: "changed", status: "completed", exitCode: 0, resultReady: true, exitNotified: false });
 		expect(appended[1]!.entry.command, "the command is carried once, on creation").toBeUndefined();
 
@@ -116,12 +117,12 @@ test("a failed sidecar write is reported and leaves the previous state readable"
 		const notices: string[] = [];
 		const { persistence, set } = harness(ctx, notices);
 		set([boundedSnapshot({ id: "bg-keep" })]);
-		expect(persistence.persistSnapshots().sidecar).toBe(true);
+		expect(persistence.persistSnapshots().sidecar).toBe("written");
 		const dir = dirname(sidecarFile);
 		chmodSync(dir, 0o500);
 		try {
 			set([boundedSnapshot({ id: "bg-keep" }), boundedSnapshot({ id: "bg-lost" })]);
-			expect(persistence.persistSnapshots().sidecar).toBe(false);
+			expect(persistence.persistSnapshots().sidecar).toBe("failed");
 		} finally {
 			chmodSync(dir, 0o700);
 		}
