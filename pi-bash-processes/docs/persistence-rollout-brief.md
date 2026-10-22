@@ -205,6 +205,11 @@ authority change is subtractive:
    `replay-missed-exits` and `tool-result-restore-barrier` keep their legacy-path
    coverage and gain a sidecar-wins case.
 
+The transition entry also carries `resultReminded` (the one-shot advisory flag
+from the wake change), so a restart cannot repeat an advisory. It is already a
+snapshot field, so the sidecar holds it; only the session transition tuple needs
+to include it.
+
 Deferred to a second slice: sidecar write volume (the file is still rewritten in
 full on output-driven persists), the owner-path rename, and the `kendex` entry
 names. They do not affect session growth.

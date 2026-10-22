@@ -14,8 +14,23 @@ already in this tree by content.
 - [Validation and compatibility audit](pi-bash-processes/docs/validation-and-compatibility-audit.md): notification-pattern cursor defect, exact schema mismatch, reproduced highlight-cache defect, unresolved test failures and runtime/storage name migration.
 
 These findings supersede earlier claims that matching was bounded per chunk or
-that the renderer/completion failures were proven load flakes. No runtime fix
-was made in this audit.
+that the renderer/completion failures were proven load flakes. Since the audit:
+the output scan cursor and the renderer highlight-cache identity are fixed, the
+transcript-definition fallback defaults to off, and the wake semantics below
+landed. Still open: the bash `outputSchema` description assertion, the
+persistence rollout, and the compatibility phase-out.
+
+## Wake semantics (landed 2026-10-22)
+
+- An exit wake is the result delivery. It waits `exitWakeBatchMs` (3 s) when idle
+  and `exitWakeRunBatchMs` (250 ms) during a run, only while a sibling is still
+  running, and is sent as steer. It is never held to `agent_settled`.
+- A finished task arms no review interval. A result still unretrieved at a later
+  idle than the one its wake started gets one advisory, with no turn, persisted as
+  `resultReminded`. Soft-timeout reminders are running-task only.
+- Next, as its own change: one TUI-only tool surface (spawn/get/stop/list/extend);
+  non-TUI modes register no managed bash, `bg_task` or `bg_status` and use Pi's
+  built-in bash. This removes `clear`, `wait`, `bg_status` and the wait machinery.
 
 ## Settings: file-managed, no editor
 
@@ -250,13 +265,12 @@ Radar owning pane detection and restart is the same split from the other side.
 - Bash schema equality fails on description strings only; field types and
   required fields match. Actual structured-result tests pass. Fix the assertion
   boundary and review our descriptions, rather than changing compatible fields.
-- Renderer layout fails in the full suite and passes alone. A separate direct
-  probe proves the highlight cache reuses the first theme's output under a
-  second theme. Width assertions also depend on highlighter call counts rather
-  than layout. Do not dismiss this as a load flake.
-- Completion-dispatch passes alone; its earlier timeout remains unexplained.
-  The idle-batch test disables batching and waits for any exit before checking
-  every task. Its helper budget exceeds the default per-test timeout.
+- Renderer: the highlight cache is now keyed by Markdown theme and cleared on host
+  invalidation, with a regression test, and the layout test asserts rendered rows
+  instead of highlighter call counts. The suite passed three consecutive runs.
+- Completion-dispatch was rewritten for the new wake contract and passed two
+  consecutive full runs; one parallel-load failure of the closed-process test in
+  `pi-bg-tool.test.ts` did not repeat.
 - The earlier diff-border failure was not reproduced in this audit. Control
   global COLUMNS and settings inputs before assigning a cause. Full evidence and
   next slices are in the validation audit linked above.
