@@ -21,7 +21,7 @@ type Routing = { accounts: string[]; candidates: Array<{ provider: string; accou
 /** Synthetic env name for a test account; keys are set by each test and never printed. */
 const accountEnv = (id: string) => `NATIVE_ROUTER_TEST_KEY_${id.replace(/-/g, "_").toUpperCase()}`;
 type Outcome = "ok" | "quota" | "transient" | "stream-ended" | "partial" | "abort" | "tool" | "bad" | 401 | 403 | 429;
-async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateThinking?: "off" | "low" | "medium" | "high"; retry?: boolean; flush?: "failed" | "absent"; maxRecoveries?: number; maxTransitions?: number; smaller?: number; manager?: SessionManager; packaged?: boolean; unauthedFirst?: boolean; ttl?: number; startTime?: number; clock?: { value: number }; accounts?: boolean; providerKeys?: boolean; healthPath?: string; decisionLogPath?: string; heldProbe?: boolean; routing?: Routing; runtimeKeys?: "absent" | "inert"; wide?: boolean; contextWindow?: number; maxTokens?: number; strategy?: "prefer-b" | "missing"; schedule?: Schedule; tracker?: Runner } = {}) {
+async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateThinking?: "off" | "low" | "medium" | "high"; retry?: boolean; flush?: "failed" | "absent"; maxRecoveries?: number; maxTransitions?: number; smaller?: number; manager?: SessionManager; packaged?: boolean; unauthedFirst?: boolean; ttl?: number; startTime?: number; clock?: { value: number }; accounts?: boolean; providerKeys?: boolean; healthPath?: string; decisionLogPath?: string; heldProbe?: boolean; routing?: Routing; runtimeKeys?: "absent" | "inert"; wide?: boolean; contextWindow?: number; maxTokens?: number; strategy?: "prefer-b" | "session-order" | "missing"; schedule?: Schedule; tracker?: Runner } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "native-router-"));
   const settings = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: opts.retry ?? false, maxRetries: 3, baseDelayMs: 1 }, cacheWarming: "off" });
   const runtime = await ModelRuntime.create({ authPath: join(dir, "auth.json"), modelsPath: null, refreshOnCreate: false });
@@ -89,6 +89,11 @@ async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateT
   }
   const strategyPath = opts.strategy ? join(dir, "strategy.ts") : undefined;
   if (strategyPath && opts.strategy === "prefer-b") writeFileSync(strategyPath, 'export default { version: 1, choose: (context: { currentTargetId?: string; eligibleTargetIds: string[]; excludedTargetIds: string[]; targets: { account?: string; pricing: { status: string }; switchingCost: { status: string }; targetId: string }[] }) => { if (!Object.isFrozen(context) || Object.keys(context).some(key => /message|credential|apiKey|secret/i.test(key)) || context.targets.length !== 3 || context.targets.some(t => (t.account !== undefined && !t.targetId.endsWith(`#${t.account}`)) || t.pricing.status === "complete" || t.switchingCost.status !== (t.targetId === context.currentTargetId ? "same-target" : "unknown") || Object.keys(t).some(key => /key|secret|credential/i.test(key)))) throw new Error("unsafe or fabricated snapshot"); const target = context.currentTargetId?.startsWith("fake-b/") || context.excludedTargetIds.some(id => id.startsWith("fake-b/")) ? "fake-c/" : "fake-b/"; return { targetId: context.eligibleTargetIds.find(id => id.startsWith(target))!, reason: `test strategy selects ${target}` }; } };');
+  if (strategyPath && opts.strategy === "session-order") writeFileSync(strategyPath, `export default { version: 1, choose: context => {
+    const expected = ["fake-b/model", "fake-a/model", "fake-c/model"];
+    if (JSON.stringify(context.route.configuredOrder) !== JSON.stringify(expected) || JSON.stringify(context.targets.map(t => t.targetId)) !== JSON.stringify(expected) || context.eligibleTargetIds.includes("fake-a/model")) return { targetId: context.eligibleTargetIds[0], reason: "unexpected order or eligibility" };
+    return { targetId: "fake-c/model", reason: "custom choice beats first candidate" };
+  } };`);
   const raw = { flushTimeoutMs: 10, providers: sharedProviders, routes: { worker: { ...(strategyPath ? { strategy: { module: strategyPath, options: {} } } : {}), candidates: routed ? routed.candidates.map(c => ({ provider: c.provider, id: "model", thinkingLevel: opts.candidateThinking ?? "off", ...(opts.ttl ? { cacheTtlMs: opts.ttl } : {}), ...(c.account ? { account: c.account } : {}) })) : ["fake-a", "fake-b", "fake-c"].map(provider => ({ provider, id: "model", thinkingLevel: opts.candidateThinking ?? "off", ...(opts.ttl ? { cacheTtlMs: opts.ttl } : {}), ...(opts.accounts ? { account: `acct-${provider}` } : {}) })), maxRecoveries: opts.maxRecoveries ?? 2, maxTransitions: opts.maxTransitions ?? 3 } } };
   const config = parseConfig(raw);
   const decisionLogPath = opts.decisionLogPath ?? join(dir, "decisions.jsonl");
@@ -1029,4 +1034,146 @@ test("production route-scope wake ignores a newly granted blocked-pin bypass", a
     expect(h.dispatches.map(d => d.physical)).toEqual(["fake-a", "fake-b", "fake-c", "fake-c"]);
     expect(timer.jobs.size).toBe(0);
   } finally { h.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+/** Drive the real custom component from the command, with only terminal IO replaced. */
+function routeOrderUI(h: Awaited<ReturnType<typeof host>>) {
+  let keys: string[] = [];
+  const notices: string[] = [];
+  let screen: string[] = [];
+  const ctx = { mode: "tui", hasUI: true, model: h.runtime.getModel("route", "worker"), modelRegistry: {
+    find: (provider: string, id: string) => h.runtime.getModel(provider, id), hasConfiguredAuth: () => true, runtime: h.runtime,
+  }, sessionManager: h.manager, getContextUsage: () => ({ tokens: 0 }), thinkingLevel: "off", ui: {
+    notify: (message: string) => notices.push(message), setStatus: () => {}, select: async (_title: string, choices: string[]) => choices[1],
+    custom: async (factory: Function) => {
+      let result: unknown;
+      const component = factory({ requestRender() {} }, {}, {}, (value: unknown) => { result = value; });
+      screen = component.render(120);
+      for (const key of keys) component.handleInput(key);
+      return result;
+    },
+  } };
+  const command = (name: string, args = "") => (h.commands.get(name) as { handler: (args: string, ctx: never) => Promise<void> }).handler(args, ctx as never);
+  return { ctx, notices, command, get screen() { return screen; }, edit: async (...input: string[]) => { keys = input; await command("route-order"); } };
+}
+
+test("session order applies once then stays sticky; reset reconsiders configured order; cancel and all-disabled preserve it", async () => {
+  const h = await host([]);
+  const ui = routeOrderUI(h);
+  try {
+    await h.session.prompt("initial");
+    await ui.edit("\x1b[B", "\x1b[1;2A", "\r");
+    await h.session.prompt("new priority");
+    await h.session.prompt("sticky");
+    await ui.edit(" ", "\x1b[B", " ", "\x1b[B", " ", "\r");
+    expect(ui.notices.some(text => text.includes("at least one"))).toBe(true);
+    await h.session.prompt("all-disabled rejected");
+    await ui.edit("\x1b[1;2B", "\x1b");
+    await h.session.prompt("cancelled");
+    await ui.command("route-order", "reset");
+    await h.session.prompt("configured priority restored");
+    expect(h.dispatches.map(d => d.physical)).toEqual(["fake-a", "fake-b", "fake-b", "fake-b", "fake-b", "fake-a"]);
+  } finally { h.close(); }
+});
+
+test("disabled candidates stay manually selectable, but a failed disabled pin is never automatically reselected", async () => {
+  const h = await host(["ok", "ok", "ok", "transient", "ok", "ok"], { retry: true });
+  const ui = routeOrderUI(h);
+  try {
+    await ui.edit(" ", "\r"); // disable A
+    await h.runtime.completeSimple(h.runtime.getModel("route", "worker")!, { messages: [{ role: "user", content: "direct respects automatic disable", timestamp: 1 }] });
+    expect(h.dispatches.at(-1)?.physical).toBe("fake-b");
+    await h.session.prompt("auto excludes A");
+    await ui.command("route-pin", "fake-a/model");
+    await h.session.prompt("explicit disabled pin succeeds");
+    await ui.command("route-pin", "fake-a/model");
+    await h.session.prompt("failed explicit disabled pin");
+    await h.session.prompt("still automatically disabled");
+    expect(h.dispatches.map(d => d.physical)).toEqual(["fake-b", "fake-b", "fake-a", "fake-a", "fake-b", "fake-b"]);
+    await (h.shortcuts.get("ctrl+shift+m") as { handler: (ctx: never) => Promise<void> }).handler(ui.ctx as never);
+    await h.session.prompt("cycle C");
+    await (h.shortcuts.get("ctrl+shift+m") as { handler: (ctx: never) => Promise<void> }).handler(ui.ctx as never);
+    await h.session.prompt("cycle includes disabled A");
+    expect(h.dispatches.at(-1)?.physical).toBe("fake-a");
+  } finally { h.close(); }
+});
+
+test("leaving a route clears its session order", async () => {
+  const h = await host([]);
+  const ui = routeOrderUI(h);
+  try {
+    await ui.edit(" ", "\r");
+    await h.session.prompt("B");
+    for (const handler of h.handlers.get("model_select") ?? []) await handler({ model: h.runtime.getModel("fake-c", "model") } as never, ui.ctx as never);
+    await ui.edit("\x1b");
+    expect(ui.screen.filter(line => line.includes("[x]"))).toHaveLength(3);
+  } finally { h.close(); }
+});
+
+test("custom strategies receive session order and enabled eligibility, and their choice wins over first candidate", async () => {
+  const h = await host([], { strategy: "session-order" });
+  const ui = routeOrderUI(h);
+  try {
+    await ui.edit(" ", "\x1b[B", "\x1b[1;2A", "\r"); // B, disabled A, C
+    await h.session.prompt("custom chooses C rather than first B");
+    expect(h.dispatches.map(d => d.physical)).toEqual(["fake-c"]);
+  } finally { h.close(); }
+});
+
+test("resumption readiness ignores a healthy disabled target and wakes in overridden enabled order", async () => {
+  const root = mkdtempSync(join(tmpdir(), "resume-order-")), healthPath = join(root, "health.sqlite");
+  const clock = { value: 1000 }, timer = manualClock(clock);
+  const h = await host(["quota", "quota", "ok"], { clock, schedule: timer.schedule, healthPath });
+  const ui = routeOrderUI(h);
+  const store = new HealthStore(healthPath, () => clock.value);
+  try {
+    await ui.edit(" ", "\x1b[B", "\x1b[B", "\x1b[1;2A", "\x1b[1;2A", "\r"); // C, disabled A, B
+    await h.session.prompt("/route-resume once");
+    await h.session.prompt("wait for enabled capacity");
+    expect(h.dispatches.map(d => d.physical)).toEqual(["fake-c", "fake-b"]);
+    timer.advance(1000); await drainResume();
+    expect(h.dispatches).toHaveLength(2); // A is healthy, but cannot wake this task
+    store.mark("fake-b", "quota", clock.value + 900_000, "quota");
+    timer.advance(300_001); await drainResume();
+    expect(h.dispatches.map(d => d.physical)).toEqual(["fake-c", "fake-b", "fake-c"]);
+    expect(timer.jobs.size).toBe(0);
+  } finally { store.close(); h.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("order edits never bypass health and restored priority does not displace a sticky fallback", async () => {
+  const h = await host(["quota", "ok", "ok", "ok", "ok"]);
+  const ui = routeOrderUI(h);
+  try {
+    await h.session.prompt("A blocked; B serves");
+    await ui.command("route-order", "reset");
+    await h.session.prompt("reset must not bypass A health");
+    h.clock.value += 300_001;
+    await h.session.prompt("one reconsideration consumed; B remains sticky after A recovers");
+    await ui.command("route-order", "reset");
+    await h.session.prompt("fresh reset now admits recovered A");
+    expect(h.dispatches.map(d => d.physical)).toEqual(["fake-a", "fake-b", "fake-b", "fake-b", "fake-a"]);
+  } finally { h.close(); }
+});
+
+test("automatic disable distinguishes two accounts of the same physical model", async () => {
+  process.env[accountEnv("order-one")] = "fixture-one";
+  process.env[accountEnv("order-two")] = "fixture-two";
+  const h = await host([], { routing: { accounts: ["order-one", "order-two"], candidates: [
+    { provider: "fake-a", account: "order-one" }, { provider: "fake-a", account: "order-two" }, { provider: "fake-b" },
+  ] } });
+  const ui = routeOrderUI(h);
+  const activated: string[] = [];
+  h.api.events.on("native-router:account-active", event => activated.push((event as { account: string }).account));
+  try {
+    await ui.edit(" ", "\r");
+    await h.session.prompt("only the first account is disabled");
+    expect(activated).toEqual(["order-two"]);
+    await ui.command("route-pin", "fake-a/model#order-one");
+    await h.session.prompt("explicit first account");
+    expect(activated).toEqual(["order-two", "order-one"]);
+  } finally {
+    h.close();
+    delete process.env[accountEnv("order-one")];
+    delete process.env[accountEnv("order-two")];
+  }
 });

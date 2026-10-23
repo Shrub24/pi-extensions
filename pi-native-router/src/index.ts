@@ -25,6 +25,7 @@ import { evaluateStrategy, loadStrategy, type LoadedStrategy, type RoutingContex
 import { projectQuotaObservation, projectStrategyPrice } from "./strategy-projection";
 import { installResumption, type Schedule } from "./resumption";
 import type { Runner } from "./quota";
+import { orderEditor, type OrderItem } from "./route-order";
 
 function tokens(messages: readonly Message[]): number {
   const canonical = messages.reduce((n, m) => n + estimateTokens(m), 0);
@@ -123,6 +124,27 @@ export function defaultHealthPath(): string {
 /** Admission made before a physical dispatch; settled by its own success or failure. */
 interface Admission { holder: string; keys: string[]; revision: number; physical: string }
 export function installRouter(pi: ExtensionAPI, config: Config, options: { transition?: TransitionHook; now?: () => number; healthPath?: string; decisionLogPath?: string; schedule?: Schedule; quotaRunner?: Runner } = {}) {
+  const orders = new Map<string, { items: OrderItem[]; reconsider: boolean }>();
+  const orderKey = (ctx: ExtensionContext, role: string) => `${ctx.sessionManager.getSessionId()}:${role}`;
+  const orderOf = (ctx: ExtensionContext, role: string) => orders.get(orderKey(ctx, role));
+  const orderedRoute = (route: RouteConfig, ctx: ExtensionContext, role: string): RouteConfig => {
+    const order = orderOf(ctx, role);
+    if (!order) return route;
+    const byId = new Map(route.candidates.map(c => [identity(c, c.account), c]));
+    return { ...route, candidates: order.items.map(item => byId.get(item.target)!) };
+  };
+  const enabled = (ctx: ExtensionContext, role: string, target: string) =>
+    orderOf(ctx, role)?.items.find(item => item.target === target)?.enabled !== false;
+  const automaticCandidates = (route: RouteConfig, ctx: ExtensionContext) => {
+    const role = Object.keys(config.routes).find(role => config.routes[role] === route)!;
+    return available(orderedRoute(route, ctx, role), ctx, config).filter(c => enabled(ctx, role, identity(c.model, c.candidate.account)));
+  };
+  const clearOrders = (_event: unknown, ctx: ExtensionContext) => {
+    const prefix = `${ctx.sessionManager.getSessionId()}:`;
+    for (const key of orders.keys()) if (key.startsWith(prefix)) orders.delete(key);
+  };
+  pi.on("session_start", clearOrders);
+  pi.on("session_shutdown", clearOrders);
   let resume: ReturnType<typeof installResumption>;
   let lastDegradation: string | undefined;
   const degrade = (error: unknown) => {
@@ -139,7 +161,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
   }
   const health = new Health(options.now, store, degrade);
   resume = installResumption(pi, { config, store, health, now: options.now ?? Date.now, schedule: options.schedule,
-    candidates: (route, ctx) => available(route, ctx, config), pin: pinOf, refresh: () => refreshQuotas() });
+    candidates: automaticCandidates, pin: pinOf, refresh: () => refreshQuotas() });
   const decisionLogPath = options.decisionLogPath ?? defaultDecisionLogPath();
   const admissions = new Map<string, Admission>();
   /** Settles this session's pending admission. Success clears only the causes it proved recovered. */
@@ -176,9 +198,10 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
   const strategyContext = (role: string, route: RouteConfig, ctx: ExtensionContext, candidates: Resolved[], estimate: number,
     input: { mode: RoutingContext["mode"]; reason: RoutingContext["reason"]; state?: State; current?: string; pin?: string; recovery?: string; priorityTarget?: string; priority?: "recovery" | "retry" | "pin"; forcePin?: boolean; excluded?: ReadonlySet<string>; failed?: string; failureKind?: string }): RoutingContext => {
     const now = options.now?.() ?? Date.now();
+    route = orderedRoute(route, ctx, role);
     const eligible = eligibleCandidates(route, candidates, health, estimate).filter(({ model, candidate }) => {
       const target = identity(model, candidate.account);
-      return !input.excluded?.has(target) && (input.state === undefined || !input.current || target === input.current || input.state.transitions < route.maxTransitions);
+      return enabled(ctx, role, target) && !input.excluded?.has(target) && (input.state === undefined || !input.current || target === input.current || input.state.transitions < route.maxTransitions);
     });
     const loaded = new Map(candidates.map(value => [identity(value.model, value.candidate.account), value]));
     const eligibleIds = new Set(eligible.map(value => identity(value.model, value.candidate.account)));
@@ -201,6 +224,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
         if (blocked) rejectionReasons.push(`health-${blocked.kind}`);
         if (model.contextWindow < requiredContext(route, model, estimate) || model.maxTokens < route.outputReserve) rejectionReasons.push("context-fit");
       }
+      if (!enabled(ctx, role, targetId)) rejectionReasons.push("session-disabled");
       if (input.excluded?.has(targetId)) rejectionReasons.push("excluded-this-attempt");
       if (input.state && input.state.transitions >= route.maxTransitions && targetId !== input.current) rejectionReasons.push("transition-budget");
       const eligibleNow = Boolean(model && model.api !== "pi-virtual" && eligibleIds.has(targetId));
@@ -239,12 +263,22 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
   };
   const chooseWithStrategy = async (role: string, route: RouteConfig, candidates: Resolved[], health: Health, estimate: number, preferred: string | undefined,
     exclude: string | ReadonlySet<string> | undefined, ctx: ExtensionContext, input: Parameters<typeof strategyContext>[5]): Promise<{ selected?: Resolved; strategyId: string; reason: string; fallback?: string; quotaObservedAt?: number; pricingObservedAt?: number }> => {
-    const selectable = route.strategy ? candidates.filter(value => input.state === undefined || !input.current || identity(value.model, value.candidate.account) === input.current || input.state.transitions < route.maxTransitions) : candidates;
+    route = orderedRoute(route, ctx, role);
+    const rank = new Map(route.candidates.map((c, index) => [identity(c, c.account), index]));
+    candidates = [...candidates].sort((a, b) => rank.get(identity(a.model, a.candidate.account))! - rank.get(identity(b.model, b.candidate.account))!);
+    const budgetCurrent = input.current;
+    const reconsider = orderOf(ctx, role)?.reconsider && !input.forcePin && !input.recovery && input.priority !== "retry";
+    if (reconsider) {
+      preferred = undefined;
+      input = { ...input, current: undefined, priorityTarget: undefined, priority: undefined };
+    }
+    const manualCandidates = route.strategy ? candidates.filter(value => input.state === undefined || !budgetCurrent || identity(value.model, value.candidate.account) === budgetCurrent || input.state.transitions < route.maxTransitions) : candidates;
+    const selectable = manualCandidates.filter(c => enabled(ctx, role, identity(c.model, c.candidate.account)));
     const isExcluded = (target: string) => typeof exclude === "string" ? exclude === target : exclude?.has(target) === true;
     // A forced pin is the user's explicit try: health is checked later by its override admission, so only fit applies here.
     const eligible = eligibleCandidates(route, selectable, health, estimate).filter(value => !isExcluded(identity(value.model, value.candidate.account)));
     if (input.forcePin && typeof input.priorityTarget === "string") {
-      const pinned = selectable.find(value => identity(value.model, value.candidate.account) === input.priorityTarget && fitsRequest(route, value, estimate) && !isExcluded(input.priorityTarget!));
+      const pinned = manualCandidates.find(value => identity(value.model, value.candidate.account) === input.priorityTarget && fitsRequest(route, value, estimate) && !isExcluded(input.priorityTarget!));
       if (pinned) return { selected: pinned, strategyId: "pin", reason: "explicit pin override" };
     }
     const currentEligible = input.current !== undefined && eligible.some(value => identity(value.model, value.candidate.account) === input.current);
@@ -267,7 +301,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       return { selected, strategyId: route.strategy ? "ordered" : "ordered", reason: "configured order or current target",
         ...(route.strategy && strategyLoadFailed.has(role) ? { fallback: "strategy module could not be loaded" } : {}) };
     }
-    const context = strategyContext(role, route, ctx, candidates, estimate, input);
+    const context = strategyContext(role, route, ctx, manualCandidates, estimate, input);
     const choice = evaluateStrategy(custom, context, () => { const value = fallback(); return value ? identity(value.model, value.candidate.account) : undefined; });
     const selected = selectable.find(value => identity(value.model, value.candidate.account) === choice.targetId && context.eligibleTargetIds.includes(choice.targetId));
     const observed = context.targets.find(value => value.targetId === choice.targetId);
@@ -295,7 +329,8 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       request.signal?.throwIfAborted();
       const resumeFence = request.reason === "direct" ? () => {} : resume.fence(ctx);
       resumeFence();
-      const candidates = request.reason === "direct" ? available(route, ctx, config) : resume.candidates(route, ctx);
+      const candidates = request.reason === "direct" || !resume.automatic()
+        ? available(route, ctx, config) : resume.candidates(route, ctx);
       // Pi's usage-aware context estimate (also shown in the footer) is authoritative for routed session turns.
       // Use the message heuristic only for direct calls or when Pi has no context usage yet.
       const estimate = request.reason === "direct"
@@ -386,7 +421,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       }
       if (!selected) {
         // Preserve structured rejection facts; resumption never parses the displayed route diagnostic.
-        const usable = candidates.filter(c => fitsRequest(route, c, estimate));
+        const usable = candidates.filter(c => enabled(ctx, role, identity(c.model, c.candidate.account)) && fitsRequest(route, c, estimate));
         const capacity = usable.length > 0 && usable.every(c => {
           const blocked = health.blockedReason(c.model, c.candidate.account);
           return blocked && (blocked.kind === "quota" || blocked.kind === "tracker-quota" ||
@@ -397,6 +432,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
         const detail = route.candidates.map(candidate => {
           const target = `${candidate.provider}/${candidate.id}${candidate.account ? `#${candidate.account}` : ""}`;
           const model = ctx.modelRegistry.find(candidate.provider, candidate.id);
+          if (!enabled(ctx, role, target)) return `${target}: disabled for automatic routing`;
           if (!model || model.api === "pi-virtual") return `${target}: not registered`;
           const source = keyOf(candidate, config);
           if (candidate.account !== undefined && !source) return `${target}: unknown account`;
@@ -473,6 +509,8 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       resumeFence();
       request.signal?.throwIfAborted();
       resume.checkTarget(selected.candidate, ctx);
+      const order = orderOf(ctx, role);
+      if (order) order.reconsider = false;
       return { model: selected.model, thinkingLevel, state: unchanged ? request.state : state };
     };
     pi.on("message_end", (event, ctx) => {
@@ -564,10 +602,10 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     const route = config.routes[role];
     const state = branchState(ctx, role);
     const pin = pinOf(ctx, role);
-    const candidates = resume.candidates(route, ctx);
+    const candidates = resume.automatic() ? resume.candidates(route, ctx) : available(route, ctx, config);
     // The footer follows what actually serves: the last dispatched target, unless the user has just chosen a new one
     // (a fresh pin is pending). A stored pin does not pull the display away from a healthy fallback.
-    if (!(typeof pin === "string" && pinOverrideOf(ctx, role)) && state?.physical) {
+    if (!orderOf(ctx, role)?.reconsider && !(typeof pin === "string" && pinOverrideOf(ctx, role)) && state?.physical) {
       const served = candidates.find(value => identity(value.model, value.candidate.account) === state.physical);
       if (served) return served;
     }
@@ -635,6 +673,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       pi.appendEntry(PIN_ENTRY, { role: leftRole, identity: null });
       if (ctx.hasUI) ctx.ui.notify(`native-router: ${leftRole} pin cleared because the model changed`, "info");
     }
+    if (previous !== next && leftRole !== undefined) orders.delete(orderKey(ctx, leftRole));
     activeModel.set(sessionId, next);
     await publishSelection(ctx, event.model);
   });
@@ -786,10 +825,36 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     if (!model || model.provider !== "route" || !config.routes[model.id]) { ctx.ui.notify("native-router: select a route first", "warning"); return; }
     const role = model.id;
     const shown = await displayed(ctx, role);
-    const target = cycleTarget(available(config.routes[role], ctx, config), shown && identity(shown.model, shown.candidate.account));
+    const target = cycleTarget(available(orderedRoute(config.routes[role], ctx, role), ctx, config), shown && identity(shown.model, shown.candidate.account));
     if (!target) { ctx.ui.notify(`native-router: no candidate for ${role}; pin unchanged`, "warning"); return; }
     await pinRoute(ctx, role, identity(target.model, target.candidate.account));
   };
+  pi.registerCommand("route-order", {
+    description: "Edit this session's route order and automatic enabled set, or reset",
+    getArgumentCompletions: prefix => completeArguments(prefix, () => [{ value: "reset" }]),
+    handler: async (args, ctx) => {
+      const model = ctx.model;
+      if (model?.provider !== "route" || !config.routes[model.id]) { ctx.ui.notify("native-router: select a route first", "warning"); return; }
+      if (args.trim() && args.trim() !== "reset") { ctx.ui.notify("Usage: /route-order [reset]", "error"); return; }
+      const role = model.id;
+      const defaults = config.routes[role].candidates.map(c => ({ target: identity(c, c.account), enabled: true }));
+      let items: OrderItem[] | undefined;
+      if (args.trim() === "reset") items = defaults;
+      else {
+        if (ctx.mode !== "tui") { ctx.ui.notify("/route-order editor requires TUI mode; /route-order reset is available in other modes", "warning"); return; }
+        items = await ctx.ui.custom<OrderItem[] | undefined>((tui, _theme, _keys, done) =>
+          orderEditor(orderOf(ctx, role)?.items ?? defaults, done, () => tui.requestRender()));
+      }
+      if (!items) return;
+      if (!items.some(item => item.enabled)) { ctx.ui.notify("native-router: keep at least one candidate enabled; route order unchanged", "error"); return; }
+      if (ctx.model?.provider !== "route" || ctx.model.id !== role) return;
+      orders.set(orderKey(ctx, role), { items, reconsider: true });
+      activeModel.set(ctx.sessionManager.getSessionId(), `route/${role}`);
+      await previewRoute(ctx, role);
+      await resume.recheck();
+      ctx.ui.notify(`native-router: ${role} route order ${args.trim() === "reset" ? "reset" : "applied"}; automatic priority reconsidered on the next request`, "info");
+    },
+  });
   pi.registerCommand("route-pin", {
     description: "Pin this route to one candidate, or auto: /route-pin [candidate|auto]",
     getArgumentCompletions: prefix => completeArguments(prefix, slots["route-pin"]),

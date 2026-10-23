@@ -291,3 +291,26 @@ bun test tests
 Tests use actual Pi 1.1.0 AgentSession/ModelRuntime with deterministic fake providers, including terminal quota recovery, native transient retry, tool continuation/no replay, flush failure/timeout/abort, capacity requirements, JSON branch restore/fork/compaction, direct isolation and package entry loading. The host materialization fixture models MC's public pending-flag protocol and asserts provider-visible transformed messages, not merely event ordering. Complementary peer-owned actual `executeCtxFlush`/registered context-handler tests pass (154 tests in MC's context-handler.test.ts), proving pending drop/history materialization independently. Together these establish the scoped flush claim; **they are not a single-process deployed-plugin end-to-end smoke**. Deployment/live credentials have not been activated or tested.
 
 Deferred: final-effective-context late preparation/re-route host seam, correlated MC requests, provider/account-specific health granularity. Rollback: unload this package and select a physical model directly; credentials are unchanged.
+
+### Session route order
+
+Select a route and run `/route-order`. Use Up/Down to select a candidate,
+Shift+Up/Down to move it, Space to toggle automatic routing, Enter to apply,
+and Escape to cancel. For example, move your cheaper account above the default
+and disable a busy account for this session. At least one candidate must remain
+enabled. `/route-order reset` restores the configured order and enabled set.
+
+Applying or resetting reconsiders automatic priority once on the next request;
+afterwards normal stickiness resumes. Health, context fit, admission and recovery
+safety still apply. Custom strategies see the effective order and enabled
+eligibility, and can choose a candidate other than the first one.
+
+Disabled candidates remain available in `/route-pin` and Ctrl+Shift+M. A fresh
+explicit pin can try a disabled candidate once; automatic retries and fallbacks
+continue to exclude it. Quota resumption also considers only enabled candidates
+within its authorized scope.
+
+These overrides are held in memory per session and route, clear when switching
+away from the route, and are not restored on reload/resume/fork. No global
+configuration is changed. The editor requires TUI mode; reset also works in
+other modes.
