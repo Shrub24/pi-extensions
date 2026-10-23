@@ -18,6 +18,7 @@ export const PEAK_GLYPH = "\u{F0535}";
 
 /** Standard ANSI colours. The status channel carries no theme, so these do not follow the active theme. */
 const ANSI_WARNING = (text: string) => `\x1b[33m${text}\x1b[39m`;
+const ANSI_ERROR = (text: string) => `\x1b[31m${text}\x1b[39m`;
 
 /**
  * The provider that will serve the request, with its account when one is bound. A configured provider label
@@ -51,8 +52,9 @@ export function stripProviderPrefix(name: string, providerLabel: string, provide
  * The single model entry: the route pin first, then the model, then peak pricing. A pinned model shows the
  * pin glyph; while the pin is set but another model serves, the glyph becomes the warning-coloured fallback.
  */
-export function modelEntryText(parts: { name: string; provider: string; providerLabel: string; pin?: "pinned" | "fallback"; peak: boolean }): string {
-  const pin = parts.pin === "pinned" ? PIN_GLYPH : parts.pin === "fallback" ? ANSI_WARNING(PIN_FALLBACK_GLYPH) : undefined;
+export function modelEntryText(parts: { name: string; provider: string; providerLabel: string; pin?: "pinned" | "fallback"; blocked?: boolean; peak: boolean }): string {
+  const pinGlyph = parts.pin === "pinned" ? PIN_GLYPH : parts.pin === "fallback" ? PIN_FALLBACK_GLYPH : undefined;
+  const pin = pinGlyph === undefined ? undefined : parts.blocked ? ANSI_ERROR(pinGlyph) : parts.pin === "fallback" ? ANSI_WARNING(pinGlyph) : pinGlyph;
   const model = stripProviderPrefix(parts.name, parts.providerLabel, parts.provider);
   const peak = parts.peak ? ANSI_WARNING(PEAK_GLYPH) : undefined;
   return [pin, model, peak].filter((part): part is string => part !== undefined && part !== "").join(" ");

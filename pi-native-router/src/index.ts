@@ -553,8 +553,11 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     if (model === undefined || role === undefined) { ctx.ui.setStatus(FOOTER_KEYS.model, undefined); return; }
     const pin = pinOf(ctx, role);
     const pinState = typeof pin !== "string" ? undefined : pin === identity(model, account) ? "pinned" as const : "fallback" as const;
+    const pinnedCandidate = typeof pin === "string" ? config.routes[role].candidates.find(candidate => identity(candidate, candidate.account) === pin) : undefined;
+    const pinnedModel = pinnedCandidate && ctx.modelRegistry.find(pinnedCandidate.provider, pinnedCandidate.id);
+    const pinBlocked = Boolean(pinnedCandidate && pinnedModel && health.blockedReason(pinnedModel, pinnedCandidate.account));
     ctx.ui.setStatus(FOOTER_KEYS.model, modelEntryText({ name: model.name, provider: model.provider, providerLabel: config.display.providers[model.provider] ?? model.provider,
-      pin: pinState, peak: isPeakNow(model.provider, model.id, options.now?.() ?? Date.now()) }));
+      pin: pinState, blocked: pinBlocked, peak: isPeakNow(model.provider, model.id, options.now?.() ?? Date.now()) }));
   };
   const clearRoute = (ctx: ExtensionContext) => {
     setPhysical(ctx, undefined, undefined, undefined);
@@ -780,7 +783,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     },
   });
   pi.registerShortcut((config.shortcuts?.cyclePin ?? DEFAULT_CYCLE_PIN) as ShortcutKey, {
-    description: "Cycle this route's physical pin to the next eligible candidate",
+    description: "Cycle this route's physical pin to the next candidate, including cooling targets",
     handler: async ctx => await cyclePin(ctx),
   });
   pi.registerCommand("route-thinking", {

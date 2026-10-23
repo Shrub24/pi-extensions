@@ -20,7 +20,7 @@ The router SHALL store a physical pin per route as a session branch entry. The l
 
 ### Requirement: User pin overrides stickiness once
 
-A newly set physical pin SHALL override the current target and automatic recovery preference for the next route resolution, if the pin is eligible. After that resolution, the dispatched physical target SHALL remain sticky while eligible; a still-stored pin SHALL be preferred when the incumbent becomes unavailable. An ineligible pin SHALL use the existing fallback selection and SHALL NOT bypass health, fit, transition, activation or flush safeguards.
+A newly set physical pin or cycle choice SHALL override current-target stickiness and automatic selection once when the candidate fits and has available credentials. It MAY bypass a live health block for this single attempt, subject to shared probe leases and normal transition, activation and flush safeguards. A failed attempt SHALL retain the block and use normal fallback; a successful attempt SHALL clear only the causes it proved recovered. After the attempt, the dispatched target SHALL remain sticky while eligible; a still-stored pin SHALL be preferred when the incumbent becomes unavailable.
 
 #### Scenario: New pin overrides a healthy incumbent once
 - **WHEN** the user sets or cycles to an eligible candidate different from the current physical target
@@ -42,18 +42,28 @@ A newly set physical pin SHALL override the current target and automatic recover
 - **THEN** the eligible pinned candidate is selected for the next resolution
 - **AND** normal retry safety and dispatch safeguards still apply
 
-### Requirement: Dormant pin
+### Requirement: Blocked pin one-shot bypass
 
-When the pinned candidate cannot serve a request, the router SHALL use the configured automatic selection for that request and SHALL keep the pin. Automatic selection uses route order when no custom strategy is configured. The pin becomes preferred again only when the incumbent is unavailable or there is no eligible incumbent.
+A cooling or otherwise health-blocked candidate SHALL remain in configured-order pin cycling and picker lists. Choosing it SHALL perform one explicit attempt if it fits and has available credentials. Health SHALL block automatic selection after the attempt fails; a successful attempt SHALL clear the causes it proved recovered. A candidate that cannot fit or lacks credentials SHALL not bypass those checks.
 
-#### Scenario: Pinned candidate in cooldown
-- **WHEN** the pinned candidate is in cooldown while the current target remains eligible
-- **THEN** the router stays with the current target
-- **AND** the pin remains stored but does not displace that target
+#### Scenario: Blocked candidate selected by cycle
+- **WHEN** the user cycles to a candidate with a live health block
+- **THEN** the candidate remains selectable and is shown with a red blocked indicator
+- **AND** the next request attempts it once
 
-#### Scenario: Pinned candidate too small
-- **WHEN** the pinned candidate cannot fit the request
-- **THEN** the router skips it for that request only
+#### Scenario: Bypassed attempt fails
+- **WHEN** the explicit attempt on the blocked candidate fails
+- **THEN** the health block remains and normal routing falls back to another eligible candidate
+- **AND** the pin remains stored and visibly marked blocked
+
+#### Scenario: Bypassed attempt succeeds
+- **WHEN** the explicit attempt on the blocked candidate succeeds
+- **THEN** the proven health block is cleared
+- **AND** the candidate's pin marker returns to its normal colour
+
+#### Scenario: Pinned candidate too small or credentials unavailable
+- **WHEN** the pinned candidate cannot fit or its credential is unavailable
+- **THEN** the router does not bypass that constraint and uses normal fallback selection
 
 ### Requirement: Picker and argument command
 
@@ -69,19 +79,19 @@ When the pinned candidate cannot serve a request, the router SHALL use the confi
 
 ### Requirement: Cycle hotkey
 
-A configurable hotkey SHALL move the pin to the next configured candidate in route order after the one currently serving, wrapping at the end; cycling order is independent of custom automatic selection. Cooling or disabled candidates remain in the cycle and the picker, marked as cooling down; a pin on one falls back until it recovers, and automatic routing still skips it.
+A configurable hotkey SHALL move the pin to the next configured candidate in route order after the one currently serving, wrapping at the end; cycling order is independent of custom automatic selection. Health-blocked candidates remain in the cycle and picker, visibly marked red. They are skipped by automatic routing but receive a one-shot explicit attempt when selected by the user.
 
 #### Scenario: Cycle wraps
 - **WHEN** the user presses the hotkey on the last candidate
-- **THEN** the pin moves to the first eligible candidate
+- **THEN** the pin moves to the first configured candidate
 
-#### Scenario: Nothing eligible
-- **WHEN** the user presses the hotkey and no candidate is eligible
+#### Scenario: No configured candidate can be cycled
+- **WHEN** no route candidate is registered with usable credentials
 - **THEN** the pin is unchanged and the user is notified
 
 ### Requirement: Visible and logged state
 
-The physical footer item SHALL show a pin mark while a pin is set, and each manual change SHALL be logged with reason `manual`.
+The physical footer item SHALL show a pin mark while a pin is set, colour that glyph red while the pinned candidate has a live health block, and return it to normal colour when the block clears. Each manual change SHALL be logged with reason `manual`.
 
 #### Scenario: Pin mark
 - **WHEN** a pin is set

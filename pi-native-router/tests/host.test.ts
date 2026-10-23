@@ -685,13 +685,15 @@ test("a pin on a blocked target is tried once; a failed attempt falls back and t
     await h.session.prompt("pinned target rate-limited; fallback selected");
     expect(h.dispatches.map(d => d.physical)).toEqual(["fake-b", "fake-b", "fake-a"]);
 
-    // Re-pinning the blocked target: the footer previews the target the next request will try.
-    await pin.handler("fake-b/model", ctx);
-    expect(statuses.get(FOOTER_KEYS.model)).toContain(PIN_GLYPH);
-    expect(statuses.get(FOOTER_KEYS.model)).not.toContain(PIN_FALLBACK_GLYPH);
+    // Cycle from the serving fallback to the blocked pin. The footer marks the pending bypass red.
+    const cycle = h.shortcuts.get("ctrl+shift+m") as { handler: (context: never) => Promise<void> };
+    await cycle.handler(ctx);
+    expect(statuses.get(FOOTER_KEYS.model)).toContain(`\x1b[31m${PIN_GLYPH}\x1b[39m`);
 
-    await h.session.prompt("explicit try of the blocked pin fails; fallback serves");
+    await h.session.prompt("one-shot cycle bypass fails; fallback serves and block remains");
     expect(h.dispatches.map(d => d.physical)).toEqual(["fake-b", "fake-b", "fake-a", "fake-b", "fake-a"]);
+    for (const handler of h.handlers.get("model_select") ?? []) await handler({ model: (ctx as unknown as { model: unknown }).model } as never, ctx);
+    expect(statuses.get(FOOTER_KEYS.model)).toContain(`\x1b[31m${PIN_FALLBACK_GLYPH}\x1b[39m`);
     expect(h.manager.getBranch().some(entry => entry.type === "custom" && entry.customType === "@vanillagreen/pi-native-router/physical-pin" &&
       (entry.data as { identity?: string | null }).identity === "fake-b/model")).toBe(true);
   } finally { h.close(); }
@@ -711,6 +713,41 @@ test("the /route-pin picker marks a candidate that is cooling down", async () =>
     await pin.handler("", ctx);
     expect(options.at(-1)?.some(option => option.includes("\u26a0"))).toBe(true);
   } finally { h.close(); }
+});
+
+test("the cycle hotkey keeps blocked targets selectable, marks the pin red, and clears its block on success", async () => {
+  const shared = mkdtempSync(join(tmpdir(), "native-router-cycle-blocked-"));
+  const healthPath = join(shared, "health.sqlite");
+  const clock = { value: 1000 };
+  const h = await host(["ok", 429, "ok", "ok"], { healthPath, clock });
+  const statuses = new Map<string, string | undefined>();
+  const ctx = { hasUI: true, model: h.runtime.getModel("route", "worker"), modelRegistry: {
+    find: (provider: string, id: string) => h.runtime.getModel(provider, id), hasConfiguredAuth: () => true, runtime: h.runtime,
+  }, sessionManager: h.manager, getContextUsage: () => ({ tokens: 0 }), thinkingLevel: "off",
+    ui: { select: async () => undefined, notify: () => {}, setStatus: (key: string, value: string | undefined) => statuses.set(key, value) } } as never;
+  try {
+    const pin = h.commands.get("route-pin") as { handler: (args: string, context: never) => Promise<void> };
+    await pin.handler("fake-b/model", ctx);
+    await h.session.prompt("initial pinned request succeeds");
+    await h.session.prompt("pinned target is rate-limited and fallback serves");
+    expect(h.dispatches.map(d => d.physical)).toEqual(["fake-b", "fake-b", "fake-a"]);
+    const before = new HealthStore(healthPath, () => clock.value);
+    expect(before.blocked(["fake-b/model"])).toBeDefined();
+    before.close();
+
+    const cycle = h.shortcuts.get("ctrl+shift+m") as { handler: (context: never) => Promise<void> };
+    await cycle.handler(ctx);
+    expect(statuses.get(FOOTER_KEYS.model)).toContain(`\x1b[31m${PIN_GLYPH}\x1b[39m`);
+    const stillBlocked = new HealthStore(healthPath, () => clock.value);
+    expect(stillBlocked.blocked(["fake-b/model"])).toBeDefined();
+    stillBlocked.close();
+
+    await h.session.prompt("one-shot cycle override succeeds and clears the block");
+    expect(h.dispatches.at(-1)?.physical).toBe("fake-b");
+    const after = new HealthStore(healthPath, () => clock.value);
+    expect(after.blocked(["fake-b/model"])).toBeUndefined();
+    after.close();
+  } finally { h.close(); rmSync(shared, { recursive: true, force: true }); }
 });
 
 test("a successful explicit try of a blocked pin clears the block in the shared store", async () => {
