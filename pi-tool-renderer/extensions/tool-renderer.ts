@@ -1,6 +1,7 @@
 import { CompactionSummaryMessageComponent, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import { registerToolBatch } from "./tool-renderer/batch.js";
+import { installAssistantMarkdownLayout } from "./tool-renderer/assistant-layout.js";
 import {
 	installToolChromePatch,
 	installToolExecutionRendererPatch,
@@ -45,6 +46,7 @@ export default async function toolRenderer(pi: ExtensionAPI): Promise<void> {
 	registerToolChromeEvents(pi);
 	installWorkingLoaderAlignmentPatch();
 	installWorkingIndicator(pi);
+	installAssistantMarkdownLayout(pi);
 	installMarkdownCodeBlockRenderer(pi);
 	installCompactionSummaryRenderer(pi, CompactionSummaryMessageComponent);
 

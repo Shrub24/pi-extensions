@@ -37,6 +37,8 @@ const MARKDOWN_CODE_BLOCK_PATCH_SYMBOL = Symbol.for("kendex.pi-tool-renderer.mar
 const OSC133_ZONE_START = "\x1b]133;A\x07";
 const OSC133_ZONE_END = "\x1b]133;B\x07";
 const OSC133_ZONE_FINAL = "\x1b]133;C\x07";
+const ASSISTANT_GUTTER_ROW_SENTINEL = "\x1b]1337;kx-assistant-row\x07";
+const assistantGutterComponents = new WeakMap<object, { cwd?: string; originalRender: (width: number) => string[] }>();
 
 interface PromptZoneMarkers {
 	end: boolean;
@@ -464,38 +466,34 @@ interface GutterCacheEntry {
 	revision: number;
 	message: unknown;
 	fingerprint: number;
-	skipPrefix?: string;
+	backgroundPrefix?: string;
 }
 
 let gutterCache = new WeakMap<object, GutterCacheEntry>();
 
 /**
- * The gutter rewrites every line of every assistant message on every TUI frame.
- * During streaming that runs per token burst; re-wrapping is the single most
- * expensive thing this patch does, so results are memoized per component until
- * the message content or render width changes.
+ * Gutter prefixes are reused while assistant content, style, width, and render
+ * settings stay unchanged across TUI frames.
  */
-function assistantTextGutterLinesCached(component: any, lines: string[], width: number, theme: any, cwd: string | undefined, style: "bar" | "agent", skipPrefix?: string): string[] {
+function assistantTextGutterLinesCached(component: any, lines: string[], width: number, theme: any, cwd: string | undefined, style: "bar" | "agent", backgroundPrefix?: string): string[] {
 	let fingerprint = lines.length;
 	for (const line of lines) fingerprint = (fingerprint * 31 + line.length) | 0;
 	if (lines.length > 0) fingerprint = (fingerprint * 31 + lines[lines.length - 1]!.length) | 0;
 	const revision = renderSettingsRevision();
 	const cached = gutterCache.get(component);
 	if (cached && cached.style === style && cached.width === width && cached.revision === revision
-		&& cached.skipPrefix === skipPrefix
+		&& cached.backgroundPrefix === backgroundPrefix
 		&& cached.message === component?.lastMessage && cached.fingerprint === fingerprint) {
 		recordGutterHit();
 		return cached.lines;
 	}
 	recordGutterMiss();
-	const result = assistantTextGutterLines(lines, width, theme, cwd, style, skipPrefix);
-	gutterCache.set(component, { lines: result, style, width, revision, message: component?.lastMessage, fingerprint, skipPrefix });
+	const result = assistantTextGutterLines(lines, theme, cwd, style, backgroundPrefix);
+	gutterCache.set(component, { lines: result, style, width, revision, message: component?.lastMessage, fingerprint, backgroundPrefix });
 	return result;
 }
 
-function assistantTextGutterLines(lines: string[], width: number, theme: any, cwd: string | undefined, style: "bar" | "agent", skipPrefix?: string): string[] {
-	const gutterWidth = style === "agent" ? 3 : 2;
-	const inner = Math.max(1, stableRenderWidth(width, cwd) - gutterWidth);
+function assistantTextGutterLines(lines: string[], theme: any, cwd: string | undefined, style: "bar" | "agent", backgroundPrefix?: string): string[] {
 	const marker = style === "agent"
 		? settingString("assistantMessageMarker", "\u{f06a9}", cwd) || glyphs(cwd).agent
 		: glyphs(cwd).accentBar;
@@ -503,32 +501,27 @@ function assistantTextGutterLines(lines: string[], width: number, theme: any, cw
 	const gutter = (text: string, first: boolean) => theme.fg(first ? colors[0]! : colors[1]!, text);
 	const out: string[] = [];
 	let first = true;
-	for (const line of lines) {
-		// Thinking panels are Box-painted rows: a gutter lead would shift their
-		// background and break the fill, and the marker belongs on the message
-		// itself rather than above it.
-		if (line.startsWith(THINKING_ROW_SENTINEL)) {
-			out.push(line.slice(THINKING_ROW_SENTINEL.length));
+	for (const renderedLine of lines) {
+		// Box-painted thinking rows retain their own full-width layout.
+		if (renderedLine.startsWith(THINKING_ROW_SENTINEL)) {
+			out.push(renderedLine.slice(THINKING_ROW_SENTINEL.length));
 			continue;
 		}
-		if (skipPrefix && line.startsWith(skipPrefix)) {
-			out.push(line);
-			continue;
-		}
+		const line = renderedLine.startsWith(ASSISTANT_GUTTER_ROW_SENTINEL)
+			? renderedLine.slice(ASSISTANT_GUTTER_ROW_SENTINEL.length)
+			: renderedLine;
 		if (stripAnsi(line).trim().length === 0) {
 			out.push(line);
 			continue;
 		}
-		const wrapped = wrapTextWithAnsi(line, inner);
-		for (const piece of (wrapped.length > 0 ? wrapped : [""])) {
-			// `agent` labels the block once and hangs the rest on the gutter
-			// indent; `bar` repeats its mark on every line.
-			const lead = style === "agent"
-				? (first ? `${gutter(marker, true)}  ` : "   ")
-				: `${gutter(marker, false)} `;
-			out.push(`${lead}${piece}`);
-			first = false;
-		}
+		const lead = style === "agent"
+			? (first ? `${gutter(marker, true)}  ` : "   ")
+			: `${gutter(marker, false)} `;
+		const paintedLead = backgroundPrefix && line.startsWith(backgroundPrefix)
+			? theme.bg("customMessageBg", lead)
+			: lead;
+		out.push(`${paintedLead}${line}`);
+		first = false;
 	}
 	return out;
 }
@@ -551,6 +544,28 @@ function alignAssistantContent(component: any): void {
 			child.paddingX = 0;
 			child.invalidate?.();
 		}
+	}
+}
+
+function reserveAssistantGutter(component: any, cwd: string | undefined): void {
+	const children = component?.contentContainer?.children;
+	if (!Array.isArray(children)) return;
+	for (const child of children) {
+		if (!(child instanceof Markdown || child instanceof Text)) continue;
+		let state = assistantGutterComponents.get(child);
+		if (state) {
+			state.cwd = cwd;
+			continue;
+		}
+		state = { cwd, originalRender: child.render };
+		assistantGutterComponents.set(child, state);
+		child.render = function assistantGutterChildRender(this: any, width: number): string[] {
+			const currentStyle = assistantTextStyle(state!.cwd);
+			if (currentStyle === "plain") return state!.originalRender.call(this, width);
+			const currentGutterWidth = currentStyle === "agent" ? 3 : 2;
+			const contentWidth = Math.max(1, stableRenderWidth(width, state!.cwd) - currentGutterWidth);
+			return state!.originalRender.call(this, contentWidth).map((line: string) => `${ASSISTANT_GUTTER_ROW_SENTINEL}${line}`);
+		};
 	}
 }
 
@@ -638,11 +653,14 @@ export function installAssistantMessageRenderer(pi: ExtensionAPI, AssistantMessa
 				return cached.lines;
 			}
 			const stripped = stripPromptZoneMarkers(rendered);
-			const thinkingPrefix = paneled && typeof theme?.bg === "function"
-				? theme.bg("customMessageBg", "")
-				: undefined;
+			let backgroundPrefix: string | undefined;
+			try {
+				if (typeof theme?.bg === "function") backgroundPrefix = ansiPartsFromStyled(theme.bg("customMessageBg", "\uE000")).open;
+			} catch {
+				// A missing or malformed theme background leaves the gutter unpainted.
+			}
 			const styled = theme && style !== "plain"
-				? applyPromptZoneMarkers(assistantTextGutterLinesCached(this, stripped.lines, width, theme, cwd, style, thinkingPrefix), stripped.markers)
+				? applyPromptZoneMarkers(assistantTextGutterLinesCached(this, stripped.lines, width, theme, cwd, style, backgroundPrefix), stripped.markers)
 				: rendered;
 			const finish = (lines: string[]): string[] => {
 				assistantRenderCache.set(this, { width, revision, fingerprint, lines, quickKey });
@@ -663,6 +681,8 @@ export function installAssistantMessageRenderer(pi: ExtensionAPI, AssistantMessa
 			state!.originalUpdateContent.call(this, message);
 			const cwd = safeCtxCwd(state?.activeCtx);
 			if (settingBoolean("alignAssistantMessages", true, cwd)) alignAssistantContent(this);
+			const style = assistantTextStyle(cwd);
+			if (style !== "plain") reserveAssistantGutter(this, cwd);
 			const theme = safeCtxTheme(state?.activeCtx);
 			if (theme && settingBoolean("thinkingPanel", false, cwd)) panelizeThinkingBlocks(this, theme);
 		};

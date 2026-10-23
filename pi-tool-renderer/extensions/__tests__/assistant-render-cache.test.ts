@@ -10,7 +10,7 @@ const theme = {
 
 test("unchanged thinking rows keep their fill", () => {
 	const lines = ["plain line", "", "another"];
-	const out = __test.assistantTextGutterLines(lines, 40, theme, "/tmp", "agent");
+	const out = __test.assistantTextGutterLines(lines, theme, "/tmp", "agent");
 	expect(out[0]!.startsWith("  ")).toBe(false);
 	expect(out[2]).toBe("   another");
 	expect(out.length).toBe(3);

@@ -4,6 +4,7 @@
 
 ### Unreleased
 
+- Assistant gutters reserve width before Markdown layout instead of wrapping rendered lines a second time; oversized Unicode box tables become labelled row cards, and styled code backgrounds retain their full row fill.
 - Restored user messages now receive inline timestamps from their active session branch; live user messages continue to use `message_start` timestamps.
 - Requires Pi 1.0.1 or later. Rows are drawn through Pi's tool renderer resolver, so the search tools keep this extension's row style when fff's override mode replaces `grep` and `find`. fff's `ffgrep`/`fffind` and the cbmem tools are drawn through the same resolver, and a tool that no extension draws gets the generic row. Existing tool renderers are preserved and wrapped in this extension's shell.
 - With the compact renderers on, the system prompt lists `read`, `bash`, `grep`, `find` and `ls` under Available tools again and keeps Pi's guidelines for them, such as using `read` instead of `cat`. With `renderMutationTools` on, `edit` and `write` keep their entries and guidelines too.

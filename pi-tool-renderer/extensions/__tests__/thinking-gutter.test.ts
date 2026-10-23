@@ -11,7 +11,7 @@ const theme = {
 test("thinking panel rows keep their fill and the marker lands on the message", () => {
 	const panelRow = `${THINKING_ROW_SENTINEL}\u001b[48;5;236m thinking text \u001b[49m`;
 	const lines = [panelRow, "", "# Heading", "body"];
-	const out = __test.assistantTextGutterLines(lines, 60, theme, "/tmp", "agent");
+	const out = __test.assistantTextGutterLines(lines, theme, "/tmp", "agent");
 	// Panel row: sentinel stripped, no gutter lead, background intact at column 0.
 	expect(out[0]).toBe("\u001b[48;5;236m thinking text \u001b[49m");
 	expect(out[0]!.startsWith(THINKING_ROW_SENTINEL)).toBe(false);
