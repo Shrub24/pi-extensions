@@ -56,8 +56,9 @@ export function modelEntryText(parts: { name: string; provider: string; provider
   const pinGlyph = parts.pin === "pinned" ? PIN_GLYPH : parts.pin === "fallback" ? PIN_FALLBACK_GLYPH : undefined;
   const pin = pinGlyph === undefined ? undefined : parts.blocked ? ANSI_ERROR(pinGlyph) : parts.pin === "fallback" ? ANSI_WARNING(pinGlyph) : pinGlyph;
   const model = stripProviderPrefix(parts.name, parts.providerLabel, parts.provider);
+  const shownModel = parts.blocked ? ANSI_ERROR(model) : model;
   const peak = parts.peak ? ANSI_WARNING(PEAK_GLYPH) : undefined;
-  return [pin, model, peak].filter((part): part is string => part !== undefined && part !== "").join(" ");
+  return [pin, shownModel, peak].filter((part): part is string => part !== undefined && part !== "").join(" ");
 }
 
 /** Nerd Font `nf-fa-pencil` (U+F040), marking a thinking level the user chose on the route. */
