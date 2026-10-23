@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager,
-  type ExtensionAPI,
+  type ExtensionAPI, type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream, type AssistantMessage } from "@earendil-works/pi-ai";
 import { installRouter } from "../src/index";
@@ -143,6 +143,58 @@ async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateT
   const { session } = await createAgentSession({ cwd: dir, agentDir: dir, modelRuntime: runtime, model: runtime.getModel("route", "worker")!, thinkingLevel: "off", settingsManager: settings, resourceLoader: loader, sessionManager: manager, tools: ["owned_tool"], customTools: [{ name: "owned_tool", label: "Owned", description: "Count owned executions", parameters: { type: "object", properties: {} } as never, execute: async () => { toolRuns++; return { content: [{ type: "text", text: "tool finished" }], details: {} }; } }] });
   return { session, runtime, manager, dispatches, order, api: api!, commands, shortcuts, handlers, clock, decisionLogPath, get toolRuns() { return toolRuns; }, close() { session.dispose(); rmSync(dir, { recursive: true, force: true }); } };
 }
+
+test("post-settlement custom continuation preserves completed tools after quota exhaustion", async () => {
+  const h = await host(["tool", "quota", "ok"], { maxRecoveries: 0 });
+  try {
+    await h.session.prompt("perform the tool then finish the task");
+    expect(h.toolRuns).toBe(1);
+    expect(h.session.messages.at(-1)).toMatchObject({ stopReason: "error" });
+    h.clock.value += 5 * 60_000 + 1;
+    await h.session.sendCustomMessage({ customType: "native-router-resume", content: "Capacity restored. Continue the interrupted task from its existing state; do not repeat completed tools.", display: false }, { triggerTurn: true });
+    expect(h.toolRuns).toBe(1);
+    expect(h.session.messages.at(-1)).toMatchObject({ stopReason: "stop" });
+    expect(h.dispatches.at(-1)?.context).toContain("tool finished");
+  } finally { h.close(); }
+});
+
+test("resumption host gate: public continuation identifies its custom source but pending checks omit nextTurn", async () => {
+  const h = await host(["quota", "ok"], { maxRecoveries: 0 });
+  let context: ExtensionContext | undefined;
+  const starts: unknown[] = [];
+  h.api.on("before_agent_start", (event, ctx) => { context = ctx; starts.push(event); });
+  try {
+    await h.session.prompt("interrupted task");
+    expect(context!.isIdle()).toBe(true);
+    await h.session.sendCustomMessage({ customType: "pending-user-intent", content: "new intent", display: false }, { deliverAs: "nextTurn" });
+    expect(context!.hasPendingMessages()).toBe(false);
+    const settled = new Promise<void>(resolve => {
+      const unsubscribe = h.session.subscribe(event => {
+        if (event.type === "agent_settled") { unsubscribe(); resolve(); }
+      });
+    });
+    h.api.sendMessage({ customType: "native-router-resume", content: "Resume interrupted task", display: false, details: { generation: 7 } }, { triggerTurn: true });
+    await settled;
+    expect(starts.at(-1)).toMatchObject({ messageType: "custom", message: { customType: "native-router-resume", details: { generation: 7 } } });
+    expect(h.dispatches.at(-1)?.context).toContain("new intent");
+    expect(h.dispatches).toHaveLength(2);
+  } finally { h.close(); }
+});
+
+test("resumption host gate: idle abort emits no session event and does not fence a later continuation", async () => {
+  const h = await host(["quota", "ok"], { maxRecoveries: 0 });
+  try {
+    await h.session.prompt("interrupted task");
+    const events: string[] = [];
+    const unsubscribe = h.session.subscribe(event => events.push(event.type));
+    await h.session.abort();
+    unsubscribe();
+    expect(events).toEqual([]);
+    await h.session.sendCustomMessage({ customType: "native-router-resume", content: "Resume interrupted task", display: false }, { triggerTurn: true });
+    expect(h.dispatches).toHaveLength(2);
+    expect(h.session.messages.at(-1)).toMatchObject({ stopReason: "stop" });
+  } finally { h.close(); }
+});
 
 test("initial selection skips an unconfigured native provider without flushing", async () => {
   const h = await host(["ok"], { unauthedFirst: true });
