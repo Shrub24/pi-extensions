@@ -479,7 +479,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			if (blockers.length > 0) {
 				return {
 					ok: false,
-					reason: `unresolved work not attributable to request "${scope.requestId}" blocks binding: ${idList(blockers)}; reconcile it explicitly (bg_task get/stop/clear) before binding`,
+					reason: `unresolved work not attributable to request "${scope.requestId}" blocks binding: ${idList(blockers)}; reconcile it explicitly (bg_task get or stop) before binding`,
 				};
 			}
 			if (boundAssignment !== scope.requestId) {
