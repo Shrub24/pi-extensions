@@ -133,8 +133,11 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     const byId = new Map(route.candidates.map(c => [identity(c, c.account), c]));
     return { ...route, candidates: order.items.map(item => byId.get(item.target)!) };
   };
-  const enabled = (ctx: ExtensionContext, role: string, target: string) =>
-    orderOf(ctx, role)?.items.find(item => item.target === target)?.enabled !== false;
+  // Configured `disabled` candidates start out of automatic routing; the session order editor can enable them.
+  const enabled = (ctx: ExtensionContext, role: string, target: string) => {
+    const override = orderOf(ctx, role)?.items.find(item => item.target === target);
+    return override ? override.enabled : !config.routes[role].candidates.some(c => c.disabled && identity(c, c.account) === target);
+  };
   const automaticCandidates = (route: RouteConfig, ctx: ExtensionContext) => {
     const role = Object.keys(config.routes).find(role => config.routes[role] === route)!;
     return available(orderedRoute(route, ctx, role), ctx, config).filter(c => enabled(ctx, role, identity(c.model, c.candidate.account)));
@@ -837,7 +840,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       if (model?.provider !== "route" || !config.routes[model.id]) { ctx.ui.notify("native-router: select a route first", "warning"); return; }
       if (args.trim() && args.trim() !== "reset") { ctx.ui.notify("Usage: /route-order [reset]", "error"); return; }
       const role = model.id;
-      const defaults = config.routes[role].candidates.map(c => ({ target: identity(c, c.account), enabled: true }));
+      const defaults = config.routes[role].candidates.map(c => ({ target: identity(c, c.account), enabled: !c.disabled }));
       let items: OrderItem[] | undefined;
       if (args.trim() === "reset") items = defaults;
       else {

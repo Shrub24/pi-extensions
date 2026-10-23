@@ -19,7 +19,7 @@ export interface ProviderConfig {
   quota?: QuotaSource;
   accounts: Record<string, Account>;
 }
-export interface Candidate { provider: string; id: string; thinkingLevel: ModelThinkingLevel; cacheTtlMs?: number; account?: string }
+export interface Candidate { provider: string; id: string; thinkingLevel: ModelThinkingLevel; cacheTtlMs?: number; account?: string; disabled?: true }
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 export interface RouteStrategyConfig { module: string; options: Record<string, JsonValue> }
 export interface RouteConfig {
@@ -167,18 +167,20 @@ export function parseConfig(raw: unknown): Config {
     // configured order. Each expansion keeps its own health, stickiness and cache epoch.
     const candidates = r.candidates.flatMap((value): Candidate[] => {
       const c = record(value);
-      keys(c, ["provider", "id", "thinkingLevel", "cacheTtlMs", "account"]);
+      keys(c, ["provider", "id", "thinkingLevel", "cacheTtlMs", "account", "disabled"]);
       if (typeof c.provider !== "string" || !c.provider || c.provider === "route" || c.provider.includes("#") || typeof c.id !== "string" || !c.id || c.id.includes("#")) throw new Error("Candidate needs physical provider and id");
       const accounts = providers[c.provider]?.accounts ?? {};
       if (c.account !== undefined && (typeof c.account !== "string" || !accounts[c.account])) throw new Error(`Candidate account must reference an account of provider ${c.provider}`);
       const thinkingLevel = c.thinkingLevel ?? "off";
       if (typeof thinkingLevel !== "string" || !levels.includes(thinkingLevel)) throw new Error("Invalid thinkingLevel");
       const cacheTtlMs = c.cacheTtlMs === undefined ? undefined : integer(c.cacheTtlMs, 0, 1, Number.MAX_SAFE_INTEGER);
-      const base = { provider: c.provider, id: c.id, thinkingLevel: thinkingLevel as ModelThinkingLevel, ...(cacheTtlMs === undefined ? {} : { cacheTtlMs }) };
+      if (c.disabled !== undefined && typeof c.disabled !== "boolean") throw new Error("Candidate disabled must be a boolean");
+      const base = { provider: c.provider, id: c.id, thinkingLevel: thinkingLevel as ModelThinkingLevel, ...(cacheTtlMs === undefined ? {} : { cacheTtlMs }), ...(c.disabled ? { disabled: true as const } : {}) };
       if (typeof c.account === "string") return [{ ...base, account: c.account }];
       const pool = Object.keys(accounts);
       return pool.length === 0 ? [base] : pool.map(account => ({ ...base, account }));
     });
+    if (candidates.every(c => c.disabled)) throw new Error(`Route ${role} needs at least one candidate that is not disabled`);
     if (candidates.length > 32) throw new Error(`Route ${role} expands to more than 32 candidates`);
     if (new Set(candidates.map(c => JSON.stringify([c.provider, c.id, c.account ?? null]))).size !== candidates.length) throw new Error(`Duplicate candidates in ${role}`);
     const strategy = r.strategy === undefined ? undefined : (() => {

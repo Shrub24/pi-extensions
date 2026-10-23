@@ -21,7 +21,7 @@ type Routing = { accounts: string[]; candidates: Array<{ provider: string; accou
 /** Synthetic env name for a test account; keys are set by each test and never printed. */
 const accountEnv = (id: string) => `NATIVE_ROUTER_TEST_KEY_${id.replace(/-/g, "_").toUpperCase()}`;
 type Outcome = "ok" | "quota" | "transient" | "stream-ended" | "partial" | "abort" | "tool" | "bad" | 401 | 403 | 429;
-async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateThinking?: "off" | "low" | "medium" | "high"; retry?: boolean; flush?: "failed" | "absent"; maxRecoveries?: number; maxTransitions?: number; smaller?: number; manager?: SessionManager; packaged?: boolean; unauthedFirst?: boolean; ttl?: number; startTime?: number; clock?: { value: number }; accounts?: boolean; providerKeys?: boolean; healthPath?: string; decisionLogPath?: string; heldProbe?: boolean; routing?: Routing; runtimeKeys?: "absent" | "inert"; wide?: boolean; contextWindow?: number; maxTokens?: number; strategy?: "prefer-b" | "session-order" | "missing"; schedule?: Schedule; tracker?: Runner } = {}) {
+async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateThinking?: "off" | "low" | "medium" | "high"; retry?: boolean; flush?: "failed" | "absent"; maxRecoveries?: number; maxTransitions?: number; smaller?: number; manager?: SessionManager; packaged?: boolean; unauthedFirst?: boolean; ttl?: number; startTime?: number; clock?: { value: number }; accounts?: boolean; providerKeys?: boolean; healthPath?: string; decisionLogPath?: string; heldProbe?: boolean; routing?: Routing; runtimeKeys?: "absent" | "inert"; wide?: boolean; contextWindow?: number; maxTokens?: number; strategy?: "prefer-b" | "session-order" | "missing"; configDisabled?: string; schedule?: Schedule; tracker?: Runner } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "native-router-"));
   const settings = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: opts.retry ?? false, maxRetries: 3, baseDelayMs: 1 }, cacheWarming: "off" });
   const runtime = await ModelRuntime.create({ authPath: join(dir, "auth.json"), modelsPath: null, refreshOnCreate: false });
@@ -94,7 +94,7 @@ async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateT
     if (JSON.stringify(context.route.configuredOrder) !== JSON.stringify(expected) || JSON.stringify(context.targets.map(t => t.targetId)) !== JSON.stringify(expected) || context.eligibleTargetIds.includes("fake-a/model")) return { targetId: context.eligibleTargetIds[0], reason: "unexpected order or eligibility" };
     return { targetId: "fake-c/model", reason: "custom choice beats first candidate" };
   } };`);
-  const raw = { flushTimeoutMs: 10, providers: sharedProviders, routes: { worker: { ...(strategyPath ? { strategy: { module: strategyPath, options: {} } } : {}), candidates: routed ? routed.candidates.map(c => ({ provider: c.provider, id: "model", thinkingLevel: opts.candidateThinking ?? "off", ...(opts.ttl ? { cacheTtlMs: opts.ttl } : {}), ...(c.account ? { account: c.account } : {}) })) : ["fake-a", "fake-b", "fake-c"].map(provider => ({ provider, id: "model", thinkingLevel: opts.candidateThinking ?? "off", ...(opts.ttl ? { cacheTtlMs: opts.ttl } : {}), ...(opts.accounts ? { account: `acct-${provider}` } : {}) })), maxRecoveries: opts.maxRecoveries ?? 2, maxTransitions: opts.maxTransitions ?? 3 } } };
+  const raw = { flushTimeoutMs: 10, providers: sharedProviders, routes: { worker: { ...(strategyPath ? { strategy: { module: strategyPath, options: {} } } : {}), candidates: routed ? routed.candidates.map(c => ({ provider: c.provider, id: "model", thinkingLevel: opts.candidateThinking ?? "off", ...(opts.ttl ? { cacheTtlMs: opts.ttl } : {}), ...(c.account ? { account: c.account } : {}) })) : ["fake-a", "fake-b", "fake-c"].map(provider => ({ provider, id: "model", thinkingLevel: opts.candidateThinking ?? "off", ...(opts.ttl ? { cacheTtlMs: opts.ttl } : {}), ...(opts.accounts ? { account: `acct-${provider}` } : {}), ...(opts.configDisabled === provider ? { disabled: true } : {}) })), maxRecoveries: opts.maxRecoveries ?? 2, maxTransitions: opts.maxTransitions ?? 3 } } };
   const config = parseConfig(raw);
   const decisionLogPath = opts.decisionLogPath ?? join(dir, "decisions.jsonl");
   runtime.registerVirtualModel({ provider: "route", id: "worker", name: "placeholder", route: () => { throw new Error("Adapter not installed"); } });
@@ -1095,6 +1095,19 @@ test("disabled candidates stay manually selectable, but a failed disabled pin is
     await (h.shortcuts.get("ctrl+shift+m") as { handler: (ctx: never) => Promise<void> }).handler(ui.ctx as never);
     await h.session.prompt("cycle includes disabled A");
     expect(h.dispatches.at(-1)?.physical).toBe("fake-a");
+  } finally { h.close(); }
+});
+
+test("a configured disabled candidate is out of automatic routing until the editor enables it, and reset restores the configured state", async () => {
+  const h = await host([], { configDisabled: "fake-a" });
+  const ui = routeOrderUI(h);
+  try {
+    await h.session.prompt("configured disabled A is skipped");
+    await ui.edit(" ", "\r"); // enable A
+    await h.session.prompt("A enabled for this session");
+    await ui.command("route-order", "reset");
+    await h.session.prompt("reset restores the configured disabled state");
+    expect(h.dispatches.map(d => d.physical)).toEqual(["fake-b", "fake-a", "fake-b"]);
   } finally { h.close(); }
 });
 
