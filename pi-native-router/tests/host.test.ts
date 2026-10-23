@@ -760,6 +760,28 @@ test("a stored pin does not pull the footer back to the pinned model once a fall
   } finally { h.close(); }
 });
 
+test("switching the selected model away from a route clears that route's pin", async () => {
+  const h = await host(["ok", "ok"]);
+  const ui = { select: async () => undefined, notify: () => {}, setStatus: () => {} };
+  const routeCtx = { hasUI: true, model: h.runtime.getModel("route", "worker"), modelRegistry: {
+    find: (provider: string, id: string) => h.runtime.getModel(provider, id), hasConfiguredAuth: () => true, runtime: h.runtime,
+  }, sessionManager: h.manager, getContextUsage: () => ({ tokens: 0 }), thinkingLevel: "off", ui } as never;
+  try {
+    const pin = h.commands.get("route-pin") as { handler: (args: string, context: never) => Promise<void> };
+    await pin.handler("fake-b/model", routeCtx);
+    const pinned = () => h.manager.getBranch().filter(entry => entry.type === "custom" && entry.customType === "@vanillagreen/pi-native-router/physical-pin")
+      .at(-1)?.type === "custom" ? (h.manager.getBranch().filter(entry => entry.type === "custom" && entry.customType === "@vanillagreen/pi-native-router/physical-pin").at(-1) as unknown as { data: { identity: string | null } }).data.identity : "no-entry";
+    expect(pinned()).toBe("fake-b/model");
+
+    await h.session.setModel(h.runtime.getModel("fake-a", "model")!);
+    expect(pinned()).toBeNull();
+
+    await h.session.setModel(h.runtime.getModel("route", "worker")!);
+    await h.session.prompt("returning to the route starts from automatic selection");
+    expect(h.dispatches.at(-1)?.physical).toBe("fake-a");
+  } finally { h.close(); }
+});
+
 test("route-pin preview normalizes a redundant strategy choice to auto and cycling follows configured order", async () => {
   const h = await host(["ok"], { strategy: "prefer-b" });
   const statuses = new Map<string, string | undefined>();

@@ -590,7 +590,18 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     ctx.ui.setStatus(FOOTER_KEYS.thinking, model.reasoning ? thinkingText(effective, requested) : undefined);
   };
   pi.on("model_select", async (event, ctx) => {
-    activeModel.set(ctx.sessionManager.getSessionId(), `${event.model.provider}/${event.model.id}`);
+    const sessionId = ctx.sessionManager.getSessionId();
+    const next = `${event.model.provider}/${event.model.id}`;
+    const previous = activeModel.get(sessionId);
+    // Switching away from a route drops that route's pin: the pin is a preference for the model in use, so returning
+    // to the route starts from automatic selection. A pin can only be set on the selected route, so no other route
+    // is left holding one.
+    const leftRole = previous?.startsWith("route/") ? previous.slice("route/".length) : undefined;
+    if (previous !== undefined && previous !== next && leftRole !== undefined && config.routes[leftRole] && typeof pinOf(ctx, leftRole) === "string") {
+      pi.appendEntry(PIN_ENTRY, { role: leftRole, identity: null });
+      if (ctx.hasUI) ctx.ui.notify(`native-router: ${leftRole} pin cleared because the model changed`, "info");
+    }
+    activeModel.set(sessionId, next);
     await publishSelection(ctx, event.model);
   });
   pi.on("thinking_level_select", async (event, ctx) => {
@@ -725,6 +736,8 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     const matchesAuto = requested !== null && requested === await autoChoice(ctx, role);
     const choice = matchesAuto ? null : requested;
     pi.appendEntry(PIN_ENTRY, { role, identity: choice, override: choice !== null });
+    // The pinned route is the model in use, so a later model switch knows which route it is leaving.
+    activeModel.set(ctx.sessionManager.getSessionId(), `route/${role}`);
     recordDecision(decisionLogPath, { at: new Date(options.now?.() ?? Date.now()).toISOString(), session: ctx.sessionManager.getSessionId(), logical: `route/${role}`, physical: choice === null ? "auto" : physicalOf(choice), ...(choice && accountOf(choice) ? { account: accountOf(choice) } : {}), reason: "manual" }, degrade);
     await previewRoute(ctx, role);
     if (matchesAuto) { ctx.ui.notify(`native-router: ${role} already follows auto on ${requested}; pin cleared`, "info"); return; }

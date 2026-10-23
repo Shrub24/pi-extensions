@@ -176,6 +176,9 @@ The model part of `provider/model` is Pi's own model name, so model labels come 
 
 - The pin is stored per route on the session branch, so resume and fork restore it. It is never shared across sessions.
 - A newly changed eligible pin overrides the incumbent once. On later requests, an eligible current model stays sticky even if a different pin remains stored; when there is no eligible incumbent, the pin is preferred over route order. A fresh manual choice also overrides pending recovery preference, but never health, fit, transition, activation or flush safeguards.
+- A pin belongs to the route you are using: switching the selected model away from a route clears its pin, so
+  returning to that route starts from automatic selection. Since a pin can only be set on the selected route,
+  no other route is left holding one.
 - A pin that cannot serve (cooldown, exhausted quota, or too small for the request) is dormant: that request uses the route's automatic selection, and the pin becomes a preference again once the incumbent is unavailable.
 - `auto` clears the pin. So does picking the candidate that automatic selection would already pick now; without a custom strategy this is the last served candidate, else the first in route order.
 - A pin is an explicit try: it is attempted even when its target is blocked (cooldown, quota, or auth), and a failed attempt falls back as normal while the pin stays stored. A successful attempt clears the blocks it proved in both the shared store and this process. Automatic routing still skips blocked targets.
