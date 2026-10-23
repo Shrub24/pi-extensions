@@ -188,6 +188,46 @@ The model part of `provider/model` is Pi's own model name, so model labels come 
 
 Selecting a route shows its next candidate (pending explicit pin, then healthy current model, then eligible stored pin, then configured automatic selection), so cycling starts from what the route will do. Cycling walks every configured candidate in route order, including cooling ones. Automatic routing skips blocked targets; cycling one grants a single explicit attempt, after which failure leaves the block and fallback in effect, while success clears the block. Failures surface as notices: a candidate that fails with a quota, auth, or rate error warns with its cooldown deadline, and a failover warns with the old and new candidates. Transient errors retried on the same candidate are shown as info.
 
+## Opt-in quota resumption
+
+Resumption is **off by default**. Select a `route/<role>` and explicitly authorize its current task (or arm before the next prompt):
+
+```text
+/route-resume once
+/route-resume on --scope provider:opencode-go
+/route-resume once --scope provider:opencode-go#go-a
+/route-resume once --scope target:opencode-go/deepseek-v4-flash#go-a
+/route-resume once --scope pin --until 2027-01-01T12:00:00Z
+/route-resume status
+/route-resume off
+```
+
+Use a future ISO timestamp with a timezone for `--until`. The default is 24 hours from arming, route scope, and three unsuccessful actual wakes per capacity pause. Arming reports the selected scope, deadline and budget. There is no scope picker. Provider/account and exact-target selectors must intersect the current route; single-key and default-auth providers have no invented account id. `pin` snapshots the current exact physical pin. Changing the pin later preserves that scope. An omitted scope always means the whole route, even with a pin set.
+
+`once` is consumed after the first resumed successful assistant step (including a tool-call step). `on` survives repeated capacity pauses until normal task completion, cancellation or deadline. Successful resumed progress starts a new pause budget; polling and unsuccessful wakes never replenish it. Arming while already stopped on a qualifying quota error enters waiting immediately. Every authorized wake gets one bounded native recovery attempt; immediate retries, transitions and fallback remain bounded within that attempt. Partial output and unresolved tool calls stay stopped.
+
+Waiting starts only after ordinary native recovery settles with empty quota exhaustion or a rate limit with an explicit reset/retry hint, and all otherwise usable candidates in scope are capacity-blocked. Authentication, request/fit errors and exhausted safety budgets alone do not schedule a wake. All quota windows matter: a short-window reset cannot override an exhausted weekly window. Authoritative fresh restoration can allow an earlier recovery attempt; newer error causes still win. Once tracker exhaustion was observed, unavailable/stale readings after a manual clear remain unknown and cannot authorize a wake.
+
+Pi must remain open. Waiting uses tracker observations and coordinated refreshes, with one local check at the next relevant reset (at least one second away), the five-minute recheck bound, or the deadline. Unknown readings back off five minutes. Checks use the existing shared four-minute fetch gate and never invoke operator-clear refresh semantics or paid model requests. Ordinary periodic refreshes also recheck waiting permission. A reset schedules evidence collection; it does not itself declare quota restored. A restored scope must still pass normal credentials, fit, strategy, recovery leases and awaited flushes at dispatch. Automatic resumption never uses a pin's explicit health bypass, and every resumed fallback stays in the saved scope.
+
+The continuation is a native hidden custom message appended to the existing conversation. Completed tools and results are preserved. Preexisting queued `nextTurn` content intentionally joins that conversation. Public pending-message checks postpone wakes during active steering/follow-up. A new actual submitted prompt, `/route-resume off`, abort during a run, selected model change, session/branch/fork/compaction change, or shutdown cancels pending permission. Escape and Ctrl+C cancel waiting through the non-consuming terminal input hook when the host provides it. Pi 1.2.0 does not expose programmatic idle `session.abort()` to extensions; use `/route-resume off` for SDK/RPC idle cancellation. This accepted limitation does not require a host upgrade. Long idle gaps before a wake are supported.
+
+Generation and conversation-head checks fence timers and queued custom wakes, including another check in the actual route resolver before provider dispatch. Deadlines authorize the start of a wake; they do not kill a running tool or request. The SQLite health store atomically owns intent and wake claims. A session branch stores only an intent pointer, never a transcript snapshot. Restart/restoration shows suspended permission and cannot automatically execute it; explicitly re-arm to continue. Store failure suspends automatic resumption while ordinary routing retains its existing health fallback. At most one active intent exists per session (a stronger restriction than per branch); terminal records retain at most 100 entries for seven days, pruned on lifecycle writes. No prompts, credentials or raw responses enter intent records. Old processes cannot reclaim a superseded generation.
+
+`/route-resume status` reports phase, mode, scope, limiting windows/tracker provenance, next check, deadline, unsuccessful wakes and last outcome. Notifications occur on transitions rather than unchanged polls. The separate `native-router-resume` footer item shows armed/waiting/waking/running state and scope without replacing the physical-model items. For a Powerline configuration using `customItems`, add this item (an explicit layout can include `custom:native-router-resume`):
+
+```json
+{
+  "powerline": {
+    "customItems": [
+      { "id": "native-router-resume", "statusKey": "native-router-resume", "position": "secondary" }
+    ]
+  }
+}
+```
+
+Rollback: run `/route-resume off` in armed sessions, then remove/disable the extension if desired. No background service or scheduler needs cleanup, and the shared health database can remain. Live provider smoke has not been performed; automated tests use fake providers, tracker runners and clocks.
+
 ## Decision log
 
 Each change of physical target is appended to `$PI_CODING_AGENT_DIR/pi-native-router/decisions.jsonl` (default `~/.pi/agent/...`, mode `0600`), one JSON object per line:

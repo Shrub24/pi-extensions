@@ -1,33 +1,33 @@
 # Tasks
 
+The user resolved the former Pi 1.2.0 host gate on 2026-10-23: preexisting queued nextTurn content intentionally joins a resumed conversation; programmatic idle abort is an accepted documented limitation. Terminal keys, explicit off, active abort and lifecycle cancellation are supported. No further host approval is required for this implementation.
+
 ## 1. Prove the continuation boundary
 
-- [x] 1.1 Demonstrate supported post-settlement continuation on the real Pi host harness: an empty quota failure can continue the existing conversation after capacity returns without replaying completed tools. Record the API and transcript semantics in design.md; stop and report a host gap if this cannot be proven.
-- [ ] 1.2 Demonstrate idle/pending-input, abort, branch/model/session-change and shutdown behavior at that boundary with controlled host events. Verify unsafe partial output and unresolved tools remain stopped; do not implement scheduling against an unproven seam.
-
-Blocked at 1.2 on installed Pi 1.2.0: idle abort has no observable session event and does not invalidate later continuation; public pending checks omit queued `nextTurn` messages. See design.md's host gate evidence. No scheduler or resumption controls are implemented; tasks 2–5 remain outstanding. Full suite/static/schema validation results are recorded there, but do not establish integration acceptance 5.1.
+- [x] 1.1 Preserve the real native host proof: empty quota failure can continue the existing conversation without replaying completed tools.
+- [x] 1.2 Verify the revised accepted idle/pending-input, abort, branch/model/session-change and shutdown contract. Exercise non-consuming terminal keys, active abort, stale queued dispatch fencing, partial-output and unresolved-tool rejection. Record accepted idle SDK abort and queued nextTurn semantics in design.md.
 
 ## 2. Intent, scope and lifecycle
 
-- [ ] 2.1 Implement normalized route/provider/account/exact-target scope and pinned-target snapshot validation. Verify default route scope ignores implicit pin narrowing, exact targets preserve account identity, and targets outside the route are rejected; document scope examples in the README.
-- [ ] 2.2 Implement arm-once/standing/waiting/waking/running/stopped/suspended lifecycle with deadline and unsuccessful-wake limits. Verify normal completion disarms, timer/observation churn cannot reset limits, and partial or non-capacity failures do not arm a wait.
-- [ ] 2.3 Persist bounded lifecycle intent in the router-owned store with generation/owner fencing and suspended restore. Verify two connections cannot claim the same generation, cancelled owners cannot wake it, shared-store failure suspends it, and terminal retention meets the count/age limits; document storage and restart behavior.
+- [x] 2.1 Implement validated route/provider/account/exact-target and pinned-target snapshot scopes, default route regardless of pin, with README examples and simple arguments/completions.
+- [x] 2.2 Implement armed/waiting/waking/running/stopped/suspended phases, default 24-hour start deadline and three unsuccessful actual wakes per pause. Preserve first-prompt arming and once/standing progress semantics; reject unsafe/non-capacity stops.
+- [x] 2.3 Persist atomic lifecycle intent and session pointer with generation/owner claim leases, one active intent per session, suspended restore and terminal retention. Test two connections, revoked generations, expired claims and store failure.
 
 ## 3. Capacity readiness and dispatch
 
-- [ ] 3.1 Emit structured terminal capacity-rejection facts after native recovery settles. Verify quota and reset-bound rate pauses are distinguished from missing auth/fit and exhausted recovery budgets, without parsing displayed errors or changing immediate retry safety.
-- [ ] 3.2 Add a scoped readiness evaluation using all quota windows, freshness/authority and health revisions. Verify short-window reset with weekly exhaustion does not wake, fresh early restoration does, unavailable tracker data after operator reset does not, and older snapshots cannot clear newer failures.
-- [ ] 3.3 Integrate periodic shared refresh and reset-aware bounded checks without invoking operator-clear refresh semantics. Use a fake clock and counting runner to verify one outstanding check, shared-fetch gating, no billed model request during passive waiting, cancellation of stale callbacks, and deadline expiry; document cadence and unknown-read behavior.
-- [ ] 3.4 Constrain the resumed execution and its fallback candidates to the saved scope while retaining native strategy, credential activation, normal probe leases and awaited flushes. Verify provider-specific wake cannot dispatch outside scope, pins cannot grant a health bypass, and capacity lost before dispatch returns to waiting within limits.
-- [ ] 3.5 Join claimed intent to the proven continuation boundary. Verify exactly one continuation for duplicate observations, successful progress consumes once permission, repeated quota failures retain standing authorization only within bounds, and prior completed tools run exactly once.
+- [x] 3.1 Record structured terminal candidate rejection facts after ordinary recovery; distinguish physical quota/reset-bound rate, auth/fit/credentials and budget-only exhaustion without parsing displayed router errors.
+- [x] 3.2 Evaluate all quota windows, authority/freshness, remembered tracker evidence and live health revisions. Test weekly exhaustion after short reset, early restoration, unavailable after manual clear and older observations against newer failures.
+- [x] 3.3 Wire periodic shared refresh rechecks and reset-aware bounded checks to the injected schedule. Use existing fetch gating without force/clear or paid passive model calls; test cancellation during pending refresh, one timeout and deadline expiry.
+- [x] 3.4 Constrain actual resumed dispatch and fallback to saved scope with normal strategy, credentials, fit, probe leases and awaited flushes. Disable automatic pin health bypass and recheck the chosen target before dispatch.
+- [x] 3.5 Join claims to public native custom continuation; test duplicate observations, bounded repeated failures, once consumption/standing progress and exactly-once completed tools.
 
 ## 4. Operator controls and lifecycle cancellation
 
-- [ ] 4.1 Implement `/route-resume once|on|off|status`, scope selection/completion and optional deadline, with explicit displayed proposed defaults. Verify invalid scopes/deadlines are rejected without arming and status never implicitly authorizes execution. Add working README examples for route, provider/account and pinned-target waits.
-- [ ] 4.2 Wire off, abort, new user intent, selected model change, branch/session switch and shutdown to generation fencing and timer cleanup. Verify a ready callback racing each cancellation cannot start the cancelled task; restored sessions require explicit re-arming.
-- [ ] 4.3 Publish quiet transition notifications and an optional compact waiting status without replacing the physical-model footer. Verify status names scope, blockers, next check, deadline and last outcome; unchanged polls create no notices and diagnostics expose no prompts or credentials. Document the status extension point and rollback procedure in the README.
+- [x] 4.1 Implement `/route-resume once|on|off|status`, simple scope/deadline arguments and completions. Report defaults, reject invalid args, and keep status read-only.
+- [x] 4.2 Fence off, active-run abort, real submitted user intent, terminal Escape/Ctrl+C, selected-model change, session switch/fork/tree/compaction and shutdown. Restores require explicit re-arming.
+- [x] 4.3 Publish quiet transitions and separate `native-router-resume` footer status; report scope, blockers/windows, tracker provenance, next check, deadline and outcome. Document footer extension point, accepted host limitations and rollback.
 
 ## 5. Integration acceptance
 
-- [ ] 5.1 Run the router suite, typecheck and strict OpenSpec validation; record any pre-existing example/typecheck failures separately. Add an integrated multi-window exhaustion -> fresh restoration -> one safe continuation example covering real host dispatch and shared store coordination, without live paid provider calls.
-- [ ] 5.2 With owner approval, smoke an explicitly armed live session across a controlled capacity pause and recovery; confirm scope enforcement, no duplicate execution, visible cancellation and correct usage accounting. Leave this unchecked until live evidence exists.
+- [x] 5.1 Run full router suite, focused production/test typecheck and strict OpenSpec validation; record pre-existing example alias errors separately. Exercise native host multi-window exhaustion -> fresh restoration -> one safe continuation using shared SQLite and fake tracker/time, without live paid calls.
+- [ ] 5.2 With owner approval, smoke an explicitly armed live session across controlled capacity pause/recovery; confirm scope enforcement, no duplicate execution, visible cancellation and correct live usage accounting. Automated tests do not establish this live evidence.

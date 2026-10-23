@@ -11,6 +11,8 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream, type AssistantMessage } from "@earendil-works/pi-ai";
 import { installRouter } from "../src/index";
+import type { Schedule } from "../src/resumption";
+import type { Runner } from "../src/quota";
 import { FOOTER_KEYS, PIN_FALLBACK_GLYPH, PIN_GLYPH } from "../src/footer";
 import { parseConfig } from "../src/config";
 import { nativeHttpError } from "./native-error";
@@ -19,7 +21,7 @@ type Routing = { accounts: string[]; candidates: Array<{ provider: string; accou
 /** Synthetic env name for a test account; keys are set by each test and never printed. */
 const accountEnv = (id: string) => `NATIVE_ROUTER_TEST_KEY_${id.replace(/-/g, "_").toUpperCase()}`;
 type Outcome = "ok" | "quota" | "transient" | "stream-ended" | "partial" | "abort" | "tool" | "bad" | 401 | 403 | 429;
-async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateThinking?: "off" | "low" | "medium" | "high"; retry?: boolean; flush?: "failed" | "absent"; maxRecoveries?: number; maxTransitions?: number; smaller?: number; manager?: SessionManager; packaged?: boolean; unauthedFirst?: boolean; ttl?: number; startTime?: number; clock?: { value: number }; accounts?: boolean; providerKeys?: boolean; healthPath?: string; decisionLogPath?: string; heldProbe?: boolean; routing?: Routing; runtimeKeys?: "absent" | "inert"; wide?: boolean; contextWindow?: number; maxTokens?: number; strategy?: "prefer-b" | "missing" } = {}) {
+async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateThinking?: "off" | "low" | "medium" | "high"; retry?: boolean; flush?: "failed" | "absent"; maxRecoveries?: number; maxTransitions?: number; smaller?: number; manager?: SessionManager; packaged?: boolean; unauthedFirst?: boolean; ttl?: number; startTime?: number; clock?: { value: number }; accounts?: boolean; providerKeys?: boolean; healthPath?: string; decisionLogPath?: string; heldProbe?: boolean; routing?: Routing; runtimeKeys?: "absent" | "inert"; wide?: boolean; contextWindow?: number; maxTokens?: number; strategy?: "prefer-b" | "missing"; schedule?: Schedule; tracker?: Runner } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "native-router-"));
   const settings = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: opts.retry ?? false, maxRetries: 3, baseDelayMs: 1 }, cacheWarming: "off" });
   const runtime = await ModelRuntime.create({ authPath: join(dir, "auth.json"), modelsPath: null, refreshOnCreate: false });
@@ -76,6 +78,7 @@ async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateT
     sharedProviders[provider] = { accounts: { ...sharedProviders[provider]?.accounts, [id]: { apiKeyEnv: accountEnv(id) } } };
   }
   else if (opts.accounts) for (const provider of ["fake-a", "fake-b", "fake-c"]) sharedProviders[provider] = { accounts: { [`acct-${provider}`]: { apiKeyEnv: `NATIVE_ROUTER_TEST_KEY_${provider.replace("-", "_").toUpperCase()}` } } };
+  if (opts.tracker) sharedProviders["fake-a"] = { quota: { source: "codexbar", provider: "fake-a", enforce: true } } as never;
   const healthPath = opts.healthPath ?? join(dir, "health.sqlite");
   if (opts.heldProbe) {
     const seeded = new HealthStore(healthPath, now);
@@ -124,7 +127,7 @@ async function host(outcomes: Outcome[], opts: { reasoning?: boolean; candidateT
         if (pending) { pending = false; materialized = true; order.push("materialized"); }
         return materialized ? { messages: [...event.messages, { role: "user", content: "MATERIALIZED DROP RESULT", timestamp: 1 }] } : undefined;
       });
-      if (!opts.packaged) installRouter(instrumented, config, { now, healthPath, decisionLogPath });
+      if (!opts.packaged) installRouter(instrumented, config, { now, healthPath, decisionLogPath, schedule: opts.schedule, quotaRunner: opts.tracker });
       pi.events.on("native-router:transition", () => order.push("transition"));
     }],
   });
@@ -905,4 +908,125 @@ test("a missing configured strategy falls back to ordered dispatch without disab
     expect(h.dispatches.map(d => d.physical)).toEqual(["fake-a"]);
     expect(readFileSync(h.decisionLogPath, "utf8")).toContain('"fallback":"strategy module could not be loaded"');
   } finally { h.close(); }
+});
+
+function manualClock(clock: { value: number }) {
+  const jobs = new Set<{ at: number; run: () => void }>();
+  const schedule: Schedule = (run, delay) => { const job = { at: clock.value + delay, run }; jobs.add(job); return () => { jobs.delete(job); }; };
+  return { schedule, jobs, advance(ms: number) { clock.value += ms; for (const job of [...jobs]) if (job.at <= clock.value) { jobs.delete(job); job.run(); } } };
+}
+async function drainResume() { for (let i = 0; i < 20; i++) await new Promise(resolve => setTimeout(resolve, 2)); }
+
+test("production auto-resumption waits after native exhaustion, includes queued nextTurn, and preserves completed tools", async () => {
+  const clock = { value: 1000 }, timer = manualClock(clock);
+  const h = await host(["tool", "quota", "quota", "quota", "ok"], { clock, schedule: timer.schedule });
+  try {
+    await h.session.prompt("/route-resume once");
+    await h.session.prompt("perform the tool then finish");
+    expect(h.toolRuns).toBe(1);
+    expect(h.dispatches).toHaveLength(4);
+    expect(timer.jobs.size).toBe(1);
+    await h.session.sendCustomMessage({ customType: "queued-content", content: "Include this queued next-turn context", display: false }, { deliverAs: "nextTurn" });
+    timer.advance(300_001);
+    await drainResume();
+    expect(h.dispatches).toHaveLength(5);
+    expect(h.dispatches.at(-1)?.context).toContain("tool finished");
+    expect(h.dispatches.at(-1)?.context).toContain("Include this queued next-turn context");
+    expect(h.toolRuns).toBe(1);
+    expect(h.session.messages.at(-1)).toMatchObject({ stopReason: "stop" });
+    expect(timer.jobs.size).toBe(0);
+  } finally { h.close(); }
+});
+
+test("production wake and native fallback remain inside the saved provider scope", async () => {
+  const clock = { value: 1000 }, timer = manualClock(clock);
+  const h = await host(["quota", "quota", "quota", "quota", "ok"], { clock, schedule: timer.schedule });
+  try {
+    await h.session.prompt("/route-resume on --scope provider:fake-b");
+    await h.session.prompt("finish when fake-b recovers");
+    expect(h.dispatches.map(d => d.physical)).toEqual(["fake-a", "fake-b", "fake-c"]);
+    timer.advance(300_001); await drainResume();
+    expect(h.dispatches.map(d => d.physical)).toEqual(["fake-a", "fake-b", "fake-c", "fake-b"]);
+    timer.advance(300_001); await drainResume();
+    expect(h.dispatches.map(d => d.physical)).toEqual(["fake-a", "fake-b", "fake-c", "fake-b", "fake-b"]);
+    expect(timer.jobs.size).toBe(0);
+  } finally { h.close(); }
+});
+
+test("production off fences a ready timer and default-off exhaustion never schedules", async () => {
+  const clock = { value: 1000 }, timer = manualClock(clock);
+  const h = await host(["quota", "quota", "quota"], { clock, schedule: timer.schedule });
+  try {
+    await h.session.prompt("interrupted but unarmed");
+    expect(timer.jobs.size).toBe(0);
+    await h.session.prompt("/route-resume once");
+    expect(timer.jobs.size).toBe(1);
+    const stale = [...timer.jobs][0].run;
+    await h.session.prompt("/route-resume off");
+    clock.value += 300_001; stale(); await drainResume();
+    expect(h.dispatches).toHaveLength(3);
+    expect(timer.jobs.size).toBe(0);
+  } finally { h.close(); }
+});
+
+test("production shared refresh keeps a weekly quota pause after the short reset, then resumes on fresh restoration", async () => {
+  const clock = { value: 1_800_000_000_000 }, timer = manualClock(clock);
+  let healthy = false, reads = 0;
+  const reset = clock.value + 300_000, weekly = clock.value + 7 * 86_400_000;
+  const tracker: Runner = async () => {
+    reads++;
+    return JSON.stringify([{ provider: "fake-a", source: "provider API", usage: { updatedAt: new Date(clock.value).toISOString(),
+      primary: { usedPercent: clock.value < reset ? 100 : 5, resetsAt: new Date(reset).toISOString() },
+      secondary: { usedPercent: healthy ? 50 : 100, resetsAt: new Date(weekly).toISOString() } } }]);
+  };
+  const h = await host(["ok"], { clock, schedule: timer.schedule, tracker, routing: { accounts: [], candidates: [{ provider: "fake-a" }] } });
+  try {
+    await h.session.prompt("/quotas");
+    await h.session.prompt("/route-resume once");
+    await h.session.prompt("finish when quota is restored");
+    expect(h.dispatches).toHaveLength(0);
+    expect(timer.jobs.size).toBe(1);
+    timer.advance(300_001); await drainResume();
+    expect(h.dispatches).toHaveLength(0);
+    expect(reads).toBe(2);
+    healthy = true;
+    timer.advance(300_001); await drainResume();
+    expect(reads).toBe(3);
+    expect(h.dispatches).toHaveLength(1);
+    expect(h.session.messages.at(-1)).toMatchObject({ stopReason: "stop" });
+    expect(timer.jobs.size).toBe(0);
+  } finally { h.close(); }
+});
+
+test("production resolver fences cancellation during an awaited wake transition", async () => {
+  const clock = { value: 1000 }, timer = manualClock(clock);
+  const h = await host(["quota", "quota", "quota", "ok"], { clock, schedule: timer.schedule });
+  try {
+    await h.session.prompt("/route-resume once --scope provider:fake-b");
+    await h.session.prompt("interrupted task");
+    h.api.events.on("native-router:before-transition", payload => {
+      const event = payload as { waitUntil: (p: Promise<void>) => void };
+      event.waitUntil(h.session.prompt("/route-resume off"));
+    });
+    timer.advance(300_001); await drainResume();
+    expect(h.dispatches).toHaveLength(3);
+    expect(h.session.messages.at(-1)).toMatchObject({ stopReason: "error" });
+    expect(timer.jobs.size).toBe(0);
+  } finally { h.close(); }
+});
+
+test("production route-scope wake ignores a newly granted blocked-pin bypass", async () => {
+  const root = mkdtempSync(join(tmpdir(), "resume-pin-")), healthPath = join(root, "health.sqlite");
+  const clock = { value: 1000 }, timer = manualClock(clock);
+  const h = await host(["quota", "quota", "quota", "ok"], { clock, schedule: timer.schedule, healthPath });
+  try {
+    await h.session.prompt("/route-resume once");
+    await h.session.prompt("interrupted task");
+    const store = new HealthStore(healthPath, () => clock.value);
+    store.mark("fake-b", "quota", clock.value + 900_000, "quota"); store.close();
+    await h.session.prompt("/route-pin fake-b/model");
+    timer.advance(300_001); await drainResume();
+    expect(h.dispatches.map(d => d.physical)).toEqual(["fake-a", "fake-b", "fake-c", "fake-c"]);
+    expect(timer.jobs.size).toBe(0);
+  } finally { h.close(); rmSync(root, { recursive: true, force: true }); }
 });

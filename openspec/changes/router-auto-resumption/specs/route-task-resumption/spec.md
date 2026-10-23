@@ -96,7 +96,7 @@ Resumption SHALL preserve transcript and tool state through a supported native c
 
 ### Requirement: Cancellation fences pending continuation
 
-User abort, a new user task, selected model change, branch/session switch, explicit disarm and shutdown SHALL invalidate pending wakes before they can start execution. Successful normal task settlement SHALL disarm standing permission. Restart or session restoration SHALL require explicit re-arming rather than silently executing old intent.
+Observable active-run abort, terminal Escape/Ctrl+C when available, new submitted user intent, model/branch/session changes, explicit off and shutdown SHALL invalidate pending wakes before execution. Successful normal settlement SHALL disarm standing permission. Restored intents SHALL require explicit re-arming. Pi 1.2.0 programmatic idle abort is covered by the accepted native queued-context requirement below.
 
 #### Scenario: User changes model while waiting
 - **WHEN** the user selects another route or direct model
@@ -130,3 +130,19 @@ The router SHALL provide arm-once, arm-standing, off and status controls with sc
 #### Scenario: Standing permission completes
 - **WHEN** the task finishes normally
 - **THEN** the waiting indicator clears and the authorization is no longer active
+
+### Requirement: Accepted native queued-context semantics
+
+Existing queued nextTurn messages SHALL intentionally join the resumed native conversation. Resumption SHALL NOT destroy queued content or require hidden queues to be empty. Public active steering/follow-up checks SHALL postpone delivery. A router wake SHALL carry intent/generation metadata and be fenced again during physical route resolution.
+
+#### Scenario: Preexisting nextTurn content
+- **WHEN** an authorized idle capacity wake starts with queued nextTurn context
+- **THEN** the native continuation includes that content and preserves completed tool results
+
+#### Scenario: Stale queued router wake
+- **WHEN** permission is cancelled or replaced after enqueueing a wake
+- **THEN** the route resolver rejects the stale generation before a provider call
+
+#### Scenario: Programmatic idle abort
+- **WHEN** a Pi 1.2.0 SDK caller needs to cancel an idle wait
+- **THEN** it uses explicit route-resume off because idle session.abort emits no observable extension event

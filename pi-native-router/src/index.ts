@@ -23,6 +23,8 @@ import { accountOf, admissionKeys, cacheExpiry, choose, cycleTarget, classify, c
 import { beforeTransition, flushBridge, type FlushHook, type TransitionHook } from "./transition";
 import { evaluateStrategy, loadStrategy, type LoadedStrategy, type RoutingContext, type StrategyTarget } from "./strategy";
 import { projectQuotaObservation, projectStrategyPrice } from "./strategy-projection";
+import { installResumption, type Schedule } from "./resumption";
+import type { Runner } from "./quota";
 
 function tokens(messages: readonly Message[]): number {
   const canonical = messages.reduce((n, m) => n + estimateTokens(m), 0);
@@ -120,9 +122,11 @@ export function defaultHealthPath(): string {
 }
 /** Admission made before a physical dispatch; settled by its own success or failure. */
 interface Admission { holder: string; keys: string[]; revision: number; physical: string }
-export function installRouter(pi: ExtensionAPI, config: Config, options: { transition?: TransitionHook; now?: () => number; healthPath?: string; decisionLogPath?: string } = {}) {
+export function installRouter(pi: ExtensionAPI, config: Config, options: { transition?: TransitionHook; now?: () => number; healthPath?: string; decisionLogPath?: string; schedule?: Schedule; quotaRunner?: Runner } = {}) {
+  let resume: ReturnType<typeof installResumption>;
   let lastDegradation: string | undefined;
   const degrade = (error: unknown) => {
+    resume?.storeFailed();
     const message = error instanceof Error ? error.message : String(error);
     if (message === lastDegradation) return;
     lastDegradation = message;
@@ -134,6 +138,8 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     catch (error) { degrade(error); }
   }
   const health = new Health(options.now, store, degrade);
+  resume = installResumption(pi, { config, store, health, now: options.now ?? Date.now, schedule: options.schedule,
+    candidates: (route, ctx) => available(route, ctx, config), pin: pinOf, refresh: () => refreshQuotas() });
   const decisionLogPath = options.decisionLogPath ?? defaultDecisionLogPath();
   const admissions = new Map<string, Admission>();
   /** Settles this session's pending admission. Success clears only the causes it proved recovered. */
@@ -287,7 +293,9 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
   for (const [role, route] of Object.entries(config.routes)) {
     const resolve = async (request: ModelRouteRequest<State>, ctx: ExtensionContext): Promise<ModelRoute<State>> => {
       request.signal?.throwIfAborted();
-      const candidates = available(route, ctx, config);
+      const resumeFence = request.reason === "direct" ? () => {} : resume.fence(ctx);
+      resumeFence();
+      const candidates = request.reason === "direct" ? available(route, ctx, config) : resume.candidates(route, ctx);
       // Pi's usage-aware context estimate (also shown in the footer) is authoritative for routed session turns.
       // Use the message heuristic only for direct calls or when Pi has no context usage yet.
       const estimate = request.reason === "direct"
@@ -310,6 +318,8 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       if (old && activity) old.cacheActivity = activity;
       const turn = turnKey(ctx);
       const state: State = old ? { ...old } : { version: 1, physical: "", turn, retries: 0, transitions: 0, recoveries: 0 };
+      // A new authorized wake starts a bounded native attempt; fallback within that attempt keeps its counters.
+      if (resume.beginAttempt()) Object.assign(state, { retries: 0, transitions: 0, recoveries: 0, next: undefined, nextSelection: undefined });
       if (activity) state.cacheActivity = activity;
       if (state.turn !== turn) Object.assign(state, { turn, retries: 0, transitions: 0, recoveries: 0, next: undefined, nextSelection: undefined });
       let exclude: string | undefined;
@@ -343,7 +353,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       // Admit one recovery probe per expired scope on the chosen target, or move to the next target.
       const skipped = new Set<string>(exclude ? [exclude] : []);
       const pin = pinOf(ctx, role);
-      const forcePin = typeof pin === "string" && pinOverrideOf(ctx, role);
+      const forcePin = !resume.automatic() && typeof pin === "string" && pinOverrideOf(ctx, role);
       const priorityTarget = forcePin ? pin : state.next ?? (typeof pin === "string" ? pin : stayRetry ? state.physical : undefined);
       const priority = forcePin ? "pin" as const : state.next ? "recovery" as const : typeof pin === "string" ? "pin" as const : stayRetry ? "retry" as const : undefined;
       const preferred = typeof pin === "string" ? pin : state.physical;
@@ -375,6 +385,14 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
         skipped.add(target);
       }
       if (!selected) {
+        // Preserve structured rejection facts; resumption never parses the displayed route diagnostic.
+        const usable = candidates.filter(c => fitsRequest(route, c, estimate));
+        const capacity = usable.length > 0 && usable.every(c => {
+          const blocked = health.blockedReason(c.model, c.candidate.account);
+          return blocked && (blocked.kind === "quota" || blocked.kind === "tracker-quota" ||
+            (blocked.kind === "rate" && request.failed && classify(request.failed.message, options.now?.()).resetBound));
+        });
+        resume.rejection(!request.failed || !partialOutput(request.failed.message), capacity, estimate);
         // Every rejection is secret-free and names the reason, so a live exhaustion is diagnosable from the error.
         const detail = route.candidates.map(candidate => {
           const target = `${candidate.provider}/${candidate.id}${candidate.account ? `#${candidate.account}` : ""}`;
@@ -452,6 +470,9 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
       const explicit = userThinking(ctx, role);
       const thinkingLevel = routeLevel(selected.model, selected.candidate.thinkingLevel, explicit) as ModelThinkingLevel;
       publishRoute(ctx, role, selected.model, selected.candidate.account, thinkingLevel, explicit);
+      resumeFence();
+      request.signal?.throwIfAborted();
+      resume.checkTarget(selected.candidate, ctx);
       return { model: selected.model, thinkingLevel, state: unchanged ? request.state : state };
     };
     pi.on("message_end", (event, ctx) => {
@@ -482,7 +503,6 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     });
   }
   // Tracker-sourced quota: snapshots are refreshed off the dispatch path and shown here.
-  const quotaHolder = randomUUID();
   // Every tracker-quota scope: named accounts, plus default-auth providers (Pi's own login).
   const quotaScopes: Array<{ label: string; key: string; scope: { provider: string; account?: string }; quota: QuotaSource }> = [
     ...Object.entries(config.providers).flatMap(([provider, p]) => Object.entries(p.accounts).filter(([, account]) => account.quota !== undefined).map(([id, account]) => ({
@@ -490,15 +510,16 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     }))),
     ...Object.entries(config.providers).filter(([, p]) => p.quota !== undefined).map(([provider, p]) => ({ label: provider, key: quotaScopeKey(provider), scope: { provider }, quota: p.quota! })),
   ];
-  const refreshQuotas = async (force = false): Promise<string[]> => {
+  const fetchQuotas = async (force = false): Promise<string[]> => {
     if (!store || quotaScopes.length === 0) return [];
+    const quotaHolder = randomUUID();
     const lines: string[] = [];
     const now = options.now ?? Date.now;
     for (const { label, scope, quota } of quotaScopes) {
       // An operator refresh asks for a fresh decision: a stale tracker block is dropped before the fetch, so the new
     // reading (or its absence) alone governs this scope. Error-derived causes are left untouched.
     if (force) store.clearTrackerQuota(quotaScopeKey(scope.provider, scope.account));
-    const outcome = await refreshQuota(store, scope, quota, codexbarRunner, now, quotaHolder, { force });
+    const outcome = await refreshQuota(store, scope, quota, options.quotaRunner ?? codexbarRunner, now, quotaHolder, { force });
       lines.push(outcome.status === "unavailable" ? `  ${label}: unknown (${outcome.reason})`
         : outcome.status === "leased" ? `  ${label}: refresh already in progress elsewhere`
         : outcome.status === "cached" ? `  ${label}: reused a fetch ${Math.round((now() - outcome.observedAt) / 1000)}s old`
@@ -506,10 +527,20 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     }
     return lines;
   };
+  let quotaRefresh: Promise<string[]> | undefined;
+  const refreshQuotas = (force = false): Promise<string[]> => {
+    if (force) return fetchQuotas(true);
+    if (quotaRefresh) return quotaRefresh;
+    const current = fetchQuotas();
+    quotaRefresh = current;
+    const clear = () => { if (quotaRefresh === current) quotaRefresh = undefined; };
+    void current.then(clear, clear);
+    return current;
+  };
   // Tracker quota refreshes on launch and periodically, never on the dispatch path. The shared store gates
   // CodexBar runs across processes; leases only stop overlapping runs.
   let quotaTimer: ReturnType<typeof setInterval> | undefined;
-  const refreshQuotaQuietly = () => { void refreshQuotas().catch(degrade); };
+  const refreshQuotaQuietly = () => { void refreshQuotas().then(() => resume.recheck()).catch(degrade); };
   // The model that was active before the latest switch. Pi applies the thinking level for a switch before
   // it emits model_select, so a thinking change counts as a user choice only when the model did not just change.
   const activeModel = new Map<string, string>();
@@ -533,7 +564,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     const route = config.routes[role];
     const state = branchState(ctx, role);
     const pin = pinOf(ctx, role);
-    const candidates = available(route, ctx, config);
+    const candidates = resume.candidates(route, ctx);
     // The footer follows what actually serves: the last dispatched target, unless the user has just chosen a new one
     // (a fresh pin is pending). A stored pin does not pull the display away from a healthy fallback.
     if (!(typeof pin === "string" && pinOverrideOf(ctx, role)) && state?.physical) {
@@ -857,7 +888,7 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     const role = ctx.model.id;
     const route = config.routes[role];
     const state = branchState(ctx, role);
-    if (!route || !state || state.next || state.recoveries >= route.maxRecoveries || state.transitions >= route.maxTransitions) return;
+    if (!route || !state || state.next) return;
     const last = event.context.contextEntries.findLast(e => e.messages.length > 0);
     const message = last?.messages.at(-1);
     if (!message || message.role !== "assistant" || message.stopReason !== "error") return;
@@ -868,9 +899,10 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     settleAdmission(`${ctx.sessionManager.getSessionId()}:${role}`, { recovered: false });
     if (observed.kind !== "unsafe") health.mark(failed, observed, accountOf(state.physical));
     if (failure.kind === "unsafe") return;
+    if (state.recoveries >= route.maxRecoveries || state.transitions >= route.maxTransitions) return;
     const estimate = Math.max(tokens(event.context.llmMessages), ctx.getContextUsage()?.tokens ?? 0);
     const failedTarget = identity(failed, accountOf(state.physical));
-    const selection = await chooseWithStrategy(role, route, available(route, ctx, config), health, estimate, state.physical, state.physical, ctx,
+    const selection = await chooseWithStrategy(role, route, resume.candidates(route, ctx), health, estimate, state.physical, state.physical, ctx,
       { mode: "dispatch", reason: "failover", state, current: state.physical, failed: failedTarget, failureKind: failure.kind, excluded: new Set([state.physical]) });
     reportStrategyFallback(role, ctx, { ...selection, selected: selection.selected });
     const selected = selection.selected;

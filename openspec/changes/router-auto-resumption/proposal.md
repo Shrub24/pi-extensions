@@ -30,4 +30,6 @@ None. Native routing still settles exhausted requests predictably; the new opt-i
 - Existing route selection, credentials, usage accounting and awaited Magic Context transitions remain authoritative.
 - No new service, global task scheduler, provider transport, automatic paid probing loop, or closed-session launcher. Direct calls and provider-wide wake broadcasts are out of scope. Generic transport/auth recovery, priority queues, spend optimisation and autonomous task scheduling are deferred.
 
-Proposed defaults for review: route-wide scope; 24-hour authorization lifetime; three unsuccessful wake attempts per capacity pause; quota and reset-bound rate failures only. No behavior changes unless the session is explicitly armed.
+Accepted defaults (2026-10-23): route-wide scope; 24-hour authorization lifetime; three unsuccessful wake attempts per capacity pause; quota and reset-bound rate failures only. No behavior changes unless the session is explicitly armed.
+
+Accepted host contract: terminal Escape/Ctrl+C, explicit off and lifecycle events cancel waiting. Programmatic idle abort is unobservable on Pi 1.2.0 and is documented. Preexisting queued `nextTurn` content intentionally joins a resumed conversation; active steering/follow-up still postpones delivery. These limitations are not implementation gates.

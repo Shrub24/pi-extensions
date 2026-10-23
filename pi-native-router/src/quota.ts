@@ -5,7 +5,7 @@ import { PROVIDER_KEY_ONLY } from "./codexbar-config";
 /** Source-neutral quota observations. Missing or stale data is unknown, never zero or available. */
 export interface QuotaWindow { slot: "primary" | "secondary" | "tertiary"; label: string; usedPercent: number; resetsAt?: number; windowMinutes?: number }
 /** `authoritative` is true only when the tracker reports account meters, not a device-local estimate. */
-export interface QuotaSnapshot { provider: string; account: string; source: string; authoritative: boolean; observedAt: number; windows: QuotaWindow[] }
+export interface QuotaSnapshot { provider: string; account: string; source: string; authoritative: boolean; observedAt: number; windows: QuotaWindow[]; healthRevision?: number }
 /** Router-side mapping of an account to a CodexBar provider (and optional CodexBar account label). */
 export interface QuotaSource { source: "codexbar"; provider: string; account?: string; enforce: boolean }
 
@@ -139,6 +139,7 @@ export async function refreshQuota(
       return { status: "unavailable", reason: parsed.error };
     }
     const snapshot = parsed.snapshot;
+    snapshot.healthRevision = started;
     store.putSnapshot(key, now(), snapshot, null);
     if (!isFresh(snapshot, now())) return { status: "refreshed", snapshot };
     const until = exhaustedUntil(snapshot, now());

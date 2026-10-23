@@ -22,6 +22,10 @@ export type CauseKind = ErrorCauseKind | "tracker-quota";
 export interface CauseRecord { key: string; kind: CauseKind; until: number; revision: number; reason: string }
 export interface LeaseRecord { key: string; holder: string; expires: number; revision: number }
 export interface ProbeLease { key: string; revision: number }
+export interface ResumeRecord {
+  id: string; session: string; branch: string; owner: string; generation: string;
+  status: string; deadline: number; updated: number; body: string;
+}
 
 export class HealthStore {
   private readonly db: DatabaseSync;
@@ -39,6 +43,12 @@ export class HealthStore {
         key TEXT PRIMARY KEY, holder TEXT NOT NULL, expires INTEGER NOT NULL, revision INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS quota_snapshots (
         account TEXT PRIMARY KEY, observed_at INTEGER NOT NULL, body TEXT, error TEXT);
+      CREATE TABLE IF NOT EXISTS resume_intents (
+        id TEXT PRIMARY KEY, session TEXT NOT NULL, branch TEXT NOT NULL, owner TEXT NOT NULL,
+        generation TEXT NOT NULL, status TEXT NOT NULL, deadline INTEGER NOT NULL,
+        updated INTEGER NOT NULL, body TEXT NOT NULL);
+      CREATE UNIQUE INDEX IF NOT EXISTS resume_active_session ON resume_intents(session)
+        WHERE status IN ('armed', 'waiting', 'waking', 'running');
       INSERT OR IGNORE INTO meta (k, v) VALUES ('schema', ${SCHEMA_VERSION}), ('revision', 0);
     `);
     const version = this.db.prepare("SELECT v FROM meta WHERE k = 'schema'").get() as { v: number };
@@ -47,6 +57,61 @@ export class HealthStore {
   }
 
   close(): void { this.db.close(); }
+
+  /** Lifecycle writes are atomic; replacing permission fences every previous owner of this session. */
+  armResume(row: ResumeRecord): void {
+    this.tx(() => {
+      this.db.prepare("UPDATE resume_intents SET status = 'stopped', updated = ? WHERE session = ? AND status IN ('armed','waiting','waking','running')")
+        .run(this.now(), row.session);
+      this.db.prepare("INSERT INTO resume_intents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        .run(row.id, row.session, row.branch, row.owner, row.generation, row.status, row.deadline, row.updated, row.body);
+      this.pruneResumes();
+    });
+  }
+
+  getResume(id: string): ResumeRecord | undefined {
+    return this.db.prepare("SELECT * FROM resume_intents WHERE id = ?").get(id) as unknown as ResumeRecord | undefined;
+  }
+
+  /** Explicit off also revokes a restored pointer owned by an earlier process. */
+  cancelResume(row: ResumeRecord): void {
+    this.tx(() => {
+      this.db.prepare("UPDATE resume_intents SET status = 'stopped', updated = ? WHERE id = ? AND session = ? AND generation = ?")
+        .run(this.now(), row.id, row.session, row.generation);
+      this.db.prepare("DELETE FROM leases WHERE key = ?").run(`resume:${row.id}`);
+      this.pruneResumes();
+    });
+  }
+
+  /** Compare owner, generation and prior phase under the same write lock as the claim/update. */
+  updateResume(row: ResumeRecord, previous: string): boolean {
+    return this.tx(() => {
+      const result = this.db.prepare(`UPDATE resume_intents SET status = ?, updated = ?, body = ?
+        WHERE id = ? AND owner = ? AND generation = ? AND status = ?`)
+        .run(row.status, row.updated, row.body, row.id, row.owner, row.generation, previous);
+      if (Number(result.changes) === 1) {
+        if (row.status === "waking") this.db.prepare("INSERT INTO leases (key, holder, expires, revision) VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET holder = excluded.holder, expires = excluded.expires, revision = excluded.revision")
+          .run(`resume:${row.id}`, `${row.owner}:${row.generation}`, this.now() + this.leaseMs, this.revision());
+        else if (row.status !== "running") this.db.prepare("DELETE FROM leases WHERE key = ?").run(`resume:${row.id}`);
+      }
+      this.pruneResumes();
+      return Number(result.changes) === 1;
+    });
+  }
+
+  resumeClaimValid(row: ResumeRecord): boolean {
+    const lease = this.db.prepare("SELECT holder, expires FROM leases WHERE key = ?").get(`resume:${row.id}`) as { holder: string; expires: number } | undefined;
+    return lease?.holder === `${row.owner}:${row.generation}` && lease.expires > this.now();
+  }
+
+  private pruneResumes(): void {
+    // Closed processes never execute persisted permission. Running work is not expired mid-tool.
+    this.db.prepare("UPDATE resume_intents SET status = 'stopped', updated = ? WHERE deadline <= ? AND status IN ('armed','waiting','waking')")
+      .run(this.now(), this.now());
+    this.db.prepare(`DELETE FROM resume_intents WHERE status NOT IN ('armed','waiting','waking','running')
+      AND (updated < ? OR id NOT IN (SELECT id FROM resume_intents WHERE status NOT IN ('armed','waiting','waking','running') ORDER BY updated DESC, rowid DESC LIMIT 100))`)
+      .run(this.now() - 7 * 86_400_000);
+  }
 
   /** Current fence: admissions record this and only later causes can override them. */
   revision(): number {
@@ -155,6 +220,14 @@ export class HealthStore {
   recordSuccess(keys: readonly string[], admittedRevision: number): void {
     this.tx(() => {
       for (const key of keys) this.db.prepare("DELETE FROM causes WHERE key = ? AND revision <= ?").run(key, admittedRevision);
+    });
+  }
+
+  /** A complete authoritative meter can restore quota, never auth/rate/outage or newer failures. */
+  restoreQuota(keys: readonly string[], observedRevision: number): void {
+    this.tx(() => {
+      for (const key of keys) this.db.prepare("DELETE FROM causes WHERE key = ? AND kind IN ('quota','tracker-quota') AND revision <= ?")
+        .run(key, observedRevision);
     });
   }
 

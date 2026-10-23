@@ -7,7 +7,7 @@ export const identity = (model: { provider: string; id: string }, account?: stri
 export const physicalOf = (key: string) => key.split("#")[0];
 export const accountOf = (key: string) => key.split("#")[1];
 export type FailureKind = "transient" | "rate" | "quota" | "auth" | "unsafe";
-export interface Failure { kind: FailureKind; scope: "model" | "provider"; delayMs: number }
+export interface Failure { kind: FailureKind; scope: "model" | "provider"; delayMs: number; resetBound?: boolean }
 /** Quota and auth resets can be days away; transient and rate hints stay short. */
 const HINT_CAP_MS = { quota: 8 * 24 * 3_600_000, auth: 8 * 24 * 3_600_000, transient: 900_000, rate: 900_000 } as const;
 /** Replay safety: output already produced, or a tool call, makes migration unsafe. */
@@ -45,7 +45,8 @@ export function classify(message: Pick<AssistantMessage, "stopReason" | "content
   const retryAfter = typeof fields.retryAfterSeconds === "number" ? fields.retryAfterSeconds * 1000 : undefined;
   const hint = retryAfter ?? resetAt ?? base;
   const scope = modelAccess ? "model" : kind === "quota" || kind === "auth" || fields.scope === "provider" ? "provider" : "model";
-  return { kind, scope, delayMs: Number.isFinite(hint) ? Math.min(HINT_CAP_MS[kind as keyof typeof HINT_CAP_MS] ?? 900_000, Math.max(1000, hint)) : base };
+  return { kind, scope, delayMs: Number.isFinite(hint) ? Math.min(HINT_CAP_MS[kind as keyof typeof HINT_CAP_MS] ?? 900_000, Math.max(1000, hint)) : base,
+    resetBound: (retryAfter !== undefined && Number.isFinite(retryAfter) && retryAfter > 0) || (resetAt !== undefined && Number.isFinite(resetAt) && resetAt > 0) };
 }
 
 /** Scope keys for a target: the account-wide or provider-wide key, and the model key. */
@@ -77,7 +78,7 @@ export class Health {
     const current = this.local.get(key);
     if (!current || until >= current.until) this.local.set(key, { until, kind: failure.kind });
     const kind: ErrorCauseKind = failure.kind;
-    this.attempt(() => this.store?.mark(key, kind, until, kind));
+    this.attempt(() => this.store?.mark(key, kind, until, kind === "rate" && failure.resetBound ? "reset-bound rate" : kind));
   }
   /** Scope keys with a process-local cause still in force. */
   liveKeys(at: number): string[] {
@@ -86,6 +87,9 @@ export class Health {
   /** Clears process-local causes for these scopes after a request on them proved it serves. */
   recovered(keys: readonly string[]) {
     for (const key of keys) this.local.delete(key);
+  }
+  recoveredQuota(keys: readonly string[]) {
+    for (const key of keys) if (this.local.get(key)?.kind === "quota") this.local.delete(key);
   }
   /** Drops process-local causes whose scope key matches, after an operator reset. */
   forget(match: (key: string) => boolean) {
