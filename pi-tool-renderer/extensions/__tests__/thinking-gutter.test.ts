@@ -140,14 +140,14 @@ test("plain assistant style never writes the thinking-panel marker to the termin
 		const component = new StreamingAssistantMessage();
 		component.updateContent({ content: [{ type: "thinking", thinking: "Editing group boundary fields" }] });
 		const thinkingOnly = component.render(50);
-		// The panel keeps its tinted padding above and below the thinking text.
-		const header = thinkingOnly.findIndex((line) => line.includes("thinking"));
-		expect(header).toBeGreaterThan(0);
-		expect(thinkingOnly[header - 1]).toContain(TINT);
-		expect(thinkingOnly[header]).toContain(TINT);
+		// No heading: the block is framed by tinted padding rows only.
+		expect(thinkingOnly.some((line) => stripAnsi(line).includes("thinking"))).toBe(false);
+		const textRow = thinkingOnly.findIndex((line) => stripAnsi(line).includes("Editing group boundary fields"));
+		expect(textRow).toBeGreaterThan(0);
+		expect(thinkingOnly[textRow - 1]).toContain(TINT);
 		// Padding rows stay non-blank for trimmers that strip ANSI, and never carry
 		// the raw marker to the terminal.
-		expect(thinkingOnly.slice(0, header).every((line) => line.trim().length > 0)).toBe(true);
+		expect(thinkingOnly.slice(0, textRow).every((line) => line.trim().length > 0)).toBe(true);
 		const lastPanelRow = thinkingOnly.map((line) => line.includes(TINT)).lastIndexOf(true);
 		expect(lastPanelRow).toBeGreaterThan(thinkingOnly.findIndex((line) => stripAnsi(line).includes("Editing group boundary fields")));
 		expect(thinkingOnly.filter((line) => line.includes(THINKING_ROW_SENTINEL))).toEqual([]);

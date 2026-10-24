@@ -596,11 +596,11 @@ function stripThinkingRowSentinels(lines: string[]): string[] {
 
 /**
  * Zero-width row whose one U+200B keeps it out of `isBlankRenderLine`, so the
- * panel's bottom padding survives the assistant trimmers that drop trailing
+ * panel's padding rows survive the assistant trimmers that drop trailing
  * blank rows (and would otherwise leave the tint stopping at the last line of
  * thinking text).
  */
-const THINKING_PANEL_BOTTOM_PAD = { render: (): string[] => ["\u200B"], invalidate() {} };
+const THINKING_PANEL_PAD = { render: (): string[] => ["\u200B"], invalidate() {} };
 
 function panelizeThinkingBlocks(component: any, theme: any): void {
 	const children = component?.contentContainer?.children;
@@ -612,10 +612,12 @@ function panelizeThinkingBlocks(component: any, theme: any): void {
 	for (let index = 0; index < children.length; index++) {
 		const child = children[index];
 		if (!(child instanceof MouseRegion)) continue;
+		// No "thinking" heading: the block's own styling and the model's placeholder
+		// already say what it is. Only the tinted padding rows frame it.
 		const box = new Box(1, 0, (text: string) => `${THINKING_ROW_SENTINEL}${theme.bg("customMessageBg", text)}`);
-		box.addChild(new Text(theme.bold(theme.fg("muted", "thinking"))));
+		box.addChild(THINKING_PANEL_PAD);
 		box.addChild(child);
-		box.addChild(THINKING_PANEL_BOTTOM_PAD);
+		box.addChild(THINKING_PANEL_PAD);
 		children[index] = box;
 	}
 }

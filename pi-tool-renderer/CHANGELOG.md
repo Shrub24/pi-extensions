@@ -4,6 +4,7 @@
 
 ### Unreleased
 
+- The thinking panel no longer prints a `thinking` heading; its tinted padding rows frame the block instead, so a collapsed block is just the placeholder between two tinted rows.
 - Consecutive tool rows that the model issues across separate assistant turns share one outline again. A tool-call-only turn no longer draws a doubled rule between them.
 - Inline message timestamps join the last line of the reply instead of taking their own row, so a stamped reply no longer gets an extra blank line after its timestamp.
 - The thinking panel's tinted padding rows survive every trimmer again, and its internal marker no longer reaches the terminal under `assistantMessageStyle: "plain"` or on thinking-only messages.
