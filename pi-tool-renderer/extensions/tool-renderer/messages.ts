@@ -583,8 +583,15 @@ function reserveAssistantGutter(component: any, cwd: string | undefined): void {
  */
 export const THINKING_ROW_SENTINEL = "\u001b]1337;kx-thinking\u0007";
 
+/**
+ * The marker is swapped for a zero-width character rather than deleted: the
+ * padding rows above, inside and below a panel are only blanks once the marker
+ * is gone, and any trimmer that strips ANSI would drop them.
+ */
+const THINKING_ROW_KEEPER = "\u200B";
+
 function stripThinkingRowSentinels(lines: string[]): string[] {
-	return lines.map((line) => (line.startsWith(THINKING_ROW_SENTINEL) ? line.slice(THINKING_ROW_SENTINEL.length) : line));
+	return lines.map((line) => (line.includes(THINKING_ROW_SENTINEL) ? line.replace(THINKING_ROW_SENTINEL, THINKING_ROW_KEEPER) : line));
 }
 
 /**
@@ -634,7 +641,7 @@ export function installAssistantMessageRenderer(pi: ExtensionAPI, AssistantMessa
 			if (quickCached && quickCached.quickKey === quickKey) return quickCached.lines;
 			const rendered = state!.originalRender.call(this, width);
 			if (!Array.isArray(rendered) || rendered.length === 0) return rendered;
-			if (isThinkingOnlyAssistantMessage(this?.lastMessage)) return trimThinkingOnlyAssistantLines(stripThinkingRowSentinels(rendered));
+			if (isThinkingOnlyAssistantMessage(this?.lastMessage)) return stripThinkingRowSentinels(trimThinkingOnlyAssistantLines(rendered));
 			const cwd = safeCtxCwd(state?.activeCtx);
 			const theme = safeCtxTheme(state?.activeCtx);
 			const style = assistantTextStyle(cwd);
@@ -667,14 +674,16 @@ export function installAssistantMessageRenderer(pi: ExtensionAPI, AssistantMessa
 			} catch {
 				// A missing or malformed theme background leaves the gutter unpainted.
 			}
-			// Without a gutter pass the panel's marker has no consumer, so it is dropped
-			// here rather than reaching the terminal as an unknown escape on every row.
 			const styled = theme && style !== "plain"
 				? applyPromptZoneMarkers(assistantTextGutterLinesCached(this, stripped.lines, width, theme, cwd, style, backgroundPrefix), stripped.markers)
-				: stripThinkingRowSentinels(rendered);
+				: rendered;
+			// Panel markers survive the trimmers, which treat a marked row as content:
+			// that is what keeps the tinted padding rows. They are dropped last, once
+			// nothing else needs to tell a panel row apart from a blank one.
 			const finish = (lines: string[]): string[] => {
-				assistantRenderCache.set(this, { width, revision, fingerprint, lines, quickKey });
-				return lines;
+				const out = stripThinkingRowSentinels(lines);
+				assistantRenderCache.set(this, { width, revision, fingerprint, lines: out, quickKey });
+				return out;
 			};
 			if (this?.hasToolCalls) return finish(styled);
 			const end = trimTrailingBlankLines(styled);

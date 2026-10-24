@@ -6,7 +6,8 @@
 
 - Consecutive tool rows that the model issues across separate assistant turns share one outline again. A tool-call-only turn no longer draws a doubled rule between them.
 - Inline message timestamps join the last line of the reply instead of taking their own row, so a stamped reply no longer gets an extra blank line after its timestamp.
-- The thinking-panel marker no longer reaches the terminal under `assistantMessageStyle: "plain"`, or on thinking-only messages in any style.
+- The thinking panel's tinted padding rows survive every trimmer again, and its internal marker no longer reaches the terminal under `assistantMessageStyle: "plain"` or on thinking-only messages.
+- Consecutive tool rows share one outline even when Pi renders the transcript through a path that skips the patched container render.
 - Box-drawn tables whose rows have no separator lines between them render as one card per row instead of merging the rows.
 - Edit and write results no longer store a whole-file diff. Edit rows are derived from the unified patch Pi already stores, and write rows show their added and removed counts. Session files shrink accordingly, and a sizeable multi-hunk edit is no longer shown as its entire changed span. Diffs are computed with `diff` (jsdiff), which is now a runtime dependency.
 - Old sessions keep their stored data, which is no longer read. Edit rows still render from Pi's patch, but a write row from an earlier session shows only its outcome.

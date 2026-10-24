@@ -341,18 +341,39 @@ function markToolChromeGroupBoundaries(children: any[]): void {
 }
 
 export function installToolChromePatch(): void {
-	const proto = Container?.prototype as any;
-	if (!proto || proto[TOOL_CHROME_PATCH_SYMBOL]) return;
-	const originalRender = proto.render;
-	if (typeof originalRender !== "function") return;
-	proto.render = function patchedToolChromeRender(this: any, width: number): string[] {
-		if (Array.isArray(this?.children)) markToolChromeGroupBoundaries(this.children);
-		const rendered = originalRender.call(this, width);
-		if (!Array.isArray(rendered) || rendered.length === 0) return rendered;
-		if (typeof this?.toolName !== "string" || typeof this?.toolCallId !== "string") return rendered;
-		return renderToolChromeLines(this, rendered, width);
-	};
-	proto[TOOL_CHROME_PATCH_SYMBOL] = true;
+	// Pi's transcript container is a `Container` from Pi's own resolution of
+	// pi-tui, which need not be the copy this extension imports. The base class of
+	// ToolExecutionComponent is the one Pi definitely uses, so it is patched first;
+	// a second copy is patched too so a single runtime never mixes behaviours.
+	const prototypes = new Set<any>();
+	const fromToolExecution = Object.getPrototypeOf(ToolExecutionComponent?.prototype ?? {});
+	if (fromToolExecution && fromToolExecution !== Object.prototype) prototypes.add(fromToolExecution);
+	if (Container?.prototype) prototypes.add(Container.prototype);
+	for (const proto of prototypes) {
+		if (proto[TOOL_CHROME_PATCH_SYMBOL]) continue;
+		const originalRender = proto.render;
+		if (typeof originalRender !== "function") continue;
+		proto.render = function patchedToolChromeRender(this: any, width: number): string[] {
+			if (Array.isArray(this?.children)) markToolChromeGroupBoundaries(this.children);
+			const rendered = originalRender.call(this, width);
+			if (!Array.isArray(rendered) || rendered.length === 0) return rendered;
+			if (typeof this?.toolName !== "string" || typeof this?.toolCallId !== "string") return rendered;
+			return renderToolChromeLines(this, rendered, width);
+		};
+		proto[TOOL_CHROME_PATCH_SYMBOL] = true;
+		// Marking on insertion as well as on render: Pi does not have to route the
+		// transcript through the patched `render` for a run to collapse.
+		const originalAddChild = proto.addChild;
+		if (typeof originalAddChild === "function") {
+			proto.addChild = function patchedAddChild(this: any, component: any): void {
+				const result = originalAddChild.call(this, component);
+				if (Array.isArray(this?.children) && typeof component?.toolCallId === "string") {
+					markToolChromeGroupBoundaries(this.children);
+				}
+				return result;
+			};
+		}
+	}
 }
 
 export function registerToolChromeEvents(pi: ExtensionAPI): void {

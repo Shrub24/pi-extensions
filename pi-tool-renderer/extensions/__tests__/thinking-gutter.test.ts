@@ -140,7 +140,16 @@ test("plain assistant style never writes the thinking-panel marker to the termin
 		const component = new StreamingAssistantMessage();
 		component.updateContent({ content: [{ type: "thinking", thinking: "Editing group boundary fields" }] });
 		const thinkingOnly = component.render(50);
-		expect(thinkingOnly.some((line) => line.includes(TINT))).toBe(true);
+		// The panel keeps its tinted padding above and below the thinking text.
+		const header = thinkingOnly.findIndex((line) => line.includes("thinking"));
+		expect(header).toBeGreaterThan(0);
+		expect(thinkingOnly[header - 1]).toContain(TINT);
+		expect(thinkingOnly[header]).toContain(TINT);
+		// Padding rows stay non-blank for trimmers that strip ANSI, and never carry
+		// the raw marker to the terminal.
+		expect(thinkingOnly.slice(0, header).every((line) => line.trim().length > 0)).toBe(true);
+		const lastPanelRow = thinkingOnly.map((line) => line.includes(TINT)).lastIndexOf(true);
+		expect(lastPanelRow).toBeGreaterThan(thinkingOnly.findIndex((line) => stripAnsi(line).includes("Editing group boundary fields")));
 		expect(thinkingOnly.filter((line) => line.includes(THINKING_ROW_SENTINEL))).toEqual([]);
 		component.updateContent({ content: [{ type: "thinking", thinking: "Editing group boundary fields" }, { type: "text", text: "Done." }] });
 		const withText = component.render(50);

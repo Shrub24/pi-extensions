@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { Container, Image, resetCapabilitiesCache, setCapabilities, visibleWidth } from "@earendil-works/pi-tui";
+import { ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
 
 import { stripAnsi } from "../tool-renderer/ansi.js";
 import { __test, installToolChromePatch, withResultTheme } from "../tool-renderer/chrome.js";
@@ -118,6 +119,53 @@ describe("tool chrome", () => { test("adjacent tool entries share only the run's
 		const lines = transcript.render(40).map(stripAnsi);
 		expect(lines.filter((line) => line === "─".repeat(39))).toHaveLength(2);
 		expect(lines.indexOf("content call-1")).toBeLessThan(lines.indexOf("content call-2"));
+	});
+
+	test("a run collapses even when the transcript container renders without the patched render", () => {
+		const cwd = tempCwd({ toolChrome: "outlines" });
+		const proto = Object.getPrototypeOf(ToolExecutionComponent.prototype);
+		installToolChromePatch();
+		// A container that renders its children itself, the way a scrolling host can.
+		const host: any = Object.create(proto);
+		host.children = [];
+		host.render = function (width: number) {
+			return this.children.flatMap((child: any) => child.render(width));
+		};
+		for (const id of ["call-1", "call-2"]) {
+			const component: any = Object.create(proto);
+			component.children = [{ render: () => [`content ${id}`], invalidate() {} }];
+			component.toolName = "read";
+			component.toolCallId = id;
+			component.cwd = cwd;
+			component.ui = { theme };
+			host.addChild(component);
+		}
+		const lines = host.render(40).map(stripAnsi);
+		expect(lines.filter((line) => line === "─".repeat(39))).toHaveLength(2);
+	});
+
+	test("the grouping patch lands on the Container class Pi's components inherit", () => {
+		installToolChromePatch();
+		const piContainer = Object.getPrototypeOf(ToolExecutionComponent.prototype);
+		expect((piContainer as any)[Symbol.for("pi-tool-renderer.tool-chrome-patch")] ?? true).toBe(true);
+		const rendered = (piContainer as any).render;
+		expect(typeof rendered).toBe("function");
+		// A transcript built from Pi's own class collapses a run into shared rules.
+		const proto = Object.getPrototypeOf(ToolExecutionComponent.prototype);
+		const transcript: any = Object.create(proto);
+		transcript.children = [];
+		const cwd = tempCwd({ toolChrome: "outlines" });
+		for (const id of ["call-1", "call-2"]) {
+			const component: any = Object.create(proto);
+			component.children = [{ render: () => [`content ${id}`], invalidate() {} }];
+			component.toolName = "read";
+			component.toolCallId = id;
+			component.cwd = cwd;
+			component.ui = { theme };
+			transcript.children.push(component);
+		}
+		const lines = transcript.render(40).map(stripAnsi);
+		expect(lines.filter((line) => line === "─".repeat(39))).toHaveLength(2);
 	});
 
 	test("hidden tool entries do not split an adjacent visible run", () => {
