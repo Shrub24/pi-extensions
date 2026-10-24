@@ -575,8 +575,6 @@ function reserveAssistantGutter(component: any, cwd: string | undefined): void {
  * Text/Markdown, so the click-to-toggle handler survives the rewrap; assistant
  * text blocks are bare Markdown and are left alone.
  */
-const thinkingPanelCache = new WeakMap<object, { count: number }>();
-
 /**
  * Zero-width marker prepended to every thinking-panel row so the assistant
  * gutter can recognise panel rows without guessing at theme escape codes. OSC
@@ -585,24 +583,30 @@ const thinkingPanelCache = new WeakMap<object, { count: number }>();
  */
 export const THINKING_ROW_SENTINEL = "\u001b]1337;kx-thinking\u0007";
 
+/**
+ * Zero-width row whose one U+200B keeps it out of `isBlankRenderLine`, so the
+ * panel's bottom padding survives the assistant trimmers that drop trailing
+ * blank rows (and would otherwise leave the tint stopping at the last line of
+ * thinking text).
+ */
+const THINKING_PANEL_BOTTOM_PAD = { render: (): string[] => ["\u200B"], invalidate() {} };
+
 function panelizeThinkingBlocks(component: any, theme: any): void {
 	const children = component?.contentContainer?.children;
 	if (!Array.isArray(children) || typeof theme?.bg !== "function") return;
-	// updateContent fires on every streaming frame. Rewrapping untouched blocks
-	// each frame allocates Boxes for nothing and churns the container; only
-	// convert children that are still unconverted, and only rescan when the
-	// child count changed.
-	const cached = thinkingPanelCache.get(component);
-	if (cached && cached.count === children.length) return;
+	// pi rebuilds these children on every streaming frame, so a converted block
+	// is replaced by a fresh MouseRegion even when the child count is unchanged.
+	// Wrapping only unconverted children makes the rescan idempotent and
+	// allocation-free once every panel is in place.
 	for (let index = 0; index < children.length; index++) {
 		const child = children[index];
 		if (!(child instanceof MouseRegion)) continue;
 		const box = new Box(1, 0, (text: string) => `${THINKING_ROW_SENTINEL}${theme.bg("customMessageBg", text)}`);
 		box.addChild(new Text(theme.bold(theme.fg("muted", "thinking"))));
 		box.addChild(child);
+		box.addChild(THINKING_PANEL_BOTTOM_PAD);
 		children[index] = box;
 	}
-	thinkingPanelCache.set(component, { count: children.length });
 }
 
 export function installAssistantMessageRenderer(pi: ExtensionAPI, AssistantMessageComponent: any): void {

@@ -1,12 +1,118 @@
 import { expect, test } from "bun:test";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 
-import { THINKING_ROW_SENTINEL, __test } from "../tool-renderer/messages.js";
+import { Container, Markdown, MouseRegion, Spacer, Text, visibleWidth } from "@earendil-works/pi-tui";
+
+import { stripAnsi } from "../tool-renderer/ansi.js";
+import { clearPackageConfigCache } from "../tool-renderer/package-config.js";
+import { installAssistantMessageRenderer, THINKING_ROW_SENTINEL, __test } from "../tool-renderer/messages.js";
+import { useWorld } from "./helpers/world.js";
+
+const world = useWorld();
+
+const TINT = "\x1b[48;5;236m";
+
+const markdownTheme = {
+	bold: (text: string) => text,
+	code: (text: string) => text,
+	codeBlock: (text: string) => text,
+	codeBlockBorder: (text: string) => text,
+	heading: (text: string) => text,
+	italic: (text: string) => text,
+	link: (text: string) => text,
+	linkUrl: (text: string) => text,
+	quote: (text: string) => text,
+	quoteBorder: (text: string) => text,
+	strikethrough: (text: string) => text,
+	underline: (text: string) => text,
+	listBullet: (text: string) => text,
+	hr: (text: string) => text,
+	highlightCode: (code: string) => code.split("\n"),
+} as never;
 
 const theme = {
 	fg: (_token: string, text: string) => text,
 	bg: (_token: string, text: string) => `\u001b[48;5;236m${text}\u001b[49m`,
 	bold: (text: string) => text,
 } as never;
+
+/** Mirrors Pi: every updateContent clears the container and rebuilds all children. */
+class StreamingAssistantMessage extends Container {
+	contentContainer = new Container();
+	hasToolCalls = false;
+	lastMessage: any = { content: [] };
+	constructor() {
+		super();
+		this.addChild(this.contentContainer);
+	}
+	render(width: number) { return this.contentContainer.render(width); }
+	updateContent(message: any): void {
+		this.lastMessage = message;
+		this.contentContainer.clear();
+		const visible = message.content.some((block: any) => block.type === "thinking" && block.thinking.trim());
+		if (visible) this.contentContainer.addChild(new Spacer(1));
+		for (const block of message.content) {
+			if (block.type === "text" && block.text.trim()) this.contentContainer.addChild(new Markdown(block.text.trim(), 0, 0, markdownTheme));
+			if (block.type !== "thinking" || !block.thinking.trim()) continue;
+			const markdown = new Markdown(block.thinking.trim(), 0, 0, markdownTheme);
+			this.contentContainer.addChild(new MouseRegion(markdown, () => undefined));
+		}
+	}
+}
+
+test("a thinking panel keeps a tinted row below its last line of thinking text", () => {
+	const { cwd } = world();
+	writeFileSync(join(cwd, ".pi", "settings.json"), JSON.stringify({ "pi-tool-renderer": { thinkingPanel: true, assistantMessageStyle: "plain" } }));
+	clearPackageConfigCache();
+	const handlers = new Map<string, (...args: any[]) => void>();
+	const pi = { on: (event: string, handler: (...args: any[]) => void) => handlers.set(event, handler) };
+	installAssistantMessageRenderer(pi as any, StreamingAssistantMessage);
+	handlers.get("session_start")!({}, { cwd, hasUI: true, ui: { theme } });
+	try {
+		const component = new StreamingAssistantMessage();
+		component.updateContent({ content: [{ type: "thinking", thinking: "Editing group boundary fields" }] });
+		const thinkingOnly = component.render(50);
+		const lastOnly = thinkingOnly[thinkingOnly.length - 1] ?? "";
+		expect(lastOnly).toContain(TINT);
+		expect(lastOnly).toContain("\u200B");
+		expect(stripAnsi(lastOnly).replace("]1337;kx-thinking", "")).not.toMatch(/[A-Za-z0-9]/);
+		expect(visibleWidth(lastOnly)).toBe(50);
+
+		component.updateContent({ content: [{ type: "thinking", thinking: "Editing group boundary fields" }, { type: "text", text: "Here is the answer." }] });
+		const withText = component.render(50);
+		const panelRows = withText.filter((line) => line.includes(TINT));
+		const lastPanelRow = panelRows[panelRows.length - 1] ?? "";
+		expect(lastPanelRow).toContain("\u200B");
+		expect(withText.indexOf(lastPanelRow)).toBeLessThan(withText.findIndex((line) => line.includes("Here is the answer.")));
+	} finally {
+		handlers.get("session_shutdown")!();
+	}
+});
+
+test("growing thinking content keeps its panel tint across streaming updates", () => {
+	const { cwd } = world();
+	writeFileSync(join(cwd, ".pi", "settings.json"), JSON.stringify({ "pi-tool-renderer": { thinkingPanel: true, assistantMessageStyle: "plain" } }));
+	clearPackageConfigCache();
+	const handlers = new Map<string, (...args: any[]) => void>();
+	const pi = { on: (event: string, handler: (...args: any[]) => void) => handlers.set(event, handler) };
+	installAssistantMessageRenderer(pi as any, StreamingAssistantMessage);
+	handlers.get("session_start")!({}, { cwd, hasUI: true, ui: { theme } });
+	try {
+		const component = new StreamingAssistantMessage();
+		component.updateContent({ content: [{ type: "thinking", thinking: "Editing group boundary fields" }] });
+		const first = component.render(60).join("\n");
+		expect(first).toContain(TINT);
+		expect(first).toContain("Editing group boundary fields");
+
+		component.updateContent({ content: [{ type: "thinking", thinking: "Editing group boundary fields\n\nUpdating tool boundaries\n\nAdding boundary cache fields" }] });
+		const streamed = component.render(60).join("\n");
+		expect(streamed).toContain("Adding boundary cache fields");
+		expect(streamed).toContain(TINT);
+	} finally {
+		handlers.get("session_shutdown")!();
+	}
+});
 
 test("thinking panel rows keep their fill and the marker lands on the message", () => {
 	const panelRow = `${THINKING_ROW_SENTINEL}\u001b[48;5;236m thinking text \u001b[49m`;
