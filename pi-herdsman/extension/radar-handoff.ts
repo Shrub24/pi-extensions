@@ -123,11 +123,11 @@ export async function publishCompletionHandoff(
  */
 export async function persistAndAcknowledgeCompletion(
   port: RadarHandoffPort,
-  handoff: { id: string; correlation_id?: string | null; sender: { registration_id: string }; content: string },
-  expected: { runId: string; agentId: string },
+  handoff: { id: string; correlation_id?: string | null; sender: { subject_id: string }; content: string },
+  expected: { runId: string; subjectId: string },
   persist: (report: { requestId: string; status: "completed" | "failed"; summary: string; content: string }) => void,
 ): Promise<void> {
-  if (handoff.correlation_id !== expected.runId || handoff.sender.registration_id !== expected.agentId)
+  if (handoff.correlation_id !== expected.runId || handoff.sender.subject_id !== expected.subjectId)
     throw new Error("Radar handoff does not match the recorded worker launch");
   const decoded = decodeSealedReport(handoff.content);
   persist({ requestId: handoff.id, status: decoded.status, summary: decoded.summary, content: handoff.content });

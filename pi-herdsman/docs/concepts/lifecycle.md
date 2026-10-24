@@ -29,9 +29,9 @@ before a durable result resolves the assignment, the assignment projects as
 its backend carries them, so a pane whose occupant claims a different identity is
 unproved rather than lost. The mailbox remains the durable owner of that
 generation until its direct owner continues or closes it; physical disappearance
-does not mean completion or task failure. Continuing the exact saved session with
-`agent_continue` retires that record and starts a new generation on the same Pi
-session, so recovery needs no `agent_close` first. Moved, conflicting, or
+does not mean completion or task failure. `agent_continue` addresses the worker by
+its Radar subject and retires that record: Radar restarts the session it recorded
+for that subject, so recovery needs no `agent_close` first and no session path. Moved, conflicting, or
 incomplete evidence remains `unknown`.
 
 The authoritative final result is correlated to the accepted assignment request
@@ -224,15 +224,14 @@ exactly-once delivery for both completed and failed terminal results.
 ## Session continuation
 
 Agent cleanup does not delete the Pi session. To continue completed context,
-use the exact returned session with `agent_continue`; Pi Herdsman starts a new agent
-generation for the new assignment. The continuation uses the saved cwd, session
+use `agent_continue` with the worker's Radar subject; Radar starts the session it
+recorded for that subject. The continuation uses the saved cwd, session
 history, definition, and logical label together with the current effective
 authorized definition configuration. Its omitted model and thinking fields
 restore the saved session settings, while explicit definition fields override
 them. The caller cannot rename the continued session.
-Session continuation does not retain the old Herdr tab. A still-live
-generation may be restored from its exact managed identity, while ordinary
-same-workspace tab movement remains presentation-only and does not change
+A still-live generation may be restored from its recorded subject, while ordinary
+same-workspace movement remains presentation-only and does not change
 assignment ownership.
 
 ## Steering and interruption

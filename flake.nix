@@ -4,7 +4,8 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     # Pi-Bolt's plugin interface (`piBoltPlugins`) and the AOT package this
-    # repository's plugins are built and verified against.
+    # repository's plugins are built and verified against. This branch carries
+    # the interface; it is not on Pi-Bolt's release line.
     pi-bolt = {
       url = "github:Shrub24/pi-bolt/feature/nix-flake-hm-module";
       # One nixpkgs: the plugin scope and these packages are built from the same
@@ -31,6 +32,7 @@
       # among them: it needs the permission system's plugin, which this
       # repository does not carry (see nix/plugins.nix).
       defaultPluginNames = [
+        "radar"
         "otel"
         "herdsman"
         "cbmem"

@@ -195,22 +195,14 @@ const controlWorkerFixture = (suffix: string) => {
         customType: "pi-herdsman-radar-spawn",
         data: launch,
       });
-      const child = readAgentState(mailbox);
-      writeAgentState(mailbox, {
-        ...state,
-        ...(child?.startupAck ? { startupAck: child.startupAck } : {}),
-      });
+      writeAgentState(mailbox, state);
       publish("first assignment");
     },
     /** The worker takes an assignment that has not produced a result yet. */
     work(requestId: string) {
-      // Taking an assignment is not a new launch: the acknowledgment the child
-      // wrote for this generation stays what a close proves it by.
-      const current = readAgentState(mailbox);
       const working = {
         ...managedState(label, requestId, identity),
         agentDefinition: name,
-        ...(current?.startupAck ? { startupAck: current.startupAck } : {}),
         updatedAt: Date.now(),
       };
       writeAgentState(mailbox, working);
@@ -344,7 +336,7 @@ test("a control restart refuses a working target and leaves it untouched", async
   }
 });
 
-test("a control restart replaces an idle worker's process by close and relaunch", async (t) => {
+test("a control restart replaces an idle worker through Radar's restart verb", async (t) => {
   const worker = controlWorkerFixture("restart");
   try {
     await worker.open();
@@ -353,7 +345,9 @@ test("a control restart replaces an idle worker's process by close and relaunch"
     const result = await answered(t, request.requestId);
     assert.equal(result.outcome, "restarted", JSON.stringify(result));
     assert.ok(result.effects.includes("process_relaunched"));
-    assert.equal(radarDaemon.spawns[0]!.closed, true, "the retained process is closed first");
+    assert.equal(radarDaemon.spawns[0]!.closed, true, "Radar replaced the retained process");
+    assert.equal(radarDaemon.closes.size, 0, "Herdsman sends no separate close");
+    assert.equal(radarDaemon.spawns[1]!.subject_id, radarDaemon.spawns[0]!.subject_id);
     assert.equal(radarDaemon.spawns.length, 2, "a fresh launch replaces it");
     assert.notEqual(radarDaemon.spawns[1]!.pane, radarDaemon.spawns[0]!.pane, "in a new pane");
     assert.notEqual(readAgentState(worker.mailbox)?.runId, worker.state.runId, "as a new run");
@@ -362,14 +356,13 @@ test("a control restart replaces an idle worker's process by close and relaunch"
   }
 });
 
-test("a control restart on an unreadable listing defers to the assignment state", async (t) => {
-  // The positively non-idle side is the working-target refusal above. An unreadable
-  // listing has no state to refuse on, so only the assignment state decides it.
+test("an unknown subject blocks assigned restart but lets Radar decide idle replacement", async (t) => {
+  // Herdsman protects the assignment; Radar decides whether its idle child can
+  // be replaced, without a local absence proof or pre-close.
   const worker = controlWorkerFixture("restart-unreadable");
   try {
     await worker.open();
-    radarDaemon.vanishPane(radarDaemon.spawns[0]!);
-    radarDaemon.options.processVerdict = "absent";
+    radarDaemon.options.processVerdict = "unavailable";
     assert.equal((await worker.list())?.state, "unknown");
     const assigned = controlRequest("restart", worker.label, AGENT_ID);
     writeAgentState(worker.mailbox, {
@@ -388,8 +381,9 @@ test("a control restart on an unreadable listing defers to the assignment state"
     assert.equal(writeControlRequest(request, LEAD_SESSION_ID).ok, true);
     const result = await answered(t, request.requestId);
     assert.equal(result.outcome, "restarted", JSON.stringify(result));
-    assert.equal(radarDaemon.spawns.length, 2, "a fresh launch replaces it");
-    assert.equal(radarDaemon.closes.size, 0, "no close is sent over a pane that is gone");
+    assert.equal(radarDaemon.spawns.length, 2, "Radar accepted the idle replacement");
+    assert.equal(radarDaemon.closes.size, 0);
+    assert.ok(readAgentState(worker.mailbox));
   } finally {
     worker.shutdown();
   }
@@ -408,12 +402,12 @@ test("a control close retires a proved-gone child's assignment without closing i
     assert.equal(writeControlRequest(request, LEAD_SESSION_ID).ok, true);
     const result = await answered(t, request.requestId);
     assert.equal(result.outcome, "closed", JSON.stringify(result));
-    assert.match(result.message, /proved absent/, "the verdict is the recorded evidence");
+    assert.match(result.message, /proved ended/, "the subject outcome is the recorded evidence");
     assert.equal(readAgentState(gone.mailbox), undefined, "the mailbox is retired");
     assert.equal(radarDaemon.closes.size, 0, "no pane close is sent");
     const wake = gone.wakeMessages() as any[];
     assert.equal(wake.length, 1, "the abandoned assignment reaches the model");
-    assert.match(String(wake[0].content), /proved absent/);
+    assert.match(String(wake[0].content), /proved ended/);
   } finally {
     gone.shutdown();
   }
@@ -424,8 +418,7 @@ test("a control close refuses a child whose process is not proved gone and keeps
   try {
     await unproven.open();
     unproven.work(randomUUID());
-    radarDaemon.vanishPane(radarDaemon.spawns[0]!);
-    radarDaemon.options.processVerdict = "verified";
+    radarDaemon.options.processVerdict = "unavailable";
     const request = controlRequest("close", unproven.label, AGENT_ID, {
       paneId: "startup-pane",
     });
@@ -440,7 +433,7 @@ test("a control close refuses a child whose process is not proved gone and keeps
   }
 });
 
-test("a control restart with a non-idle listing relaunches only on a proved-gone process", async (t) => {
+test("a control restart refuses a lost worker instead of silently continuing its session", async (t) => {
   const settling = controlWorkerFixture("restart-gone");
   try {
     await settling.open();
@@ -451,13 +444,14 @@ test("a control restart with a non-idle listing relaunches only on a proved-gone
       ...readAgentState(settling.mailbox)!,
       completedRequestId: undefined,
     });
-    assert.equal((await settling.list())?.state, "settling");
+    assert.equal((await settling.list())?.state, "lost");
     const request = controlRequest("restart", settling.label, AGENT_ID);
     assert.equal(writeControlRequest(request, LEAD_SESSION_ID).ok, true);
     const result = await answered(t, request.requestId);
-    assert.equal(result.outcome, "restarted", JSON.stringify(result));
-    assert.equal(radarDaemon.spawns.length, 2, "the proved-gone process is replaced");
-    assert.equal(radarDaemon.closes.size, 1, "the dead pane is closed before the absence proof");
+    assert.equal(result.outcome, "refused", JSON.stringify(result));
+    assert.equal(radarDaemon.spawns.length, 1, "no continuation is attempted");
+    assert.equal(radarDaemon.closes.size, 0);
+    assert.ok(readAgentState(settling.mailbox), "the lost assignment is preserved");
   } finally {
     settling.shutdown();
   }
@@ -485,18 +479,18 @@ test("a control restart with a non-idle listing refuses while the process is not
   }
 });
 
-test("a control restart past a refused close names the residue it left", async (t) => {
+test("a control restart does not depend on a separate close or invent pane residue", async (t) => {
   const worker = controlWorkerFixture("restart-residue");
   try {
     await worker.open();
     radarDaemon.options.refuseChildClose = true;
-    radarDaemon.exitProcess(radarDaemon.spawns[0]!);
     const request = controlRequest("restart", worker.label, AGENT_ID);
     assert.equal(writeControlRequest(request, LEAD_SESSION_ID).ok, true);
     const result = await answered(t, request.requestId);
     assert.equal(result.outcome, "restarted", JSON.stringify(result));
-    assert.match(result.message, /Pane .* was left open/, "the result names the residue");
-    assert.equal(radarDaemon.spawns.length, 2, "the absent process is replaced");
+    assert.doesNotMatch(result.message, /was left open/);
+    assert.equal(radarDaemon.closes.size, 0);
+    assert.equal(radarDaemon.spawns.length, 2, "Radar restarts the live idle worker");
   } finally {
     radarDaemon.options.refuseChildClose = false;
     worker.shutdown();

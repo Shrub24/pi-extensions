@@ -58,7 +58,9 @@ An absent file means these defaults:
 configured (including as an empty array), it becomes the common explicit
 extension set for managed children: Herdsman passes `--no-extensions` and loads
 only this set plus each definition's additions, minus its exclusions. The
-Herdsman extension itself is injected separately and is not part of this list.
+Herdsman extension and the required pi-radar baseline are injected separately
+and are not part of this list. Excluding optional extensions cannot remove the
+worker's registrar or assignment support.
 If the field is absent, existing extension-discovery behavior is unchanged.
 
 Malformed JSON, a non-object root, unknown fields, and invalid known values

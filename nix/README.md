@@ -40,6 +40,7 @@ nixpkgs.overlays = [
 ];
 
 programs.pi-coding-agent.package = pkgs.pi-bolt.withPlugins (ps: [
+  ps.radar
   ps.otel
   ps.herdsman
   ps.cbmem
@@ -52,7 +53,14 @@ programs.pi-coding-agent.package = pkgs.pi-bolt.withPlugins (ps: [
 
 Each selected plugin becomes a built-in extension, `builtin:<pluginName>`: on by default, turned off
 with `-builtin:<name>` in the `extensions` setting. The same derivations load at run time from the
-store, which is what `pi-bolt.override { extensions = [ ps.herdsman ]; }` does.
+store, for example `pi-bolt.override { extensions = [ ps.radar ps.herdsman ]; }`.
+
+Herdsman requires the separately activated `radar` baseline. Its dependency stages the same
+`pi-radar` package tree for SDK imports, but staging alone does not register an extension.
+Select both `ps.radar` and `ps.herdsman`; the default build above does so. Workers explicitly
+load the Radar baseline and Herdsman even when their optional extension selection disables
+discovery. Radar owns the process claim and exposes the shared subject runtime; Herdsman
+never creates a substitute registrar.
 
 `nix/plugins.nix` holds the plugin definitions: their names, entries, dependencies, npm libraries
 and the compile-time patches AOT needs. `dependencies` are plugin derivations, and a plugin whose

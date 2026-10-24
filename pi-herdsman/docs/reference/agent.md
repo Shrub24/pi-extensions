@@ -77,8 +77,9 @@ response override, and the new brief must satisfy the saved definition's role
 profile. A continuation is a new assignment, so it starts with no advisory
 instruction either: a `watcherGuidance` here arms the continued assignment's
 window with that instruction, and omitting one arms the window with none rather
-than carrying the previous assignment's over. The exact saved session path or
-full UUID supplies its cwd, definition identity, and historical Pi context.
+than carrying the previous assignment's over. The worker's Radar subject,
+recorded by this session at its launch, is its identity to Radar, which owns the
+session and cwd it recorded for that subject.
 Continuation hands one more assignment to the session's agent, creating a new
 agent generation (a new process) when no retained worker can take the work; it
 never assigns work to a working or settling
@@ -156,41 +157,29 @@ lead.
 
 ### How a configured child starts
 
-When a command is configured, the launch runs it in the pane instead of asking
-Herdr to start its canonical `pi` executable. `<command> <child args…>` is typed
-as one shell line with every element single-quoted, so a path holding a space, a
-quote or a shell metacharacter reaches the child unchanged, and the pane's
-interactive shell parses the line. Nothing else about the launch changes: the
-pane, its environment, the recorded shell process, the failure shape and the
-rollback are the same start path as before.
+The launch hands Radar the resolved executable and its arguments; Radar creates the
+pane and executes that program in it. Herdsman types no command line into a shell,
+so quoting no longer depends on the pane's interactive shell and the argv reaches
+the child byte-exact.
 
-An argument holding a newline cannot be typed this way: it would arrive as a
-second input line, and an interactive shell's plugin can refuse to submit that,
-leaving the pane holding an unterminated command. Such a launch runs from a
-script instead — Herdsman writes `exec <command> <args…>` to a private file and
-types that file's path, so the pane still receives one line and the argv still
-reaches the child byte-exact. The launch retires the file once it is over, after
-the child has read it.
+What Herdsman adds to the child's argv is what makes it a managed worker: the
+`pi-radar` baseline extension first, then its own extension, then the
+definition-derived Pi arguments. The baseline is passed explicitly because a worker
+whose definition narrows optional extension discovery must still have a registrar.
+Both entries are pinned to their store trees in a built package.
 
-Herdr does not start this child, so the running process registers itself in
-Herdr's agent registry and Herdsman waits for that record before it reports the
-launch successful. The Herdsman alias is then applied with `agent rename` and
-verified through `agent get`, so the child answers to the same alias as a child
-Herdr started. The session path Herdr reports is written at session start and
-the file appears with the child's first turn; a launch never fails on a session
-file that does not exist yet.
+The child's environment is an overlay Herdsman sends with the launch: the
+definition's own variables, `PI_SUBAGENT_CHILD=1` and, when the lead has one,
+`PI_HERDSMAN_PARENT_PANE_ID`. Radar adds the managed parent subject itself and
+refuses a caller-supplied one, so a child's routing is bound to the registration
+that spawned it.
 
-This path relies on measured Herdr behaviour, recorded for herdr 0.9.3 in the
-`herdsman-child-command` change's `probe.md` (the repository's decision record
-for it is [ADR 0029](../adr/0029-run-a-configured-child-in-its-pane.md)):
-detection of a `pane run` agent, `agent rename`, registration timing, `pane
-run` quoting and the script-borne form. A Herdr version that changes any of them
-needs the probe re-run before the launch code is adjusted.
-
-A launch that fails is reported and rolled back exactly as a failed
-`agent start`: the typed command is never retried, because it may already have
-started the child, and the pane's recent output is attached to the failure when
-Herdr can still read it.
+Radar owns the readiness verdict. A launch is `ready` when the child's own presence
+is granted inside the daemon's 30-second deadline, `failed` when the daemon withdrew
+it, and `unresolved` when the answer was lost — the last case is read back under the
+same request id rather than retried as a second launch. Herdsman does not read a
+Herdr registry, rename an agent alias, or wait for a session file to appear. See
+[agents](../concepts/agents.md#radar-seams) for the boundary.
 
 ## Separate response contracts
 

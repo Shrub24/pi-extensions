@@ -39,7 +39,9 @@ async function worker(t: any) {
     workspaceId: WORKSPACE, mailbox, pane: state.paneId,
   });
   entries.push({ type: "custom", customType: "pi-herdsman-radar-spawn", data: launch });
-  writeAgentState(mailbox, { ...state, startupAck: readAgentState(mailbox)?.startupAck });
+  // Adoption supplies a live child; this suite starts after its assignment
+  // completed, not at the dependency's launch handshake.
+  writeAgentState(mailbox, state);
   const completion = persistCompletion({
     version: 5, runId: state.runId, requestId: state.completedRequestId,
     ownerSessionId: state.ownerSessionId, workspaceId: WORKSPACE,
@@ -67,11 +69,11 @@ test("agent_complete defaults to park, returns a path, and repeats without repea
   assert.equal(first.disposition, "park");
   assert.equal(first.closed, true);
   assert.equal(first.wrapup.status, "success");
-  assert.match(realFs.readFileSync(first.handoff_path, "utf8"), /PRIVATE FULL HANDOFF/);
+  assert.match(first.handoff, /PRIVATE FULL HANDOFF/);
   assert.equal(readAgentState(w.mailbox), undefined);
   const again = await w.complete();
   assert.equal(again.repeated, true);
-  assert.equal(again.handoff_path, first.handoff_path);
+  assert.equal(again.handoff, null);
   assert.equal((await w.complete("keep")).error.category, "invalid_request");
   const roster = await w.execute("list", {});
   assert.ok(roster.saved_sessions.some((row: any) => row.pi_session_id === w.state.piSessionId));
@@ -97,7 +99,7 @@ test("a historical completion cannot park or retire a worker that accepted newer
   const newer = randomUUID();
   writeAgentState(w.mailbox, { ...managedState(w.state.agentLabel, newer, {
     paneId: w.state.paneId, piSessionId: w.state.piSessionId, piSessionFile: w.state.piSessionFile,
-  }), startupAck: readAgentState(w.mailbox)?.startupAck });
+  }) });
   assert.equal((await w.complete()).error.category, "agent_busy");
   assert.equal((await w.complete("retire")).error.category, "agent_busy");
   assert.equal(readAgentState(w.mailbox)?.activeRequestId, newer);
@@ -116,7 +118,7 @@ test("park can become retire without another close, retirement is final, and the
   const resumed = await w.execute("continue", { session: w.state.piSessionId, task: "unused" });
   assert.equal(resumed.error.category, "invalid_request");
   assert.match(resumed.error.message, /explicitly retired/);
-  assert.ok(realFs.existsSync(parked.handoff_path));
+  assert.match(parked.handoff, /PRIVATE FULL HANDOFF/);
   assert.ok(realFs.existsSync(w.state.piSessionFile));
 });
 
@@ -129,7 +131,7 @@ test("failed wrapup leaves the worker live and the completion retryable", async 
   assert.equal(failed.closed, false);
   assert.equal(failed.wrapup.status, "failed");
   assert.ok(readAgentState(w.mailbox));
-  assert.ok(realFs.existsSync(failed.handoff_path));
+  assert.match(failed.handoff, /PRIVATE FULL HANDOFF/);
 
   const retryState = readCompletion(LEAD_SESSION_ID, w.completion.requestId)!;
   retryState.wrapup = undefined;
@@ -149,7 +151,7 @@ test("another ongoing wrapup keeps the worker live and the completion retryable"
   assert.equal(result.action_outcome, "unresolved");
   assert.equal(result.closed, false);
   assert.ok(readAgentState(w.mailbox));
-  assert.ok(realFs.existsSync(result.handoff_path));
+  assert.match(result.handoff, /PRIVATE FULL HANDOFF/);
   w.preparation();
   assert.equal((await w.complete()).disposition, "park");
 });

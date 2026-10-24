@@ -23,11 +23,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1792222248,
-        "narHash": "sha256-3rwjs71cpD6aKyvJyikpOkn1odFhi6kUUrqKma9wRYg=",
+        "lastModified": 1792297483,
+        "narHash": "sha256-OQEmjPEsQjzqZtz6vFN691QeThq1SDGaCm3RGGVkQlc=",
         "owner": "Shrub24",
         "repo": "pi-bolt",
-        "rev": "7e457881d44c68684f0832c6ac6ca8f05478c7eb",
+        "rev": "58b74d6ede299e4ebad4f2ea05c9f073d7b18d2e",
         "type": "github"
       },
       "original": {

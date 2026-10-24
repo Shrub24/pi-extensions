@@ -1,5 +1,10 @@
 # Run a configured child in its pane instead of asking Herdr to start it
 
+Status: superseded. Radar launches the child from the executable and argv Herdsman
+sends, so nothing is typed into a pane, no Herdr alias is renamed, and readiness is
+Radar's own presence grant. See [agent](../reference/agent.md#how-a-configured-child-starts).
+The decision below records the Herdr-era mechanism and is kept for history.
+
 ## Decision
 
 When `PI_HERDSMAN_CHILD_COMMAND` is set, the managed child is started by typing

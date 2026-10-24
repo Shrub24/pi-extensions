@@ -1,25 +1,28 @@
 import { randomUUID } from "node:crypto";
 import { chmodSync, mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
-import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { mock } from "node:test";
+import * as sdk from "pi-radar/client";
+import type { RadarClient, RadarCloseOutcome, RadarSpawnEdge, RadarSpawnTopology, RadarLocation, RadarInventory } from "pi-radar/client";
+import type { RadarPublicationClient } from "pi-radar/publication";
 import {
-  type RadarChannel,
-  type RadarErrorCode,
-  RADAR_EVENTS_CONTRACT,
-  RADAR_MINIMUM_REVISION,
-  RADAR_PROTOCOL_VERSION,
-  RADAR_REGISTRY_CONTRACT,
-  RADAR_REGISTRY_FACTS_CONTRACT,
-  RADAR_SPAWN_CLOSE_CONTRACT,
-  RADAR_SPAWN_CONTRACT,
-  RADAR_SPAWN_LAUNCH_CONTEXT_CONTRACT,
+  type RadarChannel, type RadarErrorCode,
+  RADAR_EVENTS_CONTRACT, RADAR_MINIMUM_REVISION, RADAR_PROTOCOL_VERSION,
+  RADAR_REGISTRY_CONTRACT, RADAR_REGISTRY_FACTS_CONTRACT,
+  RADAR_SPAWN_CLOSE_CONTRACT, RADAR_SPAWN_CONTRACT, RADAR_SPAWN_LAUNCH_CONTEXT_CONTRACT,
 } from "pi-radar/client";
-import {
-  RADAR_PUBLICATION_VERSION,
-  radarBindingKey,
-} from "pi-radar/publication";
+import { RADAR_PUBLICATION_VERSION, radarBindingKey } from "pi-radar/publication";
 import { RADAR_SUBJECT_SOURCE } from "pi-radar/execution";
+
+// Select typed ports by a test-local address. No socket or wire envelope.
+const clients = new Map<string, RadarClient>();
+mock.module("pi-radar/client", { namedExports: {
+  ...sdk,
+  createRadarClient: (options?: Parameters<typeof sdk.createRadarClient>[0]) =>
+    clients.get(options?.env?.RADAR_CONTROL_SOCKET ?? process.env.RADAR_CONTROL_SOCKET ?? "") ??
+      sdk.createRadarClient(options),
+} });
 import type {
   ManagedAgentState,
   RequestAddress,
@@ -54,7 +57,7 @@ const loadMailbox = async (): Promise<typeof import("./mailbox.ts")> =>
  * control protocol, and after accepting a spawn it performs the child's own
  * share of a launch — registers the subject its launch token belongs to, writes
  * the binding sidecar the owner correlates it with, writes the child's mailbox
- * state, acknowledges the launch generation it was spawned with, and accepts the
+ * state, acknowledges its launch, and accepts the
  * assignment it is given.
  *
  * Every simulated step is switchable, because the interesting launch outcomes
@@ -72,8 +75,14 @@ export type RadarFakeSpawn = {
   pane: string;
   incarnation: string;
   agent_id?: string;
+  /** The child's durable subject, granted with its first presence. */
+  subject_id?: string;
+  bound_at?: string;
   /** The Pi session the simulated child published as its current context. */
   session_id?: string;
+  session_file?: string;
+  /** The released child's subject this launch continues, when it does. */
+  continues?: string;
   token: string;
   mailbox?: string;
   /**
@@ -88,6 +97,7 @@ export type RadarFakeSpawn = {
 export type RadarFakeOptions = {
   /** `false` leaves the edge unbound: no child registered with its token. */
   bind: boolean;
+  standing?: "granted" | "duplicate" | "pending";
   /** `false` writes the child's state but never its startup acknowledgment. */
   acknowledge: boolean;
   /** `false` leaves each assignment unacknowledged in the child's mailbox. */
@@ -195,8 +205,6 @@ export type RetainedChildOptions = {
   pane: string;
   definition?: string;
   cwd?: string;
-  /** The launch generation the child acknowledged; minted when omitted. */
-  generation?: string;
 };
 
 /**
@@ -206,19 +214,20 @@ export type RetainedChildOptions = {
 export type RetainedLaunchRecord = {
   stage: "bound";
   requestId: string;
-  generation: string;
   runId: string;
   label: string;
   ownerSessionId: string;
   workspaceId: string;
   mailbox: string;
-  agentId: string;
+  subjectId: string;
+  piSessionId: string;
   paneId: string;
   agentDefinition: string;
 };
 
 export type FakeRadarDaemon = {
   socketPath: string;
+  client: RadarClient;
   options: RadarFakeOptions;
   /**
    * The values this daemon was created with. A daemon that replaces another one
@@ -431,7 +440,8 @@ export async function startFakeRadarDaemon(
   const initial: RadarFakeOptions = { ...DEFAULTS, ...baseline };
   const directory = mkdtempSync(join(tmpdir(), "pi-herdsman-radar-"));
   chmodSync(directory, 0o700);
-  const socketPath = join(directory, "control.sock");
+  const socketPath = join(directory, "port-fixture");
+  writeFileSync(socketPath, "typed SDK ports\n");
   const spawns: RadarFakeSpawn[] = [];
   const subjects = new Map<string, Record<string, unknown>>();
   const published: Array<{
@@ -441,7 +451,6 @@ export async function startFakeRadarDaemon(
     observed_at?: string;
   }> = [];
   const registrations = new Map<string, string>();
-  const tokens = new Map<string, RadarFakeSpawn>();
   const bound = new Set<string>();
   const closes = new Map<string, Record<string, unknown>>();
   let observeGate: Promise<void> | undefined;
@@ -460,14 +469,6 @@ export async function startFakeRadarDaemon(
   };
   restartJournal("journal-1");
   const registerCalls: Array<{ agent_id: string; params: Record<string, unknown> }> = [];
-  // Presence claims, as the daemon keeps them: one live grant per session, every
-  // decision recorded by claim so a repeat replays it, and released claims that
-  // can never be granted again.
-  const presenceHolders = new Map<
-    string,
-    { registration_id: string; claim_id: string; subject_id: string }
-  >();
-  const presenceAnswers = new Map<string, Record<string, unknown>>();
   const closeContents = new Map<string, string>();
   const mailboxes = new Map<string, () => void>();
   /** Every simulated child this daemon started, ended by `reset`. */
@@ -505,92 +506,29 @@ export async function startFakeRadarDaemon(
     channel,
   });
 
-  // One session holds at most one grant. A session's subject is stable across
-  // claims, so a granted holder that reports again keeps the same subject.
-  const presence = (
-    params: Record<string, unknown>,
-  ): { result?: unknown; error?: { code: string; message: string } } => {
-    const claimId = String(params.claim_id);
-    const replayed = presenceAnswers.get(claimId);
-    if (replayed !== undefined) return { result: replayed };
-    const sessionId = String(params.session_id);
-    const registrationId =
-      typeof params.registration_id === "string"
-        ? params.registration_id
-        : subjectId(String(params.source), String(params.incarnation));
-    const holder = presenceHolders.get(sessionId);
-    let answer: Record<string, unknown>;
-    if (holder === undefined || holder.registration_id === registrationId) {
-      const grant = {
-        registration_id: registrationId,
-        claim_id: claimId,
-        subject_id: holder?.subject_id ?? subjectId("session", sessionId),
-      };
-      presenceHolders.set(sessionId, grant);
-      answer = { ...grant, standing: "granted" };
-    } else {
-      answer = {
-        claim_id: claimId,
-        registration_id: registrationId,
-        standing: "duplicate",
-      };
-    }
-    presenceAnswers.set(claimId, answer);
-    subjects.set(registrationId, {
-      ...subjects.get(registrationId),
-      session: sessionId,
-      location: params.location,
-    });
-    return { result: answer };
-  };
-
-  // Release frees the grant only for the claim that holds it. A superseded or
-  // unknown claim is refused, and repeating a completed release is a no-op.
-  const release = (
-    params: Record<string, unknown>,
-  ): { result?: unknown; error?: { code: string; message: string } } => {
-    const claimId = String(params.claim_id);
-    const recorded = presenceAnswers.get(claimId);
-    if (recorded?.standing === "released") return { result: recorded };
-    const sessionId = [...presenceHolders].find(
-      ([, grant]) => grant.claim_id === claimId,
-    )?.[0];
-    if (sessionId === undefined)
-      return { error: { code: "refused", message: "claim does not hold the grant" } };
-    const grant = presenceHolders.get(sessionId)!;
-    presenceHolders.delete(sessionId);
-    const answer = {
-      claim_id: claimId,
-      registration_id: grant.registration_id,
-      standing: "released",
-    };
-    presenceAnswers.set(claimId, answer);
-    return { result: answer };
-  };
-
   // A child's location is the pane the daemon created for it, on the server it runs.
-  const locationOf = (spawn: RadarFakeSpawn) => ({
+  const locationOf = (spawn: RadarFakeSpawn): RadarLocation => ({
     backend: settings.backend,
     instance: settings.instance ?? undefined,
     pane: spawn.pane,
   });
-  const edge = (spawn: RadarFakeSpawn): Record<string, unknown> => {
+  const edge = (spawn: RadarFakeSpawn): RadarSpawnEdge => {
     const isBound = bound.has(spawn.request_id) && spawn.agent_id !== undefined;
     return {
-      version: 2,
       request_id: spawn.request_id,
       parent: spawn.parent,
-      parent_session_id: spawn.parent_session_id,
-      recorded_at: new Date().toISOString(),
       created: "completed",
       launched: "completed",
       location: locationOf(spawn),
       ...(isBound
         ? {
+            granted_at: new Date().toISOString(),
             bound: {
               source: RADAR_SUBJECT_SOURCE,
               incarnation: spawn.incarnation,
               registration_id: spawn.agent_id,
+              subject_id: spawn.subject_id,
+              bound_at: spawn.bound_at,
             },
           }
         : {}),
@@ -609,25 +547,12 @@ export async function startFakeRadarDaemon(
    * an inventory that could not be consulted is stale with the binding left
    * standing, and only a present pane is fresh.
    */
-  const topology = (spawn: RadarFakeSpawn): Record<string, unknown> => {
-    const isBound = bound.has(spawn.request_id) && spawn.agent_id !== undefined;
-    const absent =
-      settings.locationEvidence === "absent" || spawn.closed === true;
-    // Version 2 flattens the edge into the read and adds only what the read
-    // itself derived, so the two derived fields sit beside the record.
-    return {
-      ...edge(spawn),
-      state: absent ? "unresolved" : isBound ? "bound" : "unbound",
-      // An unreadable backend inventory leaves every recorded location stale, as
-      // the daemon reports it, even where the pane itself is not in question.
-      freshness:
-        settings.locationEvidence === "present" &&
-        !absent &&
-        !settings.observeUnavailable
-          ? "fresh"
-          : "stale",
-    };
-  };
+  const topology = (spawn: RadarFakeSpawn): RadarSpawnTopology => ({
+    edge: edge(spawn),
+    state: settings.locationEvidence === "absent" || spawn.closed ? "unresolved" :
+      bound.has(spawn.request_id) ? "bound" : "unbound",
+    freshness: settings.locationEvidence === "present" && !spawn.closed && !settings.observeUnavailable ? "fresh" : "stale",
+  });
 
   /**
    * The child's own mailbox consumption: it reads the assignment it was given
@@ -743,24 +668,12 @@ export async function startFakeRadarDaemon(
   };
 
   /**
-   * The address the answering process can be held to: the subject this child's
-   * registration produced, the source its registration names, the incarnation
-   * its own process holds - another one when a test says another process answers
-   * this mailbox - and the generation its launch exported. Without a subject or a
-   * generation there is no address, which is what a process no launch produced
-   * has.
+   * The address the answering child can be held to: the subject its first
+   * presence was granted. Without one there is no address, which is what a
+   * process no launch produced has.
    */
-  const childAddress = (spawn: RadarFakeSpawn): RequestAddress | undefined => {
-    const generation = spawn.env.PI_HERDSMAN_LAUNCH_GENERATION;
-    if (spawn.agent_id === undefined || generation === undefined)
-      return undefined;
-    return {
-      subject: spawn.agent_id,
-      source: RADAR_SUBJECT_SOURCE,
-      incarnation: settings.responderIncarnation ?? spawn.incarnation,
-      generation,
-    };
-  };
+  const childAddress = (spawn: RadarFakeSpawn): RequestAddress | undefined =>
+    spawn.subject_id === undefined ? undefined : { subject: spawn.subject_id };
 
   /**
    * The child's share of the launch, performed against the same private stores
@@ -779,6 +692,8 @@ export async function startFakeRadarDaemon(
     });
     const alive = () => !cancelled;
     const session =
+      (spawn.session_id !== undefined && spawn.session_file !== undefined
+        ? { id: spawn.session_id, file: spawn.session_file } : undefined) ??
       daemon.childSession?.(spawn, spawns.indexOf(spawn)) ??
       (spawns.indexOf(spawn) === 0
         ? settings.session
@@ -794,7 +709,6 @@ export async function startFakeRadarDaemon(
     const workspaceId = env.PI_HERDSMAN_WORKSPACE_ID;
     const agentLabel = env.PI_HERDSMAN_LABEL;
     const mailbox = env.PI_HERDSMAN_MAILBOX;
-    const generation = env.PI_HERDSMAN_LAUNCH_GENERATION;
     if (
       spawn.cwd === undefined ||
       runId === undefined ||
@@ -807,6 +721,7 @@ export async function startFakeRadarDaemon(
     spawn.mailbox = mailbox;
     spawn.agent_id = subjectId(RADAR_SUBJECT_SOURCE, spawn.incarnation);
     spawn.session_id = session.id;
+    spawn.session_file = session.file;
     // The child registers the location its own TMUX_PANE names: this pane, and
     // publishes the session it runs as its current context.
     subjects.set(spawn.agent_id, {
@@ -814,28 +729,9 @@ export async function startFakeRadarDaemon(
       location: locationOf(spawn),
       contextSession: session.id,
     });
+    spawn.subject_id = subjectId("session", session.id);
+    spawn.bound_at = new Date().toISOString();
     bound.add(spawn.request_id);
-    const bindings = join(herdsmanDataRoot(), "radar", "bindings");
-    // The publication store validates the directory it reads from, so the
-    // child's sidecar has to live in the same private namespace the owner reads
-    // rather than merely at the same path.
-    mkdirSync(bindings, { recursive: true, mode: 0o700 });
-    chmodSync(bindings, 0o700);
-    writeFileSync(
-      join(bindings, `${radarBindingKey(runId, ownerSessionId, agentLabel)}.json`),
-      `${JSON.stringify({
-        version: RADAR_PUBLICATION_VERSION,
-        registration_id: spawn.agent_id,
-        incarnation: spawn.incarnation,
-        run: runId,
-        owner: ownerSessionId,
-        label: agentLabel,
-        observed_at: new Date().toISOString(),
-      })}\n`,
-      // The owner's store validates the record it reads: same private mode it
-      // writes, or the child's sidecar is not a record the owner can use.
-      { mode: 0o600 },
-    );
     const state: ManagedAgentState = {
       version: 5,
       runId,
@@ -849,39 +745,22 @@ export async function startFakeRadarDaemon(
       cwd: spawn.cwd,
       updatedAt: Date.now(),
     };
-    const { writeAgentState, writeStartupAck } = await loadMailbox();
+    const { writeAgentState } = await loadMailbox();
     writeAgentState(mailbox, state);
     await consume(spawn, mailbox);
     await daemon.onChildState?.(spawn);
     if (!alive()) return;
-    if (generation === undefined || !settings.acknowledge) return;
-    try {
-      writeStartupAck(mailbox, {
-        generation,
-        runId,
-        ownerSessionId,
-        workspaceId,
-        agentLabel,
-        paneId: settings.childPane ?? spawn.env.TMUX_PANE,
-        piSessionId: session.id,
-        acknowledgedAt: Date.now(),
-      });
-    } catch {
-      // A child whose acknowledgment cannot be written has not acknowledged
-      // startup, which is a launch outcome tests drive through this fixture.
-    }
   };
 
   /**
    * A retained child's own share, performed once for a launch that already
    * happened: the child registers with its launch's subject, writes the binding
-   * and mailbox the owner holds it by, acknowledges its generation, and consumes
+   * and mailbox the owner holds it by, acknowledges its launch, and consumes
    * the assignments it is next given.
    */
   const adoptRetainedChild = async (
     options: RetainedChildOptions,
   ): Promise<RetainedLaunchRecord> => {
-    const generation = options.generation ?? randomUUID();
     const definition = options.definition ?? "agent";
     const spawn: RadarFakeSpawn = {
       request_id: randomUUID(),
@@ -896,7 +775,6 @@ export async function startFakeRadarDaemon(
         PI_HERDSMAN_WORKSPACE_ID: options.workspaceId,
         PI_HERDSMAN_LABEL: options.label,
         PI_HERDSMAN_MAILBOX: options.mailbox,
-        PI_HERDSMAN_LAUNCH_GENERATION: generation,
         PI_HERDSMAN_AGENT_DEFINITION: definition,
         // tmux sets TMUX_PANE in every pane it creates: the child's raw pane.
         TMUX_PANE: options.pane.slice(options.pane.lastIndexOf(":") + 1),
@@ -912,13 +790,13 @@ export async function startFakeRadarDaemon(
     return {
       stage: "bound",
       requestId: spawn.request_id,
-      generation,
       runId: options.runId,
       label: options.label,
       ownerSessionId: options.ownerSessionId,
       workspaceId: options.workspaceId,
       mailbox: options.mailbox,
-      agentId: spawn.agent_id,
+      subjectId: spawn.subject_id!,
+      piSessionId: spawn.session_id!,
       paneId: options.pane,
       agentDefinition: definition,
     };
@@ -959,442 +837,236 @@ export async function startFakeRadarDaemon(
     };
   }
 
-  const answer = (
-    method: string,
-    params: Record<string, unknown>,
-    requestId: string,
-  ): { result?: unknown; error?: { code: string; message: string } } => {
-    switch (method) {
-      case "daemon.ping":
-        return {
-          result: {
-            protocol: RADAR_PROTOCOL_VERSION,
-            revision: RADAR_MINIMUM_REVISION,
-            backend: settings.backend,
-            instance: settings.instance,
-            contracts: settings.contracts,
-            tasks: { available: true, error: null },
-          },
-        };
-      case "agent.register": {
-        const source = String(params.source);
-        const incarnation = String(params.incarnation);
-        const agentId = subjectId(source, incarnation);
-        // A child presents the one-use token its spawn minted; that token is the
-        // only thing that binds the edge to this exact registration.
-        registerCalls.push({ agent_id: agentId, params: { ...params } });
-        // The registry keeps the location and session a subject registered with;
-        // agent.get answers the registration from them.
-        subjects.set(agentId, {
-          ...subjects.get(agentId),
-          location: params.location,
-          session: params.session,
-        });
-        const token = params.spawn_token;
-        if (typeof token === "string") {
-          const spawn = tokens.get(token);
-          if (spawn === undefined)
-            return {
-              error: { code: "refused", message: "unknown or spent spawn token" },
-            };
-          tokens.delete(token);
-          spawn.agent_id = agentId;
-          bound.add(spawn.request_id);
-        }
-        return { result: { registration: { registration_id: agentId } } };
-      }
-      case "agent.acquire":
-      case "agent.context": {
-        const agentId = String(params.registration_id);
-        if (!subjects.has(agentId))
-          return { error: { code: "not_found", message: "unknown agent" } };
-        return {
-          result: {
-            writer: writerOf(agentId, String(params.channel ?? "context")),
-          },
-        };
-      }
-      case "agent.publish": {
-        const agentId = String(params.registration_id);
-        published.push({
-          agent_id: agentId,
-          channel: String(params.channel) as RadarChannel,
-          snapshot: params.snapshot,
-          ...(typeof params.observed_at === "string"
-            ? { observed_at: params.observed_at }
-            : {}),
-        });
-        return {
-          result: {
-            channel: {
-              writer: { ...writerOf(agentId, String(params.channel)) },
-            },
-          },
-        };
-      }
-      case "agent.retire":
-        return { result: { retired: true } };
-      case "agent.presence":
-        return presence(params);
-      case "agent.release":
-        return release(params);
-      case "spawn.create": {
-        if (settings.crashSpawn) throw new Error("daemon crashed mid-spawn");
-        const request = params.request as Record<string, unknown>;
-        if (settings.refuseSpawn !== undefined)
-          return { error: settings.refuseSpawn };
-        const pane = paneFor(spawns.length + 1);
-        const spawn: RadarFakeSpawn = {
-          // The envelope id is the caller's durable key, exactly as the daemon's
-          // own spawn record keeps it.
-          request_id: requestId,
-          parent: String(request.parent),
-          parent_session_id: String(request.parent_session_id),
-          executable: String(request.executable),
-          argv: (request.argv as string[]) ?? [],
-          ...(request.cwd !== undefined ? { cwd: String(request.cwd) } : {}),
-          ...(typeof request.managed === "object" && request.managed !== null
-            ? {
-                managed: {
-                  ...(typeof (request.managed as Record<string, unknown>).parent_subject_id === "string"
-                    ? { parent_subject_id: String((request.managed as Record<string, unknown>).parent_subject_id) }
-                    : {}),
-                },
-              }
-            : {}),
-          pane,
-          // tmux sets TMUX_PANE in every pane it creates: the child's raw pane.
-          env: {
-            ...((request.env ?? {}) as Record<string, string>),
-            ...(typeof (request.managed as Record<string, unknown> | undefined)?.parent_subject_id === "string"
-              ? { PI_RADAR_MANAGED_PARENT_SUBJECT_ID: String((request.managed as Record<string, unknown>).parent_subject_id) }
-              : {}),
-            TMUX_PANE: pane.slice(pane.lastIndexOf(":") + 1),
-          },
-          incarnation: randomUUID(),
-          token: randomUUID(),
-        };
-        tokens.set(spawn.token, spawn);
-        spawns.push(spawn);
-        if (settings.bind) void runChild(spawn).catch(() => undefined);
-        if (settings.dropSpawnReply)
-          return { error: { code: "internal", message: "reply lost" } };
-        return { result: { spawn: edge(spawn) } };
-      }
-      case "spawn.get": {
-        const spawn = spawns.find(
-          (candidate) => candidate.request_id === String(params.request_id),
-        );
-        if (spawn === undefined)
-          return { error: { code: "not_found", message: "unknown spawn" } };
-        return { result: { spawn: topology(spawn) } };
-      }
-      case "spawn.list":
-        return { result: { spawns: spawns.map((spawn) => topology(spawn)) } };
-      case "agent.get": {
-        const agentId = String(params.registration_id);
-        const registration = subjects.get(agentId);
-        if (registration === undefined)
-          return { error: { code: "not_found", message: "unknown agent" } };
-        const spawn = spawns.find((candidate) => candidate.agent_id === agentId);
-        const verification = !settings.childProcessClaim
-          ? "unavailable"
-          : (settings.processVerdict ??
-            (spawn?.closed === true || spawn?.processGone === true
-              ? "absent"
-              : "verified"));
-        const executionPublication = published
-          .filter((entry) => entry.agent_id === agentId && entry.channel === "execution")
-          .at(-1);
-        const publicationAge = executionPublication?.observed_at === undefined
-          ? undefined
-          : Date.now() - Date.parse(executionPublication.observed_at);
-        const executionFreshness = executionPublication === undefined
-          ? undefined
-          : publicationAge !== undefined && publicationAge >= 0 && publicationAge <= 30_000
-            ? "fresh"
-            : "stale";
-        return {
-          result: {
-            agent: {
-              registration,
-              process: { claimed: settings.childProcessClaim, verification },
-              context:
-                (registration.contextSession ?? registration.session) === undefined
-                  ? null
-                  : {
-                      version: 1,
-                      registration_id: agentId,
-                      context: {
-                        freshness: "fresh",
-                        session: registration.contextSession ?? registration.session,
-                      },
-                    },
-              ...(executionPublication === undefined
-                ? {}
-                : {
-                    execution: {
-                      snapshot: {
-                        freshness: executionFreshness,
-                        snapshot: executionPublication.snapshot,
-                      },
-                    },
-                  }),
-            },
-          },
-        };
-      }
-      case "mux.observe":
-        if (settings.observeUnavailable)
-          return {
-            error: {
-              code: "backend_unavailable",
-              message: "the backend could not be read",
-            },
-          };
-        return {
-          result: {
-            inventory: settings.inventory ?? daemon.observeInventory?.() ?? observedFleet(),
-          },
-        };
-      case "spawn.close": {
-        // The daemon's own rule: a backend that cannot observe the pane's
-        // foreground process, or cannot close it, refuses here rather than being
-        // trusted on pane presence alone.
-        if (!settings.contracts.includes(RADAR_SPAWN_CLOSE_CONTRACT))
-          return {
-            error: {
-              code: "backend_unavailable",
-              message: "the backend cannot verify and close a managed pane",
-            },
-          };
-        const spawn = spawns.find(
-          (candidate) =>
-            candidate.request_id === String(params.spawn_request_id),
-        );
-        const source = String(params.source);
-        const incarnation = String(params.incarnation);
-        const intent = String(params.intent);
-        // The caller's own UUID keys the durable record. An identical replay
-        // returns the stored outcome without re-verification or a second
-        // effect; different content under the same id refuses.
-        const content = JSON.stringify([
-          String(params.spawn_request_id),
-          source,
-          incarnation,
-          intent,
-        ]);
-        const recorded = closes.get(requestId);
-        if (recorded !== undefined)
-          return closeContents.get(requestId) === content
-            ? { result: { close: recorded } }
-            : {
-                error: {
-                  code: "bad_request",
-                  message: "this close id already carries another request",
-                },
-              };
-        // Eligibility is the daemon's own: a bound edge, that exact child, its
-        // process claim, and current evidence for the pane it recorded. Every
-        // refusal lands before any pane effect, exactly as the contract puts it.
-        if (spawn === undefined || !bound.has(spawn.request_id))
-          return {
-            error: {
-              code: "refused",
-              message: "the spawn edge is not bound to a child",
-            },
-          };
-        if (
-          spawn.agent_id !== subjectId(source, incarnation) ||
-          spawn.incarnation !== incarnation
-        )
-          return {
-            error: {
-              code: "refused",
-              message: "the edge is not bound to that child",
-            },
-          };
-        if (!settings.childProcessClaim)
-          return {
-            error: {
-              code: "refused",
-              message: "the bound child has no process identity claim",
-            },
-          };
-        if (settings.locationEvidence !== "present" || spawn.closed === true)
-          return {
-            error: {
-              code: "refused",
-              message: "no current foreground evidence for the recorded pane",
-            },
-          };
-        if (settings.refuseChildClose) {
-          const close = {
-            outcome: "refused",
-            intent,
-            message: "the backend refused this close",
-          };
-          closes.set(requestId, close);
-          closeContents.set(requestId, content);
-          return { result: { close } };
-        }
-        // The daemon's dead-pane path: a pane whose command had exited has no
-        // occupant to protect, so its retained pane is cleaned up and answered
-        // with the exit the edge held. That is a pane fact, never a verdict on
-        // the registered process.
-        if (settings.closeOutcome === "already_exited") {
-          const close = {
-            outcome: "already_exited",
-            intent,
-            pane: spawn.pane,
-            exit_observation: {
-              state: "exited",
-              code: 0,
-              observed_at: new Date().toISOString(),
-            },
-          };
-          closes.set(requestId, close);
-          closeContents.set(requestId, content);
-          spawn.closed = true;
-          mailboxes.get(spawn.request_id)?.();
-          if (settings.dropCloseReply)
-            return { error: { code: "outcome_unknown", message: "reply lost" } };
-          return { result: { close } };
-        }
-        const close = { outcome: "completed", intent, pane: spawn.pane };
-        closes.set(requestId, close);
-        closeContents.set(requestId, content);
-        spawn.closed = true;
-        mailboxes.get(spawn.request_id)?.();
-        if (settings.dropCloseReply)
-          return { error: { code: "outcome_unknown", message: "reply lost" } };
-        return { result: { close } };
-      }
-      case "events.read": {
-        const after = Number(params.after ?? 0);
-        const tail = nextSequence - 1;
-        if (
-          (params.epoch !== undefined && params.epoch !== journal.epoch) ||
-          journal.earliest > after + 1
-        )
-          return {
-            result: {
-              cursor_expired: {
-                epoch: journal.epoch,
-                cursor: { epoch: journal.epoch, sequence: tail },
-                earliest: journal.earliest,
-              },
-            },
-          };
-        const events = journal.events
-          .filter((event) => (event.seq as number) > after)
-          .slice(0, Number(params.limit ?? 100));
-        const last = events.length
-          ? (events[events.length - 1].seq as number)
-          : after;
-        return {
-          result: {
-            epoch: journal.epoch,
-            events,
-            cursor: { epoch: journal.epoch, sequence: last },
-            tail,
-            more: last < tail,
-            earliest: journal.earliest,
-          },
-        };
-      }
-      case "mux.focus": {
-        return { result: { request_id: params.request_id, outcome: "completed" } };
-      }
-      case "mux.process_info":
-        return { result: { evidence: { kind: "shell" } } };
-      case "mux.output":
-        return { result: { output: { text: "", truncated: false } } };
-      default:
-        return {
-          error: { code: "not_found", message: `unknown method ${method}` },
-        };
-    }
-  };
+  const unavailable = () => ({ ok: false as const, code: "refused" as const, message: "port not configured by this test" });
+  const publicationClient = {
+    async ping() {
+      return { ok: true as const, value: {
+        protocol: RADAR_PROTOCOL_VERSION, revision: RADAR_MINIMUM_REVISION,
+        backend: settings.backend, instance: settings.instance,
+        contracts: settings.contracts, tasks: { available: true, error: null },
+      } };
+    },
+    async presence(report) {
+      const registration_id = report.registration_id ?? subjectId(report.source, report.incarnation);
+      registerCalls.push({ agent_id: registration_id, params: { ...report } });
+      subjects.set(registration_id, { source: report.source, incarnation: report.incarnation,
+        session: report.session_id, location: report.location });
+      const standing = settings.standing ?? "granted";
+      return { ok: true as const, value: {
+        registration_id, claim_id: report.claim_id, standing,
+        ...(standing === "granted" ? { subject_id: subjectId("session", report.session_id) } : {}),
+      } };
+    },
+    async releasePresence(request) {
+      return { ok: true as const, value: {
+        registration_id: request.registration_id, claim_id: request.claim_id, standing: "released" as const,
+      } };
+    },
+    async acquire(request) {
+      return { ok: true as const, value: {
+        handle: randomUUID(), source: request.publisher.source,
+        incarnation: request.publisher.incarnation, generation: 1, sequence: 0,
+      } };
+    },
+    async publish(request) {
+      published.push({ agent_id: request.registration_id, channel: request.channel,
+        snapshot: request.snapshot, observed_at: request.observed_at });
+      return { ok: true as const, value: { sequence: request.sequence } };
+    },
+    async retire() { return { ok: true as const, value: undefined }; },
+  } satisfies RadarPublicationClient;
 
-  const server: Server = createServer((socket) => {
-    let buffer = "";
-    let servedObserve = false;
-    socket.on("close", () => {
-      if (servedObserve) observesCompleted++;
-    });
-    socket.on("data", (chunk) => {
-      buffer += chunk.toString("utf8");
-      let end = buffer.indexOf("\n");
-      while (end >= 0) {
-        const line = buffer.slice(0, end);
-        buffer = buffer.slice(end + 1);
-        end = buffer.indexOf("\n");
-        let reply: Record<string, unknown>;
-        let gate: Promise<void> | undefined;
-        let hold: ReplyHold | undefined;
-        try {
-          const envelope = JSON.parse(line) as {
-            id?: unknown;
-            method?: unknown;
-            params?: unknown;
-          };
-          if (envelope.method === "mux.observe") {
-            servedObserve = true;
-            observesStarted++;
-            gate = observeGate;
-            hold = observeHold;
-            observeGate = undefined;
-            observeHold = undefined;
-          }
-          if (envelope.method === "spawn.close") {
-            gate = closeGate;
-            hold = closeHold;
-            closeGate = undefined;
-            closeHold = undefined;
-            hold?.arrive();
-          }
-          const outcome = answer(
-            String(envelope.method),
-            (envelope.params ?? {}) as Record<string, unknown>,
-            String(envelope.id),
-          );
-          reply =
-            outcome.error !== undefined
-              ? { id: envelope.id, error: outcome.error }
-              : { id: envelope.id, result: outcome.result };
-          // A long poll holds its empty page for the requested wait, as the daemon
-          // does. An event appended during the hold reaches the next read.
-          const wait = Number((envelope.params as { wait_ms?: unknown })?.wait_ms ?? 0);
-          const page = outcome.result as { events?: unknown[] } | undefined;
-          if (envelope.method === "events.read" && wait > 0 && page?.events?.length === 0)
-            gate = new Promise<void>((resolve) => setTimeout(resolve, wait).unref());
-        } catch (error) {
-          reply = {
-            id: undefined,
-            error: { code: "internal", message: String(error) },
-          };
-        }
-        const write = () => {
-          try {
-            socket.write(`${JSON.stringify(reply)}\n`);
-            if (hold) hold.written = true;
-          } catch {
-            // A client that stopped reading has its own failure to report.
-          }
+  function inventory(): RadarInventory {
+    const raw = settings.inventory ?? daemon.observeInventory?.() ?? observedFleet();
+    const location = (value: unknown) => {
+      const row = value as { location?: RadarInventory["panes"][number] };
+      return row.location ?? value as RadarInventory["panes"][number];
+    };
+    return {
+      workspaces: raw.workspaces as RadarInventory["workspaces"],
+      tabs: raw.tabs as RadarInventory["tabs"],
+      panes: raw.panes.map(location),
+      agents: raw.agents.map((value) => {
+        const row = value as RadarInventory["agents"][number] & {
+          location?: RadarInventory["panes"][number]; managed?: { label?: string; run?: string };
         };
-        if (gate) void gate.then(write);
-        else write();
+        return { ...row, ...location(row), managed_label: row.managed?.label ?? row.managed_label,
+          managed_run: row.managed?.run ?? row.managed_run };
+      }),
+    };
+  }
+
+  const client = {
+    ...publicationClient,
+    socketPath: () => socketPath,
+    register: async () => unavailable(),
+    context: async () => unavailable(),
+    async spawn(request) {
+      if (settings.crashSpawn) return { ok: false as const, code: "internal" as const, message: "fixture transport failed" };
+      if (settings.refuseSpawn) return { ok: false as const, ...settings.refuseSpawn };
+      const pane = paneFor(spawns.length + 1);
+      const continued = request.continue_subject_id === undefined ? undefined :
+        [...spawns].reverse().find((item) => item.subject_id === request.continue_subject_id);
+      if (request.continue_subject_id !== undefined && continued === undefined)
+        return { ok: false as const, code: "not_found" as const, message: "no released child has this subject" };
+      const spawn: RadarFakeSpawn = {
+        request_id: request.request_id, parent: request.parent,
+        parent_session_id: request.parent_session_id, executable: request.executable,
+        argv: request.argv, cwd: request.cwd, managed: request.managed,
+        pane, incarnation: randomUUID(), token: "",
+        env: { ...request.env, TMUX_PANE: pane.slice(pane.lastIndexOf(":") + 1),
+          ...(request.managed?.parent_subject_id
+            ? { PI_RADAR_MANAGED_PARENT_SUBJECT_ID: request.managed.parent_subject_id } : {}) },
+      };
+      if (continued !== undefined) {
+        spawn.session_id = continued.session_id;
+        spawn.session_file = continued.session_file;
+        spawn.continues = continued.subject_id;
       }
-    });
-    socket.on("error", () => undefined);
-  });
-  await new Promise<void>((resolve) => server.listen(socketPath, resolve));
-  // A test daemon must never be the reason a suite cannot exit.
-  server.unref();
+      spawns.push(spawn);
+      if (settings.bind) void runChild(spawn).catch(() => undefined);
+      if (settings.dropSpawnReply) return { ok: false as const, code: "internal" as const, message: "reply lost" };
+      return { ok: true as const, value: edge(spawn) };
+    },
+    async spawnGet(requestId) {
+      const spawn = spawns.find((item) => item.request_id === requestId);
+      return spawn ? { ok: true as const, value: topology(spawn) } :
+        { ok: false as const, code: "not_found" as const, message: "unknown fixture launch" };
+    },
+    async spawnList() {
+      return { ok: true as const, value: { next: null, spawns: spawns.map((spawn) => {
+        const view = topology(spawn);
+        return {
+          ...view.edge, state: view.state ?? "unbound", freshness: view.freshness,
+          version: 1, recorded_at: new Date().toISOString(),
+          granted_at: view.edge.granted_at ?? null,
+          withdrawn: view.edge.withdrawn ?? null,
+          exit_observation: view.edge.exit_observation ?? null,
+          bound: view.edge.bound ? { ...view.edge.bound, bound_at: spawn.bound_at } : null,
+        };
+      }) } } as never;
+    },
+    async restart(request) {
+      const previous = [...spawns].reverse().find((item) => item.subject_id === request.subject_id);
+      if (!previous) return { ok: false as const, code: "not_found" as const, message: "no live child has this subject" };
+      previous.closed = true; mailboxes.get(previous.request_id)?.();
+      const launch = randomUUID();
+      const pane = paneFor(spawns.length + 1);
+      const spawn: RadarFakeSpawn = { ...previous, request_id: launch, closed: false, processGone: false,
+        executable: request.executable, argv: request.argv, cwd: request.cwd, pane,
+        incarnation: randomUUID(), agent_id: undefined, subject_id: undefined,
+        env: { ...previous.env, ...request.env, TMUX_PANE: pane.slice(pane.lastIndexOf(":") + 1) } };
+      spawns.push(spawn);
+      if (settings.bind) void runChild(spawn).catch(() => undefined);
+      return { ok: true as const, value: { request_id: request.request_id, launch_request_id: launch } };
+    },
+    async agentGet(registrationId) {
+      const registration = subjects.get(registrationId);
+      if (!registration) return { ok: false as const, code: "not_found" as const, message: "unknown fixture child" };
+      const spawn = spawns.find((item) => item.agent_id === registrationId);
+      const execution = published.filter((entry) => entry.agent_id === registrationId && entry.channel === "execution").at(-1);
+      const age = execution?.observed_at ? Date.now() - Date.parse(execution.observed_at) : Infinity;
+      const activity = age >= 0 && age <= 30_000 ?
+        (execution?.snapshot as { activity?: string } | undefined)?.activity : undefined;
+      return { ok: true as const, value: {
+        claimed: settings.childProcessClaim,
+        verification: !settings.childProcessClaim ? "unavailable" as const :
+          settings.processVerdict ?? (spawn?.closed || spawn?.processGone ? "absent" as const : "verified" as const),
+        location: registration.location as RadarLocation | undefined,
+        session: registration.session as string | undefined,
+        contextSession: (registration.contextSession ?? registration.session) as string | undefined,
+        activity,
+      } };
+    },
+    async childGet(subjectId) {
+      const spawn = [...spawns].reverse().find((item) => item.subject_id === subjectId);
+      if (!spawn) return { ok: false as const, code: "not_found" as const, message: "unknown fixture child" };
+      const ended = spawn.closed || spawn.processGone ||
+        (settings.childProcessClaim && settings.processVerdict === "absent");
+      const present = settings.locationEvidence === "present" && !settings.observeUnavailable;
+      return { ok: true as const, value: {
+        assignment: null, execution: null, facts: null,
+        location: present && !spawn.closed ? (locationOf(spawn) as never) : null,
+        managed: { label: spawn.mailbox, run: undefined },
+        scoped: null, session_id: spawn.session_id ?? null,
+        state: !bound.has(spawn.request_id) ? "starting" as const :
+          ended ? "detached" as const :
+          settings.childProcessClaim && settings.processVerdict !== "mismatched" &&
+            settings.processVerdict !== "unavailable" ? "live" as const : "unknown" as const,
+        subject_id: subjectId,
+      } };
+    },
+    childInspect: async () => unavailable(),
+    async subjectChildren(request) {
+      const ids = [...new Set(spawns.map((spawn) => spawn.subject_id).filter((id): id is string => id !== undefined))];
+      const subjects = [];
+      for (const id of ids) {
+        const read = await client.childGet(id);
+        if (read.ok && (request.selection === undefined || request.selection === "all" ||
+          (request.selection === "live" ? read.value.state === "live" : read.value.state === "detached")))
+          subjects.push(read.value);
+      }
+      return { ok: true as const, value: { next: null, subjects } };
+    },
+    async observe() {
+      observesStarted++;
+      const gate = observeGate, hold = observeHold;
+      observeGate = undefined; observeHold = undefined;
+      const value = settings.observeUnavailable ? undefined : inventory();
+      await gate;
+      if (hold) hold.written = true;
+      observesCompleted++;
+      return value ? { ok: true as const, value } :
+        { ok: false as const, code: "backend_unavailable" as const, message: "the backend could not be read" };
+    },
+    async childClose(request) {
+      const gate = closeGate, hold = closeHold;
+      closeGate = undefined; closeHold = undefined; hold?.arrive();
+      const spawn = [...spawns].reverse().find((item) => item.subject_id === request.subject_id);
+      const previous = closes.get(request.request_id);
+      let value: RadarCloseOutcome;
+      if (previous) value = previous as RadarCloseOutcome;
+      else if (!settings.contracts.includes(RADAR_SPAWN_CLOSE_CONTRACT))
+        return { ok: false as const, code: "backend_unavailable" as const, message: "managed close is unavailable" };
+      else if (!spawn || !bound.has(spawn.request_id) ||
+        !settings.childProcessClaim || settings.locationEvidence !== "present" || spawn.closed)
+        return { ok: false as const, code: "refused" as const, message: "fixture child is not eligible for close" };
+      else {
+        value = settings.refuseChildClose ? { outcome: "refused", message: "the backend refused this close" } :
+          { outcome: settings.closeOutcome, pane: spawn.pane,
+            ...(settings.closeOutcome === "already_exited" ? {
+              exit_observation: { state: "exited" as const, code: 0, observed_at: new Date().toISOString() },
+            } : {}) };
+        closes.set(request.request_id, { ...value, intent: request.intent });
+        if (!settings.refuseChildClose) { spawn.closed = true; mailboxes.get(spawn.request_id)?.(); }
+      }
+      await gate;
+      if (hold) hold.written = true;
+      if (settings.dropCloseReply) return { ok: false as const, code: "outcome_unknown" as const, message: "reply lost" };
+      return { ok: true as const, value };
+    },
+    async events(request) {
+      const expired = (request.epoch !== undefined && request.epoch !== journal.epoch) || journal.earliest > request.after + 1;
+      const sequence = nextSequence - 1;
+      if (!expired && sequence <= request.after && request.wait_ms > 0)
+        await new Promise<void>((resolve) => setTimeout(resolve, request.wait_ms).unref());
+      return { ok: true as const, value: expired ?
+        { kind: "expired" as const, epoch: journal.epoch, sequence } :
+        { kind: "page" as const, epoch: journal.epoch, sequence, more: false } };
+    },
+    focus: async (request) => ({ ok: true as const, value: { request_id: request.request_id } }),
+    output: async () => ({ ok: true as const, value: { text: "", truncated: false } }),
+    processInfo: async () => ({ ok: true as const, value: { kind: "shell" as const } }),
+    communicationPublish: async () => unavailable(),
+    communicationInbox: async () => unavailable(),
+    communicationGet: async () => unavailable(),
+    communicationAck: async () => unavailable(),
+  } satisfies RadarClient;
+  clients.set(socketPath, client);
 
   return {
     socketPath,
+    client,
     closes,
     registerCalls,
     options: settings,
@@ -1504,7 +1176,6 @@ export async function startFakeRadarDaemon(
       observeHold = undefined;
       restartJournal("journal-1");
       bound.clear();
-      tokens.clear();
       closes.clear();
       closeContents.clear();
       registerCalls.length = 0;
@@ -1514,7 +1185,7 @@ export async function startFakeRadarDaemon(
       children.length = 0;
       for (const stop of mailboxes.values()) stop();
       mailboxes.clear();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
+      clients.delete(socketPath);
     },
   };
 }

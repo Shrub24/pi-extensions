@@ -33,6 +33,11 @@ import {
 
 export { spawnedArgvs, spawnedEnvironmentAssignments, spawnedLabels };
 import { radarProcessSlot } from "pi-radar/publication";
+import { createRadarExecutionAdapter } from "pi-radar/execution";
+import { createRadarHandoffPort } from "pi-radar/communication";
+import { createRadarChildren } from "pi-radar/children";
+import { resolveRadarProcessLocation } from "pi-radar/location";
+import { lazyRadarRuntime, provideRadarRuntime } from "pi-radar/runtime";
 import { herdsmanDataRoot } from "./storage.ts";
 import { DEFAULT_RESPONSE_CONTRACT } from "./response-contracts.ts";
 import { claimProcessLock } from "./lock.ts";
@@ -947,6 +952,7 @@ export function fakePi(
   } = {},
 ) {
   const events = new Map<string, ((event: any, ctx: Context) => unknown)[]>();
+  const sessionStartHandlers: ((event: any, ctx: Context) => unknown)[] = [];
   // Mirrors Pi's extension EventBus: synchronous emit, synchronous listener
   // mutations of the payload, and a listener that throws isolated per handler.
   const busEmitter = new EventEmitter();
@@ -987,7 +993,24 @@ export function fakePi(
   const pi = {
     events: eventBus,
     on(name: string, handler: (event: any, ctx: Context) => unknown) {
-      events.set(name, [...(events.get(name) ?? []), handler]);
+      if (name !== "session_start") {
+        events.set(name, [...(events.get(name) ?? []), handler]);
+        return;
+      }
+      // Tests dispatch `session_start` through its first listener; Pi runs
+      // every extension's, so that one listener runs them all in order.
+      sessionStartHandlers.push(handler);
+      if (sessionStartHandlers.length === 1)
+        events.set(name, [
+          async (event: any, ctx: Context) => {
+            let first: unknown;
+            for (const [index, each] of sessionStartHandlers.entries()) {
+              const result = await each(event, ctx);
+              if (index === 0) first = result;
+            }
+            return first;
+          },
+        ]);
     },
     registerCommand(name: string, options: any) {
       commands.push(name);
@@ -1065,6 +1088,36 @@ export function fakePi(
       return options.sendUserMessage?.(content, sendOptions);
     },
   };
+  // The baseline pi-radar extension is a separate package in production; here
+  // the same SDK factories run over the fixture client so Herdsman receives the
+  // shared runtime exactly as it does there. Its handlers register after
+  // Herdsman's, as they do when Pi loads the baseline second.
+  provideRadarRuntime(
+    eventBus,
+    lazyRadarRuntime(() => {
+      const execution = createRadarExecutionAdapter(pi as never, {
+        client: radarDaemon.client,
+        // One store per fixture session: a registration kept by an earlier
+        // test would carry that test's process incarnation.
+        dataRoot: join(herdsmanDataRoot(), "radar", randomUUID()),
+        location: () => resolveRadarProcessLocation(radarDaemon.client),
+      });
+      return {
+        publication: execution.publication,
+        // Completion-disposition fixtures seed the local durable completion.
+        // Broker delivery is a separate input, not a protocol simulated here.
+        communication: {
+          ...createRadarHandoffPort(radarDaemon.client, execution.publication),
+          inbox: async () => ({ ok: true as const, value: { handoff_ids: [] } }),
+        },
+        children: createRadarChildren(
+          radarDaemon.client,
+          execution.publication,
+        ),
+        execution,
+      };
+    }),
+  );
   return {
     pi,
     events,

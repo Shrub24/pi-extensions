@@ -123,7 +123,7 @@ export type ChiefDescriptor = {
    * This lead's own Radar subject. Peers prove the Chief through it, so a
    * descriptor without it is unprovable and refuses.
    */
-  agentId?: string;
+  subjectId?: string;
   createdAt: number;
 };
 
@@ -954,7 +954,7 @@ export type PeerRecord = Readonly<{
   tabId: string;
   workspaceId: string;
   /** This lead's own Radar subject; a record without it is unprovable. */
-  agentId?: string;
+  subjectId?: string;
   name?: string;
   cwd?: string;
   repo?: string;
@@ -1023,7 +1023,7 @@ function validPeerLeadRecord(value: unknown): value is PeerLeadRecord {
         "workspaceId",
         "claim",
         "updatedAt",
-        "agentId",
+        "subjectId",
         ...metadata,
       ].includes(key),
     ) &&
@@ -1045,7 +1045,7 @@ function validPeerLeadRecord(value: unknown): value is PeerLeadRecord {
     metadata.every(
       (key) => !Object.hasOwn(record, key) || validNativeIdentity(record[key]),
     ) &&
-    (record.agentId === undefined || isUuid(record.agentId)) &&
+    (record.subjectId === undefined || isUuid(record.subjectId)) &&
     isProcessLockClaim(record.claim) &&
     Number.isInteger(record.updatedAt) &&
     (record.updatedAt as number) >= 0
@@ -1075,7 +1075,7 @@ export function samePeerLeadRecord(
     actual.repo === expected.repo &&
     actual.branch === expected.branch &&
     actual.workspaceLabel === expected.workspaceLabel &&
-    actual.agentId === expected.agentId &&
+    actual.subjectId === expected.subjectId &&
     actual.claim.pid === expected.claim.pid &&
     actual.claim.id === expected.claim.id &&
     actual.updatedAt === expected.updatedAt
@@ -1213,12 +1213,12 @@ function validDescriptor(value: unknown): value is ChiefDescriptor {
     "workspaceId",
     "createdAt",
   ];
-  const optional = ["tabId", "piSessionFile", "agentId"];
+  const optional = ["tabId", "piSessionFile", "subjectId"];
   return (
     Object.keys(record).every(
       (key) => keys.includes(key) || optional.includes(key),
     ) &&
-    (record.agentId === undefined || isUuid(record.agentId)) &&
+    (record.subjectId === undefined || isUuid(record.subjectId)) &&
     Object.keys(record).length >= keys.length &&
     keys.every((key) => Object.hasOwn(record, key)) &&
     record.version === 1 &&
@@ -1344,7 +1344,7 @@ export function claimChiefLease(identity: ChiefIdentity): ChiefLease {
     typeof identity.workspaceId !== "string" ||
     !identity.workspaceId ||
     identity.workspaceId.length > 512 ||
-    (identity.agentId !== undefined && !isUuid(identity.agentId)) ||
+    (identity.subjectId !== undefined && !isUuid(identity.subjectId)) ||
     (identity.createdAt !== undefined &&
       (typeof identity.createdAt !== "number" ||
         !Number.isInteger(identity.createdAt) ||
@@ -1370,7 +1370,7 @@ export function claimChiefLease(identity: ChiefIdentity): ChiefLease {
     paneId: identity.paneId,
     ...(identity.tabId ? { tabId: identity.tabId } : {}),
     workspaceId: identity.workspaceId,
-    ...(identity.agentId !== undefined ? { agentId: identity.agentId } : {}),
+    ...(identity.subjectId !== undefined ? { subjectId: identity.subjectId } : {}),
     createdAt: identity.createdAt ?? Date.now(),
   };
   try {
@@ -1468,10 +1468,10 @@ export type CoordinatorState = {
   piSessionId: string;
   updatedAt: number;
   /**
-   * The lead's own Radar registration. A record without `agentId` cannot prove
+   * The lead's own Radar registration. A record without `subjectId` cannot prove
    * the lead's identity and is never reconstructed from observed rows.
    */
-  agentId?: string;
+  subjectId?: string;
   workspaceId?: string;
   tabId?: string;
   paneId?: string;
@@ -1484,7 +1484,7 @@ export type SupervisedLead = {
   /** Internal: path to a non-empty persisted session candidate. */
   piSessionFile?: string;
   instanceId?: string;
-  agentId?: string;
+  subjectId?: string;
   displayName: string;
   workspaceId: string;
   workspaceLabel?: string;
@@ -1556,7 +1556,7 @@ export function leadCoordinationStatePath(
     createHash("sha256").update(piSessionId).digest("hex") + ".json",
   );
 }
-const LEAD_IDENTITY_KEYS = ["agentId", "workspaceId", "tabId", "paneId"];
+const LEAD_IDENTITY_KEYS = ["subjectId", "workspaceId", "tabId", "paneId"];
 function validLeadState(value: unknown): value is CoordinatorState {
   if (!value || typeof value !== "object") return false;
   const r = value as Record<string, unknown>;
@@ -1762,7 +1762,7 @@ export function projectSupervision(options: {
     leads.push({
       lead: agent.sessionId,
       instanceId: state.instanceId,
-      agentId: state.agentId,
+      subjectId: state.subjectId,
       displayName: `${agent.workspaceId}/${name}`,
       workspaceId: agent.workspaceId,
       tabId: agent.tabId,

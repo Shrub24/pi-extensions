@@ -2,20 +2,17 @@ import { readdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-// Suites that start the in-process Radar daemon fake. They exercise Radar
-// wiring end to end through a stand-in daemon, so they run only through
-// `npm run test:integration` and are not part of the authoritative gate.
+// Legacy composed suites still being migrated away from daemon-shaped fixtures.
+// Keep their failures visible through `test:integration`; passing the unit group
+// alone does not validate the Radar adoption. Owned-contract suites move into
+// the default gate once their fixtures use the current boundary.
 export const INTEGRATION_TEST_FILES = [
   "commands",
-  "completion-lifecycle",
-  "control-integration",
   "controller-api",
   "controller-lifecycle",
   "extension-contract",
   "observation-refresh",
-  "radar-launch",
   "recovery",
-  "worker-addressing",
 ].map((name) => `extension/${name}.test.ts`);
 
 // Every other test file, discovered rather than listed, so a new unit suite is

@@ -42,11 +42,23 @@ let
     };
   };
 
-  # pi-herdsman's one npm dependency (`npm view pi-radar@0.2.0 dist.integrity`).
+  # Keep this aligned with pi-herdsman/package.json (npm registry integrity).
   piRadar = fetchNpmPackage {
     pname = "pi-radar";
-    version = "0.2.0";
-    hash = "sha512-91uezCVJCU2NeRoYPNd+8740ZS30l08DGOywqhkYF7al0fzxGHGZquTKzYGWrdMxTpbceK6qqGtgojg4EW6pSQ==";
+    version = "0.12.0";
+    hash = "sha512-9guUUWReM1Z9Vt2uMXBYuv/mRGv+wtF1XZPvxcJVa4BuEfPnmhMpmSBNOsz+uLrv2/s1oR4o9594q5XuNiRhjQ==";
+  };
+
+  # The SDK is also the registrar extension. Stage one package tree for both
+  # the baseline factory and Herdsman's imports; compilation must select radar
+  # as well as herdsman to activate the shared provider.
+  radar = buildPiBoltPlugin {
+    pname = "pi-radar";
+    version = "0.12.0";
+    src = piRadar;
+    entry = "extension/baseline.ts";
+    pluginName = "radar";
+    packageName = "pi-radar";
   };
 
   otel = buildPiBoltPlugin {
@@ -116,10 +128,10 @@ let
     src = checkout "pi-herdsman";
     entry = "extension/index.ts";
     pluginName = "herdsman";
-    libraries = [ piRadar ];
-    # Its two hooks import bash-processes' source, and bash-processes imports
-    # tool-renderer's, so both are staged whether or not the build registers them.
+    # The shared registrar is a plugin dependency, not a second SDK library.
+    # Herdsman's hooks also import bash-processes and its tool-renderer dependency.
     dependencies = [
+      radar
       bash-processes
       tool-renderer
     ];
@@ -127,13 +139,16 @@ let
     # definitions have to stay readable from disk rather than from Bun's virtual
     # file system. This plugin's own store tree is the copy that outlives the build.
     postPatch = ''
-      substituteInPlace extension/index.ts \
-        --replace-fail 'const HERDSMAN_EXTENSION_PATH = fileURLToPath(import.meta.url);' 'const HERDSMAN_EXTENSION_PATH = "$out/extension/index.ts";' \
-        --replace-fail '"../../pi-bash-processes/extensions/background-work.ts"' '"../../bash-processes/extensions/background-work.ts"'
-      substituteInPlace extension/advisory-wake.ts \
-        --replace-fail '"../../pi-bash-processes/extensions/wake-consumer.ts"' '"../../bash-processes/extensions/wake-consumer.ts"'
-      substituteInPlace extension/agent-definitions.ts \
-        --replace-fail 'const BUILTIN_AGENT_DIR = fileURLToPath(
+            substituteInPlace extension/index.ts \
+              --replace-fail 'const HERDSMAN_EXTENSION_PATH = fileURLToPath(import.meta.url);' 'const HERDSMAN_EXTENSION_PATH = "$out/extension/index.ts";' \
+              --replace-fail 'const RADAR_BASELINE_EXTENSION_PATH = fileURLToPath(
+        new URL("../../extension/baseline.ts", import.meta.resolve("pi-radar/client")),
+      );' 'const RADAR_BASELINE_EXTENSION_PATH = "${radar}/extension/baseline.ts";' \
+              --replace-fail '"../../pi-bash-processes/extensions/background-work.ts"' '"../../bash-processes/extensions/background-work.ts"'
+            substituteInPlace extension/advisory-wake.ts \
+              --replace-fail '"../../pi-bash-processes/extensions/wake-consumer.ts"' '"../../bash-processes/extensions/wake-consumer.ts"'
+            substituteInPlace extension/agent-definitions.ts \
+              --replace-fail 'const BUILTIN_AGENT_DIR = fileURLToPath(
         new URL("./agent-definitions", import.meta.url),
       );' 'const BUILTIN_AGENT_DIR = "$out/extension/agent-definitions";'
     '';
@@ -172,6 +187,7 @@ let
 
   plugins = {
     inherit
+      radar
       bash-processes
       cbmem
       herdsman

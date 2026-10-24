@@ -6,7 +6,6 @@ import {
   RADAR_SPAWN_LAUNCH_CONTEXT_CONTRACT,
   watchRadarEvents,
   isUuid,
-  type RadarAgentProcess,
   type RadarClient,
   type RadarInventory,
   type RadarLocation,
@@ -16,29 +15,23 @@ import {
   type RadarSnapshot,
   type RadarSpawnExitObservation,
 } from "pi-radar/client";
-import { createRadarHandoffPort, type RadarHandoffPort } from "pi-radar/communication";
+import {
+  requestRadarRuntime,
+  type RadarExtensionEventBus,
+  type RadarRuntimeServices,
+  type RadarRuntimeHandle,
+} from "pi-radar/runtime";
 import {
   radarLocalPane,
   radarPaneHandle,
   resolveRadarProcessLocation,
   type RadarLocationResolution,
 } from "pi-radar/location";
-import {
-  createRadarExecutionAdapter,
-  radarLocalRegistration,
-  type RadarExecutionEventApi,
-} from "pi-radar/execution";
+import type { RadarChild, RadarChildObservation } from "pi-radar/children";
 import {
   launchRadarWorker,
-  observeRadarChild,
-  type ProcessGone,
-  type RadarChildEvidence,
-  type RadarChildObservation,
   type RadarWorkerLaunched,
-  readProcessGone,
-  relaunchRefusalForChild,
 } from "pi-radar/launch";
-import { radarBindingKey, type RadarPublication } from "pi-radar/publication";
 import {
   SESSION_METADATA_ENTRY,
   readSessionMetadata,
@@ -155,14 +148,12 @@ import {
   resetAgentMailbox,
   unacknowledgedRequestExists,
   waitForState,
-  startupAckMatches,
   agentMailboxPath,
   agentStatePath,
   writeAsk,
   writeRequest,
   writeResult,
   writeAgentState,
-  writeStartupAck,
   mailboxRecordBytes,
   sameRequestAddress,
   type RequestRecord,
@@ -245,7 +236,6 @@ import {
 import { handoffResponseContract } from "./response-contracts.ts";
 import { CHILD_COMMAND_ENV, resolveChildCommand } from "./child-command.ts";
 import { sameCwd } from "./cwd.ts";
-import { inspectRadarChild, provedRead } from "pi-radar/inspection";
 import {
   acquireProcessLock,
   claimProcessLock,
@@ -350,6 +340,12 @@ const LEAD_INSTANCE_ID =
 // Keep model-facing lead handles aligned with Pi's SessionManager grammar.
 const PI_SESSION_ID_PATTERN = "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$";
 const HERDSMAN_EXTENSION_PATH = fileURLToPath(import.meta.url);
+// Infrastructure, like Herdsman itself, is required even for a worker whose
+// definition opts out of ordinary extension discovery. Use the package's same
+// source entry that Pi discovers, so its normal path deduplication still holds.
+const RADAR_BASELINE_EXTENSION_PATH = fileURLToPath(
+  new URL("../../extension/baseline.ts", import.meta.resolve("pi-radar/client")),
+);
 const AGENT_DEFINITIONS_ENTRY = "pi-herdsman-agent-definitions";
 const HERD_RUN_ENTRY = "pi-herdsman-herd-run";
 const WORKER_LAUNCH_ENTRY = "pi-herdsman-worker-launch";
@@ -358,26 +354,20 @@ type WorkerLaunchEntry = {
   label: string;
   fingerprint: string;
 };
-/** The launch generation every Radar-spawned child is started with. */
-const RADAR_LAUNCH_GENERATION_ENV = "PI_HERDSMAN_LAUNCH_GENERATION";
 /**
- * How long a fresh launch waits for its pane, its bound child and the child's
- * own startup acknowledgment. It is longer than the mailbox wait it replaces
- * because it also covers the child's registration and full Herdsman startup.
+ * How long a launch Radar already granted waits for the child's own mailbox
+ * state. Radar owns the launch deadline; this covers only Herdsman's startup.
  */
-const RADAR_LAUNCH_TIMEOUT_MS = 45_000;
+const RADAR_MAILBOX_WAIT_MS = 45_000;
 
-/**
- * The launch deadline, overridable for a host whose children start slowly and
- * for tests that have to reach a deadline without waiting out the default.
- */
-function radarLaunchTimeoutMs(): number {
+/** The mailbox wait, overridable for slow hosts and for tests that reach it. */
+function radarMailboxWaitMs(): number {
   const configured = Number(
     process.env.PI_HERDSMAN_RADAR_LAUNCH_TIMEOUT_MS?.trim(),
   );
   return Number.isFinite(configured) && configured > 0
     ? configured
-    : RADAR_LAUNCH_TIMEOUT_MS;
+    : RADAR_MAILBOX_WAIT_MS;
 }
 const RADAR_SPAWN_ENTRY = "pi-herdsman-radar-spawn";
 const RADAR_CLOSE_ENTRY = "pi-herdsman-radar-close";
@@ -391,8 +381,8 @@ type RadarCloseEntry = {
   stage: "dispatched" | "completed" | "already_exited" | "refused" | "unknown";
   requestId: string;
   spawnRequestId: string;
-  source: string;
-  incarnation: string;
+  /** The child Radar was asked to close. */
+  subjectId: string;
   intent: "complete";
   runId: string;
   label: string;
@@ -416,13 +406,15 @@ type RadarCloseEntry = {
 type RadarSpawnEntry = {
   stage: "requested" | "bound";
   requestId: string;
-  generation: string;
   runId: string;
   label: string;
   ownerSessionId: string;
   workspaceId: string;
   mailbox: string;
-  agentId?: string;
+  /** The child's durable Radar subject, known once Radar granted its presence. */
+  subjectId?: string;
+  /** The Pi session the child's mailbox recorded once it was ready; what `continues` resumes. */
+  piSessionId?: string;
   paneId?: string;
   agentDefinition?: string;
   model?: string | null;
@@ -451,16 +443,8 @@ type RadarSpawnOutcomeEntry = {
  * before anything else can read, inherit or report it. It travels back to the
  * daemon in this process's own registration request and nowhere else.
  */
-const RADAR_SPAWN_TOKEN = claimRadarSpawnToken();
-/** The launch generation this process was spawned with, absent for any other. */
-const RADAR_LAUNCH_GENERATION =
-  process.env[RADAR_LAUNCH_GENERATION_ENV]?.trim() || undefined;
 
-function claimRadarSpawnToken(): string | undefined {
-  const token = process.env.PI_RADAR_SPAWN_TOKEN?.trim();
-  delete process.env.PI_RADAR_SPAWN_TOKEN;
-  return token ? token : undefined;
-}
+
 const AGENT_CONTEXT_RETIRED_ENTRY = "pi-herdsman-agent-context-retired";
 const CONTEXT_RETIREMENT_INSTRUCTION =
   "Context pressure has retired this session. Do not start new work or new agents. " +
@@ -799,30 +783,10 @@ type Runtime = {
    * The exact Radar subject this process's own launch bound to the child, set
    * by the launch that spawned it. It is the child's primary identity.
    */
-  radarAgentId?: string;
-  /** The launch generation the bound child acknowledged for this runtime. */
-  radarLaunchGeneration?: string;
-  /**
-   * The daemon's own statement of the process its edge for this runtime's child
-   * is bound to. An assignment to a retained child is addressed with it, so the
-   * process that answers can be held to being the one the launch bound.
-   */
-  radarBoundProcess?: { source: string; incarnation: string };
+  radarSubjectId?: string;
   workspaceId: string;
   /** The child's own raw local pane, which is also its mailbox pane. */
   paneId: string;
-  /**
-   * The qualified `tmux:<server>:%N` handle the validated Radar spawn record
-   * names for the pane this launch bound. The raw local pane and this handle are
-   * the same pane in two namespaces, so each comparison uses the namespace its
-   * other side speaks: `paneId` against the mailbox and the child's own
-   * acknowledgment, this handle against the daemon's canonical registration
-   * location and every daemon call. A runtime whose bound record is missing or
-   * names no pane keeps this undefined, and a canonical comparison then refuses
-   * instead of falling back to the raw pane, which would erase the server the
-   * launch bound.
-   */
-  radarSpawnPane?: string;
   cwd: string;
   runId: string;
   ownerSessionId: string;
@@ -1012,10 +976,11 @@ const askWatchers = new Map<
 const askWatchRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const askDeliveryInFlight = new Set<string>();
 const askDeliveryRetries = new Map<string, ReturnType<typeof setTimeout>>();
-let radarPublication: RadarPublication | undefined;
-let radarExecution: ReturnType<typeof createRadarExecutionAdapter> | undefined;
+let radarRuntime: RadarRuntimeServices | undefined;
+let radarRuntimeStarting = false;
+/** This process's own granted subject, refreshed until Radar answers. */
+let radarOwnSubjectId: string | undefined;
 let radarClient: RadarClient | undefined;
-let radarCommunication: RadarHandoffPort | undefined;
 /**
  * This process's own location, resolved on demand.
  *
@@ -1073,111 +1038,42 @@ async function ensureRadarLocalLocation(): Promise<RadarLocationResolution> {
 }
 
 /**
- * Register this process with the Radar daemon, last in every role.
+ * Connect to the one Radar runtime this Pi process shares.
  *
- * Herdsman's own lifecycle handlers must stay the first subscriber of a Pi
- * event, and this adapter is additive: its listener observes the session, it
- * never drives one. A delegating session needs its own registration in every
- * role, because that registration is the exact parent a spawn is created under.
+ * pi-radar's baseline extension owns the registrar, presence and the handoff
+ * port; Herdsman never starts a second publisher. The request is idempotent and
+ * may be repeated at session start, because the baseline can load after this
+ * extension. Without a baseline Herdsman has no Radar capability.
  */
-async function initializeRadarPublication(pi: ExtensionAPI): Promise<void> {
-  const managedIdentity =
-    role() === "managed-agent"
-      ? {
-          run: String(process.env.PI_HERDSMAN_RUN_ID),
-          owner: String(process.env.PI_HERDSMAN_OWNER_SESSION_ID),
-          label: String(process.env.PI_HERDSMAN_LABEL),
-        }
-      : undefined;
-  // The process-local slot owns subject identity, so an extension reload reuses
-  // this process's registration and writer binding instead of minting a second
-  // subject. The adapter persists the immutable registration before dialing and
-  // owns its own listeners and timers across a reload.
+let radarRuntimeHandle: RadarRuntimeHandle | undefined;
+function connectRadarRuntime(pi: ExtensionAPI): void {
+  const request = requestRadarRuntime(pi.events as RadarExtensionEventBus);
+  if (request.ok === false) {
+    radarRuntimeHandle = undefined;
+    radarRuntime = undefined;
+    return;
+  }
+  if (request.handle === radarRuntimeHandle && (radarRuntime !== undefined || radarRuntimeStarting)) return;
+  // A replaced baseline owns a different runtime. Never keep services from the
+  // previous provider, or let its pending start overwrite the replacement.
+  radarRuntimeHandle = request.handle;
+  radarRuntime = undefined;
+  radarRuntimeStarting = true;
   radarClient = createRadarClient();
-  const client = radarClient;
-  // The adapter is built now, so its own lifecycle listeners are registered with
-  // every other extension's. The location it registers with is resolved when the
-  // immutable registration record is first built - the last moment it can be
-  // known - because a subject that published no pane can never acquire one, and
-  // because that is what keeps the negotiated server and this process's own pane
-  // the same facts the launch later places a worker beside.
-  radarExecution = createRadarExecutionAdapter(
-    pi as unknown as RadarExecutionEventApi,
-    {
-      client,
-      dataRoot: join(herdsmanDataRoot(), "radar"),
-      questionnaireEvent: RPIV_ASK_USER_BLOCKED_EVENT,
-      location: () => ensureRadarLocalLocation(),
-      ...(RADAR_SPAWN_TOKEN !== undefined
-        ? { spawnToken: RADAR_SPAWN_TOKEN }
-        : {}),
-      ...(managedIdentity !== undefined
-        ? {
-            managedBinding: {
-              ...managedIdentity,
-              key: radarBindingKey(
-                managedIdentity.run,
-                managedIdentity.owner,
-                managedIdentity.label,
-              ),
-            },
-          }
-        : {}),
-    },
-  );
-  radarPublication = radarExecution.publication;
-  radarCommunication = createRadarHandoffPort(client, radarExecution.publication);
+  void request.handle
+    .start()
+    .then((services) => {
+      if (radarRuntimeHandle === request.handle) radarRuntime = services;
+    })
+    .catch(() => undefined)
+    .finally(() => {
+      if (radarRuntimeHandle === request.handle) radarRuntimeStarting = false;
+    });
 }
 
 /**
- * The exact parent identity a Radar spawn needs, or why this process has none.
- *
- * Registration is best-effort for every ordinary session; a launch is the one
- * caller that cannot proceed without it, so an absent, unreachable or
- * location-less registration is reported instead of being worked around. A
- * registration is immutable, so a process whose subject record predates its
- * location cannot acquire one here: it has to be started again with the pane in
- * its own environment.
- */
-async function radarSpawnParent(paneId: string): Promise<
-  | { ok: true; parent: { registration_id: string; subject_id: string; location: RadarLocation } }
-  | { ok: false; message: string }
-> {
-  const subject = await radarPublication?.subject();
-  if (subject === undefined)
-    return {
-      ok: false,
-      message:
-        "This process has no Radar registration, so a fresh worker cannot be spawned under it",
-    };
-  const subjectId = subject.subject_id;
-  if (!isUuid(subjectId))
-    return {
-      ok: false,
-      message:
-        "This process's Radar registration has no valid managed subject identity, so a fresh worker cannot be spawned under it",
-    };
-  const location = subject.location;
-  if (location?.pane === undefined || location.pane === "")
-    return {
-      ok: false,
-      message:
-        "This process's Radar registration names no pane, so a fresh worker cannot be placed beside it",
-    };
-  if (location.pane !== paneId)
-    return {
-      ok: false,
-      message: `This process's Radar registration places it in pane ${location.pane}, not in the pane this launch would split`,
-    };
-  return {
-    ok: true,
-    parent: { registration_id: subject.registration_id, subject_id: subjectId, location },
-  };
-}
-
-/**
- * The child environment as a spawn overlay: the launch's own assignments plus
- * the generation the child must acknowledge. Radar's environment overlay is
+ * The child environment as a spawn overlay: the launch's own assignments.
+ * Radar's environment overlay is
  * additive, so this is exactly what the launch adds to the daemon's own
  * environment, and nothing from this process leaks into it.
  */
@@ -1231,6 +1127,10 @@ function radarSpawnFromEntries(
     if (!data || typeof data !== "object" || Array.isArray(data)) continue;
     const value = data as RadarSpawnEntry;
     if (typeof value.mailbox !== "string" || typeof value.runId !== "string")
+      continue;
+    // This release reads subject-addressed launches only. A legacy binding is
+    // not translated into a subject or admitted as current child authority.
+    if (value.stage !== "requested" && (value.stage !== "bound" || !isUuid(value.subjectId)))
       continue;
     spawns.set(`${value.mailbox}\0${value.runId}`, value);
   }
@@ -1290,11 +1190,9 @@ function appendSpawnOutcome(
 
 function radarLaunchEnvironment(
   env: string[],
-  generation: string,
   parentPaneId: string | undefined,
 ): Record<string, string> {
   const overlay: Record<string, string> = {
-    [RADAR_LAUNCH_GENERATION_ENV]: generation,
     // The pane this launch is created beside. It is what lets a child tell its
     // own coordinates from the parent's it may have inherited.
     ...(parentPaneId !== undefined
@@ -1312,68 +1210,20 @@ function radarLaunchEnvironment(
   return overlay;
 }
 
-/**
- * The owner-side correlation with a managed child's Radar subject. The child
- * writes this sidecar itself, keyed by the durable managed tuple both processes
- * can derive, so no mailbox schema and no registry-wide search is involved.
- */
-function radarChildBinding(
-  state: Pick<ManagedAgentState, "runId" | "ownerSessionId" | "agentLabel">,
-) {
-  return radarPublication?.binding(
-    radarBindingKey(state.runId, state.ownerSessionId, state.agentLabel),
-  );
-}
-
-/** Retire the assignment channel of a child this process actually published. */
-function retireRadarSubject(
-  state: Pick<ManagedAgentState, "runId" | "ownerSessionId" | "agentLabel">,
-): void {
-  const binding = radarChildBinding(state);
-  if (binding) radarPublication?.retireAssignment(binding.registration_id);
-}
-
-/**
- * Record that Herdsman startup finished for one launch.
- *
- * An owner that spawned this process waits for this acknowledgment and does not
- * hand out an assignment without it, so it is written here, after the mailbox
- * state, the agent controller runtime and the request pump are all in place. It
- * names the generation the launch chose: without that generation this process was
- * not spawned by Radar, and there is nothing to acknowledge. A mailbox that
- * cannot take the acknowledgment keeps none, and the launch stays unresolved for
- * its owner rather than being assigned to.
- */
-function acknowledgeRadarLaunch(
-  pi: ExtensionAPI,
+/** The durable Radar subject this session's launch recorded for one mailbox's child. */
+function radarSubjectOf(
   ctx: ExtensionContext,
-  state: ManagedAgentState,
   mailbox: string,
-): void {
-  const generation = RADAR_LAUNCH_GENERATION;
-  if (generation === undefined) return;
-  const sessionId = ctx.sessionManager.getSessionId?.();
-  if (typeof sessionId !== "string" || sessionId !== state.piSessionId) return;
-  const release = claimAssignmentLock(mailbox, "session_start", {
-    label: state.agentLabel,
-    paneId: state.paneId,
-  });
-  try {
-    writeStartupAck(mailbox, {
-      generation,
-      runId: state.runId,
-      ownerSessionId: state.ownerSessionId,
-      workspaceId: state.workspaceId,
-      agentLabel: state.agentLabel,
-      paneId: state.paneId,
-      piSessionId: state.piSessionId,
-      acknowledgedAt: Date.now(),
-    });
-  } catch (error) {
-    appendDurableError(pi, ctx, "pi_herdsman_state_error", error);
-  } finally {
-    release();
-  }
+  runId: string,
+): string | undefined {
+  return radarSpawnFromEntries(ctx.sessionManager.getEntries()).get(
+    `${mailbox}\0${runId}`,
+  )?.subjectId;
+}
+
+/** Retire the assignment channel Radar holds for a child subject. */
+function retireRadarSubject(subjectId: string | undefined): void {
+  if (subjectId !== undefined) radarRuntime?.children.retire(subjectId);
 }
 
 /**
@@ -1783,13 +1633,40 @@ async function radarLeadWorkspace(): Promise<string | undefined> {
 }
 
 /**
+ * What Radar's subject read proves about a lead or Chief: the subject is live,
+ * on the recorded pane, and holds the recorded Pi session. Absent, detached and
+ * unavailable reads are not proof. The activity is the subject's own published
+ * word, when fresh.
+ */
+async function provedSubject(request: {
+  subjectId: string;
+  paneId: string;
+  session: string;
+}): Promise<{ activity?: string } | undefined> {
+  const observed = await radarRuntime?.children.observe(request.subjectId);
+  if (observed?.kind !== "live") return undefined;
+  const { subject } = observed;
+  if (
+    subject.location?.pane !== request.paneId ||
+    subject.session_id !== request.session
+  )
+    return undefined;
+  const execution = subject.execution?.snapshot;
+  return {
+    ...(execution?.freshness === "fresh" && "activity" in execution.snapshot
+      ? { activity: String(execution.snapshot.activity) }
+      : {}),
+  };
+}
+
+/**
  * This lead's own proven location and Radar subject, or nothing. A lead is
- * identified to peers and the Chief by its `agent_id`, so a process whose
- * registration has none, or names a different pane, has no identity to publish.
+ * identified to peers and the Chief by its granted `subject_id`, so a process
+ * without one, or on a different pane, has no identity to publish.
  */
 async function radarLeadIdentity(): Promise<
   | {
-      agentId: string;
+      subjectId: string;
       location: RadarLocation & { tab: string; workspace: string; pane: string };
     }
   | undefined
@@ -1798,33 +1675,34 @@ async function radarLeadIdentity(): Promise<
   if (resolution.state !== "resolved") return undefined;
   const { location } = resolution;
   if (!location.tab || !location.workspace || !location.pane) return undefined;
-  const subject = await radarPublication?.subject();
-  if (subject === undefined || subject.location?.pane !== location.pane)
+  const subject = await radarRuntime?.publication.subject();
+  if (
+    subject?.subject_id === undefined ||
+    subject.location?.pane !== location.pane
+  )
     return undefined;
   return {
-    agentId: subject.registration_id,
+    subjectId: subject.subject_id!,
     location: { ...location, tab: location.tab, workspace: location.workspace, pane: location.pane },
   };
 }
 
 /**
- * The lead coordination records whose own Radar registration still proves them:
- * the recorded `agent_id` runs on the recorded pane and publishes the record's
+ * The lead coordination records whose own Radar subject still proves them:
+ * the recorded subject runs on the recorded pane and publishes the record's
  * session. Absent, mismatched and unavailable reads are not proof, so the lead
- * is left out. Observed agent rows are never an input: `mux.observe` does not
- * present registered agents under tmux.
+ * is left out.
  */
 async function provedLeads(): Promise<
   Array<{ state: LeadCoordinationState; agent: LiveAgent }>
 > {
-  const client = radarClient;
-  if (client === undefined) return [];
+  if (radarRuntime === undefined) return [];
   const proved: Array<{ state: LeadCoordinationState; agent: LiveAgent }> = [];
   for (const state of listLeadCoordinationStates(supervisionRuntime())) {
-    const { agentId, workspaceId, tabId, paneId } = state;
-    if (!agentId || !workspaceId || !tabId || !paneId) continue;
-    const read = await provedRead(client, {
-      agentId,
+    const { subjectId, workspaceId, tabId, paneId } = state;
+    if (!subjectId || !workspaceId || !tabId || !paneId) continue;
+    const read = await provedSubject({
+      subjectId,
       paneId,
       session: state.piSessionId,
     });
@@ -2671,6 +2549,14 @@ async function radarPreflight(): Promise<void> {
       `The Radar daemon does not provide ${missing}`,
       "preflight",
     );
+  // Radar refuses a launch from a process with no managed subject; saying so
+  // here spares the preparation that would end in that refusal.
+  if ((await radarRuntime?.publication.subject())?.subject_id === undefined)
+    fail(
+      "invalid_request",
+      "This session has no managed Radar subject, so it cannot start agent assignments",
+      "preflight",
+    );
 }
 /**
  * Prove a Radar-launched child before it is handed an assignment.
@@ -2683,23 +2569,10 @@ async function radarPreflight(): Promise<void> {
  * created one, and asking for one by name would be the guess this replaces.
  */
 function validateRadarChild(runtime: Runtime, operation: string): void {
-  const bound = runtime.radarAgentId;
-  if (bound === undefined)
+  if (runtime.radarSubjectId === undefined)
     fail(
       "target_not_found",
       `Agent ${runtime.label} was not launched through Radar`,
-      operation,
-      { ids: { label: runtime.label, paneId: runtime.paneId } },
-    );
-  const binding = radarChildBinding({
-    runId: runtime.runId,
-    ownerSessionId: runtime.ownerSessionId,
-    agentLabel: runtime.label,
-  });
-  if (binding?.registration_id !== bound)
-    fail(
-      "target_not_found",
-      `Agent ${runtime.label} no longer names the child this launch bound`,
       operation,
       { ids: { label: runtime.label, paneId: runtime.paneId } },
     );
@@ -2711,18 +2584,6 @@ function validateRadarChild(runtime: Runtime, operation: string): void {
       operation,
     );
   validateIdentity(runtime, state);
-  const ack = state.startupAck;
-  if (
-    ack === undefined ||
-    ack.generation !== runtime.radarLaunchGeneration ||
-    ack.paneId !== runtime.paneId
-  )
-    fail(
-      "target_not_found",
-      `Agent ${runtime.label} has not acknowledged this launch's startup`,
-      operation,
-      { ids: { label: runtime.label, paneId: runtime.paneId } },
-    );
 }
 
 /** Refuses unless the child's presence is proved by its Radar observation. */
@@ -2871,7 +2732,6 @@ function parsePresentationTokens(tokens: unknown): {
 function validateIdentity(
   runtime: Runtime,
   state: ManagedAgentState,
-  agent?: any,
   options: { requestId?: string } = {},
 ): void {
   const differences: [string, unknown, unknown][] = [
@@ -2902,36 +2762,7 @@ function validateIdentity(
         .join(", ")}`,
       "identity",
     );
-  if (agent) {
-    // The daemon's row speaks qualified handles, so its pane is held to the
-    // bound record's own handle. A runtime with no such record cannot be held to
-    // a location at all, and equal raw suffixes are not the same claim: two
-    // servers can name the same `%N`.
-    if (agent.pane_id !== undefined && runtime.radarSpawnPane === undefined)
-      fail(
-        "target_not_found",
-        `Agent ${runtime.label} has no bound Radar pane record to compare a registration location against`,
-        "identity",
-      );
-    // The cwd is compared only when the caller states one.
-    const liveDifferences: [string, unknown, unknown][] = [
-      ["workspaceId", agent.workspace_id, runtime.workspaceId],
-      ["paneId", agent.pane_id, runtime.radarSpawnPane],
-    ].filter(([, expected, actual]) => expected !== actual);
-    if (agent.cwd !== undefined && !sameCwd(agent.cwd, runtime.cwd))
-      liveDifferences.push(["cwd", agent.cwd, runtime.cwd]);
-    if (liveDifferences.length)
-      fail(
-        "target_not_found",
-        `Live agent identity does not match managed state: ${liveDifferences
-          .map(
-            ([field, expected, actual]) =>
-              `${field}=${JSON.stringify(expected)} != ${JSON.stringify(actual)}`,
-          )
-          .join(", ")}`,
-        "identity",
-      );
-  }
+
   if (
     options.requestId &&
     state.activeRequestId !== options.requestId &&
@@ -3009,27 +2840,15 @@ function runtimeIdentityState(runtime: Runtime): ManagedAgentState {
   };
 }
 /**
- * The exact process an assignment to this runtime is addressed to, when there is
- * one. A Radar launch's binding is the subject, the daemon's own read of that
- * binding supplies the source and incarnation the process registered under, and
- * the durable launch supplies the generation. Evidence for fewer than all three
- * addresses nothing: a Radar child is then refused rather than written an
- * unaddressed request, and only a Herdr child keeps the managed tuple it has
- * always been proved by.
+ * The child an assignment to this runtime is addressed to: the subject the
+ * launch bound. Radar carries a held assignment to a replacement process by
+ * subject, so the address names the child and no process behind it. A runtime
+ * with no bound subject addresses nothing.
  */
 function assignmentAddress(runtime: Runtime): RequestAddress | undefined {
-  if (
-    runtime.radarAgentId === undefined ||
-    runtime.radarBoundProcess === undefined ||
-    runtime.radarLaunchGeneration === undefined
-  )
-    return undefined;
-  return {
-    subject: runtime.radarAgentId,
-    source: runtime.radarBoundProcess.source,
-    incarnation: runtime.radarBoundProcess.incarnation,
-    generation: runtime.radarLaunchGeneration,
-  };
+  return runtime.radarSubjectId === undefined
+    ? undefined
+    : { subject: runtime.radarSubjectId };
 }
 async function submit(
   pi: ExtensionAPI,
@@ -3062,7 +2881,7 @@ async function submit(
   // from a request meant for a replacement process that shares its managed
   // tuple. A Herdr child, which has no registration to address, keeps the
   // unaddressed form it has always been sent.
-  if (runtime.radarAgentId !== undefined && address === undefined)
+  if (runtime.radarSubjectId !== undefined && address === undefined)
     fail(
       "target_not_found",
       `Agent ${runtime.label} has no bound process to address this ${kind} to`,
@@ -3096,7 +2915,7 @@ async function submit(
     );
   // A Radar-launched child is proved against the launch that bound it; a
   // retained Herdr child keeps the integration proof it was launched under.
-  if (runtime.radarAgentId !== undefined)
+  if (runtime.radarSubjectId !== undefined)
     validateRadarChild(runtime, operation);
   else
     requireLivePresence(
@@ -3288,6 +3107,9 @@ type ManagedAgentSnapshot = {
   lifecycleState: ReturnType<typeof radarLifecycleState>;
   presence: ManagedAgentPresence;
 };
+/** Radar's verified end of a child's process. */
+const PROCESS_ENDED = "ended";
+type ProcessGone = typeof PROCESS_ENDED;
 type ManagedAgentPresence =
   | {
       /**
@@ -3296,7 +3118,7 @@ type ManagedAgentPresence =
        * edge that launch created, which is evidence of its own kind.
        */
       kind: "radar";
-      evidence: RadarChildEvidence;
+      evidence: RadarChild;
     }
   | {
       kind: "unknown";
@@ -3305,9 +3127,9 @@ type ManagedAgentPresence =
   | {
       kind: "lost";
       /**
-       * Set when the child is a Radar child whose registered process the daemon
-       * proved gone while an assignment was outstanding. The assignment is neither
-       * resumed nor retired by this presence: it waits for an operator decision.
+       * Set when Radar verified the child's process ended. An assignment still
+       * outstanding is neither resumed nor retired by this presence: it waits for
+       * an operator decision.
        */
       processGone?: ProcessGone;
     };
@@ -3946,7 +3768,7 @@ function resolveIdleWorker(
     (processGone !== undefined ||
       confirmedRadarClose(entries, mailboxPath, state.runId) !== undefined ||
       (launch?.stage === "bound" &&
-        launch.agentId !== undefined &&
+        launch.subjectId !== undefined &&
         record.presence.kind !== "radar"));
   if (processUnproved)
     return {
@@ -3984,32 +3806,24 @@ function resolveIdleWorker(
     };
     if (launch !== undefined) {
       // A child this process launched through Radar has no mux record to read, so
-      // its own launch is its provenance and its own acknowledgment of that
-      // generation is its process evidence. A pane the daemon still reports and
-      // a fresh edge only say the location survived; they are never proof that
-      // the process behind it is still this generation.
+      // its own launch is its provenance and Radar's live observation of its
+      // subject is its process evidence. A pane the daemon still reports and a
+      // fresh edge only say the location survived; they are never proof that the
+      // process behind it is alive.
       if (record.presence.kind !== "radar")
         return {
           kind: "unproved",
           message: UNPROVABLE_PRESENCE_MESSAGE,
         };
-      if (launch.stage !== "bound" || launch.agentId === undefined)
+      if (launch.stage !== "bound" || launch.subjectId === undefined)
         return {
           kind: "unproved",
-          message: `Agent ${state.agentLabel} has no bound launch to prove this generation`,
+          message: `Agent ${state.agentLabel} has no bound launch to prove`,
         };
-      runtime.radarAgentId = launch.agentId;
-      runtime.radarLaunchGeneration = launch.generation;
+      runtime.radarSubjectId = launch.subjectId;
       // The record's own qualified handle, never reconstructed from the local
       // environment: the server in it is part of what the record proves.
-      if (launch.paneId !== undefined) runtime.radarSpawnPane = launch.paneId;
-      // The daemon's own read names the process this child is. It is the address
-      // an assignment to the child is written with, so a replacement occupying
-      // the same mailbox cannot answer for the process this launch bound.
-      runtime.radarBoundProcess = {
-        source: record.presence.evidence.source,
-        incarnation: record.presence.evidence.incarnation,
-      };
+
       try {
         validateRadarChild(runtime, "continue");
       } catch (error) {
@@ -4080,107 +3894,50 @@ function radarControlState(
 }
 
 /**
- * What this launch may claim about its own child: the subject the durable record
- * bound, the pane the daemon recorded with that binding, and the binding sidecar
- * that child wrote for itself. All three are provenance - they stay true after a
- * child is gone - so a sidecar naming another subject, or a mailbox that does not
- * repeat the launch's recorded pane, leaves the launch with nothing to correlate
- * its observation against.
- */
-function radarChildProvenance(
-  spawn: RadarSpawnEntry,
-  state: ManagedAgentState | undefined,
-): {
-  request_id: string;
-  pane_id: string | undefined;
-  registration_id: string | undefined;
-  session_id: string | undefined;
-} {
-  const binding = radarChildBinding({
-    runId: spawn.runId,
-    ownerSessionId: spawn.ownerSessionId,
-    agentLabel: spawn.label,
-  });
-  const recorded = spawn.stage === "bound" ? spawn.agentId : undefined;
-  return {
-    request_id: spawn.requestId,
-    // The pane the daemon recorded when it bound this launch's edge. A request
-    // that never bound has none: the child's mailbox is its own claim about where
-    // it runs, and a claim cannot supply the location a launch never recorded. A
-    // mailbox naming a different pane still refuses - the two witnesses then
-    // disagree, and neither is evidence. The mailbox names that pane in the
-    // child's raw namespace, so the claim is compared with the recorded handle's
-    // own raw form, while the value returned stays the qualified handle a
-    // canonical registration location is compared against.
-    pane_id:
-      spawn.paneId === undefined ||
-      (state !== undefined && state.paneId !== radarPaneHandle(spawn.paneId))
-        ? undefined
-        : spawn.paneId,
-    // The child's own binding is the subject; a launch that recorded another one
-    // makes the two witnesses disagree, and neither is then evidence.
-    registration_id:
-      recorded === undefined || binding?.registration_id === recorded
-        ? binding?.registration_id
-        : undefined,
-    // The session the mailbox records for this run: the child's own claim, which
-    // the daemon's published context must match before the child is live.
-    session_id: state?.piSessionId,
-  };
-}
-
-/**
  * Current Radar evidence for every child this session launched, keyed the way
- * the durable spawn record is: by mailbox and run. One read per launched child,
- * and every failure to read is an unproved child rather than a lost one.
+ * the durable spawn record is: by mailbox and run. One paged subject roster read
+ * covers the current mailboxes; historical launches cause no extra reads. A
+ * missing subject or failed page is unknown, never proof that a worker is gone.
  */
 async function radarChildObservations(
   ctx: ExtensionContext,
   mailboxes: readonly { path: string; state: ManagedAgentState }[],
 ): Promise<Map<string, RadarChildObservation>> {
   const observations = new Map<string, RadarChildObservation>();
-  const client = radarClient;
-  if (client === undefined) return observations;
+  const children = radarRuntime?.children;
+  if (children === undefined) return observations;
   const spawns = radarSpawnFromEntries(ctx.sessionManager.getEntries());
-  if (spawns.size === 0) return observations;
-  await Promise.all(
-    [...spawns].map(async ([key, spawn]) => {
-      const state = mailboxes.find(({ path }) => path === spawn.mailbox)?.state;
-      const observed = await observeRadarChild(
-        client,
-        radarChildProvenance(spawn, state),
-      );
-      observations.set(
-        key,
-        observed.kind === "unknown" &&
-          state?.activeRequestId !== undefined &&
-          spawn.agentId !== undefined
-          ? await gonePastUnproved(client, spawn.agentId, observed)
-          : observed,
-      );
-    }),
-  );
+  // History is needed for continuation, not for recurring observations. Only
+  // the launch backing a current mailbox participates in this pass.
+  const current = new Map(mailboxes.map(({ path, state }) => [path, state.runId]));
+  const active = [...spawns].filter(([, spawn]) => current.get(spawn.mailbox) === spawn.runId);
+  if (active.length === 0) return observations;
+  const roster = await children.list("all");
+  const bySubject = new Map(roster.ok ? roster.value.map((child) => [child.subject_id, child]) : []);
+  for (const [key, spawn] of active) {
+    const subject = spawn.subjectId === undefined ? undefined : bySubject.get(spawn.subjectId);
+    const observed: RadarChildObservation = subject?.state === "live"
+      ? { kind: "live", subject }
+      : subject?.state === "detached"
+        ? { kind: "gone", subject }
+        : { kind: "unknown", diagnostic: roster.ok
+          ? `Radar has no live or detached child for ${spawn.subjectId ?? "this unresolved launch"}`
+          : `${roster.code}: ${roster.message}` };
+    observations.set(key, observed);
+  }
   return observations;
 }
 
 /**
- * An unproved child with an outstanding assignment is lost only when the daemon's
- * process verdict proves it gone. Its location still says nothing about the
- * process, so the verdict is the only thing that can change the observation.
+ * Why an observation is not a live child, in words an operator can act on. A
+ * gone child is Radar's verified end of the process, not a missing read.
  */
-async function gonePastUnproved(
-  client: RadarClient,
-  agentId: string,
-  unproved: RadarChildObservation & { kind: "unknown" },
-): Promise<RadarChildObservation> {
-  const verification = await readProcessGone(client, agentId);
-  return verification === undefined
-    ? unproved
-    : {
-        kind: "gone",
-        verification,
-        diagnostic: `the registered process is ${verification}; its assignment is outstanding`,
-      };
+function observationDiagnostic(
+  observation: Exclude<RadarChildObservation, { kind: "live" }>,
+): string {
+  return observation.kind === "unknown"
+    ? observation.diagnostic
+    : "Radar verified the child's process has ended";
 }
 
 async function radarObservationFor(
@@ -4209,9 +3966,9 @@ export function managedAgentPresence(radar?: RadarChildObservation): ManagedAgen
         "No Radar observation of this child exists in this session, so the daemon cannot prove its presence",
     };
   return radar.kind === "live"
-    ? { kind: "radar", evidence: radar.evidence }
+    ? { kind: "radar", evidence: radar.subject }
     : radar.kind === "gone"
-      ? { kind: "lost", processGone: radar.verification }
+      ? { kind: "lost", processGone: PROCESS_ENDED }
       : { kind: "unknown", diagnostic: radar.diagnostic };
 }
 
@@ -4722,27 +4479,29 @@ function resolveMessageFiles(
   );
 }
 async function recoverRadarCompletions(ctx: ExtensionContext, onlyId?: string): Promise<void> {
-  const port = radarCommunication;
+  const port = radarRuntime?.communication;
   if (!port) return;
-  const inbox = await port.inbox();
-  if (inbox.ok === false) throw new Error(`${inbox.code}: ${inbox.message}`);
   const owner = ctx.sessionManager.getSessionId();
   const spawns = [...radarSpawnFromEntries(ctx.sessionManager.getEntries()).values()];
+  const inbox = await port.inbox();
+  if (ctx.sessionManager.getSessionId() !== owner) return;
+  if (inbox.ok === false) throw new Error(`${inbox.code}: ${inbox.message}`);
   for (const id of inbox.value.handoff_ids) {
     if (onlyId !== undefined && id !== onlyId) continue;
     const response = await port.get(id);
+    if (ctx.sessionManager.getSessionId() !== owner) return;
     if (response.ok === false) throw new Error(`${response.code}: ${response.message}`);
     const handoff = response.value.handoff;
     const spawn = spawns.find((entry) => entry.stage === "bound" &&
       entry.ownerSessionId === owner && entry.runId === handoff.correlation_id &&
-      entry.agentId === handoff.sender.registration_id);
-    if (!spawn || !spawn.agentId) continue;
+      entry.subjectId === handoff.sender.subject_id);
+    if (!spawn || !spawn.subjectId) continue;
     if (handoff.id !== id)
       throw new Error("Radar inbox returned a different completion ID");
     // Local completion/handoff files are a cache of the broker record. Persist
     // them before receipt acknowledgement so an ack can never lose the payload.
     await persistAndAcknowledgeCompletion(port, handoff, {
-      runId: spawn.runId, agentId: spawn.agentId,
+      runId: spawn.runId, subjectId: spawn.subjectId,
     }, (report) => {
       // The worker's identity comes from its mailbox; the report bytes come from Radar.
       const mailbox = agentMailboxPath(spawn.workspaceId, spawn.label);
@@ -4771,7 +4530,7 @@ async function deliverResultUnsafe(
   const entries = ctx.sessionManager.getEntries();
   const spawn = radarSpawnFromEntries(entries).get(`${runtime.mailboxPath}\0${result.runId}`);
   let completion: Completion | undefined;
-  if (spawn?.stage === "bound" && spawn.agentId) {
+  if (spawn?.stage === "bound" && spawn.subjectId) {
     try {
       await recoverRadarCompletions(ctx, result.requestId);
     } catch (error) {
@@ -5609,22 +5368,14 @@ async function resolveRuntime(
   const launch = radarSpawnFromEntries(ctx.sessionManager.getEntries()).get(
     `${runtime.mailboxPath}\0${runtime.runId}`,
   );
-  if (launch?.agentId !== undefined) {
-    runtime.radarAgentId = launch.agentId;
-    runtime.radarLaunchGeneration = launch.generation;
-    if (launch.paneId !== undefined) runtime.radarSpawnPane = launch.paneId;
+  if (launch?.subjectId !== undefined) {
+    runtime.radarSubjectId = launch.subjectId;
+
   }
-  // A current read of the child is also the daemon's own statement of which
-  // process it is, which is what an assignment to it is addressed with.
   const presence = matches[0].presence;
-  if (runtime.radarAgentId !== undefined && presence.kind === "radar")
-    runtime.radarBoundProcess = {
-      source: presence.evidence.source,
-      incarnation: presence.evidence.incarnation,
-    };
   runtimes.set(runtime.label, runtime);
   validateIdentity(runtime, state);
-  if (runtime.radarAgentId !== undefined)
+  if (runtime.radarSubjectId !== undefined)
     validateRadarChild(runtime, operation);
   else requireLivePresence(presence, operation);
   return {
@@ -5670,33 +5421,33 @@ function runtimeForListedAgent(
   runtime.agentDefinition = agentDefinition;
   return runtime;
 }
-/** A lead's inspection, proved on its own registration, pane and session. */
+/** A lead's inspection, proved on its own subject, pane and session. */
 async function inspectLeadRecord(lead: {
-  agentId?: string;
+  subjectId?: string;
   lead: string;
   paneId: string;
 }) {
-  if (radarClient === undefined || lead.agentId === undefined)
+  if (
+    radarRuntime === undefined ||
+    lead.subjectId === undefined ||
+    (await provedSubject({
+      subjectId: lead.subjectId,
+      paneId: lead.paneId,
+      session: lead.lead,
+    })) === undefined
+  )
     throw new Error("Lead identity cannot be proved");
-  return inspectRadarChild(radarClient, {
-    agentId: lead.agentId,
-    paneId: lead.paneId,
-    session: lead.lead,
-  });
+  return radarRuntime.children.inspect(lead.subjectId);
 }
 async function captureManagedInspection(runtime: Runtime) {
-  const client = radarClient;
+  const children = radarRuntime?.children;
   if (
-    client === undefined ||
-    runtime.radarAgentId === undefined ||
-    runtime.radarSpawnPane === undefined
+    children === undefined ||
+    runtime.radarSubjectId === undefined
   )
     throw new Error("Inspection target is not a Radar-launched child");
   validateRadarChild(runtime, "inspect");
-  return inspectRadarChild(client, {
-    agentId: runtime.radarAgentId,
-    paneId: runtime.radarSpawnPane,
-  });
+  return children.inspect(runtime.radarSubjectId);
 }
 function normalizeCloseFailure(
   error: unknown,
@@ -5818,16 +5569,14 @@ async function processGoneForRelaunch(
     listed.state === "idle" ||
     listed.state === "unknown" ||
     state.activeRequestId !== undefined ||
-    radarClient === undefined
+    radarRuntime === undefined
   )
     return undefined;
   const mailbox = agentMailboxPath(state.workspaceId, state.agentLabel);
-  const agentId = radarSpawnFromEntries(ctx.sessionManager.getEntries()).get(
-    `${mailbox}\0${state.runId}`,
-  )?.agentId;
-  return agentId === undefined
-    ? undefined
-    : readProcessGone(radarClient, agentId);
+  const subject = radarSubjectOf(ctx, mailbox, state.runId);
+  if (subject === undefined) return undefined;
+  const observed = await radarRuntime.children.observe(subject);
+  return observed.kind === "gone" ? PROCESS_ENDED : undefined;
 }
 
 /**
@@ -5859,13 +5608,13 @@ function refusedCloseResidue(
 async function closeRadarChildPane(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
-  evidence: RadarChildEvidence | undefined,
+  evidence: RadarChild | undefined,
   state: ManagedAgentState,
   signal?: AbortSignal,
   relaunch = false,
 ): Promise<Runtime | undefined> {
-  const client = radarClient;
-  if (client === undefined)
+  const children = radarRuntime?.children;
+  if (children === undefined)
     fail(
       "internal_failure",
       `Agent Radar is unavailable, so ${state.agentLabel} cannot be closed`,
@@ -5887,67 +5636,65 @@ async function closeRadarChildPane(
   // whole operation, and the daemon answers the request it already holds before
   // it looks for the pane again. Nothing here derives an id, a pane or a child
   // from the absence of one.
-  if (evidence !== undefined)
-    requireRadarLaunchRecord(ctx, mailbox, state);
+  const launch =
+    evidence !== undefined
+      ? requireRadarLaunchRecord(ctx, mailbox, state)
+      : undefined;
   let close: RadarCloseEntry;
-  if (previous !== undefined) close = { ...previous, stage: "dispatched" };
-  else if (evidence !== undefined)
+  if (previous !== undefined) {
+    // A close recorded by an earlier build has no subject to resend to.
+    const subjectId =
+      (previous as Partial<RadarCloseEntry>).subjectId ?? launch?.subjectId;
+    if (subjectId === undefined)
+      fail(
+        "target_ambiguous",
+        `The earlier close of ${state.agentLabel} names no child to resend to`,
+        "close",
+      );
+    close = { ...previous, subjectId, stage: "dispatched" };
+  } else if (launch !== undefined) {
     close = {
       stage: "dispatched",
       requestId: randomUUID(),
-      spawnRequestId: evidence.request_id,
-      source: evidence.source,
-      incarnation: evidence.incarnation,
+      spawnRequestId: launch.requestId,
+      subjectId: launch.subjectId!,
       intent: "complete",
       runId: state.runId,
       label: state.agentLabel,
       ownerSessionId: state.ownerSessionId,
       mailbox,
     };
-  else
+  } else
     fail(
       "target_ambiguous",
       `Agent ${state.agentLabel} has no Radar presence to close and no dispatched close to reconcile`,
       "close",
     );
   pi.appendEntry(RADAR_CLOSE_ENTRY, close);
-  const answer = await client.childClose({
-    request_id: close.requestId,
-    spawn_request_id: close.spawnRequestId,
-    source: close.source,
-    incarnation: close.incarnation,
-    intent: close.intent,
-  });
-  if (answer.ok === false) {
+  // A resend after an unknown outcome reuses the stored request id, which is how
+  // Radar tells the same close from a second one.
+  const answer = await children.close(
+    close.subjectId,
+    close.intent,
+    close.requestId,
+  );
+  if (answer.outcome === "refused" || answer.outcome === "unknown") {
     pi.appendEntry(RADAR_CLOSE_ENTRY, {
       ...close,
-      stage: "unknown",
-      reason: `${answer.code}: ${answer.message}`,
-    });
-    fail(
-      "internal_failure",
-      `The managed close of ${state.agentLabel} is unresolved (${answer.code}: ${answer.message}); its pane, edge and mailbox stay as they are`,
-      "close",
-      { retryAttempted: false },
-    );
-  }
-  if (answer.value.outcome === "refused" || answer.value.outcome === "unknown") {
-    pi.appendEntry(RADAR_CLOSE_ENTRY, {
-      ...close,
-      stage: answer.value.outcome,
-      ...(answer.value.message !== undefined
-        ? { reason: answer.value.message }
+      stage: answer.outcome,
+      ...(answer.message !== undefined
+        ? { reason: answer.message }
         : {}),
     });
     // A refusal is a positive statement made before any effect, so it is not
     // authority in either direction: a relaunch goes on to the absence proof, and
     // the stored refusal names the pane it left behind.
-    if (answer.value.outcome === "refused" && relaunch) return cached;
-    if (answer.value.outcome === "refused")
+    if (answer.outcome === "refused" && relaunch) return cached;
+    if (answer.outcome === "refused")
       fail(
         "target_ambiguous",
         `The daemon refused to close ${state.agentLabel}: ${
-          answer.value.message ?? "the child is not eligible for a managed close"
+          answer.message ?? "the child is not eligible for a managed close"
         }`,
         "close",
       );
@@ -5966,9 +5713,9 @@ async function closeRadarChildPane(
   // same in both cases.
   pi.appendEntry(RADAR_CLOSE_ENTRY, {
     ...close,
-    stage: answer.value.outcome,
-    ...(answer.value.exit_observation !== undefined
-      ? { exitObservation: answer.value.exit_observation }
+    stage: answer.outcome,
+    ...(answer.exit_observation !== undefined
+      ? { exitObservation: answer.exit_observation }
       : {}),
   });
   // The child this close confirmed gone is the only thing the launch's record
@@ -6026,11 +5773,15 @@ async function closeManagedAgent(
       // A relaunch does not need a live pane: presence cannot prove the process, and
       // the absence proof in closeRadarChild decides whether the relaunch goes ahead.
       if (observation.kind !== "live" && !relaunch)
-        fail("target_ambiguous", observation.diagnostic, "close");
+        fail(
+          "target_ambiguous",
+          observationDiagnostic(observation),
+          "close",
+        );
       await closeRadarChild(
         pi,
         ctx,
-        observation.kind === "live" ? observation.evidence : undefined,
+        observation.kind === "live" ? observation.subject : undefined,
         current,
         signal,
         stopReport,
@@ -6063,7 +5814,7 @@ function requireRadarLaunchRecord(
   ctx: ExtensionContext,
   mailbox: string,
   state: ManagedAgentState,
-): void {
+): RadarSpawnEntry {
   const spawn = radarSpawnFromEntries(ctx.sessionManager.getEntries()).get(
     `${mailbox}\0${state.runId}`,
   );
@@ -6074,6 +5825,7 @@ function requireRadarLaunchRecord(
       "close",
       { ids: { label: state.agentLabel, paneId: state.paneId } },
     );
+  return spawn;
 }
 /**
  * The explicit close of a Radar-launched child: the same authorization, lock,
@@ -6083,7 +5835,7 @@ function requireRadarLaunchRecord(
 async function closeRadarChild(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
-  evidence: RadarChildEvidence | undefined,
+  evidence: RadarChild | undefined,
   state: ManagedAgentState,
   signal?: AbortSignal,
   stopReport?: StopReportCallbacks,
@@ -6132,11 +5884,19 @@ async function closeRadarChild(
       const launched = radarSpawnFromEntries(ctx.sessionManager.getEntries()).get(
         `${mailbox}\0${current.runId}`,
       );
-      const agentId = evidence?.registration_id ?? launched?.agentId;
+      const subject = launched?.subjectId;
+      const observed =
+        subject === undefined
+          ? undefined
+          : await radarRuntime?.children.observe(subject);
       const refusal =
-        agentId === undefined || radarClient === undefined
+        observed === undefined
           ? "the registered child is not known to this process"
-          : await relaunchRefusalForChild(radarClient, agentId);
+          : observed.kind === "gone"
+            ? undefined
+            : observed.kind === "live"
+              ? "the child's registered process is still running"
+              : `the child's registered process is not proved gone (${observationDiagnostic(observed)})`;
       if (refusal !== undefined)
         fail(
           "target_ambiguous",
@@ -6189,7 +5949,7 @@ async function closeRadarChild(
       }
     }
     try {
-      retireRadarSubject(current);
+      retireRadarSubject(radarSubjectOf(ctx, mailbox, current.runId));
       removeAgentMailbox(mailbox);
     } catch (error) {
       const message = `Agent pane closed but mailbox cleanup failed: ${String(error)}`;
@@ -6297,7 +6057,7 @@ async function closeManagedSnapshot(
         "Managed agent has a durable result; close result delivery first",
         "close",
       );
-    retireRadarSubject(current);
+    retireRadarSubject(radarSubjectOf(ctx, mailbox, current.runId));
     removeAgentMailbox(mailbox);
     dropSoftWindow(current.activeRequestId);
     invalidateCachedRuntime(current.agentLabel);
@@ -6510,7 +6270,7 @@ function restartDecidesPresence(
   return (
     radarSpawnFromEntries(ctx.sessionManager.getEntries()).get(
       `${mailbox}\0${state.runId}`,
-    )?.agentId !== undefined
+    )?.subjectId !== undefined
   );
 }
 
@@ -6652,12 +6412,18 @@ async function radarFreshPlacement(
   return physicalPlacement(scope);
 }
 
+/** A child Radar granted, with the mailbox state Herdsman's own startup wrote. */
+type RadarChildLaunched = RadarWorkerLaunched & { state: ManagedAgentState };
+
 /**
- * The Radar spawn and launch of one fresh child under this process's own pane.
+ * The Radar spawn and launch of one child under this process's own pane.
  * The spawn record is written before the daemon is dialed, so a launch that never
  * reports an outcome still leaves this process able to name the edge it may have
- * created. It resolves only once the child has bound and acknowledged this
- * generation. Continuation and restart both launch through it.
+ * created. Radar decides success: the launch is ready when the daemon granted the
+ * child's first presence, and it owns the deadline and the cleanup of a launch it
+ * withdraws. Herdsman then waits only for the child's own mailbox state, which is
+ * its application state and not a launch criterion. A released child is started
+ * again with `continues`, and Radar supplies its recorded session.
  */
 async function launchRadarChild(
   pi: ExtensionAPI,
@@ -6674,24 +6440,24 @@ async function launchRadarChild(
     agentDefinition: string;
     agentCwd: string;
     launchPlan: Extract<ManagedWorkerLaunchPlan, { ok: true }>;
-    sessionArgs: string[];
+    continues?: string;
+    restartSubject?: string;
   },
   report: RadarLaunchReport,
 ): Promise<{
   spawn: RadarSpawnEntry;
-  launch: RadarWorkerLaunched<ManagedAgentState>;
+  launch: RadarChildLaunched;
 }> {
   const { operation, runId, owner, label, workspaceId, mailbox, launchPlan } =
     input;
   const client = radarClient;
-  if (client === undefined)
+  const publication = radarRuntime?.publication;
+  if (client === undefined || publication === undefined)
     fail(
       "invalid_request",
       "Radar spawn is unavailable in this process",
       operation,
     );
-  const parent = await radarSpawnParent(input.parentPaneId);
-  if (parent.ok === false) fail("invalid_request", parent.message, operation);
   const childCommand = resolveChildCommand();
   if (childCommand.kind !== "resolved")
     fail(
@@ -6699,10 +6465,9 @@ async function launchRadarChild(
       `Radar spawn runs an executable this process resolved; set ${CHILD_COMMAND_ENV} to the command a fresh worker should run`,
       operation,
     );
-  const requested: RadarSpawnEntry = {
+  let requested: RadarSpawnEntry = {
     stage: "requested",
     requestId: randomUUID(),
-    generation: randomUUID(),
     runId,
     label,
     ownerSessionId: owner,
@@ -6715,88 +6480,95 @@ async function launchRadarChild(
     thinking: launchPlan.thinking,
   };
   report.spawn = requested;
-  // The request id and the launch generation reach this session before the
-  // daemon is dialed: a spawn whose outcome is never reported still leaves
-  // this process able to name the one edge it may have created.
+  // The request id reaches this session before the daemon is dialed: a spawn
+  // whose outcome is never reported still leaves this process able to name the
+  // one edge it may have created.
   pi.appendEntry(RADAR_SPAWN_ENTRY, requested);
-  let spawn = requested;
-  const launch = await launchRadarWorker({
+  const outcome = input.restartSubject !== undefined
+    ? await radarRuntime!.children.restart(input.restartSubject, {
+      executable: childCommand.command,
+      argv: ["--extension", RADAR_BASELINE_EXTENSION_PATH, "--extension", HERDSMAN_EXTENSION_PATH, ...launchPlan.launchArgs],
+      cwd: input.agentCwd,
+      env: radarLaunchEnvironment(launchPlan.env, input.parentPaneId),
+    }, { signal: input.signal })
+    : await launchRadarWorker({
     client,
-    readers: { readState: readAgentState, waitForState, startupAckMatches },
-    timeoutMs: radarLaunchTimeoutMs(),
+    publication,
     signal: input.signal,
     launch: {
       request_id: requested.requestId,
-      generation: requested.generation,
-      parent: parent.parent,
+      pane_id: input.parentPaneId,
       parent_session_id: ctx.sessionManager.getSessionId(),
       executable: childCommand.command,
-      argv: [
-        "--extension",
-        HERDSMAN_EXTENSION_PATH,
-        ...launchPlan.launchArgs,
-        ...input.sessionArgs,
-      ],
+      argv: ["--extension", RADAR_BASELINE_EXTENSION_PATH, "--extension", HERDSMAN_EXTENSION_PATH, ...launchPlan.launchArgs],
       cwd: input.agentCwd,
-      env: radarLaunchEnvironment(
-        launchPlan.env,
-        requested.generation,
-        parent.parent.location.pane,
-      ),
-      mailbox,
-      identity: { runId, ownerSessionId: owner, workspaceId, agentLabel: label },
-      // The child's own published subject is the second witness that the
-      // edge's bound id is this launch's child.
-      observedChildAgent: () =>
-        radarChildBinding({ runId, ownerSessionId: owner, agentLabel: label })
-          ?.registration_id,
-      // The daemon's binding is written before readiness is awaited, so a
-      // reload in the pre-ready window reads the exact subject and pane this
-      // launch created rather than inferring a location from the child's
-      // mailbox. A record that cannot be written throws, which leaves the launch
-      // unresolved instead of proceeding unproved.
-      onBound: (bound) => {
-        const record: RadarSpawnEntry = {
-          ...requested,
-          stage: "bound",
-          agentId: bound.registration_id,
-          paneId: bound.pane_id,
-        };
-        pi.appendEntry(RADAR_SPAWN_ENTRY, record);
-        // Assigned only once the record is durable: a launch that could not write
-        // its binding holds nothing about the child it created.
-        report.spawn = record;
-        spawn = record;
-      },
+      env: radarLaunchEnvironment(launchPlan.env, input.parentPaneId),
+      ...(input.continues !== undefined ? { continues: input.continues } : {}),
     },
   });
-  if (launch.kind !== "ready") {
-    // A launch that reached no outcome keeps its record unanswered: the daemon
-    // may still have created the pane this request id authored, so the failure
-    // names the edge and says it stands unresolved. A refusal is the one ending
-    // that proves no child was created, which releases the label for the next
-    // attempt.
-    report.unresolved = launch.kind === "unresolved";
-    if (launch.kind === "refused")
+  if (input.restartSubject !== undefined && outcome.kind !== "failed") {
+    // Restart owns its dispatch key inside pi-radar. Once returned, retain the
+    // daemon's launch key, rather than treating the local intent id as a spawn.
+    requested = { ...requested, requestId: outcome.kind === "ready" ? outcome.value.request_id : outcome.request_id };
+    pi.appendEntry(RADAR_SPAWN_ENTRY, requested);
+    report.spawn = requested;
+  }
+  if (outcome.kind !== "ready") {
+    // An unresolved launch keeps its request id and its unanswered record: the
+    // daemon may still have created the pane this request authored, and a
+    // retry under a fresh id would start a second child. A failed launch is
+    // already withdrawn by Radar, which releases the label for the next attempt.
+    report.unresolved = outcome.kind === "unresolved";
+    if (outcome.kind === "failed")
       appendSpawnOutcome(pi, ctx, {
         outcome: "refused",
         requestId: requested.requestId,
         runId,
         mailbox,
       });
-    fail("pane_not_ready", launch.message, operation);
+    fail("pane_not_ready", outcome.message, operation);
   }
-  // Readiness is the child's own acknowledgment, and from here its mailbox state
-  // is what proves this label occupied. Recording that ends the launch's unknown
-  // window so a launch which already produced a proved child does not hold the
-  // label once the child is closed.
+  // The subject and pane Radar granted are durable before anything waits on the
+  // child's own state, so a reload in that window reads the exact child.
+  let spawn: RadarSpawnEntry = {
+    ...requested,
+    stage: "bound",
+    subjectId: outcome.value.subject_id,
+    paneId: outcome.value.pane_id,
+  };
+  pi.appendEntry(RADAR_SPAWN_ENTRY, spawn);
+  report.spawn = spawn;
+  let state: ManagedAgentState;
+  try {
+    state = await waitForState(
+      mailbox,
+      (candidate) =>
+        candidate.runId === runId &&
+        candidate.ownerSessionId === owner &&
+        candidate.agentLabel === label &&
+        typeof candidate.piSessionId === "string" &&
+        candidate.piSessionId !== "",
+      { timeoutMs: radarMailboxWaitMs(), signal: input.signal },
+    );
+  } catch (error) {
+    fail(
+      "pane_not_ready",
+      `Radar granted ${label}, but its mailbox state never appeared: ${errorMessage(error)}`,
+      operation,
+    );
+  }
+  spawn = { ...spawn, piSessionId: state.piSessionId };
+  pi.appendEntry(RADAR_SPAWN_ENTRY, spawn);
+  report.spawn = spawn;
+  // The child's own state now proves this label occupied; recording that ends the
+  // launch's unknown window.
   appendSpawnOutcome(pi, ctx, {
     outcome: "ready",
     requestId: requested.requestId,
     runId,
     mailbox,
   });
-  return { spawn, launch: launch.value };
+  return { spawn, launch: { ...outcome.value, state } };
 }
 
 async function restartIdleManagedWorker(
@@ -6833,10 +6605,15 @@ async function restartIdleManagedWorker(
       "restart",
       { ids },
     );
-  if (typeof state.piSessionFile !== "string" || !state.piSessionFile)
+  const continuesSubject = radarSubjectOf(
+    ctx,
+    agentMailboxPath(state.workspaceId, label),
+    state.runId,
+  );
+  if (continuesSubject === undefined)
     fail(
       "agent_busy",
-      `${label} has no recorded Pi session to continue.`,
+      `${label} has no Radar subject recorded by this session to continue.`,
       "restart",
       { ids },
     );
@@ -6888,8 +6665,8 @@ async function restartIdleManagedWorker(
         { ids },
       );
     const placement = await radarFreshPlacement(ctx, scope, "restart");
-    // The relaunched process is a new generation with its own run, so the closed
-    // run's stored close can never be mistaken for this one's.
+    // The replacement process gets a new Herdsman run while Radar retains the
+    // same subject and its held assignment.
     const runId = randomUUID();
     const launchPlan = prepareManagedWorkerLaunch(ctx, {
       pi,
@@ -6928,18 +6705,9 @@ async function restartIdleManagedWorker(
         { ids },
       );
     }
-    let residue: string | undefined;
     try {
-      // The retained process is closed through the launch that created it, and a
-      // process is replaced only once the absence proof shows it gone.
-      await closeManagedAgent(pi, ctx, current, signal, undefined, true, true);
-      residue = refusedCloseResidue(
-        ctx.sessionManager.getEntries(),
-        mailbox,
-        current.runId,
-        current.paneId,
-      );
-      resetAgentMailbox(mailbox);
+      // Radar stops and replaces the child as one operation. A refusal leaves
+      // its mailbox and held assignment intact; there is no local pre-close.
       try {
         await launchRadarChild(
           pi,
@@ -6956,7 +6724,7 @@ async function restartIdleManagedWorker(
             agentDefinition: definitionName,
             agentCwd: cwd,
             launchPlan,
-            sessionArgs: ["--session", state.piSessionFile],
+            restartSubject: continuesSubject,
           },
           { unresolved: false },
         );
@@ -6972,8 +6740,8 @@ async function restartIdleManagedWorker(
         invalidateCachedRuntime(label);
         requestStatusRefresh?.();
       } catch (error) {
-        // The old process is already closed, so this is not a refusal: no named
-        // outcome is honest and the requester derives `unknown`.
+        // An incomplete restart stays visible. Do not turn it into another
+        // continue attempt or erase the old mailbox.
         throw new Error(
           `Restart of ${label} did not complete: ${errorMessage(error)}`,
         );
@@ -6984,7 +6752,7 @@ async function restartIdleManagedWorker(
     return {
       outcome: "restarted",
       effects: ["process_ended", "session_retained", "process_relaunched"],
-      message: `Restarted ${label} run ${runId} in a new pane.${residue === undefined ? "" : ` ${residue}`}`,
+      message: `Restarted ${label} run ${runId} in a new pane.`,
     };
   } finally {
     release?.();
@@ -7975,11 +7743,7 @@ async function completeAgent(
               ownerSessionId: owner, workspaceId: state.workspaceId,
               agentLabel: state.agentLabel, paneId: state.paneId,
               kind: "wrapup", text: id, createdAt: Date.now(),
-              address: {
-                subject: observation.evidence.registration_id,
-                source: observation.evidence.source, incarnation: observation.evidence.incarnation,
-                generation: radarSpawnFromEntries(ctx.sessionManager.getEntries()).get(`${mailbox}\0${state.runId}`)!.generation,
-              },
+              address: { subject: radarSubjectOf(ctx, mailbox, state.runId)! },
             });
           }
           const outcome = await waitForPreparation(owner, completion.preparationId, signal);
@@ -8271,7 +8035,22 @@ async function actionUnsafe(
         "Cannot continue the controller's currently active Pi session.",
         p.action,
       );
-    const sessionArgs = resumed ? ["--session", resumed.path] : [];
+    // Radar resumes only the caller's own released child, from its own record of
+    // the session; Herdsman sends no session path and keeps no second lookup.
+    const continuesSubject = resumed
+      ? [...radarSpawnFromEntries(ctx.sessionManager.getEntries()).values()]
+          .reverse()
+          .find(
+            (entry) =>
+              entry.piSessionId === resumed.id && entry.subjectId !== undefined,
+          )?.subjectId
+      : undefined;
+    if (resumed && continuesSubject === undefined)
+      fail(
+        "invalid_request",
+        `Session ${resumed.id} has no Radar subject recorded by this session, so Radar cannot continue it.`,
+        p.action,
+      );
     // The launch fingerprint describes the definition rather than one task, so
     // it reads the raw body and digests the files that body references. The
     // expanded body would fold in whichever files this assignment inlined.
@@ -8708,16 +8487,31 @@ async function actionUnsafe(
             agentDefinition,
             agentCwd,
             launchPlan,
-            sessionArgs,
+            ...(continuesSubject !== undefined
+              ? { continues: continuesSubject }
+              : {}),
           },
           radarLaunch,
         );
         const state = launch.state;
+        // The first task is addressed to the exact process Radar granted, read
+        // from the daemon's current answer for the child's subject: a replacement
+        // process answering in this child's place is refused before it runs
+        // anything.
+        const granted = await radarRuntime?.children.observe(
+          launch.subject_id,
+        );
+        if (granted?.kind !== "live")
+          fail(
+            "pane_not_ready",
+            `Radar granted ${label}, but its process is not proved live: ${granted === undefined ? "Radar is unavailable" : observationDiagnostic(granted)}`,
+            p.action,
+          );
         const runtime: Runtime = {
           label,
           workspaceId,
           paneId: radarPaneHandle(launch.pane_id),
-          radarSpawnPane: launch.pane_id,
+
           cwd: agentCwd,
           runId: state.runId,
           ownerSessionId: owner,
@@ -8725,30 +8519,16 @@ async function actionUnsafe(
           piSessionId: state.piSessionId,
           piSessionFile: state.piSessionFile,
           agentDefinition,
-          radarAgentId: launch.registration_id,
-          radarLaunchGeneration: spawn.generation,
-          // The process the daemon bound this edge to, from the same answer that
-          // named the child: the first task is addressed to it exactly as a
-          // retained continuation is, so a replacement process answering in this
-          // child's place is refused before it runs anything.
-          radarBoundProcess: launch.bound_process,
+          radarSubjectId: launch.subject_id,
           // What this launch passed to Pi. A Radar-spawned child has no Herdr
           // record, so its launch is the only source for these two facts.
           model: launchPlan.model,
           thinking: launchPlan.thinking,
         };
-        // Readiness is the child's own acknowledgment of this launch generation
-        // plus the state it wrote for itself, both of which the wait above
-        // required. The identity check keeps that agreement explicit before the
+        // Radar's granted presence and the state the child wrote for itself both
+        // stand. The identity check keeps that agreement explicit before the
         // assignment is handed over.
-        validateIdentity(runtime, state, {
-          workspace_id: workspaceId,
-          label,
-          pane_id: launch.pane_id,
-          cwd: agentCwd,
-          pi_session_id: state.piSessionId,
-          pi_session_path: state.piSessionFile,
-        });
+        validateIdentity(runtime, state);
         try {
           pi.appendEntry(WORKER_LAUNCH_ENTRY, {
             runId: state.runId,
@@ -8872,10 +8652,9 @@ async function actionUnsafe(
             ...error.detail.details,
             radarSpawn: {
               requestId: radarLaunch.spawn.requestId,
-              generation: radarLaunch.spawn.generation,
               ...(radarLaunch.unresolved ? { unresolved: true } : {}),
-              ...(radarLaunch.spawn.agentId
-                ? { agentId: radarLaunch.spawn.agentId }
+              ...(radarLaunch.spawn.subjectId
+                ? { subjectId: radarLaunch.spawn.subjectId }
                 : {}),
               ...(radarLaunch.spawn.paneId
                 ? { paneId: radarLaunch.spawn.paneId }
@@ -9286,24 +9065,21 @@ export default function (pi: ExtensionAPI): void {
       projection: unknown;
     }[],
   ): void => {
-    if (!radarPublication) return;
+    const children = radarRuntime?.children;
+    if (!children) return;
     const owner = ctx.sessionManager.getSessionId();
     // Radar needs no pane, no TUI and no Herdr: an owned assignment is published
     // wherever the owner's projection shows it.
     for (const { state, projection } of entries) {
       if (state.ownerSessionId !== owner) continue;
-      const binding = radarChildBinding(state);
-      // The child's own sidecar names its subject, but the owned assignment must
-      // still match it before this process writes that subject's channel.
-      if (
-        !binding ||
-        binding.run !== state.runId ||
-        binding.owner !== state.ownerSessionId ||
-        binding.label !== state.agentLabel
-      )
-        continue;
-      radarPublication
-        .assignment(binding.registration_id, owner)
+      const subject = radarSubjectOf(
+        ctx,
+        agentMailboxPath(state.workspaceId, state.agentLabel),
+        state.runId,
+      );
+      if (subject === undefined) continue;
+      children
+        .assignment(subject, owner)
         .update(assignmentSnapshot(state, projection));
     }
   };
@@ -9787,7 +9563,7 @@ export default function (pi: ExtensionAPI): void {
   ): void => {
     statusUi = ctx.ui;
     statusEntries.publish({
-      blocked: radarExecution?.blocked() ?? false,
+      blocked: radarRuntime?.execution.blocked() ?? false,
       running: !ctx.isIdle(),
       backgroundTasks: sessionBackgroundTasks(),
       subagents,
@@ -9893,7 +9669,7 @@ export default function (pi: ExtensionAPI): void {
   // publishPeerPresence proves it. Session-scoped: a record for another session
   // never carries it.
   let leadRadarRecord:
-    | Pick<LeadCoordinationState, "piSessionId" | "agentId" | "workspaceId" | "tabId" | "paneId">
+    | Pick<LeadCoordinationState, "piSessionId" | "subjectId" | "workspaceId" | "tabId" | "paneId">
     | undefined;
   const persistCoordinatorState = (): boolean => {
     try {
@@ -9999,11 +9775,11 @@ export default function (pi: ExtensionAPI): void {
     if (!isCurrent()) return;
     const identity = await radarLeadIdentity();
     if (!identity) return;
-    const { agentId, location } = identity;
+    const { subjectId, location } = identity;
     const { pane: paneId, tab: tabId, workspace: workspaceId } = location;
     leadRadarRecord = {
       piSessionId: sessionId,
-      agentId,
+      subjectId,
       workspaceId,
       tabId,
       paneId,
@@ -10031,7 +9807,7 @@ export default function (pi: ExtensionAPI): void {
         paneId,
         tabId,
         workspaceId,
-        agentId,
+        subjectId,
         ...(name ? { name } : {}),
         cwd: ctx.cwd,
         claim: lease.claim,
@@ -10237,11 +10013,10 @@ export default function (pi: ExtensionAPI): void {
   /** The Chief's descriptor agent, proved on its own registered pane and session. */
   const remoteChiefAgent = async (
     descriptor: ChiefDescriptor,
-  ): Promise<RadarAgentProcess | undefined> => {
-    if (radarClient === undefined || descriptor.agentId === undefined)
-      return undefined;
-    return provedRead(radarClient, {
-      agentId: descriptor.agentId,
+  ): Promise<{ activity?: string } | undefined> => {
+    if (descriptor.subjectId === undefined) return undefined;
+    return provedSubject({
+      subjectId: descriptor.subjectId,
       paneId: descriptor.paneId,
       session: descriptor.piSessionId,
     });
@@ -10373,7 +10148,7 @@ export default function (pi: ExtensionAPI): void {
         descriptor.claim.pid !== process.pid ||
         descriptor.piSessionId !== ctx.sessionManager.getSessionId() ||
         identity === undefined ||
-        descriptor.agentId !== identity.agentId ||
+        descriptor.subjectId !== identity.subjectId ||
         descriptor.paneId !== identity.location.pane ||
         descriptor.tabId !== identity.location.tab ||
         descriptor.workspaceId !== identity.location.workspace
@@ -10783,7 +10558,7 @@ export default function (pi: ExtensionAPI): void {
       throw new Error(
         "staff requires this lead's Radar registration in its tmux pane",
       );
-    const { agentId, location } = identity;
+    const { subjectId, location } = identity;
     let lease: ChiefLease;
     try {
       lease = claimChiefLease({
@@ -10792,7 +10567,7 @@ export default function (pi: ExtensionAPI): void {
         paneId: location.pane,
         tabId: location.tab,
         workspaceId: location.workspace,
-        agentId,
+        subjectId,
       });
     } catch (error) {
       if (error instanceof ProcessLockOccupiedError) {
@@ -11420,16 +11195,16 @@ export default function (pi: ExtensionAPI): void {
       subject: string;
       /** What the operator should do when the registration no longer proves it. */
       hint: string;
-      agentId: string | undefined;
+      subjectId: string | undefined;
       paneId: string;
       session: string;
     }): Promise<string | undefined> => {
       const radar = createRadarClient();
       const proved =
-        request.agentId === undefined
+        request.subjectId === undefined
           ? undefined
-          : await provedRead(radar, {
-              agentId: request.agentId,
+          : await provedSubject({
+              subjectId: request.subjectId,
               paneId: request.paneId,
               session: request.session,
             });
@@ -11467,7 +11242,7 @@ export default function (pi: ExtensionAPI): void {
       const notice = await focusProvedLocation({
         subject: "lead",
         hint: "reopen staff.",
-        agentId: lead.agentId,
+        subjectId: lead.subjectId,
         paneId: lead.paneId,
         session: lead.lead,
       });
@@ -11486,7 +11261,7 @@ export default function (pi: ExtensionAPI): void {
       const notice = await focusProvedLocation({
         subject: "chief",
         hint: "reopen the command.",
-        agentId: descriptor.agentId,
+        subjectId: descriptor.subjectId,
         paneId: descriptor.paneId,
         session: descriptor.piSessionId,
       });
@@ -12003,9 +11778,9 @@ export default function (pi: ExtensionAPI): void {
       const notice = await focusProvedLocation({
         subject: "selected agent",
         hint: "reopen Running.",
-        agentId:
+        subjectId:
           child?.presence.kind === "radar"
-            ? child.presence.evidence.registration_id
+            ? child.presence.evidence.subject_id
             : undefined,
         paneId: target.paneId,
         session: target.sessionId,
@@ -12963,7 +12738,7 @@ export default function (pi: ExtensionAPI): void {
             throw new Error(`Lead does not currently allow ${params.action}`);
           if (params.action === "inspect") {
             const evidence = await inspectLeadRecord({
-              agentId: lead.agentId,
+              subjectId: lead.subjectId,
               lead: reportSession(lead),
               paneId: lead.paneId,
             });
@@ -13322,10 +13097,9 @@ export default function (pi: ExtensionAPI): void {
             // subject it created, and the only Radar identity a reload has. A
             // child that is also listed in the inventory is proved against it
             // exactly as an unlisted one is.
-            ...(launch?.agentId !== undefined
+            ...(launch?.subjectId !== undefined
               ? {
-                  radarAgentId: launch.agentId,
-                  radarLaunchGeneration: launch.generation,
+                  radarSubjectId: launch.subjectId,
                 }
               : {}),
             // Presentation comes from the launch record; a canonical observation
@@ -14924,7 +14698,7 @@ export default function (pi: ExtensionAPI): void {
       name: "agent_continue",
       label: "agent continue",
       description:
-        "Start one bounded assignment from an exact historical managed-Agent Pi session. Recovers a proven-stopped worker, or continues the saved session of a worker closed at delivery, using its exact saved session. `task` must be a fresh, role-valid delegation-brief/v1 Markdown document. Prefer this over a fresh `agent_delegate` when a retained worker already holds the relevant context.",
+        "Start one bounded assignment from an exact historical managed-Agent Pi session. Recovers a proven-stopped worker, or continues the saved session of a worker closed at delivery. `task` must be a fresh, role-valid delegation-brief/v1 Markdown document. Prefer this over a fresh `agent_delegate` when a retained worker already holds the relevant context.",
       parameters: agentContinueParameters,
       promptSnippet: "Resume an exact saved Agent session with a new bounded assignment",
       promptGuidelines: undefined,
@@ -15203,7 +14977,7 @@ export default function (pi: ExtensionAPI): void {
     }
   }
   if (processRole !== "managed-agent") {
-    void initializeRadarPublication(pi);
+    connectRadarRuntime(pi);
     return;
   }
   agentControllerReady = false;
@@ -15424,26 +15198,19 @@ export default function (pi: ExtensionAPI): void {
     runtimes.clear();
   };
   /**
-   * The address this process can be held to: the subject its own registration
-   * resolved to, the source and incarnation the process-local slot holds, and
-   * the launch generation it was spawned with. The incarnation comes from that
-   * slot and not from any record on disk, so a process that replaced this one in
-   * the same mailbox - same run, pane, label and session - is not this address.
-   * A process no Radar launch produced has no address at all, and an addressed
-   * request is never accepted by one.
+   * The address this child can be held to: the subject Radar granted it. The
+   * subject outlives the process, and a replacement of this child is the same
+   * subject, so an assignment held for it is delivered to the replacement. A
+   * process without a granted subject has no address and never accepts an
+   * addressed request.
    */
   const localAssignmentAddress = (): RequestAddress | undefined => {
-    const generation = RADAR_LAUNCH_GENERATION;
-    if (generation === undefined || state === undefined) return undefined;
-    const binding = radarChildBinding(state);
-    if (binding === undefined || !isUuid(binding.registration_id)) return undefined;
-    const registration = radarLocalRegistration();
-    return {
-      subject: binding.registration_id,
-      source: registration.source,
-      incarnation: registration.incarnation,
-      generation,
-    };
+    if (state === undefined) return undefined;
+    // The subject is Radar's answer and arrives asynchronously; the pump keeps
+    // refreshing it, and a request that needs it waits until it is known.
+    if (radarOwnSubjectId === undefined || !isUuid(radarOwnSubjectId))
+      return undefined;
+    return { subject: radarOwnSubjectId };
   };
   const acknowledge = (
     requestId: string,
@@ -15533,6 +15300,13 @@ export default function (pi: ExtensionAPI): void {
   });
   const pumpRequest = (ctx: ExtensionContext): void => {
     if (!initialized || !state) return;
+    if (radarOwnSubjectId === undefined)
+      void radarRuntime?.publication
+        .subject()
+        .then((subject) => {
+          radarOwnSubjectId = subject?.subject_id;
+        })
+        .catch(() => undefined);
     try {
       const request = readUnacknowledgedRequest(
         process.env.PI_HERDSMAN_MAILBOX!,
@@ -15886,7 +15660,6 @@ export default function (pi: ExtensionAPI): void {
       pumpRequest(ctx);
       requestPumpTimer = setInterval(() => pumpRequest(ctx), 250);
       requestPumpTimer.unref?.();
-      acknowledgeRadarLaunch(pi, ctx, state, mailbox);
       if (!delegationEnabled && ctx.mode === "tui" && ctx.hasUI) {
         const generation = leafStatusGeneration;
         leafStatusContext = ctx;
@@ -16022,6 +15795,14 @@ export default function (pi: ExtensionAPI): void {
     // still not that process, so it refuses the assignment rather than running
     // it: the request stays unanswered for its owner instead of being executed
     // by a process the owner did not address.
+    // Radar has not yet named this process's subject: leave the request
+    // unanswered, and the pump presents it again once the subject is known.
+    if (
+      request.address !== undefined &&
+      radarRuntime !== undefined &&
+      radarOwnSubjectId === undefined
+    )
+      return { action: "handled" };
     if (
       request.address !== undefined &&
       !sameRequestAddress(request.address, localAssignmentAddress())
@@ -16031,7 +15812,7 @@ export default function (pi: ExtensionAPI): void {
         false,
         ctx,
         "identity",
-        "Request was addressed to another Radar process incarnation",
+        "Request was addressed to another Radar subject",
       );
       return { action: "handled" };
     }
@@ -17181,12 +16962,12 @@ export default function (pi: ExtensionAPI): void {
           piSessionId: ctx.sessionManager.getSessionId(),
           piSessionFile: ctx.sessionManager.getSessionFile(),
         };
-        if (RADAR_SPAWN_TOKEN !== undefined) {
+        if (process.env.PI_RADAR_MANAGED_PARENT_SUBJECT_ID !== undefined) {
           handoffPublishing = true;
           resultWriteAttempts = 0;
-          if (!radarCommunication || !process.env.PI_RADAR_MANAGED_PARENT_SUBJECT_ID)
+          if (!radarRuntime || !process.env.PI_RADAR_MANAGED_PARENT_SUBJECT_ID)
             throw new Error("Managed worker has no Radar handoff destination");
-          await publishCompletionHandoff(radarCommunication, current);
+          await publishCompletionHandoff(radarRuntime.communication, current);
         } else {
           persistCompletion(current, source);
         }
@@ -17196,7 +16977,7 @@ export default function (pi: ExtensionAPI): void {
         finalizeStateTransition(ctx, true);
         // If publication succeeded but the process died before durable state
         // settlement, keep the staged result so restart recovery can finish it.
-        if (RADAR_SPAWN_TOKEN !== undefined && state?.activeRequestId === undefined &&
+        if (process.env.PI_RADAR_MANAGED_PARENT_SUBJECT_ID !== undefined && state?.activeRequestId === undefined &&
             state?.completedRequestId === current.requestId)
           removeResult(mailbox, current.requestId);
       } catch (error) {
@@ -17522,5 +17303,9 @@ export default function (pi: ExtensionAPI): void {
     stateRetryTimer = undefined;
   });
 
-  void initializeRadarPublication(pi);
+  // Each extension instance has its own event bus, so it has its own runtime.
+  radarRuntime = undefined;
+  radarRuntimeStarting = false;
+  radarOwnSubjectId = undefined;
+  connectRadarRuntime(pi);
 }

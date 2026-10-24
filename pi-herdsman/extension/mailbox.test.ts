@@ -193,11 +193,7 @@ test("V5 markers are emitted while V4 markers remain explicitly versioned", () =
   assert.equal(parseControlMarker("__PI_HERDSMAN_AGENT_V5__:bad"), undefined);
   assert.equal(parseControlMarker("__PI_HERDSMAN_AGENT_V5__:"), undefined);
 });
-/**
- * One address, as a launch writes it: the subject its child registered, the
- * source that registration names, the process incarnation it holds and the
- * generation that produced it.
- */
+/** One address, as a launch writes it: the subject Radar bound to the child. */
 const addressedRequest = (
   address: RequestAddress,
   overrides: Partial<RequestRecord> = {},
@@ -215,49 +211,39 @@ const addressedRequest = (
   createdAt: Date.now(),
   ...overrides,
 });
-const processAddress = (): RequestAddress => ({
-  subject: randomUUID(),
-  source: "herdsman-pi",
-  incarnation: randomUUID(),
-  generation: randomUUID(),
-});
+const processAddress = (): RequestAddress => ({ subject: randomUUID() });
 
-test("an addressed request round-trips and names one exact process", () => {
+test("an addressed request round-trips and names one exact child", () => {
   const path = mkdtempSync(join(tmpdir(), "pi-herdsman-mailbox-test-"));
   const address = processAddress();
   const request = addressedRequest(address);
   writeMailboxRequest(path, request);
   assert.deepEqual(readRequest(path, request.requestId), request);
   assert.equal(sameRequestAddress(address, { ...address }), true);
-  // Every field is part of the process: a mailbox, pane, session or label that
-  // matches is not one, so no difference between two addresses is ignorable.
-  for (const field of [
-    "subject",
-    "source",
-    "incarnation",
-    "generation",
-  ] as const)
-    assert.equal(
-      sameRequestAddress(address, { ...address, [field]: randomUUID() }),
-      false,
-      `${field} must be compared`,
-    );
+  // A mailbox, pane, session or label that matches is not a child, so only the
+  // subject names one.
+  assert.equal(
+    sameRequestAddress(address, { subject: randomUUID() }),
+    false,
+    "another subject is another child",
+  );
   assert.equal(
     sameRequestAddress(address, undefined),
     false,
-    "a missing address is never this process",
+    "a missing address is never this child",
   );
   assert.equal(sameRequestAddress(undefined, address), false);
 });
 
-test("an address must be exactly the four process fields", () => {
+test("an address must be exactly the subject", () => {
   const path = mkdtempSync(join(tmpdir(), "pi-herdsman-mailbox-test-"));
   const address = processAddress();
   const { subject: _subject, ...withoutSubject } = address;
   const invalid: unknown[] = [
     withoutSubject,
     { ...address, subject: "  " },
-    { ...address, incarnation: 7 },
+    { subject: 7 },
+    { ...address, source: "herdsman-pi" },
     { ...address, extra: "field" },
     "not-an-object",
     null,
@@ -370,8 +356,7 @@ test("an acknowledgement echoes an address or nothing at all", () => {
     },
   });
   assert.deepEqual(readAgentState(path)?.lastAck?.identity, address);
-  const { incarnation: _incarnation, ...withoutIncarnation } = address;
-  for (const bad of [withoutIncarnation, { ...address, subject: "" }, "echo"])
+  for (const bad of [{}, { ...address, subject: "" }, { ...address, generation: "g" }, "echo"])
     assert.throws(
       () =>
         writeAgentState(path, {

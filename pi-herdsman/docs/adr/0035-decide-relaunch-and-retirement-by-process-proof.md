@@ -1,10 +1,18 @@
 # Decide relaunch and retirement by process proof
 
+Status: amended for the subject path. The verdict comes from
+`children.observe(subject)`, which answers live, gone or unknown, and replacement
+runs through `children.restart` rather than a close followed by a launch. The rule
+below still governs: no close outcome or listing state is authority, and only a
+verdict from Radar grants permission. A subject the daemon cannot read is `unknown`
+and permits nothing.
+
 ## Decision
 
 **Only a process verdict grants permission.** A Radar-launched child may be
-relaunched, or retired by close, only when `agent.get` reports its registered
-process `absent` or `mismatched`. Nothing else grants it.
+relaunched, or retired by close, only when `children.observe(subject)` reports it
+`gone`. Nothing else grants it. (Before the subject path this verdict came from
+`agent.get`; the principle did not change with the source.)
 
 **Close outcomes and listing state are never authority, in either direction.**
 A `completed`, `already_exited` or `refused` close neither permits nor vetoes a

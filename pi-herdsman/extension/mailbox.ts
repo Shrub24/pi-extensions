@@ -59,25 +59,7 @@ export interface ManagedAgentState {
     identity?: RequestAddress;
     acknowledgedAt: number;
   };
-  startupAck?: StartupAck;
   updatedAt: number;
-}
-/**
- * The child's own statement that Herdsman startup finished for one launch. It
- * is written only after the state write and the controller/runtime
- * initialization a fresh worker needs before it can take an assignment, and it
- * names the launch generation that produced it, so an owner can tell this
- * launch's readiness from any earlier one in the same mailbox.
- */
-export interface StartupAck {
-  generation: string;
-  runId: string;
-  ownerSessionId: string;
-  workspaceId: string;
-  agentLabel: string;
-  paneId: string;
-  piSessionId: string;
-  acknowledgedAt: number;
 }
 export interface ResultPersistenceError {
   code: "write_failure";
@@ -96,18 +78,15 @@ export interface ResultPersistenceError {
   nextAction: string;
 }
 /**
- * The one exact process an assignment is addressed to. A Radar child is a
- * process, not a mailbox: this names the subject the originating launch bound,
- * the source and incarnation that child's own registration carries, and the
- * launch generation that produced it. A retained assignment carries it so the
- * process that answers can be held to being the one it was meant for, and an
- * owner can tell that process's own echo from any other.
+ * The one child an assignment is addressed to: the subject Radar bound to the
+ * originating launch, held as an opaque string. A subject outlives its process,
+ * and Radar carries a held assignment to a replacement, so the address names
+ * the child and never one of its processes. A retained assignment carries it so
+ * the child that answers can be held to being the one it was meant for, and an
+ * owner can tell that child's own echo from any other.
  */
 export interface RequestAddress {
   subject: string;
-  source: string;
-  incarnation: string;
-  generation: string;
 }
 export interface RequestRecord {
   /**
@@ -371,12 +350,7 @@ function ensure(path: string): void {
 function invalidRequestAddress(value: unknown): boolean {
   if (typeof value !== "object" || value === null) return true;
   const address = value as Record<string, unknown>;
-  const fields: Array<keyof RequestAddress> = [
-    "subject",
-    "source",
-    "incarnation",
-    "generation",
-  ];
+  const fields: Array<keyof RequestAddress> = ["subject"];
   return (
     Object.keys(address).some(
       (key) => !fields.includes(key as keyof RequestAddress),
@@ -457,7 +431,6 @@ function validate(
           "completedRequestId",
           "resultError",
           "lastAck",
-          "startupAck",
           "updatedAt",
         ]
       : kind === "request"
@@ -752,37 +725,6 @@ function validate(
         throw new Error("Invalid acknowledgement message");
       if (ack.identity !== undefined && invalidRequestAddress(ack.identity))
         throw new Error("Invalid acknowledgement identity");
-    }
-    if (v.startupAck !== undefined) {
-      const ack = v.startupAck as Record<string, unknown>;
-      const ackKeys = [
-        "generation",
-        "runId",
-        "ownerSessionId",
-        "workspaceId",
-        "agentLabel",
-        "paneId",
-        "piSessionId",
-        "acknowledgedAt",
-      ];
-      if (
-        Object.keys(ack).some((key) => !ackKeys.includes(key)) ||
-        typeof ack.generation !== "string" ||
-        !ack.generation.trim() ||
-        ack.runId !== v.runId ||
-        ack.ownerSessionId !== v.ownerSessionId ||
-        ack.workspaceId !== v.workspaceId ||
-        ack.agentLabel !== v.agentLabel ||
-        ack.paneId !== v.paneId ||
-        ack.piSessionId !== v.piSessionId
-      )
-        throw new Error("Invalid startup acknowledgment");
-      if (
-        typeof ack.acknowledgedAt !== "number" ||
-        !Number.isFinite(ack.acknowledgedAt) ||
-        ack.acknowledgedAt < 0
-      )
-        throw new Error("Invalid startup acknowledgment timestamp");
     }
   } else if (kind === "request") {
     if (
@@ -1168,74 +1110,16 @@ export function agentStatePath(path: string): string {
   return file(path, "state.json");
 }
 /**
- * Records that Herdsman startup finished for one launch generation. The state
- * must already name this exact identity: an acknowledgment records a fresh
- * launch, so it never creates state and never rewrites a mailbox that belongs to
- * another run or pane. The caller holds the mailbox's assignment lock, which is
- * what makes the read and the write one transition.
- */
-export function writeStartupAck(path: string, ack: StartupAck): void {
-  const state = readAgentState(path);
-  if (!state) throw new Error("Agent state is unavailable");
-  if (
-    state.runId !== ack.runId ||
-    state.ownerSessionId !== ack.ownerSessionId ||
-    state.workspaceId !== ack.workspaceId ||
-    state.agentLabel !== ack.agentLabel ||
-    state.paneId !== ack.paneId ||
-    state.piSessionId !== ack.piSessionId
-  )
-    throw new Error("Agent identity changed before startup acknowledgment");
-  writeAgentState(path, { ...state, startupAck: ack, updatedAt: Date.now() });
-}
-
-/**
- * Whether this state carries exactly the acknowledgment one launch waits for.
- * Every known field is compared, and the acknowledgment must also name the
- * session this state does: readiness is one launch's own statement, and a
- * mailbox left over from another run, pane or session cannot answer for it.
- */
-export function startupAckMatches(
-  state: ManagedAgentState | undefined,
-  expected: {
-    generation: string;
-    runId: string;
-    ownerSessionId: string;
-    workspaceId: string;
-    agentLabel: string;
-    paneId: string;
-  },
-): boolean {
-  const ack = state?.startupAck;
-  return (
-    ack !== undefined &&
-    state !== undefined &&
-    ack.piSessionId === state.piSessionId &&
-    ack.generation === expected.generation &&
-    ack.runId === expected.runId &&
-    ack.ownerSessionId === expected.ownerSessionId &&
-    ack.workspaceId === expected.workspaceId &&
-    ack.agentLabel === expected.agentLabel &&
-    ack.paneId === expected.paneId
-  );
-}
-/**
- * Whether two addresses name the same exact process. Every field is compared: a
- * mailbox, pane, label or session that matches is not a process, so an address
- * that cannot be compared - a missing one, or a generation or incarnation that
- * differs - is never the process this one names.
+ * Whether two addresses name the same child. A mailbox, pane, label or session
+ * that matches is not a child, so an address that cannot be compared - a missing
+ * one - is never the child this one names.
  */
 export function sameRequestAddress(
   left: RequestAddress | undefined,
   right: RequestAddress | undefined,
 ): boolean {
   return (
-    left !== undefined &&
-    right !== undefined &&
-    left.subject === right.subject &&
-    left.source === right.source &&
-    left.incarnation === right.incarnation &&
-    left.generation === right.generation
+    left !== undefined && right !== undefined && left.subject === right.subject
   );
 }
 export function readAgentState(path: string): ManagedAgentState | undefined {

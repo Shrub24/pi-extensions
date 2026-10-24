@@ -6,17 +6,11 @@
  * worker does with a request. These tests run the extension's request pump
  * itself, which is the only place the pre-execution refusal and the exact
  * identity echo can be proved.
- *
- * The launch generation is captured when the extension module loads, so this
- * file sets it before anything imports the extension: it is its own test
- * process, and no earlier import can have run.
  */
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import test, { beforeEach } from "node:test";
 
-const LAUNCH_GENERATION = randomUUID();
-process.env.PI_HERDSMAN_LAUNCH_GENERATION = LAUNCH_GENERATION;
 process.env.PI_HERDSMAN_PARENT_PANE_ID = "another-pane";
 
 const {
@@ -56,28 +50,26 @@ function fireShutdown(agent: {
 beforeEach(() => setConfigField("retainWorkers", false));
 
 /**
- * The worker's own address, assembled the way the daemon sees the process: the
- * subject it registered for this incarnation, the source it registered under,
- * the process-local incarnation, and the generation this launch was spawned
- * with. A test builds the request from this, so the positive case proves the
- * worker holds itself to exactly that address.
+ * The worker's own address, as the daemon sees it: the subject it was granted
+ * for this process. A test builds the request from this, so the positive case
+ * proves the worker holds itself to exactly that address.
  */
 async function workerAddress(daemon: FakeRadarDaemon): Promise<RequestAddress> {
   const incarnation = radarProcessIncarnation();
   for (let attempt = 0; attempt < 200; attempt += 1) {
-    const subject = [...daemon.subjects.entries()].find(
-      ([, registered]) => registered.incarnation === incarnation,
+    const registration = [...daemon.subjects.values()].find(
+      (registered) => registered.incarnation === incarnation,
     );
-    if (subject)
-      return {
-        subject: subject[0],
-        source: String(subject[1].source),
-        incarnation,
-        generation: LAUNCH_GENERATION,
-      };
+    // Radar's answer to the registration's session names the subject.
+    const subject = [...daemon.subjects.entries()].find(
+      ([, granted]) =>
+        granted.source === "session" &&
+        granted.incarnation === registration?.session,
+    );
+    if (registration && subject) return { subject: subject[0] };
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  throw new Error("the worker never registered as a Radar subject");
+  throw new Error("the worker never registered as a Radar subject ");
 }
 
 /** Let the worker's own 250 ms request pump see the request. */
@@ -250,17 +242,13 @@ test("an unaddressed wrapup request is rejected before it can reach a worker", a
   } finally { fireShutdown(worker); resetAgentMailbox(mailbox); }
 });
 
-test("a worker refuses an assignment addressed to another incarnation of itself", async () => {
+test("a worker refuses an assignment addressed to another child", async () => {
   const { mailbox, daemon, worker } = await startedWorker("addressed-worker");
   try {
-    const address = await workerAddress(daemon);
-    // Same mailbox, same run, same subject and same launch generation: the
-    // answering process is the one this request should have reached, and the
-    // incarnation alone says it is not.
-    const request = assignmentRequest(mailbox, {
-      ...address,
-      incarnation: randomUUID(),
-    });
+    await workerAddress(daemon);
+    // Same mailbox and run, another subject: the answering child is not the one
+    // this request was meant for, and the subject alone says so.
+    const request = assignmentRequest(mailbox, { subject: randomUUID() });
     writeRequest(mailbox, request);
     await settle();
 
@@ -283,7 +271,7 @@ test("a worker refuses an assignment addressed to another incarnation of itself"
   }
 });
 
-test("a worker accepts an assignment addressed to its own process and echoes it", async () => {
+test("a worker accepts an assignment addressed to its own subject and echoes it", async () => {
   const { mailbox, daemon, worker } = await startedWorker("own-address-worker");
   try {
     const address = await workerAddress(daemon);

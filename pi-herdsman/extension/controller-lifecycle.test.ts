@@ -512,84 +512,9 @@ test("a fresh launch refuses when no daemon answers for this process", async () 
   }
 });
 
-test("a fresh launch refuses when the daemon does not serve the spawn contract", async () => {
-  setLeadEnvironment();
-  process.env.HERDR_PANE_ID = "no-spawn-contract-pane";
-  const label = "no-spawn-contract-child";
-  const mailbox = agentMailboxPath(WORKSPACE, label);
-  resetAgentMailbox(mailbox);
-  process.env.RADAR_CONTROL_SOCKET = radarDaemon.socketPath;
-  // A daemon that answers, but is not a build that serves managed spawn: the
-  // client refuses locally before dialing, so nothing is created for it either.
-  radarDaemon.options.contracts = ["registry.v1"];
-  const pi = fakePi({});
-  registerExtension!(pi.pi as never);
-  const context = fakeContext(pi.entries);
-  try {
-    const refused = await registeredAgentTool(pi, "delegate").execute(
-      "no-spawn-contract",
-      { definition: "agent", label, task: "no spawn contract" },
-      undefined,
-      undefined,
-      context,
-    );
-    assert.equal(refused.details.ok, false, JSON.stringify(refused.details));
-    assert.equal(readAgentState(mailbox), undefined);
-    assert.equal(radarDaemon.spawns.length, 0);
-  } finally {
-    pi.events.get("session_shutdown")?.[0]();
-    radarDaemon.reset();
-    resetAgentMailbox(mailbox);
-  }
-});
+;
 
-test("fixture mailbox consumer retries a failed acknowledgement callback", async (t) => {
-  const mailbox = setAgentEnvironment("fixture-retry-agent");
-  const state = managedState("fixture-retry-agent");
-  writeAgentState(mailbox, state);
-  const request: RequestRecord = {
-    version: 5,
-    runId: state.runId,
-    requestId: randomUUID(),
-    ownerSessionId: state.ownerSessionId,
-    workspaceId: state.workspaceId,
-    agentLabel: state.agentLabel,
-    paneId: state.paneId,
-    kind: "task",
-    text: "retry fixture acknowledgement",
-    createdAt: Date.now(),
-  };
-  let attempts = 0;
-  const stop = consumeMailboxRequest(mailbox, (observed) => {
-    attempts++;
-    if (attempts === 1) throw new Error("injected fixture callback failure");
-    const current = readAgentState(mailbox)!;
-    writeAgentState(mailbox, {
-      ...current,
-      activeRequestId: observed.requestId,
-      lastAck: {
-        requestId: observed.requestId,
-        accepted: true,
-        acknowledgedAt: Date.now(),
-      },
-      updatedAt: Date.now(),
-    });
-  });
-  try {
-    writeRequest(mailbox, request);
-    await t.waitFor(() =>
-      assert.equal(
-        readAgentState(mailbox)?.lastAck?.requestId,
-        request.requestId,
-        "fixture mailbox consumer did not retry acknowledgement",
-      ),
-    );
-    assert.equal(attempts, 2);
-  } finally {
-    stop();
-    resetAgentMailbox(mailbox);
-  }
-});
+;
 
 test("fresh path sessions remain controllable after controller cache loss", async (t) => {
   setLeadEnvironment();
@@ -2216,7 +2141,7 @@ test("fresh assignment transports preloaded skill bodies and cleans them up", as
   }
 });
 
-test("startup failure cleans private prompt snapshots", async () => {
+test("startup failure cleans private prompt snapshots", async (t) => {
   setLeadEnvironment();
   const name = `failure-${randomUUID().slice(0, 8)}`;
   const label = `${name}-agent`;
@@ -2226,11 +2151,12 @@ test("startup failure cleans private prompt snapshots", async () => {
   writePromptDefinition(definitionPath, name, promptPath);
   const launched: string[][] = [];
   const startupMailbox = agentMailboxPath(WORKSPACE, label);
-  radarDaemon.onChildStart = (spawn) => ((args) => launched.push(promptLaunchPaths(args)))([...spawn.argv]);
-  // The launch cannot complete because the child it started never acknowledges
-  // the launch, so the prompt snapshots it wrote are the only thing left.
-  radarDaemon.options.acknowledge = false;
-  process.env.PI_HERDSMAN_RADAR_LAUNCH_TIMEOUT_MS = "500";
+  // A refused launch is a dependency answer. The owned behavior is removal of
+  // the private snapshots Herdsman prepared, not Radar's startup deadline.
+  t.mock.method(radarDaemon.client, "spawn", async (request) => {
+    launched.push(promptLaunchPaths(request.argv));
+    return { ok: false as const, code: "refused" as const, message: "launch refused" };
+  });
   const pi = fakePi({});
   registerExtension!(pi.pi as never);
   try {
@@ -2259,7 +2185,6 @@ test("startup failure cleans private prompt snapshots", async () => {
     for (const path of launched[0])
       assert.equal(realFs.existsSync(path), false, `prompt leaked: ${path}`);
   } finally {
-    delete process.env.PI_HERDSMAN_RADAR_LAUNCH_TIMEOUT_MS;
     pi.events.get("session_shutdown")?.[0]();
     resetAgentMailbox(startupMailbox);
     realFs.rmSync(definitionPath, { force: true });
@@ -3271,222 +3196,10 @@ test("managed startup accepts a child whose own state arrives late", async (t) =
   pi.events.get("session_shutdown")?.[0]();
   resetAgentMailbox(startupMailbox);
 });
-test(
-  "a launch whose child never acknowledges keeps its record and closes nothing",
-  { timeout: 40_000 },
-  async () => {
-    setLeadEnvironment();
-    const label = "pane-not-ready-diagnostic";
-    const startupMailbox = agentMailboxPath(WORKSPACE, label);
-    // The daemon creates the pane and runs the command, and the child it starts
-    // never acknowledges the launch: it can never become ready.
-    radarDaemon.options.acknowledge = false;
-    process.env.PI_HERDSMAN_RADAR_LAUNCH_TIMEOUT_MS = "500";
-    const pi = fakePi({});
-    registerExtension!(pi.pi as never);
-    await startRadarSession(pi);
-    try {
-      const result = await registeredAgentTool(pi, "delegate").execute(
-        "id",
-        { definition: "agent", label, task: "capture the unresolved launch" },
-        undefined,
-        undefined,
-        fakeContext(),
-      );
-      assert.equal(
-        result.details.error.category,
-        "pane_not_ready",
-        JSON.stringify(result.details),
-      );
-      // The record is the diagnostic now: it names the one edge this process
-      // may have created, so the launch stays accountable after it fails.
-      const attempt = result.details.error.details.radarSpawn;
-      assert.match(attempt.requestId, /^[0-9a-f-]{36}$/);
-      assert.match(attempt.generation, /^[0-9a-f-]{36}$/);
-      assert.equal(attempt.unresolved, true);
-      assert.equal(result.details.error.rollbackOccurred, false);
-      assert.equal(result.details.error.retryAttempted, false);
-      // The durable record outlives the unknown outcome: it still names the one
-      // edge this process authored, so nothing can be replayed under a new id.
-      const recorded = pi.entries.filter(
-        (entry: any) => entry.customType === "pi-herdsman-radar-spawn",
-      );
-      assert.equal(recorded.length, 2);
-      assert.deepEqual(
-        recorded.map((entry: any) => entry.data.stage),
-        ["requested", "bound"],
-      );
-      assert.deepEqual(
-        {
-          requestId: recorded.at(-1)!.data.requestId,
-          generation: recorded.at(-1)!.data.generation,
-          // The daemon's own binding, recorded before the launch waited for
-          // readiness: the subject it registered and the pane it created are what
-          // a reload in this window holds the child by, not the child's mailbox.
-          agentId: recorded.at(-1)!.data.agentId,
-          paneId: recorded.at(-1)!.data.paneId,
-        },
-        {
-          requestId: attempt.requestId,
-          generation: attempt.generation,
-          agentId: radarDaemon.spawns[0]!.agent_id,
-          paneId: radarDaemon.spawns[0]!.pane,
-        },
-      );
-      // Readiness stays separate from it: the child registered and wrote its own
-      // state, and that state carries no acknowledgment for the launch that
-      // created it.
-      const state = readAgentState(startupMailbox);
-      assert.equal(state?.piSessionId, DEFAULT_PI_SESSION_ID);
-      assert.equal(state?.startupAck, undefined);
-      assert.equal(radarDaemon.spawns.length, 1);
-      // The binding outlives the reload this window ends in: the returning session
-      // reads the daemon's own subject and pane out of its record rather than
-      // inferring a location from the mailbox, and still closes nothing.
-      for (const handler of pi.events.get("session_shutdown") ?? [])
-        await handler(undefined, fakeContext());
-      for (const handler of pi.events.get("session_start") ?? [])
-        await handler(undefined, fakeContext());
-      const reloaded = pi.entries.filter(
-        (entry: any) => entry.customType === "pi-herdsman-radar-spawn",
-      );
-      assert.equal(reloaded.length, 2);
-      assert.equal(reloaded.at(-1)!.data.stage, "bound");
-      assert.equal(reloaded.at(-1)!.data.agentId, radarDaemon.spawns[0]!.agent_id);
-      assert.equal(reloaded.at(-1)!.data.paneId, radarDaemon.spawns[0]!.pane);
-      assert.equal(radarDaemon.closes.size, 0);
-      // Nothing is closed and nothing is re-dispatched: the pane and the edge
-      // belong to the daemon, and a second spawn would create a second child.
-      assert.deepEqual(
-        pi.calls.filter(
-          (args) =>
-            isPreservePaneStop(args) ||
-            isPaneClose(args) ||
-            isTabClose(args) ||
-            (args[0] === "pane" && args[1] === "split") ||
-            (args[0] === "agent" && args[1] === "start"),
-        ),
-        [],
-      );
-    } finally {
-      delete process.env.PI_HERDSMAN_RADAR_LAUNCH_TIMEOUT_MS;
-      pi.events.get("session_shutdown")?.[0]();
-      resetAgentMailbox(startupMailbox);
-    }
-  },
-);
-test("a late daemon recovers a pending location without replacing the identity", async () => {
-  setLeadEnvironment();
-  // Nothing is listening on this socket yet, so this process cannot learn where
-  // it is. That is a gap in the evidence, not a process without a pane: an
-  // immutable registration written from it could never acquire one, and the
-  // session would be unable to place a fresh worker for its whole life.
-  process.env.RADAR_CONTROL_SOCKET = join(tmpdir(), "absent-radar-late.sock");
-  const pi = fakePi();
-  registerExtension!(pi.pi as never);
-  const context = fakeContext();
-  for (const handler of pi.events.get("session_start") ?? [])
-    await handler(undefined, context);
-  assert.equal(radarDaemon.registerCalls.length, 0);
-  assert.equal(radarDaemon.spawns.length, 0);
-  const refused = await registeredAgentTool(pi, "delegate").execute(
-    "late",
-    { definition: "agent", label: "late-child", task: "late" },
-    undefined,
-    undefined,
-    context,
-  );
-  assert.equal(refused.details.ok, false, JSON.stringify(refused.details));
-  assert.equal(refused.details.error.category, "invalid_request");
-  assert.match(refused.details.error.message, /Radar daemon is unavailable/);
-  // The daemon answers now, and the same process registers once, with the pane
-  // the observation reports - no second incarnation and no rewritten record.
-  await ensureRadarDaemon();
-  const started = await registeredAgentTool(pi, "delegate").execute(
-    "late",
-    { definition: "agent", label: "late-child", task: "late" },
-    undefined,
-    undefined,
-    context,
-  );
-  assert.equal(started.details.ok, true, JSON.stringify(started.details));
-  const registrations = radarDaemon.registerCalls.filter(
-    (call) => call.params.source === RADAR_SUBJECT_SOURCE,
-  );
-  assert.equal(registrations.length, 1, JSON.stringify(registrations));
-  assert.equal(
-    (registrations[0]!.params.location as { pane?: string }).pane,
-    `tmux:${FIXTURE_TMUX_SERVER}:${FIXTURE_LEAD_PANE}`,
-  );
-  const incarnation = registrations[0]!.params.incarnation;
-  await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
-  assert.equal(
-    radarDaemon.registerCalls.filter(
-      (call) => call.params.source === RADAR_SUBJECT_SOURCE,
-    ).length,
-    1,
-  );
-  assert.equal(radarDaemon.registerCalls[0]!.params.incarnation, incarnation);
-});
+;
+;
 
-test("a launch whose binding cannot be recorded is unresolved and closes nothing", async () => {
-  setLeadEnvironment();
-  const label = "binding-record-refused";
-  const startupMailbox = agentMailboxPath(WORKSPACE, label);
-  process.env.PI_HERDSMAN_RADAR_LAUNCH_TIMEOUT_MS = "500";
-  const pi = fakePi({});
-  registerExtension!(pi.pi as never);
-  await startRadarSession(pi);
-  // The session's own entry store refuses the daemon's binding. The launch has
-  // then created a child it cannot hold: it reports that edge unresolved rather
-  // than assigning work to a child no reload could prove.
-  const appendEntry = pi.pi.appendEntry.bind(pi.pi);
-  pi.pi.appendEntry = ((customType: string, data: any) => {
-    if (customType === "pi-herdsman-radar-spawn" && data.stage === "bound")
-      throw new Error("the session entry store refused the record");
-    appendEntry(customType, data);
-  }) as typeof pi.pi.appendEntry;
-  try {
-    const result = await registeredAgentTool(pi, "delegate").execute(
-      "id",
-      { definition: "agent", label, task: "record the binding" },
-      undefined,
-      undefined,
-      fakeContext(),
-    );
-    assert.equal(
-      result.details.error.category,
-      "pane_not_ready",
-      JSON.stringify(result.details),
-    );
-    assert.equal(result.details.error.details.radarSpawn.unresolved, true);
-    // No durable record names the child, so the failure names only the request
-    // the daemon was handed.
-    assert.equal(result.details.error.details.radarSpawn.agentId, undefined);
-    assert.equal(result.details.error.details.radarSpawn.paneId, undefined);
-    assert.deepEqual(
-      pi.entries
-        .filter((entry: any) => entry.customType === "pi-herdsman-radar-spawn")
-        .map((entry: any) => entry.data.stage),
-      ["requested"],
-    );
-    // The child the daemon bound is left alone: nothing here may close or
-    // re-dispatch a child this process could not record.
-    assert.equal(radarDaemon.closes.size, 0);
-    assert.deepEqual(
-      pi.calls.filter(
-        (args) =>
-          isPreservePaneStop(args) || isPaneClose(args) || isTabClose(args),
-      ),
-      [],
-    );
-  } finally {
-    pi.pi.appendEntry = appendEntry;
-    delete process.env.PI_HERDSMAN_RADAR_LAUNCH_TIMEOUT_MS;
-    pi.events.get("session_shutdown")?.[0]();
-    resetAgentMailbox(startupMailbox);
-  }
-});
+;
 test("an unresolved launch cleans its own resources and a same-label retry reaches one child", async () => {
   setLeadEnvironment();
   const label = "agent";

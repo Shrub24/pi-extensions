@@ -116,14 +116,15 @@ reuses it. The cleanup described here happens when that retained worker is
 closed, or at once after delivery when `retainWorkers` is `false`.
 
 The Pi session outlives its generations. To continue the same
-conversational context, use `agent_continue` with the exact session ID or session path
-returned with the result. Continuation of a retained worker whose launch
-configuration still matches the current definition reuses that existing process;
-otherwise it closes the process and starts a new generation, which restores
+conversational context, use `agent_continue`, which addresses the worker by the
+Radar subject this session recorded at its launch. Continuation of a retained worker
+whose launch configuration still matches the current definition reuses that existing
+process; otherwise Radar restarts the worker's own recorded session, which restores
 the saved session's model and thinking unless the current definition
-explicitly overrides either field. Fresh delegation does not inherit the
-caller's conversation; pass assignment-specific evidence through task text and
-`files`.
+explicitly overrides either field. A restart keeps the subject, the session and any
+held assignment: it is not a close followed by a continuation. Fresh delegation does
+not inherit the caller's conversation; pass assignment-specific evidence through task
+text and `files`.
 
 The identities are therefore:
 
@@ -132,7 +133,31 @@ agent definition → configuration for new work
 Pi session       → durable conversational context and continuation identity
 agent label     → stable logical name across sequential generations; live control target only for the current generation
 generation      → one process lifetime; a retained worker keeps it across assignments until its launch configuration drifts
+subject         → Radar's durable identity for an agent, retained across process lifetimes; Herdsman holds it and nothing else
 ```
+
+## Radar seams
+
+Herdsman is a Radar client, not a second registry. It calls Radar through the
+`pi-radar` runtime only, and holds no registration or claim id anywhere.
+
+| Decision | Who owns it |
+|---|---|
+| Process identity, attachment, launch placement, the 30 s launch deadline | Radar |
+| Pi session, definitions, mailbox, settlement, the choice to launch, continue, restart or retire | Herdsman |
+| Sealed completion payload transport and its delivery accounting | Radar (`pi-radar` handoff port) |
+
+- A launch or continuation returns `ready`, `failed` or `unresolved`. Only `ready`
+  carries a subject; `unresolved` carries the daemon's launch request id, which is
+  read back rather than replaced by a second launch.
+- Child process evidence is Radar's: `children.observe(subject)` answers live, gone
+  or unknown. A missing subject or a failed read is unknown, never proof that a
+  worker is gone.
+- Recurring reads use one paged `children.list` for the launches backing current
+  mailboxes, so retained history costs nothing at rest.
+- A pending, duplicate, released or reserved presence grants no child capability,
+  so Herdsman adds no local guard on top of Radar's refusal.
+
 
 ## See also
 

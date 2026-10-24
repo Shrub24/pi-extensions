@@ -36,7 +36,7 @@ export const VALID_THINKING_LEVELS = [
   "xhigh",
   "max",
 ] as const;
-const THINKING_LEVELS = new Set(VALID_THINKING_LEVELS);
+const THINKING_LEVELS = new Set<string>(VALID_THINKING_LEVELS);
 const SYSTEM_PROMPT_MODES = new Set(["append", "replace"]);
 type BodyMode = "replace" | "append";
 const BODY_MODES = new Set<BodyMode>(["append", "replace"]);
@@ -88,6 +88,11 @@ const BUILTIN_AGENT_DIR = fileURLToPath(
 export type FrontmatterValue =
   string | boolean | string[] | { [key: string]: unknown };
 export type Frontmatter = {
+  name?: string;
+  description?: string;
+  systemPromptMode?: string;
+  inheritProjectContext?: boolean;
+  inheritSkills?: boolean;
   enabled?: boolean;
   model?: string;
   thinking?: string | false;
@@ -1014,7 +1019,7 @@ function managedToolSelection(agent: AgentDefinition): ManagedToolSelection {
   const { frontmatter } = agent;
   const explicitTools = frontmatter.tools !== undefined;
   const noTools =
-    frontmatter.noTools || (explicitTools && frontmatter.tools.length === 0);
+    frontmatter.noTools || frontmatter.tools?.length === 0;
   const requiredTools = agentDefinitionDelegationEnabled(agent)
     ? [...AGENT_COORDINATION_TOOLS, "ask_owner"]
     : ["ask_owner"];

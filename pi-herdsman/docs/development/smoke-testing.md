@@ -3,12 +3,41 @@
 [Documentation index](../README.md)
 
 These are maintainer acceptance checks for behavior that benefits from a real
-Pi/herdr boundary.
+Pi/Radar boundary.
 
 Use disposable agents and exact-ID cleanup. Do not disturb unrelated user
 workspaces or agents.
 
-## Automated isolated smoke
+## Isolated Radar acceptance
+
+Use the daemon pinned in `package.json`, without replacing the live service:
+
+```sh
+RADAR_BIN=/path/to/pinned/radar npm run smoke:radar
+```
+
+This creates a uniquely named `radar-tmux@` unit, a disposable daemon socket and
+isolated Herdsman data. It checks ready launch, a worker-written handoff through
+the Herdsman adapter, durable capture before acknowledgement, repeat retrieval,
+restart with the same subject, close replay, retained listing and continuation.
+Cleanup stops only that unit and daemon and removes their temporary files.
+
+The deterministic worker uses the SDK rather than a model. It mirrors the
+baseline's awaited shutdown release; omitting release leaves a deliberately
+attached claim, so a continuation refusal in that broken fixture is not evidence
+of a Radar defect. The run prints the daemon version and binary SHA-256.
+
+This is not full Pi acceptance. On the matching deployed daemon, still verify
+an actual worker's required handoff, `agent_complete` returning the sealed report,
+wrapup and park/retire outcomes, duplicate refusal, and held-assignment delivery.
+Do not restart the operator's daemon as part of this harness.
+
+## Historical Herdr harness — not current Radar acceptance
+
+The model-driven harness below predates the Radar cutover. It is retained for
+migration reference, not as a supported command or evidence of current behavior.
+Use `smoke:radar` above for the supported isolated join. Full Pi acceptance remains
+tracked separately; do not treat the historical scenarios as passing.
 
 Configure the smoke model once for the repository:
 
