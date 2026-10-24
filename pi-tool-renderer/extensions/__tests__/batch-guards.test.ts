@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { cpSync, readFileSync, writeFileSync } from "node:fs";
+import { cpSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { CONFIG_ID, registerRendered, useIsolatedGitEnv } from "../../tests/vendor/pi-hooks/harness.ts";
 import { runBatchSession } from "./helpers/pi-batch.js";
@@ -24,6 +24,8 @@ test("must-fail control: direct child execution makes the guard regression red",
 	writeFileSync(join(agent, "settings.json"), JSON.stringify({ [CONFIG_ID]: { enabled: true, sessionDriftCheck: false } }));
 	const copy = join(root, "renderer-copy");
 	cpSync(renderer, copy, { recursive: true, filter: (path) => !path.includes("node_modules") && !path.includes("__tests__") });
+	// The renderer's own runtime dependency (jsdiff) resolves from its package's node_modules.
+	symlinkSync(join(renderer, "node_modules"), join(copy, "node_modules"));
 	const path = join(copy, "extensions/tool-renderer/batch.ts");
 	const source = readFileSync(path, "utf8");
 	const guarded = "context.executeTool(call.tool, call.args, { signal: childController.signal })";

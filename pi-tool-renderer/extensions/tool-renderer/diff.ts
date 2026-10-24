@@ -1,4 +1,5 @@
 import { getLanguageFromPath, highlightCode } from "@earendil-works/pi-coding-agent";
+import { diffArrays, parsePatch } from "diff";
 import { readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 
@@ -40,8 +41,8 @@ const DIFF_SPLIT_MIN_WIDTH = 132;
 const DIFF_SPLIT_MIN_CODE_WIDTH = 24;
 const DIFF_SPLIT_MAX_WRAP_LINES = 8;
 const DIFF_SPLIT_MAX_WRAP_RATIO = 0.55;
-const DIFF_LCS_CELL_LIMIT = 250_000;
 const DIFF_CONTEXT_LINES = 3;
+const DIFF_BUDGET_MS = 200;
 export const MAX_DIFF_INPUT_BYTES = 700 * 1024;
 const DIFF_HIGHLIGHT_MAX_CHARS = 180_000;
 export const DIFF_ADD_BG_TOKEN = "toolSuccessBg";
@@ -67,6 +68,8 @@ export interface StructuredDiff {
 	lines: StructuredDiffLine[];
 	path?: string;
 	removals: number;
+	/** Set when the comparison ran out of budget; the counts are unknown. */
+	skipped?: true;
 }
 
 const themeDiffBgParts = new WeakMap<object, Map<string, AnsiParts>>();
@@ -328,55 +331,6 @@ function splitContentLines(text: string): string[] {
 	return lines;
 }
 
-function diffOps(oldLines: string[], newLines: string[]): Array<{ text: string; type: "ctx" | "add" | "del" }> {
-	let start = 0;
-	while (start < oldLines.length && start < newLines.length && oldLines[start] === newLines[start]) start++;
-	let oldEnd = oldLines.length - 1;
-	let newEnd = newLines.length - 1;
-	while (oldEnd >= start && newEnd >= start && oldLines[oldEnd] === newLines[newEnd]) {
-		oldEnd--;
-		newEnd--;
-	}
-	const ops: Array<{ text: string; type: "ctx" | "add" | "del" }> = [];
-	for (let i = 0; i < start; i++) ops.push({ text: oldLines[i] ?? "", type: "ctx" });
-	const oldMid = oldLines.slice(start, oldEnd + 1);
-	const newMid = newLines.slice(start, newEnd + 1);
-	if (oldMid.length * newMid.length > DIFF_LCS_CELL_LIMIT) {
-		for (const text of oldMid) ops.push({ text, type: "del" });
-		for (const text of newMid) ops.push({ text, type: "add" });
-	} else {
-		const m = oldMid.length;
-		const n = newMid.length;
-		const width = n + 1;
-		const table = new Uint32Array((m + 1) * (n + 1));
-		for (let i = m - 1; i >= 0; i--) {
-			for (let j = n - 1; j >= 0; j--) {
-				table[i * width + j] = oldMid[i] === newMid[j]
-					? table[(i + 1) * width + j + 1] + 1
-					: Math.max(table[(i + 1) * width + j], table[i * width + j + 1]);
-			}
-		}
-		let i = 0;
-		let j = 0;
-		while (i < m && j < n) {
-			if (oldMid[i] === newMid[j]) {
-				ops.push({ text: oldMid[i] ?? "", type: "ctx" });
-				i++;
-				j++;
-			} else if (table[(i + 1) * width + j] >= table[i * width + j + 1]) {
-				ops.push({ text: oldMid[i] ?? "", type: "del" });
-				i++;
-			} else {
-				ops.push({ text: newMid[j] ?? "", type: "add" });
-				j++;
-			}
-		}
-		while (i < m) ops.push({ text: oldMid[i++] ?? "", type: "del" });
-		while (j < n) ops.push({ text: newMid[j++] ?? "", type: "add" });
-	}
-	for (let i = oldEnd + 1; i < oldLines.length; i++) ops.push({ text: oldLines[i] ?? "", type: "ctx" });
-	return ops;
-}
 
 export function hiddenDiffLine(count: number): StructuredDiffLine {
 	return {
@@ -449,29 +403,95 @@ function compactStructuredDiffLines(lines: StructuredDiffLine[], contextLines = 
 }
 
 export function buildStructuredDiff(oldText: string, newText: string): StructuredDiff {
-	const ops = diffOps(splitContentLines(oldText), splitContentLines(newText));
+	// jsdiff's Myers implementation aligns changes that are far apart correctly;
+	// the budget turns a pathological pair into a counts-free row instead of a
+	// blocked render.
+	const parts = diffArrays(splitContentLines(oldText), splitContentLines(newText), { timeout: DIFF_BUDGET_MS });
+	if (parts === undefined) return skippedStructuredDiff(oldText.length + newText.length);
 	let oldNum = 1;
 	let newNum = 1;
 	let additions = 0;
 	let removals = 0;
 	const lines: StructuredDiffLine[] = [];
-	for (const op of ops) {
-		if (op.type === "ctx") {
-			lines.push({ content: op.text, newNum, oldNum, type: "ctx" });
-			oldNum++;
-			newNum++;
-		} else if (op.type === "del") {
-			lines.push({ content: op.text, newNum: null, oldNum, type: "del" });
-			oldNum++;
-			removals++;
-		} else {
-			lines.push({ content: op.text, newNum, oldNum: null, type: "add" });
-			newNum++;
-			additions++;
+	for (const part of parts) {
+		for (const content of part.value) {
+			if (part.added) {
+				lines.push({ content, newNum, oldNum: null, type: "add" });
+				newNum++;
+				additions++;
+			} else if (part.removed) {
+				lines.push({ content, newNum: null, oldNum, type: "del" });
+				oldNum++;
+				removals++;
+			} else {
+				lines.push({ content, newNum, oldNum, type: "ctx" });
+				oldNum++;
+				newNum++;
+			}
 		}
 	}
 	const numbered = assignHunkNumbers(compactStructuredDiffLines(lines));
 	return { additions, chars: oldText.length + newText.length, hunks: numbered.hunks, lines: numbered.lines, removals };
+}
+
+function skippedStructuredDiff(chars: number): StructuredDiff {
+	return { additions: 0, chars, hunks: 0, lines: [], removals: 0, skipped: true };
+}
+
+/**
+ * Rows of one edit, derived from the unified patch Pi already stores on the
+ * result. Unchanged gaps between hunks become separators; the gap after the
+ * last hunk needs the file's line count, which the caller supplies when known.
+ */
+export function structuredDiffFromPatch(patch: string, lineCount?: number): StructuredDiff {
+	let parsed: ReturnType<typeof parsePatch>;
+	try {
+		parsed = parsePatch(patch);
+	} catch {
+		return skippedStructuredDiff(patch.length);
+	}
+	const lines: StructuredDiffLine[] = [];
+	let additions = 0;
+	let removals = 0;
+	let trailingNewNext: number | undefined;
+	for (const file of parsed) {
+		let previousOldEnd = 1;
+		for (const hunk of file.hunks) {
+			// jsdiff yields null bounds for a header it could not read; show nothing rather than misnumbered rows.
+			if (![hunk.oldStart, hunk.newStart, hunk.oldLines, hunk.newLines].every(Number.isInteger)) return skippedStructuredDiff(patch.length);
+			const oldFirst = hunk.oldLines === 0 ? hunk.oldStart + 1 : hunk.oldStart;
+			const newFirst = hunk.newLines === 0 ? hunk.newStart + 1 : hunk.newStart;
+			const hidden = oldFirst - previousOldEnd;
+			if (hidden > 0) lines.push(hiddenDiffLine(hidden));
+			let oldNum = oldFirst;
+			let newNum = newFirst;
+			for (const raw of hunk.lines) {
+				const marker = raw[0];
+				const content = raw.slice(1);
+				if (marker === "+") {
+					lines.push({ content, newNum, oldNum: null, type: "add" });
+					newNum++;
+					additions++;
+				} else if (marker === "-") {
+					lines.push({ content, newNum: null, oldNum, type: "del" });
+					oldNum++;
+					removals++;
+				} else if (marker === " ") {
+					lines.push({ content, newNum, oldNum, type: "ctx" });
+					oldNum++;
+					newNum++;
+				}
+			}
+			previousOldEnd = oldFirst + hunk.oldLines;
+			trailingNewNext = newFirst + hunk.newLines;
+		}
+	}
+	if (lineCount !== undefined && trailingNewNext !== undefined) {
+		const trailing = lineCount + 1 - trailingNewNext;
+		if (trailing > 0) lines.push(hiddenDiffLine(trailing));
+	}
+	const numbered = assignHunkNumbers(lines);
+	return { additions, chars: patch.length, hunks: numbered.hunks, lines: numbered.lines, removals };
 }
 
 function diffStatBar(additions: number, removals: number, theme: any, cwd?: string): string {
@@ -487,6 +507,7 @@ function diffStatBar(additions: number, removals: number, theme: any, cwd?: stri
 }
 
 export function diffSummary(diff: StructuredDiff, theme: any, cwd?: string): string {
+	if (diff.skipped) return theme.fg("muted", "changed");
 	const parts: string[] = [];
 	if (diff.additions > 0) parts.push(theme.fg("success", `+${diff.additions}`));
 	if (diff.removals > 0) parts.push(theme.fg("error", `-${diff.removals}`));
@@ -733,6 +754,7 @@ function collapsedDiffHint(remainingLines: number, hiddenHunks: number, expanded
 }
 
 export function renderStructuredDiff(diff: StructuredDiff, theme: any, expanded: boolean, cwd?: string, rowLimit?: number | null, path?: string, widthOffset = 0): string {
+	if (diff.skipped) return theme.fg("muted", "diff not shown · too large to compare");
 	if (diff.additions === 0 && diff.removals === 0) return theme.fg("muted", "no changes");
 	const width = Math.max(40, terminalWidth(cwd) - Math.max(0, widthOffset));
 	const configuredLimit = rowLimit === undefined ? configuredDiffRowLimit(expanded, cwd) : rowLimit;
@@ -978,17 +1000,40 @@ export function readTextForDiff(pathValue: unknown, cwd: string): string | undef
 	}
 }
 
-export function attachDiffDetails(result: any, before: string | undefined, after: string | undefined, path?: string): any {
-	if (before === undefined && after === undefined) return result;
-	const oldText = before ?? "";
-	const newText = after ?? "";
-	if (oldText === newText) return result;
-	const diff = { ...buildStructuredDiff(oldText, newText), path };
-	const extra = { kendexDiff: diff, kendexDiffWasNewFile: before === undefined };
+export interface MutationDiffSummary {
+	additions?: number;
+	created?: boolean;
+	hunks?: number;
+	lineCount?: number;
+	removals?: number;
+}
+
+/** Stores integers about a mutation. Diff rows are never persisted. */
+export function attachMutationSummary(result: any, summary: MutationDiffSummary): any {
+	const extra = { kendexDiffSummary: summary };
 	result.details = result?.details && typeof result.details === "object" ? { ...result.details, ...extra } : extra;
 	return result;
 }
 
+export function lineCountOfText(text: string): number {
+	return splitContentLines(text).length;
+}
+
+/** Line count of a file as it is now, gated like every other diff read. */
+export function lineCountOfFile(pathValue: unknown, cwd: string): number | undefined {
+	const text = readTextForDiff(pathValue, cwd);
+	return text === undefined ? undefined : lineCountOfText(text);
+}
+
+/** Memoises derived diffs per owning object, so frame re-renders do not recompute them. */
+const derivedDiffCache = new WeakMap<object, unknown>();
+export function memoizeByOwner<T>(owner: object | undefined, compute: () => T): T {
+	if (!owner || typeof owner !== "object") return compute();
+	if (derivedDiffCache.has(owner)) return derivedDiffCache.get(owner) as T;
+	const value = compute();
+	derivedDiffCache.set(owner, value);
+	return value;
+}
 export function editOperationsFromArgs(args: any): Array<{ oldText: string; newText: string }> {
 	if (Array.isArray(args?.edits)) {
 		return args.edits

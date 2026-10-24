@@ -1,0 +1,57 @@
+--- /home/saurabhj/Projects/dev/agent-radar/tests/control_plane.rs
++++ /home/saurabhj/Projects/dev/agent-radar/tests/control_plane.rs
+@@ -2547,8 +2547,27 @@
+         let id = random_uuid();
+         self.call_id(&id, method, params)
+     }
+ 
++    /// The first snapshot this daemon publishes, asking until it has one.
++    ///
++    /// A first read is demand alone: the revision it is answered with is the one
++    /// that existed before it, so the snapshot its demand caused arrives on a
++    /// later read. Nothing here invents a fleet to answer with.
++    fn first_snapshot(&mut self) -> Value {
++        let deadline = Instant::now() + Duration::from_secs(10);
++        loop {
++            let answer = self.call(
++                "observation.get",
++                json!({"since_revision": 0, "wait_ms": 1000}),
++            );
++            if let Some(snapshot) = answer["result"].get("snapshot") {
++                return snapshot.clone();
++            }
++            assert!(Instant::now() < deadline, "no snapshot was published: {answer}");
++        }
++    }
++
+     fn call_id(&mut self, id: &str, method: &str, params: Value) -> Value {
+         self.send(&request_line(id, method, params));
+         self.read()
+     }
+@@ -9576,10 +9595,10 @@
+ 
+     // The daemon's own observation carries the containers it recorded: a display
+     // reads them from the snapshot and from nowhere else, so a snapshot without
+     // them leaves every row unactionable and every created place unnamed.
+-    let snapshot = raw.call("observation.get", json!({"wait_ms": 5000}));
+-    let containers = snapshot["result"]["snapshot"]["observation"]["inventory"]["containers"]
++    let snapshot = raw.first_snapshot();
++    let containers = snapshot["observation"]["inventory"]["containers"]
+         .as_array()
+         .unwrap_or_else(|| panic!("containers in the snapshot: {snapshot}"));
+     assert_eq!(containers.len(), 1, "{snapshot}");
+     assert_eq!(containers[0]["label"], "work", "{snapshot}");
+@@ -10458,11 +10477,10 @@
+     let selected =
+         agent_radar::control_plane::client::connect_at(daemon.path()).expect("dashboard client");
+     // The snapshot carries the daemon's lifecycle subjects, which is what a
+     // display reads to offer a managed action on one.
+-    let snapshot = client.call("observation.get", json!({"wait_ms": 5000}));
+-    let subjects = snapshot["result"]["snapshot"]["observation"]["inventory"]
+-        ["lifecycle_subjects"]
++    let snapshot = client.first_snapshot();
++    let subjects = snapshot["observation"]["inventory"]["lifecycle_subjects"]
+         .as_array()
+         .unwrap_or_else(|| panic!("lifecycle subjects in the snapshot: {snapshot}"));
+     assert!(
+         subjects

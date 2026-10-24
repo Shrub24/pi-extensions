@@ -22,6 +22,9 @@
   "scripts": {
     "test": "bun test ./extensions/__tests__"
   },
+  "dependencies": {
+    "diff": "^9.0.0"
+  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=1.0.1",
     "@earendil-works/pi-tui": "*"

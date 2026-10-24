@@ -1,18 +1,24 @@
 import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 
 import {
-	attachDiffDetails,
+	attachMutationSummary,
 	buildStructuredDiff,
 	diffSummary,
 	editOperationsFromArgs,
 	existingSmallTextOrUndefined,
+	lineCountOfFile,
+	lineCountOfText,
+	memoizeByOwner,
 	readTextForDiff,
 	renderBashDiffOutput,
 	renderMutationCallPreview,
 	renderStructuredDiff,
 	shouldRenderBashDiffsForCommand,
+	structuredDiffFromPatch,
 	suppressReadOnlyBashDiffOutput,
+	type MutationDiffSummary,
 	type StructuredDiff,
 } from "./diff.js";
 import { renderReadImages } from "./images.js";
@@ -194,6 +200,20 @@ export function registerBashOnSessionStart(pi: ExtensionAPI, agent: any, cwd: st
 	});
 }
 
+/** An edit's rows, derived from the patch Pi stored on the result. */
+function editResultDiff(result: any): StructuredDiff | undefined {
+	const details = result?.details;
+	if (typeof details?.patch !== "string" || !details.patch) return undefined;
+	return memoizeByOwner(details, () => structuredDiffFromPatch(details.patch, details.kendexDiffSummary?.lineCount));
+}
+
+/** A write's counts from its stored summary; older results without one show the plain outcome. */
+function writeSummary(stored: MutationDiffSummary | undefined, theme: any, cwd: string): string {
+	if (!stored) return theme.fg("success", "written");
+	if (stored.additions === undefined || stored.removals === undefined) return theme.fg("muted", "written \u00b7 too large to compare");
+	return diffSummary({ additions: stored.additions, chars: 0, hunks: stored.hunks ?? 0, lines: [], removals: stored.removals }, theme, cwd);
+}
+
 export function registerEdit(pi: ExtensionAPI, agent: any, cwd: string): boolean {
 	const original = getBuiltInTool(agent, cwd, "edit");
 	if (!original) return false;
@@ -215,16 +235,17 @@ export function registerEdit(pi: ExtensionAPI, agent: any, cwd: string): boolean
 		async execute(id: string, params: any, signal: AbortSignal | undefined, onUpdate: unknown, context: any) {
 			const effectiveCwd = contextCwd(context, cwd);
 			const targetPath = params?.path ?? params?.file_path;
-			const before = readTextForDiff(targetPath, effectiveCwd);
 			const result = await getBuiltInTool(agent, effectiveCwd, "edit").execute(id, stripIntent(params), signal, onUpdate, context);
-			const after = result?.isError ? before : readTextForDiff(targetPath, effectiveCwd);
-			return attachDiffDetails(result, before, after, typeof targetPath === "string" ? targetPath : undefined);
+			if (result?.isError) return result;
+			// Rows are derived from Pi's stored patch at render time; the only thing
+			// persisted beside it is the file's line count, for the trailing gap.
+			return attachMutationSummary(result, { lineCount: lineCountOfFile(targetPath, effectiveCwd) });
 		},
 		renderCall(args: any, theme: any, context: any) {
 			const effectiveCwd = context?.cwd ?? cwd;
 			const targetPath = args?.path ?? args?.file_path ?? "";
 			if (context?.argsComplete) {
-				const diffs = editOperationsFromArgs(args).map((edit) => ({ ...buildStructuredDiff(edit.oldText, edit.newText), path: targetPath }));
+				const diffs = memoizeByOwner(args, () => editOperationsFromArgs(args).map((edit) => ({ ...buildStructuredDiff(edit.oldText, edit.newText), path: targetPath })));
 				const previewComponent = renderMutationCallPreview("Edit", String(targetPath), diffs, theme, context, effectiveCwd);
 				if (componentHasVisibleLines(previewComponent)) return previewComponent;
 			}
@@ -239,7 +260,7 @@ export function registerEdit(pi: ExtensionAPI, agent: any, cwd: string): boolean
 			const call = `${toolLabel(theme, "Edit ")}${renderToolPathText(targetPath, theme, context?.cwd ?? cwd)}`;
 			if (isPartial) return renderPendingDetail("editing…", theme);
 			clearBlink(context);
-			const structured = result?.details?.kendexDiff as StructuredDiff | undefined;
+			const structured = editResultDiff(result);
 			if (context?.isError || result?.isError) {
 				const errorText = splitTerminalLines(textContent(result))[0] || "edit failed";
 				return makeTruncatedLines(`${stackPrefix(theme)}${call}${theme.fg("dim", " · ")}${theme.fg("error", errorText)}`);
@@ -266,19 +287,30 @@ export function registerWrite(pi: ExtensionAPI, agent: any, cwd: string): boolea
 		async execute(id: string, params: any, signal: AbortSignal | undefined, onUpdate: unknown, context: any) {
 			const effectiveCwd = contextCwd(context, cwd);
 			const targetPath = params?.path ?? params?.file_path;
-			const before = readTextForDiff(targetPath, effectiveCwd);
+			// Pi stores no patch for a write, so the counts need the previous contents.
+			// A file that exists but is too large to read gets no counts rather than
+			// being reported as wholly new.
+			const existed = typeof targetPath === "string" && existsSync(resolve(effectiveCwd, targetPath));
+			const before = existed ? readTextForDiff(targetPath, effectiveCwd) : undefined;
 			const result = await getBuiltInTool(agent, effectiveCwd, "write").execute(id, stripIntent(params), signal, onUpdate, context);
-			const after = result?.isError ? before : typeof params?.content === "string" ? params.content : readTextForDiff(targetPath, effectiveCwd);
-			return attachDiffDetails(result, before, after, typeof targetPath === "string" ? targetPath : undefined);
+			if (result?.isError || typeof params?.content !== "string") return result;
+			const content: string = params.content;
+			const countable = !existed || before !== undefined;
+			const counted = countable ? buildStructuredDiff(before ?? "", content) : undefined;
+			const summary: MutationDiffSummary = { created: !existed, lineCount: lineCountOfText(content) };
+			if (counted && !counted.skipped) Object.assign(summary, { additions: counted.additions, hunks: counted.hunks ?? 0, removals: counted.removals });
+			return attachMutationSummary(result, summary);
 		},
 		renderCall(args: any, theme: any, context: any) {
 			const effectiveCwd = context?.cwd ?? cwd;
 			const targetPath = args?.path ?? args?.file_path ?? "";
 			const lineTotal = lineCount(args?.content ?? "");
 			if (context?.argsComplete && typeof args?.content === "string") {
-				const before = existingSmallTextOrUndefined(String(targetPath), effectiveCwd);
+				const { before, diff } = memoizeByOwner(args, () => {
+					const existing = existingSmallTextOrUndefined(String(targetPath), effectiveCwd);
+					return { before: existing, diff: { ...buildStructuredDiff(existing ?? "", args.content), path: String(targetPath) } };
+				});
 				const label: "Write" | "Create" = before === undefined ? "Create" : "Write";
-				const diff = { ...buildStructuredDiff(before ?? "", args.content), path: String(targetPath) };
 				const previewComponent = renderMutationCallPreview(label, String(targetPath), [diff], theme, context, effectiveCwd);
 				if (componentHasVisibleLines(previewComponent)) return previewComponent;
 			}
@@ -291,19 +323,18 @@ export function registerWrite(pi: ExtensionAPI, agent: any, cwd: string): boolea
 			const args = context?.args ?? {};
 			const targetPath = args.path ?? args.file_path ?? "";
 			const lineTotal = lineCount(args.content ?? "");
-			const label = result?.details?.kendexDiffWasNewFile ? "Create " : "Write ";
+			const label = (result?.details?.kendexDiffSummary as MutationDiffSummary | undefined)?.created ? "Create " : "Write ";
 			const call = `${toolLabel(theme, label)}${renderToolPathText(targetPath, theme, context?.cwd ?? cwd)} ${theme.fg("dim", `· ${lineTotal} lines`)}`;
 			if (isPartial) return renderPendingDetail("writing…", theme);
 			clearBlink(context);
-			const structured = result?.details?.kendexDiff as StructuredDiff | undefined;
+			const stored = result?.details?.kendexDiffSummary as MutationDiffSummary | undefined;
 			if (context?.isError || result?.isError) {
 				const errorText = splitTerminalLines(textContent(result))[0] || "write failed";
 				return makeTruncatedLines(`${stackPrefix(theme)}${call}${theme.fg("dim", " · ")}${theme.fg("error", errorText)}`);
 			}
-			const summary = structured ? diffSummary(structured, theme, context?.cwd ?? cwd) : theme.fg("success", "written");
-			let text = `${stackPrefix(theme)}${call}${theme.fg("dim", " · ")}${summary}`;
-			if (structured) text += `\n${renderStructuredDiff(structured, theme, expanded, context?.cwd ?? cwd, undefined, targetPath)}`;
-			return makeTruncatedLines(text);
+			// A write row shows its counts only: Pi persists no patch, and the diff
+			// rows are not stored.
+			return makeTruncatedLines(`${stackPrefix(theme)}${call}${theme.fg("dim", " · ")}${writeSummary(stored, theme, context?.cwd ?? cwd)}`);
 		},
 	});
 	return true;
