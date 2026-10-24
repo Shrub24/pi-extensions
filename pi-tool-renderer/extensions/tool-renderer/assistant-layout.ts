@@ -1,6 +1,4 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { visibleWidth } from "@earendil-works/pi-tui";
-
 function borderSegments(line: string, left: string, join: string, right: string): number[] | undefined {
 	const chars = Array.from(line.trim());
 	if (chars[0] !== left || chars[chars.length - 1] !== right) return undefined;
@@ -22,7 +20,7 @@ function rowCells(line: string, widths: number[]): string[] | undefined {
 	const trimmed = line.trim();
 	if (!trimmed.startsWith("│") || !trimmed.endsWith("│")) return undefined;
 	const cells = trimmed.slice(1, -1).split("│");
-	if (cells.length !== widths.length || cells.some((cell, index) => visibleWidth(cell) !== widths[index])) return undefined;
+	if (cells.length !== widths.length) return undefined;
 	return cells.map((cell) => cell.trim());
 }
 
@@ -43,7 +41,7 @@ function parseBoxTable(lines: string[], start: number): { end: number; width: nu
 			pending = [];
 			if (bottom) {
 				if (!headerSeparated || rows.length < 2) return undefined;
-				return { end: index, width: visibleWidth((lines[start] ?? "").trim()), rows };
+				return { end: index, width: widths.reduce((sum, width) => sum + width, 0) + widths.length + 1, rows };
 			}
 			headerSeparated = true;
 			continue;

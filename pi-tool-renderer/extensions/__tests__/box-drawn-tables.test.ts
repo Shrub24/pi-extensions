@@ -67,6 +67,21 @@ test("the Markdown transformer adapts assistant output only", () => {
 	expect(transform!(reportedTable, { messageType: "assistant-thinking", availableWidth: 60 })).toBe(reportedTable);
 });
 
+test("an overlong cell does not prevent a structurally complete table from reflowing", () => {
+	const lines = reportedTable.split("\n");
+	const rowIndex = lines.findIndex((line) => line.includes("Real merges; prefixBound"));
+	expect(rowIndex).toBeGreaterThanOrEqual(0);
+	const cells = lines[rowIndex]!.split("│");
+	cells[3] = " Real merges. Our two fix commits sit in the region upstream restructured, and the prefixBound derivation now appears twice (bounded hold + reasoning clearing), so the helper must feed both. ";
+	lines[rowIndex] = cells.join("│");
+	const overlongCellTable = lines.join("\n");
+	const transformed = transformBoxDrawnTables(overlongCellTable, 60);
+	expect(transformed).not.toBe(overlongCellTable);
+	expect(transformed).not.toContain("┌");
+	expect(transformed).toContain("upstream restructured");
+	expect(transformed).toContain("prefixBound derivation now appears twice");
+});
+
 test("a fitting box table stays a grid and incomplete border art stays untouched", () => {
 	expect(transformBoxDrawnTables(reportedTable, 180)).toBe(reportedTable);
 	const malformed = "┌─────┬─────┐\n│ Area│ Files│\n├────┼─────┤\n│ x   │ y   │";
