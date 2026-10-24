@@ -3,10 +3,10 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { Image, resetCapabilitiesCache, setCapabilities, visibleWidth } from "@earendil-works/pi-tui";
+import { Container, Image, resetCapabilitiesCache, setCapabilities, visibleWidth } from "@earendil-works/pi-tui";
 
 import { stripAnsi } from "../tool-renderer/ansi.js";
-import { __test, withResultTheme } from "../tool-renderer/chrome.js";
+import { __test, installToolChromePatch, withResultTheme } from "../tool-renderer/chrome.js";
 import { clearTrackedToolExecutionComponents, refreshToolExecutionComponents } from "../tool-renderer/live-settings.js";
 import { RESERVED_IMAGE_ROW_MARKER, TOOL_RENDER_OVERLAY_CHECK_SYMBOL } from "../tool-renderer/overlay.js";
 import { clearPackageConfigCache, recordProjectTrust } from "../tool-renderer/package-config.js";
@@ -40,7 +40,107 @@ function toolComponent(cwd: string): any { return { cwd,
 		ui: { theme }, };
 }
 
-describe("tool chrome", () => { test("self-rendered tools regain outline rules after Pi trims empty shell rows", () => { const cwd = tempCwd({ toolChrome: "outlines" });
+describe("tool chrome", () => { test("adjacent tool entries share only the run's outer outline", () => {
+		const cwd = tempCwd({ toolChrome: "outlines" });
+		class ToolEntry extends Container {
+			toolCallId: string;
+			toolName = "bash";
+			cwd: string;
+			ui = { theme };
+			hideComponent = false;
+			constructor(id: string) {
+				super();
+				this.toolCallId = id;
+				this.cwd = cwd;
+				this.addChild({ render: () => [`content ${id}`], invalidate() {} } as never);
+			}
+		}
+		const transcript = new Container();
+		transcript.addChild(new ToolEntry("call-1"));
+		transcript.addChild(new ToolEntry("call-2"));
+		transcript.addChild({ render: () => ["assistant response"], invalidate() {} } as never);
+		transcript.addChild(new ToolEntry("call-3"));
+		installToolChromePatch();
+
+		const lines = transcript.render(40).map(stripAnsi);
+		const rules = lines.filter((line) => line === "─".repeat(39));
+		expect(rules).toHaveLength(4);
+		expect(lines.indexOf("content call-1")).toBeLessThan(lines.indexOf("content call-2"));
+		expect(lines.indexOf("content call-2")).toBeLessThan(lines.indexOf("assistant response"));
+		expect(lines.indexOf("assistant response")).toBeLessThan(lines.indexOf("content call-3"));
+		expect(lines.slice(lines.indexOf("content call-1"), lines.indexOf("content call-2"))).not.toContain("─".repeat(39));
+	});
+
+	test("transparent chrome leaves adjacent entries ungrouped", () => {
+		const cwd = tempCwd({ toolChrome: "transparent" });
+		const makeTool = (id: string) => {
+			const component: any = new Container();
+			component.toolName = "bash";
+			component.toolCallId = id;
+			component.cwd = cwd;
+			component.ui = { theme };
+			component.hideComponent = false;
+			component.addChild({ render: () => [`content ${id}`], invalidate() {} });
+			return component;
+		};
+		const transcript = new Container();
+		transcript.addChild(makeTool("call-1"));
+		transcript.addChild(makeTool("call-2"));
+		installToolChromePatch();
+		const lines = transcript.render(40).map(stripAnsi);
+		expect(lines).toEqual(["content call-1", "content call-2"]);
+	});
+
+	test("hidden tool entries do not split an adjacent visible run", () => {
+		const cwd = tempCwd({ toolChrome: "outlines" });
+		const makeTool = (id: string, hidden = false) => {
+			const component: any = new Container();
+			component.toolName = "bash";
+			component.toolCallId = id;
+			component.cwd = cwd;
+			component.ui = { theme };
+			component.hideComponent = hidden;
+			component.render = hidden ? () => [] : Container.prototype.render;
+			if (!hidden) component.addChild({ render: () => [`content ${id}`], invalidate() {} });
+			return component;
+		};
+		const transcript = new Container();
+		transcript.addChild(makeTool("call-1"));
+		transcript.addChild(makeTool("call-hidden", true));
+		transcript.addChild(makeTool("call-2"));
+		installToolChromePatch();
+
+		const lines = transcript.render(40).map(stripAnsi);
+		expect(lines.filter((line) => line === "─".repeat(39))).toHaveLength(2);
+		expect(lines).toContain("content call-1");
+		expect(lines).toContain("content call-2");
+	});
+
+	test("adding and removing a sibling refreshes cached outer boundaries", () => {
+		const cwd = tempCwd({ toolChrome: "outlines" });
+		const makeTool = (id: string) => {
+			const component: any = new Container();
+			component.toolName = "bash";
+			component.toolCallId = id;
+			component.cwd = cwd;
+			component.ui = { theme };
+			component.hideComponent = false;
+			component.addChild({ render: () => [`content ${id}`], invalidate() {} });
+			return component;
+		};
+		const transcript = new Container();
+		const first = makeTool("call-1");
+		transcript.addChild(first);
+		installToolChromePatch();
+		expect(transcript.render(40).filter((line) => stripAnsi(line) === "─".repeat(39))).toHaveLength(2);
+		const second = makeTool("call-2");
+		transcript.addChild(second);
+		expect(transcript.render(40).filter((line) => stripAnsi(line) === "─".repeat(39))).toHaveLength(2);
+		transcript.removeChild(second);
+		expect(transcript.render(40).filter((line) => stripAnsi(line) === "─".repeat(39))).toHaveLength(2);
+	});
+
+	test("self-rendered tools regain outline rules after Pi trims empty shell rows", () => { const cwd = tempCwd({ toolChrome: "outlines" });
 		const rendered = ["", "● Bash $ echo hi", ""];
 		const lines = __test.renderToolChromeLines(toolComponent(cwd), rendered, 40);
 

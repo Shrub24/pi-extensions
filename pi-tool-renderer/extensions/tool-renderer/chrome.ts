@@ -36,6 +36,7 @@ import { subtleRule } from "./theme.js";
 const TOOL_EXECUTION_RENDERER_PATCH_SYMBOL = Symbol.for("kendex.pi-tool-renderer.tool-execution-renderer-patch.v2");
 const TOOL_CHROME_PATCH_SYMBOL = Symbol.for("kendex.pi-tool-renderer.tool-chrome-patch");
 const TOOL_CHROME_THEME_SYMBOL = Symbol.for("kendex.pi-tool-renderer.tool-chrome-theme");
+const TOOL_CHROME_GROUP_SYMBOL = Symbol.for("kendex.pi-tool-renderer.tool-chrome-group");
 const WORKING_LOADER_ALIGNMENT_PATCH_SYMBOL = Symbol.for("kendex.pi-tool-renderer.working-loader-alignment-patch");
 
 interface ToolChromeRenderCacheEntry {
@@ -46,6 +47,8 @@ interface ToolChromeRenderCacheEntry {
 	sourceLines: string[];
 	theme: any;
 	width: number;
+	groupStart: boolean;
+	groupEnd: boolean;
 }
 
 const toolChromeRenderCache = new WeakMap<object, ToolChromeRenderCacheEntry>();
@@ -215,6 +218,7 @@ function renderToolChromeLines(component: any, rendered: string[], width: number
 	const revision = renderSettingsRevision();
 	const cacheKey = component && typeof component === "object" ? component as object : undefined;
 	const chromeTheme = mode === "outlines" || mode === "panel" ? toolChromeThemeFor(component) : undefined;
+	const boundaries = mode === "outlines" ? component?.[TOOL_CHROME_GROUP_SYMBOL] ?? { start: true, end: true } : { start: true, end: true };
 	const cached = cacheKey ? toolChromeRenderCache.get(cacheKey) : undefined;
 	if (cached) recordChromeHit();
 	else recordChromeMiss();
@@ -224,6 +228,8 @@ function renderToolChromeLines(component: any, rendered: string[], width: number
 		&& cached.revision === revision
 		&& cached.theme === chromeTheme
 		&& cached.width === width
+		&& cached.groupStart === boundaries.start
+		&& cached.groupEnd === boundaries.end
 		&& sameLines(cached.sourceLines, rendered)) return cached.lines;
 
 	const core = renderedToolCore(rendered, width, effectiveCwd);
@@ -233,7 +239,11 @@ function renderToolChromeLines(component: any, rendered: string[], width: number
 		else if (mode === "panel") lines = renderPanelChrome(component, core, chromeTheme, width);
 		else {
 			const rule = mutedHorizontalRule(chromeTheme, width, effectiveCwd);
-			lines = shouldOmitBottomToolChromeRule(core) ? [rule, ...core] : [rule, ...core, rule];
+			lines = [
+				...(boundaries.start ? [rule] : []),
+				...core,
+				...(boundaries.end && !shouldOmitBottomToolChromeRule(core) ? [rule] : []),
+			];
 		}
 	}
 	if (cacheKey) toolChromeRenderCache.set(cacheKey, {
@@ -244,6 +254,8 @@ function renderToolChromeLines(component: any, rendered: string[], width: number
 		sourceLines: [...rendered],
 		theme: chromeTheme,
 		width,
+		groupStart: boundaries.start,
+		groupEnd: boundaries.end,
 	});
 	return lines;
 }
@@ -290,12 +302,34 @@ function isSelfRenderedTool(component: any): boolean {	try {
 
 export const __test = { renderPanelChrome, renderToolChromeLines, renderedToolCore, renderWidthFor: stableRenderWidth, shouldOmitBottomToolChromeRule };
 
+function isVisibleToolComponent(component: any): boolean {
+	return typeof component?.toolName === "string"
+		&& typeof component?.toolCallId === "string"
+		&& !component.hideComponent;
+}
+
+function markToolChromeGroupBoundaries(children: any[]): void {
+	for (let index = 0; index < children.length; index++) {
+		const component = children[index];
+		if (!isVisibleToolComponent(component)) continue;
+		let previous = index - 1;
+		while (previous >= 0 && typeof children[previous]?.toolCallId === "string" && children[previous]?.hideComponent) previous--;
+		let next = index + 1;
+		while (next < children.length && typeof children[next]?.toolCallId === "string" && children[next]?.hideComponent) next++;
+		component[TOOL_CHROME_GROUP_SYMBOL] = {
+			start: previous < 0 || !isVisibleToolComponent(children[previous]),
+			end: next >= children.length || !isVisibleToolComponent(children[next]),
+		};
+	}
+}
+
 export function installToolChromePatch(): void {
 	const proto = Container?.prototype as any;
 	if (!proto || proto[TOOL_CHROME_PATCH_SYMBOL]) return;
 	const originalRender = proto.render;
 	if (typeof originalRender !== "function") return;
 	proto.render = function patchedToolChromeRender(this: any, width: number): string[] {
+		if (Array.isArray(this?.children)) markToolChromeGroupBoundaries(this.children);
 		const rendered = originalRender.call(this, width);
 		if (!Array.isArray(rendered) || rendered.length === 0) return rendered;
 		if (typeof this?.toolName !== "string" || typeof this?.toolCallId !== "string") return rendered;
