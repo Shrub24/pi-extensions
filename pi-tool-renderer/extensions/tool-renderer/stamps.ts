@@ -12,6 +12,7 @@
  */
 import { visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 
+import { stripAnsi, truncateAnsi } from "./ansi.js";
 import { settingBoolean, settingEnum } from "./settings.js";
 
 export type MessageStampMode = "off" | "inline";
@@ -93,14 +94,14 @@ export function withInlineStamp(lines: string[], theme: any, label: string | und
 		}
 	}
 	if (target < 0) return lines;
-	const line = lines[target]!;
-	const lineWidth = visibleWidth(line);
-	const padding = width - lineWidth - labelWidth;
-	// The last line already fills the width: stamp on its own line rather than
-	// colliding with content.
+	// Markdown pads every row to the full width, so measure the text itself:
+	// trailing spaces are layout, not content, and must not push the stamp down.
+	const contentWidth = visibleWidth(stripAnsi(lines[target]!).trimEnd());
+	const padding = width - contentWidth - labelWidth;
+	// The text fills the width: stamp on its own line rather than colliding with it.
 	if (padding < gap) return [...lines.slice(0, target + 1), " ".repeat(Math.max(0, width - labelWidth)) + styled, ...lines.slice(target + 1)];
 	const out = [...lines];
-	out[target] = `${line}${" ".repeat(padding)}${styled}`;
+	out[target] = `${truncateAnsi(lines[target]!, contentWidth)}${" ".repeat(padding)}${styled}`;
 	return out;
 }
 

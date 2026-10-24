@@ -26,6 +26,15 @@ test("stamp moves to its own line when the last line is full width", () => {
 	expect(visibleWidth(lines[1]!)).toBe(40);
 });
 
+test("stamp joins a Markdown row that is padded to full width, not a separate row", () => {
+	const padded = "hello" + " ".repeat(35);
+	const lines = withInlineStamp([padded], theme, "14:32:07", 40);
+	expect(lines.length).toBe(1);
+	expect(visibleWidth(lines[0]!)).toBe(40);
+	expect(lines[0]!.startsWith("hello")).toBe(true);
+	expect(lines[0]!.endsWith("14:32:07")).toBe(true);
+});
+
 test("a terminal narrower than the label renders unstamped", () => {
 	const lines = withInlineStamp(["hello"], theme, "14:32:07", 6);
 	expect(lines).toEqual(["hello"]);
