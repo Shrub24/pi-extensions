@@ -40,7 +40,7 @@ Two defects are fixed here, and they are separate:
   and may discard a terminal result that was never retrieved, recording the discard as a
   deliberate resolution distinct from a delivered handoff. Running work is never cleared.
 - **Wakes report per-task result status**, in the batched form as well as the single one:
-  id, outcome, and whether the result is still unretrieved.
+  id, outcome, and whether the result is still unretrieved. User-visible wake and `bg_task` action messages use the package's styled renderers, with a themed generic fallback for unrecognized event shapes.
 - **The capture path is not model-facing text.** An operation's result text names no
   capture file or directory; the operator surface (tool-result details) keeps the path,
   and an oversized response keeps its reference through the truncated-output artifact.

@@ -4,6 +4,8 @@
 
 ### Unreleased
 
+- `bg_task extend` now renders as a styled task-status row, and background messages without a specialized detail shape use a themed generic card instead of plain text.
+- Grouped `result-review` advisories now use the configured `wakeMessageStyle`: compact styled lines by default, ruled cards when requested, and hidden collapsed notifications when configured; expanded views retain task details.
 - `bg_task spawn` takes `needsResult` (default `true`). `needsResult: false` marks informational work: its completion is still reported in the batched exit wake, but that wake asks for no retrieval, starts no turn of its own, the task receives no idle result-review advisory, and it never counts as outstanding work for assignment settlement. The flag is persisted, so a restart cannot turn informational work into an owed result. Useful for smoke tests, timing waits and log tails that would otherwise earn a wake turn each.
 - The shared bash/background-task guidance now says why a trim costs more in a background task: lines discarded by `| head`, `| tail` or `2>/dev/null` never reach the captured result, so `get output:"full"` cannot return them. It also names sleeping as a wait idiom to avoid (`sleep N; check`, `while …; do sleep N; done`) instead of standing in for the completion wake.
 

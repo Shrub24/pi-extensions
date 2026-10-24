@@ -92,6 +92,18 @@ path and remains the explicit reference for complete output.
   one — user lifecycle, packaging, IPC, cleanup, authorization, and recovery — and is not
   required to fix the incident.
 
+## Decision 5: user-visible background messages never fall through unstyled
+
+Every displayed `BG_MESSAGE_TYPE` event is rendered through the specialized output, exit,
+soft-timeout, or result-review view when its detail shape is known. Other event shapes use a
+generic themed card that preserves the message content. The `bg_task extend` tool result
+gets a compact semantic row naming the task, the reminder state, and the unchanged hard
+timeout; it does not echo the raw sentence as an unformatted result.
+
+The generic fallback is deliberate: new background events receive consistent chrome even
+before a specialized renderer is added. Meaningful task controls remain better served by
+explicit action renderers than by styling their model-facing prose.
+
 ## Risks
 
 - **Enforcement becomes advisory.** A worker can now publish an answer while one of its

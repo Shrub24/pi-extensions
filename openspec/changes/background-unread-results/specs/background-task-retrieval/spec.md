@@ -91,6 +91,19 @@ review reminder until then.
 - **WHEN** an unretrieved terminal result's review interval elapses
 - **THEN** a wake names the task and the retrieval or dismissal it still owes
 
+### Requirement: Background-task messages use a styled operator renderer
+Every user-visible background-task notification and `bg_task` action result SHALL use a purpose-built renderer or a generic styled fallback. When a message has a recognized action or event shape, the renderer SHALL emphasize its status and task identity; an unknown background-task message SHALL still receive consistent chrome and readable themed text rather than falling through as plain white text.
+
+#### Scenario: Extending a soft reminder
+- **WHEN** `bg_task action:"extend"` successfully changes or disables a soft reminder
+- **THEN** the rendered result identifies the task and whether the reminder was extended or disabled
+- **AND** it states that the hard timeout is unchanged
+
+#### Scenario: An event has no specialized renderer
+- **WHEN** a background-task event has valid content but its detail shape is not recognized
+- **THEN** the generic background-task renderer supplies consistent chrome and themed body text
+- **AND** the message content remains visible
+
 ### Requirement: The capture path is not model-facing
 
 A task operation's model-facing text SHALL NOT name the capture file, its directory, or a

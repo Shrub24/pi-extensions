@@ -286,13 +286,82 @@ function outputLineLimit(cwd?: string): number {
 	return Math.max(1, Math.floor(settingNumber("toolExpandedLogLines", 80, cwd)));
 }
 
+function isResultReviewDetails(value: unknown): value is { eventType: "result-review"; grouped: true; tasks: BackgroundTaskSnapshot[] } {
+	if (!value || typeof value !== "object") return false;
+	const candidate = value as { eventType?: unknown; grouped?: unknown; tasks?: unknown };
+	return candidate.eventType === "result-review"
+		&& candidate.grouped === true
+		&& Array.isArray(candidate.tasks)
+		&& candidate.tasks.every((task) => task !== null && typeof task === "object" && typeof (task as { id?: unknown }).id === "string");
+}
+
+function renderResultReviewMessage(
+	message: { content?: unknown },
+	details: { tasks: BackgroundTaskSnapshot[] },
+	expanded: boolean,
+	theme: Theme,
+): Component {
+	const tasks = details.tasks;
+	const cwd = tasks[0] ? cwdOf(tasks[0]) : undefined;
+	const style = settingEnum("wakeMessageStyle", ["line", "card", "hidden"] as const, "line", cwd);
+	if (!expanded && style === "hidden") return { invalidate() {}, render: () => [] };
+
+	const count = tasks.length;
+	const heading = count === 1
+		? "One finished background result remains unretrieved"
+		: `${count} finished background results remain unretrieved`;
+	const taskLines = tasks.map((task) =>
+		`${theme.fg("accent", task.id)} ${theme.fg("dim", `· ${summarizeWakeStatus(task)} · ${compactText(taskDisplayName(task), 64)}`)}`,
+	);
+	const contentLines = String(message.content ?? "").split(/\r?\n/).filter(Boolean);
+	const retrieval = contentLines[contentLines.length - 1] ?? 'Retrieve a result with bg_task action:"get" id: <id>.';
+
+	if (expanded || style === "card") {
+		const lines = [
+			`${theme.fg("toolTitle", theme.bold("Background results "))}${theme.fg("warning", "still unretrieved")}`,
+			...tasks.flatMap((task, index) => [
+				`${theme.fg("accent", "●")} ${taskLines[index]}`,
+				...(expanded ? renderTaskDetails(task, theme, cwdOf(task)) : []),
+			]),
+			"",
+			theme.fg("muted", retrieval),
+		];
+		return renderRuledBackgroundMessage(lines.join("\n"), theme);
+	}
+
+	const glyph = glyphs(cwd).emptyBullet.trim();
+	const line = `${theme.fg("dim", glyph)} ${theme.fg("dim", heading)} ${taskLines.join("; ")} ${theme.fg("muted", retrieval)}`;
+	return {
+		invalidate() {},
+		render(width: number): string[] {
+			return wrapAnsiLines(line, width);
+		},
+	};
+}
+
+function renderGenericBackgroundMessage(message: { content?: unknown; details?: unknown }, theme: Theme): Component {
+	const content = String(message.content ?? "Background task update");
+	const eventType = (message.details as { eventType?: unknown } | undefined)?.eventType;
+	const title = typeof eventType === "string"
+		? eventType === "output-budget-exhausted" ? "Background task output limit reached" : "Background task update"
+		: "Background task update";
+	const lines = [
+		`${theme.fg("toolTitle", theme.bold(title))}`,
+		...content.split(/\r?\n/).filter(Boolean).map((line) => theme.fg("dim", line)),
+	];
+	return renderRuledBackgroundMessage(lines.join("\n"), theme);
+}
+
 export function renderTaskEventMessage(
 	message: { content?: unknown; details?: unknown },
 	expanded: boolean,
 	theme: Theme,
 ): Component {
+	if (isResultReviewDetails(message.details)) {
+		return renderResultReviewMessage(message, message.details, expanded, theme);
+	}
 	if (!isBackgroundTaskEventDetails(message.details)) {
-		return renderRuledBackgroundMessage(String(message.content ?? "Background task update"), theme);
+		return renderGenericBackgroundMessage(message, theme);
 	}
 
 	const details = message.details;
@@ -448,7 +517,16 @@ export function renderBgToolResult(result: any, options: any, theme: Theme, cont
 		return renderLines(`${theme.fg("success", "● ")}${bgToolLabel(theme, "Background tasks cleared")}${theme.fg("dim", ` · removed ${removed} finished`)}`);
 	}
 
-	return raw ? renderLines(raw) : renderEmpty();
+	if (action === "extend") {
+		const task = latestSnapshot(details.task as BackgroundTaskSnapshot | undefined);
+		const disabled = raw.includes("disabled.");
+		const heading = disabled ? "Soft reminder disabled" : "Soft reminder extended";
+		const taskId = task ? ` ${theme.fg("accent", task.id)}` : "";
+		const interval = task && task.softTimeoutMs > 0 ? ` · next reminder in ${formatDuration(task.softTimeoutMs)}` : "";
+		return renderLines(`${theme.fg("success", "● ")}${bgToolLabel(theme, heading)}${taskId}${theme.fg("dim", `${interval} · hard timeout unchanged`)}`);
+	}
+
+	return raw ? renderLines(`${theme.fg("dim", raw)}`) : renderEmpty();
 }
 
 function fallbackBashCommand(args: any): string {

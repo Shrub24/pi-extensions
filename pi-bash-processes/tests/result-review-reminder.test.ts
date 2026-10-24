@@ -4,6 +4,7 @@
 
 import { afterAll, expect, test } from "bun:test";
 
+import { renderTaskEventMessage } from "../extensions/render.js";
 import { startExtensionHost, type ExtensionHost, type HostTool } from "./fixtures/extension-host.js";
 
 const host: ExtensionHost = await startExtensionHost({ settings: { exitWakeDebounceMs: 0, exitWakeBatchMs: 0, defaultSoftTimeoutMs: 0 } });
@@ -35,6 +36,15 @@ test("an unretrieved result is reminded once at idle, as a message that starts n
 	expect(JSON.stringify(message)).toContain(`${id} · exit 0`);
 	expect(JSON.stringify(message), "the retrieval instruction is stated once, not per task").toContain('Retrieve a result with bg_task action:\\"get\\" id: <id>');
 	expect(options, "it costs no model turn of its own").toMatchObject({ triggerTurn: false });
+	const theme = { bold: (text: string) => text, fg: (token: string, text: string) => `<${token}>${text}</${token}>` } as never;
+	const rendered = renderTaskEventMessage(message as any, false, theme).render(1000).join("\n");
+	expect(rendered).toContain(`<accent>${id}</accent>`);
+	expect(rendered).toContain("unretrieved");
+	expect(rendered).toContain(`<muted>${'Retrieve a result with bg_task action:"get" id: <id>.'}</muted>`);
+	const expanded = renderTaskEventMessage(message as any, true, theme).render(160).join("\n");
+	expect(expanded).toContain("<toolTitle>");
+	expect(expanded).toContain(`<accent>${id}</accent>`);
+	expect(expanded).toContain("<borderMuted>");
 
 	await host.settle();
 	await Bun.sleep(400);
