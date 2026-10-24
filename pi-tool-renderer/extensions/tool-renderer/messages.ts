@@ -583,6 +583,10 @@ function reserveAssistantGutter(component: any, cwd: string | undefined): void {
  */
 export const THINKING_ROW_SENTINEL = "\u001b]1337;kx-thinking\u0007";
 
+function stripThinkingRowSentinels(lines: string[]): string[] {
+	return lines.map((line) => (line.startsWith(THINKING_ROW_SENTINEL) ? line.slice(THINKING_ROW_SENTINEL.length) : line));
+}
+
 /**
  * Zero-width row whose one U+200B keeps it out of `isBlankRenderLine`, so the
  * panel's bottom padding survives the assistant trimmers that drop trailing
@@ -630,7 +634,7 @@ export function installAssistantMessageRenderer(pi: ExtensionAPI, AssistantMessa
 			if (quickCached && quickCached.quickKey === quickKey) return quickCached.lines;
 			const rendered = state!.originalRender.call(this, width);
 			if (!Array.isArray(rendered) || rendered.length === 0) return rendered;
-			if (isThinkingOnlyAssistantMessage(this?.lastMessage)) return trimThinkingOnlyAssistantLines(rendered);
+			if (isThinkingOnlyAssistantMessage(this?.lastMessage)) return trimThinkingOnlyAssistantLines(stripThinkingRowSentinels(rendered));
 			const cwd = safeCtxCwd(state?.activeCtx);
 			const theme = safeCtxTheme(state?.activeCtx);
 			const style = assistantTextStyle(cwd);
@@ -663,9 +667,11 @@ export function installAssistantMessageRenderer(pi: ExtensionAPI, AssistantMessa
 			} catch {
 				// A missing or malformed theme background leaves the gutter unpainted.
 			}
+			// Without a gutter pass the panel's marker has no consumer, so it is dropped
+			// here rather than reaching the terminal as an unknown escape on every row.
 			const styled = theme && style !== "plain"
 				? applyPromptZoneMarkers(assistantTextGutterLinesCached(this, stripped.lines, width, theme, cwd, style, backgroundPrefix), stripped.markers)
-				: rendered;
+				: stripThinkingRowSentinels(rendered);
 			const finish = (lines: string[]): string[] => {
 				assistantRenderCache.set(this, { width, revision, fingerprint, lines, quickKey });
 				return lines;

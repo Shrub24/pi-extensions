@@ -127,3 +127,26 @@ test("thinking panel rows keep their fill and the marker lands on the message", 
 	// Continuation lines hang on the same indent.
 	expect(out[3]).toBe("   body");
 });
+
+test("plain assistant style never writes the thinking-panel marker to the terminal", () => {
+	const { cwd } = world();
+	writeFileSync(join(cwd, ".pi", "settings.json"), JSON.stringify({ "pi-tool-renderer": { thinkingPanel: true, assistantMessageStyle: "plain" } }));
+	clearPackageConfigCache();
+	const handlers = new Map<string, (...args: any[]) => void>();
+	const pi = { on: (event: string, handler: (...args: any[]) => void) => handlers.set(event, handler) };
+	installAssistantMessageRenderer(pi as any, StreamingAssistantMessage);
+	handlers.get("session_start")!({}, { cwd, hasUI: true, ui: { theme } });
+	try {
+		const component = new StreamingAssistantMessage();
+		component.updateContent({ content: [{ type: "thinking", thinking: "Editing group boundary fields" }] });
+		const thinkingOnly = component.render(50);
+		expect(thinkingOnly.some((line) => line.includes(TINT))).toBe(true);
+		expect(thinkingOnly.filter((line) => line.includes(THINKING_ROW_SENTINEL))).toEqual([]);
+		component.updateContent({ content: [{ type: "thinking", thinking: "Editing group boundary fields" }, { type: "text", text: "Done." }] });
+		const withText = component.render(50);
+		expect(withText.some((line) => line.includes(TINT))).toBe(true);
+		expect(withText.filter((line) => line.includes(THINKING_ROW_SENTINEL))).toEqual([]);
+	} finally {
+		handlers.get("session_shutdown")!();
+	}
+});

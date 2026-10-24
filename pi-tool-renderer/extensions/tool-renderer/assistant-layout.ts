@@ -30,6 +30,9 @@ function parseBoxTable(lines: string[], start: number): { end: number; width: nu
 	const rows: string[][] = [];
 	let pending: string[][] = [];
 	let headerSeparated = false;
+	// A line whose first cell is filled starts a new row. A blank first cell
+	// continues the row above, which is how wrapped cells are drawn.
+	const collapse = (group: string[][]) => widths.map((_, column) => group.map((row) => row[column]!).filter(Boolean).join(" "));
 	for (let index = start + 1; index < lines.length; index++) {
 		const line = lines[index] ?? "";
 		const middle = borderSegments(line, "├", "┼", "┤");
@@ -37,7 +40,7 @@ function parseBoxTable(lines: string[], start: number): { end: number; width: nu
 		if (middle || bottom) {
 			const segments = middle ?? bottom!;
 			if (segments.length !== widths.length || segments.some((width, column) => width !== widths[column]) || pending.length === 0) return undefined;
-			rows.push(widths.map((_, column) => pending.map((row) => row[column]!).filter(Boolean).join(" ")));
+			rows.push(collapse(pending));
 			pending = [];
 			if (bottom) {
 				if (!headerSeparated || rows.length < 2) return undefined;
@@ -48,6 +51,10 @@ function parseBoxTable(lines: string[], start: number): { end: number; width: nu
 		}
 		const row = rowCells(line, widths);
 		if (!row) return undefined;
+		if (pending.length > 0 && row[0] !== "") {
+			rows.push(collapse(pending));
+			pending = [];
+		}
 		pending.push(row);
 	}
 	return undefined;

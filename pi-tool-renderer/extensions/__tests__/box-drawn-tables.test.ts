@@ -58,6 +58,34 @@ test("a too-wide reported box table becomes readable header/value blocks", () =>
 	expect(Math.max(...lines.map(visibleWidth))).toBeLessThanOrEqual(60);
 });
 
+test("rows separated only by their own lines stay separate rows, not one merged row", () => {
+	const unseparated = [
+		border("┌", "┬", "┐"),
+		...row(["Area", "Files", "Work"]),
+		border("├", "┼", "┤"),
+		...row(["Boundaries", "tool-renderer/diff.ts", "Add the cache"]),
+		...row(["Tests", "mutation-diffs.test.ts", "Cover parsing"]),
+		border("└", "┴", "┘"),
+	].join("\n");
+	const transformed = transformBoxDrawnTables(unseparated, 40);
+	expect(transformed).toContain("**Area: Boundaries**");
+	expect(transformed).toContain("**Area: Tests**");
+	expect(transformed).not.toContain("Boundaries Tests");
+});
+
+test("a continuation line with a blank first cell still belongs to the row above", () => {
+	const wrapped = [
+		border("┌", "┬", "┐"),
+		...row(["Area", "Files", "Work"]),
+		border("├", "┼", "┤"),
+		...row(["Manual, high risk", "context-handler.ts", "Real merges; prefixBound is derived twice and both paths must share it."]),
+		border("└", "┴", "┘"),
+	].join("\n");
+	const transformed = transformBoxDrawnTables(wrapped, 40);
+	expect(transformed).toContain("prefixBound");
+	expect(transformed.match(/\*\*Area:/g)).toHaveLength(1);
+});
+
 test("the Markdown transformer adapts assistant output only", () => {
 	let transform: ((markdown: string, context: { messageType: string; availableWidth: number }) => string) | undefined;
 	installAssistantMarkdownLayout({ registerMarkdownTransformer: (handler: typeof transform) => { transform = handler; } } as any);
