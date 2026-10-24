@@ -24,9 +24,10 @@ const ANSI_ERROR = (text: string) => `\x1b[31m${text}\x1b[39m`;
  * The provider that will serve the request, with its account when one is bound. A configured provider label
  * replaces the provider id on screen only.
  */
-export function providerText(provider: string, account: string | undefined, display?: Display): string {
+export function providerText(provider: string, account: string | undefined, display?: Display, blocked = false): string {
   const shown = display?.providers[provider] ?? provider;
-  return account === undefined ? shown : `${shown} · ${account}`;
+  const text = account === undefined ? shown : `${shown} · ${account}`;
+  return blocked ? ANSI_ERROR(text) : text;
 }
 
 /** Whether the physical model's price is at peak, evaluated when the request is dispatched. */

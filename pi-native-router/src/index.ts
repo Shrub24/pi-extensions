@@ -621,8 +621,14 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
   };
   // The route's model entry: pin glyph (fallback-coloured while another model serves), model name, peak glyph.
   const setPhysical = (ctx: ExtensionContext, role: string | undefined, model: Model<Api> | undefined, account: string | undefined) => {
-    ctx.ui.setStatus(FOOTER_KEYS.provider, model === undefined ? undefined : providerText(model.provider, account, config.display));
-    if (model === undefined || role === undefined) { ctx.ui.setStatus(FOOTER_KEYS.model, undefined); return; }
+    if (model === undefined || role === undefined) {
+      ctx.ui.setStatus(FOOTER_KEYS.provider, undefined);
+      ctx.ui.setStatus(FOOTER_KEYS.model, undefined);
+      return;
+    }
+    const providerBlock = health.blockedReason(model, account);
+    const providerBlocked = providerBlock !== undefined && providerBlock.key !== identity(model, account);
+    ctx.ui.setStatus(FOOTER_KEYS.provider, providerText(model.provider, account, config.display, providerBlocked));
     const pin = pinOf(ctx, role);
     const pinState = typeof pin !== "string" ? undefined : pin === identity(model, account) ? "pinned" as const : "fallback" as const;
     const pinnedCandidate = typeof pin === "string" ? config.routes[role].candidates.find(candidate => identity(candidate, candidate.account) === pin) : undefined;

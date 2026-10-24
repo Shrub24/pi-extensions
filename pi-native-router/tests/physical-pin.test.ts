@@ -47,6 +47,7 @@ test("the cycle hotkey defaults to ctrl+shift+m and accepts a configured key", (
 test("the model entry carries pin, model and peak in one entry, pin first and fallback-coloured", () => {
   expect(providerText("a", "go-a")).toBe("a · go-a");
   expect(providerText("a", undefined)).toBe("a");
+  expect(providerText("a", "go-a", undefined, true)).toBe("\x1b[31ma · go-a\x1b[39m");
   const entry = (pin?: "pinned" | "fallback", peak = false, pinBlocked = false, modelBlocked = false) => modelEntryText({ name: "Claude Haiku 5.5", provider: "anthropic", providerLabel: "Claude", pin, pinBlocked, modelBlocked, peak });
   expect(entry()).toBe("Haiku 5.5");
   expect(entry("pinned", true)).toBe(`${PIN_GLYPH} Haiku 5.5 \x1b[33m${PEAK_GLYPH}\x1b[39m`);
