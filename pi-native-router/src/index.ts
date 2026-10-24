@@ -605,13 +605,9 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     const route = config.routes[role];
     const state = branchState(ctx, role);
     const pin = pinOf(ctx, role);
-    const candidates = resume.automatic() ? resume.candidates(route, ctx) : available(route, ctx, config);
-    // The footer follows what actually serves: the last dispatched target, unless the user has just chosen a new one
-    // (a fresh pin is pending). A stored pin does not pull the display away from a healthy fallback.
-    if (!orderOf(ctx, role)?.reconsider && !(typeof pin === "string" && pinOverrideOf(ctx, role)) && state?.physical) {
-      const served = candidates.find(value => identity(value.model, value.candidate.account) === state.physical);
-      if (served) return served;
-    }
+    // What the next request will try, not the last served answer. A healthy served model stays (stickiness), a
+    // served model that can no longer take the request yields to the next eligible candidate, and a fresh pin
+    // previews the pin. Cycle therefore continues from wherever auto sits rather than from the top of the route.
     const preferred = typeof pin === "string" ? pin : state?.physical;
     const selection = await chooseWithStrategy(role, route, available(route, ctx, config), health, ctx.getContextUsage()?.tokens ?? 0, preferred, undefined, ctx,
       { mode: "preview", reason: state?.physical ? "continuation" : "initial", state, current: state?.physical || undefined,

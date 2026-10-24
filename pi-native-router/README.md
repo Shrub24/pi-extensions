@@ -181,8 +181,9 @@ The model part of `provider/model` is Pi's own model name, so model labels come 
   no other route is left holding one.
 - `auto` clears the pin. So does picking the candidate that automatic selection would already pick now; without a custom strategy this is the last served candidate, else the first in route order.
 - If a one-shot attempt fails, the health block remains and normal fallback serves; the pinned model stays visibly red. If it succeeds, the proven block clears in shared and process-local health. Automatic routing still skips blocked targets. Fit and credential failures are not bypassed.
-- The footer's model entry follows the model that actually serves: dispatch and each finished assistant message publish it.
+- The footer's model entry shows what the next request will try: the served model while it can still take the request, the next eligible candidate once it cannot (blocked, cooling, disabled, unfit), and a fresh pin instead of either. It is never a stale answer that automatic routing has already moved past.
   A stored pin never pulls it back to the pinned model once another model has served; only a fresh pin change previews the pin.
+- Cycling continues from the candidate the footer shows, so it moves to the next candidate after wherever automatic selection currently sits rather than restarting at the top of the route.
 - The pin glyph shows only when the displayed model is the pinned one. When another model serves, the fallback glyph replaces it in the same entry; the glyph and model name are red while the pinned candidate remains blocked. Picker entries for cooling candidates carry a red `⚠` mark. Each manual change is logged with reason `manual`.
 - A pin change reports that an eligible new choice will apply on the next request and then stay sticky; an actual physical switch uses the normal cache-rebuild notice.
 

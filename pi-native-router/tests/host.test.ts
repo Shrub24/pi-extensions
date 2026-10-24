@@ -857,6 +857,28 @@ test("a stored pin does not pull the footer back to the pinned model once a fall
   } finally { h.close(); }
 });
 
+test("the footer previews what the next request will try, and cycle continues from that candidate", async () => {
+  const shared = mkdtempSync(join(tmpdir(), "native-router-auto-position-"));
+  const healthPath = join(shared, "health.sqlite");
+  const clock = { value: 1000 };
+  const h = await host(["ok", "ok"], { healthPath, clock });
+  const ui = routeOrderUI(h);
+  try {
+    await h.session.prompt("A serves");
+    // A quota block lands on the served target from outside dispatch, so auto now sits on B while A is the last answer.
+    const store = new HealthStore(healthPath, () => clock.value);
+    store.mark("fake-a/model", "quota", clock.value + 900_000, "fixture-quota");
+    store.close();
+    for (const handler of h.handlers.get("model_select") ?? []) await handler({ model: h.runtime.getModel("route", "worker") } as never, ui.ctx as never);
+    expect(ui.statuses.get(FOOTER_KEYS.model)).toContain("fake-b");
+    // Cycle continues from where auto sits, not from the blocked last answer.
+    await (h.shortcuts.get("ctrl+shift+m") as { handler: (ctx: never) => Promise<void> }).handler(ui.ctx as never);
+    expect(ui.statuses.get(FOOTER_KEYS.model)).toContain("fake-c");
+    await h.session.prompt("cycle continues past auto");
+    expect(h.dispatches.map(d => d.physical)).toEqual(["fake-a", "fake-c"]);
+  } finally { h.close(); rmSync(shared, { recursive: true, force: true }); }
+});
+
 test("switching the selected model away from a route clears that route's pin", async () => {
   const h = await host(["ok", "ok"]);
   const ui = { select: async () => undefined, notify: () => {}, setStatus: () => {} };
@@ -1041,10 +1063,11 @@ function routeOrderUI(h: Awaited<ReturnType<typeof host>>) {
   let keys: string[] = [];
   const notices: string[] = [];
   let screen: string[] = [];
+  const statuses = new Map<string, string | undefined>();
   const ctx = { mode: "tui", hasUI: true, model: h.runtime.getModel("route", "worker"), modelRegistry: {
     find: (provider: string, id: string) => h.runtime.getModel(provider, id), hasConfiguredAuth: () => true, runtime: h.runtime,
   }, sessionManager: h.manager, getContextUsage: () => ({ tokens: 0 }), thinkingLevel: "off", ui: {
-    notify: (message: string) => notices.push(message), setStatus: () => {}, select: async (_title: string, choices: string[]) => choices[1],
+    notify: (message: string) => notices.push(message), setStatus: (key: string, value: string | undefined) => statuses.set(key, value), select: async (_title: string, choices: string[]) => choices[1],
     custom: async (factory: Function) => {
       let result: unknown;
       const component = factory({ requestRender() {} }, {}, {}, (value: unknown) => { result = value; });
@@ -1054,7 +1077,7 @@ function routeOrderUI(h: Awaited<ReturnType<typeof host>>) {
     },
   } };
   const command = (name: string, args = "") => (h.commands.get(name) as { handler: (args: string, ctx: never) => Promise<void> }).handler(args, ctx as never);
-  return { ctx, notices, command, get screen() { return screen; }, edit: async (...input: string[]) => { keys = input; await command("route-order"); } };
+  return { ctx, notices, statuses, command, get screen() { return screen; }, edit: async (...input: string[]) => { keys = input; await command("route-order"); } };
 }
 
 test("session order applies once then stays sticky; reset reconsiders configured order; cancel and all-disabled preserve it", async () => {
