@@ -52,11 +52,11 @@ export function stripProviderPrefix(name: string, providerLabel: string, provide
  * The single model entry: the route pin first, then the model, then peak pricing. A pinned model shows the
  * pin glyph; while the pin is set but another model serves, the glyph becomes the warning-coloured fallback.
  */
-export function modelEntryText(parts: { name: string; provider: string; providerLabel: string; pin?: "pinned" | "fallback"; blocked?: boolean; peak: boolean }): string {
+export function modelEntryText(parts: { name: string; provider: string; providerLabel: string; pin?: "pinned" | "fallback"; pinBlocked?: boolean; modelBlocked?: boolean; peak: boolean }): string {
   const pinGlyph = parts.pin === "pinned" ? PIN_GLYPH : parts.pin === "fallback" ? PIN_FALLBACK_GLYPH : undefined;
-  const pin = pinGlyph === undefined ? undefined : parts.blocked ? ANSI_ERROR(pinGlyph) : parts.pin === "fallback" ? ANSI_WARNING(pinGlyph) : pinGlyph;
+  const pin = pinGlyph === undefined ? undefined : parts.pinBlocked ? ANSI_ERROR(pinGlyph) : parts.pin === "fallback" ? ANSI_WARNING(pinGlyph) : pinGlyph;
   const model = stripProviderPrefix(parts.name, parts.providerLabel, parts.provider);
-  const shownModel = parts.blocked ? ANSI_ERROR(model) : model;
+  const shownModel = parts.modelBlocked ? ANSI_ERROR(model) : model;
   const peak = parts.peak ? ANSI_WARNING(PEAK_GLYPH) : undefined;
   return [pin, shownModel, peak].filter((part): part is string => part !== undefined && part !== "").join(" ");
 }

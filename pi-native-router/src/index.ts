@@ -628,8 +628,9 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     const pinnedCandidate = typeof pin === "string" ? config.routes[role].candidates.find(candidate => identity(candidate, candidate.account) === pin) : undefined;
     const pinnedModel = pinnedCandidate && ctx.modelRegistry.find(pinnedCandidate.provider, pinnedCandidate.id);
     const pinBlocked = Boolean(pinnedCandidate && pinnedModel && health.blockedReason(pinnedModel, pinnedCandidate.account));
+    const modelBlocked = Boolean(health.blockedReason(model, account));
     ctx.ui.setStatus(FOOTER_KEYS.model, modelEntryText({ name: model.name, provider: model.provider, providerLabel: config.display.providers[model.provider] ?? model.provider,
-      pin: pinState, blocked: pinBlocked, peak: isPeakNow(model.provider, model.id, options.now?.() ?? Date.now()) }));
+      pin: pinState, pinBlocked, modelBlocked, peak: isPeakNow(model.provider, model.id, options.now?.() ?? Date.now()) }));
   };
   const clearRoute = (ctx: ExtensionContext) => {
     setPhysical(ctx, undefined, undefined, undefined);
@@ -674,7 +675,6 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     const leftRole = previous?.startsWith("route/") ? previous.slice("route/".length) : undefined;
     if (previous !== undefined && previous !== next && leftRole !== undefined && config.routes[leftRole] && typeof pinOf(ctx, leftRole) === "string") {
       pi.appendEntry(PIN_ENTRY, { role: leftRole, identity: null });
-      if (ctx.hasUI) ctx.ui.notify(`native-router: ${leftRole} pin cleared because the model changed`, "info");
     }
     if (previous !== next && leftRole !== undefined) orders.delete(orderKey(ctx, leftRole));
     activeModel.set(sessionId, next);
@@ -816,12 +816,8 @@ export function installRouter(pi: ExtensionAPI, config: Config, options: { trans
     activeModel.set(ctx.sessionManager.getSessionId(), `route/${role}`);
     recordDecision(decisionLogPath, { at: new Date(options.now?.() ?? Date.now()).toISOString(), session: ctx.sessionManager.getSessionId(), logical: `route/${role}`, physical: choice === null ? "auto" : physicalOf(choice), ...(choice && accountOf(choice) ? { account: accountOf(choice) } : {}), reason: "manual" }, degrade);
     await previewRoute(ctx, role);
-    if (matchesAuto) { ctx.ui.notify(`native-router: ${role} already follows auto on ${requested}; pin cleared`, "info"); return; }
-    const note = choice === null ? `native-router: ${role} follows automatic selection` : `native-router: ${role} prefers ${choice}`;
-    const chosen = choice === null ? undefined : config.routes[role].candidates.find(c => identity(c, c.account) === choice);
-    const cooling = chosen ? blockedTarget(ctx, chosen) : undefined;
-    if (cooling) { ctx.ui.notify(`${note}; ${choice} is cooling down until ${new Date(cooling.until).toISOString()}, so the fallback serves until it recovers`, "warning"); return; }
-    ctx.ui.notify(`${note}; an eligible new pin applies on the next request, then the selected model stays sticky`, "info");
+    // Pin/cycle state is already visible in the physical-model footer. Avoid one chat notice per keypress;
+    // notifications remain for dispatch outcomes and actionable errors.
   };
   const cyclePin = async (ctx: ExtensionContext) => {
     const model = ctx.model;

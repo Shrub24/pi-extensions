@@ -895,7 +895,7 @@ test("route-pin preview normalizes a redundant strategy choice to auto and cycli
     await pin.handler("", ctx);
     expect(h.manager.getBranch().some(entry => entry.type === "custom" && entry.customType === "@vanillagreen/pi-native-router/physical-pin" &&
       (entry.data as { role?: string; identity?: string | null }).identity === null)).toBe(true);
-    expect(notices.some(message => message.includes("pin cleared"))).toBe(true);
+    expect(notices).toEqual([]);
     expect(statuses.has(FOOTER_KEYS.model)).toBe(true);
 
     const cycle = h.shortcuts.get("ctrl+shift+m") as { handler: (context: never) => Promise<void> };

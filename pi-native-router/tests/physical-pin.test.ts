@@ -47,12 +47,14 @@ test("the cycle hotkey defaults to ctrl+shift+m and accepts a configured key", (
 test("the model entry carries pin, model and peak in one entry, pin first and fallback-coloured", () => {
   expect(providerText("a", "go-a")).toBe("a · go-a");
   expect(providerText("a", undefined)).toBe("a");
-  const entry = (pin?: "pinned" | "fallback", peak = false, blocked = false) => modelEntryText({ name: "Claude Haiku 5.5", provider: "anthropic", providerLabel: "Claude", pin, blocked, peak });
+  const entry = (pin?: "pinned" | "fallback", peak = false, pinBlocked = false, modelBlocked = false) => modelEntryText({ name: "Claude Haiku 5.5", provider: "anthropic", providerLabel: "Claude", pin, pinBlocked, modelBlocked, peak });
   expect(entry()).toBe("Haiku 5.5");
   expect(entry("pinned", true)).toBe(`${PIN_GLYPH} Haiku 5.5 \x1b[33m${PEAK_GLYPH}\x1b[39m`);
   expect(entry("fallback")).toBe(`\x1b[33m${PIN_FALLBACK_GLYPH}\x1b[39m Haiku 5.5`);
-  expect(entry("pinned", false, true)).toBe(`\x1b[31m${PIN_GLYPH}\x1b[39m \x1b[31mHaiku 5.5\x1b[39m`);
-  expect(entry("fallback", false, true)).toBe(`\x1b[31m${PIN_FALLBACK_GLYPH}\x1b[39m \x1b[31mHaiku 5.5\x1b[39m`);
+  expect(entry("pinned", false, true)).toBe(`\x1b[31m${PIN_GLYPH}\x1b[39m Haiku 5.5`);
+  expect(entry("fallback", false, true, false)).toBe(`\x1b[31m${PIN_FALLBACK_GLYPH}\x1b[39m Haiku 5.5`);
+  expect(entry("fallback", false, true, true)).toBe(`\x1b[31m${PIN_FALLBACK_GLYPH}\x1b[39m \x1b[31mHaiku 5.5\x1b[39m`);
+  expect(entry("fallback", false, false, true)).toBe(`\x1b[33m${PIN_FALLBACK_GLYPH}\x1b[39m \x1b[31mHaiku 5.5\x1b[39m`);
 });
 
 test("a provider prefix is removed from the model name only when something remains", () => {
