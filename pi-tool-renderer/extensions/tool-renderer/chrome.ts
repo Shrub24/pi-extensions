@@ -308,14 +308,31 @@ function isVisibleToolComponent(component: any): boolean {
 		&& !component.hideComponent;
 }
 
+/**
+ * A tool-call-only assistant message renders no lines, yet Pi gives each model
+ * turn its own message component. Such a message must not split a run of tool
+ * rows that the model issued across turns.
+ */
+function isSilentToolTurn(component: any): boolean {
+	if (isVisibleToolComponent(component) || component?.hasToolCalls !== true) return false;
+	const content = component?.lastMessage?.content;
+	if (!Array.isArray(content)) return false;
+	return !content.some((block: any) => (block?.type === "text" && String(block.text ?? "").trim().length > 0)
+		|| (block?.type === "thinking" && String(block.thinking ?? "").trim().length > 0));
+}
+
+function isTransparentToolRunChild(component: any): boolean {
+	return (typeof component?.toolCallId === "string" && component?.hideComponent === true) || isSilentToolTurn(component);
+}
+
 function markToolChromeGroupBoundaries(children: any[]): void {
 	for (let index = 0; index < children.length; index++) {
 		const component = children[index];
 		if (!isVisibleToolComponent(component)) continue;
 		let previous = index - 1;
-		while (previous >= 0 && typeof children[previous]?.toolCallId === "string" && children[previous]?.hideComponent) previous--;
+		while (previous >= 0 && isTransparentToolRunChild(children[previous])) previous--;
 		let next = index + 1;
-		while (next < children.length && typeof children[next]?.toolCallId === "string" && children[next]?.hideComponent) next++;
+		while (next < children.length && isTransparentToolRunChild(children[next])) next++;
 		component[TOOL_CHROME_GROUP_SYMBOL] = {
 			start: previous < 0 || !isVisibleToolComponent(children[previous]),
 			end: next >= children.length || !isVisibleToolComponent(children[next]),

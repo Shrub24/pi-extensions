@@ -4,6 +4,7 @@
 
 ### Unreleased
 
+- Consecutive tool rows that the model issues across separate assistant turns share one outline again. A tool-call-only turn no longer draws a doubled rule between them.
 - Inline message timestamps join the last line of the reply instead of taking their own row, so a stamped reply no longer gets an extra blank line after its timestamp.
 - The thinking-panel marker no longer reaches the terminal under `assistantMessageStyle: "plain"`, or on thinking-only messages in any style.
 - Box-drawn tables whose rows have no separator lines between them render as one card per row instead of merging the rows.

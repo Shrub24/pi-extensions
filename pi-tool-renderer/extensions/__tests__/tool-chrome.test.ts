@@ -91,6 +91,35 @@ describe("tool chrome", () => { test("adjacent tool entries share only the run's
 		expect(lines).toEqual(["content call-1", "content call-2"]);
 	});
 
+	test("a tool-call-only assistant message between two tools does not split their run", () => {
+		const cwd = tempCwd({ toolChrome: "outlines" });
+		const makeTool = (id: string) => {
+			const component: any = new Container();
+			component.toolName = "read";
+			component.toolCallId = id;
+			component.cwd = cwd;
+			component.ui = { theme };
+			component.hideComponent = false;
+			component.render = Container.prototype.render;
+			component.addChild({ render: () => [`content ${id}`], invalidate() {} });
+			return component;
+		};
+		// Pi adds one assistant message per model turn; a tool-only turn renders no lines.
+		const toolOnlyTurn: any = new Container();
+		toolOnlyTurn.hasToolCalls = true;
+		toolOnlyTurn.lastMessage = { content: [{ type: "toolCall", id: "call-2", name: "ls", arguments: {} }] };
+		toolOnlyTurn.render = () => [];
+		const transcript = new Container();
+		transcript.addChild(makeTool("call-1"));
+		transcript.addChild(toolOnlyTurn);
+		transcript.addChild(makeTool("call-2"));
+		installToolChromePatch();
+
+		const lines = transcript.render(40).map(stripAnsi);
+		expect(lines.filter((line) => line === "─".repeat(39))).toHaveLength(2);
+		expect(lines.indexOf("content call-1")).toBeLessThan(lines.indexOf("content call-2"));
+	});
+
 	test("hidden tool entries do not split an adjacent visible run", () => {
 		const cwd = tempCwd({ toolChrome: "outlines" });
 		const makeTool = (id: string, hidden = false) => {
