@@ -11,6 +11,7 @@ import { truncateText } from "./glyphs.js";
 import { toolLabel } from "./theme.js";
 import {
 	bashCallBlock,
+	boundedBashCommand,
 	clearBlink,
 	commandExit,
 	lineCount,
@@ -148,7 +149,7 @@ function renderManagedBashTaskRow({ task, expanded, isPartial, context, theme, c
 	const declaredIntent = typeof args?.intent === "string" ? args.intent.trim() : "";
 	const intentLead = declaredIntent ? `\n${theme.fg("dim", "— ")}${theme.fg("accent", declaredIntent)}\n` : "";
 	text += `${intentLead}${theme.fg("dim", "$ ")}${theme.fg("toolOutput", bashCommandText(args ?? {}, expanded, cwd))}`;
-	const limit = Math.max(1, Math.floor(settingNumber(expanded ? "bashPreviewLines" : "bashCollapsedLines", expanded ? 80 : 10, cwd)));
+	const limit = Math.max(1, Math.floor(settingNumber(expanded ? "bashPreviewLines" : "bashCollapsedLines", expanded ? 80 : 5, cwd)));
 	const showTail = mode !== "summary" && task.tail.length > 0 && (!isPartial || task.status !== "running" || expanded);
 	if (showTail) {
 		const tail = renderBashTail(task.tail, limit, theme, cwd);
@@ -166,14 +167,7 @@ function renderManagedBashTaskRow({ task, expanded, isPartial, context, theme, c
  * characters so one heredoc cannot take over the transcript.
  */
 function bashCommandText(args: Record<string, unknown> | undefined, expanded: boolean, cwd?: string): string {
-	const raw = typeof args?.command === "string" ? args.command : "";
-	if (expanded) return raw;
-	const maxChars = Math.max(20, Math.floor(settingNumber("commandPreviewChars", 96, cwd)));
-	const maxLines = Math.max(1, Math.floor(settingNumber("commandHeaderLines", 1, cwd)));
-	const bounded = truncateText(raw, maxChars, cwd);
-	const lines = splitTerminalLines(bounded);
-	if (lines.length <= maxLines) return bounded;
-	return `${lines.slice(0, maxLines).join("\n")}…`;
+	return boundedBashCommand(typeof args?.command === "string" ? args.command : "", cwd, expanded);
 }
 
 function formatElapsed(ms: number): string {
@@ -238,20 +232,11 @@ export function renderManagedBashResult({ result, expanded, isPartial, context, 
 	if (diffPreview) {
 		text += `\n${diffPreview}`;
 	} else if (!suppressDiffOutput && mode === "preview" && output) {
-		const limit = Math.max(1, Math.floor(settingNumber(expanded ? "bashPreviewLines" : "bashCollapsedLines", expanded ? 80 : 10, effectiveCwd)));
+		const limit = Math.max(1, Math.floor(settingNumber(expanded ? "bashPreviewLines" : "bashCollapsedLines", expanded ? 80 : 5, effectiveCwd)));
 		text += `\n${splitTerminalLines(preview(output, limit, "tail", effectiveCwd))
 			.map((line) => theme.fg("dim", line))
 			.join("\n")}`;
 		if (count > limit) text += `\n${theme.fg("muted", `… ${count - limit} older line(s)`)}`;
-	} else if (!suppressDiffOutput && mode === "opencode" && expanded && output) {
-		const limit = Math.max(1, Math.floor(settingNumber("bashPreviewLines", 80, effectiveCwd)));
-		text += `\n${splitTerminalLines(preview(output, limit, "tail", effectiveCwd))
-			.map((line) => theme.fg("dim", line))
-			.join("\n")}`;
-		if (count > limit) text += `\n${theme.fg("muted", `… ${count - limit} older line(s)`)}`;
-	} else if (!suppressDiffOutput && mode === "opencode" && output) {
-		const tailText = renderBashTail(output, bashLiveTailLines(effectiveCwd), theme, effectiveCwd);
-		if (tailText) text += `\n${tailText}`;
 	}
 	return makeTruncatedLines(text);
 }

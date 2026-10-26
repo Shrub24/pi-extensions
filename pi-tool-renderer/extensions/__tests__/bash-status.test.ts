@@ -1,7 +1,10 @@
 import { beforeEach, expect, test } from "bun:test";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { ExtensionAPI, Theme, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { newStackItem, renderStackItemText, setStackItemResultText } from "../tool-renderer/stack.js";
 import { commandExit } from "../tool-renderer/text.js";
+import { clearPackageConfigCache } from "../tool-renderer/package-config.js";
 import { registerBash } from "../tool-renderer/tools.js";
 import { useWorld } from "./helpers/world.js";
 
@@ -73,4 +76,37 @@ test("a finished one-line bash result stays visible in the collapsed row", () =>
 		{ args: { command: "echo hi" }, isError: false, isPartial: false, cwd: world().cwd } as any,
 	);
 	expect(stripStyles(drawn.render(80).join("\n"))).toContain("hi");
+});
+
+function setRendererSettings(settings: Record<string, unknown>): void {
+	writeFileSync(join(world().cwd, ".pi", "settings.json"), JSON.stringify({ "pi-tool-renderer": settings }));
+	clearPackageConfigCache();
+}
+
+function renderFinished(command: string, output: string, expanded = false): string {
+	const drawn = definition.renderResult!(
+		{ content: [{ type: "text", text: output }], details: undefined } as any,
+		{ expanded, isPartial: false } as any,
+		plainTheme,
+		{ args: { command }, isError: false, isPartial: false, cwd: world().cwd } as any,
+	);
+	return stripStyles(drawn.render(80).join("\n"));
+}
+
+test("opencode is the former name of preview and collapses to five output lines", () => {
+	setRendererSettings({ bashOutputMode: "opencode" });
+	const output = Array.from({ length: 12 }, (_value, index) => `row ${index + 1}`).join("\n");
+	const collapsed = renderFinished("seq 12", output);
+	expect(collapsed).toContain("row 12");
+	expect(collapsed).toContain("row 8");
+	expect(collapsed, "rows before the last five are hidden").not.toContain("row 7");
+});
+
+test("a multi-line command shows its first line and an ellipsis when collapsed", () => {
+	setRendererSettings({});
+	const command = "set -e\nfor i in 1 2 3; do\n  echo $i\ndone";
+	const collapsed = renderFinished(command, "1\n2\n3");
+	expect(collapsed).toContain("$ set -e…");
+	expect(collapsed).not.toContain("for i in");
+	expect(renderFinished(command, "1\n2\n3", true)).toContain("done");
 });

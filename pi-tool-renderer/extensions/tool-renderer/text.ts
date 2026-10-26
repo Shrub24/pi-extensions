@@ -5,7 +5,7 @@ import { pathToFileURL } from "node:url";
 
 import { stableRenderWidth, stripAnsi } from "./ansi.js";
 import { glyphs, truncateText } from "./glyphs.js";
-import { fileHyperlinkMode, pendingStatusAnimation, settingNumber, stackToolCalls } from "./settings.js";
+import { bashCommandMaxChars, fileHyperlinkMode, pendingStatusAnimation, settingNumber, stackToolCalls } from "./settings.js";
 import { stackPrefix, toolLabel, treeConnector, type TreeBranch } from "./theme.js";
 
 export class TruncatedLines {
@@ -324,9 +324,22 @@ export function readCallText(args: any, theme: any, cwd?: string, hyperlinks?: b
  * cannot flood the transcript.
  */
 function bashCommandSource(args: any, cwd: string | undefined, full: boolean): string {
-	const max = Math.max(20, Math.floor(settingNumber("commandPreviewChars", 96, cwd)));
-	const rawCommand = typeof args?.command === "string" ? args.command : "";
-	return full ? rawCommand : truncateText(rawCommand, max, cwd);
+	return boundedBashCommand(typeof args?.command === "string" ? args.command : "", cwd, full);
+}
+
+/**
+ * The command as a bash row shows it. Collapsed rows keep `commandHeaderLines`
+ * lines (the line budget is the primary limit) and, only when `commandPreviewChars`
+ * is set, a character cap as well. Expanded rows show the command verbatim.
+ */
+export function boundedBashCommand(raw: string, cwd: string | undefined, full: boolean): string {
+	if (full) return raw;
+	const maxChars = bashCommandMaxChars(cwd);
+	const bounded = maxChars === undefined ? raw : truncateText(raw, maxChars, cwd);
+	const maxLines = Math.max(1, Math.floor(settingNumber("commandHeaderLines", 1, cwd)));
+	const lines = splitTerminalLines(bounded);
+	if (lines.length <= maxLines) return bounded;
+	return `${lines.slice(0, maxLines).join("\n")}…`;
 }
 
 /** The model-written intent: it is the why, and more informative than the command. */

@@ -61,7 +61,7 @@ export function stackShell(cwd?: string): { renderShell?: "self" } {
 export type ReadOutputMode = "hidden" | "summary" | "preview";
 export type ReadImageMode = "off" | "always" | "on";
 export type SearchOutputMode = "hidden" | "count" | "preview";
-export type BashOutputMode = "hidden" | "summary" | "opencode" | "preview";
+export type BashOutputMode = "hidden" | "summary" | "preview";
 export type McpOutputMode = "hidden" | "summary" | "preview";
 
 export function readOutputMode(cwd?: string): ReadOutputMode {
@@ -79,8 +79,17 @@ export function searchOutputMode(cwd?: string): SearchOutputMode {
 	return settingEnum("searchOutputMode", ["hidden", "count", "preview"] as const, "preview", cwd);
 }
 
+/** `opencode` is the former name of `preview`; existing settings keep working. */
 export function bashOutputMode(cwd?: string): BashOutputMode {
-	return settingEnum("bashOutputMode", ["hidden", "summary", "opencode", "preview"] as const, "opencode", cwd);
+	const value = settingEnum("bashOutputMode", ["hidden", "summary", "opencode", "preview"] as const, "preview", cwd);
+	return value === "opencode" ? "preview" : value;
+}
+
+/** Optional character cap on a shown bash command; unset means no character cap. */
+export function bashCommandMaxChars(cwd?: string): number | undefined {
+	const value = readkendexConfig(cwd).commandPreviewChars;
+	const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
+	return Number.isFinite(parsed) && parsed > 0 ? Math.max(20, Math.floor(parsed)) : undefined;
 }
 
 export function bashLiveOutputDelayMs(cwd?: string): number {

@@ -4,6 +4,8 @@
 
 ### Unreleased
 
+- `opencode` is now an alias for the `preview` bash output mode: both show the same tail, with collapsed rows at `bashCollapsedLines` (default 5, was 10 for preview and 4 for opencode). Live streaming still uses `bashLiveTailLines`.
+- Collapsed bash commands are limited by `commandHeaderLines` lines. `commandPreviewChars` is an optional character cap, unset by default, so a single-line command is no longer cut at 96 characters.
 - Todo state changes draw on one line: a finished `todo` row shows its call and status together (`todo → Subject  ● completed`) instead of two rows.
 - Standalone bash rows put the command on its own line below the label and intent, in `toolOutput` colour, so it no longer blends with the intent. Stacked rows keep the inline layout.
 - Collapsed bash rows keep the last output line for finished commands, instead of hiding output unless it streamed.

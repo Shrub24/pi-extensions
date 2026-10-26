@@ -1,6 +1,12 @@
 import { expect, test } from "bun:test";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 
+import { clearPackageConfigCache } from "../tool-renderer/package-config.js";
 import { renderManagedBashResult } from "../tool-renderer/managed-bash.js";
+import { useWorld } from "./helpers/world.js";
+
+const world = useWorld();
 
 // Minimal theme/context stand-ins: the row renderer only styles text and reads
 // the tool context for the command, cwd and expansion state.
@@ -11,10 +17,11 @@ const theme = {
 } as never;
 
 function render(task: Record<string, unknown>, options: { expanded?: boolean; isPartial?: boolean; command?: string } = {}): string {
+	const cwd = world().cwd;
 	const component = renderManagedBashResult({
 		args: { command: options.command ?? "bun test" },
-		context: { args: { command: options.command ?? "bun test" }, cwd: process.cwd() },
-		cwd: process.cwd(),
+		context: { args: { command: options.command ?? "bun test" }, cwd },
+		cwd,
 		expanded: options.expanded ?? false,
 		isPartial: options.isPartial ?? false,
 		// The runner row is driven by task state, never by the result text.
@@ -49,7 +56,18 @@ test("expanding a task row shows the whole tail, the log path and the untruncate
 	expect(expanded).toContain("line 1\n");
 	expect(expanded).toContain("bg-7.log");
 	expect(expanded).toContain("# ENDMARK");
-	expect(collapsed, "collapsed rows keep the command preview bounded").not.toContain("# ENDMARK");
+	expect(collapsed, "a single-line command is not cut when no character cap is set").toContain("# ENDMARK");
+});
+
+test("a character cap bounds the collapsed command only when commandPreviewChars is set", () => {
+	const longCommand = `echo ${"x".repeat(200)} # ENDMARK`;
+	writeFileSync(join(world().cwd, ".pi", "settings.json"), JSON.stringify({ "pi-tool-renderer": { commandPreviewChars: 60 } }));
+	clearPackageConfigCache();
+	const collapsed = render({}, { command: longCommand });
+	const expanded = render({}, { command: longCommand, expanded: true });
+	expect(collapsed).not.toContain("# ENDMARK");
+	expect(collapsed).toContain("…");
+	expect(expanded, "expanded rows show the full command").toContain("# ENDMARK");
 });
 
 test("a multi-line command stays on one header line unless expanded", () => {
