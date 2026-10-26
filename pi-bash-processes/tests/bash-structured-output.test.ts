@@ -36,10 +36,19 @@ function expectMatchesSchema(schema: JsonSchema, value: Record<string, unknown>)
 	for (const key of Object.keys(value)) expect(Object.keys(schema.properties), `undeclared field ${key}`).toContain(key);
 }
 
-test("bash declares Pi's built-in bash outputSchema", () => {
-	const builtIn = JSON.parse(JSON.stringify(createBashToolDefinition(host.cwd).outputSchema)) as JsonSchema;
-	expect(JSON.parse(JSON.stringify(BASH_OUTPUT_SCHEMA))).toEqual(builtIn);
-	expect(JSON.parse(JSON.stringify(bash().outputSchema)), "the registered tool declares it").toEqual(builtIn);
+/**
+ * Field names, types and required keys only. Descriptions are model-facing prose
+ * that Pi rewords between versions, and ours differ on purpose: `full_output_path`
+ * is never a temp file here, so Pi's "Temp file with the full output" would lie.
+ */
+function shapeOf(schema: unknown): unknown {
+	return JSON.parse(JSON.stringify(schema, (key, value) => (key === "description" ? undefined : value)));
+}
+
+test("bash declares Pi's built-in bash outputSchema shape", () => {
+	const builtIn = shapeOf(createBashToolDefinition(host.cwd).outputSchema);
+	expect(shapeOf(BASH_OUTPUT_SCHEMA)).toEqual(builtIn);
+	expect(shapeOf(bash().outputSchema), "the registered tool declares it").toEqual(builtIn);
 });
 
 test("a completed command returns the text the model reads and a matching structured result", async () => {
