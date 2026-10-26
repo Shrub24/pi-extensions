@@ -111,6 +111,7 @@ import {
   publishCompletionHandoff,
   sealedCompletionFor,
 } from "./radar-handoff.ts";
+import { radarBaselineExtensionPath } from "./radar-baseline.ts";
 import {
   Container,
   fuzzyFilter,
@@ -340,12 +341,6 @@ const LEAD_INSTANCE_ID =
 // Keep model-facing lead handles aligned with Pi's SessionManager grammar.
 const PI_SESSION_ID_PATTERN = "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$";
 const HERDSMAN_EXTENSION_PATH = fileURLToPath(import.meta.url);
-// Infrastructure, like Herdsman itself, is required even for a worker whose
-// definition opts out of ordinary extension discovery. Use the package's same
-// source entry that Pi discovers, so its normal path deduplication still holds.
-const RADAR_BASELINE_EXTENSION_PATH = fileURLToPath(
-  new URL("../../extension/baseline.ts", import.meta.resolve("pi-radar/client")),
-);
 const AGENT_DEFINITIONS_ENTRY = "pi-herdsman-agent-definitions";
 const HERD_RUN_ENTRY = "pi-herdsman-herd-run";
 const WORKER_LAUNCH_ENTRY = "pi-herdsman-worker-launch";
@@ -6465,6 +6460,15 @@ async function launchRadarChild(
       `Radar spawn runs an executable this process resolved; set ${CHILD_COMMAND_ENV} to the command a fresh worker should run`,
       operation,
     );
+  // Infrastructure, like Herdsman itself, is required even for a worker whose
+  // definition opts out of ordinary extension discovery.
+  const radarBaseline = radarBaselineExtensionPath();
+  if (radarBaseline === undefined)
+    fail(
+      "invalid_request",
+      "Radar spawn cannot find the pi-radar baseline extension in this build; a compiled build must stage pi-radar at a known path",
+      operation,
+    );
   let requested: RadarSpawnEntry = {
     stage: "requested",
     requestId: randomUUID(),
@@ -6487,7 +6491,7 @@ async function launchRadarChild(
   const outcome = input.restartSubject !== undefined
     ? await radarRuntime!.children.restart(input.restartSubject, {
       executable: childCommand.command,
-      argv: ["--extension", RADAR_BASELINE_EXTENSION_PATH, "--extension", HERDSMAN_EXTENSION_PATH, ...launchPlan.launchArgs],
+      argv: ["--extension", radarBaseline, "--extension", HERDSMAN_EXTENSION_PATH, ...launchPlan.launchArgs],
       cwd: input.agentCwd,
       env: radarLaunchEnvironment(launchPlan.env, input.parentPaneId),
     }, { signal: input.signal })
@@ -6500,7 +6504,7 @@ async function launchRadarChild(
       pane_id: input.parentPaneId,
       parent_session_id: ctx.sessionManager.getSessionId(),
       executable: childCommand.command,
-      argv: ["--extension", RADAR_BASELINE_EXTENSION_PATH, "--extension", HERDSMAN_EXTENSION_PATH, ...launchPlan.launchArgs],
+      argv: ["--extension", radarBaseline, "--extension", HERDSMAN_EXTENSION_PATH, ...launchPlan.launchArgs],
       cwd: input.agentCwd,
       env: radarLaunchEnvironment(launchPlan.env, input.parentPaneId),
       ...(input.continues !== undefined ? { continues: input.continues } : {}),

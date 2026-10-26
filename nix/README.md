@@ -62,10 +62,34 @@ load the Radar baseline and Herdsman even when their optional extension selectio
 discovery. Radar owns the process claim and exposes the shared subject runtime; Herdsman
 never creates a substitute registrar.
 
-`nix/plugins.nix` holds the plugin definitions: their names, entries, dependencies, npm libraries
-and the compile-time patches AOT needs. `dependencies` are plugin derivations, and a plugin whose
+`nix/recipes.nix` holds the plugin recipes as data: each plugin's path in this checkout (or the npm
+archive it is pinned to), manifest, entry, plugin name, dependencies by name, and the compile-time
+patch AOT needs. `nix/plugins.nix` builds those recipes into plugin derivations. A plugin whose
 dependency has a `packageName` imports it by that name without either side being rewritten —
 `pi-bash-processes` imports `pi-tool-renderer` that way.
+
+A package set that builds these plugins with its own lock consumes the recipes as a flake output,
+and supplies only its own source and its own `pi-radar` tree:
+
+```nix
+let
+  recipes = inputs.pi-extensions.lib.piBoltRecipes;
+in
+{
+  herdsman = {
+    inherit (recipes.herdsman) entry pluginName dependencies;
+    src = "${inputs.pi-extensions}/${recipes.herdsman.path}";
+    postPatch = recipes.herdsman.patch {
+      radar = radarTree;                 # the `radar` plugin's built tree
+      inherit (recipes.herdsman) version;
+    };
+  };
+}
+```
+
+`recipe.version` is the plugin's own version, and an npm recipe (`radar`) has `npm.name`/`npm.hash`
+instead of `path`. The `pi-radar` pin is checked against `pi-herdsman/package.json` when the recipes
+are evaluated, so a recipe cannot drift from Herdsman's dependency.
 
 ## jev
 

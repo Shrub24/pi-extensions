@@ -1,4 +1,4 @@
-# This repository's extensions as Pi-Bolt plugins.
+# This repository's extensions as Pi-Bolt plugins, built from `nix/recipes.nix`.
 #
 # The interface is Pi-Bolt's: `piBoltPlugins.buildPiBoltPlugin` (nix/plugins/build-plugin.nix
 # in Pi-Bolt) returns a plugin derivation that `pi-bolt.withPlugins` compiles in and
@@ -13,6 +13,7 @@
   fetchNpmPackage,
 }:
 let
+  recipes = import ./recipes.nix { inherit lib self; };
   checkout = name: "${self}/${name}";
   versionOf = name: (lib.importJSON "${checkout name}/package.json").version;
 
@@ -42,121 +43,45 @@ let
     };
   };
 
-  # Keep this aligned with pi-herdsman/package.json (npm registry integrity).
-  piRadar = fetchNpmPackage {
-    pname = "pi-radar";
-    version = "0.12.0";
-    hash = "sha512-9guUUWReM1Z9Vt2uMXBYuv/mRGv+wtF1XZPvxcJVa4BuEfPnmhMpmSBNOsz+uLrv2/s1oR4o9594q5XuNiRhjQ==";
+  # What a recipe needs beyond its recipe data: a dependency closure this repository builds itself.
+  extras = {
+    otel.nodeModules = "${otelDependencies}/node_modules";
   };
 
-  # The SDK is also the registrar extension. Stage one package tree for both
-  # the baseline factory and Herdsman's imports; compilation must select radar
-  # as well as herdsman to activate the shared provider.
-  radar = buildPiBoltPlugin {
-    pname = "pi-radar";
-    version = "0.12.0";
-    src = piRadar;
-    entry = "extension/baseline.ts";
-    pluginName = "radar";
-    packageName = "pi-radar";
-  };
+  # Every recipe becomes a plugin. Dependencies and patches name other plugins, so the set refers to
+  # itself lazily; the graph is acyclic.
+  plugins = lib.mapAttrs (
+    name: recipe:
+    let
+      src =
+        if recipe.npm != null then
+          fetchNpmPackage {
+            pname = recipe.npm.name;
+            inherit (recipe) version;
+            inherit (recipe.npm) hash;
+          }
+        else
+          checkout recipe.path;
+    in
+    buildPiBoltPlugin (
+      {
+        pname = if recipe.npm != null then recipe.npm.name else recipe.path;
+        inherit (recipe) version entry pluginName;
+        inherit src;
+        dependencies = map (dep: plugins.${dep}) recipe.dependencies;
+        postPatch = recipe.patch {
+          inherit (recipe) version;
+          radar = plugins.radar;
+        };
+      }
+      // lib.optionalAttrs (recipe ? packageName) { inherit (recipe) packageName; }
+      // (extras.${name} or { })
+    )
+  ) recipes;
 
-  otel = buildPiBoltPlugin {
-    pname = "pi-otel";
-    version = versionOf "pi-otel";
-    src = checkout "pi-otel";
-    entry = "src/index.ts";
-    pluginName = "otel";
-    nodeModules = "${otelDependencies}/node_modules";
-    # A compiled build has no source-relative package.json to read the version from.
-    postPatch = ''
-      substituteInPlace src/version.ts \
-        --replace-fail 'import { readFileSync } from "node:fs";' "" \
-        --replace-fail 'JSON.parse(readFileSync(url, "utf8")) as { version?: string }' '{ version: "${versionOf "pi-otel"}" } as { version?: string }'
-    '';
-  };
-
-  cbmem = buildPiBoltPlugin {
-    pname = "pi-cbmem";
-    version = versionOf "pi-cbmem";
-    src = checkout "pi-cbmem";
-    entry = "extensions/cbmem.ts";
-    pluginName = "cbmem";
-  };
-
-  output-policy = buildPiBoltPlugin {
-    pname = "pi-output-policy";
-    version = versionOf "pi-output-policy";
-    src = checkout "pi-output-policy";
-    entry = "extensions/output-policy.ts";
-    pluginName = "output-policy";
-  };
-
-  reqcap = buildPiBoltPlugin {
-    pname = "pi-reqcap";
-    version = versionOf "pi-reqcap";
-    src = checkout "pi-reqcap";
-    entry = "extensions/index.ts";
-    pluginName = "reqcap";
-  };
-
-  # Its package.json export map is what pi-bash-processes imports it by, so a
-  # dependency link there resolves without either plugin being rewritten. The
-  # dependency is optional: without the renderer the row falls back to its own
-  # presentation.
-  tool-renderer = buildPiBoltPlugin {
-    pname = "pi-tool-renderer";
-    version = versionOf "pi-tool-renderer";
-    src = checkout "pi-tool-renderer";
-    entry = "extensions/tool-renderer.ts";
-    pluginName = "tool-renderer";
-    packageName = "pi-tool-renderer";
-  };
-
-  bash-processes = buildPiBoltPlugin {
-    pname = "pi-bash-processes";
-    version = versionOf "pi-bash-processes";
-    src = checkout "pi-bash-processes";
-    entry = "extensions/background-tasks.ts";
-    pluginName = "bash-processes";
-    dependencies = [ tool-renderer ];
-  };
-
-  herdsman = buildPiBoltPlugin {
-    pname = "pi-herdsman";
-    version = versionOf "pi-herdsman";
-    src = checkout "pi-herdsman";
-    entry = "extension/index.ts";
-    pluginName = "herdsman";
-    # The shared registrar is a plugin dependency, not a second SDK library.
-    # Herdsman's hooks also import bash-processes and its tool-renderer dependency.
-    dependencies = [
-      radar
-      bash-processes
-      tool-renderer
-    ];
-    # A child on stock Pi needs the extension's files as a path, and bundled agent
-    # definitions have to stay readable from disk rather than from Bun's virtual
-    # file system. This plugin's own store tree is the copy that outlives the build.
-    postPatch = ''
-            substituteInPlace extension/index.ts \
-              --replace-fail 'const HERDSMAN_EXTENSION_PATH = fileURLToPath(import.meta.url);' 'const HERDSMAN_EXTENSION_PATH = "$out/extension/index.ts";' \
-              --replace-fail 'const RADAR_BASELINE_EXTENSION_PATH = fileURLToPath(
-        new URL("../../extension/baseline.ts", import.meta.resolve("pi-radar/client")),
-      );' 'const RADAR_BASELINE_EXTENSION_PATH = "${radar}/extension/baseline.ts";' \
-              --replace-fail '"../../pi-bash-processes/extensions/background-work.ts"' '"../../bash-processes/extensions/background-work.ts"'
-            substituteInPlace extension/advisory-wake.ts \
-              --replace-fail '"../../pi-bash-processes/extensions/wake-consumer.ts"' '"../../bash-processes/extensions/wake-consumer.ts"'
-            substituteInPlace extension/agent-definitions.ts \
-              --replace-fail 'const BUILTIN_AGENT_DIR = fileURLToPath(
-        new URL("./agent-definitions", import.meta.url),
-      );' 'const BUILTIN_AGENT_DIR = "$out/extension/agent-definitions";'
-    '';
-  };
-
-  # pi-jev is the permission system's consumer side, and this repository does not
-  # carry its provider: build it with the plugin that provides it. The provider's
-  # plugin name is what its patched import names, so it has to be that one.
+  # jev is a builder, not a recipe: its provider is another plugin this repository does not carry.
+  # Its two entry files are one extension with a permission surface and one with a tool surface; a
+  # compiled manifest takes one factory.
   mkJev =
     permissionSystem:
     assert lib.assertMsg ((permissionSystem.piBolt or { }).name == "permission-system")
@@ -168,8 +93,9 @@ let
       entry = "extensions/compiled.ts";
       pluginName = "jev";
       dependencies = [ permissionSystem ];
-      # Its two entry files are one extension with a permission surface and one
-      # with a tool surface; a compiled manifest takes one factory.
+      # The provider is resolved per session through a process global, so the provider's module
+      # is imported, never cached. A compiled build cannot resolve a computed specifier, so name the
+      # staged provider instead.
       postPatch = ''
         cat > extensions/compiled.ts <<'EOF'
         import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -177,27 +103,11 @@ let
         import intent from "./tool-intent.ts";
         export default function jev(pi: ExtensionAPI) { permissions(pi); intent(pi); }
         EOF
-        # The provider is resolved per session through a process global, so the
-        # provider's module is imported, never cached. A compiled build cannot
-        # resolve a computed specifier, so name the staged provider instead.
         substituteInPlace extensions/gotgenes.ts \
           --replace-fail 'return import(specifier);' 'return import("../../permission-system/src/service.ts");'
       '';
     };
-
-  plugins = {
-    inherit
-      radar
-      bash-processes
-      cbmem
-      herdsman
-      otel
-      output-policy
-      reqcap
-      tool-renderer
-      ;
-  };
 in
 {
-  inherit plugins mkJev;
+  inherit plugins mkJev recipes;
 }

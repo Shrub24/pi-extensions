@@ -159,6 +159,16 @@
         pi-bolt = scope.compiledCheck;
       }) scopes;
 
+      # The plugin recipes as data, for a package set that builds them with its own lock and its
+      # own Pi-Bolt: `inputs.pi-extensions.lib.piBoltRecipes.<name>` is one recipe, and
+      # `recipe.patch { radar = ...; version = ...; }` returns its postPatch text.
+      lib = {
+        piBoltRecipes = import ./nix/recipes.nix {
+          inherit lib;
+          self = self.outPath;
+        };
+      };
+
       formatter = forAllSystems (system: nixpkgs.legacyPackages.${system}.nixfmt);
     };
 }
