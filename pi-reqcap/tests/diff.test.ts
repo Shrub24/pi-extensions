@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { diff, fingerprint, sectionsOf, usageFlags } from "../extensions/diff.js";
+import { diff, fingerprint, isChatBody, sectionsOf, usageFlags } from "../extensions/diff.js";
 
 const META = { pid: 1, session: "s.jsonl", at: "2026-10-04T00:00:00.000Z" };
 
@@ -148,4 +148,48 @@ test("a collapsed cached prefix is a re-bill even without a write charge", () =>
   expect(shrank.reBilled).toBe(true);
   const warm = usageFlags({ prompt_tokens: 232066, prompt_tokens_details: { cached_tokens: 230656 } }, 230784, 230272);
   expect(warm.reBilled).toBe(false);
+});
+
+/** A Responses-API body for one turn: instructions, function tools, `input` items. */
+function responsesBody(over: Record<string, unknown> = {}) {
+  return {
+    model: "gpt-6.1-sol",
+    max_output_tokens: 32000,
+    instructions: "billing header\n<cwd>\n/proj\n</cwd>",
+    tools: [{ type: "function", name: "read", description: "read a file", parameters: { type: "object" } }],
+    input: [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "desk" }] },
+      { type: "reasoning", summary: [{ type: "summary_text", text: "thinking" }] },
+      { type: "function_call", name: "read", arguments: "{\"path\":\"a\"}", call_id: "c1" },
+      { type: "function_call_output", call_id: "c1", output: "file body" },
+    ],
+    ...over,
+  };
+}
+
+test("a Responses body is a chat request", () => {
+  expect(isChatBody(responsesBody())).toBe(true);
+  expect(isChatBody(responsesBody({ tools: [] }))).toBe(false);
+});
+
+test("Responses input items map onto message roles", () => {
+  const fp = fingerprint(responsesBody(), META);
+  expect(fp.messages.map((m) => m.role)).toEqual(["user", "reasoning", "assistant", "toolResult"]);
+  expect(fp.system[0].sections.map((s) => s.name)).toEqual(["cwd"]);
+  expect(fp.tools.n).toBe(1);
+});
+
+test("an appended Responses turn is an append, not a rewrite", () => {
+  const first = responsesBody();
+  const second = responsesBody({ input: [...responsesBody().input, { type: "message", role: "user", content: [{ type: "input_text", text: "next" }] }] });
+  expect(diff(fingerprint(first, META), fingerprint(second, META))).toEqual({ kind: "append", detail: "+1 messages" });
+});
+
+test("Responses usage counts the cached prefix once", () => {
+  // input_tokens includes the cached part; input_tokens_details says how much.
+  const u = usageFlags({ input_tokens: 73_057, output_tokens: 51, input_tokens_details: { cached_tokens: 72_704 } }, 0, 60_000);
+  expect(u.read).toBe(72_704);
+  expect(u.input).toBe(353);
+  expect(u.promptTokens).toBe(73_057);
+  expect(u.cold).toBe(false);
 });

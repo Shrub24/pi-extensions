@@ -20,7 +20,7 @@
 // failure must never break a request.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { diff, fingerprint, prefixTrace, usageFlags, type Divergence, type Fingerprint } from "./diff.js";
+import { diff, fingerprint, isChatBody, prefixTrace, usageFlags, type Divergence, type Fingerprint } from "./diff.js";
 import { bustLine, diffReport, overview, short, traceLines } from "./report.js";
 import {
   CAPTURE_BODIES,
@@ -176,7 +176,7 @@ export default function piReqcap(pi: ExtensionAPI): void {
       flush();
       const payload = event?.payload;
       const body = payload as any;
-      const chat = Array.isArray(body?.messages) && Array.isArray(body?.tools) && body.tools.length > 0;
+      const chat = isChatBody(body);
       seq += 1;
       const fp = fingerprint(body, { pid: process.pid, session: sessionId(), at: new Date().toISOString() });
       const key = keyFor(fp.model);

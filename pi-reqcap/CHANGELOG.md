@@ -12,6 +12,9 @@ All notable changes to `pi-reqcap` will be documented in this file.
 - Commands: `/reqcap` (session overview), `/reqcap all`, `/reqcap trace [n]`,
   `/reqcap diff [seq]` (full prefix comparison), `/reqcap where`, `/reqcap help`.
 - `/reqcap trace` names the process (`pid=`) once one log holds more than one.
+- Requests from the OpenAI Responses API are recorded and diffed like Anthropic ones:
+  `input` items and `instructions` are mapped onto messages and system blocks, so a
+  routed model no longer lands in the log as a tool-less `utility` call with no body.
 
 ### Fixed
 
@@ -27,6 +30,9 @@ All notable changes to `pi-reqcap` will be documented in this file.
   and says which one it took.
 - An inserted or deleted message is reported as `inserted`/`removed` rather than a
   `mutate` at the first index the shift moved.
+- Responses usage (`input_tokens` inclusive of `input_tokens_details.cached_tokens`)
+  counted the cached prefix as both read and input, and read it as zero when only the
+  nested detail was present.
 
 ## [0.1.0]
 

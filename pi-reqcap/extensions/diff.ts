@@ -138,14 +138,58 @@ export function sectionsOf(text: string): Section[] {
   });
 }
 
-export function fingerprint(body: any, meta: { pid: number; session: string; at: string }): Fingerprint {
-  const messages = Array.isArray(body?.messages) ? body.messages : [];
-  const system = Array.isArray(body?.system)
-    ? body.system
-    : typeof body?.system === "string"
-      ? [{ type: "text", text: body.system }]
-      : [];
+function systemBlocks(system: unknown): any[] {
+  return Array.isArray(system) ? system : typeof system === "string" ? [{ type: "text", text: system }] : [];
+}
+
+function textBlocks(content: unknown): any[] {
+  if (Array.isArray(content)) return content;
+  return content === undefined || content === null ? [] : [{ type: "text", text: blockText(content) }];
+}
+
+/** One Responses-API `input` item, as a message the classifiers above understand. */
+function inputItemToMessage(item: any): any {
+  const type = item?.type;
+  if (type === "function_call") {
+    return { role: "assistant", content: [{ type: "toolCall", name: item.name, arguments: item.arguments }] };
+  }
+  if (type === "function_call_output") {
+    return { role: "toolResult", content: textBlocks(item.output) };
+  }
+  if (type === "reasoning") {
+    const summary = Array.isArray(item.summary) ? item.summary.map(blockText).join("\n") : undefined;
+    return { role: "reasoning", content: [{ type: "reasoning", text: summary || item.encrypted_content || JSON.stringify(item) }] };
+  }
+  if (item?.role) return { role: String(item.role), content: textBlocks(item.content) };
+  return { role: "?", content: [{ type: "text", text: JSON.stringify(item) }] };
+}
+
+/**
+ * A provider body in the shape the divergence classifiers read. Anthropic sends
+ * `messages` and `system` with per-block `cache_control`; the Responses API sends
+ * `input` and `instructions` with implicit caching. Mapping the second onto the
+ * first keeps every comparison in one format, so a Responses request is recorded
+ * and diffed like any other instead of being written off as a utility call.
+ */
+export function normalizeBody(body: any): { messages: any[]; system: any[]; tools: any[] } {
   const tools = Array.isArray(body?.tools) ? body.tools : [];
+  if (Array.isArray(body?.messages)) {
+    return { messages: body.messages, system: systemBlocks(body?.system), tools };
+  }
+  if (Array.isArray(body?.input)) {
+    return { messages: body.input.map(inputItemToMessage), system: systemBlocks(body?.instructions), tools };
+  }
+  return { messages: [], system: systemBlocks(body?.system), tools };
+}
+
+/** A request that carries both a conversation and tools, whichever API shape it arrived in. */
+export function isChatBody(body: any): boolean {
+  const { messages, tools } = normalizeBody(body);
+  return messages.length > 0 && tools.length > 0;
+}
+
+export function fingerprint(body: any, meta: { pid: number; session: string; at: string }): Fingerprint {
+  const { messages, system, tools } = normalizeBody(body);
   const breakpoints: { at: string; ttl: unknown }[] = [];
 
   const systemFp = system.map((b: any, i: number) => {
@@ -186,8 +230,10 @@ export function fingerprint(body: any, meta: { pid: number; session: string; at:
     params: {
       model: body?.model,
       max_tokens: body?.max_tokens,
+      max_output_tokens: body?.max_output_tokens,
       temperature: body?.temperature,
       thinking: body?.thinking,
+      reasoning: body?.reasoning,
       tool_choice: body?.tool_choice,
       stream: body?.stream,
     },
@@ -290,14 +336,22 @@ export function diff(prevFp: Fingerprint | null, cur: Fingerprint): Divergence {
  */
 export function usageFlags(usage: Record<string, any> | undefined, prevPromptTokens: number, prevRead = 0): Usage {
   const seen = usage != null;
-  const read = Number(usage?.cache_read_input_tokens ?? usage?.cached_tokens ?? usage?.prompt_tokens_details?.cached_tokens ?? 0);
+  const read = Number(
+    usage?.cache_read_input_tokens ??
+      usage?.cached_tokens ??
+      usage?.prompt_tokens_details?.cached_tokens ??
+      usage?.input_tokens_details?.cached_tokens ??
+      0,
+  );
   const write = Number(usage?.cache_creation_input_tokens ?? 0);
   const write1h = Number(usage?.cache_creation?.ephemeral_1h_input_tokens ?? 0);
   // Anthropic reports input_tokens and cache_read_input_tokens as disjoint parts.
-  // The OpenAI-shaped providers report prompt_tokens *including* the cached part,
-  // so adding them would double count the whole cached prefix.
+  // Every OpenAI-shaped provider reports the prompt *including* the cached part,
+  // spelled `prompt_tokens` (completions) or `input_tokens` beside
+  // `input_tokens_details` (responses); adding the cached part back would count it twice.
   const rawInput = Number(usage?.input_tokens ?? usage?.prompt_tokens ?? 0);
-  const input = usage?.input_tokens !== undefined ? rawInput : Math.max(0, rawInput - read - write);
+  const inclusive = usage?.input_tokens === undefined || usage?.input_tokens_details !== undefined;
+  const input = inclusive ? Math.max(0, rawInput - read - write) : rawInput;
   const output = Number(usage?.output_tokens ?? usage?.completion_tokens ?? 0);
   const promptTokens = input + read + write;
   // Two ways a request can pay again. Anthropic charges the re-billed part as a
