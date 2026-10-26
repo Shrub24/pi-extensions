@@ -48,3 +48,29 @@ for (const [text, expected] of [
 ] as const) {
 	test(`exit footer: ${JSON.stringify(text)}`, () => expect(commandExit(text)).toBe(expected));
 }
+
+const plainTheme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as Theme;
+const stripStyles = (text: string) => text.replace(/\x1b\[[0-9;]*m/g, "");
+
+test("a finished bash row puts the command on its own line below the head", () => {
+	const drawn = definition.renderResult!(
+		{ content: [{ type: "text", text: "hello" }], details: undefined } as any,
+		{ expanded: false, isPartial: false } as any,
+		plainTheme,
+		{ args: { command: "echo hello", intent: "say hello" }, isError: false, isPartial: false, cwd: world().cwd } as any,
+	);
+	const lines = stripStyles(drawn.render(80).join("\n")).split("\n");
+	expect(lines[0]).toContain("Bash — say hello");
+	expect(lines[1]).toContain("$ echo hello");
+	expect(lines[0]).not.toContain("echo hello");
+});
+
+test("a finished one-line bash result stays visible in the collapsed row", () => {
+	const drawn = definition.renderResult!(
+		{ content: [{ type: "text", text: "hi" }], details: undefined } as any,
+		{ expanded: false, isPartial: false } as any,
+		plainTheme,
+		{ args: { command: "echo hi" }, isError: false, isPartial: false, cwd: world().cwd } as any,
+	);
+	expect(stripStyles(drawn.render(80).join("\n"))).toContain("hi");
+});

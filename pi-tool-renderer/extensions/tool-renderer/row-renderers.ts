@@ -14,11 +14,13 @@
  * resolver seam, so rows keep Pi's own shell.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 
 import { CBM_TOOL_NAMES, renderCbmCall, renderCbmResult } from "./cbm.js";
 import { renderFffCall, renderFffResult } from "./fff.js";
 import { renderGenericToolCall, renderGenericToolResult } from "./generic.js";
 import { settingBoolean } from "./settings.js";
+import { makeEmpty } from "./text.js";
 import { readOnlyRowDefinitions } from "./tools.js";
 
 const FFF_TOOL_NAMES = new Set(["ffgrep", "fffind", "fff-multi-grep", "multi_grep"]);
@@ -26,6 +28,27 @@ const FFF_TOOL_NAMES = new Set(["ffgrep", "fffind", "fff-multi-grep", "multi_gre
 /** A row drawn in this package's shell: chrome lines and the bounded body. */
 function rowRenderers(renderCall: (...args: any[]) => any, renderResult: (...args: any[]) => any) {
 	return { renderShell: "self" as const, renderCall, renderResult };
+}
+
+/** The plain text of a node the package's renderers returned (a pi-tui `Text`). */
+function textOf(node: any): string {
+	return typeof node?.text === "string" ? node.text : "";
+}
+
+/**
+ * One line per todo state change. The call draws alone while it is pending;
+ * once its result is in, the call is dropped and the result draws the call and
+ * its status together, so `todo → Subject  ● completed` is a single row.
+ */
+function inlineTodoRow(base: any) {
+	return rowRenderers(
+		(args, theme, context) => (context?.isPartial === false ? makeEmpty() : base.renderCall(args, theme, context)),
+		(result, options, theme, context) => {
+			const call = textOf(base.renderCall(context?.args ?? {}, theme, context));
+			const status = textOf(base.renderResult(result, options, theme, context));
+			return new Text(status ? `${call}  ${status}` : call, 0, 0);
+		},
+	);
 }
 
 export function installRowRenderers(pi: ExtensionAPI): void {
@@ -47,6 +70,7 @@ export function installRowRenderers(pi: ExtensionAPI): void {
 			);
 		}
 		const base = next();
+		if (toolName === "todo" && base?.renderCall && base?.renderResult) return inlineTodoRow(base);
 		if (base?.renderCall || base?.renderResult) {
 			return base.renderShell === "self" ? base : { ...base, renderShell: "self" };
 		}

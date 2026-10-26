@@ -318,22 +318,41 @@ export function readCallText(args: any, theme: any, cwd?: string, hyperlinks?: b
 	return `${toolLabel(theme, "Read ")}${renderToolPathText(args?.path ?? args?.file_path ?? "", theme, cwd, undefined, hyperlinks)}${range ? theme.fg("accent", range) : ""}`;
 }
 
-export function bashCallText(args: any, theme: any, cwd?: string, options: { full?: boolean; leadingIntent?: string } = {}): string {
+/**
+ * The command text for a bash row. Expanded rows show the command the model
+ * actually sent; collapsed rows keep the bounded preview so one long heredoc
+ * cannot flood the transcript.
+ */
+function bashCommandSource(args: any, cwd: string | undefined, full: boolean): string {
 	const max = Math.max(20, Math.floor(settingNumber("commandPreviewChars", 96, cwd)));
 	const rawCommand = typeof args?.command === "string" ? args.command : "";
-	// Expanded rows show the command the model actually sent; collapsed rows keep
-	// the bounded preview so one long heredoc cannot flood the transcript.
-	const command = options.full ? rawCommand : truncateText(rawCommand, max, cwd);
-	// The model-written intent leads the row when present: it is the why, and
-	// more informative than the command text.
-	const intentLead = typeof options.leadingIntent === "string" && options.leadingIntent.trim()
-		? `${theme.fg("dim", "— ")}${theme.fg("accent", options.leadingIntent.trim())}${theme.fg("dim", " · ")}`
-		: "";
-	const commandLines = splitTerminalLines(command);
-	const [firstLine = "", ...continuationLines] = commandLines;
+	return full ? rawCommand : truncateText(rawCommand, max, cwd);
+}
+
+/** The model-written intent: it is the why, and more informative than the command. */
+function bashIntentText(theme: any, leadingIntent: string | undefined): string {
+	return typeof leadingIntent === "string" && leadingIntent.trim() ? theme.fg("accent", leadingIntent.trim()) : "";
+}
+
+export function bashCallText(args: any, theme: any, cwd?: string, options: { full?: boolean; leadingIntent?: string } = {}): string {
+	const intent = bashIntentText(theme, options.leadingIntent);
+	const intentLead = intent ? `${theme.fg("dim", "— ")}${intent}${theme.fg("dim", " · ")}` : "";
+	const [firstLine = "", ...continuationLines] = splitTerminalLines(bashCommandSource(args, cwd, options.full === true));
 	const styledFirstLine = theme.fg("accent", firstLine);
 	const styledContinuation = continuationLines.map((line) => theme.fg("accent", line)).join("\n");
 	return `${toolLabel(theme, "Bash ")}${intentLead}${theme.fg("dim", "$ ")}${styledFirstLine}${styledContinuation ? `\n${styledContinuation}` : ""}`;
+}
+
+/**
+ * Standalone bash rows: the label and intent form the head line, and the command
+ * sits on the line below in `toolOutput`, so it stays apart from the intent.
+ */
+export function bashCallBlock(args: any, theme: any, cwd?: string, options: { full?: boolean; leadingIntent?: string } = {}): { head: string; command: string } {
+	const intent = bashIntentText(theme, options.leadingIntent);
+	const head = intent ? `${toolLabel(theme, "Bash")} ${theme.fg("dim", "— ")}${intent}` : toolLabel(theme, "Bash");
+	const [first = "", ...rest] = splitTerminalLines(bashCommandSource(args, cwd, options.full === true));
+	const lines = [`  ${theme.fg("dim", "$ ")}${theme.fg("toolOutput", first)}`, ...rest.map((line) => `    ${theme.fg("toolOutput", line)}`)];
+	return { head, command: lines.join("\n") };
 }
 
 export function isGitDiffCommand(command: unknown): boolean {

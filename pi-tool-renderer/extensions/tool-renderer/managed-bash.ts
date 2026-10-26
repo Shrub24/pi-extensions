@@ -10,7 +10,7 @@ import { renderBashDiffOutput, shouldRenderBashDiffsForCommand, suppressReadOnly
 import { truncateText } from "./glyphs.js";
 import { toolLabel } from "./theme.js";
 import {
-	bashCallText,
+	bashCallBlock,
 	clearBlink,
 	commandExit,
 	lineCount,
@@ -90,7 +90,8 @@ export interface ManagedBashRenderInput {
 
 export function renderManagedBashCall({ args, context, theme, cwd }: ManagedBashRenderInput): TruncatedLines | ReturnType<typeof makeEmpty> {
 	markBashStarted(context);
-	return renderPendingCall(`${bashCallText(args ?? {}, theme, context?.cwd ?? cwd, { leadingIntent: getIntent(args) })}`, theme, context, cwd);
+	const { head, command } = bashCallBlock(args ?? {}, theme, context?.cwd ?? cwd, { leadingIntent: getIntent(args) });
+	return renderPendingCall(`${head}\n${command}`, theme, context, cwd);
 }
 
 export interface ManagedBashRenderResultInput extends ManagedBashRenderInput {
@@ -146,7 +147,7 @@ function renderManagedBashTaskRow({ task, expanded, isPartial, context, theme, c
 	let text = `${stackPrefix(theme)}${header.join("")}`;
 	const declaredIntent = typeof args?.intent === "string" ? args.intent.trim() : "";
 	const intentLead = declaredIntent ? `\n${theme.fg("dim", "— ")}${theme.fg("accent", declaredIntent)}\n` : "";
-	text += `${intentLead}${theme.fg("dim", "$ ")}${theme.fg("accent", bashCommandText(args ?? {}, expanded, cwd))}`;
+	text += `${intentLead}${theme.fg("dim", "$ ")}${theme.fg("toolOutput", bashCommandText(args ?? {}, expanded, cwd))}`;
 	const limit = Math.max(1, Math.floor(settingNumber(expanded ? "bashPreviewLines" : "bashCollapsedLines", expanded ? 80 : 10, cwd)));
 	const showTail = mode !== "summary" && task.tail.length > 0 && (!isPartial || task.status !== "running" || expanded);
 	if (showTail) {
@@ -190,7 +191,7 @@ export function renderManagedBashResult({ result, expanded, isPartial, context, 
 	const effectiveCwd = context?.cwd ?? cwd;
 	const liveTailState = markBashStarted(context);
 	if (task) return renderManagedBashTaskRow({ args: context?.args, context, theme, cwd: effectiveCwd, task, expanded, isPartial });
-	const call = bashCallText(context?.args ?? {}, theme, effectiveCwd, { full: expanded, leadingIntent: getIntent(context?.args) });
+	const { head, command } = bashCallBlock(context?.args ?? {}, theme, effectiveCwd, { full: expanded, leadingIntent: getIntent(context?.args) });
 	const output = textContent(result);
 	if (isPartial) {
 		const trimmedOutput = output.trim();
@@ -229,7 +230,8 @@ export function renderManagedBashResult({ result, expanded, isPartial, context, 
 	if (resultTruncated(result)) summary += theme.fg("warning", " · truncated");
 	const mode = bashOutputMode(effectiveCwd);
 	if (mode === "hidden") return makeEmpty();
-	let text = `${stackPrefix(theme)}${call}${theme.fg("dim", " · ")}${summary}`;
+	// The head carries the label, intent and status; the command sits below it.
+	let text = `${stackPrefix(theme)}${head}${theme.fg("dim", " · ")}${summary}\n${command}`;
 	const renderDiffs = shouldRenderBashDiffsForCommand(context?.args ?? {}, effectiveCwd);
 	const suppressDiffOutput = output ? suppressReadOnlyBashDiffOutput(context?.args ?? {}, output, effectiveCwd) : false;
 	const diffPreview = output && mode !== "summary" ? renderBashDiffOutput(output, theme, expanded, effectiveCwd, renderDiffs) : null;
@@ -247,7 +249,7 @@ export function renderManagedBashResult({ result, expanded, isPartial, context, 
 			.map((line) => theme.fg("dim", line))
 			.join("\n")}`;
 		if (count > limit) text += `\n${theme.fg("muted", `… ${count - limit} older line(s)`)}`;
-	} else if (!suppressDiffOutput && mode === "opencode" && liveTailState.tailShown && output) {
+	} else if (!suppressDiffOutput && mode === "opencode" && output) {
 		const tailText = renderBashTail(output, bashLiveTailLines(effectiveCwd), theme, effectiveCwd);
 		if (tailText) text += `\n${tailText}`;
 	}

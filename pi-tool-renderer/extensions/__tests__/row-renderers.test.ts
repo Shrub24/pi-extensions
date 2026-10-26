@@ -43,11 +43,33 @@ test("the resolver keeps another extension's renderers and adds our chrome shell
 	const { pi, state } = fakePi();
 	installRowRenderers(pi);
 	const base = foreign();
-	const drawn = state.resolver!("todo", () => base);
+	const drawn = state.resolver!("some_other_tool", () => base);
 	expect(drawn).not.toBe(base);
 	expect(drawn.renderShell).toBe("self");
 	expect(drawn.renderCall).toBe(base.renderCall);
 	expect(drawn.renderResult).toBe(base.renderResult);
+});
+
+const todoBase = () => ({
+	renderCall: (args: any) => ({ text: `todo → ${args.subject}` }),
+	renderResult: () => ({ text: "● completed" }),
+});
+
+test("a pending todo call keeps the package's call line", () => {
+	const { pi, state } = fakePi();
+	installRowRenderers(pi);
+	const drawn = state.resolver!("todo", todoBase);
+	expect(drawn.renderShell).toBe("self");
+	expect(drawn.renderCall({ subject: "Fix" }, {}, { isPartial: true }).text).toBe("todo → Fix");
+});
+
+test("a finished todo call draws nothing, and its result draws the call and status on one line", () => {
+	const { pi, state } = fakePi();
+	installRowRenderers(pi);
+	const drawn = state.resolver!("todo", todoBase);
+	expect(drawn.renderCall({ subject: "Fix" }, {}, { isPartial: false }).render(40)).toEqual([]);
+	const row = drawn.renderResult({ content: [], details: {} }, {}, {}, { args: { subject: "Fix" }, isPartial: false });
+	expect(row.text).toBe("todo → Fix  ● completed");
 });
 
 test("a tool with no renderer from anyone gets the generic row", () => {

@@ -4,6 +4,9 @@
 
 ### Unreleased
 
+- Todo state changes draw on one line: a finished `todo` row shows its call and status together (`todo → Subject  ● completed`) instead of two rows.
+- Standalone bash rows put the command on its own line below the label and intent, in `toolOutput` colour, so it no longer blends with the intent. Stacked rows keep the inline layout.
+- Collapsed bash rows keep the last output line for finished commands, instead of hiding output unless it streamed.
 - The thinking panel no longer prints a `thinking` heading; its tinted padding rows frame the block instead, so a collapsed block is just the placeholder between two tinted rows.
 - Consecutive tool rows that the model issues across separate assistant turns share one outline again. A tool-call-only turn no longer draws a doubled rule between them.
 - Inline message timestamps join the last line of the reply instead of taking their own row, so a stamped reply no longer gets an extra blank line after its timestamp.
