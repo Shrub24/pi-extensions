@@ -6,7 +6,7 @@ In `toolChrome: "outlines"`, each adjacent tool-call entry gets its own full-wid
 
 ## What Changes
 
-- Treat consecutive visible tool-call entries in the transcript as one visual chrome run: one outer top rule and one outer bottom rule, with each call's existing heading, status, and content retained inside.
+- Treat consecutive visible tool-call entries in the transcript as one visual chrome run: a rule above each call, which separates consecutive calls, and one outer bottom rule after the run, with each call's existing heading, status, and content retained inside. No blank row separates calls.
 - Remove the repeated separator spacing between entries in a run; keep the normal spacing outside the run, before the first tool and after the last.
 - Keep isolated tool entries, hidden/empty entries, and non-outline chrome modes behaving as they do now.
 

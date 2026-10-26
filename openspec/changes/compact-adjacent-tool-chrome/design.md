@@ -30,7 +30,7 @@ Store group-start/group-end flags on the tool component using a private symbol. 
 
 ### Preserve existing omission for content-owned bottom borders
 
-The final tool in a run omits its outer bottom rule when the core already contains a complete bottom border, using the existing check. An internal tool omits the rule regardless; content-owned inner borders remain part of that call's output.
+Every visible tool entry draws its top rule, so a rule separates it from the call above. Only the final tool in a run draws its bottom rule, and omits it when the core already contains a complete bottom border, using the existing check. Content-owned inner borders remain part of that call's output.
 
 ## Risks / Trade-offs
 

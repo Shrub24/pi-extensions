@@ -325,16 +325,19 @@ function isTransparentToolRunChild(component: any): boolean {
 	return (typeof component?.toolCallId === "string" && component?.hideComponent === true) || isSilentToolTurn(component);
 }
 
+/**
+ * Every visible entry draws its own top rule, so a rule separates consecutive
+ * calls in a run; only the last entry of a run draws the bottom rule. Entries
+ * add no blank rows between them.
+ */
 function markToolChromeGroupBoundaries(children: any[]): void {
 	for (let index = 0; index < children.length; index++) {
 		const component = children[index];
 		if (!isVisibleToolComponent(component)) continue;
-		let previous = index - 1;
-		while (previous >= 0 && isTransparentToolRunChild(children[previous])) previous--;
 		let next = index + 1;
 		while (next < children.length && isTransparentToolRunChild(children[next])) next++;
 		component[TOOL_CHROME_GROUP_SYMBOL] = {
-			start: previous < 0 || !isVisibleToolComponent(children[previous]),
+			start: true,
 			end: next >= children.length || !isVisibleToolComponent(children[next]),
 		};
 	}

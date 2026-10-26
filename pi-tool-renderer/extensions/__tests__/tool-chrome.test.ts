@@ -41,7 +41,7 @@ function toolComponent(cwd: string): any { return { cwd,
 		ui: { theme }, };
 }
 
-describe("tool chrome", () => { test("adjacent tool entries share only the run's outer outline", () => {
+describe("tool chrome", () => { test("adjacent tool entries are separated by rules within one outline", () => {
 		const cwd = tempCwd({ toolChrome: "outlines" });
 		class ToolEntry extends Container {
 			toolCallId: string;
@@ -65,11 +65,15 @@ describe("tool chrome", () => { test("adjacent tool entries share only the run's
 
 		const lines = transcript.render(40).map(stripAnsi);
 		const rules = lines.filter((line) => line === "─".repeat(39));
-		expect(rules).toHaveLength(4);
+		// One rule above each call in the first run (a separator between calls, the
+		// top of the run) plus its bottom rule; the second run has the same shape.
+		expect(rules).toHaveLength(5);
 		expect(lines.indexOf("content call-1")).toBeLessThan(lines.indexOf("content call-2"));
 		expect(lines.indexOf("content call-2")).toBeLessThan(lines.indexOf("assistant response"));
 		expect(lines.indexOf("assistant response")).toBeLessThan(lines.indexOf("content call-3"));
-		expect(lines.slice(lines.indexOf("content call-1"), lines.indexOf("content call-2"))).not.toContain("─".repeat(39));
+		const between = lines.slice(lines.indexOf("content call-1") + 1, lines.indexOf("content call-2"));
+		expect(between).toEqual(["─".repeat(39)]);
+		expect(lines.slice(lines.indexOf("content call-2") + 1, lines.indexOf("assistant response"))).toEqual(["─".repeat(39)]);
 	});
 
 	test("transparent chrome leaves adjacent entries ungrouped", () => {
@@ -117,7 +121,7 @@ describe("tool chrome", () => { test("adjacent tool entries share only the run's
 		installToolChromePatch();
 
 		const lines = transcript.render(40).map(stripAnsi);
-		expect(lines.filter((line) => line === "─".repeat(39))).toHaveLength(2);
+		expect(lines.filter((line) => line === "─".repeat(39))).toHaveLength(3);
 		expect(lines.indexOf("content call-1")).toBeLessThan(lines.indexOf("content call-2"));
 	});
 
@@ -141,7 +145,7 @@ describe("tool chrome", () => { test("adjacent tool entries share only the run's
 			host.addChild(component);
 		}
 		const lines = host.render(40).map(stripAnsi);
-		expect(lines.filter((line) => line === "─".repeat(39))).toHaveLength(2);
+		expect(lines.filter((line) => line === "─".repeat(39))).toHaveLength(3);
 	});
 
 	test("the grouping patch lands on the Container class Pi's components inherit", () => {
@@ -165,7 +169,7 @@ describe("tool chrome", () => { test("adjacent tool entries share only the run's
 			transcript.children.push(component);
 		}
 		const lines = transcript.render(40).map(stripAnsi);
-		expect(lines.filter((line) => line === "─".repeat(39))).toHaveLength(2);
+		expect(lines.filter((line) => line === "─".repeat(39))).toHaveLength(3);
 	});
 
 	test("hidden tool entries do not split an adjacent visible run", () => {
@@ -188,7 +192,8 @@ describe("tool chrome", () => { test("adjacent tool entries share only the run's
 		installToolChromePatch();
 
 		const lines = transcript.render(40).map(stripAnsi);
-		expect(lines.filter((line) => line === "─".repeat(39))).toHaveLength(2);
+		// A separator between the calls plus the run's top and bottom rules.
+		expect(lines.filter((line) => line === "─".repeat(39))).toHaveLength(3);
 		expect(lines).toContain("content call-1");
 		expect(lines).toContain("content call-2");
 	});
@@ -212,7 +217,7 @@ describe("tool chrome", () => { test("adjacent tool entries share only the run's
 		expect(transcript.render(40).filter((line) => stripAnsi(line) === "─".repeat(39))).toHaveLength(2);
 		const second = makeTool("call-2");
 		transcript.addChild(second);
-		expect(transcript.render(40).filter((line) => stripAnsi(line) === "─".repeat(39))).toHaveLength(2);
+		expect(transcript.render(40).filter((line) => stripAnsi(line) === "─".repeat(39))).toHaveLength(3);
 		transcript.removeChild(second);
 		expect(transcript.render(40).filter((line) => stripAnsi(line) === "─".repeat(39))).toHaveLength(2);
 	});

@@ -6,13 +6,14 @@ Keep consecutive tool calls visually distinct while reducing repeated full-width
 
 ## ADDED Requirements
 
-### Requirement: Consecutive tool entries share only their outer outline
-In outline chrome mode, a consecutive run of visible tool-call entries SHALL render with one top rule before the first entry and one bottom rule after the last entry. Each entry's title, status, and content SHALL remain in its original order and visibly associated with that entry.
+### Requirement: Consecutive tool entries share one outline with a rule between calls
+In outline chrome mode, a consecutive run of visible tool-call entries SHALL render as one outline: a rule above each entry, which separates consecutive calls, and one bottom rule after the last entry. Each entry's title, status, and content SHALL remain in its original order and visibly associated with that entry.
 
 #### Scenario: Several tool calls are adjacent in the transcript
 - **WHEN** two or more visible tool-call entries are consecutive with no non-tool transcript entry between them
-- **THEN** only the first entry has the run's top rule and only the last entry has its bottom rule
-- **AND** no repeated full-width rule or blank separator is inserted between entries
+- **THEN** each entry has a rule above it, so a rule separates every pair of consecutive calls
+- **AND** only the last entry has a bottom rule
+- **AND** no blank row is inserted between entries
 - **AND** each tool entry retains its own heading and content
 
 #### Scenario: An ordinary message separates tool calls
