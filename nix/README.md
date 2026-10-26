@@ -68,17 +68,22 @@ patch AOT needs. `nix/plugins.nix` builds those recipes into plugin derivations.
 dependency has a `packageName` imports it by that name without either side being rewritten —
 `pi-bash-processes` imports `pi-tool-renderer` that way.
 
-A package set that builds these plugins with its own lock consumes the recipes as a flake output,
-and supplies only its own source and its own `pi-radar` tree:
+A package set that builds these plugins with its own lock imports the recipes from a checkout of
+this repository and supplies only its own `pi-radar` tree. `nix/recipes.nix` takes the checkout as
+`self`, so it works for a source-only input as well as a flake input:
 
 ```nix
 let
-  recipes = inputs.pi-extensions.lib.piBoltRecipes;
+  piExtensions = inputs.pi-extensions;   # a checkout, flake = false is enough
+  recipes = import "${piExtensions}/nix/recipes.nix" {
+    inherit lib;
+    self = piExtensions;
+  };
 in
 {
   herdsman = {
     inherit (recipes.herdsman) entry pluginName dependencies;
-    src = "${inputs.pi-extensions}/${recipes.herdsman.path}";
+    src = "${piExtensions}/${recipes.herdsman.path}";
     postPatch = recipes.herdsman.patch {
       radar = radarTree;                 # the `radar` plugin's built tree
       inherit (recipes.herdsman) version;
@@ -86,6 +91,8 @@ in
   };
 }
 ```
+
+A flake input can read the same value as `inputs.pi-extensions.lib.piBoltRecipes`.
 
 `recipe.version` is the plugin's own version, and an npm recipe (`radar`) has `npm.name`/`npm.hash`
 instead of `path`. The `pi-radar` pin is checked against `pi-herdsman/package.json` when the recipes
