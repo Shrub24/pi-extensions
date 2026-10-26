@@ -487,6 +487,16 @@ function compactResourceControl(snapshot: BackgroundTaskSnapshot): BackgroundTas
  * truncated command is acceptable as a sidecar-less fallback because sidecar
  * state is the canonical source and is loaded first by `restoreSnapshots`.
  */
+/**
+ * The task a tool result carries in its details. A title that only repeats the
+ * command is stored empty, because every reader shows the command when the title
+ * is blank (`taskDisplayName`). That drops the repeated text from each result.
+ */
+export function toolResultTaskSnapshot(snapshot: BackgroundTaskSnapshot): BackgroundTaskSnapshot {
+	const compact = compactBackgroundTaskSnapshot(snapshot);
+	return compact.title.trim() === compact.command.trim() ? { ...compact, title: "" } : compact;
+}
+
 export function compactBackgroundTaskSnapshot(snapshot: BackgroundTaskSnapshot): BackgroundTaskSnapshot {
 	return {
 		command: truncateField(snapshot.command, WAKE_MANIFEST_FIELD_MAX_CHARS) ?? "",

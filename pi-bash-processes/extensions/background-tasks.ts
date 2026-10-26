@@ -173,6 +173,7 @@ import type {
 import {
 	canEmitOutputWake,
 	compactBackgroundTaskSnapshot,
+	toolResultTaskSnapshot,
 	emptyOutputWakeBudget,
 	ensureOutputWakeBudget,
 	ensureWakeState,
@@ -2419,7 +2420,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 						lastPartialTail = tail;
 						onUpdate({
 							content: [{ type: "text", text: tail }],
-							details: { action: "bash", task: compactBackgroundTaskSnapshot(rememberSnapshot(task)) },
+							details: { action: "bash", task: toolResultTaskSnapshot(rememberSnapshot(task)) },
 						});
 					} catch {
 						// Partial rendering is best-effort; the final result still lands.
@@ -2436,7 +2437,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			})();
 			if (outcome.kind === "aborted") throw new Error("Operation aborted");
 			const elapsedMs = Date.now() - task.startedAt;
-			const details = { action: "bash", task: compactBackgroundTaskSnapshot(rememberSnapshot(task)) };
+			const details = { action: "bash", task: toolResultTaskSnapshot(rememberSnapshot(task)) };
 			if (outcome.kind === "exited") {
 				// A command that finished inside its foreground window was never a
 				// background task: the model gets its stdout, and any non-clean end

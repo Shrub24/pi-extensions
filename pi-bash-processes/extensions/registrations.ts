@@ -24,7 +24,7 @@ import { makeToolResult, renderBgToolResult, renderEmpty } from "./render.js";
 import { bgToolResultTasks } from "./tool-result-details.js";
 import type { TaskResultAck, TaskResultHandoff } from "./task-result.js";
 import type { BackgroundTaskSnapshot, ManagedTask, SpawnTaskOptions } from "./types.js";
-import { compactBackgroundTaskSnapshot, NOTIFY_MODES, WAKE_MANIFEST_FIELD_MAX_CHARS, truncateForTranscript } from "./wake-events.js";
+import { NOTIFY_MODES, toolResultTaskSnapshot, WAKE_MANIFEST_FIELD_MAX_CHARS, truncateForTranscript } from "./wake-events.js";
 
 export interface RegistrationDeps {
 	getActiveCtx: () => ExtensionContext | null;
@@ -174,7 +174,7 @@ export function registerBgTaskTool(pi: ExtensionAPI, deps: RegistrationDeps): vo
 					}\nWakeups: exit=${task.notifyOnExit ? "yes" : "no"}, output=${
 						task.notifyOnOutput ? (safePattern ?? "yes") : "no"
 					}, mode=${task.notifyMode ?? "always"}${safeDedupe ? `, dedupeKey=${safeDedupe}` : ""}${resourceControl}${duplicateNote}${buildRunningInventory(deps, task.id, undefined)}`,
-					{ action: "spawn", task: compactBackgroundTaskSnapshot(deps.rememberSnapshot(task)) },
+					{ action: "spawn", task: toolResultTaskSnapshot(deps.rememberSnapshot(task)) },
 				);
 			}
 			if (params.action === "stop" && (params.id === "all" || params.pid === "all")) {
@@ -186,7 +186,7 @@ export function registerBgTaskTool(pi: ExtensionAPI, deps: RegistrationDeps): vo
 				const summary = results.map(({ candidate, stopped }) => stopped.ok ? `Stopped ${candidate.id}.` : `Failed to stop ${candidate.id}: ${stopped.message}`);
 				return makeToolResult(summary.join("\n"), {
 					action: "stop",
-					tasks: results.map(({ candidate }) => compactBackgroundTaskSnapshot(deps.rememberSnapshot(candidate))),
+					tasks: results.map(({ candidate }) => toolResultTaskSnapshot(deps.rememberSnapshot(candidate))),
 				});
 			}
 			const task = deps.resolveTask(params.id, params.pid);
@@ -194,7 +194,7 @@ export function registerBgTaskTool(pi: ExtensionAPI, deps: RegistrationDeps): vo
 			if (params.action === "extend") {
 				const extended = deps.extendSoftTimeout(task, params.softTimeoutMs, params.watcherGuidance);
 				if (!extended.ok) throw new Error(extended.message);
-				return makeToolResult(extended.message, { action: "extend", task: compactBackgroundTaskSnapshot(deps.rememberSnapshot(task)) });
+				return makeToolResult(extended.message, { action: "extend", task: toolResultTaskSnapshot(deps.rememberSnapshot(task)) });
 			}
 			if (params.action === "get") {
 				return makeToolResult(...(await getResultResult(deps, task, params.output, "get")));
@@ -260,7 +260,7 @@ async function getResultResult(
 				status: observation.status,
 				terminationReason: observation.terminationReason,
 			},
-			task: compactBackgroundTaskSnapshot(deps.rememberSnapshot(task)),
+			task: toolResultTaskSnapshot(deps.rememberSnapshot(task)),
 		},
 	];
 }
