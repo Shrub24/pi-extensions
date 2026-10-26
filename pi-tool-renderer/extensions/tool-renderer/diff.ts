@@ -753,15 +753,19 @@ function collapsedDiffHint(remainingLines: number, hiddenHunks: number, expanded
 	return g.ellipsis;
 }
 
-export function renderStructuredDiff(diff: StructuredDiff, theme: any, expanded: boolean, cwd?: string, rowLimit?: number | null, path?: string, widthOffset = 0): string {
+export function renderStructuredDiff(diff: StructuredDiff, theme: any, expanded: boolean, cwd?: string, rowLimit?: number | null, path?: string, widthOffset = 0, availableWidth?: number): string {
 	if (diff.skipped) return theme.fg("muted", "diff not shown · too large to compare");
 	if (diff.additions === 0 && diff.removals === 0) return theme.fg("muted", "no changes");
-	const width = Math.max(40, terminalWidth(cwd) - Math.max(0, widthOffset));
+	const width = availableWidth === undefined ? Math.max(40, terminalWidth(cwd) - Math.max(0, widthOffset)) : Math.max(1, availableWidth);
 	const configuredLimit = rowLimit === undefined ? configuredDiffRowLimit(expanded, cwd) : rowLimit;
 	const maxRows = configuredLimit === null ? diff.lines.length : Math.max(1, configuredLimit);
 	const rows = diff.lines.slice(0, maxRows);
 	const useSplit = settingBoolean("splitDiffs", true, cwd) && shouldUseSplitDiff(diff, rows, width);
-	const rendered = useSplit ? renderSplitDiff(diff, rows, width, theme, path ?? diff.path, cwd) : renderUnifiedDiff(diff, rows, width, theme, path ?? diff.path, cwd);
+	// A narrow embedded view cannot fit the table frame; retain numbered,
+	// signed diff rows rather than wrapping the frame into broken box art.
+	const rendered = width < 40
+		? rows.map((line) => truncateAnsi(renderUnifiedLine(line, width, 2, theme, path ?? diff.path, cwd), width))
+		: useSplit ? renderSplitDiff(diff, rows, width, theme, path ?? diff.path, cwd) : renderUnifiedDiff(diff, rows, width, theme, path ?? diff.path, cwd);
 	const remaining = diff.lines.length - rows.length;
 	if (remaining > 0) rendered.push(theme.fg("dim", collapsedDiffHint(remaining, hiddenHunksAfter(diff.lines, rows), expanded, rows.length, diff.lines.length, width, cwd)));
 	return rendered.join("\n");

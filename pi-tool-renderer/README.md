@@ -23,9 +23,18 @@ Restart Pi after installation. Use `kendex update-pi --check` to preview the ins
 
 Pi runs a tool and gives its call and result to the display extension. The extension formats those values using your settings. It shows a compact preview that you can expand. Optional diff views show changed files, and grouped read calls share one result display.
 
+## Codemode
+
+Codemode uses a combined call view rather than a JavaScript preview followed by JSON arguments. Each executed nested call gets a row with its tool, target, status and duration. Parallel calls stay in start order, and each result appears below its own call. Bash commands sit beneath their headings.
+
+Successful edits show actual addition/removal counts; expanding the tool shows the existing diff view for each retained edit patch, along with Pi's script source. Failed calls show their errors even in the collapsed view. The collapsed view shows the first eight calls plus any later failures, with up to three output rows per call. Script-authored output remains a separate section because a script can combine or transform results.
+
+Pi does not save nested results. To keep these views on resume, the parent result stores bounded display metadata under `kendexCodemode`: short targets, status/timing, result previews of at most 2,048 characters, integer mutation summaries and original edit patches. Each patch is limited to 64 KiB; the entire display record is limited to 128 KiB and 128 calls. Whole patches or previews are omitted with a notice when the budget is exceeded. Expansion shows the retained preview, not an unlimited copy of each nested result. No before/after file snapshots or computed diff rows are stored, and tool execution and model-facing output are unchanged. Old sessions without this metadata show their recorded call summaries, without guessed diffs.
+
 ## Memory use
 
 - User messages keep at most 256 weakly held Markdown layouts. Each keeps one width and at most 65,536 characters each of source text and rendered lines. Larger messages render without retention. The layouts do not keep message components alive and are cleared at session shutdown.
+- Active codemode capture is bounded per root as described above and released when the root finishes or the session shuts down. Completed display records belong to Pi's result messages; derived edit diffs are weakly cached.
 - Grouped tool calls are tracked only while `stackToolCalls` is on.
 - At most 256 grouped calls are kept, in groups of at most 64; older groups are dropped. Each keeps at most 16,384 characters of its result for the preview: the start for read and search calls, the end for bash.
 - A dropped call that Pi draws again (ctrl+o, a resize) is shown on its own and is not kept.

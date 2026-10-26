@@ -24,6 +24,7 @@ import { registerStackEvents } from "./tool-renderer/stack.js";
 import { installIntentGuard } from "./tool-renderer/intent.js";
 import { registerBashOnSessionStart, registerEdit, registerRead, registerReadOnly, registerWrite } from "./tool-renderer/tools.js";
 import { installRowRenderers } from "./tool-renderer/row-renderers.js";
+import { installCodemodeRendering } from "./tool-renderer/codemode-view.js";
 import { installRenderDebugOnSessionStart, registerRenderDebugCommand } from "./tool-renderer/render-debug.js";
 
 const INSTALL_SYMBOL = Symbol.for("kendex.pi-tool-renderer.installed");
@@ -39,6 +40,7 @@ export default async function toolRenderer(pi: ExtensionAPI): Promise<void> {
 	registerStackEvents(pi);
 	registerRenderDebugCommand(pi);
 	installRenderDebugOnSessionStart(pi);
+	installCodemodeRendering(pi);
 	installRowRenderers(pi);
 	installToolExecutionRendererPatch(pi);
 	installLiveSettingsRefresh(pi);

@@ -4,6 +4,7 @@
 
 ### Unreleased
 
+- Codemode now shows one evolving row per nested execution, with readable targets and output beneath the owning call instead of JavaScript and repeated JSON arguments. Expansion retains source and shows actual nested edit diffs. Bounded display metadata keeps captured patches and previews available on resume without storing file snapshots or computed diff rows.
 - Consecutive tool calls in `outlines` mode are separated by a rule, so long calls no longer blend into each other. The run still has one bottom rule and no blank row between calls.
 - `opencode` is now an alias for the `preview` bash output mode: both show the same tail, with collapsed rows at `bashCollapsedLines` (default 5, was 10 for preview and 4 for opencode). Live streaming still uses `bashLiveTailLines`.
 - Collapsed bash commands are limited by `commandHeaderLines` lines. `commandPreviewChars` is an optional character cap, unset by default, so a single-line command is no longer cut at 96 characters.
