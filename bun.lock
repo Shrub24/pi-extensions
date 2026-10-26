@@ -26,6 +26,21 @@
         "pi-tool-renderer",
       ],
     },
+    "pi-copy-mode": {
+      "name": "pi-copy-mode",
+      "version": "0.1.0",
+      "devDependencies": {
+        "@earendil-works/pi-tui": "1.2.0",
+      },
+      "peerDependencies": {
+        "@earendil-works/pi-coding-agent": "*",
+        "@earendil-works/pi-tui": "*",
+      },
+      "optionalPeers": [
+        "@earendil-works/pi-coding-agent",
+        "@earendil-works/pi-tui",
+      ],
+    },
     "pi-cbmem": {
       "name": "@vanillagreen/pi-cbmem",
       "version": "0.1.0",

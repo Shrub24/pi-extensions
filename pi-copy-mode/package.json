@@ -1,0 +1,48 @@
+{
+  "name": "pi-copy-mode",
+  "version": "0.1.0",
+  "description": "Pi extension for copying raw markdown source from assistant messages through an overlay, without terminal wrapping, gutters or tints.",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "coding-agent",
+    "clipboard",
+    "markdown"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/copy-mode.ts"
+    ]
+  },
+  "scripts": {
+    "test": "bun test ./tests"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "files": [
+    "extensions/",
+    "README.md",
+    "CHANGELOG.md",
+    "package.json"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-tui": "1.2.0"
+  }
+}

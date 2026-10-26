@@ -4,6 +4,7 @@ let
   packageDirs = [
     "pi-bash-processes"
     "pi-cbmem"
+    "pi-copy-mode"
     "pi-herdsman"
     "pi-jev"
     "pi-native-router"

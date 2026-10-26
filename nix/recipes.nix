@@ -77,6 +77,12 @@ let
       dependencies = [ ];
     };
 
+    copy-mode = (local "pi-copy-mode") // {
+      entry = "extensions/copy-mode.ts";
+      pluginName = "copy-mode";
+      dependencies = [ ];
+    };
+
     output-policy = (local "pi-output-policy") // {
       entry = "extensions/output-policy.ts";
       pluginName = "output-policy";
