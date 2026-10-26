@@ -182,10 +182,9 @@ export function normalizeBody(body: any): { messages: any[]; system: any[]; tool
   return { messages: [], system: systemBlocks(body?.system), tools };
 }
 
-/** A request that carries both a conversation and tools, whichever API shape it arrived in. */
+/** A request that carries a conversation, whichever API shape it arrived in. */
 export function isChatBody(body: any): boolean {
-  const { messages, tools } = normalizeBody(body);
-  return messages.length > 0 && tools.length > 0;
+  return normalizeBody(body).messages.length > 0;
 }
 
 export function fingerprint(body: any, meta: { pid: number; session: string; at: string }): Fingerprint {

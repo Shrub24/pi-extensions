@@ -169,7 +169,8 @@ function responsesBody(over: Record<string, unknown> = {}) {
 
 test("a Responses body is a chat request", () => {
   expect(isChatBody(responsesBody())).toBe(true);
-  expect(isChatBody(responsesBody({ tools: [] }))).toBe(false);
+  expect(isChatBody(responsesBody({ tools: [] }))).toBe(true);
+  expect(isChatBody(responsesBody({ input: [] }))).toBe(false);
 });
 
 test("Responses input items map onto message roles", () => {
