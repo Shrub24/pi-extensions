@@ -8,7 +8,7 @@ const DIR = process.env.PI_MEMTRACE_DIR ?? `${process.env.HOME}/.local/share/pi-
 const EVERY = Number(process.env.PI_MEMTRACE_EVERY ?? 0);
 const TYPES_EVERY = Number(process.env.PI_MEMTRACE_TYPES_EVERY ?? 0);
 
-type Bun = { generateHeapSnapshot?: (format: "v8") => string };
+type Bun = { generateHeapSnapshot?: (format: "v8") => string; gc?: (force: boolean) => void };
 
 function sessionOf(ctx: any): string {
 	const id = ctx?.sessionManager?.getSessionId?.();
@@ -36,6 +36,18 @@ async function typeCounts(top = 15): Promise<[string, number][] | undefined> {
 		.slice(0, top);
 }
 
+function writeSnapshot(session: string, label: string): { path: string; size: number; ms: number } {
+	const bun = (globalThis as { Bun?: Bun }).Bun;
+	if (!bun?.generateHeapSnapshot) throw new Error("heapsnap needs Bun's generateHeapSnapshot");
+	const started = performance.now();
+	const snapshot = bun.generateHeapSnapshot("v8");
+	const dir = `${DIR}/snapshots`;
+	mkdirSync(dir, { recursive: true });
+	const path = `${dir}/${session}-${new Date().toISOString().replace(/[:.]/g, "-")}-${label}.heapsnapshot`;
+	writeFileSync(path, snapshot);
+	return { path, size: snapshot.length, ms: Math.round(performance.now() - started) };
+}
+
 function line(sample: Sample): string {
 	return JSON.stringify(sample);
 }
@@ -43,7 +55,7 @@ function line(sample: Sample): string {
 function describe(sample: Sample): string[] {
 	const mb = (n?: number) => (n === undefined ? "n/a" : `${(n / 1048576).toFixed(0)} MB`);
 	const out = [
-		`rss ${mb(sample.rss)}  anon ${mb(sample.anon)}  heapUsed ${mb(sample.heapUsed)}  heapTotal ${mb(sample.heapTotal)}  external ${mb(sample.external)}`,
+		`rss ${mb(sample.rss)}  anon ${mb(sample.anon)}  swap ${mb(sample.swap)}  heapUsed ${mb(sample.heapUsed)}  heapTotal ${mb(sample.heapTotal)}  external ${mb(sample.external)}`,
 	];
 	for (const [name, reading] of Object.entries(sample.reporters)) {
 		out.push(`  ${name}: ${"error" in reading ? `error ${reading.error}` : JSON.stringify(reading)}`);
@@ -54,10 +66,11 @@ function describe(sample: Sample): string[] {
 export default function piMemtrace(pi: ExtensionAPI): void {
 	let samples = 0;
 	let currentSession = "unknown";
+	let every = EVERY;
 
 	pi.on("turn_end", (event: any, ctx: any) => {
 		currentSession = sessionOf(ctx);
-		if (EVERY <= 0 || event?.turnIndex === undefined || event.turnIndex % EVERY !== 0) return;
+		if (every <= 0 || event?.turnIndex === undefined || event.turnIndex % every !== 0) return;
 		try {
 			samples += 1;
 			const sample = takeSample(currentSession, event.turnIndex);
@@ -71,6 +84,59 @@ export default function piMemtrace(pi: ExtensionAPI): void {
 		} catch {
 			/* a diagnostic must never break a turn */
 		}
+	});
+
+	pi.registerCommand("memtrace", {
+		description: "Memory diagnostics and sampling controls",
+		handler: async (_args: string, ctx: any) => {
+			for (;;) {
+				const sample = takeSample(sessionOf(ctx));
+				const choice = await ctx.ui.select(
+					`Memory diagnostics · ${describe(sample)[0]} · sampling ${every > 0 ? `every ${every} turns` : "off"}`,
+					[
+						"Show memory and object counts",
+						"Compare before and after forced GC",
+						every > 0 ? "Disable sampling" : "Enable sampling (every turn)",
+						"Write heap snapshot",
+					],
+				);
+				if (!choice) return;
+				if (choice === "Show memory and object counts") {
+					const types = await typeCounts();
+					ctx.ui.notify([...describe(sample), ...(types ? types.map(([name, n]) => `  ${name}: ${n}`) : ["object-type counts need Bun"])].join("\n"), "info");
+					return;
+				}
+				if (choice === "Compare before and after forced GC") {
+					const bun = (globalThis as { Bun?: Bun }).Bun;
+					const j = await jsc();
+					if (!bun?.gc || !j) {
+						ctx.ui.notify("GC comparison needs Bun and bun:jsc", "error");
+						return;
+					}
+					const before = { sample: takeSample(sessionOf(ctx)), heap: j.heapStats() };
+					bun.gc(true);
+					const after = { sample: takeSample(sessionOf(ctx)), heap: j.heapStats() };
+					mkdirSync(DIR, { recursive: true });
+					const path = `${DIR}/${sessionOf(ctx)}.gc.jsonl`;
+					appendFileSync(path, `${JSON.stringify({ before, after })}\n`);
+					ctx.ui.notify(`Before: ${describe(before.sample)[0]}\nAfter: ${describe(after.sample)[0]}\nFull heap statistics: ${path}`, "info");
+					return;
+				}
+				if (choice === "Disable sampling" || choice === "Enable sampling (every turn)") {
+					every = every > 0 ? 0 : 1;
+					continue;
+				}
+				if (choice === "Write heap snapshot") {
+					try {
+						const snapshot = writeSnapshot(sessionOf(ctx), "manual");
+						ctx.ui.notify(`heap snapshot ${(snapshot.size / 1048576).toFixed(1)} MB in ${snapshot.ms} ms\n${snapshot.path}`, "info");
+					} catch (err) {
+						ctx.ui.notify(`heapsnap failed: ${err instanceof Error ? err.message : String(err)}`, "error");
+					}
+					return;
+				}
+			}
+		},
 	});
 
 	pi.registerCommand("memstat", {
@@ -89,22 +155,10 @@ export default function piMemtrace(pi: ExtensionAPI): void {
 	pi.registerCommand("heapsnap", {
 		description: "Write a V8-format heap snapshot of this process to the memtrace directory, for diffing two points in a session.",
 		handler: async (args: string, ctx: any) => {
-			const bun = (globalThis as { Bun?: Bun }).Bun;
-			if (typeof bun?.generateHeapSnapshot !== "function") {
-				ctx?.ui?.notify("heapsnap needs Bun's generateHeapSnapshot", "error");
-				return;
-			}
 			const label = String(args ?? "").trim().replace(/[^\w-]+/g, "-") || "manual";
-			const session = sessionOf(ctx);
-			const started = performance.now();
 			try {
-				const snapshot = bun.generateHeapSnapshot("v8");
-				const dir = `${DIR}/snapshots`;
-				mkdirSync(dir, { recursive: true });
-				const path = `${dir}/${session}-${new Date().toISOString().replace(/[:.]/g, "-")}-${label}.heapsnapshot`;
-				writeFileSync(path, snapshot);
-				const ms = Math.round(performance.now() - started);
-				ctx?.ui?.notify(`heap snapshot ${(snapshot.length / 1048576).toFixed(1)} MB in ${ms} ms\n${path}`, "info");
+				const snapshot = writeSnapshot(sessionOf(ctx), label);
+				ctx?.ui?.notify(`heap snapshot ${(snapshot.size / 1048576).toFixed(1)} MB in ${snapshot.ms} ms\n${snapshot.path}`, "info");
 			} catch (err) {
 				ctx?.ui?.notify(`heapsnap failed: ${err instanceof Error ? err.message : String(err)}`, "error");
 			}

@@ -14,19 +14,20 @@ export interface Sample {
 	/** Resident set, and its anonymous part from /proc/self/smaps_rollup. Anonymous is the memory no file backs. */
 	rss: number;
 	anon?: number;
+	swap?: number;
 	reporters: ReporterReadings;
 }
 
 /** Reads `Rss:` and `Anonymous:` from smaps_rollup text, converted from kB to bytes. */
-export function parseSmapsRollup(text: string): { rss?: number; anon?: number } {
+export function parseSmapsRollup(text: string): { rss?: number; anon?: number; swap?: number } {
 	const kb = (key: string): number | undefined => {
 		const m = new RegExp(`^${key}:\\s+(\\d+)\\s+kB`, "m").exec(text);
 		return m ? Number(m[1]) * 1024 : undefined;
 	};
-	return { rss: kb("Rss"), anon: kb("Anonymous") };
+	return { rss: kb("Rss"), anon: kb("Anonymous"), swap: kb("Swap") };
 }
 
-export function readSmapsRollup(): { rss?: number; anon?: number } {
+export function readSmapsRollup(): { rss?: number; anon?: number; swap?: number } {
 	try {
 		return parseSmapsRollup(readFileSync("/proc/self/smaps_rollup", "utf8"));
 	} catch {
@@ -48,6 +49,7 @@ export function takeSample(session: string, turn?: number): Sample {
 		arrayBuffers: usage.arrayBuffers,
 		rss: smaps.rss ?? usage.rss,
 		anon: smaps.anon,
+		swap: smaps.swap,
 		reporters: readReporters(),
 	};
 }
