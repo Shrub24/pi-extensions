@@ -1,0 +1,17 @@
+{
+  "name": "pi-memtrace",
+  "version": "0.1.0",
+  "description": "On-demand memory tracing for Pi-Bolt: per-turn heap and RSS samples, type counts, heap snapshots, and size reporters that extensions register to name what they hold.",
+  "license": "MIT",
+  "type": "module",
+  "keywords": ["pi-package", "pi", "pi-coding-agent", "diagnostics", "memory", "observability"],
+  "pi": {
+    "extensions": ["./extensions/index.ts"]
+  },
+  "scripts": {
+    "test": "bun test ./tests"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
