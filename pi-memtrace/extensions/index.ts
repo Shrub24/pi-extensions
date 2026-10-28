@@ -2,11 +2,11 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { takeSample, type Sample } from "./sample.js";
 
-// Off unless asked for. PI_MEMTRACE_EVERY=N writes a sample every N turns; PI_MEMTRACE_TYPES_EVERY=N also
-// walks the heap for object-type counts every N samples (a full heap walk, so keep it sparse).
+// Sampling is on for every session while the RSS growth here is unexplained; the menu turns it off. PI_MEMTRACE_TYPES_EVERY also
+// walks the heap for object-type counts, which is expensive enough to keep sparse.
 const DIR = process.env.PI_MEMTRACE_DIR ?? `${process.env.HOME}/.local/share/pi-memtrace`;
-const EVERY = Number(process.env.PI_MEMTRACE_EVERY ?? 0);
-const TYPES_EVERY = Number(process.env.PI_MEMTRACE_TYPES_EVERY ?? 0);
+const EVERY = Number(process.env.PI_MEMTRACE_EVERY ?? 1);
+const TYPES_EVERY = Number(process.env.PI_MEMTRACE_TYPES_EVERY ?? 25);
 
 type Bun = { generateHeapSnapshot?: (format: "v8") => string; gc?: (force: boolean) => void };
 

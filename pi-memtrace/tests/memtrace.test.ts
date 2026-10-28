@@ -42,15 +42,15 @@ test("a sample carries heap, runtime and reporter readings, tagged with session 
 	expect(sample.reporters).toEqual({ "ext.cache": { entries: 3 } });
 });
 
-test("menu toggles per-turn sampling without restarting the extension", async () => {
+test("menu reports sampling on by default and toggles it off", async () => {
 	const commands: Record<string, any> = {};
 	const events: Record<string, any> = {};
 	memtrace({ registerCommand: (name: string, command: unknown) => { commands[name] = command; }, on: (name: string, handler: unknown) => { events[name] = handler; } } as any);
 	const titles: string[] = [];
-	const choices = ["Enable sampling (every turn)", undefined];
+	const choices = ["Disable sampling", undefined];
 	const ctx = { ui: { select: async (title: string) => { titles.push(title); return choices.shift(); } }, sessionManager: { getSessionId: () => "test-menu" } };
 	await commands.memtrace.handler("", ctx);
-	expect(titles[0]).toContain("sampling off");
-	expect(titles[1]).toContain("sampling every 1 turns");
+	expect(titles[0]).toContain("sampling every 1 turns");
+	expect(titles[1]).toContain("sampling off");
 	expect(typeof events.turn_end).toBe("function");
 });

@@ -10,7 +10,10 @@ On-demand memory tracing for Pi-Bolt. Load it only when you are chasing growth; 
 
 ## Per-turn sampling
 
-Off by default. Set `PI_MEMTRACE_EVERY=N` to append a sample to `$PI_MEMTRACE_DIR/<session>.jsonl` every N turns. Set `PI_MEMTRACE_TYPES_EVERY=N` to also append object-type counts every N samples to `<session>.types.jsonl`.
+On by default, one sample per turn, appended to `$PI_MEMTRACE_DIR/<session>.jsonl`. `/memtrace` turns it off for the current
+process. `PI_MEMTRACE_EVERY=N` changes the interval, and `PI_MEMTRACE_EVERY=0` starts with sampling off.
+`PI_MEMTRACE_TYPES_EVERY=N` also appends object-type counts every N samples to `<session>.types.jsonl`; the default walks the
+heap every 25 samples, and `0` disables it.
 
 `PI_MEMTRACE_DIR` defaults to `~/.local/share/pi-memtrace`. A forced-GC comparison saves complete `heapStats()` results and process samples before and after collection to `<session>.gc.jsonl`. Object-type counts are counts, not byte sizes. Heap walks, forced GC, and snapshots may pause the process or increase memory usage.
 
