@@ -4,6 +4,8 @@
 
 ### Unreleased
 
+- A task's output-dedupe hash is dropped with the task, and the whole map is cleared with the task list at a session boundary. Left behind, it held one entry per bash call for the life of the process, and a dedupe key a later task reused could be compared against an unrelated task's hash.
+
 - Tool results carry a smaller task snapshot: a title that only repeats the command is stored empty, and displays fall back to the command as before. Session files grow more slowly; existing entries are unchanged and still restore.
 - `bg_task extend` now renders as a styled task-status row, and background messages without a specialized detail shape use a themed generic card instead of plain text.
 - Grouped `result-review` advisories now use the configured `wakeMessageStyle`: compact styled lines by default, ruled cards when requested, and hidden collapsed notifications when configured; expanded views retain task details.

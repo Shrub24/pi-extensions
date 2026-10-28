@@ -178,6 +178,7 @@ import {
 	ensureOutputWakeBudget,
 	ensureWakeState,
 	deliverWakeMessage,
+	outputDedupeKey,
 	resolveNotifyMode,
 	recordScheduledOutputDrop,
 	scheduleTaskWake,
@@ -242,7 +243,14 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 	let taskCounter = 0;
 	let shuttingDown = false;
 	const tasks = new Map<string, ManagedTask>();
+	// The last output hash emitted per dedupe key. A task's entry goes with the task:
+	// left behind, the map would hold one pair for every bash call of the process,
+	// and a key a later task reused would be deduped against an unrelated one.
 	const outputDedupeHashes = new Map<string, string>();
+	// Reported through pi-memtrace's registry so a sample says how much this map
+	// holds, and a test can watch it go back to nothing when a task is dropped.
+	const reporters = ((globalThis as any)[Symbol.for("pi-memtrace.reporters")] ??= new Map());
+	reporters.set("pi-bash-processes.dedupe-hashes", () => ({ entries: outputDedupeHashes.size }));
 
 	const numericTaskId = (id: string): number => {
 		const match = id.match(/^bg-(\d+)$/);
@@ -1232,6 +1240,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		// longer exists in the map.
 		for (const task of tasks.values()) releaseTaskTimers(task);
 		tasks.clear();
+		outputDedupeHashes.clear();
 		taskCounter = 0;
 		activeSessionId = sessionIdForContext(ctx);
 		// Forks replay their parent's branch, but those tasks remain owned by the parent session.
@@ -1457,6 +1466,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		voidPendingTaskWakes(task, "clear", logWakeDiagnostic);
 		clearTaskTimers(task);
 		tasks.delete(task.id);
+		outputDedupeHashes.delete(outputDedupeKey(task));
 		bumpSettlementRevision();
 		forgetSnapshot(task.id);
 		// A pruned task cannot settle a handoff any more, so its unaccepted
@@ -3135,6 +3145,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 		await clearPaneFacts();
 		// The persisted snapshots carry the tasks to the next session_start.
 		tasks.clear();
+		outputDedupeHashes.clear();
 		clearWidget();
 		lastLogTail = undefined;
 		activeCtx = null;
