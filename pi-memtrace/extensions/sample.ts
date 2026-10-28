@@ -15,6 +15,9 @@ export interface Sample {
 	rss: number;
 	anon?: number;
 	swap?: number;
+	/** The session the runtime holds: how many entries it keeps parsed, and the transcript on disk. */
+	sessionEntries?: number;
+	sessionBytes?: number;
 	reporters: ReporterReadings;
 }
 
@@ -35,7 +38,11 @@ export function readSmapsRollup(): { rss?: number; anon?: number; swap?: number 
 	}
 }
 
-export function takeSample(session: string, turn?: number): Sample {
+export function takeSample(
+	session: string,
+	turn?: number,
+	sessionState: { entries?: number; bytes?: number } = {},
+): Sample {
 	const usage = process.memoryUsage();
 	const smaps = readSmapsRollup();
 	return {
@@ -43,6 +50,8 @@ export function takeSample(session: string, turn?: number): Sample {
 		pid: process.pid,
 		session,
 		turn,
+		...(sessionState.entries === undefined ? {} : { sessionEntries: sessionState.entries }),
+		...(sessionState.bytes === undefined ? {} : { sessionBytes: sessionState.bytes }),
 		heapUsed: usage.heapUsed,
 		heapTotal: usage.heapTotal,
 		external: usage.external,

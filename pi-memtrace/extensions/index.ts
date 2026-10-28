@@ -1,5 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { takeSample, type Sample } from "./sample.js";
 
 // Sampling is on for every session while the RSS growth here is unexplained; the menu turns it off. PI_MEMTRACE_TYPES_EVERY also
@@ -34,6 +34,24 @@ async function typeCounts(top = 15): Promise<[string, number][] | undefined> {
 	return Object.entries(counts)
 		.sort((a, b) => b[1] - a[1])
 		.slice(0, top);
+}
+
+/** The runtime and the transcript, which is what a parsed entry array costs beyond the heap reporter. */
+function sessionState(ctx: any): { entries?: number; bytes?: number } {
+	const out: { entries?: number; bytes?: number } = {};
+	try {
+		const entries = ctx?.sessionManager?.getEntries?.();
+		if (Array.isArray(entries)) out.entries = entries.length;
+	} catch {
+		/* an unavailable session manager leaves the field out */
+	}
+	try {
+		const file = ctx?.sessionManager?.getSessionFile?.();
+		if (file) out.bytes = statSync(file).size;
+	} catch {
+		/* an unreadable transcript leaves the field out */
+	}
+	return out;
 }
 
 function writeSnapshot(session: string, label: string): { path: string; size: number; ms: number } {
@@ -73,7 +91,7 @@ export default function piMemtrace(pi: ExtensionAPI): void {
 		if (every <= 0 || event?.turnIndex === undefined || event.turnIndex % every !== 0) return;
 		try {
 			samples += 1;
-			const sample = takeSample(currentSession, event.turnIndex);
+			const sample = takeSample(currentSession, event.turnIndex, sessionState(ctx));
 			mkdirSync(DIR, { recursive: true });
 			appendFileSync(`${DIR}/${currentSession}.jsonl`, `${line(sample)}\n`);
 			if (TYPES_EVERY > 0 && samples % TYPES_EVERY === 0) {

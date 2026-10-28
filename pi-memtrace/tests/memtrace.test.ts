@@ -54,3 +54,12 @@ test("menu reports sampling on by default and toggles it off", async () => {
 	expect(titles[1]).toContain("sampling off");
 	expect(typeof events.turn_end).toBe("function");
 });
+
+test("a sample carries the parsed-entry count and transcript size when given", () => {
+	const withState = takeSample("entries", 3, { entries: 23320, bytes: 22754048 });
+	expect(withState.sessionEntries).toBe(23320);
+	expect(withState.sessionBytes).toBe(22754048);
+	const bare = takeSample("entries", 4);
+	expect("sessionEntries" in bare).toBe(false);
+	expect("sessionBytes" in bare).toBe(false);
+});
