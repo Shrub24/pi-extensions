@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { appendFileSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { takeSample, type Sample } from "./sample.js";
+import { maxUserWatches, ownInotify, systemInotify } from "./inotify.js";
 
 // Sampling is on for every session while the RSS growth here is unexplained; the menu turns it off. PI_MEMTRACE_TYPES_EVERY also
 // walks the heap for object-type counts, which is expensive enough to keep sparse.
@@ -86,6 +87,11 @@ export default function piMemtrace(pi: ExtensionAPI): void {
 	let currentSession = "unknown";
 	let every = EVERY;
 
+	// Inotify is counted every sample: a recursive watch multiplies by directory count, and the
+	// budget it consumes is shared with every other watcher on the machine.
+	const registry = ((globalThis as any)[Symbol.for("pi-memtrace.reporters")] ??= new Map());
+	registry.set("pi-memtrace.inotify", ownInotify);
+
 	pi.on("turn_end", (event: any, ctx: any) => {
 		currentSession = sessionOf(ctx);
 		if (every <= 0 || event?.turnIndex === undefined || event.turnIndex % every !== 0) return;
@@ -116,6 +122,7 @@ export default function piMemtrace(pi: ExtensionAPI): void {
 						"Compare before and after forced GC",
 						every > 0 ? "Disable sampling" : "Enable sampling (every turn)",
 						"Write heap snapshot",
+						"Show inotify watches",
 					],
 				);
 				if (!choice) return;
@@ -138,6 +145,21 @@ export default function piMemtrace(pi: ExtensionAPI): void {
 					const path = `${DIR}/${sessionOf(ctx)}.gc.jsonl`;
 					appendFileSync(path, `${JSON.stringify({ before, after })}\n`);
 					ctx.ui.notify(`Before: ${describe(before.sample)[0]}\nAfter: ${describe(after.sample)[0]}\nFull heap statistics: ${path}`, "info");
+					return;
+				}
+				if (choice === "Show inotify watches") {
+					const own = ownInotify();
+					const cap = maxUserWatches();
+					const holders = systemInotify(6);
+					const total = holders.reduce((sum, row) => sum + row.watches, 0);
+					const lines = [
+						`this process: ${own.instances} instance(s), ${own.capped ? "at least " : ""}${own.watches.toLocaleString()} watches`,
+						`per-user cap: ${cap.toLocaleString()}`,
+						"heaviest holders:",
+						...holders.map((row) => `  ${row.watches.toLocaleString().padStart(9)}  pid ${row.pid}  ${row.command.slice(0, 60)}`),
+					];
+					if (total >= cap) lines.push(`the cap is reached, so any new watch now fails with ENOSPC`);
+					ctx.ui.notify(lines.join("\n"), total >= cap ? "error" : "info");
 					return;
 				}
 				if (choice === "Disable sampling" || choice === "Enable sampling (every turn)") {

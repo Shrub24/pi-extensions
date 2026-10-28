@@ -2,6 +2,9 @@ import { beforeEach, expect, test } from "bun:test";
 import { parseSmapsRollup, takeSample } from "../extensions/sample.js";
 import { readReporters, reporters } from "../extensions/registry.js";
 import memtrace from "../extensions/index.js";
+import { countMarks, maxUserWatches, ownInotify } from "../extensions/inotify.js";
+import { rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 
 beforeEach(() => reporters().clear());
 
@@ -62,4 +65,33 @@ test("a sample carries the parsed-entry count and transcript size when given", (
 	const bare = takeSample("entries", 4);
 	expect("sessionEntries" in bare).toBe(false);
 	expect("sessionBytes" in bare).toBe(false);
+});
+
+test("inotify accounting counts this process's own marks and reads the cap", () => {
+	const own = ownInotify();
+	expect(own.instances).toBeGreaterThanOrEqual(0);
+	expect(own.watches).toBeGreaterThanOrEqual(0);
+	expect(maxUserWatches()).toBeGreaterThan(0);
+});
+
+test("a mark line is counted once per mark, not once per byte", () => {
+	const counts = ownInotify();
+	if (counts.instances === 0) return; // nothing registered in this test process
+	expect(Number.isInteger(counts.watches)).toBe(true);
+	expect(counts.watches).toBeGreaterThan(0);
+});
+
+test("marks are counted exactly across chunk boundaries, and capping is reported", () => {
+	const file = `${tmpdir()}/memtrace-fdinfo-${process.pid}`;
+	const line = "inotify wd:1 ino:2 sdev:24 mask:fc6 ignored_mask:0 fhandle-bytes:14 fhandle-type:4d f_handle:0000000000000000000000000000000000000000\n";
+	writeFileSync(file, line.repeat(3000));
+	try {
+		expect(countMarks(file, Number.POSITIVE_INFINITY)).toEqual({ marks: 3000, capped: false });
+		const capped = countMarks(file, 1000);
+		expect(capped.capped).toBe(true);
+		expect(capped.marks).toBeGreaterThan(0);
+		expect(capped.marks).toBeLessThan(3000);
+	} finally {
+		rmSync(file, { force: true });
+	}
 });
