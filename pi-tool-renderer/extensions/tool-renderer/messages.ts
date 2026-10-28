@@ -586,21 +586,14 @@ export const THINKING_ROW_SENTINEL = "\u001b]1337;kx-thinking\u0007";
 /**
  * The marker is swapped for a zero-width character rather than deleted: the
  * padding rows above, inside and below a panel are only blanks once the marker
- * is gone, and any trimmer that strips ANSI would drop them.
+ * is gone, and any trimmer that strips ANSI would drop them. The box's own
+ * padding rows carry the marker too, because its background draws every row.
  */
 const THINKING_ROW_KEEPER = "\u200B";
 
 function stripThinkingRowSentinels(lines: string[]): string[] {
 	return lines.map((line) => (line.includes(THINKING_ROW_SENTINEL) ? line.replace(THINKING_ROW_SENTINEL, THINKING_ROW_KEEPER) : line));
 }
-
-/**
- * Zero-width row whose one U+200B keeps it out of `isBlankRenderLine`, so the
- * panel's padding rows survive the assistant trimmers that drop trailing
- * blank rows (and would otherwise leave the tint stopping at the last line of
- * thinking text).
- */
-const THINKING_PANEL_PAD = { render: (): string[] => ["\u200B"], invalidate() {} };
 
 function panelizeThinkingBlocks(component: any, theme: any): void {
 	const children = component?.contentContainer?.children;
@@ -613,11 +606,12 @@ function panelizeThinkingBlocks(component: any, theme: any): void {
 		const child = children[index];
 		if (!(child instanceof MouseRegion)) continue;
 		// No "thinking" heading: the block's own styling and the model's placeholder
-		// already say what it is. Only the tinted padding rows frame it.
-		const box = new Box(1, 0, (text: string) => `${THINKING_ROW_SENTINEL}${theme.bg("customMessageBg", text)}`);
-		box.addChild(THINKING_PANEL_PAD);
+		// already say what it is. Only the tinted padding rows frame it. The padding
+		// is the box's own: a padding component shared between panels would be
+		// retained by every panel that rendered it, keeping them all reachable
+		// (Pi-Bolt records each rendered child's owners).
+		const box = new Box(1, 1, (text: string) => `${THINKING_ROW_SENTINEL}${theme.bg("customMessageBg", text)}`);
 		box.addChild(child);
-		box.addChild(THINKING_PANEL_PAD);
 		children[index] = box;
 	}
 }

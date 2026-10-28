@@ -80,7 +80,53 @@ function renderImageResult(
 function hasTerminalImage(lines: string[]): boolean { return lines.some((line) => line.includes("\x1b_G"));
 }
 
-describe("read image rendering", () => { test("on follows expanded state across repeated toggles", () => { const cwd = tempCwd("on");
+function renderImageComponent(
+	definition: any,
+	cwd: string,
+	expanded: boolean,
+	showImages: boolean,
+	state: Record<string, unknown>,
+): any {
+	const context: any = { args: { path: "image.png" }, cwd, invalidate() {}, showImages, state };
+	return definition.renderResult(
+		{ content: [
+			{ type: "text", text: "Read image file [image/png]" },
+			{ type: "image", data: imageData, mimeType: "image/png" },
+		] },
+		{ expanded, isPartial: false },
+		{ bold: (text: string) => text, fg: (_token: string, text: string) => text },
+		context,
+	);
+}
+
+/** The image wrappers a rendered read row holds, however deeply the row nests them. */
+function imageComponents(component: any): any[] {
+	const found: any[] = [];
+	const walk = (node: any): void => {
+		if (!node || typeof node !== "object") return;
+		if (node.constructor?.name === "OverlayAwareImage") found.push(node);
+		for (const child of Array.isArray(node.children) ? node.children : []) walk(child);
+	};
+	walk(component);
+	return found;
+}
+
+describe("read image rendering", () => { test("a re-rendered read row mounts a fresh image, never the one it showed before", () => {
+		// Pi-Bolt records each rendered child's owners and holds them strongly, so a
+		// cached image re-mounted into a new container would keep every container it
+		// had ever been shown in, and with them the row's content and rendered lines.
+		const cwd = tempCwd("always");
+		const definition = readRenderer(cwd);
+		const state = {};
+		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
+
+		const first = imageComponents(renderImageComponent(definition, cwd, false, false, state));
+		const second = imageComponents(renderImageComponent(definition, cwd, false, false, state));
+		expect(first.length).toBe(1);
+		expect(second.length).toBe(1);
+		expect(second[0]).not.toBe(first[0]); });
+
+	test("on follows expanded state across repeated toggles", () => { const cwd = tempCwd("on");
 		const definition = readRenderer(cwd);
 		const state = {};
 		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });

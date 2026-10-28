@@ -4,6 +4,10 @@
 
 ### Unreleased
 
+- Thinking panels draw their tinted padding from the panel box itself instead of a padding component shared between panels. Pi-Bolt records each rendered child's owners, and held them strongly, so the shared row kept every panel that had ever rendered it reachable; a streaming reply therefore held all of its earlier frames. The tinted frame is unchanged, and its padding rows are now full width.
+- A read row builds its image component per render instead of caching one in the row's state. Pi-Bolt's owner bookkeeping holds a child's owners strongly, so a cached image re-mounted into a new container kept every container it had been shown in, and with them the row's content and rendered lines. The PNG conversion stays cached.
+- Pending-row blink state holds its row weakly and is cleared at each session boundary. A row that stopped rendering while pending — an aborted turn, a switched session — otherwise kept its context and a 450ms timer for the life of the process. A row without an id is no longer tracked, since nothing could clear it later.
+
 - Codemode now shows one evolving row per nested execution, with readable targets and output beneath the owning call instead of JavaScript and repeated JSON arguments. Expansion retains source and shows actual nested edit diffs. Bounded display metadata keeps captured patches and previews available on resume without storing file snapshots or computed diff rows.
 - Consecutive tool calls in `outlines` mode are separated by a rule, so long calls no longer blend into each other. The run still has one bottom rule and no blank row between calls.
 - `opencode` is now an alias for the `preview` bash output mode: both show the same tail, with collapsed rows at `bashCollapsedLines` (default 5, was 10 for preview and 4 for opencode). Live streaming still uses `bashLiveTailLines`.

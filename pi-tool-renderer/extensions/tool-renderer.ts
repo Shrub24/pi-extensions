@@ -20,6 +20,7 @@ import {
 import { installLiveSettingsRefresh } from "./tool-renderer/live-settings.js";
 import { installSettingsCacheRefresh, recordProjectTrust } from "./tool-renderer/package-config.js";
 import { settingBoolean } from "./tool-renderer/settings.js";
+import { resetBlinkStore } from "./tool-renderer/text.js";
 import { registerStackEvents } from "./tool-renderer/stack.js";
 import { installIntentGuard } from "./tool-renderer/intent.js";
 import { registerBashOnSessionStart, registerEdit, registerRead, registerReadOnly, registerWrite } from "./tool-renderer/tools.js";
@@ -36,6 +37,11 @@ export default async function toolRenderer(pi: ExtensionAPI): Promise<void> {
 	if (!settingBoolean("enabled", true)) return;
 	installSettingsCacheRefresh(pi);
 	pi.on("session_start", (_event, ctx) => recordProjectTrust(ctx));
+	// Pending-row blink state belongs to the session that started it: a row that
+	// stops rendering while pending (aborted turn, session switched) would
+	// otherwise keep its context and its timer for the life of the process.
+	pi.on("session_start", resetBlinkStore);
+	pi.on("session_shutdown", resetBlinkStore);
 
 	registerStackEvents(pi);
 	registerRenderDebugCommand(pi);

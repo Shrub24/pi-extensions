@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { Container, Markdown, MouseRegion, Spacer, Text, visibleWidth } from "@earendil-works/pi-tui";
+import { Box, Container, Markdown, MouseRegion, Spacer, Text, visibleWidth } from "@earendil-works/pi-tui";
 
 import { stripAnsi } from "../tool-renderer/ansi.js";
 import { clearPackageConfigCache } from "../tool-renderer/package-config.js";
@@ -60,6 +60,41 @@ class StreamingAssistantMessage extends Container {
 		}
 	}
 }
+
+test("each thinking panel frames its block with the box's own padding, sharing no child", () => {
+	const { cwd } = world();
+	writeFileSync(join(cwd, ".pi", "settings.json"), JSON.stringify({ "pi-tool-renderer": { thinkingPanel: true, assistantMessageStyle: "plain" } }));
+	clearPackageConfigCache();
+	const handlers = new Map<string, (...args: any[]) => void>();
+	const pi = { on: (event: string, handler: (...args: any[]) => void) => handlers.set(event, handler) };
+	installAssistantMessageRenderer(pi as any, StreamingAssistantMessage);
+	handlers.get("session_start")!({}, { cwd, hasUI: true, ui: { theme } });
+	try {
+		const panels = ["First block", "Second block"].map((thinking) => {
+			const component = new StreamingAssistantMessage();
+			component.updateContent({ content: [{ type: "thinking", thinking }] });
+			return component.contentContainer.children.filter((child) => child instanceof Box) as Box[];
+		});
+		for (const panel of panels) {
+			expect(panel).toHaveLength(1);
+			// Pi-Bolt's render bookkeeping holds each rendered child's owners strongly, so a
+			// component shared between panels keeps every panel that ever rendered it alive.
+			expect(panel[0]!.children).toHaveLength(1);
+		}
+		for (const left of panels[0]![0]!.children) {
+			for (const right of panels[1]![0]!.children) expect(right).not.toBe(left);
+		}
+		const rows = (panels[0]![0] as any).render(40) as string[];
+		// The box paints every row, padding included: the marker the assistant pass later
+		// swaps for a zero-width keeper is what keeps a tinted blank row from being trimmed.
+		expect(rows[0]).toContain(TINT);
+		expect(rows.at(-1)).toContain(TINT);
+		expect(rows[0]).toContain(THINKING_ROW_SENTINEL);
+		expect(rows.at(-1)).toContain(THINKING_ROW_SENTINEL);
+	} finally {
+		handlers.get("session_shutdown")!();
+	}
+});
 
 test("a thinking panel keeps a tinted row below its last line of thinking text", () => {
 	const { cwd } = world();

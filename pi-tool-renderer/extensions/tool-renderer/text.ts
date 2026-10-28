@@ -131,55 +131,69 @@ export function readResultSummary(result: any, args: any, theme: any): string {
 }
 
 interface BlinkEntry {
-	invalidate: () => void;
+	/** The row may already be gone: a weak reference keeps an abandoned pending row collectable. */
+	context: WeakRef<{ invalidate?: () => void }>;
 }
 
-const blinkEntries = new Map<unknown, BlinkEntry>();
+const blinkEntries = new Map<string, BlinkEntry>();
 let blinkTimer: ReturnType<typeof setInterval> | undefined;
 
-function blinkKey(context: any): unknown {
-	return context?.toolCallId ?? context?.id ?? context;
+/** A row without an id cannot be cleared later, so it is never tracked. */
+function blinkKey(context: any): string | undefined {
+	const key = context?.toolCallId ?? context?.id;
+	return typeof key === "string" && key.length > 0 ? key : undefined;
+}
+
+function sweepBlinkEntries(): void {
+	for (const [key, entry] of blinkEntries) {
+		const context = entry.context.deref();
+		if (!context) {
+			blinkEntries.delete(key);
+			continue;
+		}
+		try {
+			context.invalidate?.();
+		} catch {
+			// Rendering invalidation is best-effort only.
+		}
+	}
+	if (blinkEntries.size === 0) stopBlinkTimer();
+}
+
+function stopBlinkTimer(): void {
+	if (!blinkTimer) return;
+	clearInterval(blinkTimer);
+	blinkTimer = undefined;
+}
+
+/** A session boundary drops every tracked row: their contexts belong to the session that made them. */
+export function resetBlinkStore(): void {
+	blinkEntries.clear();
+	stopBlinkTimer();
 }
 
 function startBlinkTimer(): void {
 	if (blinkTimer) return;
-	blinkTimer = setInterval(() => {
-		for (const entry of blinkEntries.values()) {
-			try {
-				entry.invalidate();
-			} catch {
-				// Rendering invalidation is best-effort only.
-			}
-		}
-		if (blinkEntries.size === 0 && blinkTimer) {
-			clearInterval(blinkTimer);
-			blinkTimer = undefined;
-		}
-	}, 450);
+	blinkTimer = setInterval(sweepBlinkEntries, 450);
 	blinkTimer.unref?.();
 }
 
 function trackBlink(context: any): void {
 	const key = blinkKey(context);
 	if (!key || typeof context?.invalidate !== "function") return;
-	blinkEntries.set(key, { invalidate: () => context.invalidate() });
+	blinkEntries.set(key, { context: new WeakRef(context) });
 	startBlinkTimer();
 }
 
 export function clearBlink(context: any): void {
 	const key = blinkKey(context);
 	if (key) blinkEntries.delete(key);
-	if (blinkEntries.size === 0 && blinkTimer) {
-		clearInterval(blinkTimer);
-		blinkTimer = undefined;
-	}
+	if (blinkEntries.size === 0) stopBlinkTimer();
 }
 
 /**
- * Read-only size of the blink store, for `/renderdebug memory`. Entries hold one
- * `invalidate` closure each, so the entry count is the honest number: no byte
- * total is reported for closures. The store is populated only while
- * `pendingStatusAnimation` is on.
+ * Read-only size of the blink store, for `/renderdebug memory`. Each entry holds
+ * one weak reference, so the entry count is the honest number.
  */
 export function blinkStoreStats(): { entries: number; timerRunning: boolean } {
 	return { entries: blinkEntries.size, timerRunning: blinkTimer !== undefined };
