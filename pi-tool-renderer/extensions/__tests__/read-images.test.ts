@@ -111,10 +111,11 @@ function imageComponents(component: any): any[] {
 	return found;
 }
 
-describe("read image rendering", () => { test("a re-rendered read row mounts a fresh image, never the one it showed before", () => {
-		// Pi-Bolt records each rendered child's owners and holds them strongly, so a
-		// cached image re-mounted into a new container would keep every container it
-		// had ever been shown in, and with them the row's content and rendered lines.
+describe("read image rendering", () => { test("a re-rendered read row reuses its image, so the terminal escape is not rebuilt", () => {
+		// Image caches its lines per width, and a row that does not report its changes
+		// is rendered again every frame, so the wrapper is kept rather than rebuilt.
+		// A rendered child's owners are held weakly on Pi-Bolt, so re-mounting it into
+		// a new container does not keep the containers it was shown in.
 		const cwd = tempCwd("always");
 		const definition = readRenderer(cwd);
 		const state = {};
@@ -124,7 +125,7 @@ describe("read image rendering", () => { test("a re-rendered read row mounts a f
 		const second = imageComponents(renderImageComponent(definition, cwd, false, false, state));
 		expect(first.length).toBe(1);
 		expect(second.length).toBe(1);
-		expect(second[0]).not.toBe(first[0]); });
+		expect(second[0]).toBe(first[0]); });
 
 	test("on follows expanded state across repeated toggles", () => { const cwd = tempCwd("on");
 		const definition = readRenderer(cwd);

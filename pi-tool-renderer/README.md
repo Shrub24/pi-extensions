@@ -40,8 +40,8 @@ Pi does not save nested results. To keep these views on resume, the parent resul
 - A dropped call that Pi draws again (ctrl+o, a resize) is shown on its own and is not kept.
 - Grouped calls and the list of tool displays to refresh are cleared when a session starts or ends. A tool display Pi no longer shows is not kept alive.
 - Code blocks keep at most 120 highlighted results, keyed by language and source text. The entry count is capped, not the characters, so a few very large blocks are held until 120 newer ones displace them.
-- A thinking panel is one box holding only its own clickable block, so a panel that leaves the transcript can be collected. Nothing here is shared between panels: Pi-Bolt records each rendered child's owners and holds them strongly, so a component shared between panels would keep every one of them, and their rows, reachable for the life of the process.
-- A read row's image component is built per render; only the PNG conversion is cached. Re-mounting a cached component into a new container would keep every container it had been shown in, for the same reason.
+- A thinking panel is one box holding only its own clickable block, so a panel that leaves the transcript can be collected. Nothing is shared between panels: one component mounted into every panel would be retained by each of them, and would keep their rows reachable.
+- A read row keeps its image component across renders, so the image's per-width line cache answers rather than its terminal escape being rebuilt on a row that is rendered again every frame. Re-mounting it into a new container is safe because Pi-Bolt holds a rendered child's owners weakly (1.0.7 and later); only the PNG conversion is asynchronous.
 - Pending-row blink state holds each row weakly and is cleared when a session starts or ends. A row without an id is not tracked, because nothing could clear it later.
 
 ## Diagnostics

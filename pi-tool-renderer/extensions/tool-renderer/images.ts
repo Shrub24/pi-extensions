@@ -43,6 +43,9 @@ interface ReadImageCacheEntry {
 	sourceMimeType: string;
 	converted?: NonNullable<ImageConversionResult>;
 	conversionStarted?: boolean;
+	builtData?: string;
+	builtMimeType?: string;
+	component?: OverlayAwareImage;
 }
 
 interface ReadImageRenderState {
@@ -92,12 +95,21 @@ function readImageComponent(block: ReadImageBlock, index: number, theme: any, co
 		mimeType = entry.converted.mimeType;
 	}
 
-	// A fresh wrapper every render. Pi-Bolt records each rendered child's owners and
-	// keeps them strongly, so a cached wrapper re-mounted into a new container
-	// would keep every container it was ever shown in, and with them the row's
-	// content and rendered lines. Only the conversion is cached.
-	const image = new Image(data, mimeType, { fallbackColor: (text: string) => theme.fg("toolOutput", text) });
-	return new OverlayAwareImage(image, context);
+	// One wrapper per row, reused across renders: Image caches its lines per width,
+	// and a row that does not report its changes is rendered again every frame, so
+	// rebuilding the wrapper would rebuild the terminal escape each time. Re-mounting
+	// a component into a new container is safe on Pi-Bolt: a rendered child's owners
+	// are held weakly and a discarded owner is pruned when the child next reports.
+	if (!entry.component || entry.builtData !== data || entry.builtMimeType !== mimeType) {
+		entry.builtData = data;
+		entry.builtMimeType = mimeType;
+		const image = new Image(data, mimeType, { fallbackColor: (text: string) => theme.fg("toolOutput", text) });
+		entry.component = new OverlayAwareImage(image, context);
+	} else {
+		// The overlay state is read from the context at render time.
+		entry.component.setContext(context);
+	}
+	return entry.component;
 }
 
 export function renderReadImages(component: any, result: any, expanded: boolean, theme: any, context: any, cwd: string): any {
