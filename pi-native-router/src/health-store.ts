@@ -300,6 +300,12 @@ export class HealthStore {
     });
   }
 
+  /** A healthy authoritative reading clears quota causes recorded by dispatch errors, unless written after it started. */
+  clearErrorQuota(key: string, startedRevision: number): void {
+    this.tx(() => {
+      this.db.prepare("DELETE FROM causes WHERE key = ? AND kind = 'quota' AND revision <= ?").run(key, startedRevision);
+    });
+  }
   reconcileTrackerQuota(key: string, exhaustedUntil: number | undefined, startedRevision: number, reason: string): void {
     if (exhaustedUntil !== undefined) {
       this.writeCause(key, "tracker-quota", exhaustedUntil, reason);

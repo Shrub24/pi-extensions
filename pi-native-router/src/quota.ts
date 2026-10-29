@@ -146,6 +146,8 @@ export async function refreshQuota(
     // Only an enforced, authoritative exhaustion may block; any other fresh reading clears tracker quota.
     const blockingUntil = source.enforce && snapshot.authoritative ? until : undefined;
     store.reconcileTrackerQuota(key, blockingUntil, started, `tracker reports exhausted quota for ${source.provider}`);
+    // A healthy authoritative reading also clears quota causes that dispatch errors recorded before it started.
+    if (until === undefined && snapshot.authoritative) store.clearErrorQuota(key, started);
     return { status: "refreshed", snapshot };
   } finally {
     store.releaseLease(leaseKey, holder);

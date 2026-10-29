@@ -312,3 +312,20 @@ test("usage shows two decimals and a fill bar that matches the percentage", () =
   expect(usageBar(57.1234, 10)).toBe("[██████░░░░]");
   expect(usageBar(150, 4)).toBe("[████]");
 });
+
+test("a healthy authoritative refresh clears a quota block that a dispatch error recorded", async () => {
+  const root = dir();
+  try {
+    const store = new HealthStore(join(root, "h.sqlite"), () => NOW);
+    store.mark("opencode-go#go-a", "quota", NOW + 60 * 60_000, "insufficient_quota from dispatch");
+    store.mark("opencode-go#go-a", "auth", NOW + 60 * 60_000, "auth kept");
+    const healthy = JSON.stringify([{ provider: "opencodego", source: "api", usage: {
+      primary: { resetsAt: "2026-10-11T13:26:18Z", usedPercent: 0, windowMinutes: 300 },
+      secondary: { resetsAt: "2026-10-18T23:59:56Z", usedPercent: 0, windowMinutes: 10080 },
+      updatedAt: "2026-10-11T08:26:18Z",
+    } }]);
+    await refreshQuota(store, { provider: "opencode-go", account: "go-a" }, source(true), async () => healthy, () => NOW, "h1", { force: true });
+    expect(store.inspect().causes.map(cause => cause.kind)).toEqual(["auth"]);
+    store.close();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
