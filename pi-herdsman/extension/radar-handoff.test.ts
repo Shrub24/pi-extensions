@@ -1,47 +1,42 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { RadarHandoffPort } from "pi-radar/communication";
+import type { RadarMailboxPort } from "pi-radar/communication";
 import type { ResultRecord } from "./mailbox.ts";
 import {
-  decodeSealedReport,
-  persistAndAcknowledgeCompletion,
-  publishCompletionHandoff,
-  sealedCompletionFor,
+  decodeCompletionMessage, decodeSealedReport, publishCompletionHandoff,
+  sealedCompletionFor, type CompletionMessage,
 } from "./radar-handoff.ts";
 
 const SEALED = [
-  "---",
-  "schema: handoff/v1",
-  "title: Parser fix",
-  "summary: The parser now accepts empty files.",
-  "---",
-  "",
-  "## Outcome", "Complete.",
-  "## Changes and findings", "Changed the parser.",
-  "## Evidence", "Tests pass.",
-  "## Decisions", "Empty input is valid.",
-  "## Caveats", "None.",
-  "## Remaining work", "None.",
-  "## Relevant artifacts", "- parser.ts",
-  "",
+  "---", "schema: handoff/v1", "title: Parser fix",
+  "summary: The parser now accepts empty files.", "---", "",
+  "## Outcome", "Complete.", "## Changes and findings", "Changed the parser.",
+  "## Evidence", "Tests pass.", "## Decisions", "Empty input is valid.",
+  "## Caveats", "None.", "## Remaining work", "None.", "## Relevant artifacts", "- parser.ts", "",
 ].join("\n");
-
 const completed: ResultRecord = {
   version: 6, requestId: "11111111-1111-4111-8111-111111111111", runId: "run-1",
   ownerSessionId: "owner-1", workspaceId: "workspace-1", agentLabel: "worker", paneId: "%4",
   status: "completed", text: "Acknowledged.", completedAt: 1234,
   handoff: { title: "Parser fix", summary: "The parser now accepts empty files.", content: SEALED, sha256: "x", bytes: SEALED.length, published: false },
 };
+const message: CompletionMessage = {
+  version: 1, id: completed.requestId, created_at_unix_ms: 1234,
+  producer: { registration_id: "registration", session_id: "session", subject_id: "worker-subject", claim_id: "claim" },
+  recipients: ["owner-subject"],
+  body: { kind: "handoff", correlation_id: completed.runId, summary: "A transport summary", content: SEALED },
+};
+const expected = { runId: completed.runId, subjectId: "worker-subject" };
 
-test("publication sends the sealed Markdown report, never the chat acknowledgement", async () => {
-  const requests: Array<Record<string, unknown>> = [];
-  const port = {
-    publish: async (value: Record<string, unknown>) => {
+test("publication sends the sealed report with a stable ID and body across an uncertain retry", async () => {
+  const requests: Parameters<RadarMailboxPort["publish"]>[0][] = [];
+  const port: Pick<RadarMailboxPort, "publish"> = {
+    publish: async (value) => {
       requests.push(value);
       if (requests.length === 1) throw new Error("reply lost after dispatch");
-      return { ok: true as const, value: { handoff: { id: value.request_id }, created: false } };
+      return { ok: true, value: { message, created: false } };
     },
-  } as unknown as RadarHandoffPort;
+  };
   await assert.rejects(() => publishCompletionHandoff(port, completed), /reply lost/u);
   await publishCompletionHandoff(port, completed);
   assert.equal(requests[0]?.request_id, completed.requestId);
@@ -51,70 +46,36 @@ test("publication sends the sealed Markdown report, never the chat acknowledgeme
   assert.deepEqual(requests[1], requests[0]);
 });
 
-test("a result with no sealed handoff is refused rather than reconstructed from chat text", () => {
-  assert.throws(
-    () => sealedCompletionFor({ ...completed, handoff: undefined }),
-    /no sealed handoff/u,
-  );
+test("a result without a sealed handoff is refused, not reconstructed from chat", () => {
+  assert.throws(() => sealedCompletionFor({ ...completed, handoff: undefined }), /no sealed handoff/u);
 });
 
-test("a failed worker publishes a Herdsman failure record that cannot be mistaken for a report", () => {
+test("a failed worker publishes a distinct Herdsman failure record", () => {
   const sealed = sealedCompletionFor({
     ...completed, status: "failed", text: undefined, handoff: undefined,
     error: { code: "invalid_response", message: "Missing Evidence section" },
   });
   assert.equal(sealed.status, "failed");
-  assert.match(sealed.content, /^---\nschema: handoff\/v1\ntitle: "Failed: worker"/u);
   assert.deepEqual(decodeSealedReport(sealed.content), {
     status: "failed", title: "Failed: worker", summary: "invalid_response: Missing Evidence section",
   });
 });
 
-test("a retrieved worker report decodes to its title and summary as completed", () => {
-  assert.deepEqual(decodeSealedReport(SEALED), {
-    status: "completed", title: "Parser fix", summary: "The parser now accepts empty files.",
+test("capture maps the message ID and sealed body, not the transport summary", () => {
+  assert.deepEqual(decodeCompletionMessage(message, expected), {
+    requestId: completed.requestId, status: "completed",
+    summary: "The parser now accepts empty files.", content: SEALED,
   });
 });
 
-test("the owner durably records the report before acknowledging it", async () => {
-  const events: string[] = [];
-  const port = {
-    ack: async (id: string) => {
-      events.push(`ack:${id}`);
-      return { ok: true as const, value: { receipt: {}, created: true } };
-    },
-  } as unknown as RadarHandoffPort;
-  await persistAndAcknowledgeCompletion(port, {
-    id: completed.requestId, correlation_id: completed.runId,
-    sender: { registration_id: "worker-agent" }, content: SEALED,
-  }, { runId: completed.runId, agentId: "worker-agent" }, (report) => {
-    events.push("persist");
-    assert.equal(report.content, SEALED);
-    assert.equal(report.status, "completed");
-  });
-  assert.deepEqual(events, ["persist", `ack:${completed.requestId}`]);
-});
-
-test("failed local persistence leaves the report unacknowledged", async () => {
-  let acknowledged = false;
-  const port = {
-    ack: async () => { acknowledged = true; return { ok: true, value: {} }; },
-  } as unknown as RadarHandoffPort;
-  await assert.rejects(() => persistAndAcknowledgeCompletion(port, {
-    id: completed.requestId, correlation_id: completed.runId,
-    sender: { registration_id: "worker-agent" }, content: SEALED,
-  }, { runId: completed.runId, agentId: "worker-agent" }, () => { throw new Error("disk unavailable"); }));
-  assert.equal(acknowledged, false);
-});
-
-test("a report from another managed execution is never acknowledged", async () => {
-  let acknowledged = false;
-  const port = {
-    ack: async () => { acknowledged = true; return { ok: true, value: {} }; },
-  } as unknown as RadarHandoffPort;
-  await assert.rejects(() => persistAndAcknowledgeCompletion(port, {
-    id: completed.requestId, correlation_id: "another-run",
-    sender: { registration_id: "worker-agent" }, content: SEALED,
-  }, { runId: completed.runId, agentId: "worker-agent" }, () => {}));
-  assert.equal(acknowledged, false);
+test("capture refuses another subject, another run, or an invalid sealed report", () => {
+  assert.throws(() => decodeCompletionMessage({
+    ...message, producer: { ...message.producer, subject_id: "other-worker" },
+  }, expected), /does not match/u);
+  assert.throws(() => decodeCompletionMessage({
+    ...message, body: { ...message.body, correlation_id: "other-run" },
+  }, expected), /does not match/u);
+  assert.throws(() => decodeCompletionMessage({
+    ...message, body: { ...message.body, content: "plain acknowledgement" },
+  }, expected), /not a handoff\/v1/u);
 });

@@ -1057,10 +1057,11 @@ export async function startFakeRadarDaemon(
     focus: async (request) => ({ ok: true as const, value: { request_id: request.request_id } }),
     output: async () => ({ ok: true as const, value: { text: "", truncated: false } }),
     processInfo: async () => ({ ok: true as const, value: { kind: "shell" as const } }),
-    communicationPublish: async () => unavailable(),
-    communicationInbox: async () => unavailable(),
-    communicationGet: async () => unavailable(),
-    communicationAck: async () => unavailable(),
+    messagePublish: async () => unavailable(),
+    messagePage: async () => ({ ok: true as const, value: { message_ids: [], next: null } }),
+    messageGet: async () => unavailable(),
+    messageReceive: async () => unavailable(),
+    watchAttention: async () => unavailable(),
   } satisfies RadarClient;
   clients.set(socketPath, client);
 

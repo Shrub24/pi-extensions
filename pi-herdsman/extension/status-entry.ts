@@ -10,6 +10,7 @@
 export interface StatusEntryFacts {
   blocked: boolean;
   running: boolean;
+  waitingForTool?: boolean;
   /** `undefined` when this session cannot observe its own background work. */
   backgroundTasks: number | undefined;
   /** `undefined` when the child count is unknown: it neither shows nor claims waiting. */
@@ -28,12 +29,26 @@ const GLYPH = {
 export const STATUS_ENTRY_KEY = "pi-herdsman";
 export const WORK_ENTRY_KEY = "pi-herdsman-waiting";
 
+export type HerdsmanStatus = "blocked" | "running" | "waiting" | "idle";
+
+export function statusEntryState(facts: StatusEntryFacts): HerdsmanStatus {
+  if (facts.blocked) return "blocked";
+  if (facts.waitingForTool) return "waiting";
+  if (facts.running) return "running";
+  if ((facts.backgroundTasks ?? 0) > 0 || (facts.subagents ?? 0) > 0) return "waiting";
+  return "idle";
+}
+
 export function statusEntryText(facts: StatusEntryFacts): string {
-  if (facts.blocked) return GLYPH.blocked;
-  if (facts.running) return GLYPH.running;
-  if ((facts.backgroundTasks ?? 0) > 0 || (facts.subagents ?? 0) > 0)
-    return GLYPH.waiting;
-  return GLYPH.idle;
+  return GLYPH[statusEntryState(facts)];
+}
+
+/** Radar follows the same owned status as the footer, not Pi streaming flags. */
+export function statusEntryActivity(facts: StatusEntryFacts): "idle" | "waiting" | "working" {
+  const activity = {
+    blocked: "waiting", running: "working", waiting: "waiting", idle: "idle",
+  } as const satisfies Record<HerdsmanStatus, "idle" | "waiting" | "working">;
+  return activity[statusEntryState(facts)];
 }
 
 /** The counts of outstanding work, or `undefined` when there is none to show. */

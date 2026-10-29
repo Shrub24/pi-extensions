@@ -1,5 +1,7 @@
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
-import type { RadarHandoffPort } from "pi-radar/communication";
+import type { RadarMailboxPort, RadarMessageConsumer } from "pi-radar/communication";
+
+export type CompletionMessage = Parameters<RadarMessageConsumer["capture"]>[0];
 import type { ResultRecord } from "./mailbox.ts";
 import { HANDOFF_REQUIRED_SECTIONS } from "./response-contracts.ts";
 
@@ -102,7 +104,7 @@ export function decodeSealedReport(content: string): {
 }
 
 export async function publishCompletionHandoff(
-  port: RadarHandoffPort,
+  port: Pick<RadarMailboxPort, "publish">,
   result: ResultRecord,
 ): Promise<void> {
   const sealed = sealedCompletionFor(result);
@@ -113,24 +115,18 @@ export async function publishCompletionHandoff(
     content: sealed.content,
   });
   if (published.ok === false) throw new Error(`${published.code}: ${published.message}`);
-  if (published.value.handoff.id !== sealed.requestId)
+  if (published.value.message.id !== sealed.requestId)
     throw new Error("Radar published a different completion ID");
 }
 
-/**
- * Durably record one retrieved report, then acknowledge it. The recipient's
- * record is the only thing an acknowledgement may follow.
- */
-export async function persistAndAcknowledgeCompletion(
-  port: RadarHandoffPort,
-  handoff: { id: string; correlation_id?: string | null; sender: { subject_id: string }; content: string },
+/** Decode only the report belonging to the recorded worker; capture never acknowledges. */
+export function decodeCompletionMessage(
+  message: CompletionMessage,
   expected: { runId: string; subjectId: string },
-  persist: (report: { requestId: string; status: "completed" | "failed"; summary: string; content: string }) => void,
-): Promise<void> {
-  if (handoff.correlation_id !== expected.runId || handoff.sender.subject_id !== expected.subjectId)
-    throw new Error("Radar handoff does not match the recorded worker launch");
-  const decoded = decodeSealedReport(handoff.content);
-  persist({ requestId: handoff.id, status: decoded.status, summary: decoded.summary, content: handoff.content });
-  const acknowledged = await port.ack(handoff.id);
-  if (acknowledged.ok === false) throw new Error(`${acknowledged.code}: ${acknowledged.message}`);
+): { requestId: string; status: "completed" | "failed"; summary: string; content: string } {
+  if (message.body.kind !== "handoff" || message.body.correlation_id !== expected.runId ||
+      message.producer.subject_id !== expected.subjectId)
+    throw new Error("Radar message does not match the recorded worker launch");
+  const decoded = decodeSealedReport(message.body.content);
+  return { requestId: message.id, status: decoded.status, summary: decoded.summary, content: message.body.content };
 }

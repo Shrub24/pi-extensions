@@ -139,13 +139,14 @@ subject         → Radar's durable identity for an agent, retained across proce
 ## Radar seams
 
 Herdsman is a Radar client, not a second registry. It calls Radar through the
-`pi-radar` runtime only, and holds no registration or claim id anywhere.
+`pi-radar` runtime and persists no registration or claim IDs.
 
 | Decision | Who owns it |
 |---|---|
 | Process identity, attachment, launch placement, the 30 s launch deadline | Radar |
 | Pi session, definitions, mailbox, settlement, the choice to launch, continue, restart or retire | Herdsman |
-| Sealed completion payload transport and its delivery accounting | Radar (`pi-radar` handoff port) |
+| Addressed messages, delivery receipts and attention scheduling | Radar (`pi-radar` mailbox and attention loop) |
+| Durable completion capture, rejection and when to prompt or settle | Herdsman |
 
 - A launch or continuation returns `ready`, `failed` or `unresolved`. Only `ready`
   carries a subject; `unresolved` carries the daemon's launch request id, which is
@@ -158,6 +159,30 @@ Herdsman is a Radar client, not a second registry. It calls Radar through the
 - A pending, duplicate, released or reserved presence grants no child capability,
   so Herdsman adds no local guard on top of Radar's refusal.
 
+### Addressed completions
+
+A sealed handoff is the body of a Radar message. One recipient loop per process
+captures it into the existing completion store, deduplicated by message ID, before
+Radar records a receipt. Capture does not prompt the model or settle an assignment.
+A permanent rejection is recorded in the recipient's session before receipt;
+unavailable storage or identity evidence leaves the message pending.
+
+The loop drains at startup. Accepted facts-publication hints reach it through
+`publication.facts.onAttention`; an absent hint is normal before a managed subject
+exists. Herdsman opts into the attention subscription while working or waiting.
+Its own status distinguishes tool, questionnaire, owner, background-work and child
+waits from idle; Radar owns the idle hold and reconnect policy. Attention revisions
+are never persisted. Background-task snapshots remain on the separate Radar task
+bus, and pi-bash-processes still owns task output retrieval.
+
+### Upgrading from the handoff-only mailbox
+
+The addressed-message daemon refuses old records in `communications/`. First
+capture pending results with the old build, then stop it and archive or explicitly
+discard that directory before starting the new daemon. An empty inbox is not
+sufficient: acknowledged records may still be retained. Plain `radar reset` keeps
+them; `radar reset --hard` discards acknowledged records too. There is no migration
+or dual-write period. Update the daemon, shared baseline and Herdsman SDK together.
 
 ## See also
 

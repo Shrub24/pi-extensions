@@ -34,7 +34,7 @@ import {
 export { spawnedArgvs, spawnedEnvironmentAssignments, spawnedLabels };
 import { radarProcessSlot } from "pi-radar/publication";
 import { createRadarExecutionAdapter } from "pi-radar/execution";
-import { createRadarHandoffPort } from "pi-radar/communication";
+import { createRadarMailboxPort } from "pi-radar/communication";
 import { createRadarChildren } from "pi-radar/children";
 import { resolveRadarProcessLocation } from "pi-radar/location";
 import { lazyRadarRuntime, provideRadarRuntime } from "pi-radar/runtime";
@@ -952,7 +952,7 @@ export function fakePi(
   } = {},
 ) {
   const events = new Map<string, ((event: any, ctx: Context) => unknown)[]>();
-  const sessionStartHandlers: ((event: any, ctx: Context) => unknown)[] = [];
+  const lifecycleHandlers = new Map<string, ((event: any, ctx: Context) => unknown)[]>();
   // Mirrors Pi's extension EventBus: synchronous emit, synchronous listener
   // mutations of the payload, and a listener that throws isolated per handler.
   const busEmitter = new EventEmitter();
@@ -993,18 +993,20 @@ export function fakePi(
   const pi = {
     events: eventBus,
     on(name: string, handler: (event: any, ctx: Context) => unknown) {
-      if (name !== "session_start") {
+      if (name !== "session_start" && name !== "session_shutdown") {
         events.set(name, [...(events.get(name) ?? []), handler]);
         return;
       }
-      // Tests dispatch `session_start` through its first listener; Pi runs
-      // every extension's, so that one listener runs them all in order.
-      sessionStartHandlers.push(handler);
-      if (sessionStartHandlers.length === 1)
+      // Tests dispatch lifecycle events through the first listener; Pi runs
+      // every extension's, including the baseline and the recipient loop.
+      const handlers = lifecycleHandlers.get(name) ?? [];
+      lifecycleHandlers.set(name, handlers);
+      handlers.push(handler);
+      if (handlers.length === 1)
         events.set(name, [
           async (event: any, ctx: Context) => {
             let first: unknown;
-            for (const [index, each] of sessionStartHandlers.entries()) {
+            for (const [index, each] of handlers.entries()) {
               const result = await each(event, ctx);
               if (index === 0) first = result;
             }
@@ -1107,8 +1109,8 @@ export function fakePi(
         // Completion-disposition fixtures seed the local durable completion.
         // Broker delivery is a separate input, not a protocol simulated here.
         communication: {
-          ...createRadarHandoffPort(radarDaemon.client, execution.publication),
-          inbox: async () => ({ ok: true as const, value: { handoff_ids: [] } }),
+          ...createRadarMailboxPort(radarDaemon.client, execution.publication),
+          page: async () => ({ ok: true as const, value: { message_ids: [], next: null } }),
         },
         children: createRadarChildren(
           radarDaemon.client,

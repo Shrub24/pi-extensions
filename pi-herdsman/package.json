@@ -51,9 +51,9 @@
     "runtime": {
       "pi": "1.2.0",
       "radar": {
-        "commit": "2c9c460a54332c35e729df3d32f2893672848881",
+        "commit": "b3d77b1ea2dbb871521b66b5185daff2de18b052",
         "protocol": 2,
-        "minimumRevision": 10
+        "minimumRevision": 12
       }
     }
   },
@@ -61,7 +61,6 @@
     "test": "node scripts/run-tests.mjs unit",
     "test:integration": "node scripts/run-tests.mjs integration",
     "smoke": "node scripts/smoke.mjs",
-    "smoke:radar": "node scripts/radar-subject-acceptance.mjs",
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && node scripts/check.mjs",
     "package:audit": "node scripts/package-audit.mjs",
@@ -100,6 +99,6 @@
     "registry": "https://registry.npmjs.org/"
   },
   "dependencies": {
-    "pi-radar": "0.12.0"
+    "pi-radar": "0.13.2"
   }
 }

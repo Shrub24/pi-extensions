@@ -101,13 +101,14 @@ import {
 } from "./storage.ts";
 import { Type } from "typebox";
 import {
-  handoffPath, listCompletions, persistCompletion, persistSealedCompletion, readCompletion,
+  handoffPath, listCompletions, persistCompletion, persistSealedCompletion, readCompletion, CompletionConflictError,
   readPreparationResult, saveCompletion, sessionManuallyRetired,
   waitForPreparation, wrapupContext, writePreparationResult,
   type Completion, type Disposition,
 } from "./completions.ts";
 import {
-  persistAndAcknowledgeCompletion,
+  decodeCompletionMessage,
+  type CompletionMessage,
   publishCompletionHandoff,
   sealedCompletionFor,
 } from "./radar-handoff.ts";
@@ -328,7 +329,9 @@ import {
   renderHerdRunEntry,
 } from "./presentation.ts";
 import type { SupervisionContextStatus } from "./presentation.ts";
-import { createStatusEntries } from "./status-entry.ts";
+import { createStatusEntries, statusEntryActivity } from "./status-entry.ts";
+import { startRadarInbox } from "./radar-inbox.ts";
+import type { RadarActivity } from "pi-radar/attention";
 
 const HERDSMAN_VERSION = packageMetadata.version;
 const RESERVED_PREFIXES = [
@@ -4473,43 +4476,57 @@ function resolveMessageFiles(
     (file) => resolveResultReference(file, branch, operation) ?? file,
   );
 }
-async function recoverRadarCompletions(ctx: ExtensionContext, onlyId?: string): Promise<void> {
-  const port = radarRuntime?.communication;
-  if (!port) return;
+/** Capture never prompts or settles an assignment. Only Radar's loop records receipts. */
+function captureRadarCompletion(pi: ExtensionAPI, ctx: ExtensionContext, message: CompletionMessage): boolean {
   const owner = ctx.sessionManager.getSessionId();
-  const spawns = [...radarSpawnFromEntries(ctx.sessionManager.getEntries()).values()];
-  const inbox = await port.inbox();
-  if (ctx.sessionManager.getSessionId() !== owner) return;
-  if (inbox.ok === false) throw new Error(`${inbox.code}: ${inbox.message}`);
-  for (const id of inbox.value.handoff_ids) {
-    if (onlyId !== undefined && id !== onlyId) continue;
-    const response = await port.get(id);
-    if (ctx.sessionManager.getSessionId() !== owner) return;
-    if (response.ok === false) throw new Error(`${response.code}: ${response.message}`);
-    const handoff = response.value.handoff;
-    const spawn = spawns.find((entry) => entry.stage === "bound" &&
-      entry.ownerSessionId === owner && entry.runId === handoff.correlation_id &&
-      entry.subjectId === handoff.sender.subject_id);
-    if (!spawn || !spawn.subjectId) continue;
-    if (handoff.id !== id)
-      throw new Error("Radar inbox returned a different completion ID");
-    // Local completion/handoff files are a cache of the broker record. Persist
-    // them before receipt acknowledgement so an ack can never lose the payload.
-    await persistAndAcknowledgeCompletion(port, handoff, {
-      runId: spawn.runId, subjectId: spawn.subjectId,
-    }, (report) => {
-      // The worker's identity comes from its mailbox; the report bytes come from Radar.
-      const mailbox = agentMailboxPath(spawn.workspaceId, spawn.label);
-      const state = readAgentState(mailbox);
-      if (!state || state.runId !== spawn.runId || state.ownerSessionId !== owner)
-        throw new Error("Worker identity is unavailable; the completion stays unacknowledged");
-      persistSealedCompletion({
-        requestId: report.requestId, ownerSessionId: owner, runId: state.runId,
-        workspaceId: state.workspaceId, agentLabel: state.agentLabel, paneId: state.paneId,
-        cwd: state.cwd, definition: stateAgentDefinition(state),
-        piSessionId: state.piSessionId, piSessionFile: state.piSessionFile,
-      }, report, Date.now());
-    });
+  const entries = ctx.sessionManager.getEntries();
+  const rejectionType = "pi-herdsman-radar-message-rejected";
+  const reject = (reason: string): boolean => {
+    pi.appendEntry(rejectionType, { messageId: message.id, ownerSessionId: owner, reason });
+    return true;
+  };
+  try {
+    if (entries.some((entry) => entry.type === "custom" && entry.customType === rejectionType &&
+        (entry.data as { messageId?: string } | undefined)?.messageId === message.id &&
+        (entry.data as { ownerSessionId?: string } | undefined)?.ownerSessionId === owner)) return true;
+    const spawn = [...radarSpawnFromEntries(entries).values()].find((entry) =>
+      entry.stage === "bound" && entry.ownerSessionId === owner &&
+      entry.runId === message.body.correlation_id && entry.subjectId === message.producer.subject_id);
+    // Permanent rejection must be durable before receipt, otherwise it blocks
+    // every later message. Store rejection metadata in the existing session,
+    // not a second payload mailbox.
+    if (!spawn?.subjectId) return reject("Message does not match an owned worker launch");
+    let report: ReturnType<typeof decodeCompletionMessage>;
+    try {
+      report = decodeCompletionMessage(message, { runId: spawn.runId, subjectId: spawn.subjectId });
+    } catch (error) {
+      return reject(errorMessage(error));
+    }
+    const existing = readCompletion(owner, message.id);
+    if (existing) {
+      try {
+        persistSealedCompletion({ ...existing, runId: spawn.runId }, report, existing.completedAt);
+      } catch (error) {
+        if (error instanceof CompletionConflictError) return reject(error.message);
+        throw error;
+      }
+      return true;
+    }
+    const state = readAgentState(agentMailboxPath(spawn.workspaceId, spawn.label));
+    if (!state) return false;
+    if (state.runId !== spawn.runId || state.ownerSessionId !== owner ||
+        state.workspaceId !== spawn.workspaceId || state.agentLabel !== spawn.label)
+      return reject("Worker mailbox now belongs to a different assignment");
+    persistSealedCompletion({
+      requestId: message.id, ownerSessionId: owner, runId: state.runId,
+      workspaceId: state.workspaceId, agentLabel: state.agentLabel, paneId: state.paneId,
+      cwd: state.cwd, definition: stateAgentDefinition(state),
+      piSessionId: state.piSessionId, piSessionFile: state.piSessionFile,
+    }, report, Date.now());
+    return true;
+  } catch {
+    // Storage or identity evidence unavailable: redelivery must remain possible.
+    return false;
   }
 }
 
@@ -4526,12 +4543,6 @@ async function deliverResultUnsafe(
   const spawn = radarSpawnFromEntries(entries).get(`${runtime.mailboxPath}\0${result.runId}`);
   let completion: Completion | undefined;
   if (spawn?.stage === "bound" && spawn.subjectId) {
-    try {
-      await recoverRadarCompletions(ctx, result.requestId);
-    } catch (error) {
-      appendDurableError(pi, ctx, "pi_herdsman_handoff_recovery_error", error);
-      return;
-    }
     completion = readCompletion(result.ownerSessionId, result.requestId);
     if (!completion) return;
   } else {
@@ -7680,7 +7691,6 @@ async function completeAgent(
   if (!isUuid(id) || !["keep", "park", "retire"].includes(disposition))
     fail("invalid_request", "complete requires an exact completion_id and keep, park or retire disposition", "complete");
   const owner = ctx.sessionManager.getSessionId();
-  await recoverRadarCompletions(ctx, id);
   const completion = readCompletion(owner, id);
   if (!completion) fail("target_not_found", "No owned completion matched", "complete");
   // The sealed report is returned on first consumption and on explicit retrieval;
@@ -9062,6 +9072,15 @@ async function action(
 }
 
 export default function (pi: ExtensionAPI): void {
+  let inbox: ReturnType<typeof startRadarInbox> | undefined;
+  let inboxGeneration = 0;
+  let inboxActivity: RadarActivity = "working";
+  let ownRunActive = false;
+  const ownToolWaits = new Set<string>();
+  let knownSubagents: number | undefined;
+  let inboxContext: ExtensionContext | undefined;
+  let questionnaireBlocked = false;
+  let statusSubscriptions: (() => void)[] = [];
   const publishRadarAssignments = (
     ctx: ExtensionContext,
     entries: {
@@ -9090,6 +9109,8 @@ export default function (pi: ExtensionAPI): void {
 
   publishOwnerView = (currentPi, ctx, view) => {
     if (currentPi !== pi) return;
+    publishStatusEntries(ctx, view.visible.filter(({ state }) =>
+      state.ownerSessionId === ctx.sessionManager.getSessionId() && state.activeRequestId !== undefined).length);
     publishRadarAssignments(
       ctx,
       view.visible.map((snapshot) => ({
@@ -9113,6 +9134,76 @@ export default function (pi: ExtensionAPI): void {
     });
     return;
   }
+  const registerRadarInbox = () => {
+    pi.on("session_start", async (_event: unknown, ctx: ExtensionContext) => {
+      const generation = ++inboxGeneration;
+      inbox?.stop();
+      inbox = undefined;
+      inboxContext = ctx;
+      ownRunActive = false;
+      ownToolWaits.clear();
+      knownSubagents = undefined;
+      questionnaireBlocked = false;
+      statusSubscriptions.forEach((unsubscribe) => unsubscribe());
+      statusSubscriptions = subscribeInboxStatus();
+      publishStatusEntries(ctx, knownSubagents);
+      connectRadarRuntime(pi);
+      const handle = radarRuntimeHandle;
+      if (!handle) return;
+      const owner = ctx.sessionManager.getSessionId();
+      try {
+        const services = await handle.start();
+        if (generation !== inboxGeneration || handle !== radarRuntimeHandle ||
+            ctx.sessionManager.getSessionId() !== owner || !radarClient) return;
+        inbox = startRadarInbox({
+          services, client: radarClient, activity: () => inboxActivity,
+          capture: (message) => generation === inboxGeneration &&
+            ctx.sessionManager.getSessionId() === owner && captureRadarCompletion(pi, ctx, message),
+        });
+      } catch (error) {
+        appendDurableError(pi, ctx, "pi_herdsman_radar_inbox_error", error);
+      }
+    });
+    pi.on("session_shutdown", () => {
+      ++inboxGeneration;
+      inbox?.stop();
+      inbox = undefined;
+      inboxContext = undefined;
+    });
+    pi.on("agent_start", (_event, ctx) => {
+      ownRunActive = true;
+      publishStatusEntries(ctx, knownSubagents);
+    });
+    pi.on("agent_end", (_event, ctx) => {
+      ownRunActive = false;
+      ownToolWaits.clear();
+      publishStatusEntries(ctx, knownSubagents);
+    });
+    pi.on("tool_execution_start", (event, ctx) => {
+      ownToolWaits.add(event.toolCallId);
+      publishStatusEntries(ctx, knownSubagents);
+    });
+    pi.on("tool_execution_end", (event, ctx) => {
+      ownToolWaits.delete(event.toolCallId);
+      publishStatusEntries(ctx, knownSubagents);
+    });
+    const refreshInboxStatus = () => {
+      if (inboxContext) publishStatusEntries(inboxContext, knownSubagents);
+    };
+    const subscribeInboxStatus = () => [
+      pi.events.on(RPIV_ASK_USER_BLOCKED_EVENT, (event) => {
+        const active = (event as { active?: unknown } | null)?.active;
+        if (typeof active !== "boolean") return;
+        questionnaireBlocked = active;
+        refreshInboxStatus();
+      }),
+      // Let the shared execution adapter apply the permission decision first.
+      pi.events.on("permissions:ui_prompt", () => queueMicrotask(refreshInboxStatus)),
+      pi.events.on("permissions:decision", () => queueMicrotask(refreshInboxStatus)),
+    ];
+    pi.on("session_shutdown", () => statusSubscriptions.forEach((unsubscribe) => unsubscribe()));
+  };
+
   pi.registerEntryRenderer(AGENT_DEFINITIONS_ENTRY, (entry, options, theme) => {
     const definitions = entry?.data?.definitions;
     if (
@@ -9566,12 +9657,20 @@ export default function (pi: ExtensionAPI): void {
     subagents: number | undefined,
   ): void => {
     statusUi = ctx.ui;
-    statusEntries.publish({
-      blocked: radarRuntime?.execution.blocked() ?? false,
-      running: !ctx.isIdle(),
+    knownSubagents = subagents;
+    const ownState = process.env.PI_HERDSMAN_MAILBOX
+      ? readAgentState(process.env.PI_HERDSMAN_MAILBOX)
+      : undefined;
+    const facts = {
+      blocked: questionnaireBlocked || (radarRuntime?.execution.blocked() ?? false) || ownState?.pendingAskId !== undefined,
+      running: ownRunActive,
+      waitingForTool: ownToolWaits.size > 0,
       backgroundTasks: sessionBackgroundTasks(),
       subagents,
-    });
+    };
+    statusEntries.publish(facts);
+    inboxActivity = statusEntryActivity(facts);
+    inbox?.activity();
   };
   let clearNormalUI: (() => void) | undefined;
   let startSupervisionUI: ((ctx: ExtensionContext) => void) | undefined;
@@ -14132,7 +14231,6 @@ export default function (pi: ExtensionAPI): void {
       const generation = ++healthGeneration;
       let healthInFlight = false;
       let healthRescanRequested = false;
-      let handoffRecoveryError: string | undefined;
       const requestHealthScan = (): void => {
         healthRescanRequested = true;
         if (healthInFlight || signal.aborted) return;
@@ -14140,15 +14238,6 @@ export default function (pi: ExtensionAPI): void {
         void (async () => {
           while (healthRescanRequested && !signal.aborted) {
             healthRescanRequested = false;
-            try {
-              await recoverRadarCompletions(ctx);
-              handoffRecoveryError = undefined;
-            } catch (error) {
-              const message = errorMessage(error);
-              if (message !== handoffRecoveryError)
-                ctx.ui.notify(`Radar completion recovery delayed: ${message}`, "warning");
-              handoffRecoveryError = message;
-            }
             await scanAgentHealth(ctx, signal, generation);
           }
         })()
@@ -14981,6 +15070,7 @@ export default function (pi: ExtensionAPI): void {
     }
   }
   if (processRole !== "managed-agent") {
+    registerRadarInbox();
     connectRadarRuntime(pi);
     return;
   }
@@ -17311,5 +17401,6 @@ export default function (pi: ExtensionAPI): void {
   radarRuntime = undefined;
   radarRuntimeStarting = false;
   radarOwnSubjectId = undefined;
+  registerRadarInbox();
   connectRadarRuntime(pi);
 }

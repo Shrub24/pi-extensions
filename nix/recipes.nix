@@ -34,7 +34,7 @@ let
 
   # Herdsman's pi-radar pin. Pi-Bolt compiles the baseline in as a plugin; this pin is the one the
   # shared SDK imports, so the two must agree.
-  radarVersion = "0.12.0";
+  radarVersion = "0.13.2";
 
   recipes = assert lib.assertMsg
     ((manifestOf "pi-herdsman").dependencies."pi-radar" == radarVersion)
@@ -46,7 +46,7 @@ let
       path = null;
       npm = {
         name = "pi-radar";
-        hash = "sha512-9guUUWReM1Z9Vt2uMXBYuv/mRGv+wtF1XZPvxcJVa4BuEfPnmhMpmSBNOsz+uLrv2/s1oR4o9594q5XuNiRhjQ==";
+        hash = "sha512-MNmChA/Do0lZ6kczgP/43I6bK6NslhZT8uCAezqrNBD1sWd1GVo+I4T4WWK0YPN2id9IETRgfrKolCGT4FYMrA==";
       };
       version = radarVersion;
       manifest = "package/package.json";

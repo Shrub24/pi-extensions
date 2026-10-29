@@ -106,6 +106,8 @@ export function persistCompletion(
   return completion;
 }
 
+export class CompletionConflictError extends Error {}
+
 /**
  * Record a retrieved Radar report verbatim. The stored handoff is the report
  * bytes, so an identical retrieval is a no-op and a changed one is refused.
@@ -118,7 +120,7 @@ export function persistSealedCompletion(
   const existing = readCompletion(identity.ownerSessionId, identity.requestId);
   if (existing) {
     if (existing.runId !== identity.runId || readFileSync(handoffPath(existing), "utf8") !== report.content)
-      throw new Error("Completion identity or report changed");
+      throw new CompletionConflictError("Completion identity or report changed");
     return existing;
   }
   const completion: Completion = {

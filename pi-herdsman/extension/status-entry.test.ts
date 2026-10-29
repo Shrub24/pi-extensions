@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   createStatusEntries,
   statusEntryText,
+  statusEntryActivity,
   workEntryText,
 } from "./status-entry.ts";
 
@@ -56,6 +57,15 @@ test("the work entry shows only nonzero known counts, each with its own glyph", 
   assert.equal(workEntryText({ ...none, backgroundTasks: 3 }), `${terminal} 3`);
   assert.equal(workEntryText({ ...none, backgroundTasks: undefined }), undefined);
   assert.equal(workEntryText(none), undefined);
+});
+
+test("Radar activity follows owned status, with tool and user waits ahead of running", () => {
+  assert.equal(statusEntryActivity(none), "idle");
+  assert.equal(statusEntryActivity({ ...none, running: true }), "working");
+  assert.equal(statusEntryActivity({ ...none, running: true, waitingForTool: true }), "waiting");
+  assert.equal(statusEntryActivity({ ...none, running: true, blocked: true }), "waiting");
+  assert.equal(statusEntryActivity({ ...none, subagents: 1 }), "waiting");
+  assert.equal(statusEntryActivity({ ...none, backgroundTasks: 1 }), "waiting");
 });
 
 test("entries publish only when their text changes and clear once", () => {
