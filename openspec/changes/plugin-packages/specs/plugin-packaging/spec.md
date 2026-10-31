@@ -30,6 +30,17 @@ payload under any package name.
 - **THEN** it receives the plugin trees, not a Pi-Bolt build carrying this repository's selection and
   AOT ceiling
 
+### Requirement: Published plugins carry their lock facts
+The flake SHALL export `lib.pluginLockCandidates`, mapping each published plugin to its manifest and,
+for an npm-sourced plugin, the pin its archive lives at, so a consumer holding a plugin set lock does
+not read this repository's recipe file.
+
+#### Scenario: A consumer regenerates its plugin lock
+- **WHEN** the consumer reads `lib.pluginLockCandidates`
+- **THEN** it receives every published plugin's manifest path and, for an npm-sourced one, the name,
+  version and hash needed to fetch the archive the manifest lives in
+- **AND** the value evaluates without a `pkgs` instance
+
 ### Requirement: Checks prove only this repository's artefacts
 `checks.<system>` SHALL build the npm tarballs and the plugin trees, and SHALL NOT assert the
 behaviour of Pi-Bolt.nix's builder, Pi-Bolt's payload, or any nixpkgs primitive.
@@ -53,7 +64,6 @@ the whole set, and `mkJev` SHALL remain in that scope as a builder.
 ### Requirement: The flake builds against the published interface
 The flake SHALL take its plugin builders from `github:Shrub24/Pi-Bolt.nix` rather than from a branch of
 the Pi-Bolt application repository.
-
 #### Scenario: The interface moves
 - **WHEN** Pi-Bolt.nix changes its builder, the flake's input moves to the release that carries it
 - **THEN** no recipe in this repository needs editing, because recipes pass only arguments the builder

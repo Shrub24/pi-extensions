@@ -10,6 +10,8 @@
 - [x] 2.1 Export every plugin as `packages.<system>.<plugin name>` beside the npm tarballs.
 - [x] 2.2 Make `default` the plugin catalogue; drop `packages.<system>.pi-bolt`.
 - [x] 2.3 Drop `legacyPackages` and `lib.piBoltRecipes`.
+- [x] 2.4 Export `lib.pluginLockCandidates` from the recipes, and point the consumer that keeps the
+      plugin set lock at it instead of at `nix/recipes.nix`.
 
 ## 3. Checks
 
@@ -30,6 +32,7 @@
 - [x] 5.3 `pkgs.pi-bolt.withPlugins (_: [ packages.<system>.herdsman ])` evaluates from the package
       table only.
 - [x] 5.4 No file references `piBoltRecipes`, `legacyPackages` or the removed payload.
+- [x] 5.6 `lib.pluginLockCandidates` evaluates without `pkgs` and names every published plugin.
 - [x] 5.5 nix-dotfiles: rename the follow to `inputs.pi-extensions.pi-bolt-nix.follows`, bump
       `pi-bolt-nix` to the revision that exports the npm helper, regenerate their generated flake, and
       confirm one Pi-Bolt.nix node in their lock.

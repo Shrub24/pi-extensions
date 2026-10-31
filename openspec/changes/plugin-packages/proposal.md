@@ -38,7 +38,12 @@ builder's behaviour, or Pi's runtime.
 
 **Two flake outputs nothing consumes go.** `legacyPackages.<system>.piBoltPlugins` and
 `lib.piBoltRecipes` have no caller in this repository or downstream; the overlay carries the scope,
-and a consumer that wants the recipes reads `nix/recipes.nix` from a checkout.
+and a consumer that wants recipe detail takes the plugin package instead.
+
+**The pins move to the producer.** `lib.pluginLockCandidates` republishes each plugin's manifest and
+npm pin, so a consumer that keeps a plugin set lock names its lock's members from the same data these
+packages are built from. Today the only such consumer reads `nix/recipes.nix` out of a checkout for
+exactly that, which is the last place downstream reaches into this repository's internals.
 
 ## Non-goals
 
@@ -58,6 +63,8 @@ and a consumer that wants the recipes reads `nix/recipes.nix` from a checkout.
 - `pkgs.pi-bolt.withPlugins (_: [ inputs.pi-extensions.packages.${system}.herdsman ])` evaluates, with
   the plugin coming from the package table rather than the scope.
 - `lib.piBoltRecipes` and `legacyPackages` are gone, and no file references them.
+- `lib.pluginLockCandidates` names every published plugin, and the consumer that keeps a plugin set
+  lock reads it instead of `nix/recipes.nix`.
 
 ## Risks
 

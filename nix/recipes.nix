@@ -3,8 +3,8 @@
 # A recipe names where a plugin's source is (a path in this checkout, or the npm archive it is
 # pinned to), its manifest, the entry Pi-Bolt compiles, the name it registers under, the plugins
 # it depends on by name, and its compile-time patch. Nothing here builds anything: `nix/plugins.nix`
-# builds these recipes for this repository, and a downstream package set builds the same recipes
-# with its own lock and its own copy of the source.
+# builds these recipes into this flake's plugin packages, and `lib.pluginLockCandidates` republishes
+# their manifests and npm pins for a consumer that keeps a plugin set lock.
 #
 # Paths are relative to the repository root, so a consumer composes them with its own input:
 #

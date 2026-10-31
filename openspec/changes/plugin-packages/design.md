@@ -30,6 +30,7 @@ packages.<system>.pi-bolt-plugins    unchanged: every plugin tree, in one linkFa
 packages.<system>.default            now the catalogue (pi-bolt-plugins)
 checks.<system>.npm-packages         unchanged
 checks.<system>.pi-bolt-plugins      unchanged
+lib.pluginLockCandidates             new: manifest and npm pin per published plugin
 overlays.default                     unchanged
 ```
 
@@ -68,3 +69,21 @@ programs.pi-coding-agent.package = pkgs.pi-bolt.withPlugins (_: [
 
 The overlay remains for a consumer that wants the whole set merged into `piBoltPlugins`, and mixing
 the two is fine: the payload reads `passthru.piBolt` only.
+
+### Plugin lock candidates
+
+A consumer that keeps a plugin set lock — one npm lock covering every plugin the payload compiles in —
+needs each member's manifest, and for an npm-sourced plugin the archive that manifest lives in. Those
+are the recipes' own facts, so the flake publishes them instead of leaving a consumer to import
+`nix/recipes.nix` from a checkout and restate them in its own vocabulary:
+
+```nix
+inputs.pi-extensions.lib.pluginLockCandidates
+# { herdsman = { manifest = "pi-herdsman/package.json"; };
+#   radar    = { manifest = "package/package.json";
+#                npm = { name = "pi-radar"; version = "0.13.2"; hash = "sha512-…"; }; };
+#   … }
+```
+
+The shape carries no store path: an npm pin is a name, a version and a hash, which is what the
+consumer's own fetch helper needs, so the value stays evaluable without a `pkgs` instance.

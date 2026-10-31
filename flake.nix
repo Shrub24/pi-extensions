@@ -50,7 +50,6 @@
         in
         {
           inherit
-            pkgs
             extensions
             npmPackages
             pluginTrees
@@ -98,6 +97,32 @@
         npm-packages = scope.npmPackages.npm-extensions;
         pi-bolt-plugins = scope.pluginTrees;
       }) scopes;
+
+      # The plugins' manifests and npm pins, for a consumer that keeps a plugin set
+      # lock: it names the lock's members from the same recipes these packages are
+      # built from, so a pin stays beside the source that needs it and downstream
+      # never reads `nix/recipes.nix` itself.
+      lib = {
+        pluginLockCandidates =
+          lib.mapAttrs
+            (
+              _: recipe:
+              {
+                inherit (recipe) manifest;
+              }
+              // lib.optionalAttrs (recipe.npm != null) {
+                npm = recipe.npm // {
+                  inherit (recipe) version;
+                };
+              }
+            )
+            (
+              import ./nix/recipes.nix {
+                inherit lib;
+                self = self.outPath;
+              }
+            );
+      };
 
       formatter = forAllSystems (system: nixpkgs.legacyPackages.${system}.nixfmt);
     };

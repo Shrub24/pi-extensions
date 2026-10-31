@@ -26,6 +26,7 @@ nix flake check                 # tarballs and plugin trees
 | `packages.<system>.npm-extensions` | All of them, in one directory. |
 | `packages.<system>.pi-bolt-plugins` (default) | This repository's plugin trees. |
 | `overlays.default` | The plugin scope, with this repository's plugins merged into Pi-Bolt's. Apply it after Pi-Bolt's overlay. |
+| `lib.pluginLockCandidates` | Each published plugin's manifest and npm pin, for a consumer that keeps a plugin set lock. |
 | `checks.<system>` | The tarballs and the plugin trees, built. |
 
 There is no payload here: which plugins a Pi-Bolt build carries is the consumer's decision, and a
@@ -88,28 +89,16 @@ patch AOT needs. `nix/plugins.nix` builds those recipes into plugin derivations.
 dependency has a `packageName` imports it by that name without either side being rewritten —
 `pi-bash-processes` imports `pi-tool-renderer` that way.
 
-A package set that builds these plugins with its own lock imports the recipes from a checkout of
-this repository and supplies only its own `pi-radar` tree. `nix/recipes.nix` takes the checkout as
-`self`, so it works for a source-only input as well as a flake input:
+A consumer that keeps a plugin set lock — one npm lock shared by the plugins it compiles in — reads
+`lib.pluginLockCandidates` instead of the recipes: each published plugin's manifest, and for an
+npm-sourced one its pin, as the packages were built from them.
 
 ```nix
-let
-  piExtensions = inputs.pi-extensions;   # a checkout, flake = false is enough
-  recipes = import "${piExtensions}/nix/recipes.nix" {
-    inherit lib;
-    self = piExtensions;
-  };
-in
-{
-  herdsman = {
-    inherit (recipes.herdsman) entry pluginName dependencies;
-    src = "${piExtensions}/${recipes.herdsman.path}";
-    postPatch = recipes.herdsman.patch {
-      radar = radarTree;                 # the `radar` plugin's built tree
-      inherit (recipes.herdsman) version;
-    };
-  };
-}
+inputs.pi-extensions.lib.pluginLockCandidates
+# { herdsman = { manifest = "pi-herdsman/package.json"; };
+#   radar = { manifest = "package/package.json";
+#             npm = { name = "pi-radar"; version = "0.13.2"; hash = "sha512-…"; }; };
+#   … }
 ```
 
 `recipe.version` is the plugin's own version, and an npm recipe (`radar`) has `npm.name`/`npm.hash`
