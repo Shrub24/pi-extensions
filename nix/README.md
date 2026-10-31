@@ -7,35 +7,55 @@ This flake packages the extensions in this repository two ways:
 - as **npm tarballs**, one per workspace, installable by npm or Pi.
 
 Which plugins a build contains is the caller's decision; this flake carries the plugins, not a
-profile.
+profile. Each plugin is a package of its own, so a consumer takes the ones it compiles in.
 
 ```sh
-nix build .#npm-extensions      # every workspace tarball in one directory
+nix build .#herdsman            # one plugin, as a derivation a payload can compile
 nix build .#pi-herdsman         # one npm tarball
-nix build .#pi-bolt-plugins     # every plugin tree (patched)
-nix build .#pi-bolt             # this repository's plugins compiled in
-nix flake check                 # tarballs, plugins, and a Pi-Bolt build
+nix build .#pi-bolt-plugins     # every plugin tree (patched), also the default
+nix build .#npm-extensions      # every workspace tarball in one directory
+nix flake check                 # tarballs and plugin trees
 ```
 
 ## Outputs
 
 | Output | |
 |---|---|
+| `packages.<system>.<plugin>` | One plugin, under the name Pi knows it by (`herdsman`, `radar`, `tool-renderer`, …). |
 | `packages.<system>.pi-<name>` | One workspace's npm tarball. |
 | `packages.<system>.npm-extensions` | All of them, in one directory. |
-| `packages.<system>.pi-bolt-plugins` | This repository's plugin trees. |
-| `packages.<system>.pi-bolt` (default) | Pi-Bolt with this repository's plugins compiled in. |
-| `legacyPackages.<system>.piBoltPlugins` | The plugin scope, with this repository's plugins merged into Pi-Bolt's. |
-| `overlays.default` | The same merge, for `nixpkgs.overlays`. Apply it after Pi-Bolt's overlay. |
-| `checks.<system>` | The three above, built. |
+| `packages.<system>.pi-bolt-plugins` (default) | This repository's plugin trees. |
+| `overlays.default` | The plugin scope, with this repository's plugins merged into Pi-Bolt's. Apply it after Pi-Bolt's overlay. |
+| `checks.<system>` | The tarballs and the plugin trees, built. |
 
-## Selecting plugins
+There is no payload here: which plugins a Pi-Bolt build carries is the consumer's decision, and a
+payload exported from this repository would be that decision already made. Build one where it is
+wanted — `pkgs.pi-bolt.withPlugins` below — and test it there.
+
+## Taking one plugin
+
+A plugin is a package, so a consumer takes it by name and passes it to the payload. Pi-Bolt's overlay
+defines `pi-bolt` and `piBoltPlugins`; this repository's overlay is only needed for the `ps.<name>`
+form below.
+
+```nix
+programs.pi-coding-agent.package = pkgs.pi-bolt.withPlugins (_: [
+  inputs.pi-extensions.packages.${system}.radar
+  inputs.pi-extensions.packages.${system}.herdsman
+  inputs.pi-extensions.packages.${system}.tool-renderer
+]);
+```
+
+The payload reads `passthru.piBolt` from each derivation and nothing else, so a package taken this way
+and one taken from the scope compile identically.
+
+## Selecting plugins through the scope
 
 Apply Pi-Bolt's overlay first (it defines `piBoltPlugins`), then this one:
 
 ```nix
 nixpkgs.overlays = [
-  inputs.pi-bolt.overlays.default
+  inputs.pi-bolt-nix.overlays.default
   inputs.pi-extensions.overlays.default
 ];
 
@@ -57,7 +77,7 @@ store, for example `pi-bolt.override { extensions = [ ps.radar ps.herdsman ]; }`
 
 Herdsman requires the separately activated `radar` baseline. Its dependency stages the same
 `pi-radar` package tree for SDK imports, but staging alone does not register an extension.
-Select both `ps.radar` and `ps.herdsman`; the default build above does so. Workers explicitly
+Select both `ps.radar` and `ps.herdsman`. Workers explicitly
 load the Radar baseline and Herdsman even when their optional extension selection disables
 discovery. Radar owns the process claim and exposes the shared subject runtime; Herdsman
 never creates a substitute registrar.
@@ -92,8 +112,6 @@ in
 }
 ```
 
-A flake input can read the same value as `inputs.pi-extensions.lib.piBoltRecipes`.
-
 `recipe.version` is the plugin's own version, and an npm recipe (`radar`) has `npm.name`/`npm.hash`
 instead of `path`. The `pi-radar` pin is checked against `pi-herdsman/package.json` when the recipes
 are evaluated, so a recipe cannot drift from Herdsman's dependency.
@@ -114,7 +132,10 @@ pkgs.pi-bolt.withPlugins (ps: [
 The provider plugin's tree has to keep its `src/` layout, because the patched import names
 `../../permission-system/src/service.ts`.
 
-## The Pi-Bolt pin
+## The Pi-Bolt input
 
-`pi-bolt` is an input pinned to the plugin interface this packaging is written against. When that
-work lands upstream, point the input at the upstream repository instead of the fork's branch.
+`pi-bolt-nix` is [Pi-Bolt.nix](https://github.com/Shrub24/Pi-Bolt.nix), the published packaging:
+it owns the payload, the plugin scope and the builder this repository writes its recipes against. Its
+own checks test the plugin contract (`checks.plugins`, `plugin-builder`, `plugin-dependencies`), so
+this repository does not repeat them — it verifies the two things it produces, the plugin trees and
+the npm tarballs.

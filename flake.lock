@@ -17,30 +17,51 @@
       }
     },
     "pi-bolt": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1793162523,
+        "narHash": "sha256-/0cYdhKvkjCZodm3zzc8ykUmzPDm6oAEutKFi+37gqY=",
+        "owner": "opensec-git",
+        "repo": "Pi-Bolt",
+        "rev": "6c9d19ef3f46ecc06d141c112adfc1c1fbb6069f",
+        "type": "github"
+      },
+      "original": {
+        "owner": "opensec-git",
+        "ref": "bolt-v1.0.7",
+        "repo": "Pi-Bolt",
+        "type": "github"
+      }
+    },
+    "pi-bolt-nix": {
       "inputs": {
         "nixpkgs": [
           "nixpkgs"
+        ],
+        "pi-bolt": "pi-bolt",
+        "pi-bolt-source": [
+          "pi-bolt-nix",
+          "pi-bolt"
         ]
       },
       "locked": {
-        "lastModified": 1792297483,
-        "narHash": "sha256-OQEmjPEsQjzqZtz6vFN691QeThq1SDGaCm3RGGVkQlc=",
+        "lastModified": 1793434497,
+        "narHash": "sha256-fyJX35GMu9Odk8vc2rb8ZgHzfVJhtIfACR+/F5VB/j0=",
         "owner": "Shrub24",
-        "repo": "pi-bolt",
-        "rev": "58b74d6ede299e4ebad4f2ea05c9f073d7b18d2e",
+        "repo": "Pi-Bolt.nix",
+        "rev": "15b6eee47f114e12f71104a2e589e9c9838868b0",
         "type": "github"
       },
       "original": {
         "owner": "Shrub24",
-        "ref": "feature/nix-flake-hm-module",
-        "repo": "pi-bolt",
+        "repo": "Pi-Bolt.nix",
         "type": "github"
       }
     },
     "root": {
       "inputs": {
         "nixpkgs": "nixpkgs",
-        "pi-bolt": "pi-bolt"
+        "pi-bolt-nix": "pi-bolt-nix"
       }
     }
   },
