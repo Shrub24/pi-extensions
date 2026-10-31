@@ -30,4 +30,6 @@
 - [x] 5.3 `pkgs.pi-bolt.withPlugins (_: [ packages.<system>.herdsman ])` evaluates from the package
       table only.
 - [x] 5.4 No file references `piBoltRecipes`, `legacyPackages` or the removed payload.
-- [x] 5.5 nix-dotfiles: delete `inputs.pi-extensions.pi-bolt.follows` and confirm the flake evaluates.
+- [x] 5.5 nix-dotfiles: rename the follow to `inputs.pi-extensions.pi-bolt-nix.follows`, bump
+      `pi-bolt-nix` to the revision that exports the npm helper, regenerate their generated flake, and
+      confirm one Pi-Bolt.nix node in their lock.

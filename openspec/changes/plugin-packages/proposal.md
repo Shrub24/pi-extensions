@@ -61,9 +61,13 @@ and a consumer that wants the recipes reads `nix/recipes.nix` from a checkout.
 
 ## Risks
 
-- **The input rename is cross-repository.** nix-dotfiles follows
-  `inputs.pi-extensions.pi-bolt.follows = "pi-bolt-nix"`; that line is deleted in the same landing, or
-  their next lock update fails to evaluate.
+- **The input rename is cross-repository.** nix-dotfiles followed
+  `inputs.pi-extensions.pi-bolt.follows = "pi-bolt-nix"`; the rename makes that
+  line name an input that no longer exists, so it is renamed to
+  `inputs.pi-extensions.pi-bolt-nix.follows`, the pin is moved to the release that
+  carries the interface, and their lock is regenerated in the same landing. The
+  follow is kept, not dropped: it is what keeps one Pi-Bolt.nix for the plugins and
+  for the payload that compiles them in.
 - **Losing the payload build loses a local integration gate.** Nothing in this repository now proves
   the plugins compile together. That proof moves to the consumer's build and to Pi-Bolt.nix's own
   `checks.plugins`/`plugin-builder`/`plugin-dependencies`, which test the contract at the layer that
