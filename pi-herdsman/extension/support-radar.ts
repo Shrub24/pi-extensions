@@ -8,7 +8,7 @@ import type { RadarClient, RadarCloseOutcome, RadarSpawnEdge, RadarSpawnTopology
 import type { RadarPublicationClient } from "pi-radar/publication";
 import {
   type RadarChannel, type RadarErrorCode,
-  RADAR_EVENTS_CONTRACT, RADAR_MINIMUM_REVISION, RADAR_PROTOCOL_VERSION,
+  RADAR_EVENTS_CONTRACT, RADAR_WIRE_REVISION, RADAR_PROTOCOL_VERSION,
   RADAR_REGISTRY_CONTRACT, RADAR_REGISTRY_FACTS_CONTRACT,
   RADAR_SPAWN_CLOSE_CONTRACT, RADAR_SPAWN_CONTRACT, RADAR_SPAWN_LAUNCH_CONTEXT_CONTRACT,
 } from "pi-radar/client";
@@ -841,7 +841,7 @@ export async function startFakeRadarDaemon(
   const publicationClient = {
     async ping() {
       return { ok: true as const, value: {
-        protocol: RADAR_PROTOCOL_VERSION, revision: RADAR_MINIMUM_REVISION,
+        protocol: RADAR_PROTOCOL_VERSION, revision: RADAR_WIRE_REVISION,
         backend: settings.backend, instance: settings.instance,
         contracts: settings.contracts, tasks: { available: true, error: null },
       } };

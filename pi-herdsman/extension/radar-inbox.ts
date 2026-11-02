@@ -9,6 +9,8 @@ export function startRadarInbox(options: {
   client: Pick<RadarClient, "watchAttention">;
   activity(): RadarActivity;
   capture: RadarMessageConsumer["capture"];
+  /** Why the mailbox stopped draining, or `undefined` once it drains again. */
+  onDiagnostic(problem: string | undefined): void;
   scheduler?: RadarScheduler;
 }) {
   let active = true;
@@ -18,6 +20,12 @@ export function startRadarInbox(options: {
     consumers: [{ kind: "handoff", capture: (message) => active && options.capture(message) }],
     scheduler: options.scheduler ?? systemScheduler,
     activity: options.activity,
+    // A drain that keeps failing stops every later message behind it. Radar reports
+    // the reason whenever it changes; silence here would leave a stuck mailbox
+    // looking like an idle one.
+    onDiagnostic: (problem) => {
+      if (active) options.onDiagnostic(problem);
+    },
     // Herdsman opts into push while working or waiting; the SDK owns idle hold,
     // opener deadlines and reconnects. The subscription carries no payloads.
     watch: async (onAttention, onEnd) => {

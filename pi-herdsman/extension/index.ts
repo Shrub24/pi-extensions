@@ -9159,6 +9159,11 @@ export default function (pi: ExtensionAPI): void {
           services, client: radarClient, activity: () => inboxActivity,
           capture: (message) => generation === inboxGeneration &&
             ctx.sessionManager.getSessionId() === owner && captureRadarCompletion(pi, ctx, message),
+          // Radar reports only changes, so this warns once per distinct fault.
+          onDiagnostic: (problem) => {
+            if (problem === undefined) return;
+            ctx.ui.notify(`Radar mailbox stopped draining: ${problem}`, "warning");
+          },
         });
       } catch (error) {
         appendDurableError(pi, ctx, "pi_herdsman_radar_inbox_error", error);

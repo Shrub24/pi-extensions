@@ -51,9 +51,9 @@
     "runtime": {
       "pi": "1.2.0",
       "radar": {
-        "commit": "b3d77b1ea2dbb871521b66b5185daff2de18b052",
+        "commit": "4218a32c278249c02c365a07fc0942e2faed018a",
         "protocol": 2,
-        "minimumRevision": 12
+        "wireRevision": 17
       }
     }
   },
@@ -100,6 +100,6 @@
     "registry": "https://registry.npmjs.org/"
   },
   "dependencies": {
-    "pi-radar": "0.13.2"
+    "pi-radar": "0.15.0"
   }
 }

@@ -172,3 +172,32 @@ test("permanent rejection is recorded; missing identity remains pending until re
   await t.waitFor(() => assert.ok(received.includes(r.message.id)));
   assert.equal(readCompletion(LEAD_SESSION_ID, r.message.id)?.summary, "Ready for review.");
 });
+
+test("a mailbox that stops draining is reported, and its recovery clears the report", async (t) => {
+  const r = await recipient(t);
+  const warnings: string[] = [];
+  t.mock.method(r.ctx.ui, "notify", (text: string) => warnings.push(text));
+  let failing = true;
+  let pages = 0;
+  r.services.communication = {
+    publish: async () => ({ ok: false, code: "refused", message: "recipient only" }),
+    page: async () => {
+      pages++;
+      return failing
+        ? { ok: false as const, code: "transport" as const, message: "socket closed" }
+        : { ok: true as const, value: { message_ids: [], next: null } };
+    },
+    get: async () => ({ ok: true, value: { message: r.message, receipt: null } }),
+    receive: async () => ({ ok: true, value: { created: true, receipt: {
+      version: 1, message_id: r.message.id, recipient: r.message.producer, received_at_unix_ms: 456,
+    } } }),
+  };
+  await r.start();
+  await t.waitFor(() => assert.equal(warnings.length, 1));
+  assert.match(warnings[0]!, /socket closed/);
+  failing = false;
+  const before = pages;
+  r.hint();
+  await t.waitFor(() => assert.ok(pages > before));
+  assert.equal(warnings.length, 1, "recovery is not a warning");
+});

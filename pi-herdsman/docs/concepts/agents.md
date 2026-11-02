@@ -172,8 +172,11 @@ The loop drains at startup. Accepted facts-publication hints reach it through
 exists. Herdsman opts into the attention subscription while working or waiting.
 Its own status distinguishes tool, questionnaire, owner, background-work and child
 waits from idle; Radar owns the idle hold and reconnect policy. Attention revisions
-are never persisted. Background-task snapshots remain on the separate Radar task
-bus, and pi-bash-processes still owns task output retrieval.
+are never persisted. A drain that stops — an unreadable page, a declined capture,
+a failed receipt — is reported to the operator with Radar's own reason, and the
+report clears once the mailbox drains again. Background-task snapshots remain on
+the separate Radar task bus, and pi-bash-processes still owns task output
+retrieval.
 
 ### Upgrading from the handoff-only mailbox
 
@@ -182,7 +185,9 @@ capture pending results with the old build, then stop it and archive or explicit
 discard that directory before starting the new daemon. An empty inbox is not
 sufficient: acknowledged records may still be retained. Plain `radar reset` keeps
 them; `radar reset --hard` discards acknowledged records too. There is no migration
-or dual-write period. Update the daemon, shared baseline and Herdsman SDK together.
+or dual-write period. Update the daemon, shared baseline and Herdsman SDK together:
+the client speaks one wire revision and refuses a daemon of any other revision with
+a restart instruction rather than serving around it.
 
 ## See also
 
