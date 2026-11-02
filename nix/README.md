@@ -86,8 +86,11 @@ never creates a substitute registrar.
 `nix/recipes.nix` holds the plugin recipes as data: each plugin's path in this checkout (or the npm
 archive it is pinned to), manifest, entry, plugin name, dependencies by name, and the compile-time
 patch AOT needs. `nix/plugins.nix` builds those recipes into plugin derivations. A plugin whose
-dependency has a `packageName` imports it by that name without either side being rewritten —
-`pi-bash-processes` imports `pi-tool-renderer` that way.
+dependency has a `packageName` imports it by that name, linked into the dependent's `node_modules` —
+`pi-bash-processes` imports `pi-tool-renderer` that way, and `pi-herdsman` imports
+`pi-bash-processes`. A dependency without one is addressed by its staged sibling folder, which only
+exists while the plugin set is being compiled, so a recipe that needs the import to work in the
+built tree gives the dependency a `packageName` and rewrites the import to it.
 
 A consumer that keeps a plugin set lock — one npm lock shared by the plugins it compiles in — reads
 `lib.pluginLockCandidates` instead of the recipes: each published plugin's manifest, and for an

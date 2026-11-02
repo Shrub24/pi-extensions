@@ -108,6 +108,10 @@ let
     bash-processes = (local "pi-bash-processes") // {
       entry = "extensions/background-tasks.ts";
       pluginName = "bash-processes";
+      # Herdsman imports it by name, so it is linked into the dependent's node_modules
+      # rather than addressed by its sibling folder: a plugin's dependency edge is a
+      # package name, not a position in the staging layout.
+      packageName = "pi-bash-processes";
       dependencies = [ "tool-renderer" ];
     };
 
@@ -129,11 +133,11 @@ let
         ''
           substituteInPlace extension/index.ts \
             --replace-fail 'const HERDSMAN_EXTENSION_PATH = fileURLToPath(import.meta.url);' 'const HERDSMAN_EXTENSION_PATH = "$out/extension/index.ts";' \
-            --replace-fail '"../../pi-bash-processes/extensions/background-work.ts"' '"../../bash-processes/extensions/background-work.ts"'
+            --replace-fail '"../../pi-bash-processes/extensions/background-work.ts"' '"pi-bash-processes/extensions/background-work.ts"'
           substituteInPlace extension/radar-baseline.ts \
             --replace-fail 'const BUILD_BASELINE_PATH: string | undefined = undefined;' 'const BUILD_BASELINE_PATH: string | undefined = "${radar}/extension/baseline.ts";'
           substituteInPlace extension/advisory-wake.ts \
-            --replace-fail '"../../pi-bash-processes/extensions/wake-consumer.ts"' '"../../bash-processes/extensions/wake-consumer.ts"'
+            --replace-fail '"../../pi-bash-processes/extensions/wake-consumer.ts"' '"pi-bash-processes/extensions/wake-consumer.ts"'
           substituteInPlace extension/agent-definitions.ts \
             --replace-fail 'const BUILTIN_AGENT_DIR = fileURLToPath(
             new URL("./agent-definitions", import.meta.url),
