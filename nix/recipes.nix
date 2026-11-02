@@ -108,9 +108,7 @@ let
     bash-processes = (local "pi-bash-processes") // {
       entry = "extensions/background-tasks.ts";
       pluginName = "bash-processes";
-      # Herdsman imports it by name, so it is linked into the dependent's node_modules
-      # rather than addressed by its sibling folder: a plugin's dependency edge is a
-      # package name, not a position in the staging layout.
+      # Herdsman imports it by name; the builder links it into node_modules.
       packageName = "pi-bash-processes";
       dependencies = [ "tool-renderer" ];
     };
