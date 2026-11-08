@@ -43,9 +43,22 @@ let
     };
   };
 
+  # tool-renderer's one runtime dependency, as the node_modules it imports it from. diff is
+  # dependency-free, so its tarball is the whole tree; the pin is the one bun.lock records.
+  toolRendererDependencies = pkgs.runCommand "pi-tool-renderer-node-modules" { } ''
+    mkdir -p $out/node_modules/diff
+    tar -xzf ${
+      pkgs.fetchurl {
+        url = "https://registry.npmjs.org/diff/-/diff-9.0.0.tgz";
+        hash = "sha512-svtcdpS8CgJyqAjEQIXdb3OjhFVVYjzGAPO8WGCmRbrml64SPw/jJD4GoE98aR7r25A0XcgrK3F02yw9R/vhQw==";
+      }
+    } --strip-components=1 -C $out/node_modules/diff
+  '';
+
   # What a recipe needs beyond its recipe data: a dependency closure this repository builds itself.
   extras = {
     otel.nodeModules = "${otelDependencies}/node_modules";
+    tool-renderer.nodeModules = "${toolRendererDependencies}/node_modules";
   };
 
   # Every recipe becomes a plugin. Dependencies and patches name other plugins, so the set refers to
