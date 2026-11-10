@@ -15,7 +15,9 @@
     "pi-tool-renderer"
   ],
   "scripts": {
-    "test": "for p in pi-bash-processes pi-tool-renderer pi-otel pi-jev pi-native-router pi-cbmem pi-output-policy pi-reqcap pi-copy-mode pi-memtrace; do echo \"== $p\"; (cd $p && bun run test) || exit 1; done"
+    "test": "for p in pi-bash-processes pi-tool-renderer pi-otel pi-jev pi-native-router pi-cbmem pi-output-policy pi-reqcap pi-copy-mode pi-memtrace; do echo \"== $p\"; (cd $p && bun run test) || exit 1; done",
+    "nix:locks": "node nix/gen-plugin-locks.mjs",
+    "nix:locks:check": "node nix/gen-plugin-locks.mjs --check"
   },
   "devDependencies": {
     "@gotgenes/pi-permission-system": "^33.0.5",

@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  locks:
+    name: dependency locks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      # The development lock still describes these manifests.
+      - run: bun install --frozen-lockfile --ignore-scripts
+      # Each plugin's own lock still resolves its dependencies.
+      - run: bun run nix:locks:check
+
+  plugins:
+    name: plugin packages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      # Builds every plugin and npm tarball, and verifies each plugin tree holds what its lock
+      # installs. No binary cache: the build is fetches and file copies, not compilation.
+      - run: nix flake check --print-build-logs
