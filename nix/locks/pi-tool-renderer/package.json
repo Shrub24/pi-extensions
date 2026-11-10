@@ -1,0 +1,8 @@
+{
+  "name": "pi-tool-renderer",
+  "version": "2.0.9",
+  "private": true,
+  "dependencies": {
+    "diff": "^9.0.0"
+  }
+}

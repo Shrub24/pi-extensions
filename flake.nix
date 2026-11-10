@@ -47,12 +47,41 @@
               path = plugin;
             }) extensions.plugins
           );
+
+          # Plugins that ship a lock of their own: the built tree must install what it resolves.
+          lockedPlugins =
+            lib.mapAttrs'
+              (
+                name: recipe:
+                lib.nameValuePair name {
+                  tree = extensions.plugins.${name};
+                  lock = "${self}/nix/locks/${recipe.path}/package-lock.json";
+                }
+              )
+              (
+                lib.filterAttrs (
+                  _: recipe:
+                  recipe.path != null && builtins.pathExists "${self}/nix/locks/${recipe.path}/package-lock.json"
+                ) extensions.recipes
+              );
+
+          # A plugin's dependencies are the ones its own lock installs, at those versions.
+          pluginDependenciesCheck =
+            pkgs.runCommand "plugin-dependencies"
+              {
+                nativeBuildInputs = [ pkgs.nodejs ];
+                expected = builtins.toJSON lockedPlugins;
+              }
+              ''
+                node ${./nix/check-plugin-dependencies.mjs} > $out
+              '';
         in
         {
           inherit
             extensions
             npmPackages
             pluginTrees
+            pluginDependenciesCheck
             ;
         };
 
@@ -96,33 +125,41 @@
       checks = lib.mapAttrs (_: scope: {
         npm-packages = scope.npmPackages.npm-extensions;
         pi-bolt-plugins = scope.pluginTrees;
+
+        # The plugin trees carry the closure the lock resolves, at those versions.
+        plugin-dependencies = scope.pluginDependenciesCheck;
       }) scopes;
 
       # The plugins' manifests and npm pins, for a consumer that keeps a plugin set
       # lock: it names the lock's members from the same recipes these packages are
       # built from, so a pin stays beside the source that needs it and downstream
-      # never reads `nix/recipes.nix` itself.
-      lib = {
-        pluginLockCandidates =
-          lib.mapAttrs
-            (
-              _: recipe:
-              {
-                inherit (recipe) manifest;
-              }
-              // lib.optionalAttrs (recipe.npm != null) {
-                npm = recipe.npm // {
-                  inherit (recipe) version;
-                };
-              }
-            )
-            (
-              import ./nix/recipes.nix {
-                inherit lib;
-                self = self.outPath;
-              }
-            );
-      };
+      # never reads `nix/recipes.nix` itself. Versions and hashes are the lock's.
+      lib =
+        let
+          lock = import ./nix/lock.nix { inherit lib; };
+        in
+        {
+          pluginLockCandidates =
+            lib.mapAttrs
+              (
+                _: recipe:
+                {
+                  inherit (recipe) manifest;
+                }
+                // lib.optionalAttrs (recipe.npm != null) {
+                  npm = recipe.npm // {
+                    inherit (lock.packageOf recipe.npm.name) version;
+                    hash = (lock.packageOf recipe.npm.name).integrity;
+                  };
+                }
+              )
+              (
+                import ./nix/recipes.nix {
+                  inherit lib;
+                  self = self.outPath;
+                }
+              );
+        };
 
       formatter = forAllSystems (system: nixpkgs.legacyPackages.${system}.nixfmt);
     };

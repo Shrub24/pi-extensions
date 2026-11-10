@@ -17,60 +17,31 @@ let
   checkout = name: "${self}/${name}";
   versionOf = name: (lib.importJSON "${checkout name}/package.json").version;
 
-  # pi-otel's locked OpenTelemetry dependencies, as the node_modules the plugin imports them from.
-  #
-  # Its lockfile is the runtime tree only once Pi's own packages (Pi provides them) and the
-  # dev-only entries are dropped: npm records some dev entries without an integrity hash, which
-  # importNpmLock has to fetch with.
-  otelManifest = lib.importJSON "${checkout "pi-otel"}/package.json";
-  otelLock = lib.importJSON "${checkout "pi-otel"}/package-lock.json";
-  otelDependencies = pkgs.importNpmLock.buildNodeModules {
-    npmRoot = checkout "pi-otel";
-    package = removeAttrs otelManifest [ "devDependencies" ];
-    packageLock = otelLock // {
-      packages = lib.filterAttrs (
-        path: entry:
-        !(entry.dev or false)
-        && !(entry.link or false)
-        && !(lib.hasInfix "node_modules/@earendil-works/pi-" path)
-      ) otelLock.packages;
-    };
-    nodejs = pkgs.nodejs;
-    # Pi supplies its own packages as peers, so npm must not try to install them.
-    derivationArgs = {
-      npmFlags = [ "--legacy-peer-deps" ];
-      npmRebuildFlags = [ "--ignore-scripts" ];
-    };
-  };
-
-  # tool-renderer's one runtime dependency, as the node_modules it imports it from. diff is
-  # dependency-free, so its tarball is the whole tree; the pin is the one bun.lock records.
-  toolRendererDependencies = pkgs.runCommand "pi-tool-renderer-node-modules" { } ''
-    mkdir -p $out/node_modules/diff
-    tar -xzf ${
-      pkgs.fetchurl {
-        url = "https://registry.npmjs.org/diff/-/diff-9.0.0.tgz";
-        hash = "sha512-svtcdpS8CgJyqAjEQIXdb3OjhFVVYjzGAPO8WGCmRbrml64SPw/jJD4GoE98aR7r25A0XcgrK3F02yw9R/vhQw==";
-      }
-    } --strip-components=1 -C $out/node_modules/diff
-  '';
-
-  # What a recipe needs beyond its recipe data: a dependency closure this repository builds itself.
-  extras = {
-    otel.nodeModules = "${otelDependencies}/node_modules";
-    tool-renderer.nodeModules = "${toolRendererDependencies}/node_modules";
-  };
+  # A plugin's runtime dependencies, as its lock under nix/locks resolves them (`bun run nix:locks`).
+  # Pi-Bolt installs that lock into the plugin's node_modules, so the tree carries no dev tooling and
+  # no second copy of Pi.
+  ownDependencies =
+    recipe:
+    lib.optionalAttrs
+      (recipe.path != null && builtins.pathExists "${self}/nix/locks/${recipe.path}/package-lock.json")
+      {
+        packageLock = "${self}/nix/locks/${recipe.path}/package-lock.json";
+      };
 
   # Every recipe becomes a plugin. Dependencies and patches name other plugins, so the set refers to
   # itself lazily; the graph is acyclic.
   plugins = lib.mapAttrs (
     name: recipe:
     let
+      # A plugin fetched from npm states its pin in the recipe; a local one states its version in its
+      # manifest.
+      fromNpm = recipe.npm != null;
+      inherit (recipe) version;
       src =
-        if recipe.npm != null then
+        if fromNpm then
           fetchNpmPackage {
             pname = recipe.npm.name;
-            inherit (recipe) version;
+            inherit version;
             inherit (recipe.npm) hash;
           }
         else
@@ -78,17 +49,18 @@ let
     in
     buildPiBoltPlugin (
       {
-        pname = if recipe.npm != null then recipe.npm.name else recipe.path;
-        inherit (recipe) version entry pluginName;
+        pname = if fromNpm then recipe.npm.name else recipe.path;
+        inherit version;
+        inherit (recipe) entry pluginName;
         inherit src;
         dependencies = map (dep: plugins.${dep}) recipe.dependencies;
         postPatch = recipe.patch {
-          inherit (recipe) version;
+          inherit version;
           radar = plugins.radar;
         };
       }
       // lib.optionalAttrs (recipe ? packageName) { inherit (recipe) packageName; }
-      // (extras.${name} or { })
+      // ownDependencies recipe
     )
   ) recipes;
 
