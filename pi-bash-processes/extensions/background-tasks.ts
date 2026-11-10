@@ -243,6 +243,10 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 	let taskCounter = 0;
 	let shuttingDown = false;
 	const tasks = new Map<string, ManagedTask>();
+	// Tool calls still inside their foreground window, so the call row can carry
+	// the live status of the task it spawned. Entries go with the call: after it
+	// settles the row is a plain bash row or a real task row.
+	const foregroundCalls = new Map<string, ManagedTask>();
 	// The last output hash emitted per dedupe key. A task's entry goes with the task:
 	// left behind, the map would hold one pair for every bash call of the process,
 	// and a key a later task reused would be deduped against an unrelated one.
@@ -2389,6 +2393,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 	};
 
 	const runManagedBash = async (
+		toolCallId: string,
 		params: { command?: unknown; timeout?: unknown },
 		signal: AbortSignal | undefined,
 		ctx: ExtensionContext,
@@ -2410,6 +2415,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			origin: "managed-bash",
 			timeoutSeconds,
 		});
+		foregroundCalls.set(toolCallId, task);
 		const onAbort = () => {
 			settleForeground(task, { exitCode: null, kind: "aborted", status: "running" });
 			requestStop(task, "user");
@@ -2472,6 +2478,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			}
 			return makeToolResult(formatManagedBashRunning(task, elapsedMs, ctx.cwd), details);
 		} finally {
+			if (foregroundCalls.get(toolCallId) === task) foregroundCalls.delete(toolCallId);
 			signal?.removeEventListener("abort", onAbort);
 		}
 	};
@@ -3238,6 +3245,7 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			const args = params as { command?: unknown; timeout?: unknown };
 			if (codemodeCallIds.has(toolCallId)) return runScriptBash(toolCallId, args, signal, onUpdate as never, ctx);
 			return runManagedBash(
+				toolCallId,
 				args,
 				signal,
 				ctx,
@@ -3245,21 +3253,32 @@ export default function backgroundTasks(pi: ExtensionAPI): void {
 			);
 		},
 		renderCall(args: any, theme: any, context: any) {
-			if (managedBashPresentation) return managedBashPresentation.renderManagedBashCall({ args, context, theme, cwd: activeCtx?.cwd ?? process.cwd() });
+			if (managedBashPresentation) {
+				// The live task of this call gives the row its status while it runs.
+				const live = typeof context?.toolCallId === "string" ? foregroundCalls.get(context.toolCallId) : undefined;
+				return managedBashPresentation.renderManagedBashCall({
+					args,
+					context,
+					theme,
+					cwd: activeCtx?.cwd ?? process.cwd(),
+					task: live ? managedBashRowFor(live, activeCtx?.cwd) : undefined,
+				});
+			}
 			return renderManagedBashFallbackCall(args, theme);
 		},
 		renderResult(result: any, options: any, theme: any, context: any) {
 			if (managedBashPresentation) {
 				// Only a task that actually yielded is a background task. One that
-				// exited inside its foreground window renders as a plain bash row.
+				// exited inside its foreground window renders as a plain bash row, and
+				// one still inside that window keeps the call row's head — so the
+				// partial result contributes its streamed tail and nothing else.
 				const id = (result?.details?.task as { id?: string } | undefined)?.id;
 				const live = id ? tasks.get(id) : undefined;
-				const isPartial = Boolean(options?.isPartial);
-				const asBackground = isPartial || live?.foregroundWaiter?.outcome?.kind === "yielded";
+				const asBackground = live?.foregroundWaiter?.outcome?.kind === "yielded";
 				return managedBashPresentation.renderManagedBashResult({
 					context,
 					expanded: Boolean(options?.expanded),
-					isPartial,
+					isPartial: Boolean(options?.isPartial),
 					result,
 					task: live && asBackground ? managedBashRowFor(live, activeCtx?.cwd) : undefined,
 					theme,

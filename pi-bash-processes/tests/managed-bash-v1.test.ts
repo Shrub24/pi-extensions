@@ -11,6 +11,8 @@ interface FixtureResult {
 	widgetDuringForeground: string;
 	widgetAfterSettle: string;
 	partialTexts: string[];
+	foregroundCallLines: string[];
+	foregroundResultLines: string[];
 	managedBashCleared: boolean;
 	spawns: number;
 	spawnsAfterExecute: number;
@@ -73,6 +75,15 @@ test("managed bash v1: slow command yields Running, same process wakes once on e
 		result.partialTexts.some((text) => text.includes("streamed-line")),
 		"output produced inside the foreground window streams through onUpdate",
 	).toBe(true);
+	// One tool call is drawn by two components; the mid-window call row owns the
+	// head and the command, and the streamed result adds neither.
+	const foregroundCall = result.foregroundCallLines.join("\n");
+	const foregroundResult = result.foregroundResultLines.join("\n");
+	expect(foregroundCall, "the call row reports the running task's live state").toContain("running");
+	expect(foregroundCall, "the call row carries the command").toContain("fixture command");
+	expect(foregroundResult, "the streamed result repeats neither the head nor the command").not.toContain("fixture command");
+	expect(foregroundResult).not.toContain("Bash");
+	expect(`${foregroundCall}\n${foregroundResult}`.match(/fixture command/g)?.length, "the command is drawn once").toBe(1);
 	expect(result.unexpected).toEqual([]);
 }, SPAWN_FIXTURE_TIMEOUT_MS);
 

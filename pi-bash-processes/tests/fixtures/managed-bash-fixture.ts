@@ -96,6 +96,11 @@ try {
 
 	let result: ToolResult | undefined;
 	let resultError: string | undefined;
+	// Pi draws the call component and the partial result component of one tool
+	// call side by side; the slow scenario captures both mid-window.
+	let foregroundCallLines: string[] = [];
+	let foregroundResultLines: string[] = [];
+	const toLines = (component: unknown): string[] => component && typeof (component as { render?: unknown }).render === "function" ? (component as { render(width: number): string[] }).render(120) : [];
 	if (input.scenario === "abort") {
 		controller.abort();
 		try { result = await pending; }
@@ -117,6 +122,21 @@ try {
 		child.stdout.emit("data", Buffer.from("streamed-line\n"));
 		native.fireInterval(MANAGED_BASH_PARTIAL_UPDATE_MS);
 		if (partialUpdates.length === 0) throw new Error("managed_bash_fixture.partial_update_missing");
+		// The optional presentation module is imported in the background at
+		// session_start; awaiting the same specifier here means the mid-window rows
+		// come from it rather than from the degraded fallback renderer.
+		await import("pi-tool-renderer/managed-bash");
+		const foregroundContext = { args: { command, intent: "fixture intent" }, toolCallId: "bash-call-1", cwd: ctx.cwd, executionStarted: true, argsComplete: true, isPartial: true, expanded: false, state: {}, invalidate() {} };
+		const renderer = bash as unknown as {
+			renderCall?: (...a: unknown[]) => unknown;
+			renderResult?: (...a: unknown[]) => unknown;
+		};
+		const args = { command, intent: "fixture intent" };
+		foregroundCallLines = toLines(renderer.renderCall?.(args, widgetTheme, foregroundContext));
+		foregroundResultLines = toLines(renderer.renderResult?.(partialUpdates[0], { expanded: false, isPartial: true }, widgetTheme, foregroundContext));
+		// The mid-window call row starts the elapsed repaint; render it once more
+		// settled so the fixture leaves no timer behind.
+		renderer.renderCall?.(args, widgetTheme, { ...foregroundContext, args, isPartial: false });
 		native.fireTimeout(yieldMs[0]!);
 		result = await pending;
 		const listed = await bgTask.execute("list-1", { action: "list" });
@@ -184,6 +204,8 @@ try {
 		resultTask: result?.details.task,
 		resultError,
 		composedCommand: command,
+		foregroundCallLines,
+		foregroundResultLines,
 		finalTasks: tasks,
 		exitWakeCount: exitWakes.length,
 		env: { PI_SESSION_ID: spawnEnv?.PI_SESSION_ID, PI_SESSION_FILE: spawnEnv?.PI_SESSION_FILE, PI_PROVIDER: spawnEnv?.PI_PROVIDER, PI_MODEL: spawnEnv?.PI_MODEL, PI_REASONING_LEVEL: spawnEnv?.PI_REASONING_LEVEL, PATH: typeof spawnEnv?.PATH === "string" },

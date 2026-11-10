@@ -1,13 +1,11 @@
 import {
 	bashLiveOutputDelayMs,
-	bashLiveTailLines,
 	bashOutputMode,
 	settingNumber,
 	stackToolCalls,
 } from "./settings.js";
 import { getIntent } from "./intent.js";
 import { renderBashDiffOutput, shouldRenderBashDiffsForCommand, suppressReadOnlyBashDiffOutput } from "./diff.js";
-import { truncateText } from "./glyphs.js";
 import { toolLabel } from "./theme.js";
 import {
 	bashCallBlock,
@@ -38,6 +36,7 @@ export interface BashLiveTailState {
 	startedAt?: number;
 	tailShown?: boolean;
 	timer?: ReturnType<typeof setTimeout>;
+	elapsedTimer?: ReturnType<typeof setInterval>;
 }
 
 export function bashLiveTailState(context: any): BashLiveTailState {
@@ -75,6 +74,31 @@ export function scheduleBashLiveTailRerender(state: BashLiveTailState, context: 
 	state.timer.unref?.();
 }
 
+/**
+ * A foreground call row shows a live elapsed time, and Pi only repaints a row
+ * when something invalidates it. The partial updates that would do that fire
+ * only when the tail grows, so a silent command would hold a frozen clock; one
+ * repaint a second keeps it honest while the call is still in its foreground
+ * window.
+ */
+export function scheduleBashElapsedTimer(state: BashLiveTailState, context: any): void {
+	if (state.elapsedTimer || typeof context?.invalidate !== "function") return;
+	state.elapsedTimer = setInterval(() => {
+		try {
+			context.invalidate();
+		} catch {
+			// Best-effort repaint only; tool execution continues either way.
+		}
+	}, 1_000);
+	state.elapsedTimer.unref?.();
+}
+
+export function clearBashElapsedTimer(state: BashLiveTailState): void {
+	if (!state.elapsedTimer) return;
+	clearInterval(state.elapsedTimer);
+	state.elapsedTimer = undefined;
+}
+
 export function renderBashTail(output: string, limit: number, theme: any, cwd?: string): string {
 	const trimmed = output.replace(/(?:\r?\n)+$/, "");
 	if (!trimmed) return "";
@@ -87,24 +111,36 @@ export interface ManagedBashRenderInput {
 	context: any;
 	theme: any;
 	cwd: string;
+	/**
+	 * Live task of this call, supplied while the call is inside its foreground
+	 * window. Pi renders a call component and a partial result component side by
+	 * side, so the call row is the only place the head, intent and command may
+	 * be drawn during the run; the partial result adds its tail and nothing else.
+	 * A result row gets the task only once the command outlived that window and
+	 * really is a background task.
+	 */
+	task?: ManagedBashRowTask;
 }
 
-export function renderManagedBashCall({ args, context, theme, cwd }: ManagedBashRenderInput): TruncatedLines | ReturnType<typeof makeEmpty> {
-	markBashStarted(context);
-	const { head, command } = bashCallBlock(args ?? {}, theme, context?.cwd ?? cwd, { leadingIntent: getIntent(args) });
-	return renderPendingCall(`${head}\n${command}`, theme, context, cwd);
+export function renderManagedBashCall({ args, context, theme, cwd, task }: ManagedBashRenderInput): TruncatedLines | ReturnType<typeof makeEmpty> {
+	const state = markBashStarted(context);
+	const effectiveCwd = context?.cwd ?? cwd;
+	const live = task && context?.isPartial ? task : undefined;
+	if (!live) {
+		clearBashElapsedTimer(state);
+		const { head, command } = bashCallBlock(args ?? {}, theme, effectiveCwd, { leadingIntent: getIntent(args) });
+		return renderPendingCall(`${head}\n${command}`, theme, context, cwd);
+	}
+	scheduleBashElapsedTimer(state, context);
+	// The same head a yielded task row draws, so the row does not change shape
+	// when a command outlives its foreground window and becomes a task.
+	return renderPendingCall(`${managedBashTaskHead(live, theme, false)}\n${managedBashTaskCommand(args, theme, effectiveCwd, Boolean(context?.expanded))}`, theme, context, cwd);
 }
 
 export interface ManagedBashRenderResultInput extends ManagedBashRenderInput {
 	result: any;
 	expanded: boolean;
 	isPartial: boolean;
-	/**
-	 * Live task state supplied by the process manager. Present for every
-	 * managed Bash result, so the row can report the task's *current* status
-	 * and expose the bounded output without parsing the model-facing text.
-	 */
-	task?: ManagedBashRowTask;
 }
 
 /** Bounded, render-ready view of one managed task. */
@@ -133,22 +169,33 @@ function managedBashStatusText(task: ManagedBashRowTask, theme: any): string {
  * yielded command keeps the same chrome as a foreground one, streams its
  * bounded tail while running, and expands to the tail plus the log path.
  */
-function renderManagedBashTaskRow({ task, expanded, isPartial, context, theme, cwd, args }: ManagedBashRenderInput & { task: ManagedBashRowTask; expanded: boolean; isPartial: boolean }): TruncatedLines {
-	const mode = bashOutputMode(cwd);
-	if (mode === "hidden") return makeEmpty() as TruncatedLines;
-	// Status line first: id, live state, elapsed and output size stay readable
-	// even when the command itself is long. The id only appears once the task
-	// really is a background task, so a foreground command is not claimed early.
-	// The chrome bullet comes from stackPrefix; do not add another one.
+/**
+ * Status line of a task-driven row: label, id, live state, elapsed and output
+ * size stay readable even when the command itself is long. The id only appears
+ * once the task really is a background task, so a foreground command is not
+ * claimed early. The chrome bullet is the caller's; it is not drawn here.
+ */
+function managedBashTaskHead(task: ManagedBashRowTask, theme: any, showId: boolean): string {
 	const header = [toolLabel(theme, "Bash")];
-	if (!isPartial || task.status !== "running") header.push(` ${theme.fg("accent", task.id)}`);
+	if (showId) header.push(` ${theme.fg("accent", task.id)}`);
 	header.push(` ${theme.fg("dim", "·")} ${managedBashStatusText(task, theme)}`);
 	header.push(theme.fg("dim", ` · ${formatElapsed(task.elapsedMs)}`));
 	header.push(theme.fg("dim", ` · ${task.lineCount} line${task.lineCount === 1 ? "" : "s"}`));
-	let text = `${stackPrefix(theme)}${header.join("")}`;
+	return header.join("");
+}
+
+/** The declared intent and the command, below a task row's status line. */
+function managedBashTaskCommand(args: Record<string, unknown> | undefined, theme: any, cwd: string, expanded: boolean): string {
 	const declaredIntent = typeof args?.intent === "string" ? args.intent.trim() : "";
-	const intentLead = declaredIntent ? `\n${theme.fg("dim", "— ")}${theme.fg("accent", declaredIntent)}\n` : "";
-	text += `${intentLead}${theme.fg("dim", "$ ")}${theme.fg("toolOutput", bashCommandText(args ?? {}, expanded, cwd))}`;
+	const intentLead = declaredIntent ? `${theme.fg("dim", "— ")}${theme.fg("accent", declaredIntent)}\n` : "";
+	return `${intentLead}${theme.fg("dim", "$ ")}${theme.fg("toolOutput", bashCommandText(args ?? {}, expanded, cwd))}`;
+}
+
+function renderManagedBashTaskRow({ task, expanded, isPartial, context, theme, cwd, args }: ManagedBashRenderInput & { task: ManagedBashRowTask; expanded: boolean; isPartial: boolean }): TruncatedLines {
+	const mode = bashOutputMode(cwd);
+	if (mode === "hidden") return makeEmpty() as TruncatedLines;
+	let text = `${stackPrefix(theme)}${managedBashTaskHead(task, theme, !isPartial || task.status !== "running")}`;
+	text += `\n${managedBashTaskCommand(args, theme, cwd, expanded)}`;
 	const limit = Math.max(1, Math.floor(settingNumber(expanded ? "bashPreviewLines" : "bashCollapsedLines", expanded ? 80 : 5, cwd)));
 	const showTail = mode !== "summary" && task.tail.length > 0 && (!isPartial || task.status !== "running" || expanded);
 	if (showTail) {
@@ -196,7 +243,10 @@ export function renderManagedBashResult({ result, expanded, isPartial, context, 
 			if (Date.now() - startedAt >= delayMs) {
 				clearBashLiveTailTimer(liveTailState);
 				liveTailState.tailShown = true;
-				const tailText = renderBashTail(output, bashLiveTailLines(effectiveCwd), theme, effectiveCwd);
+				// Expanding a running call asks for more of its output, so the tail
+				// takes the full preview budget instead of the live-tail one.
+				const limit = Math.max(1, Math.floor(settingNumber(expanded ? "bashPreviewLines" : "bashLiveTailLines", expanded ? 80 : 4, effectiveCwd)));
+				const tailText = renderBashTail(output, limit, theme, effectiveCwd);
 				if (tailText) return makeTruncatedLines(tailText);
 			}
 			scheduleBashLiveTailRerender(liveTailState, context, delayMs);

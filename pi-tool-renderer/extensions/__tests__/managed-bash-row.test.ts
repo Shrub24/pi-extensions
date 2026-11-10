@@ -3,7 +3,7 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { clearPackageConfigCache } from "../tool-renderer/package-config.js";
-import { renderManagedBashResult } from "../tool-renderer/managed-bash.js";
+import { renderManagedBashCall, renderManagedBashResult } from "../tool-renderer/managed-bash.js";
 import { useWorld } from "./helpers/world.js";
 
 const world = useWorld();
@@ -83,6 +83,60 @@ test("a finished task row shows its exit code, not the running state", () => {
 	const line = render({ elapsedMs: 1_500, exitCode: 2, status: "failed" });
 	expect(line).toContain("exit 2");
 	expect(line).not.toContain("running");
+});
+
+/**
+ * Pi renders the call component and the partial result component of one tool
+ * call side by side, so anything both of them draw appears twice in the
+ * transcript. A command inside its foreground window must be drawn once: by the
+ * call row, which is the only one that knows the row is still live.
+ */
+test("a running call draws the head and command, and its streamed output is only the tail", () => {
+	const cwd = world().cwd;
+	const args = { command: "bun test", intent: "Run the suite" };
+	const state: Record<string, unknown> = {};
+	const context = { args, cwd, executionStarted: true, argsComplete: true, isPartial: true, expanded: false, state, invalidate() {} };
+	const live = { elapsedMs: 12_000, exitCode: null, id: "bg-7", lineCount: 40, logFile: "/tmp/kendex-pi-bg/bg-7.log", status: "running", tail: "streamed output" };
+
+	const callRow = renderManagedBashCall({ args, context, cwd, theme, task: live }).render(120).join("\n");
+	expect(callRow).toContain("running");
+	expect(callRow).toContain("12s");
+	expect(callRow).toContain("40 lines");
+	expect(callRow).toContain("bun test");
+	expect(callRow, "a foreground command is not claimed as a background task").not.toContain("bg-7");
+
+	// Past the live-tail delay, so the streamed tail is what the row would show.
+	state.kendexBashLiveTail = { startedAt: Date.now() - 2_000 };
+	const streamed = renderManagedBashResult({
+		args,
+		context,
+		cwd,
+		expanded: false,
+		isPartial: true,
+		result: { content: [{ type: "text", text: "streamed output\n" }], details: { action: "bash" } },
+		theme,
+	}).render(120).join("\n");
+	expect(streamed.trim()).toBe("streamed output");
+	expect(streamed, "the streamed row repeats neither the head nor the command").not.toContain("bun test");
+	expect(`${callRow}\n${streamed}`.match(/bun test/g)?.length, "the command appears once in the row").toBe(1);
+});
+
+test("expanding a running call shows the whole live tail", () => {
+	const cwd = world().cwd;
+	const args = { command: "bun test" };
+	const tail = Array.from({ length: 30 }, (_value, index) => `out ${index + 1}`).join("\n");
+	const streamed = (expanded: boolean): string => renderManagedBashResult({
+		args,
+		context: { args, cwd, expanded, state: { kendexBashLiveTail: { startedAt: Date.now() - 2_000 } }, invalidate() {} },
+		cwd,
+		expanded,
+		isPartial: true,
+		result: { content: [{ type: "text", text: `${tail}\n` }], details: {} },
+		theme,
+	}).render(120).join("\n");
+	expect(streamed(false), "collapsed rows keep the live-tail budget").not.toContain("out 1\n");
+	expect(streamed(false)).toContain("out 30");
+	expect(streamed(true), "expanded rows show the full tail").toContain("out 1\n");
 });
 
 import { renderManagedBashResult as renderPlain } from "../tool-renderer/managed-bash.js";
