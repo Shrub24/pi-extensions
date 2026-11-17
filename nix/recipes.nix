@@ -133,7 +133,7 @@ let
           { radar, ... }:
           ''
             substituteInPlace extension/index.ts \
-              --replace-fail 'const HERDSMAN_EXTENSION_PATH = fileURLToPath(import.meta.url);' 'const HERDSMAN_EXTENSION_PATH = "$out/extension/index.ts";' \
+              --replace-fail 'const HERDSMAN_EXTENSION_PATH = fileURLToPath(import.meta.url);' "const HERDSMAN_EXTENSION_PATH = \"$out/extension/index.ts\";" \
               --replace-fail '"../../pi-bash-processes/extensions/background-work.ts"' '"pi-bash-processes/extensions/background-work.ts"'
             substituteInPlace extension/radar-baseline.ts \
               --replace-fail 'const BUILD_BASELINE_PATH: string | undefined = undefined;' 'const BUILD_BASELINE_PATH: string | undefined = "${radar}/extension/baseline.ts";'
@@ -142,7 +142,7 @@ let
             substituteInPlace extension/agent-definitions.ts \
               --replace-fail 'const BUILTIN_AGENT_DIR = fileURLToPath(
               new URL("./agent-definitions", import.meta.url),
-            );' 'const BUILTIN_AGENT_DIR = "$out/extension/agent-definitions";'
+            );' "const BUILTIN_AGENT_DIR = \"$out/extension/agent-definitions\";"
           '';
       };
     };
