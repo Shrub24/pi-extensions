@@ -55,7 +55,7 @@
       "name": "pi-herdsman",
       "version": "0.18.0",
       "dependencies": {
-        "pi-radar": "0.15.0",
+        "pi-radar": "0.16.0",
       },
       "devDependencies": {
         "@earendil-works/pi-ai": "1.2.0",
@@ -550,7 +550,7 @@
 
     "pi-output-policy": ["pi-output-policy@workspace:pi-output-policy"],
 
-    "pi-radar": ["pi-radar@0.15.0", "", {}, "sha512-81PB4aKYts00C3vDrHtofPGTdbOr7dx+IukpnW2+lLkMC5IwQSocAwqlppGrKc0kINDnssgSHjUTU6+WOUndcQ=="],
+    "pi-radar": ["pi-radar@0.16.0", "", {}, "sha512-i0L10XNRsqvWorv9oXcKv+UfpKdpkqOom+HgJBi3dCYtGrYdmzvdRPn6E0BDpN0aQRF1yYijdEiKGcE/RirNlg=="],
 
     "pi-reqcap": ["pi-reqcap@workspace:pi-reqcap"],
 

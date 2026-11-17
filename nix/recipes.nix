@@ -37,7 +37,7 @@ let
   noPatch = _: "";
 
   # Herdsman imports the SDK, so its manifest, its lock and this pin are one version.
-  radarVersion = "0.15.0";
+  radarVersion = "0.16.0";
 
   recipes =
     assert lib.assertMsg
@@ -50,7 +50,7 @@ let
         path = null;
         npm = {
           name = "pi-radar";
-          hash = "sha512-81PB4aKYts00C3vDrHtofPGTdbOr7dx+IukpnW2+lLkMC5IwQSocAwqlppGrKc0kINDnssgSHjUTU6+WOUndcQ==";
+          hash = "sha512-i0L10XNRsqvWorv9oXcKv+UfpKdpkqOom+HgJBi3dCYtGrYdmzvdRPn6E0BDpN0aQRF1yYijdEiKGcE/RirNlg==";
         };
         version = radarVersion;
         manifest = "package/package.json";

@@ -838,6 +838,8 @@ export async function startFakeRadarDaemon(
   }
 
   const unavailable = () => ({ ok: false as const, code: "refused" as const, message: "port not configured by this test" });
+  // Radar mints the claim: a claimless report resumes this session's claim or gets a new one.
+  const claims = new Map<string, string>();
   const publicationClient = {
     async ping() {
       return { ok: true as const, value: {
@@ -852,8 +854,10 @@ export async function startFakeRadarDaemon(
       subjects.set(registration_id, { source: report.source, incarnation: report.incarnation,
         session: report.session_id, location: report.location });
       const standing = settings.standing ?? "granted";
+      const attachment = `${registration_id}:${report.session_id}`;
+      if (!claims.has(attachment)) claims.set(attachment, report.claim_id ?? randomUUID());
       return { ok: true as const, value: {
-        registration_id, claim_id: report.claim_id, standing,
+        registration_id, standing, claim_id: report.claim_id ?? claims.get(attachment)!,
         ...(standing === "granted" ? { subject_id: subjectId("session", report.session_id) } : {}),
       } };
     },
