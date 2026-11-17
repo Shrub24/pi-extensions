@@ -1070,12 +1070,6 @@ function connectRadarRuntime(pi: ExtensionAPI): void {
 }
 
 /**
- * The child environment as a spawn overlay: the launch's own assignments.
- * Radar's environment overlay is
- * additive, so this is exactly what the launch adds to the daemon's own
- * environment, and nothing from this process leaks into it.
- */
-/**
  * This session's Radar spawns, keyed by the mailbox and run each was created
  * for. The entry is written before the daemon is dialed, so a reload can
  * reconcile a child with the one edge this process may have created even when
