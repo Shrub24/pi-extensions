@@ -1,5 +1,5 @@
 import { getMarkdownTheme, keyText, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Box, Markdown, MouseRegion, Text } from "@earendil-works/pi-tui";
+import { Box, Markdown, MouseRegion, Text, truncateToWidth } from "@earendil-works/pi-tui";
 
 import {
 	ANSI_FG_RESET,
@@ -181,9 +181,37 @@ const userStampTimes = new WeakMap<object, number>();
 const pendingUserStamps: number[] = [];
 export const __stampTest = { userStampTimes, pendingUserStamps };
 
-/** A message longer than this is never cached: the layout exists to keep a
- *  frame cheap, and a one-off 100 KB message would cost more held than redrawn. */
-const USER_LAYOUT_MAX_CHARS = 40_000;
+/** A prompt over either bound is shown folded to a preview. */
+interface UserMessageFold {
+	preview: string;
+	hiddenLines: number;
+	totalChars: number;
+}
+
+function userMessageFold(text: string, cwd?: string): UserMessageFold | undefined {
+	const maxChars = settingNumber("userMessageFoldChars", 8000, cwd);
+	const maxLines = settingNumber("userMessageFoldLines", 80, cwd);
+	if (maxChars <= 0 && maxLines <= 0) return undefined;
+	let totalLines = 1;
+	for (let at = text.indexOf("\n"); at !== -1; at = text.indexOf("\n", at + 1)) totalLines++;
+	if (!((maxChars > 0 && text.length > maxChars) || (maxLines > 0 && totalLines > maxLines))) return undefined;
+	// Bounded by lines and characters both: one pasted line can be the whole message.
+	const previewLines = Math.max(1, Math.floor(settingNumber("userMessagePreviewLines", 12, cwd)));
+	const previewChars = Math.max(1, Math.floor(settingNumber("userMessagePreviewChars", 2000, cwd)));
+	let end = 0;
+	for (let line = 0; line < previewLines && end < previewChars; line++) {
+		const next = text.indexOf("\n", end);
+		if (next === -1) { end = text.length; break; }
+		end = next + 1;
+	}
+	const preview = text.slice(0, Math.min(end, previewChars)).replace(/\n+$/, "");
+	let shownLines = 1;
+	for (let at = preview.indexOf("\n"); at !== -1; at = preview.indexOf("\n", at + 1)) shownLines++;
+	return { preview, hiddenLines: totalLines - shownLines, totalChars: text.length };
+}
+
+/** Folded prompts the reader opened, by component. */
+const expandedUserMessages = new WeakSet<object>();
 
 interface UserMessageLayout {
 	text: string;
@@ -191,6 +219,8 @@ interface UserMessageLayout {
 	markdownTheme: unknown;
 	settings: unknown;
 	revision: number;
+	fold?: UserMessageFold;
+	expanded: boolean;
 	markdown: Markdown;
 	width?: number;
 	lines?: string[];
@@ -207,36 +237,49 @@ function renderRawUserMessageLines(component: any, width: number, theme: any, cw
 	// case: a record and its settings can both be referentially unchanged across
 	// a settings edit, and the entry would otherwise serve stale lines.
 	const revision = renderSettingsRevision();
+	const expanded = expandedUserMessages.has(component);
 	let layout = userMessageLayouts.get(component);
-	if (!layout || layout.theme !== theme || layout.markdownTheme !== markdownTheme || layout.settings !== settings || layout.revision !== revision) {
+	if (!layout || layout.theme !== theme || layout.markdownTheme !== markdownTheme || layout.settings !== settings
+		|| layout.revision !== revision || layout.text !== text || (layout.fold !== undefined && layout.expanded !== expanded)) {
+		const fold = layout && layout.text === text && layout.settings === settings && layout.revision === revision
+			? layout.fold
+			: userMessageFold(text, cwd);
+		// A fresh Markdown per source, so a re-fold leaves the whole message's tokens
+		// and lines unreferenced rather than held until the next parse replaces them.
 		layout = {
-			text, theme, markdownTheme, settings, revision,
-			markdown: new Markdown(text, 0, 0, markdownTheme ?? getMarkdownTheme(),
+			text, theme, markdownTheme, settings, revision, fold, expanded,
+			markdown: new Markdown(fold && !expanded ? fold.preview : text, 0, 0, markdownTheme ?? getMarkdownTheme(),
 				{ color: (content: string) => theme.fg("userMessageText", content) },
 				{ preserveOrderedListMarkers: true, preserveBackslashEscapes: true }),
 		};
-	} else if (layout.text !== text) {
-		layout.markdown.setText(text);
-		layout.text = text;
-		layout.lines = undefined;
 	}
 	if (layout.lines && layout.width === width) return layout.lines;
-	const lines = layout.markdown.render(width);
-	if (text.length <= USER_LAYOUT_MAX_CHARS && lines.reduce((size, line) => size + line.length, 0) <= USER_LAYOUT_MAX_CHARS) {
-		layout.width = width;
-		layout.lines = lines;
-		if (!userMessageLayouts.has(component)) {
-			if (userMessageLayoutCount >= 256) {
-				userMessageLayouts = new WeakMap();
-				userMessageLayoutCount = 0;
-			}
-			userMessageLayoutCount++;
-		}
-		userMessageLayouts.set(component, layout);
-	} else if (userMessageLayouts.delete(component)) {
-		userMessageLayoutCount--;
+	let lines = layout.markdown.render(width);
+	if (layout.fold && !expanded) {
+		const { hiddenLines, totalChars } = layout.fold;
+		const hidden = hiddenLines > 0 ? `${hiddenLines.toLocaleString("en-US")} more lines, ` : "";
+		const hint = `… ${hidden}${totalChars.toLocaleString("en-US")} chars · ${keyText("app.tools.expand")} expand`;
+		lines = [...lines, truncateToWidth(theme.fg("dim", hint), Math.max(1, width), "")];
 	}
+	layout.width = width;
+	layout.lines = lines;
+	if (!userMessageLayouts.has(component)) {
+		if (userMessageLayoutCount >= 256) {
+			userMessageLayouts = new WeakMap();
+			userMessageLayoutCount = 0;
+		}
+		userMessageLayoutCount++;
+	}
+	userMessageLayouts.set(component, layout);
 	return lines;
+}
+
+/** Opens or folds an oversized prompt; whether it changed what the prompt shows. */
+function setUserMessageExpanded(component: object, expanded: boolean): boolean {
+	if (expandedUserMessages.has(component) === expanded) return false;
+	if (expanded) expandedUserMessages.add(component);
+	else expandedUserMessages.delete(component);
+	return userMessageLayouts.get(component)?.fold !== undefined;
 }
 
 interface CompactUserMessageRenderCacheEntry {
@@ -310,6 +353,22 @@ export function installUserMessageRenderer(pi: ExtensionAPI, UserMessageComponen
 				state!.originalInvalidate?.call(this);
 			};
 		}
+		// Pi's expand toggle reaches every chat child with setExpanded; a click
+		// opens one prompt, as it does one tool result. Only a folded prompt claims
+		// the click, and the host invalidation reports the change without clearing
+		// the highlight cache a theme change needs cleared.
+		prototype.setExpanded = function setUserMessageFold(this: object, expanded: boolean): void {
+			if (setUserMessageExpanded(this, expanded)) state!.originalInvalidate?.call(this);
+		};
+		const originalHandleMouse = prototype.handleMouse as ((event: unknown) => unknown) | undefined;
+		prototype.handleMouse = function toggleUserMessageFold(this: object, event: any): unknown {
+			if (event?.type === "click" && event.button === "left" && userMessageLayouts.get(this)?.fold) {
+				setUserMessageExpanded(this, !expandedUserMessages.has(this));
+				state!.originalInvalidate?.call(this);
+				return { handled: true };
+			}
+			return originalHandleMouse?.call(this, event);
+		};
 		prototype.render = function compactUserMessageRender(this: any, width: number): string[] {
 			const ctx = state?.activeCtx;
 			const cwd = safeCtxCwd(ctx);

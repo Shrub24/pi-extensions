@@ -4,6 +4,9 @@
 
 ### Unreleased
 
+- A compact user message keeps its layout whatever its size. Above 40,000 characters it used to be laid out again on every frame — about 125 ms a frame for a 245 KB prompt, against 0.004 ms now.
+- A prompt over `userMessageFoldChars` or `userMessageFoldLines` shows folded to a bounded preview with a line naming what is hidden. The expand key (ctrl+o) opens and folds such prompts with the tool output; in fullscreen a click toggles one. Folding a prompt again drops its full layout. Only the view folds; the prompt sent is unchanged.
+
 - A running foreground bash command is drawn once. Pi renders a call component and a partial result component in the same row, and both drew the label, intent and command; the call row now carries them together with the task's live state, elapsed time and line count, and the output streamed below it is the tail only. Expanding the row shows the full live tail (`bashPreviewLines`) instead of the `bashLiveTailLines` budget.
 
 - Thinking panels draw their tinted padding from the panel box itself instead of a padding component shared between panels. The tinted frame is unchanged, and its padding rows are now full width. (The old shared component was also the shape Pi-Bolt's earlier owner bookkeeping retained: it held a rendered child's owners strongly, so one component mounted into every panel kept the panels reachable. Pi-Bolt 1.0.7 holds owners weakly.)

@@ -79,12 +79,98 @@ test("restored user messages get inline stamps from the active session branch", 
 		__stampTest.pendingUserStamps.length = 0; }
 });
 
-test("user layouts bypass oversized content and drop old component layouts at the count bound", () => { const theme = { fg: (_token: string, text: string) => text };
+test("user layouts keep oversized content and drop old component layouts at the count bound", () => { const theme = { fg: (_token: string, text: string) => text };
 	const component = { text: "first", markdownTheme: getMarkdownTheme() };
 	const first = __test.renderRawUserMessageLines(component, 80, theme);
 	for (let index = 0; index < 256; index++) __test.renderRawUserMessageLines({ text: "next", markdownTheme: component.markdownTheme }, 80, theme);
 	expect(__test.renderRawUserMessageLines(component, 80, theme)).not.toBe(first);
+	// Folding off, so this is the whole message's layout and not a short preview.
+	writeFileSync(join(world().agent, "settings.json"), JSON.stringify({ "pi-tool-renderer": { userMessageFoldChars: 0, userMessageFoldLines: 0 } }));
+	clearPackageConfigCache();
 	component.text = "a".repeat(64 * 1024 + 1);
 	const oversized = __test.renderRawUserMessageLines(component, 80, theme);
-	expect(__test.renderRawUserMessageLines(component, 80, theme)).not.toBe(oversized);
+	// Redrawing an unchanged message must not lay it out again, whatever its size.
+	expect(__test.renderRawUserMessageLines(component, 80, theme)).toBe(oversized);
+});
+
+test("an oversized prompt shows a bounded preview, opens with the expand toggle or a click, and reuses each view", () => {
+	const theme = { fg: (_token: string, text: string) => text };
+	const handlers = new Map<string, (...args: any[]) => void>();
+	class Message { text = Array.from({ length: 200 }, (_, index) => `line ${index + 1}`).join("\n");
+		markdownTheme = getMarkdownTheme();
+		invalidations = 0;
+		invalidate() { this.invalidations++; }
+		render(_width = 60) { return ["upstream"]; } }
+	installUserMessageRenderer({ on: (event: string, handler: (...args: any[]) => void) => handlers.set(event, handler) } as never, Message);
+	const component = new Message() as Message & { setExpanded(expanded: boolean): void; handleMouse(event: unknown): unknown };
+	try { handlers.get("session_start")!({}, { cwd: world().cwd, hasUI: true, ui: { theme }, sessionManager: { getBranch: () => [] } });
+		const folded = component.render(60);
+		expect(folded.join("\n")).toContain("line 12");
+		expect(folded.join("\n")).not.toContain("line 13");
+		expect(folded.join("\n")).toContain("188 more lines");
+		expect(component.render(60)).toBe(folded);
+
+		component.setExpanded(true);
+		expect(component.invalidations).toBe(1);
+		const open = component.render(60);
+		expect(open.join("\n")).toContain("line 200");
+		expect(open.join("\n")).not.toContain("more lines");
+		expect(component.render(60)).toBe(open);
+
+		expect(component.handleMouse({ type: "click", button: "left" })).toEqual({ handled: true });
+		expect(component.render(60).join("\n")).not.toContain("line 200");
+		component.handleMouse({ type: "click", button: "left" });
+		expect(component.render(60).join("\n")).toContain("line 200");
+		component.setExpanded(false);
+		expect(component.render(60).join("\n")).toContain("188 more lines"); } finally { handlers.get("session_shutdown")!(); }
+});
+
+test("a single oversized line folds within the character bound", () => {
+	const theme = { fg: (_token: string, text: string) => text };
+	const component = { text: "x".repeat(50_000), markdownTheme: getMarkdownTheme() };
+	const lines = __test.renderRawUserMessageLines(component, 80, theme)!;
+	expect(lines.join("").length).toBeLessThan(2_200);
+	expect(lines.at(-1)).toContain("50,000 chars");
+});
+
+test("re-folding leaves the opened layout collectible", async () => {
+	const theme = { fg: (_token: string, text: string) => text };
+	const handlers = new Map<string, (...args: any[]) => void>();
+	class Message { text = Array.from({ length: 500 }, (_, index) => `row ${index}`).join("\n");
+		markdownTheme = getMarkdownTheme();
+		render(_width = 60) { return ["upstream"]; } }
+	installUserMessageRenderer({ on: (event: string, handler: (...args: any[]) => void) => handlers.set(event, handler) } as never, Message);
+	const component = new Message() as Message & { setExpanded(expanded: boolean): void };
+	try { handlers.get("session_start")!({}, { cwd: world().cwd, hasUI: true, ui: { theme }, sessionManager: { getBranch: () => [] } });
+		component.setExpanded(true);
+		const opened = (() => new WeakRef(component.render(60)))();
+		component.setExpanded(false);
+		component.render(60);
+		Bun.gc(true);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		Bun.gc(true);
+		expect(opened.deref()).toBeUndefined(); } finally { handlers.get("session_shutdown")!(); }
+});
+
+test("prompts within the bounds, and every prompt with folding off, render whole and ignore the toggle", () => {
+	const theme = { fg: (_token: string, text: string) => text };
+	const handlers = new Map<string, (...args: any[]) => void>();
+	class Message { text = "a short prompt";
+		markdownTheme = getMarkdownTheme();
+		render(_width = 60) { return ["upstream"]; } }
+	installUserMessageRenderer({ on: (event: string, handler: (...args: any[]) => void) => handlers.set(event, handler) } as never, Message);
+	const component = new Message() as Message & { setExpanded(expanded: boolean): void; handleMouse(event: unknown): unknown };
+	try { handlers.get("session_start")!({}, { cwd: world().cwd, hasUI: true, ui: { theme }, sessionManager: { getBranch: () => [] } });
+		const whole = component.render(60);
+		expect(whole.join("\n")).toContain("a short prompt");
+		expect(whole.join("\n")).not.toContain("expand");
+		expect(component.handleMouse({ type: "click", button: "left" })).toBeUndefined();
+		component.setExpanded(true);
+		expect(component.render(60)).toBe(whole);
+
+		writeFileSync(join(world().agent, "settings.json"), JSON.stringify({ "pi-tool-renderer": { userMessageFoldChars: 0, userMessageFoldLines: 0 } }));
+		clearPackageConfigCache();
+		component.text = Array.from({ length: 200 }, (_, index) => `line ${index + 1}`).join("\n");
+		component.setExpanded(false);
+		expect(component.render(60).join("\n")).toContain("line 200"); } finally { handlers.get("session_shutdown")!(); }
 });
