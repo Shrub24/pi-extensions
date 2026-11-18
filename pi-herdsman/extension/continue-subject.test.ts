@@ -75,6 +75,26 @@ test("agent_continue asks Radar to continue the released child by its subject", 
     "the child loads the shared Radar baseline, even when optional extensions are disabled");
 });
 
+test("a configured worker extension set replaces the extension files, and the agent dir stays the child's", async (t) => {
+  const environment = globalThis.process.env;
+  const previous = environment.PI_HERDSMAN_CHILD_EXTENSIONS;
+  t.after(() => {
+    if (previous === undefined) delete environment.PI_HERDSMAN_CHILD_EXTENSIONS;
+    else environment.PI_HERDSMAN_CHILD_EXTENSIONS = previous;
+  });
+  environment.PI_HERDSMAN_CHILD_EXTENSIONS = '["builtin:herdsman","builtin:radar"]';
+  assert.ok(environment.PI_CODING_AGENT_DIR, "the lead runs with its own agent dir");
+  const worker = await releasedWorker(t, true);
+  await worker.tool.execute("call", { session: worker.session.path, task: testBrief("resume") },
+    undefined, undefined, worker.ctx);
+  const launch = radarDaemon.spawns.at(-1)!;
+  const loaded = launch.argv.flatMap((arg, index) => arg === "--extension" ? [launch.argv[index + 1]] : []);
+  assert.deepEqual(loaded.slice(0, 2), ["builtin:herdsman", "builtin:radar"]);
+  assert.ok(!loaded.some((extension) => extension?.endsWith(".ts")), JSON.stringify(loaded));
+  assert.equal(launch.env.PI_CODING_AGENT_DIR, undefined);
+  assert.equal(launch.env.PI_HERDSMAN_CHILD_EXTENSIONS, environment.PI_HERDSMAN_CHILD_EXTENSIONS);
+});
+
 test("agent_continue refuses a session whose subject this session never recorded", async (t) => {
   const worker = await releasedWorker(t, false);
   const before = radarDaemon.spawns.length;

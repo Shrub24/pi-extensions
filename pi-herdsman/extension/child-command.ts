@@ -53,3 +53,36 @@ export function resolveChildCommand(
       }
     : { kind: "resolved", command };
 }
+
+/**
+ * The extensions every managed worker loads, as a JSON array of `--extension`
+ * specifiers. A build whose child command compiles them in names them as
+ * `builtin:<id>`; unset, a worker loads Herdsman and pi-radar from their files.
+ */
+export const CHILD_EXTENSIONS_ENV = "PI_HERDSMAN_CHILD_EXTENSIONS";
+
+export type ChildExtensionsLookup =
+  | Readonly<{ kind: "unset" }>
+  | Readonly<{ kind: "resolved"; extensions: readonly string[] }>
+  | Readonly<{ kind: "invalid"; reason: string }>;
+
+export function resolveRequiredChildExtensions(
+  env: NodeJS.ProcessEnv = process.env,
+): ChildExtensionsLookup {
+  const value = env[CHILD_EXTENSIONS_ENV];
+  if (value === undefined || value === "") return { kind: "unset" };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    parsed = undefined;
+  }
+  return Array.isArray(parsed) &&
+    parsed.length > 0 &&
+    parsed.every((entry) => typeof entry === "string" && entry !== "")
+    ? { kind: "resolved", extensions: parsed }
+    : {
+        kind: "invalid",
+        reason: `${CHILD_EXTENSIONS_ENV}=${JSON.stringify(value)} must be a non-empty JSON array of extension specifiers`,
+      };
+}

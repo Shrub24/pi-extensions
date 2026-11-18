@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { resolveChildCommand } from "./child-command.ts";
+import { resolveChildCommand, resolveRequiredChildExtensions } from "./child-command.ts";
 
 test("the configured child command resolves or is refused", () => {
   const environment = globalThis.process.env;
@@ -49,4 +49,16 @@ test("the configured child command resolves or is refused", () => {
     else environment.PATH = previous.path;
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("the configured worker extensions are a non-empty JSON array or refused", () => {
+  const key = "PI_HERDSMAN_CHILD_EXTENSIONS";
+  assert.deepEqual(resolveRequiredChildExtensions({}), { kind: "unset" });
+  assert.deepEqual(resolveRequiredChildExtensions({ [key]: "" }), { kind: "unset" });
+  assert.deepEqual(
+    resolveRequiredChildExtensions({ [key]: '["builtin:herdsman","builtin:radar"]' }),
+    { kind: "resolved", extensions: ["builtin:herdsman", "builtin:radar"] },
+  );
+  for (const value of ["builtin:herdsman", "[]", '[""]', "[1]", '{"a":1}'])
+    assert.equal(resolveRequiredChildExtensions({ [key]: value }).kind, "invalid", value);
 });

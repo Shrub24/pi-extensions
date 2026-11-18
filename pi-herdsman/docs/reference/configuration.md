@@ -59,6 +59,7 @@ configured (including as an empty array), it becomes the common explicit
 extension set for managed children: Herdsman passes `--no-extensions` and loads
 only this set plus each definition's additions, minus its exclusions. The
 Herdsman extension and the required pi-radar baseline are injected separately
+(see `PI_HERDSMAN_CHILD_EXTENSIONS` in [the agent reference](agent.md#worker-extensions))
 and are not part of this list. Excluding optional extensions cannot remove the
 worker's registrar or assignment support.
 If the field is absent, existing extension-discovery behavior is unchanged.

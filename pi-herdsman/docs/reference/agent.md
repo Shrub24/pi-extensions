@@ -155,6 +155,19 @@ exporting anything. The export itself belongs to the lead process's environment
 does not manage those files. To roll back, unset the variable and restart the
 lead.
 
+## Worker extensions
+
+Every managed worker loads Herdsman and the pi-radar baseline, whatever its
+definition selects. `PI_HERDSMAN_CHILD_EXTENSIONS` names how, as a JSON array of
+`--extension` specifiers: a child command that compiles them in names them as
+built-ins, for example `["builtin:herdsman","builtin:radar"]`. Unset or empty, a
+worker loads both from their files. Any other value fails the launch with an
+`invalid_request` naming the variable. Like the child command, the value is
+passed to the worker, so nested workers load the same set.
+
+The worker's agent directory is its child command's choice: Herdsman does not
+pass the lead's `PI_CODING_AGENT_DIR` to it.
+
 ### How a configured child starts
 
 The launch hands Radar the resolved executable and its arguments; Radar creates the

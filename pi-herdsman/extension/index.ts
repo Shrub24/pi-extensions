@@ -236,7 +236,12 @@ import {
   type ResponseDiagnostic,
 } from "./response-validation.ts";
 import { handoffResponseContract } from "./response-contracts.ts";
-import { CHILD_COMMAND_ENV, resolveChildCommand } from "./child-command.ts";
+import {
+  CHILD_COMMAND_ENV,
+  CHILD_EXTENSIONS_ENV,
+  resolveChildCommand,
+  resolveRequiredChildExtensions,
+} from "./child-command.ts";
 import { sameCwd } from "./cwd.ts";
 import {
   acquireProcessLock,
@@ -3547,9 +3552,6 @@ function prepareManagedWorkerLaunch(
       `PI_HERDSMAN_ALLOWED_AGENT_DEFINITIONS=${JSON.stringify(
         inputs.allowedAgentDefinitions,
       )}`,
-      ...(process.env.PI_CODING_AGENT_DIR
-        ? [`PI_CODING_AGENT_DIR=${process.env.PI_CODING_AGENT_DIR}`]
-        : []),
       ...(process.env.PI_HERDSMAN_DATA_DIR
         ? [`PI_HERDSMAN_DATA_DIR=${process.env.PI_HERDSMAN_DATA_DIR}`]
         : []),
@@ -3558,6 +3560,9 @@ function prepareManagedWorkerLaunch(
       "MAGIC_CONTEXT_PROFILE=subagent",
       ...(childCommand.kind === "resolved"
         ? [`${CHILD_COMMAND_ENV}=${childCommand.command}`]
+        : []),
+      ...(process.env[CHILD_EXTENSIONS_ENV]
+        ? [`${CHILD_EXTENSIONS_ENV}=${process.env[CHILD_EXTENSIONS_ENV]}`]
         : []),
     ];
     // Virtual models need discovery too, but registering one does not add
@@ -6467,13 +6472,26 @@ async function launchRadarChild(
     );
   // Infrastructure, like Herdsman itself, is required even for a worker whose
   // definition opts out of ordinary extension discovery.
-  const radarBaseline = radarBaselineExtensionPath();
-  if (radarBaseline === undefined)
-    fail(
-      "invalid_request",
-      "Radar spawn cannot find the pi-radar baseline extension in this build; a compiled build must stage pi-radar at a known path",
-      operation,
-    );
+  const configuredExtensions = resolveRequiredChildExtensions();
+  if (configuredExtensions.kind === "invalid")
+    fail("invalid_request", configuredExtensions.reason, operation);
+  let requiredExtensions: readonly string[];
+  if (configuredExtensions.kind === "resolved")
+    requiredExtensions = configuredExtensions.extensions;
+  else {
+    const radarBaseline = radarBaselineExtensionPath();
+    if (radarBaseline === undefined)
+      fail(
+        "invalid_request",
+        "Radar spawn cannot find the pi-radar baseline extension in this build; a compiled build must stage pi-radar at a known path",
+        operation,
+      );
+    requiredExtensions = [radarBaseline, HERDSMAN_EXTENSION_PATH];
+  }
+  const requiredExtensionArgs = requiredExtensions.flatMap((extension) => [
+    "--extension",
+    extension,
+  ]);
   let requested: RadarSpawnEntry = {
     stage: "requested",
     requestId: randomUUID(),
@@ -6496,7 +6514,7 @@ async function launchRadarChild(
   const outcome = input.restartSubject !== undefined
     ? await radarRuntime!.children.restart(input.restartSubject, {
       executable: childCommand.command,
-      argv: ["--extension", radarBaseline, "--extension", HERDSMAN_EXTENSION_PATH, ...launchPlan.launchArgs],
+      argv: [...requiredExtensionArgs, ...launchPlan.launchArgs],
       cwd: input.agentCwd,
       env: radarLaunchEnvironment(launchPlan.env, input.parentPaneId),
     }, { signal: input.signal })
@@ -6509,7 +6527,7 @@ async function launchRadarChild(
       pane_id: input.parentPaneId,
       parent_session_id: ctx.sessionManager.getSessionId(),
       executable: childCommand.command,
-      argv: ["--extension", radarBaseline, "--extension", HERDSMAN_EXTENSION_PATH, ...launchPlan.launchArgs],
+      argv: [...requiredExtensionArgs, ...launchPlan.launchArgs],
       cwd: input.agentCwd,
       env: radarLaunchEnvironment(launchPlan.env, input.parentPaneId),
       ...(input.continues !== undefined ? { continues: input.continues } : {}),
