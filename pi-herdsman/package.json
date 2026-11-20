@@ -100,6 +100,6 @@
     "registry": "https://registry.npmjs.org/"
   },
   "dependencies": {
-    "pi-radar": "0.16.1"
+    "pi-radar": "0.17.0"
   }
 }

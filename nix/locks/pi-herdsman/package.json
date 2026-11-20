@@ -3,6 +3,6 @@
   "version": "0.18.0",
   "private": true,
   "dependencies": {
-    "pi-radar": "0.16.1"
+    "pi-radar": "0.17.0"
   }
 }
