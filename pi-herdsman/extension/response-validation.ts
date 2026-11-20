@@ -506,6 +506,19 @@ function markdownHeadings(text: string): ReadonlySet<string> {
 }
 
 const MAX_HANDOFF_SUMMARY_CHARS = 600;
+// Reserved for Herdsman's failure records (radar-handoff.ts FAILURE_TITLE_PREFIX),
+// so a worker's own report can never be read back as a failure.
+const RESERVED_TITLE_PREFIX = "Failed: ";
+
+/** What `handoff/v1` metadata must hold, stated from the rules the validator enforces. */
+export function metadataRequirements(schema: "handoff/v1"): string {
+  return (
+    `\`${schema}\` metadata: the Markdown starts with YAML frontmatter holding only ` +
+    `${HANDOFF_FIELDS.map((field) => `\`${field}\``).join(", ")}: \`schema: ${schema}\`, ` +
+    `a non-empty \`title\` that does not start with "${RESERVED_TITLE_PREFIX}", and a non-empty ` +
+    `\`summary\` of at most ${MAX_HANDOFF_SUMMARY_CHARS} characters.`
+  );
+}
 
 function validateMetadata(
   text: string,
@@ -539,9 +552,7 @@ function validateMetadata(
   if ([...summary].length > MAX_HANDOFF_SUMMARY_CHARS) {
     throwDiagnostic(code, "metadata.summary", `Handoff summary exceeds ${MAX_HANDOFF_SUMMARY_CHARS} characters`, artifactPath);
   }
-  // Reserved for Herdsman's failure records (radar-handoff.ts FAILURE_TITLE_PREFIX),
-  // so a worker's own report can never be read back as a failure.
-  if ((frontmatter.title as string).startsWith("Failed: ")) {
+  if ((frontmatter.title as string).startsWith(RESERVED_TITLE_PREFIX)) {
     throwDiagnostic(code, "metadata.title", "The 'Failed:' title prefix is reserved for Herdsman failure records", artifactPath);
   }
   return { title: frontmatter.title as string, summary };

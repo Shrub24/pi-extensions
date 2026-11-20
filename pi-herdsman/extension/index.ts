@@ -230,6 +230,7 @@ import {
   createAcceptedAssignmentContract,
   validateAcceptedAssignmentContract,
   validateResponse,
+  metadataRequirements,
   ResponseValidationError,
   type AcceptedAssignmentContract,
   type AcceptedContextSnapshot,
@@ -3120,6 +3121,11 @@ type ManagedAgentPresence =
   | {
       kind: "unknown";
       diagnostic: string;
+      /**
+       * Radar records no such child of this session, so no process can be reached
+       * through this record: closing it retires only its assignment.
+       */
+      unrecorded?: true;
     }
   | {
       kind: "lost";
@@ -3917,9 +3923,11 @@ async function radarChildObservations(
       ? { kind: "live", subject }
       : subject?.state === "detached"
         ? { kind: "gone", subject }
-        : { kind: "unknown", diagnostic: roster.ok
-          ? `Radar has no live or detached child for ${spawn.subjectId ?? "this unresolved launch"}`
-          : `${roster.code}: ${roster.message}` };
+        : roster.ok && spawn.subjectId !== undefined && subject === undefined
+          ? { kind: "unrecorded", diagnostic: `Radar records no child ${spawn.subjectId} of this session` }
+          : { kind: "unknown", diagnostic: roster.ok
+            ? `Radar has no live or detached child for ${spawn.subjectId ?? "this unresolved launch"}`
+            : `${roster.code}: ${roster.message}` };
     observations.set(key, observed);
   }
   return observations;
@@ -3966,7 +3974,9 @@ export function managedAgentPresence(radar?: RadarChildObservation): ManagedAgen
     ? { kind: "radar", evidence: radar.subject }
     : radar.kind === "gone"
       ? { kind: "lost", processGone: PROCESS_ENDED }
-      : { kind: "unknown", diagnostic: radar.diagnostic };
+      : radar.kind === "unrecorded"
+        ? { kind: "unknown", diagnostic: radar.diagnostic, unrecorded: true }
+        : { kind: "unknown", diagnostic: radar.diagnostic };
 }
 
 function visibleAgentSnapshots(
@@ -4022,12 +4032,10 @@ function listedAgentRecord(
   const mailbox = agentMailboxPath(state.workspaceId, state.agentLabel);
   let closeAvailable = false;
 
-  // A lost child is closed by retiring its mailbox, so a proven-gone one is closeable
-  // too: its close needs no pane.
-  if (
-    direct &&
-    (presence.kind === "radar" || presence.kind === "lost")
-  ) {
+  // A lost or unrecorded child is closed by retiring its mailbox: its close needs no pane.
+  const retireOnly =
+    presence.kind === "lost" || (presence.kind === "unknown" && presence.unrecorded === true);
+  if (direct && (presence.kind === "radar" || retireOnly)) {
     try {
       if (scope?.kind === "lead") {
         if (!unresolvedMailboxState) {
@@ -4050,7 +4058,7 @@ function listedAgentRecord(
   }
 
   const actions: string[] = [];
-  if (direct && presence.kind === "lost") {
+  if (direct && retireOnly) {
     if (transcriptAvailable) actions.push("transcript");
     if (closeAvailable) actions.push("close");
   } else if (
@@ -6000,7 +6008,7 @@ async function closeManagedSnapshot(
     ctx.sessionManager.getEntries(),
     snapshot.state,
   );
-  if (snapshot.presence.kind === "unknown" && !reconcilable)
+  if (snapshot.presence.kind === "unknown" && !snapshot.presence.unrecorded && !reconcilable)
     fail("target_ambiguous", UNPROVABLE_PRESENCE_MESSAGE, "close");
   // A control request resolves its target before the shared close runs, so the
   // generation it resolved must still be the one under the assignment lock.
@@ -6027,7 +6035,7 @@ async function closeManagedSnapshot(
       );
     const radarObservation = await radarObservationFor(ctx, mailbox, current);
     const presence = managedAgentPresence(radarObservation);
-    if (presence.kind === "unknown") {
+    if (presence.kind === "unknown" && (reconcilable || !presence.unrecorded)) {
       if (!reconcilable)
         fail("target_ambiguous", UNPROVABLE_PRESENCE_MESSAGE, "close");
       await closeRadarChild(
@@ -6304,6 +6312,7 @@ async function resolveControlTarget(
     const snapshot = exact[0]!;
     if (
       snapshot.presence.kind === "unknown" &&
+      !(request.operation === "close" && snapshot.presence.unrecorded) &&
       !restartDecidesPresence(ctx, request, snapshot)
     )
       return {
@@ -6990,6 +6999,7 @@ function assertManagedAgentCascadeSafe(
     // presence still stops the cascade before its first mutation.
     if (
       snapshot.presence.kind === "unknown" &&
+      !snapshot.presence.unrecorded &&
       !closeIsReconcilable(entries, snapshot.state)
     )
       fail("target_ambiguous", UNPROVABLE_PRESENCE_MESSAGE, "close");
@@ -7609,6 +7619,9 @@ function formatAcceptedAssignmentPrompt(
     "",
     "## Response contract",
     JSON.stringify(responseContract, null, 2),
+    ...(responseContract.metadataSchema
+      ? [metadataRequirements(responseContract.metadataSchema)]
+      : []),
     "The framework validates this response contract before publishing success.",
   ].join("\n");
 }

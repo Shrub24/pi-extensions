@@ -413,6 +413,26 @@ test("a control close retires a proved-gone child's assignment without closing i
   }
 });
 
+test("a control close retires the assignment of a child Radar no longer records", async (t) => {
+  const forgotten = controlWorkerFixture("forgotten");
+  try {
+    await forgotten.open();
+    forgotten.work(randomUUID());
+    // A reset daemon has no record of the child, so nothing can be reached through it.
+    radarDaemon.spawns[0]!.subject_id = undefined;
+    const request = controlRequest("close", forgotten.label, AGENT_ID, {
+      paneId: "startup-pane",
+    });
+    assert.equal(writeControlRequest(request, LEAD_SESSION_ID).ok, true);
+    const result = await answered(t, request.requestId);
+    assert.equal(result.outcome, "closed", JSON.stringify(result));
+    assert.equal(readAgentState(forgotten.mailbox), undefined, "the mailbox is retired");
+    assert.equal(radarDaemon.closes.size, 0, "no pane close is sent");
+  } finally {
+    forgotten.shutdown();
+  }
+});
+
 test("a control close refuses a child whose process is not proved gone and keeps its mailbox", async (t) => {
   const unproven = controlWorkerFixture("unproven");
   try {
