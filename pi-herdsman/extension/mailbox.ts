@@ -383,10 +383,8 @@ function validate(
     version !== ADDRESSED_REQUEST_PROTOCOL_VERSION
   )
     throw new Error("Invalid mailbox protocol version or record");
-  if (version === ADDRESSED_REQUEST_PROTOCOL_VERSION && kind !== "request")
-    throw new Error(
-      "Only requests can carry the addressed mailbox protocol version",
-    );
+  if (version === ADDRESSED_REQUEST_PROTOCOL_VERSION && !supportsMailboxV6(kind))
+    throw new Error("Only requests and results can carry mailbox protocol version 6");
   const text = JSON.stringify(value);
   if (Buffer.byteLength(text, "utf8") > LIMITS[kind])
     throw new Error("Mailbox record is too large");
@@ -986,6 +984,10 @@ function validate(
     }
   }
 }
+function supportsMailboxV6(kind: keyof typeof LIMITS): boolean {
+  return kind === "request" || kind === "result";
+}
+
 function atomic(path: string, value: unknown, kind: keyof typeof LIMITS): void {
   const version =
     typeof value === "object" && value !== null
@@ -993,10 +995,7 @@ function atomic(path: string, value: unknown, kind: keyof typeof LIMITS): void {
       : undefined;
   if (
     version !== MAILBOX_PROTOCOL_VERSION &&
-    // An addressed request is the one record kind this build writes at the
-    // addressed version; every other record stays at the current version, and a
-    // record from an older build stays read-only.
-    !(kind === "request" && version === ADDRESSED_REQUEST_PROTOCOL_VERSION)
+    !(version === ADDRESSED_REQUEST_PROTOCOL_VERSION && supportsMailboxV6(kind))
   )
     throw new Error("Legacy mailbox records are read-only");
   validate(value, kind);

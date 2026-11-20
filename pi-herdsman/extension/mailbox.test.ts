@@ -6,13 +6,14 @@ import {
   readFileSync,
   readdirSync,
   rmdirSync,
+  rmSync,
   statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import test from "node:test";
 import { boundedContextUsage } from "./mailbox.ts";
 import { DELEGATION_BRIEF_EXAMPLES, parseDelegationBrief } from "./briefs.ts";
@@ -268,7 +269,35 @@ test("an address must be exactly the subject", () => {
   );
 });
 
-test("an addressed request is a version of its own, and only a request has it", () => {
+test("a sealed completion survives a mailbox round trip", (t) => {
+  const path = mkdtempSync(join(tmpdir(), "pi-herdsman-mailbox-test-"));
+  t.after(() => rmSync(path, { recursive: true, force: true }));
+  const content = "---\nschema: handoff/v1\ntitle: Probe\nsummary: Verified.\n---\n";
+  const result: ResultRecord = {
+    version: 6,
+    runId: state.runId,
+    requestId: randomUUID(),
+    ownerSessionId: state.ownerSessionId,
+    workspaceId: state.workspaceId,
+    agentLabel: state.agentLabel,
+    paneId: state.paneId,
+    status: "completed",
+    text: "Probe complete.",
+    completedAt: Date.now(),
+    handoff: {
+      title: "Probe",
+      summary: "Verified.",
+      content,
+      sha256: createHash("sha256").update(content).digest("hex"),
+      bytes: Buffer.byteLength(content),
+      published: false,
+    },
+  };
+  writeResult(path, result);
+  assert.deepEqual(readResult(path, result.requestId)?.handoff, result.handoff);
+});
+
+test("addressed requests round trip and v6 state records are refused", () => {
   const path = mkdtempSync(join(tmpdir(), "pi-herdsman-mailbox-test-"));
   const address = processAddress();
   const addressed = addressedRequest(address);
@@ -287,8 +316,6 @@ test("an addressed request is a version of its own, and only a request has it", 
     () => writeMailboxRequest(path, unaddressed as RequestRecord),
     /Addressed requests require a process address/,
   );
-  // The version belongs to requests: the same number on any other record kind
-  // is neither a record this build writes nor one it reads.
   assert.throws(
     () => writeAgentState(path, { ...state, version: 6 as never }),
     /Legacy mailbox records are read-only/,
@@ -299,7 +326,7 @@ test("an addressed request is a version of its own, and only a request has it", 
   );
   assert.throws(
     () => readAgentState(path),
-    /Only requests can carry the addressed mailbox protocol version/,
+    /Only requests and results can carry mailbox protocol version 6/,
   );
 });
 
