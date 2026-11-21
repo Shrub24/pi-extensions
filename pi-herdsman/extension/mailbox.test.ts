@@ -282,7 +282,6 @@ test("a sealed completion survives a mailbox round trip", (t) => {
     agentLabel: state.agentLabel,
     paneId: state.paneId,
     status: "completed",
-    text: "Probe complete.",
     completedAt: Date.now(),
     handoff: {
       title: "Probe",
@@ -294,7 +293,7 @@ test("a sealed completion survives a mailbox round trip", (t) => {
     },
   };
   writeResult(path, result);
-  assert.deepEqual(readResult(path, result.requestId)?.handoff, result.handoff);
+  assert.deepEqual(readResult(path, result.requestId), result);
 });
 
 test("addressed requests round trip and v6 state records are refused", () => {

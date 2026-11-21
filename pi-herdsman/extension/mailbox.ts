@@ -808,7 +808,9 @@ function validate(
     finite("completedAt");
     if (
       v.status === "completed" &&
-      (typeof v.text !== "string" || !v.text.trim() || v.error !== undefined)
+      (v.error !== undefined || (v.version === 6
+        ? v.text !== undefined
+        : typeof v.text !== "string" || !v.text.trim()))
     )
       throw new Error("Invalid completed result");
     if (v.status === "failed") {

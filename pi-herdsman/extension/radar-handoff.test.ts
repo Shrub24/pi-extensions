@@ -17,7 +17,7 @@ const SEALED = [
 const completed: ResultRecord = {
   version: 6, requestId: "11111111-1111-4111-8111-111111111111", runId: "run-1",
   ownerSessionId: "owner-1", workspaceId: "workspace-1", agentLabel: "worker", paneId: "%4",
-  status: "completed", text: "Acknowledged.", completedAt: 1234,
+  status: "completed", completedAt: 1234,
   handoff: { title: "Parser fix", summary: "The parser now accepts empty files.", content: SEALED, sha256: "x", bytes: SEALED.length, published: false },
 };
 const message: CompletionMessage = {

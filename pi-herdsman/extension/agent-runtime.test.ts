@@ -2261,13 +2261,13 @@ test("response text claiming another identity or passing checks stays model-auth
   resetAgentMailbox(mailbox);
 });
 
-test("worker result provenance records the validated artifact hash", async () => {
+test("the worker stages a sealed handoff with provenance and no chat text", async () => {
   const mailbox = setAgentEnvironment("artifact-response-agent");
   const agent = fakePi();
   const context = fakeContext();
   const artifactPath = `response-${randomUUID()}.md`;
   let canonicalPath: string | undefined;
-  const artifactText = "## Outcome\nArtifact-backed response";
+  const artifactText = "---\nschema: handoff/v1\ntitle: Probe\nsummary: Verified.\n---\n\n## Outcome\nArtifact-backed response\n";
   registerExtension!(agent.pi as never);
   try {
     await agent.events.get("session_start")![0](undefined, context);
@@ -2282,6 +2282,7 @@ test("worker result provenance records the validated artifact hash", async () =>
         format: "markdown",
         path: artifactPath,
         requiredSections: ["Outcome"],
+        metadataSchema: "handoff/v1",
       },
     });
     const acceptedAssignment = createAcceptedAssignmentContract(
@@ -2315,7 +2316,8 @@ test("worker result provenance records the validated artifact hash", async () =>
 
     const result = readResult(mailbox, requestId);
     assert.equal(result?.status, "completed", JSON.stringify(result));
-    assert.equal(result?.text, `Artifact validated: ${artifactPath}`);
+    assert.equal(result?.text, undefined);
+    assert.equal(result?.handoff?.content, artifactText);
     assert.equal(result?.responseValidation?.target, "artifact");
     assert.equal(result?.responseValidation?.textSource, "framework");
     assert.equal(result?.responseValidation?.workerSessionId, started.piSessionId);
