@@ -4263,6 +4263,13 @@ test("Model output preserves inspection, concise controls, and structured errors
   }
 
   {
+    const handoff = "## Evidence\n\nThe probe exited with status 0.";
+    assert.ok(formatToolModelResult("complete", {
+      ok: true, status: "completed", handoff,
+    }).includes(handoff));
+  }
+
+  {
     assert.doesNotMatch(
       formatToolModelResult("close", { ok: true, agent: "agent" }),
       /Next:/,

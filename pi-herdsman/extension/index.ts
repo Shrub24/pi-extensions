@@ -4483,7 +4483,7 @@ function resolveMessageFiles(
     (file) => resolveResultReference(file, branch, operation) ?? file,
   );
 }
-/** Capture never prompts or settles an assignment. Only Radar's loop records receipts. */
+/** Persist the Radar report before notifying the owner or acknowledging receipt. */
 function captureRadarCompletion(pi: ExtensionAPI, ctx: ExtensionContext, message: CompletionMessage): boolean {
   const owner = ctx.sessionManager.getSessionId();
   const entries = ctx.sessionManager.getEntries();
@@ -4510,26 +4510,31 @@ function captureRadarCompletion(pi: ExtensionAPI, ctx: ExtensionContext, message
       return reject(errorMessage(error));
     }
     const existing = readCompletion(owner, message.id);
-    if (existing) {
-      try {
+    const mailbox = agentMailboxPath(spawn.workspaceId, spawn.label);
+    try {
+      if (existing) {
         persistSealedCompletion({ ...existing, runId: spawn.runId }, report, existing.completedAt);
-      } catch (error) {
-        if (error instanceof CompletionConflictError) return reject(error.message);
-        throw error;
+      } else {
+        const state = readAgentState(mailbox);
+        if (!state) return false;
+        if (state.runId !== spawn.runId || state.ownerSessionId !== owner ||
+            state.workspaceId !== spawn.workspaceId || state.agentLabel !== spawn.label)
+          return reject("Worker mailbox now belongs to a different assignment");
+        persistSealedCompletion({
+          requestId: message.id, ownerSessionId: owner, runId: state.runId,
+          workspaceId: state.workspaceId, agentLabel: state.agentLabel, paneId: state.paneId,
+          cwd: state.cwd, definition: stateAgentDefinition(state),
+          piSessionId: state.piSessionId, piSessionFile: state.piSessionFile,
+        }, report, Date.now());
       }
-      return true;
+    } catch (error) {
+      if (error instanceof CompletionConflictError) return reject(error.message);
+      throw error;
     }
-    const state = readAgentState(agentMailboxPath(spawn.workspaceId, spawn.label));
-    if (!state) return false;
-    if (state.runId !== spawn.runId || state.ownerSessionId !== owner ||
-        state.workspaceId !== spawn.workspaceId || state.agentLabel !== spawn.label)
-      return reject("Worker mailbox now belongs to a different assignment");
-    persistSealedCompletion({
-      requestId: message.id, ownerSessionId: owner, runId: state.runId,
-      workspaceId: state.workspaceId, agentLabel: state.agentLabel, paneId: state.paneId,
-      cwd: state.cwd, definition: stateAgentDefinition(state),
-      piSessionId: state.piSessionId, piSessionFile: state.piSessionFile,
-    }, report, Date.now());
+    const runtime = runtimes.get(spawn.label);
+    const result = runtime?.mailboxPath === mailbox ? readResult(mailbox, message.id) : undefined;
+    if (runtime && result)
+      void deliverResult(pi, runtime, ctx, result, controllerAbortController?.signal);
     return true;
   } catch {
     // Storage or identity evidence unavailable: redelivery must remain possible.
@@ -17099,11 +17104,6 @@ export default function (pi: ExtensionAPI): void {
         if (retryTimer) clearInterval(retryTimer);
         retryTimer = undefined;
         finalizeStateTransition(ctx, true);
-        // If publication succeeded but the process died before durable state
-        // settlement, keep the staged result so restart recovery can finish it.
-        if (process.env.PI_RADAR_MANAGED_PARENT_SUBJECT_ID !== undefined && state?.activeRequestId === undefined &&
-            state?.completedRequestId === current.requestId)
-          removeResult(mailbox, current.requestId);
       } catch (error) {
         if (
           !handoffPublishing && current.status === "completed" &&

@@ -1528,7 +1528,7 @@ export function formatToolModelResult(
     return [
       `Completion ${value(v.completion_id)} · ${value(v.agent)} · ${value(v.status)}`,
       value(v.summary),
-      `Handoff: ${value(v.handoff_path)}`,
+      ...(typeof v.handoff === "string" ? [`Handoff:\n${v.handoff}`] : []),
       `Disposition: ${value(v.disposition) || "pending"} · closed: ${v.closed === true}`,
       ...(v.wrapup ? [`Wrapup: ${JSON.stringify(v.wrapup)}`] : []),
       ...(v.repeated ? ["Repeated read; no effects repeated."] : []),
