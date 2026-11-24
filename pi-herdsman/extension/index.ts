@@ -5776,7 +5776,7 @@ async function closeManagedAgent(
     // A steer or interrupt not yet accepted by the child is still queued in its
     // mailbox. Closing now would delete that request unseen, so refuse until the
     // child takes it at its next boundary.
-    if (unacknowledgedRequestExists(mailbox, current))
+    if (queuedRequestBlocksClose(mailbox, current))
       fail(
         "agent_busy",
         `Agent ${state.agentLabel} has a queued request the child has not accepted yet; close after it is delivered`,
@@ -5819,6 +5819,22 @@ async function closeManagedAgent(
     );
   } finally {
     release?.();
+  }
+}
+/**
+ * A wrapup whose outcome is already recorded has run: the child only has to
+ * acknowledge it, and that acknowledgement can be lost to the assignment lock the
+ * parking owner holds while it waits. Closing then deletes nothing unseen.
+ */
+function queuedRequestBlocksClose(mailbox: string, state: ManagedAgentState): boolean {
+  try {
+    const queued = readUnacknowledgedRequest(mailbox, state);
+    return queued !== undefined && !(
+      queued.kind === "wrapup" &&
+      readPreparationResult(state.ownerSessionId, queued.requestId) !== undefined
+    );
+  } catch {
+    return true;
   }
 }
 /**

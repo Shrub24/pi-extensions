@@ -6,7 +6,7 @@ import {
   LEAD_SESSION_ID, PI_AGENT_ROOT, WORKSPACE, agentMailboxPath,
   fakeContext, fakePi, managedState, nativeSessions, radarDaemon,
   readAgentState, realFs, registerExtension, setLeadEnvironment,
-  startRadarSession, writeAgentState,
+  startRadarSession, writeAgentState, writeRequest,
 } from "./support.ts";
 import { persistCompletion, readCompletion, saveCompletion, writePreparationResult } from "./completions.ts";
 import { setConfigField } from "./support-config.ts";
@@ -78,6 +78,26 @@ test("agent_complete defaults to park, returns a path, and repeats without repea
   const roster = await w.execute("list", {});
   assert.ok(roster.saved_sessions.some((row: any) => row.pi_session_id === w.state.piSessionId));
   assert.ok(realFs.existsSync(w.state.piSessionFile));
+});
+
+test("park closes a worker whose wrapup outcome is recorded before the child acknowledges the request", async (t) => {
+  const w = await worker(t);
+  const preparationId = randomUUID();
+  const saved = readCompletion(LEAD_SESSION_ID, w.completion.requestId)!;
+  saved.preparationId = preparationId;
+  saveCompletion(saved);
+  // The child records the outcome, then its acknowledgement is lost to the lock the parking owner holds.
+  writeRequest(w.mailbox, {
+    version: 6, runId: w.state.runId, requestId: preparationId, ownerSessionId: LEAD_SESSION_ID,
+    workspaceId: WORKSPACE, agentLabel: w.state.agentLabel, paneId: w.state.paneId,
+    kind: "wrapup", text: w.completion.requestId, createdAt: Date.now(), address: { subject: randomUUID() },
+  } as never);
+  writePreparationResult(LEAD_SESSION_ID, preparationId, { status: "success" });
+  const parked = await w.complete();
+  assert.equal(parked.action_outcome, undefined);
+  assert.equal(parked.disposition, "park");
+  assert.equal(parked.closed, true);
+  assert.equal(readAgentState(w.mailbox), undefined);
 });
 
 test("keep leaves the generation live; changing to park closes that same completed assignment", async (t) => {
